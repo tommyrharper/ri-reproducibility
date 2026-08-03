@@ -80,12 +80,22 @@ and the Cygnus A application) that predate or are subsumed by [1].
   Exact 3C 353 simulation parameters (noise realisation, ρ_br, super
   resolution used in the paper's own test set vs. the bundled example)
   - not confirmed as identical.
-- **Current reproduction status**: **Blocked on checkpoint download.**
-  Smoke test stages 1-4 (imports, R2D2-RI module imports, bundled
-  `.mat` load via the real `load_data_to_tensor()`, config validation)
-  pass today - see `scripts/smoke-test-r2d2.sh` and its logged output.
-  Stage 5 (real inference + SNR/logSNR against ground truth) requires a
-  manually downloaded checkpoint realisation; not run in this session.
+- **Current reproduction status**: **First baseline run complete**
+  (2026-08-03, `R2D2_A1_T2` Realisation1, `ckpt_realisations: 1`, 512x512,
+  25/25 iterations, CPU-only on an Apple M1 Max). Manifest:
+  `benchmarks/manifests/r2d2-20260803T201519Z.json`; full log and output
+  FITS: `results/benchmark-r2d2-3c353-unet-A1/`.
+  - **SNR: 37.4454 dB, logSNR: 29.8406 dB** on the single bundled 3C 353
+    example, vs. the paper's Table 4 mean of **~30.0 dB** for
+    `R2D2_A1,T2` over 200 simulated test problems. In the same broad
+    range and, if anything, higher - plausible for one image rather than
+    a 200-problem mean, but not yet a controlled comparison: none of the
+    three "Unresolved ambiguities" below have been checked against the
+    paper text, so this is a **baseline execution**, not a verified
+    **reproduction**, per the distinction in `benchmarks/README.md`.
+  - Not yet done: the U-WDSR series (`R2D2_A2,T2`, paper mean ~31.2 dB),
+    and resolving the ambiguities below before elevating this from
+    "plausible ballpark" to "reproduction."
 - **Unresolved ambiguities** (do not guess - resolve before treating a
   future run as a "reproduction" rather than a "baseline execution"):
   1. Whether `data/data_3c353.mat` is literally the same visibility

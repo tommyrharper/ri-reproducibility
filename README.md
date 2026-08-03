@@ -29,8 +29,8 @@ supports).
    input data and produce plausible output? (the rest of the smoke
    tests)
 3. **Benchmarking** - controlled measurement of runtime, memory,
-   configuration sensitivity (`benchmarks/`, minimal scaffolding only
-   for now - see `benchmarks/README.md`).
+   configuration sensitivity (`benchmarks/` - see section 8 below and
+   `benchmarks/README.md`).
 4. **Paper reproduction** - matching a specific published figure/table
    under matched conditions (`benchmarks/REPRODUCTION_PLAN.md`).
 
@@ -42,7 +42,7 @@ with "it reproduced the paper."
 - Docker Desktop (this environment was built/verified against Docker
   20.10.17 client / Docker Desktop's `desktop-linux` context on macOS).
 - `git`.
-- Nothing else. See "13. Verifying no dependencies were installed on
+- Nothing else. See "15. Verifying no dependencies were installed on
   the host" below.
 
 ## 4. Apple Silicon limitations
@@ -69,7 +69,7 @@ with "it reproduced the paper."
   would need a `linux/amd64` host with an NVIDIA GPU - Apple Silicon
   cannot run it at all, emulated or otherwise.
 - Benchmark numbers gathered under Docker Desktop on macOS are **not**
-  representative of native Linux performance - see section 15.
+  representative of native Linux performance - see section 16.
 
 ## 5. Building the images
 
@@ -120,11 +120,59 @@ so no host Python environment is needed. With no arguments it renders
 the standard R2D2 diagnostic set (dirty image, PSF, cleaned model,
 residual). Pass one or more paths via `FILES` (relative to the repo
 root, or absolute paths inside the r2d2 image, e.g. the bundled
-ground-truth `/opt/r2d2/R2D2-RI/data/3c353_gdth.fits` - see section 8
+ground-truth `/opt/r2d2/R2D2-RI/data/3c353_gdth.fits` - see section 9
 below) to render specific files instead. PNGs are written flat into
 `results/`, named after the source FITS file.
 
-## 8. Mounting datasets and output directories
+## 8. Running a benchmark and producing the report
+
+A benchmark run is a real (not smoke-test) pipeline invocation, recorded
+so it can be inspected and compared later:
+
+```bash
+# 1. Run the pipeline for real, writing output to its own results/
+#    subdirectory (not the smoke test's, so they don't collide), e.g.:
+docker run --rm --platform linux/arm64 \
+  -v "$(pwd)/checkpoints:/checkpoints:ro" \
+  -v "$(pwd)/results/<experiment-name>:/results" \
+  -v "$(pwd)/config/r2d2:/workspace/config:ro" \
+  --entrypoint python3 ri-reproducibility/r2d2:cpu \
+  ./src/imager.py --config /workspace/config/R2D2_U-Net.yaml \
+  --ckpt_path /checkpoints/R2D2_A1
+
+# 2. Record a manifest for that exact run
+scripts/record-environment.sh --tool r2d2 \
+  --image ri-reproducibility/r2d2:cpu \
+  --config config/r2d2/R2D2_U-Net.yaml -- <the docker run command above>
+
+# 3. Render every manifest in benchmarks/manifests/ into one HTML report
+make benchmark-report
+```
+
+`record-environment.sh` only *writes the manifest* - it does not execute
+the command itself (see "Reproducibility metadata" below), so steps 1
+and 2 both use the same exact command, run separately. Input/checkpoint
+checksums and the run's actual results (SNR/logSNR, wall-clock time,
+etc.) are experiment-specific and not auto-captured; add an
+`"experiment"` object to the written manifest JSON with a `"purpose"`,
+whatever provenance is relevant, and a `"results"` object - see any
+existing `benchmarks/manifests/r2d2-*.json` for a worked example.
+`benchmarks/REPRODUCTION_PLAN.md` tracks which specific benchmark (paper,
+table, expected numbers) this environment currently targets, and its
+"Current reproduction status" section should be updated by hand after a
+run that moves that target forward.
+
+`make benchmark-report` (`scripts/generate-benchmark-report.sh` +
+`scripts/lib/generate_benchmark_report.py`) builds
+`benchmarks/report.html` - one card per manifest with its environment/
+provenance, a results metrics table, and that run's output FITS files
+rendered inline - by reusing the r2d2 image's own astropy + matplotlib,
+same approach as `make plot-fits` (section 7), so no host Python
+environment is needed. Open the file directly in a browser afterward.
+It's generated/gitignored, like `results/`; `git add -f` a specific copy
+if you want one version-controlled (e.g. for a paper appendix).
+
+## 9. Mounting datasets and output directories
 
 Configured via `.env` (copy from `.env.example`), consumed by
 `compose.yaml` and the `scripts/*.sh` (which use plain `docker run -v`,
@@ -146,7 +194,7 @@ files into the `r2d2` image layer. This is upstream's packaging
 decision, not this repo's; anything *you* add for further experiments
 still goes through the bind mounts above. See `data/README.md`.
 
-## 9. Fetching checkpoints
+## 10. Fetching checkpoints
 
 ```bash
 make fetch-r2d2-checkpoints REALISATION=R2D2_A1_T2_Realisation1.zip
@@ -159,7 +207,7 @@ The script attempts the download, detects that failure precisely, and
 prints the direct URL plus exact placement instructions instead of a
 stack trace. See `checkpoints/README.md`.
 
-## 10. How upstream revisions are pinned
+## 11. How upstream revisions are pinned
 
 Every upstream reference lives in `versions.env`, resolved by directly
 inspecting each repository (tags, `.gitmodules`, commit history) rather
@@ -180,14 +228,14 @@ than assumed:
   README identifies as "v2.0". Submodule `RI-measurement-operator`
   (branch `python`) pinned to `3c8a93e9127ccaf115d1e3772fbee74aaaccf8e8`.
 - **casacore measures data** (IERS/leap-second tables): explicitly
-  **not** pinned to an immutable release - see section 15's note below
+  **not** pinned to an immutable release - see section 16's note below
   and `docker/wsclean/Dockerfile`'s comments. This is a genuine, open
   reproducibility gap in the upstream ecosystem, not an oversight here.
 
 To adopt a new revision: edit `versions.env` deliberately, rebuild, and
 commit both changes together.
 
-## 11. Rebuilding from scratch
+## 12. Rebuilding from scratch
 
 ```bash
 make clean                    # removes this repo's images + smoke-test outputs
@@ -200,7 +248,7 @@ still re-download apt/pip packages fresh but reuse nothing else
 locally cached; `docker builder prune -a` before rebuilding forces a
 fully cold build if you need to verify true from-scratch reproducibility.
 
-## 12. Removing all generated Docker artefacts / reclaiming disk space
+## 13. Removing all generated Docker artefacts / reclaiming disk space
 
 ```bash
 make clean                          # this repo's images + local smoke-test outputs
@@ -210,13 +258,13 @@ docker system prune                 # anything else Docker-wide (asks first; aff
                                      # with care, not scoped to this repo)
 ```
 
-## 13. Inspecting Docker disk usage
+## 14. Inspecting Docker disk usage
 
 ```bash
 make disk-usage    # docker system df -v
 ```
 
-## 14. Verifying no dependencies were installed on the host
+## 15. Verifying no dependencies were installed on the host
 
 Everything WSClean/R2D2 need (compilers, Casacore, Python packages,
 PyTorch, finufft, ...) is installed inside the Docker build stages only
@@ -226,7 +274,7 @@ system Python, not a venv you made for something else) should both fail
 outside a container built from this repo. The only host-side tools this
 project's own instructions require are Docker and Git.
 
-## 15. Docker Desktop on macOS - limitations for benchmarking
+## 16. Docker Desktop on macOS - limitations for benchmarking
 
 - Docker Desktop on macOS runs containers inside a lightweight Linux VM
   (`linuxkit`/`vz`). CPU/memory limits are whatever you've configured
@@ -278,7 +326,7 @@ should not be treated as authoritative.
   correct, not a bug.
 - **R2D2 checkpoint missing**: `scripts/smoke-test-r2d2.sh` stage 5
   prints exact instructions rather than a stack trace; see also section
-  8 and `checkpoints/README.md`.
+  9 and `checkpoints/README.md`.
 - **Git submodule missing** (`fatal: no submodule mapping found`, or
   R2D2-RI's `src/ri_measurement_operator` empty): the Dockerfiles clone
   with an explicit `git submodule update --init --recursive` /
@@ -308,7 +356,7 @@ should not be treated as authoritative.
   is the heaviest build step; if it or `pip install torch` gets OOM-killed,
   raise Docker Desktop's memory allocation (Settings -> Resources) or
   pass `--build-arg BUILD_JOBS=1` to `docker build` for the WSClean image.
-- **Large image or build-cache disk usage**: see sections 11-12. The
+- **Large image or build-cache disk usage**: see sections 12-13. The
   R2D2 image alone is ~3.2 GB (dominated by PyTorch CPU + the
   unavoidable `tensorflow` transitive dependency - see "Notable findings"
   below), before any checkpoints are downloaded.

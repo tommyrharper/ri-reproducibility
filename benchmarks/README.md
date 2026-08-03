@@ -14,6 +14,14 @@ at least one baseline run each (see `REPRODUCTION_PLAN.md`).
   for a paper appendix), copy them out and `git add -f`.
 - `scripts/` - benchmark drivers, added once there is more than one
   thing to benchmark. Empty for now.
+- `report.html` - generated, gitignored; run `make benchmark-report` to
+  build it from whatever is currently in `manifests/`. One card per
+  manifest: environment/provenance, the `experiment.results` metrics
+  table (if the manifest has one - see the `r2d2-*.json` example), and
+  the run's output FITS files rendered inline. Uses the r2d2 image's own
+  astropy + matplotlib (`scripts/generate-benchmark-report.sh`, same
+  approach as `scripts/plot-fits.sh`), so no host Python environment is
+  needed; open the file directly in a browser afterward.
 
 ## What "benchmarking" means here vs. what it doesn't
 

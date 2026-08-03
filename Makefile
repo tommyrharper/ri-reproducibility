@@ -1,6 +1,6 @@
 .PHONY: build build-wsclean build-r2d2 smoke-test smoke-test-wsclean smoke-test-r2d2 \
         shell-wsclean shell-r2d2 fetch-r2d2-checkpoints record-environment \
-        plot-fits config clean disk-usage
+        plot-fits benchmark-report config clean disk-usage
 
 SHELL := /usr/bin/env bash
 
@@ -38,6 +38,9 @@ record-environment:
 
 plot-fits:
 	scripts/plot-fits.sh $(FILES)
+
+benchmark-report:
+	scripts/generate-benchmark-report.sh
 
 config:
 	docker compose config

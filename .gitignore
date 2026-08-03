@@ -8,6 +8,7 @@ results/*
 !results/.gitkeep
 benchmarks/manifests/*
 !benchmarks/manifests/.gitkeep
+benchmarks/report.html
 vendor/*
 !vendor/README.md
 
