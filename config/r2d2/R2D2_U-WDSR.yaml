@@ -1,0 +1,33 @@
+# Adapted from R2D2-RI's config/imaging/R2D2_U-WDSR.yaml (pinned commit
+# 22669259f770a0cb3a3191a5d3e8dbad4ae5a70c) for this repo's container
+# paths. See R2D2_U-Net.yaml for field-by-field notes; only the
+# architecture-specific fields differ (num_chans, ckpt_path).
+
+# i/o
+gdth_file: /data/3c353_gdth.fits
+data_file: /data/data_3c353.mat
+output_path: /results/r2d2-uwdsr
+save_all_outputs: False
+
+# measurement operator
+nufft_pkg: finufft
+meas_op_on_gpu: False
+meas_dtype: double
+im_dim_x: 512
+im_dim_y: 512
+
+# weighting
+data_weighting: True
+natural_weight: True
+weight_type: briggs
+
+# algorithm
+num_iter: 25
+num_chans: 64
+series: R2D2
+layers: 1
+architecture: uwdsr
+prune: True
+sigma_res_tol: 1e-4
+ckpt_path: /checkpoints/R2D2_A2
+ckpt_realisations: 1

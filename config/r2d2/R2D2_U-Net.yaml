@@ -1,0 +1,34 @@
+# Adapted from R2D2-RI's config/imaging/R2D2_U-Net.yaml (pinned commit
+# 22669259f770a0cb3a3191a5d3e8dbad4ae5a70c) for this repo's container
+# paths. Upstream field documentation: see R2D2-RI README.md "Usage and
+# Example". Mounted read-only into the r2d2 container at
+# /workspace/config/R2D2_U-Net.yaml by compose.yaml.
+
+# i/o
+gdth_file: /data/3c353_gdth.fits
+data_file: /data/data_3c353.mat
+output_path: /results/r2d2-unet
+save_all_outputs: False
+
+# measurement operator
+nufft_pkg: finufft
+meas_op_on_gpu: False   # CPU-only image; set True only in a CUDA build
+meas_dtype: double
+im_dim_x: 512
+im_dim_y: 512
+
+# weighting
+data_weighting: True
+natural_weight: True
+weight_type: briggs
+
+# algorithm
+num_iter: 25
+num_chans: 32
+series: R2D2
+layers: 1
+architecture: unet
+prune: True
+sigma_res_tol: 1e-4
+ckpt_path: /checkpoints/R2D2_A1
+ckpt_realisations: 1   # set to 5 for full epistemic-uncertainty runs

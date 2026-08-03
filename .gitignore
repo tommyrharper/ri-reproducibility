@@ -1,0 +1,43 @@
+# Datasets, checkpoints, and generated outputs are bind-mounted at runtime
+# and must never be committed.
+data/*
+!data/README.md
+checkpoints/*
+!checkpoints/README.md
+results/*
+!results/.gitkeep
+benchmarks/manifests/*
+!benchmarks/manifests/.gitkeep
+vendor/*
+!vendor/README.md
+
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# CMake / C++ build artefacts (only relevant if building outside Docker)
+build/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.so
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Benchmark / profiling artefacts
+*.prof
+*.trace

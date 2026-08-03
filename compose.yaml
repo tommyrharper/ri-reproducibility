@@ -1,0 +1,42 @@
+# Primarily used for `docker compose config` validation and interactive
+# shells (`make shell-wsclean` / `make shell-r2d2`). Actual smoke-test and
+# benchmark runs use plain `docker run` (see scripts/) so that per-run
+# bind mounts, platform flags, and commands stay explicit and easy to
+# reason about individually.
+services:
+  wsclean:
+    build:
+      context: .
+      dockerfile: docker/wsclean/Dockerfile
+      args:
+        WSCLEAN_PORTABLE: ${WSCLEAN_PORTABLE:-ON}
+      platforms:
+        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    image: ri-reproducibility/wsclean:v3.7
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    entrypoint: ["wsclean"]
+    command: ["--version"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${RESULTS_DIR:-./results}:/results
+      - ./config/wsclean:/workspace/config:ro
+    environment:
+      - OMP_NUM_THREADS
+
+  r2d2:
+    build:
+      context: .
+      dockerfile: docker/r2d2/Dockerfile
+      platforms:
+        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    image: ri-reproducibility/r2d2:cpu
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    entrypoint: ["python3"]
+    command: ["--version"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${CHECKPOINTS_DIR:-./checkpoints}:/checkpoints
+      - ${RESULTS_DIR:-./results}:/results
+      - ./config/r2d2:/workspace/config:ro
+    environment:
+      - OMP_NUM_THREADS
