@@ -5,8 +5,13 @@
 # /workspace/config/R2D2_U-Net.yaml by compose.yaml.
 
 # i/o
-gdth_file: /data/3c353_gdth.fits
-data_file: /data/data_3c353.mat
+# Note: these are relative to WORKDIR (/opt/r2d2/R2D2-RI) inside the
+# image, not the /data bind mount - the bundled 3c353 example ships
+# baked into the upstream R2D2-RI repo itself (see data/README.md and
+# README.md "Reproducibility limitations"), not under the host ./data
+# bind mount.
+gdth_file: data/3c353_gdth.fits
+data_file: data/data_3c353.mat
 output_path: /results/r2d2-unet
 save_all_outputs: False
 
@@ -24,7 +29,12 @@ weight_type: briggs
 
 # algorithm
 num_iter: 25
-num_chans: 32
+# 64, not upstream's demo-config value of 32: the VLA-trained R2D2_A1
+# checkpoint series (see checkpoints/README.md) was trained with the
+# args.py default num_chans=64, confirmed by the checkpoint's own
+# down_sample_layers.0 weight shape ([64, 2, 3, 3]) - loading it into a
+# num_chans=32 model raises a state_dict size mismatch on every layer.
+num_chans: 64
 series: R2D2
 layers: 1
 architecture: unet
