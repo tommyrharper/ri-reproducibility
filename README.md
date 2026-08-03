@@ -69,7 +69,7 @@ with "it reproduced the paper."
   would need a `linux/amd64` host with an NVIDIA GPU - Apple Silicon
   cannot run it at all, emulated or otherwise.
 - Benchmark numbers gathered under Docker Desktop on macOS are **not**
-  representative of native Linux performance - see section 14.
+  representative of native Linux performance - see section 15.
 
 ## 5. Building the images
 
@@ -107,7 +107,24 @@ make smoke-test-r2d2       # staged: imports -> app modules -> bundled
 See `scripts/smoke-test-wsclean.sh` and `scripts/smoke-test-r2d2.sh` for
 exactly what each stage does and why.
 
-## 7. Mounting datasets and output directories
+## 7. Visualizing FITS output
+
+```bash
+make plot-fits                        # renders the R2D2 smoke-test outputs
+make plot-fits FILES="results/smoke-test-wsclean/foo-image.fits"
+```
+
+Renders FITS images to PNG (zscale + asinh stretch, via
+`scripts/plot-fits.sh`) using the r2d2 image's own astropy + matplotlib,
+so no host Python environment is needed. With no arguments it renders
+the standard R2D2 diagnostic set (dirty image, PSF, cleaned model,
+residual). Pass one or more paths via `FILES` (relative to the repo
+root, or absolute paths inside the r2d2 image, e.g. the bundled
+ground-truth `/opt/r2d2/R2D2-RI/data/3c353_gdth.fits` - see section 8
+below) to render specific files instead. PNGs are written flat into
+`results/`, named after the source FITS file.
+
+## 8. Mounting datasets and output directories
 
 Configured via `.env` (copy from `.env.example`), consumed by
 `compose.yaml` and the `scripts/*.sh` (which use plain `docker run -v`,
@@ -129,7 +146,7 @@ files into the `r2d2` image layer. This is upstream's packaging
 decision, not this repo's; anything *you* add for further experiments
 still goes through the bind mounts above. See `data/README.md`.
 
-## 8. Fetching checkpoints
+## 9. Fetching checkpoints
 
 ```bash
 make fetch-r2d2-checkpoints REALISATION=R2D2_A1_T2_Realisation1.zip
@@ -142,7 +159,7 @@ The script attempts the download, detects that failure precisely, and
 prints the direct URL plus exact placement instructions instead of a
 stack trace. See `checkpoints/README.md`.
 
-## 9. How upstream revisions are pinned
+## 10. How upstream revisions are pinned
 
 Every upstream reference lives in `versions.env`, resolved by directly
 inspecting each repository (tags, `.gitmodules`, commit history) rather
@@ -163,14 +180,14 @@ than assumed:
   README identifies as "v2.0". Submodule `RI-measurement-operator`
   (branch `python`) pinned to `3c8a93e9127ccaf115d1e3772fbee74aaaccf8e8`.
 - **casacore measures data** (IERS/leap-second tables): explicitly
-  **not** pinned to an immutable release - see section 14's note below
+  **not** pinned to an immutable release - see section 15's note below
   and `docker/wsclean/Dockerfile`'s comments. This is a genuine, open
   reproducibility gap in the upstream ecosystem, not an oversight here.
 
 To adopt a new revision: edit `versions.env` deliberately, rebuild, and
 commit both changes together.
 
-## 10. Rebuilding from scratch
+## 11. Rebuilding from scratch
 
 ```bash
 make clean                    # removes this repo's images + smoke-test outputs
@@ -183,7 +200,7 @@ still re-download apt/pip packages fresh but reuse nothing else
 locally cached; `docker builder prune -a` before rebuilding forces a
 fully cold build if you need to verify true from-scratch reproducibility.
 
-## 11. Removing all generated Docker artefacts / reclaiming disk space
+## 12. Removing all generated Docker artefacts / reclaiming disk space
 
 ```bash
 make clean                          # this repo's images + local smoke-test outputs
@@ -193,13 +210,13 @@ docker system prune                 # anything else Docker-wide (asks first; aff
                                      # with care, not scoped to this repo)
 ```
 
-## 12. Inspecting Docker disk usage
+## 13. Inspecting Docker disk usage
 
 ```bash
 make disk-usage    # docker system df -v
 ```
 
-## 13. Verifying no dependencies were installed on the host
+## 14. Verifying no dependencies were installed on the host
 
 Everything WSClean/R2D2 need (compilers, Casacore, Python packages,
 PyTorch, finufft, ...) is installed inside the Docker build stages only
@@ -209,7 +226,7 @@ system Python, not a venv you made for something else) should both fail
 outside a container built from this repo. The only host-side tools this
 project's own instructions require are Docker and Git.
 
-## 14. Docker Desktop on macOS - limitations for benchmarking
+## 15. Docker Desktop on macOS - limitations for benchmarking
 
 - Docker Desktop on macOS runs containers inside a lightweight Linux VM
   (`linuxkit`/`vz`). CPU/memory limits are whatever you've configured

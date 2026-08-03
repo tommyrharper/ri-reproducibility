@@ -1,6 +1,6 @@
 .PHONY: build build-wsclean build-r2d2 smoke-test smoke-test-wsclean smoke-test-r2d2 \
         shell-wsclean shell-r2d2 fetch-r2d2-checkpoints record-environment \
-        config clean disk-usage
+        plot-fits config clean disk-usage
 
 SHELL := /usr/bin/env bash
 
@@ -35,6 +35,9 @@ fetch-r2d2-checkpoints:
 
 record-environment:
 	scripts/record-environment.sh --tool $(TOOL) --image $(IMAGE) $(if $(CONFIG),--config $(CONFIG),)
+
+plot-fits:
+	scripts/plot-fits.sh $(FILES)
 
 config:
 	docker compose config
