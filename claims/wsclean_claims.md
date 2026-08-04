@@ -26,6 +26,21 @@ Table 2, page 9:
 
 ## Accuracy
 
+Based on simulated MWA observations (page 8, 4.1 Accuracy):
+```
+To assess the accuracy of WSCLEAN and CASA’s clean task, we
+simulate a MWA observation with 100 sources of 1 Jy in a 20◦
+diameter area, without adding system noise. A unitary primary beam
+is assumed. We image the simulated set with WSCLEAN and CASA
+using Cotton-Schwab cleaning to a threshold of 10 mJy. The two
+imagers calculate slightly different restoring (synthesised) beams,
+hence to avoid bias the restoring beams are fixed. Other imaging
+parameters are given in Table 2. The AEGEAN program (Hancock
+et al. 2012) is used to perform source detection on the produced
+images. Sidelobe noise of the residual 10 mJy source structures
+triggers a few false detections. These are ignored."
+```
+
 Table 3, page 9:
 |                                            | WSCLEAN            | WSCLEAN + recentre | CASA              |
 |--------------------------------------------|--------------------|--------------------|-------------------|
@@ -47,7 +62,15 @@ Table 3, page 9:
 
 ## Performance
 
-
+Based on real MWA observations:
+```
+We measure the performance of the imagers using several MWA
+data sets. Each specific configuration is run five times and standard deviations are calculated. The variation in duration between
+runs is typically a few seconds. In each benchmark, the wall-clock
+time is measured that is required to produce the synthesised pointspread function and the image itself. No cleaning or prediction is
+performed, and the optimisation of §3.5 is not used. The results are
+given in Fig. 7.
+```
 
 ## Verbal claims
 
