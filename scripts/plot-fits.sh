@@ -63,7 +63,16 @@ for rel in sys.argv[1:]:
     if data.ndim != 2:
         raise SystemExit(f'FATAL: {src!r} is not a 2-D image after squeezing (shape {data.shape})')
 
-    norm = ImageNormalize(data, interval=ZScaleInterval(), stretch=AsinhStretch())
+    vmin, vmax = ZScaleInterval().get_limits(data)
+    if vmin == vmax:
+        # ZScaleInterval degenerates to (0, 0) on sparse images (e.g. a
+        # CLEAN component model that's mostly zeros) - fall back to the
+        # actual data range rather than feeding AsinhStretch a zero-width
+        # interval (which divides by zero and renders every pixel NaN).
+        vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
+        if vmin == vmax:
+            vmin, vmax = vmin - 1, vmax + 1
+    norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
     fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
     im = ax.imshow(data, origin='lower', cmap='inferno', norm=norm)
     ax.set_title(os.path.basename(src))

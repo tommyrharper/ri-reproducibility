@@ -141,8 +141,17 @@ and the Cygnus A application) that predate or are subsumed by [1].
   `-psf.fits` outputs without error - a runnability/baseline check, not
   a fidelity metric, since there is no published ground truth for this
   CI fixture.
-- **Current reproduction status**: pending first full build (see root
-  README "Verification and acceptance criteria" for the latest run).
+- **Current reproduction status**: **First baseline run complete**
+  (2026-08-03, JVLA-MultiBand-S1_C5-minimal.ms, 256x256, `-j 1`, Apple
+  M1 Max). Manifest: `benchmarks/manifests/wsclean-20260803T220305Z.json`;
+  full log and output FITS: `results/benchmark-wsclean-jvla-minimal/`.
+  3 major CLEAN cycles, 320 total minor iterations, all 5 expected
+  output files produced, 2.08s wall-clock (Docker Desktop on macOS -
+  not representative of native Linux timing, see section 16). As noted
+  above, this fixture has no published ground truth, so there is no
+  fidelity (SNR-style) metric to report - this is a runnability/timing
+  baseline only, one rung below a "reproduction" per
+  `benchmarks/README.md`'s activity ladder.
 - **Next concrete step toward the first real WSClean benchmark**: pick
   one MWA or LOFAR public archive dataset small enough to bind-mount
   (order 100 MB-1 GB), and use it to attempt a modest reproduction of
