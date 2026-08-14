@@ -13,6 +13,7 @@
 | `arXiv-2403.05452v3.tar.gz` | Original arXiv source tarball |
 | `latex/` | Extracted LaTeX source (authoritative) |
 | `R2D2_paper.md` | Agent-friendly markdown view of the paper body |
+| `tables/` | Extracted numerical tables (markdown) |
 
 ## Main LaTeX entrypoint
 
@@ -20,6 +21,18 @@
 - **`latex/R2D2.bib`** / **`latex/R2D2.bbl`** — bibliography
 - **`latex/aastex631.cls`**, **`latex/aasjournal.bst`** — AASTeX class + BibTeX style
 - **`latex/fig/`** — figures (~96 files; leave as-is)
+
+## Tables (quantitative claims)
+
+All numerical tables from the paper are extracted under **`tables/`** (see [`tables/README.md`](tables/README.md)):
+
+| Label | File |
+|-------|------|
+| `table:training_cost` | [`tables/table_training_cost.md`](tables/table_training_cost.md) |
+| `table:results` | [`tables/table_results.md`](tables/table_results.md) |
+| `table:testset_config` | [`tables/table_testset_config.md`](tables/table_testset_config.md) |
+
+**Agents should read these markdown files for quantitative claims** (SNR/logSNR, timings, training cost, experiment configs). Source of truth remains `latex/R2D2.tex`.
 
 ## Build (optional)
 
@@ -37,10 +50,11 @@ A prebuilt PDF is already at `r2d2.pdf`; rebuilding is usually unnecessary for r
 
 ## What agents should read
 
-1. **`R2D2_paper.md`** — fastest greppable overview (sections, abstract, body text; math/citations simplified; figure/table bodies replaced by captions).
-2. **`latex/R2D2.tex`** — authoritative equations, macros, and exact wording.
-3. **`latex/R2D2.bib`** — reference keys/details.
-4. **`r2d2.pdf`** — only when figures/layout matter.
+1. **`R2D2_paper.md`** — fastest greppable overview (sections, abstract, body text; math/citations simplified; figures replaced by captions; tables linked into `tables/`).
+2. **`tables/*.md`** — full numerical table extracts for quantitative claims.
+3. **`latex/R2D2.tex`** — authoritative equations, macros, and exact wording.
+4. **`latex/R2D2.bib`** — reference keys/details.
+5. **`r2d2.pdf`** — only when figures/layout matter.
 
 ## Paper structure (sections)
 

@@ -1,8 +1,8 @@
 # The R2D2 deep neural network series paradigm for fast precision imaging in radio astronomy
 
 > Agent-friendly plain-text view derived from `latex/R2D2.tex` (arXiv:2403.05452v3).
-> Section structure preserved; citations simplified to `[key]`; figures/tables replaced by captions where available.
-> Prefer `latex/R2D2.tex` for authoritative wording and equations.
+> Section structure preserved; citations simplified to `[key]`; figures replaced by captions where available.
+> **Tables:** full numerical extracts live under [`tables/`](tables/README.md) (linked at each table placeholder below). Prefer those files for quantitative claims; prefer `latex/R2D2.tex` for authoritative wording and equations.
 
 **arXiv:** [2403.05452](https://arxiv.org/abs/2403.05452) (v3)
 **Authors:** Amir Aghabiglou, Chung San Chu, Arwa Dabbech, Yves Wiaux
@@ -199,7 +199,7 @@ R2D2 training concluded at iteration $I=15$. For R3D3 realizations, training of 
 
 The computational cost of building the different DNN series in terms of CPU core time (CPU hr) incurred for the computation of the residual dirty images, and GPU time (GPU hr) incurred for the training of the DNNs, is provided in Table [table:training_cost]. The computational cost of the first network component of their series is also provided. On the one hand, R2D2 required approximately 80% less GPU hr than both realizations of R3D3, owing to the simpler architecture of its network components. On the other hand, it demanded about twice as many CPU hr for updating the residual dirty images, since it is trained with almost twice as many network components in its series. Interestingly, for all DNN series, 30 to 60% of the GPU hr cost was incurred in the training of their first network component. Their subsequent network components benefited from efficient initialization of their learnable parameters using their preceding trained component, and a reduced training dataset thanks to the data fidelity-driven pruning procedure. Both realizations of R3D3 required similar resources in both GPU hr and CPU hr, suggesting a balance between the depth of their network components and the required number of iterations in their series. 
 
-*[Figure/Table omitted]*
+**Table [table:training_cost]** — Training computational details (iterations, parameters, epochs, GPU/CPU hr) for U-Net, R2D2-Net, R2D2, and R3D3. Full data: [`tables/table_training_cost.md`](tables/table_training_cost.md).
 
 ## Simulations and results
   
@@ -262,7 +262,7 @@ Numerical analysis of the image-domain data fidelity obtained by the imaging alg
 
 The Python and MATLAB implementations of R2D2 and R3D3 yield consistent results, with marginal difference in logSNR values induced by their different NUFFT implementations. We note that sparse matrix interpolation NUFFT implementation is also available in Python. 
 
-*[Figure/Table omitted]*
+**Table [table:results]** — Generic experiment results (SNR, logSNR, residual fidelity, iterations, timings, resources) averaged over 200 inverse problems; MATLAB vs Python rows included. Full data: [`tables/table_results.md`](tables/table_results.md).
 
 We note that sparse matrix interpolation NUFFT implementation is also available in Python. This was validated on the same experiments and confirmed to provide identical results to the MATLAB version. It is however slower than its table-based interpolation counterpart.
 
@@ -272,7 +272,7 @@ Considering the four radio images used in the previous experiment, we designed f
 
 Numerical results of Experiments I--IV are provided in Figure [fig:metrics_plots], comprising graphs of the evolution of the SNR, logSNR, and $\overline{\sigma}_{res.}$ metrics across the iterations of R2D2 and R3D3. In these graphs, the numerical values at the first iteration of R2D2, $R3D3^{3L}$, and $R3D3^{6L}$ correspond to the results of the end-to-end DNNs, U-Net, $R2D2-Net^{3L}$, and $R2D2-Net^{6L}$, respectively. Final results of CLEAN, AIRI, and uSARA are indicated with horizontal lines.
 
-*[Figure/Table omitted]*
+**Table [table:testset_config]** — Experiments I–IV settings (*ρ*<sub>DR</sub>, observation durations, frequency channels). Full data: [`tables/table_testset_config.md`](tables/table_testset_config.md).
 
 In Experiment I, we consider a single frequency-channel observation, a relatively short observation time totaling 6.6 hr with both VLA configurations, and an extremely high-dynamic range regime with $\rho_{DR}=10^5$. This scenario will serve as a reference in our analysis. We first study the performance of R2D2 and R3D3 under different regimes of the dynamic range of the ground-truth images. To this aim, we consider Experiment II, characterized by a relatively low-dynamic range regime with $\rho_{DR}=5\times 10^3$. In terms of SNR and logSNR, both $R3D3^{3L}$ and $R3D3^{6L}$ consistently outperform all imaging algorithms, showing a wider gap in both SNR and logSNR in the high-dynamic range regime. Although trailing behind AIRI in the low-dynamic range regime, R2D2 outperforms the benchmark algorithms in the high-dynamic range regime. Generally, both realizations of R3D3 converge faster than R2D2, with the SNR and logSNR metrics saturating more promptly in the low-dynamic range regime compared to the high-dynamic range regime.
 
