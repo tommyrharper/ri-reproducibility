@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Create a VLA Measurement Set for a noisy single point source.
 
-The MS skeleton and VLA.A antenna table come from MeqTrees/Cattery's bundled
-makems examples. The visibility fill is the closed-form point-source equation,
-which is the smallest deterministic ceiling for this one-source PoC.
+The MS skeleton and VLA.A antenna table come from makems' bundled VLA-A
+example (shipped by the `makems` KERN package). Visibilities are predicted by
+an actual MeqTrees/Meow point-source RIME run (see point_source_forest.py),
+driven non-interactively through meqtree-pipeliner.py; thermal noise is then
+added on top of that clean MeqTrees prediction.
 """
 
 from __future__ import annotations
@@ -19,8 +21,9 @@ import numpy as np
 from casacore.tables import table
 
 
-C_M_PER_S = 299_792_458.0
-Cattery_VLA_A = Path("/usr/Cattery/Siamese/MS/VLAAA_ANTENNA")
+Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
+ANTENNA_TABLE_NAME = "VLAA_ANT"
+TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,9 +55,9 @@ def require_clean_output(output_ms: Path) -> None:
 
 def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
     output_ms.parent.mkdir(parents=True, exist_ok=True)
-    antenna_dst = output_ms.parent / "VLAAA_ANTENNA"
+    antenna_dst = output_ms.parent / ANTENNA_TABLE_NAME
     if not antenna_dst.exists():
-        shutil.copytree(Cattery_VLA_A, antenna_dst)
+        shutil.unpack_archive(Cattery_VLA_A, output_ms.parent)
 
     n_times = max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds)))
     cfg = output_ms.parent / "makems.cfg"
@@ -72,7 +75,7 @@ def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
                 f"NTimes={n_times}",
                 "NParts=1",
                 "WriteAutoCorr=F",
-                "AntennaTableName=VLAAA_ANTENNA",
+                f"AntennaTableName={ANTENNA_TABLE_NAME}",
                 f"MSName={output_ms.name}",
                 "WriteImagerColumns=F",
                 "MSDesPath=.",
@@ -104,6 +107,41 @@ def run_makems(output_ms: Path) -> None:
     raise SystemExit(f"FATAL: makems did not create {output_ms.name}_p0, {output_ms.name}_p1, or {output_ms}")
 
 
+def determine_corr_selection(output_ms: Path) -> tuple[str, int]:
+    corr_sel_by_count = {1: "1", 2: "2", 4: "2x2"}
+    with table(str(output_ms), readonly=True, ack=False) as ms:
+        n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape[-1]
+    corr_sel = corr_sel_by_count.get(n_corr)
+    if corr_sel is None:
+        raise SystemExit(f"FATAL: unsupported correlation count in {output_ms}: {n_corr}")
+    return corr_sel, n_corr
+
+
+def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, l_rad: float, m_rad: float) -> None:
+    tdlconf = output_ms.parent / "point_source_forest.tdlconf"
+    tdlconf.write_text(
+        "\n".join(
+            [
+                "[predict]",
+                f"ms_sel.msname = {output_ms}",
+                f"ms_sel.ms_corr_sel = {corr_sel}",
+                f"source_flux_jy = {source_flux_jy!r}",
+                f"source_l_rad = {l_rad!r}",
+                f"source_m_rad = {m_rad!r}",
+                "",
+            ]
+        )
+    )
+    log_path = output_ms.parent / "meqtree-pipeliner.log"
+    with log_path.open("w") as log:
+        subprocess.run(
+            ["meqtree-pipeliner.py", "-c", str(tdlconf), f"{TDL_SCRIPT}[predict]", "=predict"],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+
+
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
@@ -113,39 +151,28 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     noise_sigma_jy = args.source_flux_jy / args.dynamic_range
     l_rad = math.radians(args.source_l_arcsec / 3600.0)
     m_rad = math.radians(args.source_m_arcsec / 3600.0)
-    n_term = math.sqrt(max(0.0, 1.0 - l_rad * l_rad - m_rad * m_rad))
 
     with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
         freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
 
+    # ponytail: this PoC supports one unpolarized point source; full Stokes
+    # models and multi-source dynamic-range stress cases are a follow-up ceiling.
+    corr_sel, n_corr = determine_corr_selection(output_ms)
+    run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
+
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
-        data_shape = ms.getcol("DATA").shape
-        if len(data_shape) != 3:
-            raise SystemExit(f"FATAL: unexpected DATA shape in {output_ms}: {data_shape}")
-        n_rows, n_chan, n_corr = data_shape
+        data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
+        n_rows, n_chan, data_n_corr = data.shape
         if n_chan != len(freqs_hz):
             raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
-
-        uvw_m = np.asarray(ms.getcol("UVW"), dtype=np.float64)
-        uvw_lambda = uvw_m[:, None, :] * freqs_hz[None, :, None] / C_M_PER_S
-        phase_arg = uvw_lambda[:, :, 0] * l_rad + uvw_lambda[:, :, 1] * m_rad + uvw_lambda[:, :, 2] * (n_term - 1.0)
-        point_model = args.source_flux_jy * np.exp(-2j * np.pi * phase_arg)
-
-        data = np.zeros((n_rows, n_chan, n_corr), dtype=np.complex64)
-        # ponytail: this PoC supports one unpolarized point source; full Stokes
-        # models and multi-source dynamic-range stress cases are a follow-up ceiling.
-        if n_corr >= 1:
-            data[:, :, 0] = point_model
-        if n_corr >= 4:
-            data[:, :, 3] = point_model
-        elif n_corr >= 2:
-            data[:, :, 1] = point_model
+        if data_n_corr != n_corr:
+            raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
 
         if noise_sigma_jy:
             per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
             noise = rng.normal(0.0, per_component_sigma, data.shape) + 1j * rng.normal(0.0, per_component_sigma, data.shape)
-            data += noise.astype(np.complex64)
+            data = data + noise.astype(np.complex64)
 
         ms.putcol("DATA", data)
         for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -164,7 +191,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
         "measurement_set": str(output_ms),
         "vla_config": args.vla_config,
         "antenna_table_source": str(Cattery_VLA_A),
-        "visibility_engine": "MeqTrees/Cattery makems uvw skeleton plus analytic single-point-source fill",
+        "visibility_engine": "MeqTrees Meow point-source RIME predict (meqtree-pipeliner.py) plus seeded thermal-noise fill",
         "source": {
             "flux_jy": args.source_flux_jy,
             "l_arcsec": args.source_l_arcsec,

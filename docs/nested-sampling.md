@@ -19,8 +19,12 @@ make build-polychord
 `make build` also builds the MeqTrees and PolyChord images.
 
 The MeqTrees image uses KERN 10 packages on Ubuntu 24.04. The VLA.A antenna
-table is copied from Cattery's bundled `VLAAA_ANTENNA` makems example inside
-the image, so antenna positions are not hand-rolled in this repo.
+table is unpacked from makems' bundled `VLAA_ANT` example inside the image,
+so antenna positions are not hand-rolled in this repo. Visibilities for that
+skeleton are predicted by an actual MeqTrees/Meow point-source RIME run
+(`scripts/lib/nested_sampling/point_source_forest.py`, driven through
+`meqtree-pipeliner.py`), not a hand-rolled formula; thermal noise is added on
+top of that clean MeqTrees prediction.
 
 ## Run The PoC
 

@@ -29,11 +29,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         makems=1.5.6-1kern1 \
         meqtrees=1.8.0-1kern1 \
         meqtrees-timba=1.11-1kern1 \
+        python3-meqtrees-cattery=1.8.0-1kern1 \
         python3-casacore=3.7.1-1kern2 \
         python3-numpy \
     && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/lib/nested_sampling/simulate_point_source_ms.py /opt/ri-nested-sampling/simulate_point_source_ms.py
+COPY scripts/lib/nested_sampling/point_source_forest.py /opt/ri-nested-sampling/point_source_forest.py
 
 WORKDIR /workspace
 VOLUME ["/data", "/results"]
