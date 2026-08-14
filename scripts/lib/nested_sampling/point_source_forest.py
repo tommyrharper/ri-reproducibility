@@ -32,8 +32,21 @@ def _define_forest(ns, **kw):
     # imaging columns (makems writes only the base columns).
     mssel.output_column = "DATA"
 
-    direction = Meow.LMDirection(ns, "psrc", source_l_rad, source_m_rad)
-    source = Meow.PointSource(ns, "psrc", direction, I=source_flux_jy)
+    # At zero offset, reuse the phase-centre Direction object itself (identity
+    # check in SkyComponent.visibilities()) rather than building a new
+    # LMDirection(0, 0): Meow's K-Jones phase-shift path degenerates at exact
+    # l=m=0 and writes a wrongly-shaped result ("shape of child result does
+    # not match output column"); the identity-direction path skips K-Jones
+    # entirely and is exact for a source at phase centre anyway.
+    if source_l_rad == 0.0 and source_m_rad == 0.0:
+        direction = observation.phase_centre
+    else:
+        direction = Meow.LMDirection(ns, "psrc", source_l_rad, source_m_rad)
+    # Q/U/V=0.0 (not None) forces Meow to build the full 2x2 brightness matrix.
+    # Leaving them None marks the source "unpolarized" and PointSource.brightness()
+    # then returns a bare scalar, which Sink can't write into a 2x2 correlation
+    # column ("shape of child result does not match output column").
+    source = Meow.PointSource(ns, "psrc", direction, I=source_flux_jy, Q=0.0, U=0.0, V=0.0)
     predict = source.visibilities(array, observation)
 
     Meow.StdTrees.make_sinks(

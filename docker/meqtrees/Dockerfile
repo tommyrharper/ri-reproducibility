@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         'deb [signed-by=/etc/apt/keyrings/kernsuite.gpg] https://ppa.launchpadcontent.net/kernsuite/kern-10/ubuntu noble main' \
         > /etc/apt/sources.list.d/kernsuite.list \
     && apt-get update \
+    && printf 'path-include=/usr/share/doc/makems/*\n' > /etc/dpkg/dpkg.cfg.d/zzz-include-makems-doc \
     && apt-get install -y --no-install-recommends \
         casacore-data=20250826-160001-5 \
         makems=1.5.6-1kern1 \
