@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "${TOOL}" ] || [ -z "${IMAGE}" ]; then
-  echo "usage: $0 --tool <wsclean|r2d2> --image <image[:tag]> [--config <path>] [-- <command...>]" >&2
+  echo "usage: $0 --tool <wsclean|r2d2|meqtrees|polychord> --image <image[:tag]> [--config <path>] [-- <command...>]" >&2
   exit 1
 fi
 

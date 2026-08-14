@@ -78,9 +78,11 @@ cp .env.example .env   # adjust HOST_UID/HOST_GID/paths if needed
 make build              # both images
 make build-wsclean      # WSClean only
 make build-r2d2         # R2D2-RI only
+make build-meqtrees     # MeqTrees/Cattery MS simulator only
+make build-polychord    # PolyChord nested-sampling driver only
 ```
 
-Equivalent to `scripts/build.sh [all|wsclean|r2d2]`, which wraps `docker
+Equivalent to `scripts/build.sh [all|wsclean|r2d2|meqtrees|polychord]`, which wraps `docker
 build` directly (not `docker compose build`) so build args stay
 explicit. `docker compose config` (`make config`) is provided for
 validation and for `make shell-*`, not as the primary build path.
@@ -161,6 +163,11 @@ existing `benchmarks/manifests/r2d2-*.json` for a worked example.
 table, expected numbers) this environment currently targets, and its
 "Current reproduction status" section should be updated by hand after a
 run that moves that target forward.
+
+For the WSClean x VLA.A nested-sampling infrastructure PoC, see
+`docs/nested-sampling.md` and run `make nested-sampling-poc`. That run
+uses MeqTrees/Cattery's VLA.A makems data to create noisy single-point-source
+Measurement Sets and PolyChord to search for high-badness WSClean settings.
 
 `make benchmark-report` (`scripts/generate-benchmark-report.sh` +
 `scripts/lib/generate_benchmark_report.py`) builds
