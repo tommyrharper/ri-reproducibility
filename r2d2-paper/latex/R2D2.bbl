@@ -1,0 +1,219 @@
+\begin{thebibliography}{}
+\expandafter\ifx\csname natexlab\endcsname\relax\def\natexlab#1{#1}\fi
+\providecommand{\url}[1]{\href{#1}{#1}}
+\providecommand{\dodoi}[1]{doi:~\href{http://doi.org/#1}{\nolinkurl{#1}}}
+\providecommand{\doeprint}[1]{\href{http://ascl.net/#1}{\nolinkurl{http://ascl.net/#1}}}
+\providecommand{\doarXiv}[1]{\href{https://arxiv.org/abs/#1}{\nolinkurl{https://arxiv.org/abs/#1}}}
+
+\bibitem[{Aghabiglou {et~al.}(2024)Aghabiglou, Chu, Dabbech, \&
+  Wiaux}]{r2d2dnns}
+Aghabiglou, A., Chu, C.~S., A., Dabbech, A., \& Wiaux, Y. 2024, R2D2 deep
+  neural network series for radio-interferometric imaging [Data~set],
+  \dodoi{10.17861/99cbe654-5071-4625-b59d-a26c790cbeb4}
+
+\bibitem[{Aghabiglou {et~al.}(2023)Aghabiglou, Terris, Jackson, \&
+  Wiaux}]{aghabiglou2023a}
+Aghabiglou, A., Terris, M., Jackson, A., \& Wiaux, Y. 2023, in Proc. IEEE
+  ICASSP 2023, 1--5
+
+\bibitem[{Arras {et~al.}(2019)Arras, Frank, Leike, Westermann, \&
+  En{\ss}lin}]{arras2019unified}
+Arras, P., Frank, P., Leike, R., Westermann, R., \& En{\ss}lin, T.~A. 2019,
+  \aap, 627, A134
+
+\bibitem[{Bhatnagar \& Cornwell(2004)}]{bhatnagar2004scale}
+Bhatnagar, S., \& Cornwell, T. 2004, \aap, 426, 747
+
+\bibitem[{Botteon {et~al.}(2022)Botteon, Shimwell, Cassano, Cuciti, Zhang,
+  Bruno, Camillini, Natale, Jones, Gastaldello, {et~al.}}]{botteon2022}
+Botteon, A., Shimwell, T., Cassano, R., {et~al.} 2022, \aap, 660, A78
+
+\bibitem[{Briggs(1995)}]{briggs1995}
+Briggs, D. 1995, in \aas, Vol. 187, 112--02
+
+\bibitem[{Cai {et~al.}(2018)Cai, Pereyra, \& McEwen}]{cai2018uncertainty}
+Cai, X., Pereyra, M., \& McEwen, J.~D. 2018, \mnras, 480, 4154
+
+\bibitem[{Carrillo {et~al.}(2012)Carrillo, McEwen, \&
+  Wiaux}]{carrillo2012sparsity}
+Carrillo, R.~E., McEwen, J.~D., \& Wiaux, Y. 2012, \mnras, 426, 1223
+
+\bibitem[{Chan {et~al.}(2017)Chan, Wang, \& Elgendy}]{Chan2017}
+Chan, S.~H., Wang, X., \& Elgendy, O.~A. 2017, IEEE Trans. Comput. Imaging, 3,
+  84
+
+\bibitem[{Connor {et~al.}(2022)Connor, Bouman, Ravi, \&
+  Hallinan}]{connor2022deep}
+Connor, L., Bouman, K.~L., Ravi, V., \& Hallinan, G. 2022, \mnras, 514, 2614
+
+\bibitem[{Cornwell(2008)}]{cornwell2008multiscale}
+Cornwell, T.~J. 2008, IEEE J. Sel. Top. Signal Process., 2, 793
+
+\bibitem[{Dabbech {et~al.}(2024)Dabbech, Aghabiglou, Chu, \&
+  Wiaux}]{dabbech2024}
+Dabbech, A., Aghabiglou, A., Chu, C.~S., \& Wiaux, Y. 2024, preprint
+  arXiv:2309.03291
+
+\bibitem[{Dabbech {et~al.}(2015)Dabbech, Ferrari, Mary, Slezak, Smirnov, \&
+  Kenyon}]{dabbech2015moresane}
+Dabbech, A., Ferrari, C., Mary, D., {et~al.} 2015, \aap, 576, A7
+
+\bibitem[{Dabbech {et~al.}(2018)Dabbech, Onose, Abdulaziz, Perley, Smirnov, \&
+  Wiaux}]{dabbech2018}
+Dabbech, A., Onose, A., Abdulaziz, A., {et~al.} 2018, \mnras, 476, 2853
+
+\bibitem[{Dabbech {et~al.}(2022)Dabbech, Terris, Jackson, Ramatsoku, Smirnov,
+  \& Wiaux}]{dabbech2022}
+Dabbech, A., Terris, M., Jackson, A., {et~al.} 2022, ApJL, 939
+
+\bibitem[{Edler {et~al.}(2023)Edler, de~Gasperin, Shimwell, Hardcastle,
+  Boselli, Heesen, McCall, Bomans, Br{\"u}ggen, Bulbul, {et~al.}}]{edler2023}
+Edler, H., de~Gasperin, F., Shimwell, T., {et~al.} 2023, \aap, 676, A24
+
+\bibitem[{Fessler \& Sutton(2003)}]{Fessler2003}
+Fessler, J., \& Sutton, B. 2003, IEEE Trans. Signal Process., 51, 560
+
+\bibitem[{Garsden {et~al.}(2015)Garsden, Girard, Starck, Corbel, Tasse,
+  Woiselle, McKean, Van~Amesfoort, Anderson, Avruch, {et~al.}}]{garsden2015}
+Garsden, H., Girard, J., Starck, J.-L., {et~al.} 2015, MNRAS Letters, 575, A90
+
+\bibitem[{Hauptmann {et~al.}(2018)Hauptmann, Lucka, Betcke, Huynh, Adler, Cox,
+  Beard, Ourselin, \& Arridge}]{Hauptmann2018}
+Hauptmann, A., Lucka, F., Betcke, M., {et~al.} 2018, IEEE Trans. Med. Imaging,
+  37, 1382
+
+\bibitem[{H{\"o}gbom(1974)}]{hogbom1974aperture}
+H{\"o}gbom, J. 1974, \aaps, 15, 417
+
+\bibitem[{Hotan {et~al.}(2021)Hotan, Bunton, Chippendale, Whiting, Tuthill,
+  Moss, McConnell, Amy, Huynh, Allison, {et~al.}}]{hotan2021}
+Hotan, A., Bunton, J., Chippendale, A., {et~al.} 2021, \pasa, 38, e009
+
+\bibitem[{Jonas(2016)}]{jonas2016proc}
+Jonas, J. 2016, Proc. Sci., MeerKAT Science: On the Pathway to the SKA,  Sissa
+  Trieste
+
+\bibitem[{Junklewitz {et~al.}(2016)Junklewitz, Bell, Selig, \&
+  En{\ss}lin}]{junklewitz2016resolve}
+Junklewitz, H., Bell, M., Selig, M., \& En{\ss}lin, T. 2016, \aap, 586, A76
+
+\bibitem[{Kamilov {et~al.}(2023)Kamilov, Bouman, Buzzard, \&
+  Wohlberg}]{Kamilov23}
+Kamilov, U.~S., Bouman, C.~A., Buzzard, G.~T., \& Wohlberg, B. 2023, IEEE
+  Signal Process. Mag., 40, 85
+
+\bibitem[{Knoll {et~al.}(2020)Knoll, Zbontar, Sriram, Muckley, Bruno, Defazio,
+  Parente, Geras, Katsnelson, Chandarana, {et~al.}}]{knoll2020fastmri}
+Knoll, F., Zbontar, J., Sriram, A., {et~al.} 2020, Radiol. Artif. Intell., 2,
+  e190007
+
+\bibitem[{Labate {et~al.}(2022)Labate, Waterson, Alachkar, Hendre, Lewis,
+  Bartolini, \& Dewdney}]{Labate2022}
+Labate, M.~G., Waterson, M., Alachkar, B., {et~al.} 2022, JATIS, 8, 011024
+
+\bibitem[{LeCun {et~al.}(2015)LeCun, Bengio, \& Hinton}]{lecun2015deep}
+LeCun, Y., Bengio, Y., \& Hinton, G. 2015, Nature, 521, 436
+
+\bibitem[{Monga {et~al.}(2021)Monga, Li, \& Eldar}]{Monga21}
+Monga, V., Li, Y., \& Eldar, Y.~C. 2021, IEEE Signal Process. Mag., 38, 18
+
+\bibitem[{Muckley {et~al.}(2020)Muckley, Stern, Murrell, \& Knoll}]{muckley20}
+Muckley, M.~J., Stern, R., Murrell, T., \& Knoll, F. 2020, in ISMRM Workshop on
+  Data Sampling \& Image Reconstruction
+
+\bibitem[{{Noordam} \& {Smirnov}(2010)}]{Noordam2010}
+{Noordam}, J.~E., \& {Smirnov}, O.~M. 2010, \aap, 524, A61
+
+\bibitem[{Offringa {et~al.}(2014)Offringa, McKinley, Hurley-Walker, Briggs,
+  Wayth, Kaplan, Bell, Feng, Neben, Hughes, {et~al.}}]{offringa2014}
+Offringa, A., McKinley, B., Hurley-Walker, N., {et~al.} 2014, \mnras, 444, 606
+
+\bibitem[{Offringa \& Smirnov(2017)}]{offringa2017}
+Offringa, A.~R., \& Smirnov, O. 2017, \mnras, 471, 301
+
+\bibitem[{Onose {et~al.}(2016)Onose, Carrillo, Repetti, McEwen, Thiran,
+  Pesquet, \& Wiaux}]{onose2016scalable}
+Onose, A., Carrillo, R.~E., Repetti, A., {et~al.} 2016, \mnras, 462, 4314
+
+\bibitem[{Onose {et~al.}(2017)Onose, Dabbech, \& Wiaux}]{onose2017accelerated}
+Onose, A., Dabbech, A., \& Wiaux, Y. 2017, \mnras, 469, 938
+
+\bibitem[{{Paszke} {et~al.}(2019){Paszke}, {Gross}, {Massa}, {Lerer},
+  {Bradbury}, {Chanan}, {Killeen}, {Lin}, {Gimelshein}, {Antiga}, {Desmaison},
+  {K{\"o}pf}, {Yang}, {DeVito}, {Raison}, {Tejani}, {Chilamkurthy}, {Steiner},
+  {Fang}, {Bai}, \& {Chintala}}]{paszke2019pytorch}
+{Paszke}, A., {Gross}, S., {Massa}, F., {et~al.} 2019, preprint
+  arXiv:1912.01703
+
+\bibitem[{Repetti \& Wiaux(2020)}]{repetti2020forward}
+Repetti, A., \& Wiaux, Y. 2020, in Proc. IEEE ICASSP 2020, 1434--1438
+
+\bibitem[{Ronneberger {et~al.}(2015)Ronneberger, Fischer, \&
+  Brox}]{Ronneberger15}
+Ronneberger, O., Fischer, P., \& Brox, T. 2015, in MICCAI 2015, 234--241
+
+\bibitem[{{Schwab}(1984)}]{schwab1984}
+{Schwab}, F.~R. 1984, \aj, 89, 1076
+
+\bibitem[{Shimwell {et~al.}(2022)Shimwell, Hardcastle, Tasse, Best,
+  R{\"o}ttgering, Williams, Botteon, Drabent, Mechev, Shulevski,
+  {et~al.}}]{shimwell2022}
+Shimwell, T., Hardcastle, M., Tasse, C., {et~al.} 2022, \aap, 659, A1
+
+\bibitem[{Swart {et~al.}(2022)Swart, Dewdney, \& Cremonini}]{Swart22}
+Swart, G.~P., Dewdney, P.~E., \& Cremonini, A. 2022, JATIS, 8, 011021
+
+\bibitem[{Terris {et~al.}(2022)Terris, Dabbech, Tang, \& Wiaux}]{terris2022}
+Terris, M., Dabbech, A., Tang, C., \& Wiaux, Y. 2022, \mnras, 518, 604
+
+\bibitem[{Terris {et~al.}(2023)Terris, Tang, Jackson, \&
+  Wiaux}]{terris2023plug}
+Terris, M., Tang, C., Jackson, A., \& Wiaux, Y. 2023, preprint arXiv:2312.07137
+
+\bibitem[{Thompson {et~al.}(2017)Thompson, Moran, \&
+  Swenson}]{thompson2017interferometry}
+Thompson, A.~R., Moran, J.~M., \& Swenson, G.~W. 2017, Interferometry and
+  synthesis in radio astronomy (Springer Nature)
+
+\bibitem[{Thouvenin {et~al.}(2023)Thouvenin, Abdulaziz, Dabbech, Repetti, \&
+  Wiaux}]{thouvenin2023a}
+Thouvenin, P.-A., Abdulaziz, A., Dabbech, A., Repetti, A., \& Wiaux, Y. 2023,
+  \mnras, 521, 1
+
+\bibitem[{van Haarlem {et~al.}(2013)van Haarlem, Wise, Gunst, Heald, McKean,
+  Hessels, de~Bruyn, Nijboer, Swinbank, Fallows, {et~al.}}]{van2013lofar}
+van Haarlem, M.~P., Wise, M.~W., Gunst, A., {et~al.} 2013, \aap, 556, A2
+
+\bibitem[{Venkatakrishnan {et~al.}(2013)Venkatakrishnan, Bouman, \&
+  Wohlberg}]{venkatakrishnan2013}
+Venkatakrishnan, S.~V., Bouman, C.~A., \& Wohlberg, B. 2013, in Proc. IEEE
+  GlobalSIP 2013, 945--948
+
+\bibitem[{Wiaux {et~al.}(2009)Wiaux, Jacques, Puy, Scaife, \&
+  Vandergheynst}]{wiaux2009compressed}
+Wiaux, Y., Jacques, L., Puy, G., Scaife, A.~M., \& Vandergheynst, P. 2009,
+  \mnras, 395, 1733
+
+\bibitem[{Wilber {et~al.}(2023{\natexlab{a}})Wilber, Dabbech, Jackson, \&
+  Wiaux}]{wilber23a}
+Wilber, A.~G., Dabbech, A., Jackson, A., \& Wiaux, Y. 2023{\natexlab{a}},
+  \mnras, 522, 5558
+
+\bibitem[{Wilber {et~al.}(2023{\natexlab{b}})Wilber, Dabbech, Terris, Jackson,
+  \& Wiaux}]{wilber23b}
+Wilber, A.~G., Dabbech, A., Terris, M., Jackson, A., \& Wiaux, Y.
+  2023{\natexlab{b}}, \mnras, 522, 5576
+
+\bibitem[{Zbontar {et~al.}(2018)Zbontar, Knoll, Sriram, Murrell, Huang,
+  Muckley, Defazio, Stern, Johnson, Bruno, {et~al.}}]{zbontar2018fastmri}
+Zbontar, J., Knoll, F., Sriram, A., {et~al.} 2018, preprint arXiv:1811.08839
+
+\bibitem[{Zhang {et~al.}(2017)Zhang, Zuo, Chen, Meng, \& Zhang}]{Zhang2017}
+Zhang, K., Zuo, W., Chen, Y., Meng, D., \& Zhang, L. 2017, IEEE Trans. Image
+  Process., 26, 3142
+
+\bibitem[{Zhang {et~al.}(2023)Zhang, Li, Liang, Cao, Zhang, Tang, Fan, Timofte,
+  \& Gool}]{zhang2023practical}
+Zhang, K., Li, Y., Liang, J., {et~al.} 2023, Mach. Intell. Res., 20, 822–836
+
+\end{thebibliography}
