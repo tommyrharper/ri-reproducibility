@@ -1,7 +1,0 @@
-# no-mistakes per-repo configuration
-# See https://github.com/tommyrharper/no-mistakes for the schema.
-
-# This repository has no GitHub Actions CI yet. Declare that intentionally so
-# the ci step treats zero registered checks as ready instead of waiting for
-# checks that will never appear. Real CI is tracked as a follow-up task.
-no_ci: true
