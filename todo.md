@@ -1,0 +1,2 @@
+- [ ] Add ci pipeline
+- [ ] Add commands so that agents can view basically a contents page for the paper, then select small sections of the paper to read, so they don't have to load the full document.md into context.
