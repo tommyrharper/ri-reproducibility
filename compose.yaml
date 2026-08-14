@@ -40,3 +40,31 @@ services:
       - ./config/r2d2:/workspace/config:ro
     environment:
       - OMP_NUM_THREADS
+
+  meqtrees:
+    build:
+      context: .
+      dockerfile: docker/meqtrees/Dockerfile
+      platforms:
+        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    image: ri-reproducibility/meqtrees:kern-10
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    command: ["--help"]
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${RESULTS_DIR:-./results}:/results
+
+  polychord:
+    build:
+      context: .
+      dockerfile: docker/polychord/Dockerfile
+      platforms:
+        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    image: ri-reproducibility/polychord:lite
+    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
+    command: ["--help"]
+    volumes:
+      - .:/workspace/repo
+      - ${DATA_DIR:-./data}:/data
+      - ${RESULTS_DIR:-./results}:/results
+      - /var/run/docker.sock:/var/run/docker.sock

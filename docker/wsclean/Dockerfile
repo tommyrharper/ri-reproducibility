@@ -152,13 +152,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpython3.11 \
     python3 \
     ca-certificates \
+    time \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/casacore /opt/casacore
 COPY --from=build /opt/casacore-data /opt/casacore-data
 COPY --from=build /opt/wsclean /opt/wsclean
 
-ENV LD_LIBRARY_PATH=/opt/casacore/lib:/opt/wsclean/lib:${LD_LIBRARY_PATH} \
+ENV LD_LIBRARY_PATH=/opt/casacore/lib:/opt/wsclean/lib \
     PATH=/opt/wsclean/bin:${PATH} \
     CASARCFILES=/opt/casacore-data/measures.d
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build one or both images. Wraps `docker build` directly rather than
+# Build one or more images. Wraps `docker build` directly rather than
 # `docker compose build` so build args (portability, platform) stay
 # explicit and idempotent - re-running just hits Docker's layer cache.
 set -euo pipefail
@@ -26,9 +26,25 @@ build_r2d2() {
     -t ri-reproducibility/r2d2:cpu .
 }
 
+build_meqtrees() {
+  echo "==> building ri-reproducibility/meqtrees:kern-10 (platform=${PLATFORM})"
+  docker build --platform "${PLATFORM}" \
+    -f docker/meqtrees/Dockerfile \
+    -t ri-reproducibility/meqtrees:kern-10 .
+}
+
+build_polychord() {
+  echo "==> building ri-reproducibility/polychord:lite (platform=${PLATFORM})"
+  docker build --platform "${PLATFORM}" \
+    -f docker/polychord/Dockerfile \
+    -t ri-reproducibility/polychord:lite .
+}
+
 case "${TARGET}" in
   wsclean) build_wsclean ;;
   r2d2) build_r2d2 ;;
-  all) build_wsclean && build_r2d2 ;;
-  *) echo "usage: $0 [all|wsclean|r2d2]" >&2; exit 1 ;;
+  meqtrees) build_meqtrees ;;
+  polychord) build_polychord ;;
+  all) build_wsclean && build_r2d2 && build_meqtrees && build_polychord ;;
+  *) echo "usage: $0 [all|wsclean|r2d2|meqtrees|polychord]" >&2; exit 1 ;;
 esac
