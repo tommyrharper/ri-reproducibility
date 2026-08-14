@@ -75,7 +75,7 @@ with "it reproduced the paper."
 
 ```bash
 cp .env.example .env   # adjust HOST_UID/HOST_GID/paths if needed
-make build              # both images
+make build              # all images
 make build-wsclean      # WSClean only
 make build-r2d2         # R2D2-RI only
 make build-meqtrees     # MeqTrees/Cattery MS simulator only
