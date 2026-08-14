@@ -335,7 +335,7 @@ def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, e
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluations_dir = output_dir / "evaluations"
     evaluations_dir.mkdir(exist_ok=True)
