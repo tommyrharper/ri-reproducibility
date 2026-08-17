@@ -140,9 +140,8 @@ def main() -> None:
             "anesthetic (and matplotlib) required on the host. Install with: uv add anesthetic"
         ) from exc
 
-    names = [str(spec["name"]) for spec in space]
-    labels = {name: PARAMETER_TEX_LABELS.get(name, name) for name in names}
-    samples = read_chains(str(chain_root), columns=names, labels=labels)
+    # Let anesthetic read <root>.paramnames so TeX labels get wrapped in $...$.
+    samples = read_chains(str(chain_root))
     samples.gui()
     plt.show()
 
