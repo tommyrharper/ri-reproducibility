@@ -16,6 +16,7 @@ new tools (wsclean) and fields get added without needing a fixed schema.
 """
 import base64
 import glob
+import hashlib
 import html
 import io
 import json
@@ -237,6 +238,36 @@ def objective_fill(objective, obj_min, obj_max):
     return 1.0
 
 
+def run_tab_id(run_name):
+    """Sanitize a run directory name into a valid unique HTML id fragment."""
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", run_name).strip("-") or "run"
+    digest = hashlib.sha1(run_name.encode()).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
+
+
+def render_images_posterior_collapsible(tab_id, eval_images_html, posterior_html):
+    """Collapsed-by-default Images / Posterior tabs for one nested-sampling run."""
+    if not eval_images_html and not posterior_html:
+        return ""
+    safe_id = html.escape(tab_id)
+    tabset = f"""
+    <div class="run-media-tabset">
+      <input type="radio" class="tab-images-radio" name="tabs-{safe_id}" id="tab-images-{safe_id}" checked>
+      <label for="tab-images-{safe_id}">Images</label>
+      <input type="radio" class="tab-posterior-radio" name="tabs-{safe_id}" id="tab-posterior-{safe_id}">
+      <label for="tab-posterior-{safe_id}">Posterior</label>
+      <div class="tab-panel tab-panel-images">{eval_images_html}</div>
+      <div class="tab-panel tab-panel-posterior">{posterior_html}</div>
+    </div>
+    """
+    return f"""
+    <details>
+      <summary>Run images and posterior</summary>
+      {tabset}
+    </details>
+    """
+
+
 def format_searched_params(params, parameter_space):
     parts = []
     for spec in parameter_space:
@@ -385,6 +416,7 @@ def render_eval_images(evaluations, metric, run_dir, parameter_space):
 def render_nested_sampling_run(poc_summary_path):
     run_dir = os.path.dirname(poc_summary_path)
     run_name = os.path.basename(run_dir)
+    tab_id = run_tab_id(run_name)
     with open(poc_summary_path) as f:
         summary = json.load(f)
 
@@ -516,18 +548,9 @@ def render_nested_sampling_run(poc_summary_path):
     if eval_rows:
         glance_summary_html = render_eval_glance_summary(evaluations, metric, len(failed))
         eval_images_html = render_eval_images(evaluations, metric, run_dir, parameter_space)
-        images_parts = []
-        if eval_images_html:
-            images_parts.append(eval_images_html)
-        images_parts.append(posterior_html)
-        images_collapsible = ""
-        if images_parts:
-            images_collapsible = f"""
-          <details>
-            <summary>Run images and posterior</summary>
-            {"".join(images_parts)}
-          </details>
-            """
+        images_collapsible = render_images_posterior_collapsible(
+            tab_id, eval_images_html, posterior_html
+        )
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
@@ -549,10 +572,7 @@ def render_nested_sampling_run(poc_summary_path):
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
-          <details>
-            <summary>Run images and posterior</summary>
-            {posterior_html}
-          </details>
+          {render_images_posterior_collapsible(tab_id, "", posterior_html)}
         </section>
         """
 
@@ -850,6 +870,34 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .eval-table .eval-recon { min-width: 120px; }
 .posterior-plot { margin: 0.5rem 0; }
 .posterior-plot img { max-width: 100%; height: auto; border-radius: 6px; }
+.run-media-tabset { margin-top: 0.5rem; }
+.run-media-tabset input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+.run-media-tabset label {
+  display: inline-block;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.35rem 0.75rem;
+  margin: 0 0.15rem 0 0;
+  border: 1px solid transparent;
+  border-radius: 6px 6px 0 0;
+  opacity: 0.65;
+}
+.run-media-tabset input.tab-images-radio:checked + label,
+.run-media-tabset input.tab-posterior-radio:checked + label {
+  opacity: 1;
+  background: color-mix(in srgb, CanvasText 6%, transparent);
+  border-color: color-mix(in srgb, CanvasText 15%, transparent);
+  border-bottom-color: Canvas;
+}
+.run-media-tabset .tab-panel { display: none; padding-top: 0.75rem; }
+.run-media-tabset input.tab-images-radio:checked ~ .tab-panel-images { display: block; }
+.run-media-tabset input.tab-posterior-radio:checked ~ .tab-panel-posterior { display: block; }
 .section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
 """
 

@@ -250,10 +250,11 @@ The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
 (no manifest join). It parses PolyChord `chains/*.stats` for log(Z) and shows
 each run's total wall-clock duration (from `total_wall_seconds`, when present)
 top-right in the card header. Per-run images - the shared synthesized
-ground-truth image, a per-evaluation card gallery (reconstruction, objective,
-and searched parameters), and the best-effort `anesthetic` posterior plot -
-sit in one collapsed-by-default details block, separate from the collapsed
-raw metrics table.
+ground-truth image and a per-evaluation card gallery (reconstruction,
+objective, and searched parameters) - sit in an Images tab, and the
+best-effort `anesthetic` posterior plot sits in a Posterior tab, both inside
+one collapsed-by-default details block, separate from the collapsed raw
+metrics table.
 
 ### Replay a run in anesthetic's GUI
 
