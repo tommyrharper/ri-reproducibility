@@ -252,9 +252,9 @@ def render_images_posterior_collapsible(tab_id, eval_images_html, posterior_html
     safe_id = html.escape(tab_id)
     tabset = f"""
     <div class="run-media-tabset">
-      <input type="radio" class="tab-images-radio" name="tabs-{safe_id}" id="tab-images-{safe_id}" checked>
+      <input type="radio" class="tab-images-radio" name="tabs-{safe_id}" id="tab-images-{safe_id}">
       <label for="tab-images-{safe_id}">Images</label>
-      <input type="radio" class="tab-posterior-radio" name="tabs-{safe_id}" id="tab-posterior-{safe_id}">
+      <input type="radio" class="tab-posterior-radio" name="tabs-{safe_id}" id="tab-posterior-{safe_id}" checked>
       <label for="tab-posterior-{safe_id}">Posterior</label>
       <div class="tab-panel tab-panel-images">{eval_images_html}</div>
       <div class="tab-panel tab-panel-posterior">{posterior_html}</div>
