@@ -7,7 +7,9 @@ authors = [
     { name = "tommyrharper", email = "zeroknowledgeltd@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "anesthetic>=2.15.1",
+]
 
 [project.scripts]
 ri-reproducibility = "ri_reproducibility:main"

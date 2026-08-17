@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Launch anesthetic's nested-sampling GUI with labelled PolyChord chains.
+
+Run on the host (needs a display), e.g.:
+
+  uv run scripts/anesthetic-gui.py
+  uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-...
+  make anesthetic-gui RUN=results/nested-sampling-poc/wsclean-vlaa-...
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
+
+# GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
+PARAMETER_TEX_LABELS = {
+    "log10_dynamic_range": r"\mathrm{log}_{10}(\rho_{DR})",
+    "observation_minutes": r"t_{\mathrm{obs}}\,[\mathrm{min}]",
+    "channel_count": r"n_{\mathrm{freq}}",
+    "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
+    "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
+    "wsclean_niter": r"N_{\mathrm{iter}}",
+    "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
+}
+
+FALLBACK_PARAMETER_SPACE = [
+    {"name": "log10_dynamic_range"},
+    {"name": "observation_minutes"},
+    {"name": "channel_count"},
+    {"name": "start_frequency_hz"},
+    {"name": "channel_width_hz"},
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Run directory, chains/ directory, or PolyChord file root. "
+        "Default: most recent results/nested-sampling-poc/*/ ",
+    )
+    return parser.parse_args()
+
+
+def latest_run_dir() -> Path:
+    runs = [p for p in NESTED_SAMPLING_DIR.glob("*") if p.is_dir() and (p / "chains").is_dir()]
+    if not runs:
+        raise SystemExit(f"No nested-sampling runs found under {NESTED_SAMPLING_DIR}")
+    return max(runs, key=lambda p: p.stat().st_mtime)
+
+
+def find_chain_root(target: Path) -> Path:
+    """Return PolyChord file root (path without _dead-birth.txt suffix)."""
+    target = target.resolve()
+    if target.is_file():
+        name = target.name
+        for suffix in (
+            "_dead-birth.txt",
+            "_phys_live-birth.txt",
+            "_dead.txt",
+            "_equal_weights.txt",
+            ".stats",
+            ".paramnames",
+            ".txt",
+        ):
+            if name.endswith(suffix):
+                return target.with_name(name[: -len(suffix)])
+        raise SystemExit(f"Unrecognized chain file: {target}")
+
+    if target.is_dir():
+        chains_dir = target / "chains" if (target / "chains").is_dir() else target
+        dead = sorted(chains_dir.glob("*_dead-birth.txt"))
+        if len(dead) == 1:
+            return dead[0].with_name(dead[0].name[: -len("_dead-birth.txt")])
+        if len(dead) > 1:
+            names = ", ".join(p.name for p in dead)
+            raise SystemExit(f"Multiple chain roots in {chains_dir}: {names}")
+        raise SystemExit(f"No *_dead-birth.txt under {chains_dir}")
+
+    dead = Path(str(target) + "_dead-birth.txt")
+    if dead.is_file():
+        return target
+    raise SystemExit(f"No nested-sampling chains at {target}")
+
+
+def run_dir_for_chain_root(chain_root: Path) -> Path:
+    return chain_root.parent.parent if chain_root.parent.name == "chains" else chain_root.parent
+
+
+def load_parameter_space(run_dir: Path) -> list[dict[str, Any]]:
+    summary = run_dir / "poc-summary.json"
+    if summary.is_file():
+        data = json.loads(summary.read_text())
+        space = data.get("parameter_space")
+        if isinstance(space, list) and space:
+            return space
+    space_path = run_dir / "parameter-space.json"
+    if space_path.is_file():
+        space = json.loads(space_path.read_text())
+        if isinstance(space, list) and space:
+            return space
+    return list(FALLBACK_PARAMETER_SPACE)
+
+
+def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) -> Path:
+    path = chain_root.parent / f"{chain_root.name}.paramnames"
+    with path.open("w") as handle:
+        for spec in parameter_space:
+            name = str(spec["name"])
+            tex = PARAMETER_TEX_LABELS.get(name, name)
+            handle.write(f"{name}   {tex}\n")
+    return path
+
+
+def main() -> None:
+    args = parse_args()
+    target = Path(args.target) if args.target else latest_run_dir()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    chain_root = find_chain_root(target)
+    run_dir = run_dir_for_chain_root(chain_root)
+    space = load_parameter_space(run_dir)
+    paramnames = write_paramnames(chain_root, space)
+    print(f"chain root: {chain_root}")
+    print(f"paramnames: {paramnames}")
+
+    try:
+        from anesthetic import read_chains
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise SystemExit(
+            "anesthetic (and matplotlib) required on the host. Install with: uv add anesthetic"
+        ) from exc
+
+    names = [str(spec["name"]) for spec in space]
+    labels = {name: PARAMETER_TEX_LABELS.get(name, name) for name in names}
+    samples = read_chains(str(chain_root), columns=names, labels=labels)
+    samples.gui()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

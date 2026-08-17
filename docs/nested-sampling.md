@@ -240,6 +240,24 @@ per-evaluation card grid (reconstruction, objective, and searched
 parameters, with a collapsed raw metrics table as secondary reference), and
 best-effort posterior plots via `anesthetic` in the r2d2 image.
 
+### Replay a run in anesthetic's GUI
+
+For an interactive nested-sampling replay (live points vs \(\ln X\), \(\beta\)
+tempering) with human-readable parameter labels, run on the **host** (needs a
+display; not inside Docker/Colima):
+
+```bash
+make anesthetic-gui
+make anesthetic-gui RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+```
+
+With no `RUN=`, the latest `results/nested-sampling-poc/*/` directory is used.
+The script writes/refreshes `chains/<root>.paramnames` from that run's
+`poc-summary.json` / `parameter-space.json` so anesthetic shows names such as
+`log10_dynamic_range` instead of `0, 1, 2…`. Requires the host `uv` project
+dependency `anesthetic` (`uv add anesthetic` if missing).
+
 The run also writes a standard environment manifest through
 `scripts/record-environment.sh`.
 

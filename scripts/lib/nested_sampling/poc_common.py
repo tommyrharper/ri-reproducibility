@@ -42,15 +42,32 @@ PARAMETER_SPACE = [
     {"name": "channel_width_hz", "min": 0.5e6, "max": 2.0e6},
 ]
 
+# GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
+PARAMETER_TEX_LABELS = {
+    "log10_dynamic_range": r"\mathrm{log}_{10}(\rho_{DR})",
+    "observation_minutes": r"t_{\mathrm{obs}}\,[\mathrm{min}]",
+    "channel_count": r"n_{\mathrm{freq}}",
+    "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
+    "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
+    "wsclean_niter": r"N_{\mathrm{iter}}",
+    "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
+}
 
-def write_polychord_paramnames(base_dir: Path, file_root: str) -> Path:
+
+def write_polychord_paramnames(
+    base_dir: Path,
+    file_root: str,
+    parameter_space: list[dict[str, Any]] | None = None,
+) -> Path:
     """Write PolyChord's <file_root>.paramnames beside future chain output."""
     base_dir.mkdir(parents=True, exist_ok=True)
     path = base_dir / f"{file_root}.paramnames"
+    specs = parameter_space if parameter_space is not None else PARAMETER_SPACE
     with path.open("w") as handle:
-        for spec in PARAMETER_SPACE:
-            name = spec["name"]
-            handle.write(f"{name}   {name}\n")
+        for spec in specs:
+            name = str(spec["name"])
+            tex = PARAMETER_TEX_LABELS.get(name, name)
+            handle.write(f"{name}   {tex}\n")
     return path
 
 

@@ -1,7 +1,7 @@
 .PHONY: build build-wsclean build-r2d2 build-meqtrees build-polychord \
         smoke-test smoke-test-wsclean smoke-test-r2d2 nested-sampling-poc nested-sampling-r2d2-poc \
         shell-wsclean shell-r2d2 shell-meqtrees shell-polychord \
-        fetch-r2d2-checkpoints record-environment plot-fits benchmark-report \
+        fetch-r2d2-checkpoints record-environment plot-fits benchmark-report anesthetic-gui \
         config clean disk-usage
 
 SHELL := /usr/bin/env bash
@@ -68,6 +68,11 @@ plot-fits:
 
 benchmark-report:
 	scripts/generate-benchmark-report.sh
+
+# Host-side anesthetic GUI (needs a display). Optional RUN= path to a PoC
+# run dir, chains/, or PolyChord file root; default is the latest PoC run.
+anesthetic-gui:
+	uv run scripts/anesthetic-gui.py $(RUN)
 
 config:
 	docker compose config
