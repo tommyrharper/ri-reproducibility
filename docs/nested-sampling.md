@@ -1,8 +1,8 @@
 # Nested Sampling PoC
 
 This repo uses PolyChord as a targeted search tool, not as a Bayesian
-posterior fit. The likelihood is a badness score: higher values mean worse
-single-point-source reconstruction.
+posterior fit. The likelihood is a configurable objective metric (default
+`off_source_rms_jy`). PolyChord maximizes whatever metric is selected.
 
 Ground truth for every run is one unpolarized 1 Jy point source at phase
 centre. Dynamic range is controlled by complex Gaussian thermal noise in the
@@ -42,6 +42,7 @@ Useful overrides:
 
 ```bash
 NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
+NS_METRIC=badness make nested-sampling-poc
 NS_METRIC=snr make nested-sampling-poc
 OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
 ```
@@ -87,7 +88,9 @@ For each sample, the pipeline records:
 | `peak_memory_bytes` | Peak WSClean memory from GNU `time`, with Docker stats as a secondary source |
 
 PolyChord maximizes whatever value the run returns as its log-likelihood. The
-default objective is a composite badness score (higher means worse
+default objective is `off_source_rms_jy` (off-source RMS in Jy/beam).
+
+An optional composite `badness` score is also available (higher means worse
 reconstruction or a more expensive run):
 
 ```text
@@ -100,12 +103,12 @@ max(0, 3 - log_snr)
 ### Choosing the objective (`--metric` / `NS_METRIC`)
 
 `scripts/lib/nested_sampling/polychord_wsclean_poc.py` accepts
-`--metric <value>`. The shell wrapper forwards `NS_METRIC` when set. Resolution
-order:
+`--metric <value>` (default `off_source_rms_jy`). The shell wrapper forwards
+`NS_METRIC` with the same default. Resolution order:
 
-1. `badness` (default) — the composite formula above.
+1. `badness` — the composite formula above.
 2. Any bare metric name from the table — use that raw value directly as the
-   objective.
+   objective (including the default `off_source_rms_jy`).
 3. Any other string — treat it as an arithmetic expression over the same metric
    names (for example `log_snr + 0.1 * wall_seconds`, or the composite formula
    rewritten by hand).
@@ -115,9 +118,10 @@ evaluated in a restricted namespace: no Python builtins, metric names as
 locals, and `math` module functions available by name. A typo or unsafe
 expression fails immediately at startup.
 
-PolyChord always maximizes the returned value. The default badness score is
-oriented so higher is worse. Raw metrics keep their natural orientation with no
-automatic sign flip: `--metric snr` searches for the highest-SNR corner, and a
+PolyChord always maximizes the returned value with no automatic sign flip. The
+`badness` composite is oriented so higher is worse. Raw metrics keep their
+natural orientation: the default `off_source_rms_jy` search prefers higher
+off-source RMS, `--metric snr` searches for the highest-SNR corner, and a
 worst-SNR search must negate explicitly (`--metric "-snr"` or
 `--metric "1/snr"`). Failed simulations or WSClean runs still receive objective
 `100.0`.

@@ -15,6 +15,7 @@ NS_NLIVE="${NS_NLIVE:-8}"
 NS_NUM_REPEATS="${NS_NUM_REPEATS:-2}"
 NS_MAX_NDEAD="${NS_MAX_NDEAD:-12}"
 NS_SEED="${NS_SEED:-41}"
+NS_METRIC="${NS_METRIC:-off_source_rms_jy}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
   DOCKER_SOCKET="/var/run/docker.sock"
@@ -44,12 +45,9 @@ RUN_COMMAND=(
   --num-repeats "${NS_NUM_REPEATS}"
   --max-ndead "${NS_MAX_NDEAD}"
   --seed "${NS_SEED}"
+  --metric "${NS_METRIC}"
   --platform "${PLATFORM}"
 )
-
-if [ -n "${NS_METRIC:-}" ]; then
-  RUN_COMMAND+=(--metric "${NS_METRIC}")
-fi
 
 scripts/record-environment.sh \
   --tool polychord \
