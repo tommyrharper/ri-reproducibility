@@ -227,8 +227,18 @@ def render_posterior_plot(chain_root, param_names):
     except ImportError:
         return None
 
+    import warnings
+
     try:
-        samples = anesthetic.read_chains(chain_root)
+        # Finished PolyChord runs sometimes leave an empty *_phys_live-birth.txt;
+        # anesthetic emits a numpy loadtxt UserWarning for those. Harmless.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"loadtxt: input contained no data:.*_phys_live-birth\.txt",
+                category=UserWarning,
+            )
+            samples = anesthetic.read_chains(chain_root)
     except Exception:
         return None
 
