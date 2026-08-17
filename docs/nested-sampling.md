@@ -150,6 +150,19 @@ The run-level summary is:
 poc-summary.json
 ```
 
+View completed runs (settings, evidence, per-evaluation metrics and
+reconstructions) in the shared benchmark HTML report:
+
+```bash
+make benchmark-report
+# open benchmarks/report.html
+```
+
+The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
+(no manifest join). It parses PolyChord `chains/*.stats` for log(Z), renders
+evaluation FITS thumbnails, and best-effort posterior plots via `anesthetic`
+in the r2d2 image.
+
 The run also writes a standard environment manifest through
 `scripts/record-environment.sh`.
 

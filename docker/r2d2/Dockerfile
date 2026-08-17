@@ -73,6 +73,10 @@ RUN pip install -r requirements.txt
 # recorded here rather than silently patching requirements.txt itself.
 RUN pip install scipy
 
+# Posterior/corner plots for nested-sampling PoC cards in
+# scripts/lib/generate_benchmark_report.py (make benchmark-report).
+RUN pip install anesthetic
+
 # Resolved, fully-pinned environment snapshot - the "lock file" mandated
 # alongside upstream's floating-minimum requirements.txt. Inspect with
 # `make shell-r2d2` then `cat /opt/r2d2/requirements.lock.txt`, or copy
