@@ -47,12 +47,9 @@ shell-meqtrees:
 		--entrypoint bash ri-reproducibility/meqtrees:kern-10
 
 shell-polychord:
-	DOCKER_SOCKET_JSON="$$(docker context inspect --format '{{json .Endpoints.docker.Host}}')"; \
-	DOCKER_SOCKET="$${DOCKER_SOCKET_JSON#\"unix://}"; \
-	DOCKER_SOCKET="$${DOCKER_SOCKET%\"}"; \
 	docker run --rm -it --platform linux/arm64 \
 		-v "$$(pwd):$$(pwd)" -w "$$(pwd)" \
-		-v "$${DOCKER_SOCKET}:/var/run/docker.sock" \
+		-v /var/run/docker.sock:/var/run/docker.sock \
 		--entrypoint bash ri-reproducibility/polychord:lite
 
 fetch-r2d2-checkpoints:
