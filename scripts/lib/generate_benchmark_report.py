@@ -98,6 +98,20 @@ def short(s, n=12):
     return s[:n] if isinstance(s, str) else s
 
 
+def format_wall_duration(seconds):
+    """Format run wall-clock seconds for display (e.g. 4m 12s)."""
+    if seconds is None:
+        return None
+    total = max(0, int(round(float(seconds))))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {secs}s"
+
+
 def fmt_value(v):
     if isinstance(v, float):
         return f"{v:.4g}"
@@ -284,7 +298,7 @@ def render_eval_card(ev, parameter_space, run_dir, metric, is_best):
     """
 
 
-def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_space):
+def render_eval_glance_summary(evaluations, metric, failed_count):
     if not evaluations:
         if failed_count:
             return (
@@ -319,18 +333,6 @@ def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_spa
     )
     headline_html = f'<div class="headline">{" · ".join(headline_bits)}</div>'
 
-    truth_ref_ev = next(
-        (
-            ev
-            for ev in evaluations
-            if resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
-        ),
-        evaluations[0],
-    )
-    truth_image_path = resolve_run_path(run_dir, (truth_ref_ev.get("paths") or {}).get("image"))
-    truth_source_flux_jy = float((truth_ref_ev.get("params") or {}).get("source_flux_jy", 1.0))
-    truth_html = render_shared_truth_image(truth_image_path, truth_source_flux_jy)
-
     strip_cells = []
     best_eval_id = best.get("eval_id")
     for ev in evaluations:
@@ -350,6 +352,26 @@ def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_spa
         "</div>"
     )
 
+    return f'<div class="eval-glance">{headline_html}{strip_html}</div>'
+
+
+def render_eval_images(evaluations, metric, run_dir, parameter_space):
+    if not evaluations:
+        return ""
+
+    best = evaluations[0]
+    truth_ref_ev = next(
+        (
+            ev
+            for ev in evaluations
+            if resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
+        ),
+        evaluations[0],
+    )
+    truth_image_path = resolve_run_path(run_dir, (truth_ref_ev.get("paths") or {}).get("image"))
+    truth_source_flux_jy = float((truth_ref_ev.get("params") or {}).get("source_flux_jy", 1.0))
+    truth_html = render_shared_truth_image(truth_image_path, truth_source_flux_jy)
+
     best_eval_id = best.get("eval_id")
     cards = [
         render_eval_card(ev, parameter_space, run_dir, metric, ev.get("eval_id") == best_eval_id)
@@ -357,7 +379,13 @@ def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_spa
     ]
     cards_html = f'<div class="eval-gallery">{"".join(cards)}</div>'
 
-    return f'<div class="eval-glance">{headline_html}{truth_html}{strip_html}{cards_html}</div>'
+    return f'<div class="eval-images">{truth_html}{cards_html}</div>'
+
+
+def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_space):
+    summary_html = render_eval_glance_summary(evaluations, metric, failed_count)
+    images_html = render_eval_images(evaluations, metric, run_dir, parameter_space)
+    return f"{summary_html}{images_html}"
 
 
 def render_nested_sampling_run(poc_summary_path):
@@ -384,10 +412,18 @@ def render_nested_sampling_run(poc_summary_path):
             if key not in param_names:
                 param_names.append(key)
 
+    duration_html = ""
+    duration_label = format_wall_duration(summary.get("total_wall_seconds"))
+    if duration_label:
+        duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>'
+
     header = f"""
     <header class="card-header">
-      <h2>nested sampling: {html.escape(str(algorithm))}
-        <span class="ts">{html.escape(run_name)}</span></h2>
+      <div class="card-header-top">
+        <h2>nested sampling: {html.escape(str(algorithm))}
+          <span class="ts">{html.escape(run_name)}</span></h2>
+        {duration_html}
+      </div>
       <div class="badges">
         <span class="badge">{html.escape(str(vla_config))}</span>
         <span class="badge">nlive {html.escape(str(polychord.get('nlive', '?')))}</span>
@@ -471,13 +507,38 @@ def render_nested_sampling_run(poc_summary_path):
         </details>
         """
 
+    posterior_html = '<section><h3>Posterior</h3><p class="empty">Posterior plot unavailable.</p></section>'
+    if chain_root:
+        uri = render_posterior_plot(chain_root, space_names)
+        if uri:
+            posterior_html = f"""
+            <section>
+              <h3>Posterior</h3>
+              <figure class="posterior-plot"><img src="{uri}" alt="posterior corner plot"></figure>
+            </section>
+            """
+
     evaluations_html = ""
     if eval_rows:
-        glance_html = render_eval_glance(evaluations, metric, run_dir, len(failed), parameter_space)
+        glance_summary_html = render_eval_glance_summary(evaluations, metric, len(failed))
+        eval_images_html = render_eval_images(evaluations, metric, run_dir, parameter_space)
+        images_parts = []
+        if eval_images_html:
+            images_parts.append(eval_images_html)
+        images_parts.append(posterior_html)
+        images_collapsible = ""
+        if images_parts:
+            images_collapsible = f"""
+          <details>
+            <summary>Run images and posterior</summary>
+            {"".join(images_parts)}
+          </details>
+            """
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
-          {glance_html}
+          {glance_summary_html}
+          {images_collapsible}
           <details>
             <summary>{len(eval_rows)} evaluations (raw table)</summary>
             <div class="eval-table-wrap">
@@ -490,17 +551,16 @@ def render_nested_sampling_run(poc_summary_path):
           {failed_html}
         </section>
         """
-
-    posterior_html = '<section><h3>Posterior</h3><p class="empty">Posterior plot unavailable.</p></section>'
-    if chain_root:
-        uri = render_posterior_plot(chain_root, space_names)
-        if uri:
-            posterior_html = f"""
-            <section>
-              <h3>Posterior</h3>
-              <figure class="posterior-plot"><img src="{uri}" alt="posterior corner plot"></figure>
-            </section>
-            """
+    elif posterior_html:
+        evaluations_html = f"""
+        <section>
+          <h3>Evaluations</h3>
+          <details>
+            <summary>Run images and posterior</summary>
+            {posterior_html}
+          </details>
+        </section>
+        """
 
     fixed_hp = summary.get("wsclean_fixed_hyperparameters") or summary.get("algorithm_fixed_hyperparameters")
     fixed_html = ""
@@ -523,7 +583,6 @@ def render_nested_sampling_run(poc_summary_path):
       {meta_html}
       {evidence_html}
       {evaluations_html}
-      {posterior_html}
       {fixed_html}
       <p class="manifest-name">{html.escape(rel_summary)}</p>
     </article>
@@ -663,6 +722,21 @@ h1 { font-size: 1.4rem; }
   border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.5rem;
 }
 .card-header h2 { margin-bottom: 0.4rem; font-size: 1.1rem; }
+.card-header-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.4rem;
+}
+.card-header-top h2 { margin-bottom: 0; flex: 1 1 auto; min-width: 0; }
+.run-duration {
+  font-size: 0.85rem;
+  opacity: 0.7;
+  white-space: nowrap;
+  flex-shrink: 0;
+  padding-top: 0.1rem;
+}
 .card-header .ts { opacity: 0.6; font-weight: normal; font-size: 0.85rem; }
 .badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 .badge {
@@ -690,6 +764,7 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .eval-table th, .eval-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); text-align: left; vertical-align: top; }
 .eval-table th { opacity: 0.7; white-space: nowrap; }
 .eval-glance { margin: 0.75rem 0 1rem; }
+.eval-images { margin: 0.75rem 0; }
 .eval-strip-wrap { margin: 0.75rem 0; }
 .eval-strip {
   display: flex; align-items: flex-end; gap: 3px;
