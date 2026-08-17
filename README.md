@@ -164,10 +164,13 @@ table, expected numbers) this environment currently targets, and its
 "Current reproduction status" section should be updated by hand after a
 run that moves that target forward.
 
-For the WSClean x VLA.A nested-sampling infrastructure PoC, see
-`docs/nested-sampling.md` and run `make nested-sampling-poc`. That run
-uses MeqTrees/Cattery's VLA.A makems data to create noisy single-point-source
-Measurement Sets and PolyChord to search for high-badness WSClean settings.
+For the WSClean and R2D2 x VLA.A nested-sampling infrastructure PoCs, see
+`docs/nested-sampling.md` and run `make nested-sampling-poc` (WSClean) or
+`make nested-sampling-r2d2-poc` (R2D2). Each run uses MeqTrees/Cattery's
+VLA.A makems data to create noisy single-point-source Measurement Sets, then
+PolyChord to search parameter space by a configurable objective metric
+(`--metric`/`NS_METRIC`, default `off_source_rms_jy`; an optional composite
+`badness` score is also available).
 
 `make benchmark-report` (`scripts/generate-benchmark-report.sh` +
 `scripts/lib/generate_benchmark_report.py`) builds
