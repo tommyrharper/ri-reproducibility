@@ -120,6 +120,23 @@ def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) ->
     return path
 
 
+def run_title(run_dir: Path, chain_root: Path) -> str:
+    """Human-readable window title for the anesthetic GUI."""
+    parts: list[str] = [run_dir.name]
+    summary_path = run_dir / "poc-summary.json"
+    if summary_path.is_file():
+        data = json.loads(summary_path.read_text())
+        algorithm = data.get("algorithm")
+        metric = data.get("metric")
+        vla = data.get("vla_config")
+        meta = [str(x) for x in (algorithm, vla, metric) if x]
+        if meta:
+            parts.append(" · ".join(meta))
+    else:
+        parts.append(chain_root.name)
+    return " — ".join(parts)
+
+
 def main() -> None:
     args = parse_args()
     target = Path(args.target) if args.target else latest_run_dir()
@@ -129,8 +146,10 @@ def main() -> None:
     run_dir = run_dir_for_chain_root(chain_root)
     space = load_parameter_space(run_dir)
     paramnames = write_paramnames(chain_root, space)
+    title = run_title(run_dir, chain_root)
     print(f"chain root: {chain_root}")
     print(f"paramnames: {paramnames}")
+    print(f"title: {title}")
 
     try:
         from anesthetic import read_chains
@@ -142,7 +161,14 @@ def main() -> None:
 
     # Let anesthetic read <root>.paramnames so TeX labels get wrapped in $...$.
     samples = read_chains(str(chain_root))
-    samples.gui()
+    plotter = samples.gui()
+    plotter.fig.suptitle(title, fontsize=12)
+    plotter.fig.tight_layout()
+    plotter.fig.subplots_adjust(top=0.92)
+    manager = getattr(plotter.fig.canvas, "manager", None)
+    if manager is not None and hasattr(manager, "set_window_title"):
+        manager.set_window_title(title)
+    plotter.fig.canvas.draw()
     plt.show()
 
 
