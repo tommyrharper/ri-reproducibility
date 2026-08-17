@@ -17,12 +17,10 @@ NS_MAX_NDEAD="${NS_MAX_NDEAD:-12}"
 NS_SEED="${NS_SEED:-41}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
-  DOCKER_SOCKET_JSON="$(docker context inspect --format '{{json .Endpoints.docker.Host}}')"
-  DOCKER_SOCKET="${DOCKER_SOCKET_JSON#\"unix://}"
-  DOCKER_SOCKET="${DOCKER_SOCKET%\"}"
+  DOCKER_SOCKET="/var/run/docker.sock"
 fi
-if [ ! -S "${DOCKER_SOCKET}" ]; then
-  echo "FATAL: Docker socket is not available at ${DOCKER_SOCKET}" >&2
+if ! docker info >/dev/null 2>&1; then
+  echo "FATAL: Docker daemon is not available" >&2
   exit 1
 fi
 
