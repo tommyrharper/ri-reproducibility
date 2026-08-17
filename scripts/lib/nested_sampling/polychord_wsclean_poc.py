@@ -36,14 +36,15 @@ METRIC_NAMES = (
 
 FAILURE_OBJECTIVE = 100.0
 
+DEFAULT_WSCLEAN_NITER = 100
+DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
+
 PARAMETER_SPACE = [
     {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
     {"name": "observation_minutes", "min": 4.0, "max": 10.0},
     {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"},
     {"name": "start_frequency_hz", "min": 1.0e9, "max": 1.1e9},
     {"name": "channel_width_hz", "min": 0.5e6, "max": 2.0e6},
-    {"name": "wsclean_niter", "min": 25, "max": 150, "kind": "integer"},
-    {"name": "wsclean_auto_threshold", "min": 1.5, "max": 5.0},
 ]
 
 
@@ -335,11 +336,11 @@ def evaluate(
         "-scale",
         "1asec",
         "-niter",
-        str(params["wsclean_niter"]),
+        str(DEFAULT_WSCLEAN_NITER),
         "-mgain",
         "0.8",
         "-auto-threshold",
-        f"{params['wsclean_auto_threshold']:.6f}",
+        f"{DEFAULT_WSCLEAN_AUTO_THRESHOLD:.6f}",
         "-weight",
         "natural",
         "-pol",
@@ -486,6 +487,10 @@ def main() -> None:
             "num_repeats": args.num_repeats,
             "max_ndead": args.max_ndead,
             "seed": args.seed,
+        },
+        "wsclean_fixed_hyperparameters": {
+            "niter": DEFAULT_WSCLEAN_NITER,
+            "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
         },
         "parameter_space": PARAMETER_SPACE,
         "evaluations": evaluations,
