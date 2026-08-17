@@ -41,11 +41,7 @@ LOG_Z_RE = re.compile(
 )
 
 
-def render_fits_to_data_uri(path, figsize=(4, 4), dpi=130):
-    data = fits.getdata(path)
-    data = np.squeeze(np.asarray(data, dtype=float))
-    if data.ndim != 2:
-        return None
+def _image_norm_for_display(data):
     vmin, vmax = ZScaleInterval().get_limits(data)
     if vmin == vmax:
         # ZScaleInterval degenerates to (0, 0) on sparse images (e.g. a
@@ -55,16 +51,47 @@ def render_fits_to_data_uri(path, figsize=(4, 4), dpi=130):
         vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
         if vmin == vmax:
             vmin, vmax = vmin - 1, vmax + 1
-    norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
+    return ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
+
+
+def figure_to_data_uri(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def render_array_to_data_uri(data, figsize=(4, 4), dpi=130):
+    data = np.squeeze(np.asarray(data, dtype=float))
+    if data.ndim != 2:
+        return None
+    norm = _image_norm_for_display(data)
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     ax.imshow(data, origin="lower", cmap="inferno", norm=norm)
     ax.set_xticks([])
     ax.set_yticks([])
     fig.tight_layout(pad=0.2)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return figure_to_data_uri(fig)
+
+
+def render_fits_to_data_uri(path, figsize=(4, 4), dpi=130):
+    return render_array_to_data_uri(fits.getdata(path), figsize=figsize, dpi=dpi)
+
+
+def synthesize_truth_array(image_path, source_flux_jy):
+    """Mirror poc_common.compute_image_metrics truth construction."""
+    data, header = fits.getdata(image_path, header=True)
+    image = np.squeeze(np.asarray(data, dtype=np.float64))
+    if image.ndim != 2:
+        return None
+    y_size, x_size = image.shape
+    cx = int(round(float(header.get("CRPIX1", x_size / 2.0)) - 1.0))
+    cy = int(round(float(header.get("CRPIX2", y_size / 2.0)) - 1.0))
+    cx = max(0, min(x_size - 1, cx))
+    cy = max(0, min(y_size - 1, cy))
+    truth = np.zeros_like(image)
+    truth[cy, cx] = source_flux_jy
+    return truth
 
 
 def short(s, n=12):
@@ -131,13 +158,6 @@ def resolve_run_path(run_dir, path):
     return None
 
 
-def render_array_to_data_uri(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-
-
 def label_chain_samples(samples, param_names):
     """Map PolyChord's numeric columns onto parameter_space names."""
     import pandas as pd
@@ -175,7 +195,7 @@ def render_posterior_plot(chain_root, param_names):
     try:
         grid = samples.plot_2d(plot_params, kind="scatter_2d")
         fig = grid.iloc[0, 0].figure
-        return render_array_to_data_uri(fig)
+        return figure_to_data_uri(fig)
     except Exception:
         pass
 
@@ -192,7 +212,7 @@ def render_posterior_plot(chain_root, param_names):
                 else:
                     ax.axis("off")
         fig.tight_layout()
-        return render_array_to_data_uri(fig)
+        return figure_to_data_uri(fig)
     except Exception:
         return None
 
@@ -203,7 +223,64 @@ def objective_fill(objective, obj_min, obj_max):
     return 1.0
 
 
-def render_eval_glance(evaluations, metric, run_dir, failed_count):
+def format_searched_params(params, parameter_space):
+    parts = []
+    for spec in parameter_space:
+        name = spec.get("name")
+        if not name:
+            continue
+        value = (params or {}).get(name)
+        if value is None:
+            continue
+        parts.append(f"{html.escape(name)}={fmt_value(value)}")
+    return " · ".join(parts)
+
+
+def render_eval_image_pair(image_path, source_flux_jy, eval_id, figsize=(2.8, 2.8), dpi=120):
+    if not image_path:
+        return '<span class="empty">—</span>'
+    recon_uri = render_fits_to_data_uri(image_path, figsize=figsize, dpi=dpi)
+    truth_array = synthesize_truth_array(image_path, source_flux_jy)
+    truth_uri = render_array_to_data_uri(truth_array, figsize=figsize, dpi=dpi) if truth_array is not None else None
+    if not recon_uri and not truth_uri:
+        return '<span class="empty">—</span>'
+    recon_html = (
+        f'<figure><img src="{recon_uri}" alt="eval {html.escape(str(eval_id))} reconstruction">'
+        f'<figcaption>recon</figcaption></figure>'
+        if recon_uri
+        else '<span class="empty">—</span>'
+    )
+    truth_html = (
+        f'<figure><img src="{truth_uri}" alt="eval {html.escape(str(eval_id))} truth">'
+        f'<figcaption>truth</figcaption></figure>'
+        if truth_uri
+        else '<span class="empty">—</span>'
+    )
+    return f'<div class="eval-image-pair">{recon_html}{truth_html}</div>'
+
+
+def render_eval_card(ev, parameter_space, run_dir, metric, is_best):
+    eval_id = ev.get("eval_id", "?")
+    params = ev.get("params") or {}
+    source_flux_jy = float(params.get("source_flux_jy", 1.0))
+    image_path = resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
+    metric_label = html.escape(metric or "objective")
+    best_class = " is-best" if is_best else ""
+    params_caption = format_searched_params(params, parameter_space)
+    image_pair_html = render_eval_image_pair(image_path, source_flux_jy, eval_id)
+    return f"""
+    <article class="eval-card{best_class}">
+      <header class="eval-card-header">
+        <span class="eval-card-id">#{html.escape(str(eval_id))}</span>
+        <span class="eval-card-objective">{metric_label} <strong>{fmt_value(ev.get('objective'))}</strong></span>
+      </header>
+      {image_pair_html}
+      <p class="eval-params">{params_caption or '<span class="empty">no searched parameters</span>'}</p>
+    </article>
+    """
+
+
+def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_space):
     if not evaluations:
         if failed_count:
             return (
@@ -257,20 +334,14 @@ def render_eval_glance(evaluations, metric, run_dir, failed_count):
         "</div>"
     )
 
-    best_image_html = ""
-    image_path = resolve_run_path(run_dir, (best.get("paths") or {}).get("image"))
-    if image_path:
-        uri = render_fits_to_data_uri(image_path, figsize=(5.5, 5.5), dpi=140)
-        if uri:
-            best_image_html = f"""
-            <figure class="best-eval-figure">
-              <img src="{uri}" alt="Best evaluation {html.escape(str(best.get('eval_id', '?')))}">
-              <figcaption>Best evaluation #{html.escape(str(best.get('eval_id', '?')))}
-                · {metric_label} {fmt_value(best.get('objective'))}</figcaption>
-            </figure>
-            """
+    best_eval_id = best.get("eval_id")
+    cards = [
+        render_eval_card(ev, parameter_space, run_dir, metric, ev.get("eval_id") == best_eval_id)
+        for ev in evaluations
+    ]
+    cards_html = f'<div class="eval-gallery">{"".join(cards)}</div>'
 
-    return f'<div class="eval-glance">{headline_html}{strip_html}{best_image_html}</div>'
+    return f'<div class="eval-glance">{headline_html}{strip_html}{cards_html}</div>'
 
 
 def render_nested_sampling_run(poc_summary_path):
@@ -358,13 +429,8 @@ def render_nested_sampling_run(poc_summary_path):
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
         image_path = resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
-        thumb = ""
-        if image_path:
-            uri = render_fits_to_data_uri(image_path)
-            if uri:
-                thumb = f'<img class="eval-thumb" src="{uri}" alt="eval {ev.get("eval_id", "?")}">'
-        if not thumb:
-            thumb = '<span class="empty">—</span>'
+        source_flux_jy = float((ev.get("params") or {}).get("source_flux_jy", 1.0))
+        thumb = render_eval_image_pair(image_path, source_flux_jy, ev.get("eval_id", "?"), figsize=(2.2, 2.2), dpi=100)
         eval_rows.append(
             "<tr>"
             f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
@@ -392,7 +458,7 @@ def render_nested_sampling_run(poc_summary_path):
 
     evaluations_html = ""
     if eval_rows:
-        glance_html = render_eval_glance(evaluations, metric, run_dir, len(failed))
+        glance_html = render_eval_glance(evaluations, metric, run_dir, len(failed), parameter_space)
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
@@ -608,7 +674,6 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .eval-table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
 .eval-table th, .eval-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); text-align: left; vertical-align: top; }
 .eval-table th { opacity: 0.7; white-space: nowrap; }
-.eval-thumb { width: 96px; height: auto; border-radius: 4px; display: block; }
 .eval-glance { margin: 0.75rem 0 1rem; }
 .eval-strip-wrap { margin: 0.75rem 0; }
 .eval-strip {
@@ -628,13 +693,59 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
   box-shadow: 0 0 0 2px color-mix(in srgb, #2e9e5b 30%, transparent);
 }
 .eval-strip-label { font-size: 0.75rem; opacity: 0.65; margin: 0.35rem 0 0; }
-.best-eval-figure { margin: 1rem 0 0.25rem; }
-.best-eval-figure img {
-  width: 100%; max-width: 420px; height: auto; display: block;
-  border-radius: 8px;
-  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+.eval-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
 }
-.best-eval-figure figcaption { font-size: 0.8rem; opacity: 0.75; margin-top: 0.35rem; }
+.eval-card {
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+  border-radius: 8px;
+  padding: 0.65rem 0.75rem;
+  min-width: 0;
+}
+.eval-card.is-best {
+  border-color: color-mix(in srgb, #2e9e5b 55%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, #2e9e5b 20%, transparent);
+}
+.eval-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  margin-bottom: 0.45rem;
+}
+.eval-card-id { opacity: 0.75; }
+.eval-card-objective { text-align: right; }
+.eval-image-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.35rem;
+}
+.eval-image-pair figure { margin: 0; min-width: 0; }
+.eval-image-pair img {
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+  display: block;
+  border: 1px solid color-mix(in srgb, CanvasText 10%, transparent);
+}
+.eval-image-pair figcaption {
+  font-size: 0.65rem;
+  opacity: 0.65;
+  text-align: center;
+  margin-top: 0.2rem;
+}
+.eval-params {
+  font-size: 0.72rem;
+  opacity: 0.8;
+  margin: 0.45rem 0 0;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.eval-table .eval-image-pair { min-width: 180px; }
 .posterior-plot { margin: 0.5rem 0; }
 .posterior-plot img { max-width: 100%; height: auto; border-radius: 6px; }
 .section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
