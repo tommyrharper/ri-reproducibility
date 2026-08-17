@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,7 @@ LOG_Z_RE = re.compile(
     r"log\(Z\)\s*=\s*([-\d.]+E[+-]\d+)\s*\+/-\s*([-\d.]+E[+-]\d+)",
     re.IGNORECASE,
 )
+RUN_ID_TS_RE = re.compile(r"(\d{8}T\d{6}Z)$")
 
 
 def _image_norm_for_display(data):
@@ -111,6 +113,18 @@ def format_wall_duration(seconds):
         return f"{minutes}m {secs}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m {secs}s"
+
+
+def format_run_id_timestamp(run_name):
+    """Human-readable UTC label when run_name ends with %Y%m%dT%H%M%SZ (see run-nested-sampling-*.sh)."""
+    match = RUN_ID_TS_RE.search(run_name)
+    if not match:
+        return None
+    try:
+        dt = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return dt.strftime("%d %b %Y, %H:%M:%S UTC")
 
 
 def fmt_value(v):
@@ -443,11 +457,17 @@ def render_nested_sampling_run(poc_summary_path):
     if duration_label:
         duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>'
 
+    run_name_bits = [f'<span class="ts">{html.escape(run_name)}</span>']
+    run_ts_label = format_run_id_timestamp(run_name)
+    if run_ts_label:
+        run_name_bits.append(f'<span class="ts">{html.escape(run_ts_label)}</span>')
+    run_name_html = " ".join(run_name_bits)
+
     header = f"""
     <header class="card-header">
       <div class="card-header-top">
         <h2>nested sampling: {html.escape(str(algorithm))}
-          <span class="ts">{html.escape(run_name)}</span></h2>
+          {run_name_html}</h2>
         {duration_html}
       </div>
       <div class="badges">
