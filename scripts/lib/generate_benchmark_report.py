@@ -236,45 +236,49 @@ def format_searched_params(params, parameter_space):
     return " · ".join(parts)
 
 
-def render_eval_image_pair(image_path, source_flux_jy, eval_id, figsize=(2.8, 2.8), dpi=120):
+def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
     if not image_path:
         return '<span class="empty">—</span>'
     recon_uri = render_fits_to_data_uri(image_path, figsize=figsize, dpi=dpi)
+    if not recon_uri:
+        return '<span class="empty">—</span>'
+    return (
+        f'<figure class="eval-recon">'
+        f'<img src="{recon_uri}" alt="eval {html.escape(str(eval_id))} reconstruction">'
+        f'<figcaption>recon</figcaption></figure>'
+    )
+
+
+def render_shared_truth_image(image_path, source_flux_jy, figsize=(3.2, 3.2), dpi=120):
+    if not image_path:
+        return ""
     truth_array = synthesize_truth_array(image_path, source_flux_jy)
     truth_uri = render_array_to_data_uri(truth_array, figsize=figsize, dpi=dpi) if truth_array is not None else None
-    if not recon_uri and not truth_uri:
-        return '<span class="empty">—</span>'
-    recon_html = (
-        f'<figure><img src="{recon_uri}" alt="eval {html.escape(str(eval_id))} reconstruction">'
-        f'<figcaption>recon</figcaption></figure>'
-        if recon_uri
-        else '<span class="empty">—</span>'
+    if not truth_uri:
+        return ""
+    return (
+        '<div class="eval-truth-shared">'
+        f'<figure><img src="{truth_uri}" alt="shared ground truth">'
+        f'<figcaption>Ground truth (shared across all evaluations)</figcaption></figure>'
+        "</div>"
     )
-    truth_html = (
-        f'<figure><img src="{truth_uri}" alt="eval {html.escape(str(eval_id))} truth">'
-        f'<figcaption>truth</figcaption></figure>'
-        if truth_uri
-        else '<span class="empty">—</span>'
-    )
-    return f'<div class="eval-image-pair">{recon_html}{truth_html}</div>'
 
 
 def render_eval_card(ev, parameter_space, run_dir, metric, is_best):
     eval_id = ev.get("eval_id", "?")
     params = ev.get("params") or {}
-    source_flux_jy = float(params.get("source_flux_jy", 1.0))
     image_path = resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
     metric_label = html.escape(metric or "objective")
     best_class = " is-best" if is_best else ""
     params_caption = format_searched_params(params, parameter_space)
-    image_pair_html = render_eval_image_pair(image_path, source_flux_jy, eval_id)
+    recon_html = render_eval_recon(image_path, eval_id)
     return f"""
     <article class="eval-card{best_class}">
       <header class="eval-card-header">
         <span class="eval-card-id">#{html.escape(str(eval_id))}</span>
         <span class="eval-card-objective">{metric_label} <strong>{fmt_value(ev.get('objective'))}</strong></span>
       </header>
-      {image_pair_html}
+      {recon_html}
       <p class="eval-params">{params_caption or '<span class="empty">no searched parameters</span>'}</p>
     </article>
     """
@@ -315,6 +319,18 @@ def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_spa
     )
     headline_html = f'<div class="headline">{" · ".join(headline_bits)}</div>'
 
+    truth_ref_ev = next(
+        (
+            ev
+            for ev in evaluations
+            if resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
+        ),
+        evaluations[0],
+    )
+    truth_image_path = resolve_run_path(run_dir, (truth_ref_ev.get("paths") or {}).get("image"))
+    truth_source_flux_jy = float((truth_ref_ev.get("params") or {}).get("source_flux_jy", 1.0))
+    truth_html = render_shared_truth_image(truth_image_path, truth_source_flux_jy)
+
     strip_cells = []
     best_eval_id = best.get("eval_id")
     for ev in evaluations:
@@ -341,7 +357,7 @@ def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_spa
     ]
     cards_html = f'<div class="eval-gallery">{"".join(cards)}</div>'
 
-    return f'<div class="eval-glance">{headline_html}{strip_html}{cards_html}</div>'
+    return f'<div class="eval-glance">{headline_html}{truth_html}{strip_html}{cards_html}</div>'
 
 
 def render_nested_sampling_run(poc_summary_path):
@@ -429,8 +445,7 @@ def render_nested_sampling_run(poc_summary_path):
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
         image_path = resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
-        source_flux_jy = float((ev.get("params") or {}).get("source_flux_jy", 1.0))
-        thumb = render_eval_image_pair(image_path, source_flux_jy, ev.get("eval_id", "?"), figsize=(2.2, 2.2), dpi=100)
+        thumb = render_eval_recon(image_path, ev.get("eval_id", "?"), figsize=(2.2, 2.2), dpi=100)
         eval_rows.append(
             "<tr>"
             f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
@@ -719,20 +734,38 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 }
 .eval-card-id { opacity: 0.75; }
 .eval-card-objective { text-align: right; }
-.eval-image-pair {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.35rem;
+.eval-truth-shared {
+  margin: 0.75rem 0;
+  padding: 0.65rem 0.75rem;
+  max-width: 220px;
+  border: 1px dashed color-mix(in srgb, CanvasText 25%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, CanvasText 4%, transparent);
 }
-.eval-image-pair figure { margin: 0; min-width: 0; }
-.eval-image-pair img {
+.eval-truth-shared figure { margin: 0; min-width: 0; }
+.eval-truth-shared img {
   width: 100%;
   height: auto;
   border-radius: 4px;
   display: block;
   border: 1px solid color-mix(in srgb, CanvasText 10%, transparent);
 }
-.eval-image-pair figcaption {
+.eval-truth-shared figcaption {
+  font-size: 0.75rem;
+  font-weight: 500;
+  opacity: 0.85;
+  text-align: center;
+  margin-top: 0.35rem;
+}
+.eval-recon { margin: 0; min-width: 0; }
+.eval-recon img {
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+  display: block;
+  border: 1px solid color-mix(in srgb, CanvasText 10%, transparent);
+}
+.eval-recon figcaption {
   font-size: 0.65rem;
   opacity: 0.65;
   text-align: center;
@@ -745,7 +778,7 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
   line-height: 1.35;
   word-break: break-word;
 }
-.eval-table .eval-image-pair { min-width: 180px; }
+.eval-table .eval-recon { min-width: 120px; }
 .posterior-plot { margin: 0.5rem 0; }
 .posterior-plot img { max-width: 100%; height: auto; border-radius: 6px; }
 .section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
