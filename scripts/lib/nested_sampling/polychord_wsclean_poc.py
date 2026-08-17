@@ -23,6 +23,8 @@ from poc_common import (
     cube_like_from_theta,
     cube_to_params,
     compute_image_metrics,
+    load_evaluations_from_dir,
+    mpi_rank,
     params_key,
     prior_vector,
     read_gnu_time_peak_memory,
@@ -209,30 +211,34 @@ def main() -> None:
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
 
-    best = max(evaluations, key=lambda item: item["objective"]) if evaluations else None
-    summary = {
-        "algorithm": "wsclean",
-        "vla_config": "VLA.A",
-        "run_type": "cheap infrastructure PoC",
-        "metric": args.metric,
-        "likelihood_framing": likelihood_framing,
-        "polychord": {
-            "nlive": args.nlive,
-            "num_repeats": args.num_repeats,
-            "max_ndead": args.max_ndead,
-            "seed": args.seed,
-        },
-        "wsclean_fixed_hyperparameters": {
-            "niter": DEFAULT_WSCLEAN_NITER,
-            "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
-        },
-        "parameter_space": PARAMETER_SPACE,
-        "evaluations": evaluations,
-        "worst_evaluation": best,
-    }
-    summary_path = output_dir / "poc-summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"wrote {summary_path}")
+    if mpi_rank() == 0:
+        all_evaluations = load_evaluations_from_dir(evaluations_dir)
+        best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
+        mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
+        summary = {
+            "algorithm": "wsclean",
+            "vla_config": "VLA.A",
+            "run_type": "cheap infrastructure PoC",
+            "metric": args.metric,
+            "likelihood_framing": likelihood_framing,
+            "polychord": {
+                "nlive": args.nlive,
+                "num_repeats": args.num_repeats,
+                "max_ndead": args.max_ndead,
+                "seed": args.seed,
+                "mpi_procs": mpi_procs,
+            },
+            "wsclean_fixed_hyperparameters": {
+                "niter": DEFAULT_WSCLEAN_NITER,
+                "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
+            },
+            "parameter_space": PARAMETER_SPACE,
+            "evaluations": all_evaluations,
+            "worst_evaluation": best,
+        }
+        summary_path = output_dir / "poc-summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+        print(f"wrote {summary_path}")
 
 
 if __name__ == "__main__":

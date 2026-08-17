@@ -32,7 +32,8 @@ ENV PATH=/opt/venv/bin:${PATH}
 RUN pip install --upgrade pip \
     && pip install \
         "git+${POLYCHORD_GIT_URL}@${POLYCHORD_GIT_COMMIT}" \
-        astropy
+        astropy \
+        mpi4py
 
 FROM python:3.11-slim-bookworm AS runtime
 

@@ -45,10 +45,16 @@ Useful overrides:
 
 ```bash
 NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
+NS_MPI_PROCS=4 make nested-sampling-poc
 NS_METRIC=badness make nested-sampling-poc
 NS_METRIC=snr make nested-sampling-poc
 OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
 ```
+
+PolyChord likelihood evaluations run in parallel across MPI ranks inside the
+PolyChord container. `NS_MPI_PROCS` sets the rank count (default
+`min(NS_NLIVE, host CPUs)`). Set `NS_MPI_PROCS=1` to disable parallel
+evaluations for debugging.
 
 The target builds any missing WSClean, MeqTrees, and PolyChord images first,
 then runs the PolyChord container. That container mounts the Docker socket and
@@ -110,6 +116,13 @@ Each R2D2 imaging container is launched with OpenMP/BLAS thread env vars
 host's available CPU count, overridable via `R2D2_OMP_THREADS`. The
 previous image default of `OMP_NUM_THREADS=4` capped finufft/OpenMP work
 when the Docker VM exposed more CPUs than four.
+
+`run-nested-sampling-r2d2-poc.sh` runs `NS_MPI_PROCS` PolyChord ranks
+concurrently, each launching its own R2D2 container. To avoid CPU
+oversubscription, the script defaults `R2D2_OMP_THREADS` to `host CPUs /
+NS_MPI_PROCS` (minimum `1`) when not set explicitly, so each rank's R2D2
+container gets a fair share of the host's cores instead of all of them. Set
+`R2D2_OMP_THREADS` explicitly to override this per-rank default.
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
