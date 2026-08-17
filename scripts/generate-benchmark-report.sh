@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
-# Builds benchmarks/report.html from benchmarks/manifests/*.json and
-# results/nested-sampling-poc/*/poc-summary.json - a single self-contained
-# page (metrics + rendered output images) for browsing benchmark runs. See
-# scripts/lib/generate_benchmark_report.py for what it does; runs inside the
-# r2d2 image to reuse its astropy + matplotlib + anesthetic, same approach
-# as scripts/plot-fits.sh.
+# Build HTML reports inside the r2d2 image (astropy + matplotlib + anesthetic).
+#
+# Usage:
+#   scripts/generate-benchmark-report.sh benchmarks
+#   scripts/generate-benchmark-report.sh nested-sampling
+#
+# Outputs:
+#   benchmarks/report.html
+#   benchmarks/nested-sampling-report.html
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
+KIND="${1:-}"
+
+case "${KIND}" in
+  benchmarks)
+    OUT_NAME="report.html"
+    ;;
+  nested-sampling)
+    OUT_NAME="nested-sampling-report.html"
+    ;;
+  *)
+    echo "usage: $0 {benchmarks|nested-sampling}" >&2
+    exit 1
+    ;;
+esac
 
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
@@ -18,6 +35,8 @@ docker run --rm --platform linux/arm64 \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   -v "${REPO_ROOT}/benchmarks:/workspace/out:rw" \
   --entrypoint python3 \
-  "${IMAGE}" /workspace/repo/scripts/lib/generate_benchmark_report.py /workspace/out/report.html
+  "${IMAGE}" /workspace/repo/scripts/lib/generate_benchmark_report.py \
+  --kind "${KIND}" \
+  "/workspace/out/${OUT_NAME}"
 
-echo "OK: open ${REPO_ROOT}/benchmarks/report.html in a browser"
+echo "OK: open ${REPO_ROOT}/benchmarks/${OUT_NAME} in a browser"

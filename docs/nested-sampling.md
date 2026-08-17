@@ -242,11 +242,11 @@ poc-summary.json
 ```
 
 View completed runs (settings, evidence, per-evaluation metrics and
-reconstructions) in the shared benchmark HTML report:
+reconstructions) in the nested-sampling HTML report:
 
 ```bash
-make benchmark-report
-# open benchmarks/report.html
+make nested-sampling-report
+# open benchmarks/nested-sampling-report.html
 ```
 
 The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
@@ -257,7 +257,8 @@ ground-truth image and a per-evaluation card gallery (reconstruction,
 objective, and searched parameters) - sit in an Images tab, and the
 best-effort `anesthetic` posterior plot sits in a Posterior tab, both inside
 one collapsed-by-default details block, separate from the collapsed raw
-metrics table.
+metrics table. Runs are ordered newest-first by the UTC timestamp in the
+run directory name.
 
 ### Replay a run in anesthetic's GUI
 

@@ -149,6 +149,8 @@ scripts/record-environment.sh --tool r2d2 \
 
 # 3. Render every manifest in benchmarks/manifests/ into one HTML report
 make benchmark-report
+# Nested-sampling PoC runs have a separate report:
+# make nested-sampling-report
 ```
 
 `record-environment.sh` only *writes the manifest* - it does not execute
@@ -172,15 +174,13 @@ PolyChord to search parameter space by a configurable objective metric
 (`--metric`/`NS_METRIC`, default `off_source_rms_jy`; an optional composite
 `badness` score is also available).
 
-`make benchmark-report` (`scripts/generate-benchmark-report.sh` +
-`scripts/lib/generate_benchmark_report.py`) builds
-`benchmarks/report.html` - one card per manifest with its environment/
-provenance, a results metrics table, and that run's output FITS files
-rendered inline - plus one card per
-`results/nested-sampling-poc/*/poc-summary.json` nested-sampling PoC run
-(PolyChord log(Z), a card grid of per-evaluation reconstruction/truth image
-pairs, best-effort posterior plot; see `docs/nested-sampling.md`). It reuses
-the r2d2 image's own astropy + matplotlib + anesthetic,
+`make benchmark-report` builds `benchmarks/report.html` from
+`benchmarks/manifests/` (one card per manifest: environment/provenance,
+results metrics, output FITS). `make nested-sampling-report` builds
+`benchmarks/nested-sampling-report.html` from
+`results/nested-sampling-poc/*/poc-summary.json` (PolyChord log(Z),
+evaluation image grid, posterior plot; see `docs/nested-sampling.md`).
+Both reuse the r2d2 image's own astropy + matplotlib + anesthetic,
 same approach as `make plot-fits` (section 7), so no host Python
 environment is needed. Open the file directly in a browser afterward.
 It's generated/gitignored, like `results/`; `git add -f` a specific copy

@@ -1,19 +1,14 @@
 """
-Builds a single self-contained HTML report from benchmarks/manifests/*.json
-(written by record-environment.sh, optionally hand-extended with an
-"experiment" section - see benchmarks/manifests/*.json for examples) and from
-results/nested-sampling-poc/*/poc-summary.json (nested-sampling PoC runs).
+Builds self-contained HTML reports from either:
+  - benchmarks/manifests/*.json (pipeline benchmark manifests), or
+  - results/nested-sampling-poc/*/poc-summary.json (nested-sampling PoC runs).
 
-Run via scripts/generate-benchmark-report.sh, which wraps this in the r2d2
-image so it can reuse the pipeline's own astropy + matplotlib rather than
-requiring a host Python environment - same approach as scripts/plot-fits.sh.
-
-Not a general-purpose report format: it renders whatever each manifest's
-"experiment" block happens to contain (results table, input/checkpoint
-provenance, output images), and degrades to just the manifest's baseline
-run/environment metadata when that block is absent, so it stays useful as
-new tools (wsclean) and fields get added without needing a fixed schema.
+Run via scripts/generate-benchmark-report.sh with --kind benchmarks|nested-sampling,
+which wraps this in the r2d2 image so it can reuse the pipeline's own
+astropy + matplotlib + anesthetic rather than requiring a host Python
+environment - same approach as scripts/plot-fits.sh.
 """
+import argparse
 import base64
 import glob
 import hashlib
@@ -23,6 +18,7 @@ import json
 import os
 import re
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -226,8 +222,6 @@ def render_posterior_plot(chain_root, param_names):
         import anesthetic
     except ImportError:
         return None
-
-    import warnings
 
     try:
         # Finished PolyChord runs sometimes leave an empty *_phys_live-birth.txt;
@@ -949,52 +943,96 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 """
 
 
-def main():
+def render_benchmark_body():
     manifest_paths = sorted(glob.glob(os.path.join(MANIFEST_DIR, "*.json")), reverse=True)
     cards = []
     for p in manifest_paths:
         with open(p) as f:
             manifest = json.load(f)
         cards.append(render_manifest(manifest, p))
+    if cards:
+        return "".join(cards)
+    return (
+        '<p class="empty">No manifests found in benchmarks/manifests/ yet - '
+        "run scripts/record-environment.sh as part of a benchmark run.</p>"
+    )
 
+
+def render_nested_sampling_body():
     nested_paths = sorted(
         glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
         key=nested_sampling_run_sort_key,
     )
     nested_cards = [render_nested_sampling_run(p) for p in nested_paths]
-
-    sections = []
-    if cards:
-        sections.append("".join(cards))
-    elif not nested_cards:
-        sections.append(
-            '<p class="empty">No manifests found in benchmarks/manifests/ yet - run scripts/record-environment.sh as part of a benchmark run.</p>'
-        )
     if nested_cards:
-        sections.append('<h2 class="section-heading">Nested-sampling PoC runs</h2>')
-        sections.append("".join(nested_cards))
+        return "".join(nested_cards)
+    return (
+        '<p class="empty">No nested-sampling PoC runs found under '
+        "results/nested-sampling-poc/*/poc-summary.json yet.</p>"
+    )
 
-    body = "".join(sections)
 
+def write_html_doc(out_path, title, subtitle, body):
     html_doc = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>ri-reproducibility benchmark report</title>
+<title>{html.escape(title)}</title>
 <style>{CSS}</style>
 </head>
 <body>
-<h1>ri-reproducibility benchmark report</h1>
-<p class="subtitle">Generated from benchmarks/manifests/ and results/nested-sampling-poc/ - regenerate with <code>make benchmark-report</code>.</p>
+<h1>{html.escape(title)}</h1>
+<p class="subtitle">{subtitle}</p>
 {body}
 </body>
 </html>
 """
-
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "/workspace/out/report.html"
     with open(out_path, "w") as f:
         f.write(html_doc)
     print(f"wrote {out_path}")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--kind",
+        choices=("benchmarks", "nested-sampling"),
+        required=True,
+        help="Which report to generate.",
+    )
+    parser.add_argument(
+        "out_path",
+        nargs="?",
+        default=None,
+        help="Output HTML path (defaults depend on --kind).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.kind == "benchmarks":
+        out_path = args.out_path or "/workspace/out/report.html"
+        write_html_doc(
+            out_path,
+            title="ri-reproducibility benchmark report",
+            subtitle=(
+                "Generated from <code>benchmarks/manifests/</code> - "
+                "regenerate with <code>make benchmark-report</code>."
+            ),
+            body=render_benchmark_body(),
+        )
+    else:
+        out_path = args.out_path or "/workspace/out/nested-sampling-report.html"
+        write_html_doc(
+            out_path,
+            title="ri-reproducibility nested-sampling report",
+            subtitle=(
+                "Generated from <code>results/nested-sampling-poc/*/poc-summary.json</code> - "
+                "regenerate with <code>make nested-sampling-report</code>."
+            ),
+            body=render_nested_sampling_body(),
+        )
 
 
 def _self_check_log_evidence_parser():

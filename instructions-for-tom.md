@@ -25,5 +25,6 @@ make nested-sampling-r2d2-poc
 NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-poc
 NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-r2d2-poc
 make benchmark-report
+make nested-sampling-report
 make anesthetic-gui RUN=results/nested-sampling-poc/r2d2-vlaa-20260817T155938Z
 ```
