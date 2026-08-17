@@ -173,7 +173,10 @@ Measurement Sets and PolyChord to search for high-badness WSClean settings.
 `scripts/lib/generate_benchmark_report.py`) builds
 `benchmarks/report.html` - one card per manifest with its environment/
 provenance, a results metrics table, and that run's output FITS files
-rendered inline - by reusing the r2d2 image's own astropy + matplotlib,
+rendered inline - plus one card per
+`results/nested-sampling-poc/*/poc-summary.json` nested-sampling PoC run
+(PolyChord log(Z), evaluation table with thumbnails, best-effort posterior
+plot). It reuses the r2d2 image's own astropy + matplotlib + anesthetic,
 same approach as `make plot-fits` (section 7), so no host Python
 environment is needed. Open the file directly in a browser afterward.
 It's generated/gitignored, like `results/`; `git add -f` a specific copy
