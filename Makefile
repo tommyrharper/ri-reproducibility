@@ -1,5 +1,5 @@
 .PHONY: build build-wsclean build-r2d2 build-meqtrees build-polychord \
-        smoke-test smoke-test-wsclean smoke-test-r2d2 nested-sampling-poc \
+        smoke-test smoke-test-wsclean smoke-test-r2d2 nested-sampling-poc nested-sampling-r2d2-poc \
         shell-wsclean shell-r2d2 shell-meqtrees shell-polychord \
         fetch-r2d2-checkpoints record-environment plot-fits benchmark-report \
         config clean disk-usage
@@ -30,6 +30,9 @@ smoke-test-r2d2:
 
 nested-sampling-poc: build-wsclean build-meqtrees build-polychord
 	scripts/run-nested-sampling-poc.sh
+
+nested-sampling-r2d2-poc: build-r2d2 build-meqtrees build-polychord
+	scripts/run-nested-sampling-r2d2-poc.sh
 
 shell-wsclean:
 	docker run --rm -it --platform linux/arm64 \
