@@ -127,6 +127,23 @@ def format_run_id_timestamp(run_name):
     return dt.strftime("%d %b %Y, %H:%M:%S UTC")
 
 
+def nested_sampling_run_sort_key(poc_summary_path):
+    """Sort key for newest-first nested-sampling cards (run-id UTC, else mtime)."""
+    run_name = os.path.basename(os.path.dirname(poc_summary_path))
+    match = RUN_ID_TS_RE.search(run_name)
+    if match:
+        try:
+            dt = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return (0, -dt.timestamp(), run_name)
+        except ValueError:
+            pass
+    try:
+        mtime = os.path.getmtime(poc_summary_path)
+    except OSError:
+        mtime = 0.0
+    return (1, -mtime, run_name)
+
+
 def fmt_value(v):
     if isinstance(v, float):
         return f"{v:.4g}"
@@ -930,7 +947,10 @@ def main():
             manifest = json.load(f)
         cards.append(render_manifest(manifest, p))
 
-    nested_paths = sorted(glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")), reverse=True)
+    nested_paths = sorted(
+        glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
+        key=nested_sampling_run_sort_key,
+    )
     nested_cards = [render_nested_sampling_run(p) for p in nested_paths]
 
     sections = []
