@@ -229,8 +229,10 @@ make benchmark-report
 
 The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
 (no manifest join). It parses PolyChord `chains/*.stats` for log(Z), renders
-evaluation FITS thumbnails, and best-effort posterior plots via `anesthetic`
-in the r2d2 image.
+a per-evaluation card grid (reconstruction next to a synthesized
+ground-truth image, objective, and searched parameters, with a collapsed
+raw metrics table as secondary reference), and best-effort posterior plots
+via `anesthetic` in the r2d2 image.
 
 The run also writes a standard environment manifest through
 `scripts/record-environment.sh`.

@@ -178,8 +178,9 @@ PolyChord to search parameter space by a configurable objective metric
 provenance, a results metrics table, and that run's output FITS files
 rendered inline - plus one card per
 `results/nested-sampling-poc/*/poc-summary.json` nested-sampling PoC run
-(PolyChord log(Z), evaluation table with thumbnails, best-effort posterior
-plot). It reuses the r2d2 image's own astropy + matplotlib + anesthetic,
+(PolyChord log(Z), a card grid of per-evaluation reconstruction/truth image
+pairs, best-effort posterior plot; see `docs/nested-sampling.md`). It reuses
+the r2d2 image's own astropy + matplotlib + anesthetic,
 same approach as `make plot-fits` (section 7), so no host Python
 environment is needed. Open the file directly in a browser afterward.
 It's generated/gitignored, like `results/`; `git add -f` a specific copy
