@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import subprocess
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -264,7 +265,9 @@ def main() -> None:
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    run_start = time.monotonic()
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
+    total_wall_seconds = time.monotonic() - run_start
 
     if mpi_rank() == 0:
         all_evaluations = load_evaluations_from_dir(evaluations_dir)
@@ -296,6 +299,7 @@ def main() -> None:
             "parameter_space": PARAMETER_SPACE,
             "evaluations": all_evaluations,
             "worst_evaluation": best,
+            "total_wall_seconds": total_wall_seconds,
         }
         summary_path = output_dir / "poc-summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
