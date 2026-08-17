@@ -1,12 +1,12 @@
 # Nested Sampling PoC
 
-This repo uses PolyChord as a targeted search tool, not as a Bayesian
-posterior fit. The likelihood is a configurable objective metric (default
-`off_source_rms_jy`). PolyChord maximizes whatever metric is selected.
+This repo uses PolyChord as a targeted search tool, not as a Bayesian posterior
+fit. PolyChord maximizes a configurable objective metric (default
+`off_source_rms_jy`).
 
-Ground truth for every run is one unpolarized 1 Jy point source at phase
-centre. Dynamic range is controlled by complex Gaussian thermal noise in the
-simulated visibilities.
+Ground truth for every run is one unpolarized 1 Jy point source at phase centre.
+Dynamic range is controlled by complex Gaussian thermal noise in the simulated
+visibilities.
 
 ## Images
 
@@ -19,15 +19,19 @@ make build-polychord
 
 `make build` also builds the MeqTrees and PolyChord images.
 
-The MeqTrees image uses KERN 10 packages on Ubuntu 24.04. The VLA.A antenna
-table is unpacked from makems' bundled `VLAA_ANT` example inside the image,
-so antenna positions are not hand-rolled in this repo. Visibilities for that
-skeleton are predicted by an actual MeqTrees/Meow point-source RIME run
+The MeqTrees image uses KERN 10 packages on Ubuntu 24.04. The VLA.A antenna table
+is unpacked from makems' bundled `VLAA_ANT` example inside the image, so antenna
+positions are not hand-rolled in this repo. Visibilities for that skeleton are
+predicted by an actual MeqTrees/Meow point-source RIME run
 (`scripts/lib/nested_sampling/point_source_forest.py`, driven through
 `meqtree-pipeliner.py`), not a hand-rolled formula; thermal noise is added on
 top of that clean MeqTrees prediction.
 
-## Run The PoC
+## Run the PoC
+
+Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see WSClean below).
+Each target builds its required images first, then runs the PolyChord container,
+which mounts the Docker socket and launches per-evaluation sidecar containers.
 
 ### WSClean
 
@@ -35,7 +39,7 @@ top of that clean MeqTrees prediction.
 make nested-sampling-poc
 ```
 
-Outputs are written under:
+Outputs:
 
 ```text
 results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>/
@@ -56,10 +60,9 @@ PolyChord container. `NS_MPI_PROCS` sets the rank count (default
 `min(NS_NLIVE, host CPUs)`). Set `NS_MPI_PROCS=1` to disable parallel
 evaluations for debugging.
 
-The target builds any missing WSClean, MeqTrees, and PolyChord images first,
-then runs the PolyChord container. That container mounts the Docker socket and
-launches one MeqTrees simulation container plus one WSClean imaging container
-per likelihood evaluation.
+The target builds any missing WSClean, MeqTrees, and PolyChord images first.
+Each likelihood evaluation launches one MeqTrees simulation container plus one
+WSClean imaging container.
 
 ### R2D2
 
@@ -67,16 +70,15 @@ per likelihood evaluation.
 make nested-sampling-r2d2-poc
 ```
 
-Outputs are written under:
+Outputs:
 
 ```text
 results/nested-sampling-poc/r2d2-vlaa-<UTC timestamp>/
 ```
 
-Use the same `NS_*` and `OUTPUT_DIR` overrides as the WSClean PoC. The target
-builds R2D2, MeqTrees, and PolyChord images first, then runs the PolyChord
-container. Each likelihood evaluation launches one MeqTrees simulation container,
-one MeqTrees-hosted MS-to-`.mat` conversion, and one R2D2 imaging container.
+The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
+evaluation launches one MeqTrees simulation container, one MeqTrees-hosted
+MS-to-`.mat` conversion, and one R2D2 imaging container.
 
 R2D2 requires pretrained checkpoints at `checkpoints/R2D2_A1/R2D2_UNet_N*.ckpt`
 (see `make fetch-r2d2-checkpoints` and `make smoke-test-r2d2`).
@@ -87,7 +89,19 @@ Before a full end-to-end run, validate the MS-to-`.mat` bridge:
 scripts/check-ms-to-r2d2-mat.sh
 ```
 
-## Parameter Space
+`run-nested-sampling-r2d2-poc.sh` runs `NS_MPI_PROCS` PolyChord ranks
+concurrently, each launching its own R2D2 container. Each R2D2 imaging
+container is launched with OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`,
+`MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set from the host's available CPU
+count, overridable via `R2D2_OMP_THREADS`. The previous image default of
+`OMP_NUM_THREADS=4` capped finufft/OpenMP work when the Docker VM exposed more
+CPUs than four. To avoid CPU oversubscription, the script defaults
+`R2D2_OMP_THREADS` to `host CPUs / NS_MPI_PROCS` (minimum `1`) when not set
+explicitly, so each rank's R2D2 container gets a fair share of the host's cores
+instead of all of them. Set `R2D2_OMP_THREADS` explicitly to override this
+per-rank default.
+
+## Parameter space
 
 VLA configuration is an outer-loop dimension. This PoC only runs `VLA.A`.
 
@@ -101,41 +115,28 @@ PolyChord dimensions for both algorithm PoCs:
 | `start_frequency_hz` | `1.0e9` to `1.1e9` | First channel frequency |
 | `channel_width_hz` | `0.5e6` to `2.0e6` | Uniform spacing between channels |
 
-WSClean runs with fixed hyperparameters on every evaluation: `-niter 100`
-and `-auto-threshold 3.0`. These are recorded in `poc-summary.json` under
-`wsclean_fixed_hyperparameters`.
-
-R2D2 runs with fixed hyperparameters on every evaluation: `128x128` image
-size (matching the WSClean PoC's `-size 128 128 -scale 1asec` footprint),
-`num_iter 25`, `architecture unet`, `num_chans 64`, `ckpt_path
-/checkpoints/R2D2_A1`, and `ckpt_realisations 1`. These are recorded in
-`poc-summary.json` under `r2d2_fixed_hyperparameters`.
-
-Each R2D2 imaging container is launched with OpenMP/BLAS thread env vars
-(`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set from the
-host's available CPU count, overridable via `R2D2_OMP_THREADS`. The
-previous image default of `OMP_NUM_THREADS=4` capped finufft/OpenMP work
-when the Docker VM exposed more CPUs than four.
-
-`run-nested-sampling-r2d2-poc.sh` runs `NS_MPI_PROCS` PolyChord ranks
-concurrently, each launching its own R2D2 container. To avoid CPU
-oversubscription, the script defaults `R2D2_OMP_THREADS` to `host CPUs /
-NS_MPI_PROCS` (minimum `1`) when not set explicitly, so each rank's R2D2
-container gets a fair share of the host's cores instead of all of them. Set
-`R2D2_OMP_THREADS` explicitly to override this per-rank default.
-
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
 frequency sets are a follow-up ceiling.
 
-## MS To R2D2 `.mat` Bridge
+Fixed hyperparameters (not searched) on every evaluation:
+
+**WSClean:** `-niter 100` and `-auto-threshold 3.0`, recorded in
+`poc-summary.json` under `wsclean_fixed_hyperparameters`.
+
+**R2D2:** `128x128` image size (matching the WSClean PoC's `-size 128 128
+-scale 1asec` footprint), `num_iter 25`, `architecture unet`, `num_chans 64`,
+`ckpt_path /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in
+`poc-summary.json` under `r2d2_fixed_hyperparameters`.
+
+## MS to R2D2 `.mat` bridge
 
 R2D2-RI reads visibilities from a MATLAB `.mat` file via `load_data_to_tensor()`
 in the upstream `src/utils.py`. The nested-sampling simulator produces a CASA
 Measurement Set (`sim.ms`) that WSClean consumes directly. The R2D2 PoC adds
 `scripts/lib/nested_sampling/ms_to_r2d2_mat.py`, which runs inside the MeqTrees
-image (python3-casacore plus scipy) and writes the minimal field set R2D2
-loads without flag metadata:
+image (python3-casacore plus scipy) and writes the minimal field set R2D2 loads
+without flag metadata:
 
 | Field | Meaning |
 |---|---|
@@ -147,7 +148,7 @@ Imaging weights are generated inside R2D2 when `data_weighting: True` in the
 per-evaluation YAML config. The converter does not replicate the bundled
 `data_3c353.mat` pruning or tau-compressed weight fields.
 
-## Metrics And Objective
+## Metrics and objective
 
 For each sample, the pipeline records:
 
@@ -189,9 +190,9 @@ Both `polychord_wsclean_poc.py` and `polychord_r2d2_poc.py` accept
    rewritten by hand).
 
 Expressions are compiled once at startup (before any Docker evaluations) and
-evaluated in a restricted namespace: no Python builtins, metric names as
-locals, and `math` module functions available by name. A typo or unsafe
-expression fails immediately at startup.
+evaluated in a restricted namespace: no Python builtins, metric names as locals,
+and `math` module functions available by name. A typo or unsafe expression fails
+immediately at startup.
 
 PolyChord always maximizes the returned value with no automatic sign flip. The
 `badness` composite is oriented so higher is worse. Raw metrics keep their
@@ -205,11 +206,11 @@ Each evaluation record and `poc-summary.json` store the chosen value in an
 `objective` field. `poc-summary.json` also records the `--metric` string and a
 `likelihood_framing` sentence describing what was optimized.
 
-## Output Files
+## Output files
 
 ### WSClean
 
-Each likelihood evaluation gets:
+Each likelihood evaluation:
 
 ```text
 evaluations/eval-*/sim.ms
@@ -221,7 +222,7 @@ evaluations/eval-*/metrics.json
 
 ### R2D2
 
-Each likelihood evaluation gets:
+Each likelihood evaluation:
 
 ```text
 evaluations/eval-*/sim.ms
@@ -232,7 +233,9 @@ evaluations/eval-*/r2d2/r2d2_data/R2D2_model_image.fits
 evaluations/eval-*/metrics.json
 ```
 
-The run-level summary is:
+### Run summary and reports
+
+Run-level summary:
 
 ```text
 poc-summary.json
