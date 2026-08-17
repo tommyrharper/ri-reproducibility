@@ -209,7 +209,7 @@ evaluations/eval-*/sim.ms
 evaluations/eval-*/simulation.json
 evaluations/eval-*/r2d2_data.mat
 evaluations/eval-*/r2d2_config.yaml
-evaluations/eval-*/r2d2/R2D2_model_image.fits
+evaluations/eval-*/r2d2/r2d2_data/R2D2_model_image.fits
 evaluations/eval-*/metrics.json
 ```
 

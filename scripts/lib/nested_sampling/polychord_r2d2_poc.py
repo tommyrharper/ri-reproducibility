@@ -171,7 +171,7 @@ def evaluate(
             "peak_memory_bytes": peak_memory_bytes,
         }
 
-    image_path = r2d2_dir / "R2D2_model_image.fits"
+    image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
     try:
         metrics = compute_image_metrics(image_path, params["source_flux_jy"], run_result.wall_seconds, peak_memory_bytes)
         objective = objective_from_metrics(metrics)
