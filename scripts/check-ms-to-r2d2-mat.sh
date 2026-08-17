@@ -26,6 +26,7 @@ docker run --rm --platform "${PLATFORM}" \
   -e MEQTREES_IMAGE="${MEQTREES_IMAGE}" \
   -e R2D2_IMAGE="${R2D2_IMAGE}" \
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}" \
+  ${R2D2_OMP_THREADS:+-e "R2D2_OMP_THREADS=${R2D2_OMP_THREADS}"} \
   --entrypoint python3 \
   ri-reproducibility/polychord:lite \
   /opt/ri-nested-sampling/check_ms_to_r2d2_mat.py \

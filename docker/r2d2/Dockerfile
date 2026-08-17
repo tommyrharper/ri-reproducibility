@@ -104,8 +104,7 @@ COPY --from=build /opt/venv /opt/venv
 COPY --from=build /opt/r2d2 /opt/r2d2
 
 ENV PATH=/opt/venv/bin:${PATH} \
-    R2D2_HOME=/opt/r2d2/R2D2-RI \
-    OMP_NUM_THREADS=4
+    R2D2_HOME=/opt/r2d2/R2D2-RI
 
 WORKDIR /opt/r2d2/R2D2-RI
 VOLUME ["/data", "/checkpoints", "/results"]

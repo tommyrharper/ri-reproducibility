@@ -105,6 +105,12 @@ size (matching the WSClean PoC's `-size 128 128 -scale 1asec` footprint),
 /checkpoints/R2D2_A1`, and `ckpt_realisations 1`. These are recorded in
 `poc-summary.json` under `r2d2_fixed_hyperparameters`.
 
+Each R2D2 imaging container is launched with OpenMP/BLAS thread env vars
+(`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set from the
+host's available CPU count, overridable via `R2D2_OMP_THREADS`. The
+previous image default of `OMP_NUM_THREADS=4` capped finufft/OpenMP work
+when the Docker VM exposed more CPUs than four.
+
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
 frequency sets are a follow-up ceiling.

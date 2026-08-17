@@ -23,7 +23,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
 
       - name: Lint shell scripts
-        run: shellcheck scripts/*.sh
+        run: shellcheck -x scripts/*.sh
 
       - name: Check shell syntax
         run: bash -n scripts/*.sh

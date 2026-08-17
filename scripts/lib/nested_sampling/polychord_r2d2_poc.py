@@ -24,10 +24,12 @@ from poc_common import (
     compute_image_metrics,
     params_key,
     prior_vector,
+    r2d2_docker_thread_env_flags,
     resolve_metric,
     run_checked,
     run_docker_monitored,
     self_check_metric_resolution,
+    self_check_r2d2_thread_env,
     simulate_measurement_set,
     stable_seed,
     write_polychord_paramnames,
@@ -148,6 +150,7 @@ def evaluate(
         container_name,
         "--platform",
         args.platform,
+        *r2d2_docker_thread_env_flags(),
         "-v",
         f"{eval_dir}:/work",
         "-v",
@@ -296,6 +299,7 @@ def main() -> None:
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_R2D2_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
+        self_check_r2d2_thread_env()
         print("metric resolution self-check passed")
     else:
         main()

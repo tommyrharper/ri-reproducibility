@@ -10,7 +10,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
 
+# shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
+source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
+
 docker run --rm --platform linux/arm64 \
+  "${R2D2_DOCKER_ENV_FLAGS[@]}" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   -v "${REPO_ROOT}/benchmarks:/workspace/out:rw" \
   --entrypoint python3 \
