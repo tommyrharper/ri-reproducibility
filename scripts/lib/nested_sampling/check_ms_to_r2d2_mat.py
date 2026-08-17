@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from poc_common import r2d2_docker_thread_env_flags
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -97,6 +99,7 @@ def main() -> None:
         "--rm",
         "--platform",
         args.platform,
+        *r2d2_docker_thread_env_flags(),
         "-v",
         f"{work_dir}:/work",
         "--entrypoint",

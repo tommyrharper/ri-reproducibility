@@ -10,10 +10,14 @@ CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-${REPO_ROOT}/checkpoints}"
 RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/results}"
 CONFIG_DIR="${REPO_ROOT}/config/r2d2"
 
+# shellcheck source=lib/r2d2-docker-thread-env.sh
+source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
+
 mkdir -p "${RESULTS_DIR}/smoke-test-r2d2"
 
 run() {
   docker run --rm --platform linux/arm64 \
+    "${R2D2_DOCKER_ENV_FLAGS[@]}" \
     -v "${CHECKPOINTS_DIR}:/checkpoints:ro" \
     -v "${RESULTS_DIR}/smoke-test-r2d2:/results" \
     -v "${CONFIG_DIR}:/workspace/config:ro" \

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import time
@@ -58,6 +59,25 @@ class DockerRunResult:
     returncode: int
     wall_seconds: float
     peak_memory_bytes: int
+
+
+def r2d2_thread_count() -> int:
+    override = os.environ.get("R2D2_OMP_THREADS")
+    if override:
+        return max(1, int(override))
+    return os.cpu_count() or 1
+
+
+def r2d2_docker_thread_env_flags() -> list[str]:
+    threads = str(r2d2_thread_count())
+    return [
+        "-e",
+        f"OMP_NUM_THREADS={threads}",
+        "-e",
+        f"MKL_NUM_THREADS={threads}",
+        "-e",
+        f"OPENBLAS_NUM_THREADS={threads}",
+    ]
 
 
 def scale(cube_value: float, lower: float, upper: float) -> float:
@@ -308,6 +328,31 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
         [params[spec["name"]] if spec["name"] in params else math.log10(params["dynamic_range"]) for spec in PARAMETER_SPACE],
         dtype=np.float64,
     )
+
+
+def self_check_r2d2_thread_env() -> None:
+    saved = os.environ.get("R2D2_OMP_THREADS")
+    try:
+        os.environ["R2D2_OMP_THREADS"] = "6"
+        flags = r2d2_docker_thread_env_flags()
+        assert flags == [
+            "-e",
+            "OMP_NUM_THREADS=6",
+            "-e",
+            "MKL_NUM_THREADS=6",
+            "-e",
+            "OPENBLAS_NUM_THREADS=6",
+        ]
+        del os.environ["R2D2_OMP_THREADS"]
+        count = r2d2_thread_count()
+        assert count >= 1
+        auto_flags = r2d2_docker_thread_env_flags()
+        assert auto_flags[1] == f"OMP_NUM_THREADS={count}"
+    finally:
+        if saved is None:
+            os.environ.pop("R2D2_OMP_THREADS", None)
+        else:
+            os.environ["R2D2_OMP_THREADS"] = saved
 
 
 def self_check_metric_resolution() -> None:
