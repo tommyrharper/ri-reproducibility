@@ -65,8 +65,10 @@ PolyChord dimensions for the WSClean PoC:
 | `channel_count` | `2` to `6` | Number of frequency channels |
 | `start_frequency_hz` | `1.0e9` to `1.1e9` | First channel frequency |
 | `channel_width_hz` | `0.5e6` to `2.0e6` | Uniform spacing between channels |
-| `wsclean_niter` | `25` to `150` | CLEAN iteration cap |
-| `wsclean_auto_threshold` | `1.5` to `5.0` | WSClean auto-threshold in sigma |
+
+WSClean runs with fixed hyperparameters on every evaluation: `-niter 100`
+and `-auto-threshold 3.0`. These are recorded in `poc-summary.json` under
+`wsclean_fixed_hyperparameters`.
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
