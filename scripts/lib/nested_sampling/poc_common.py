@@ -262,6 +262,22 @@ def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float
     )
 
 
+def mpi_rank() -> int:
+    try:
+        from mpi4py import MPI
+
+        return int(MPI.COMM_WORLD.Get_rank())
+    except ImportError:
+        return 0
+
+
+def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for metrics_path in sorted(evaluations_dir.glob("eval-*/metrics.json")):
+        records.append(json.loads(metrics_path.read_text()))
+    return records
+
+
 def simulate_measurement_set(
     params: dict[str, Any],
     eval_dir: Path,

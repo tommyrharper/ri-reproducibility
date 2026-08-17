@@ -25,6 +25,15 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
+HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+if [ -z "${NS_MPI_PROCS:-}" ]; then
+  if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
+    NS_MPI_PROCS="${NS_NLIVE}"
+  else
+    NS_MPI_PROCS="${HOST_CPUS}"
+  fi
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 RUN_COMMAND=(
@@ -36,7 +45,14 @@ RUN_COMMAND=(
   -e MEQTREES_IMAGE="${MEQTREES_IMAGE}"
   -e WSCLEAN_IMAGE="${WSCLEAN_IMAGE}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
+  -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  -e OMPI_ALLOW_RUN_AS_ROOT=1
+  -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+  --entrypoint mpirun
   "${POLYCHORD_IMAGE}"
+  --allow-run-as-root
+  -np "${NS_MPI_PROCS}"
+  python3 /opt/ri-nested-sampling/polychord_wsclean_poc.py
   --output-dir "${OUTPUT_DIR}"
   --repo-root "${REPO_ROOT}"
   --meqtrees-image "${MEQTREES_IMAGE}"

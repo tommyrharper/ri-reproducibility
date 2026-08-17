@@ -45,10 +45,16 @@ Useful overrides:
 
 ```bash
 NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
+NS_MPI_PROCS=4 make nested-sampling-poc
 NS_METRIC=badness make nested-sampling-poc
 NS_METRIC=snr make nested-sampling-poc
 OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
 ```
+
+PolyChord likelihood evaluations run in parallel across MPI ranks inside the
+PolyChord container. `NS_MPI_PROCS` sets the rank count (default
+`min(NS_NLIVE, host CPUs)`). Set `NS_MPI_PROCS=1` to disable parallel
+evaluations for debugging.
 
 The target builds any missing WSClean, MeqTrees, and PolyChord images first,
 then runs the PolyChord container. That container mounts the Docker socket and

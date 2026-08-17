@@ -26,6 +26,15 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
+HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+if [ -z "${NS_MPI_PROCS:-}" ]; then
+  if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
+    NS_MPI_PROCS="${NS_NLIVE}"
+  else
+    NS_MPI_PROCS="${HOST_CPUS}"
+  fi
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 RUN_COMMAND=(
@@ -38,10 +47,15 @@ RUN_COMMAND=(
   -e R2D2_IMAGE="${R2D2_IMAGE}"
   -e CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
+  -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  -e OMPI_ALLOW_RUN_AS_ROOT=1
+  -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   ${R2D2_OMP_THREADS:+-e "R2D2_OMP_THREADS=${R2D2_OMP_THREADS}"}
-  --entrypoint python3
+  --entrypoint mpirun
   "${POLYCHORD_IMAGE}"
-  /opt/ri-nested-sampling/polychord_r2d2_poc.py
+  --allow-run-as-root
+  -np "${NS_MPI_PROCS}"
+  python3 /opt/ri-nested-sampling/polychord_r2d2_poc.py
   --output-dir "${OUTPUT_DIR}"
   --repo-root "${REPO_ROOT}"
   --meqtrees-image "${MEQTREES_IMAGE}"

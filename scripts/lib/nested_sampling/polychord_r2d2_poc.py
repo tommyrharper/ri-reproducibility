@@ -22,6 +22,8 @@ from poc_common import (
     cube_like_from_theta,
     cube_to_params,
     compute_image_metrics,
+    load_evaluations_from_dir,
+    mpi_rank,
     params_key,
     prior_vector,
     r2d2_docker_thread_env_flags,
@@ -264,36 +266,40 @@ def main() -> None:
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
 
-    best = max(evaluations, key=lambda item: item["objective"]) if evaluations else None
-    summary = {
-        "algorithm": "r2d2",
-        "vla_config": "VLA.A",
-        "run_type": "cheap infrastructure PoC",
-        "metric": args.metric,
-        "likelihood_framing": likelihood_framing,
-        "polychord": {
-            "nlive": args.nlive,
-            "num_repeats": args.num_repeats,
-            "max_ndead": args.max_ndead,
-            "seed": args.seed,
-        },
-        "r2d2_fixed_hyperparameters": {
-            "im_dim_x": DEFAULT_R2D2_IM_DIM,
-            "im_dim_y": DEFAULT_R2D2_IM_DIM,
-            "num_iter": DEFAULT_R2D2_NUM_ITER,
-            "num_chans": DEFAULT_R2D2_NUM_CHANS,
-            "architecture": DEFAULT_R2D2_ARCHITECTURE,
-            "super_resolution": DEFAULT_R2D2_SUPER_RESOLUTION,
-            "ckpt_path": "/checkpoints/R2D2_A1",
-            "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
-        },
-        "parameter_space": PARAMETER_SPACE,
-        "evaluations": evaluations,
-        "worst_evaluation": best,
-    }
-    summary_path = output_dir / "poc-summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"wrote {summary_path}")
+    if mpi_rank() == 0:
+        all_evaluations = load_evaluations_from_dir(evaluations_dir)
+        best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
+        mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
+        summary = {
+            "algorithm": "r2d2",
+            "vla_config": "VLA.A",
+            "run_type": "cheap infrastructure PoC",
+            "metric": args.metric,
+            "likelihood_framing": likelihood_framing,
+            "polychord": {
+                "nlive": args.nlive,
+                "num_repeats": args.num_repeats,
+                "max_ndead": args.max_ndead,
+                "seed": args.seed,
+                "mpi_procs": mpi_procs,
+            },
+            "r2d2_fixed_hyperparameters": {
+                "im_dim_x": DEFAULT_R2D2_IM_DIM,
+                "im_dim_y": DEFAULT_R2D2_IM_DIM,
+                "num_iter": DEFAULT_R2D2_NUM_ITER,
+                "num_chans": DEFAULT_R2D2_NUM_CHANS,
+                "architecture": DEFAULT_R2D2_ARCHITECTURE,
+                "super_resolution": DEFAULT_R2D2_SUPER_RESOLUTION,
+                "ckpt_path": "/checkpoints/R2D2_A1",
+                "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
+            },
+            "parameter_space": PARAMETER_SPACE,
+            "evaluations": all_evaluations,
+            "worst_evaluation": best,
+        }
+        summary_path = output_dir / "poc-summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+        print(f"wrote {summary_path}")
 
 
 if __name__ == "__main__":
