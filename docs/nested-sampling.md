@@ -66,7 +66,7 @@ PolyChord dimensions for the WSClean PoC:
 | `wsclean_niter` | `25` to `150` | CLEAN iteration cap |
 | `wsclean_auto_threshold` | `1.5` to `5.0` | WSClean auto-threshold in sigma |
 
-ponytail: channel frequencies are represented as a contiguous uniform
+Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
 frequency sets are a follow-up ceiling.
 
