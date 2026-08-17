@@ -15,3 +15,14 @@
   - can set to a bunch of other metrics
 - `OUTPUT_DIR` where the results are saved (default `results/nested-sampling-poc/wsclean-vlaa-<UTC>` or `r2d2-vlaa-<UTC>`)
   - leave empty
+
+## key commands
+
+```zsh
+make anesthetic-gui
+make nested-sampling-poc
+make nested-sampling-r2d2-poc
+NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-poc
+NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-r2d2-poc
+make benchmark-report
+```
