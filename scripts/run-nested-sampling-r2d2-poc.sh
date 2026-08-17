@@ -35,6 +35,13 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   fi
 fi
 
+if [ -z "${R2D2_OMP_THREADS:-}" ]; then
+  R2D2_OMP_THREADS="$(( HOST_CPUS / NS_MPI_PROCS ))"
+  if [ "${R2D2_OMP_THREADS}" -lt 1 ]; then
+    R2D2_OMP_THREADS=1
+  fi
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 RUN_COMMAND=(
@@ -50,7 +57,7 @@ RUN_COMMAND=(
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-  ${R2D2_OMP_THREADS:+-e "R2D2_OMP_THREADS=${R2D2_OMP_THREADS}"}
+  -e R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
   --entrypoint mpirun
   "${POLYCHORD_IMAGE}"
   --allow-run-as-root
