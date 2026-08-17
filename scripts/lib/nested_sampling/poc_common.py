@@ -42,6 +42,17 @@ PARAMETER_SPACE = [
 ]
 
 
+def write_polychord_paramnames(base_dir: Path, file_root: str) -> Path:
+    """Write PolyChord's <file_root>.paramnames beside future chain output."""
+    base_dir.mkdir(parents=True, exist_ok=True)
+    path = base_dir / f"{file_root}.paramnames"
+    with path.open("w") as handle:
+        for spec in PARAMETER_SPACE:
+            name = spec["name"]
+            handle.write(f"{name}   {name}\n")
+    return path
+
+
 @dataclass
 class DockerRunResult:
     returncode: int
