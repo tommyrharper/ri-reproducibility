@@ -12,6 +12,7 @@ import re
 import subprocess
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,19 @@ import pypolychord
 from astropy.io import fits
 from pypolychord.settings import PolyChordSettings
 
+
+METRIC_NAMES = (
+    "snr",
+    "log_snr",
+    "off_source_rms_jy",
+    "peak_jy_per_beam",
+    "relative_l2_error",
+    "peak_flux_abs_error_jy",
+    "wall_seconds",
+    "peak_memory_bytes",
+)
+
+FAILURE_OBJECTIVE = 100.0
 
 PARAMETER_SPACE = [
     {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
@@ -50,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-repeats", type=int, default=2)
     parser.add_argument("--max-ndead", type=int, default=12)
     parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--metric", default="off_source_rms_jy", help="Objective metric: badness, a raw metric name, or an expression over metric names")
     parser.add_argument("--platform", default=os.environ.get("DOCKER_DEFAULT_PLATFORM", "linux/arm64"))
     return parser.parse_args()
 
@@ -187,7 +202,56 @@ def badness_from_metrics(metrics: dict[str, float]) -> float:
     return float(log_snr_loss + fidelity_loss + 0.05 * time_loss + 0.02 * memory_loss)
 
 
-def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, eval_id: int) -> dict[str, Any]:
+def _math_namespace() -> dict[str, Any]:
+    return {name: getattr(math, name) for name in dir(math) if not name.startswith("_")}
+
+
+def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float], str]:
+    if metric_spec == "badness":
+        return badness_from_metrics, (
+            "PolyChord log-likelihood is the composite badness score; higher means worse reconstruction."
+        )
+
+    if metric_spec in METRIC_NAMES:
+        key = metric_spec
+
+        def raw_metric(metrics: dict[str, float]) -> float:
+            return float(metrics[key])
+
+        return raw_metric, (
+            f"PolyChord log-likelihood is the raw metric `{key}` with no sign flip; "
+            "higher returned values are preferred by PolyChord."
+        )
+
+    try:
+        code = compile(metric_spec, "<metric>", "eval")
+    except SyntaxError as exc:
+        raise SystemExit(f"invalid --metric expression: {exc}") from exc
+
+    globals_ns = _math_namespace()
+    globals_ns["__builtins__"] = {}
+    probe_metrics = {name: 1.0 for name in METRIC_NAMES}
+    try:
+        eval(code, globals_ns, probe_metrics)
+    except Exception as exc:
+        raise SystemExit(f"invalid --metric expression: {exc}") from exc
+
+    def expression_metric(metrics: dict[str, float]) -> float:
+        return float(eval(code, globals_ns, metrics))
+
+    return expression_metric, (
+        f"PolyChord log-likelihood is the expression `{metric_spec}` with no sign flip; "
+        "higher returned values are preferred by PolyChord."
+    )
+
+
+def evaluate(
+    params: dict[str, Any],
+    args: argparse.Namespace,
+    eval_dir: Path,
+    eval_id: int,
+    objective_from_metrics: Callable[[dict[str, float]], float],
+) -> dict[str, Any]:
     eval_dir.mkdir(parents=True, exist_ok=False)
     ms_path = eval_dir / "sim.ms"
     sim_stdout = eval_dir / "simulate.stdout.log"
@@ -233,7 +297,7 @@ def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, e
         return {
             "eval_id": eval_id,
             "params": params,
-            "badness": 100.0,
+            "objective": FAILURE_OBJECTIVE,
             "error": f"simulation failed with exit {exc.returncode}",
             "paths": {"eval_dir": str(eval_dir)},
         }
@@ -291,7 +355,7 @@ def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, e
         return {
             "eval_id": eval_id,
             "params": params,
-            "badness": 100.0,
+            "objective": FAILURE_OBJECTIVE,
             "error": f"wsclean failed with exit {run_result.returncode}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
             "wall_seconds": run_result.wall_seconds,
@@ -301,12 +365,12 @@ def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, e
     image_path = wsclean_dir / "recon-image.fits"
     try:
         metrics = compute_image_metrics(image_path, params["source_flux_jy"], run_result.wall_seconds, peak_memory_bytes)
-        badness = badness_from_metrics(metrics)
+        objective = objective_from_metrics(metrics)
     except Exception as exc:
         return {
             "eval_id": eval_id,
             "params": params,
-            "badness": 100.0,
+            "objective": FAILURE_OBJECTIVE,
             "error": f"metric computation failed: {exc}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path), "image": str(image_path)},
         }
@@ -315,7 +379,7 @@ def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, e
         "eval_id": eval_id,
         "params": params,
         "metrics": metrics,
-        "badness": badness,
+        "objective": objective,
         "paths": {
             "eval_dir": str(eval_dir),
             "measurement_set": str(ms_path),
@@ -333,8 +397,34 @@ def evaluate(params: dict[str, Any], args: argparse.Namespace, eval_dir: Path, e
     return record
 
 
+def _self_check_metric_resolution() -> None:
+    sample = {name: float(index + 1) for index, name in enumerate(METRIC_NAMES)}
+    sample["log_snr"] = 2.5
+    sample["relative_l2_error"] = 0.5
+    sample["wall_seconds"] = 120.0
+    sample["peak_memory_bytes"] = 1024.0**3
+
+    badness_fn, _ = resolve_metric("badness")
+    assert badness_fn(sample) == badness_from_metrics(sample)
+
+    snr_fn, _ = resolve_metric("snr")
+    assert snr_fn(sample) == sample["snr"]
+
+    expr_fn, _ = resolve_metric("log_snr + 0.1 * wall_seconds")
+    assert expr_fn(sample) == sample["log_snr"] + 0.1 * sample["wall_seconds"]
+
+    for invalid in ("not_a_metric", "snr + unknown", "snr ++", "__import__('os').system('id')"):
+        try:
+            resolve_metric(invalid)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"expected SystemExit for invalid metric {invalid!r}")
+
+
 def main() -> None:
     args = parse_args()
+    objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluations_dir = output_dir / "evaluations"
@@ -365,11 +455,11 @@ def main() -> None:
         if key not in cache:
             eval_id = len(evaluations) + 1
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
-            record = evaluate(params, args, eval_dir, eval_id)
+            record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
             cache[key] = record
             evaluations.append(record)
-            print(json.dumps({"eval_id": eval_id, "badness": record["badness"], "params": params}), flush=True)
-        return float(cache[key]["badness"]), []
+            print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
+        return float(cache[key]["objective"]), []
 
     settings = PolyChordSettings(len(PARAMETER_SPACE), 0)
     settings.base_dir = str(output_dir / "chains")
@@ -384,12 +474,13 @@ def main() -> None:
 
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
 
-    best = max(evaluations, key=lambda item: item["badness"]) if evaluations else None
+    best = max(evaluations, key=lambda item: item["objective"]) if evaluations else None
     summary = {
         "algorithm": "wsclean",
         "vla_config": "VLA.A",
         "run_type": "cheap infrastructure PoC",
-        "likelihood_framing": "PolyChord log-likelihood is the badness score; higher means worse reconstruction.",
+        "metric": args.metric,
+        "likelihood_framing": likelihood_framing,
         "polychord": {
             "nlive": args.nlive,
             "num_repeats": args.num_repeats,
@@ -406,4 +497,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("POLYCHORD_WSCLEAN_POC_SELF_CHECK") == "1":
+        _self_check_metric_resolution()
+        print("metric resolution self-check passed")
+    else:
+        main()
