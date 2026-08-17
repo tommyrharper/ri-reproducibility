@@ -42,6 +42,7 @@ Useful overrides:
 
 ```bash
 NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
+NS_METRIC=snr make nested-sampling-poc
 OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
 ```
 
@@ -70,7 +71,7 @@ Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
 frequency sets are a follow-up ceiling.
 
-## Metrics And Badness
+## Metrics And Objective
 
 For each sample, the pipeline records:
 
@@ -78,12 +79,16 @@ For each sample, the pipeline records:
 |---|---|
 | `snr` | Reconstructed image peak divided by off-source RMS |
 | `log_snr` | `log10(snr)` |
+| `off_source_rms_jy` | Off-source RMS in Jy/beam |
+| `peak_jy_per_beam` | Peak absolute flux in the reconstructed image |
 | `relative_l2_error` | Image residual versus the one-pixel point-source truth |
 | `peak_flux_abs_error_jy` | Absolute centre-pixel flux error |
 | `wall_seconds` | WSClean container runtime |
 | `peak_memory_bytes` | Peak WSClean memory from GNU `time`, with Docker stats as a secondary source |
 
-The badness score is:
+PolyChord maximizes whatever value the run returns as its log-likelihood. The
+default objective is a composite badness score (higher means worse
+reconstruction or a more expensive run):
 
 ```text
 max(0, 3 - log_snr)
@@ -92,8 +97,34 @@ max(0, 3 - log_snr)
 + 0.02 * min(peak_memory_bytes / 2 GiB, 5)
 ```
 
-PolyChord receives this badness score as its log-likelihood. That means
-high-likelihood samples are bad reconstructions or expensive runs.
+### Choosing the objective (`--metric` / `NS_METRIC`)
+
+`scripts/lib/nested_sampling/polychord_wsclean_poc.py` accepts
+`--metric <value>`. The shell wrapper forwards `NS_METRIC` when set. Resolution
+order:
+
+1. `badness` (default) — the composite formula above.
+2. Any bare metric name from the table — use that raw value directly as the
+   objective.
+3. Any other string — treat it as an arithmetic expression over the same metric
+   names (for example `log_snr + 0.1 * wall_seconds`, or the composite formula
+   rewritten by hand).
+
+Expressions are compiled once at startup (before any Docker evaluations) and
+evaluated in a restricted namespace: no Python builtins, metric names as
+locals, and `math` module functions available by name. A typo or unsafe
+expression fails immediately at startup.
+
+PolyChord always maximizes the returned value. The default badness score is
+oriented so higher is worse. Raw metrics keep their natural orientation with no
+automatic sign flip: `--metric snr` searches for the highest-SNR corner, and a
+worst-SNR search must negate explicitly (`--metric "-snr"` or
+`--metric "1/snr"`). Failed simulations or WSClean runs still receive objective
+`100.0`.
+
+Each evaluation record and `poc-summary.json` store the chosen value in an
+`objective` field. `poc-summary.json` also records the `--metric` string and a
+`likelihood_framing` sentence describing what was optimized.
 
 ## Output Files
 

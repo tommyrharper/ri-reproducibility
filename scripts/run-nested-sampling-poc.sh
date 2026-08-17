@@ -47,6 +47,10 @@ RUN_COMMAND=(
   --platform "${PLATFORM}"
 )
 
+if [ -n "${NS_METRIC:-}" ]; then
+  RUN_COMMAND+=(--metric "${NS_METRIC}")
+fi
+
 scripts/record-environment.sh \
   --tool polychord \
   --image "${POLYCHORD_IMAGE}" \
