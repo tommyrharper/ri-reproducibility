@@ -182,10 +182,10 @@ Both `polychord_wsclean_poc.py` and `polychord_r2d2_poc.py` accept
 `--metric <value>` (default `off_source_rms_jy`). The shell wrappers forward
 `NS_METRIC` with the same default. Resolution order:
 
-1. `badness` — the composite formula above.
-2. Any bare metric name from the table — use that raw value directly as the
+1. `badness` - the composite formula above.
+2. Any bare metric name from the table - use that raw value directly as the
    objective (including the default `off_source_rms_jy`).
-3. Any other string — treat it as an arithmetic expression over the same metric
+3. Any other string - treat it as an arithmetic expression over the same metric
    names (for example `log_snr + 0.1 * wall_seconds`, or the composite formula
    rewritten by hand).
 
