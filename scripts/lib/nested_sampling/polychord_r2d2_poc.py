@@ -30,6 +30,7 @@ from poc_common import (
     self_check_metric_resolution,
     simulate_measurement_set,
     stable_seed,
+    write_polychord_paramnames,
 )
 
 DEFAULT_R2D2_IM_DIM = 128
@@ -257,6 +258,7 @@ def main() -> None:
     settings.write_resume = False
     settings.feedback = 1
 
+    write_polychord_paramnames(output_dir / "chains", settings.file_root)
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
 
     best = max(evaluations, key=lambda item: item["objective"]) if evaluations else None

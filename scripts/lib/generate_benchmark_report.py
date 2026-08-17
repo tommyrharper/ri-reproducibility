@@ -41,7 +41,7 @@ LOG_Z_RE = re.compile(
 )
 
 
-def render_fits_to_data_uri(path):
+def render_fits_to_data_uri(path, figsize=(4, 4), dpi=130):
     data = fits.getdata(path)
     data = np.squeeze(np.asarray(data, dtype=float))
     if data.ndim != 2:
@@ -56,7 +56,7 @@ def render_fits_to_data_uri(path):
         if vmin == vmax:
             vmin, vmax = vmin - 1, vmax + 1
     norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
-    fig, ax = plt.subplots(figsize=(4, 4), dpi=130)
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     ax.imshow(data, origin="lower", cmap="inferno", norm=norm)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -138,6 +138,23 @@ def render_array_to_data_uri(fig):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def label_chain_samples(samples, param_names):
+    """Map PolyChord's numeric columns onto parameter_space names."""
+    import pandas as pd
+
+    new_tuples = []
+    for col in samples.columns:
+        if isinstance(col, tuple) and isinstance(col[0], (int, np.integer)):
+            idx = int(col[0])
+            if idx < len(param_names):
+                new_tuples.append((param_names[idx], col[1]))
+                continue
+        new_tuples.append(col)
+    labelled = samples.copy()
+    labelled.columns = pd.MultiIndex.from_tuples(new_tuples, names=samples.columns.names)
+    return labelled
+
+
 def render_posterior_plot(chain_root, param_names):
     try:
         import anesthetic
@@ -149,15 +166,111 @@ def render_posterior_plot(chain_root, param_names):
     except Exception:
         return None
 
+    samples = label_chain_samples(samples, param_names)
     plot_params = [name for name in param_names if name in samples.columns]
     if len(plot_params) < 2:
         return None
 
+    plot_params = plot_params[: min(4, len(plot_params))]
     try:
-        grid = anesthetic.plot.plot_2d(samples, plot_params[: min(4, len(plot_params))])
-        return render_array_to_data_uri(grid.fig)
+        grid = samples.plot_2d(plot_params, kind="scatter_2d")
+        fig = grid.iloc[0, 0].figure
+        return render_array_to_data_uri(fig)
+    except Exception:
+        pass
+
+    try:
+        fig, axes = anesthetic.make_2d_axes(plot_params)
+        for yi, y in enumerate(plot_params):
+            for xi, x in enumerate(plot_params):
+                ax = axes.iloc[yi, xi]
+                if yi == xi:
+                    values = samples[x].values
+                    ax.hist(values, bins=min(max(len(values), 1), 8))
+                elif yi > xi:
+                    ax.scatter(samples[x].values, samples[y].values, s=14, alpha=0.85)
+                else:
+                    ax.axis("off")
+        fig.tight_layout()
+        return render_array_to_data_uri(fig)
     except Exception:
         return None
+
+
+def objective_fill(objective, obj_min, obj_max):
+    if obj_max > obj_min:
+        return (float(objective) - obj_min) / (obj_max - obj_min)
+    return 1.0
+
+
+def render_eval_glance(evaluations, metric, run_dir, failed_count):
+    if not evaluations:
+        if failed_count:
+            return (
+                '<div class="eval-glance">'
+                f'<div class="headline"><span class="badge badge-warn">{failed_count} failed</span>'
+                " · no successful evaluations</div></div>"
+            )
+        return ""
+
+    objectives = [float(ev.get("objective", 0)) for ev in evaluations]
+    obj_min, obj_max = min(objectives), max(objectives)
+    best = evaluations[0]
+    metric_label = html.escape(metric or "objective")
+
+    headline_bits = [
+        f'<span class="badge badge-ok">{len(evaluations)} succeeded</span>',
+    ]
+    if failed_count:
+        headline_bits.append(f'<span class="badge badge-warn">{failed_count} failed</span>')
+    headline_bits.extend(
+        [
+            f"optimized <strong>{metric_label}</strong>",
+            (
+                f"range <strong>{fmt_value(obj_min)}</strong>"
+                f'<span class="delta">–</span><strong>{fmt_value(obj_max)}</strong>'
+            ),
+            (
+                f"best eval <strong>#{html.escape(str(best.get('eval_id', '?')))}</strong>"
+                f' <span class="delta">({fmt_value(best.get("objective"))})</span>'
+            ),
+        ]
+    )
+    headline_html = f'<div class="headline">{" · ".join(headline_bits)}</div>'
+
+    strip_cells = []
+    best_eval_id = best.get("eval_id")
+    for ev in evaluations:
+        eval_id = ev.get("eval_id", "?")
+        objective = float(ev.get("objective", 0))
+        fill = objective_fill(objective, obj_min, obj_max)
+        best_class = " is-best" if eval_id == best_eval_id else ""
+        title = html.escape(f"eval {eval_id}: {fmt_value(objective)}")
+        strip_cells.append(
+            f'<div class="eval-strip-cell{best_class}" style="--fill:{fill:.4f}" title="{title}"></div>'
+        )
+    strip_html = (
+        '<div class="eval-strip-wrap">'
+        f'<div class="eval-strip" aria-label="Evaluation objectives from best to worst">'
+        f'{"".join(strip_cells)}</div>'
+        '<p class="eval-strip-label">Each bar is one evaluation (best left); height encodes objective within this run.</p>'
+        "</div>"
+    )
+
+    best_image_html = ""
+    image_path = resolve_run_path(run_dir, (best.get("paths") or {}).get("image"))
+    if image_path:
+        uri = render_fits_to_data_uri(image_path, figsize=(5.5, 5.5), dpi=140)
+        if uri:
+            best_image_html = f"""
+            <figure class="best-eval-figure">
+              <img src="{uri}" alt="Best evaluation {html.escape(str(best.get('eval_id', '?')))}">
+              <figcaption>Best evaluation #{html.escape(str(best.get('eval_id', '?')))}
+                · {metric_label} {fmt_value(best.get('objective'))}</figcaption>
+            </figure>
+            """
+
+    return f'<div class="eval-glance">{headline_html}{strip_html}{best_image_html}</div>'
 
 
 def render_nested_sampling_run(poc_summary_path):
@@ -279,15 +392,20 @@ def render_nested_sampling_run(poc_summary_path):
 
     evaluations_html = ""
     if eval_rows:
+        glance_html = render_eval_glance(evaluations, metric, run_dir, len(failed))
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
-          <div class="eval-table-wrap">
-            <table class="eval-table">
-              <thead>{eval_header}</thead>
-              <tbody>{"".join(eval_rows)}</tbody>
-            </table>
-          </div>
+          {glance_html}
+          <details>
+            <summary>{len(eval_rows)} evaluations (raw table)</summary>
+            <div class="eval-table-wrap">
+              <table class="eval-table">
+                <thead>{eval_header}</thead>
+                <tbody>{"".join(eval_rows)}</tbody>
+              </table>
+            </div>
+          </details>
           {failed_html}
         </section>
         """
@@ -491,6 +609,32 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .eval-table th, .eval-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); text-align: left; vertical-align: top; }
 .eval-table th { opacity: 0.7; white-space: nowrap; }
 .eval-thumb { width: 96px; height: auto; border-radius: 4px; display: block; }
+.eval-glance { margin: 0.75rem 0 1rem; }
+.eval-strip-wrap { margin: 0.75rem 0; }
+.eval-strip {
+  display: flex; align-items: flex-end; gap: 3px;
+  height: 3rem; padding: 0 1px;
+}
+.eval-strip-cell {
+  flex: 1 1 0; min-width: 0;
+  height: calc(25% + 75% * var(--fill, 0.5));
+  background: color-mix(in srgb, AccentColor calc(20% + 60% * var(--fill, 0.5)), transparent);
+  border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+  border-radius: 3px 3px 0 0;
+}
+.eval-strip-cell.is-best {
+  background: color-mix(in srgb, #2e9e5b 50%, transparent);
+  border-color: color-mix(in srgb, #2e9e5b 70%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, #2e9e5b 30%, transparent);
+}
+.eval-strip-label { font-size: 0.75rem; opacity: 0.65; margin: 0.35rem 0 0; }
+.best-eval-figure { margin: 1rem 0 0.25rem; }
+.best-eval-figure img {
+  width: 100%; max-width: 420px; height: auto; display: block;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+}
+.best-eval-figure figcaption { font-size: 0.8rem; opacity: 0.75; margin-top: 0.35rem; }
 .posterior-plot { margin: 0.5rem 0; }
 .posterior-plot img { max-width: 100%; height: auto; border-radius: 6px; }
 .section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
