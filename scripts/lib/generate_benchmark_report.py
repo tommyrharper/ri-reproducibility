@@ -16,6 +16,7 @@ new tools (wsclean) and fields get added without needing a fixed schema.
 """
 import base64
 import glob
+import hashlib
 import html
 import io
 import json
@@ -239,8 +240,9 @@ def objective_fill(objective, obj_min, obj_max):
 
 def run_tab_id(run_name):
     """Sanitize a run directory name into a valid unique HTML id fragment."""
-    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", run_name)
-    return sanitized.strip("-") or "run"
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", run_name).strip("-") or "run"
+    digest = hashlib.sha1(run_name.encode()).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
 
 
 def render_images_posterior_collapsible(tab_id, eval_images_html, posterior_html):
