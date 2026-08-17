@@ -38,6 +38,7 @@ RUN_COMMAND=(
   -e R2D2_IMAGE="${R2D2_IMAGE}"
   -e CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
+  ${R2D2_OMP_THREADS:+-e "R2D2_OMP_THREADS=${R2D2_OMP_THREADS}"}
   --entrypoint python3
   "${POLYCHORD_IMAGE}"
   /opt/ri-nested-sampling/polychord_r2d2_poc.py
