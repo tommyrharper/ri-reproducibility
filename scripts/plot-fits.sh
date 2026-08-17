@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
 RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/results}"
 
-# shellcheck source=lib/r2d2-docker-thread-env.sh
+# shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 
 if [ "$#" -gt 0 ]; then
