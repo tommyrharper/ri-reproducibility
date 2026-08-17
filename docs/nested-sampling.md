@@ -272,11 +272,14 @@ make anesthetic-gui RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 ```
 
-With no `RUN=`, the latest `results/nested-sampling-poc/*/` directory is used.
-The script writes/refreshes `chains/<root>.paramnames` from that run's
-`poc-summary.json` / `parameter-space.json` so anesthetic shows names such as
-`log10_dynamic_range` instead of `0, 1, 2…`. Requires the host `uv` project
-dependency `anesthetic` (`uv add anesthetic` if missing).
+With no `RUN=`, the latest *completed* run (has `poc-summary.json` and
+`chains/`) under `results/nested-sampling-poc/*/` is used. The script
+writes/refreshes `chains/<root>.paramnames` from that run's
+`poc-summary.json` / `parameter-space.json` and passes only the searched
+Fourier parameter names into `samples.gui(params=...)` (not `logL` /
+`logL_birth` / `nlive`). Close the GUI window to return to the shell.
+Requires the host `uv` project dependency `anesthetic`
+(`uv add anesthetic` if missing).
 
 The run also writes a standard environment manifest through
 `scripts/record-environment.sh`.

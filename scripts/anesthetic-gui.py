@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
@@ -45,15 +46,20 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         default=None,
         help="Run directory, chains/ directory, or PolyChord file root. "
-        "Default: most recent results/nested-sampling-poc/*/ ",
+        "Default: most recent completed results/nested-sampling-poc/*/ ",
     )
     return parser.parse_args()
 
 
 def latest_run_dir() -> Path:
-    runs = [p for p in NESTED_SAMPLING_DIR.glob("*") if p.is_dir() and (p / "chains").is_dir()]
+    """Newest completed run: requires poc-summary.json and chains/."""
+    runs = [
+        p
+        for p in NESTED_SAMPLING_DIR.glob("*")
+        if p.is_dir() and (p / "chains").is_dir() and (p / "poc-summary.json").is_file()
+    ]
     if not runs:
-        raise SystemExit(f"No nested-sampling runs found under {NESTED_SAMPLING_DIR}")
+        raise SystemExit(f"No completed nested-sampling runs found under {NESTED_SAMPLING_DIR}")
     return max(runs, key=lambda p: p.stat().st_mtime)
 
 
@@ -141,6 +147,11 @@ def load_parameter_space(run_dir: Path) -> list[dict[str, Any]]:
     return list(FALLBACK_PARAMETER_SPACE)
 
 
+def searched_param_names(parameter_space: list[dict[str, Any]]) -> list[str]:
+    """Fourier / search params only — never logL, logL_birth, nlive."""
+    return [str(spec["name"]) for spec in parameter_space if "name" in spec]
+
+
 def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) -> Path:
     path = chain_root.parent / f"{chain_root.name}.paramnames"
     with path.open("w") as handle:
@@ -149,6 +160,22 @@ def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) ->
             tex = PARAMETER_TEX_LABELS.get(name, name)
             handle.write(f"{name}   {tex}\n")
     return path
+
+
+@contextmanager
+def hide_empty_phys_live_birth(chain_root: Path) -> Iterator[None]:
+    """Aside empty *_phys_live-birth.txt so anesthetic's np.loadtxt doesn't warn."""
+    path = Path(str(chain_root) + "_phys_live-birth.txt")
+    aside = path.with_name(path.name + ".empty")
+    moved = False
+    if path.is_file() and path.stat().st_size == 0:
+        path.rename(aside)
+        moved = True
+    try:
+        yield
+    finally:
+        if moved and aside.is_file() and not path.exists():
+            aside.rename(path)
 
 
 def run_title(run_dir: Path, chain_root: Path) -> str:
@@ -174,10 +201,12 @@ def main() -> None:
     chain_root = find_chain_root(target)
     run_dir = run_dir_for_chain_root(chain_root)
     space = load_parameter_space(run_dir)
+    params = searched_param_names(space)
     paramnames = write_paramnames(chain_root, space)
     title = run_title(run_dir, chain_root)
     print(f"chain root: {chain_root}")
     print(f"paramnames: {paramnames}")
+    print(f"gui params: {params}")
     print(f"title: {title}")
 
     try:
@@ -189,15 +218,15 @@ def main() -> None:
         ) from exc
 
     # Let anesthetic read <root>.paramnames so TeX labels get wrapped in $...$.
-    samples = read_chains(str(chain_root))
-    plotter = samples.gui()
+    with hide_empty_phys_live_birth(chain_root):
+        samples = read_chains(str(chain_root))
+    plotter = samples.gui(params=params)
     plotter.fig.suptitle(title, fontsize=12)
-    plotter.fig.tight_layout()
     plotter.fig.subplots_adjust(top=0.92)
     manager = getattr(plotter.fig.canvas, "manager", None)
     if manager is not None and hasattr(manager, "set_window_title"):
         manager.set_window_title(title)
-    plotter.fig.canvas.draw()
+    print("Opening GUI — close the window to return to the shell.", flush=True)
     plt.show()
 
 
