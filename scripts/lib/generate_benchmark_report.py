@@ -382,12 +382,6 @@ def render_eval_images(evaluations, metric, run_dir, parameter_space):
     return f'<div class="eval-images">{truth_html}{cards_html}</div>'
 
 
-def render_eval_glance(evaluations, metric, run_dir, failed_count, parameter_space):
-    summary_html = render_eval_glance_summary(evaluations, metric, failed_count)
-    images_html = render_eval_images(evaluations, metric, run_dir, parameter_space)
-    return f"{summary_html}{images_html}"
-
-
 def render_nested_sampling_run(poc_summary_path):
     run_dir = os.path.dirname(poc_summary_path)
     run_name = os.path.basename(run_dir)
