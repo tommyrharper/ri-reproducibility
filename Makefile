@@ -2,7 +2,7 @@
         smoke-test smoke-test-wsclean smoke-test-r2d2 nested-sampling-poc nested-sampling-r2d2-poc \
         shell-wsclean shell-r2d2 shell-meqtrees shell-polychord \
         fetch-r2d2-checkpoints record-environment plot-fits \
-        benchmark-report nested-sampling-report anesthetic-gui \
+        benchmark-report nested-sampling-report anesthetic-gui merge-nested-sampling \
         config clean disk-usage
 
 SHELL := /usr/bin/env bash
@@ -77,6 +77,11 @@ nested-sampling-report:
 # run dir, chains/, or PolyChord file root; default is the latest PoC run.
 anesthetic-gui:
 	uv run scripts/anesthetic-gui.py $(RUN)
+
+# Merge two or more compatible PoC runs into one run directory.
+# RUNS="results/nested-sampling-poc/A results/nested-sampling-poc/B [--out DIR]"
+merge-nested-sampling:
+	uv run scripts/merge-nested-sampling-runs.py $(RUNS)
 
 config:
 	docker compose config

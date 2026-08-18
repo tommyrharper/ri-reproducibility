@@ -6,18 +6,25 @@ Run on the host (needs a display), e.g.:
   uv run scripts/anesthetic-gui.py
   uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-...
   make anesthetic-gui RUN=results/nested-sampling-poc/wsclean-vlaa-...
+
+Also opens a merged run directory (poc-summary.json with merged_from),
+re-merging the source runs' chains on the fly via anesthetic_io.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from contextlib import contextmanager
+import sys
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
+
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
+
+from anesthetic_io import find_chain_root, load_nested_samples  # noqa: E402
 
 # GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
 PARAMETER_TEX_LABELS = {
@@ -51,81 +58,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def is_completed_run(run_dir: Path) -> bool:
+    """Completed: poc-summary.json + chains/, or a merged run (poc-summary.json only)."""
+    if not run_dir.is_dir():
+        return False
+    summary_path = run_dir / "poc-summary.json"
+    if not summary_path.is_file():
+        return False
+    if (run_dir / "chains").is_dir():
+        return True
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(summary.get("merged_from"))
+
+
 def latest_run_dir() -> Path:
-    """Newest completed run: requires poc-summary.json and chains/."""
-    runs = [
-        p
-        for p in NESTED_SAMPLING_DIR.glob("*")
-        if p.is_dir() and (p / "chains").is_dir() and (p / "poc-summary.json").is_file()
-    ]
+    runs = [p for p in NESTED_SAMPLING_DIR.glob("*") if is_completed_run(p)]
     if not runs:
         raise SystemExit(f"No completed nested-sampling runs found under {NESTED_SAMPLING_DIR}")
     return max(runs, key=lambda p: p.stat().st_mtime)
 
 
-def find_chain_root(target: Path) -> Path:
-    """Return PolyChord file root (path without _dead-birth.txt suffix)."""
+def resolve_target(target: Path) -> Path:
     target = target.expanduser()
     if not target.is_absolute():
         target = (Path.cwd() / target).resolve()
     else:
         target = target.resolve()
-
-    if not target.exists() and not Path(str(target) + "_dead-birth.txt").is_file():
-        suggestions = _similar_run_dirs(target.name)
-        hint = ""
-        if suggestions:
-            hint = " Did you mean:\n  " + "\n  ".join(suggestions)
-        raise SystemExit(f"Path does not exist: {target}{hint}")
-
-    if target.is_file():
-        name = target.name
-        for suffix in (
-            "_dead-birth.txt",
-            "_phys_live-birth.txt",
-            "_dead.txt",
-            "_equal_weights.txt",
-            ".stats",
-            ".paramnames",
-            ".txt",
-        ):
-            if name.endswith(suffix):
-                return target.with_name(name[: -len(suffix)])
-        raise SystemExit(f"Unrecognized chain file: {target}")
-
-    if target.is_dir():
-        chains_dir = target / "chains" if (target / "chains").is_dir() else target
-        dead = sorted(chains_dir.glob("*_dead-birth.txt"))
-        if len(dead) == 1:
-            return dead[0].with_name(dead[0].name[: -len("_dead-birth.txt")])
-        if len(dead) > 1:
-            names = ", ".join(p.name for p in dead)
-            raise SystemExit(f"Multiple chain roots in {chains_dir}: {names}")
-        raise SystemExit(f"No *_dead-birth.txt under {chains_dir}")
-
-    dead = Path(str(target) + "_dead-birth.txt")
-    if dead.is_file():
-        return target
-    raise SystemExit(f"No nested-sampling chains at {target}")
+    return target
 
 
-def _similar_run_dirs(name: str) -> list[str]:
-    """Suggest nearby run directory names when RUN= looks like a typo."""
-    if not NESTED_SAMPLING_DIR.is_dir():
-        return []
-    runs = [p.name for p in NESTED_SAMPLING_DIR.iterdir() if p.is_dir()]
-    # Prefer names that share a long common prefix with the typo.
-    scored = []
-    for run in runs:
-        common = 0
-        for a, b in zip(name, run):
-            if a != b:
-                break
-            common += 1
-        if common >= 8 or name.rstrip("0123456789") == run or run.startswith(name[:16]):
-            scored.append((common, run))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return [f"results/nested-sampling-poc/{run}" for _, run in scored[:5]]
+def merged_run_dir(target: Path) -> Path | None:
+    """target itself if it's a merged run directory, else None."""
+    summary_path = target / "poc-summary.json"
+    if not target.is_dir() or not summary_path.is_file():
+        return None
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, ValueError):
+        return None
+    return target if summary.get("merged_from") else None
 
 
 def run_dir_for_chain_root(chain_root: Path) -> Path:
@@ -162,23 +136,7 @@ def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) ->
     return path
 
 
-@contextmanager
-def hide_empty_phys_live_birth(chain_root: Path) -> Iterator[None]:
-    """Aside empty *_phys_live-birth.txt so anesthetic's np.loadtxt doesn't warn."""
-    path = Path(str(chain_root) + "_phys_live-birth.txt")
-    aside = path.with_name(path.name + ".empty")
-    moved = False
-    if path.is_file() and path.stat().st_size == 0:
-        path.rename(aside)
-        moved = True
-    try:
-        yield
-    finally:
-        if moved and aside.is_file() and not path.exists():
-            aside.rename(path)
-
-
-def run_title(run_dir: Path, chain_root: Path) -> str:
+def run_title(run_dir: Path, fallback_label: str) -> str:
     """Human-readable window title for the anesthetic GUI."""
     parts: list[str] = [run_dir.name]
     summary_path = run_dir / "poc-summary.json"
@@ -188,38 +146,46 @@ def run_title(run_dir: Path, chain_root: Path) -> str:
         metric = data.get("metric")
         vla = data.get("vla_config")
         meta = [str(x) for x in (algorithm, vla, metric) if x]
+        if data.get("merged_from"):
+            meta.append("merged")
         if meta:
             parts.append(" · ".join(meta))
     else:
-        parts.append(chain_root.name)
+        parts.append(fallback_label)
     return " — ".join(parts)
 
 
 def main() -> None:
     args = parse_args()
-    target = Path(args.target) if args.target else latest_run_dir()
-    chain_root = find_chain_root(target)
-    run_dir = run_dir_for_chain_root(chain_root)
+    target = resolve_target(Path(args.target)) if args.target else latest_run_dir()
+
+    run_dir = merged_run_dir(target)
+    chain_root = None
+    if run_dir is None:
+        chain_root = find_chain_root(target)
+        run_dir = run_dir_for_chain_root(chain_root)
+
     space = load_parameter_space(run_dir)
     params = searched_param_names(space)
-    paramnames = write_paramnames(chain_root, space)
-    title = run_title(run_dir, chain_root)
-    print(f"chain root: {chain_root}")
-    print(f"paramnames: {paramnames}")
+    title = run_title(run_dir, chain_root.name if chain_root else run_dir.name)
+
+    if chain_root is not None:
+        paramnames = write_paramnames(chain_root, space)
+        print(f"chain root: {chain_root}")
+        print(f"paramnames: {paramnames}")
+    else:
+        print(f"merged run dir: {run_dir}")
     print(f"gui params: {params}")
     print(f"title: {title}")
 
     try:
-        from anesthetic import read_chains
         import matplotlib.pyplot as plt
     except ImportError as exc:
         raise SystemExit(
             "anesthetic (and matplotlib) required on the host. Install with: uv add anesthetic"
         ) from exc
 
-    # Let anesthetic read <root>.paramnames so TeX labels get wrapped in $...$.
-    with hide_empty_phys_live_birth(chain_root):
-        samples = read_chains(str(chain_root))
+    samples = load_nested_samples(run_dir)
     plotter = samples.gui(params=params)
     plotter.fig.suptitle(title, fontsize=12)
     plotter.fig.subplots_adjust(top=0.92)

@@ -259,7 +259,10 @@ make nested-sampling-report
 ```
 
 The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
-(no manifest join). It parses PolyChord `chains/*.stats` for log(Z) and shows
+(no manifest join), so a merged run directory (see **Merge runs** below) shows
+up as its own card automatically. Evidence prefers a `log_z` /
+`log_z_err` pair already in the summary (written for merged runs); otherwise
+it parses PolyChord `chains/*.stats` for log(Z). It shows
 each run's total wall-clock duration (from `total_wall_seconds`, when present)
 top-right in the card header. Per-run images - the shared synthesized
 ground-truth image and a per-evaluation card gallery (reconstruction,
@@ -281,17 +284,64 @@ make anesthetic-gui RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 ```
 
-With no `RUN=`, the latest *completed* run (has `poc-summary.json` and
-`chains/`) under `results/nested-sampling-poc/*/` is used. The script
-writes/refreshes `chains/<root>.paramnames` from that run's
-`poc-summary.json` / `parameter-space.json` and passes only the searched
-Fourier parameter names into `samples.gui(params=...)` (not `logL` /
+With no `RUN=`, the latest *completed* run under `results/nested-sampling-poc/*/`
+is used - either a plain run (`poc-summary.json` and `chains/`) or a merged
+run (`poc-summary.json` with `merged_from`, no local `chains/`). For a plain
+run the script writes/refreshes `chains/<root>.paramnames` from that run's
+`poc-summary.json` / `parameter-space.json`; either way it passes only the
+searched Fourier parameter names into `samples.gui(params=...)` (not `logL` /
 `logL_birth` / `nlive`). Close the GUI window to return to the shell.
 Requires the host `uv` project dependency `anesthetic`
 (`uv add anesthetic` if missing).
 
 The run also writes a standard environment manifest through
 `scripts/record-environment.sh`.
+
+## Merge runs
+
+Independent PolyChord runs of the **same likelihood and prior** can be fused
+after the fact into one run directory, without re-running PolyChord. This is
+post-processing only: it concatenates nested-sampling dead points with
+`anesthetic.samples.merge_nested_samples` and recomputes live-point weights.
+Evaluation directories, FITS images, and PolyChord chain files are never
+copied; the merged summary just points back at the absolute evaluation paths
+and source run directories already on disk.
+
+Sampler effort may differ between sources; the search itself must not:
+
+| May differ | Must match |
+|---|---|
+| `NS_NLIVE` / `polychord.nlive` | `algorithm` |
+| `NS_NUM_REPEATS` / `polychord.num_repeats` | `vla_config` |
+| `NS_MAX_NDEAD` / `polychord.max_ndead` | `metric` |
+| `seed`, `mpi_procs` | `parameter_space` (name/min/max/kind) |
+| | `r2d2_fixed_hyperparameters` **or** `wsclean_fixed_hyperparameters` |
+
+WSClean and R2D2 runs never merge with each other, nor do runs with a
+different `--metric` / `NS_METRIC` or a different prior box (the prior box is
+`PARAMETER_SPACE` in `scripts/lib/nested_sampling/poc_common.py`, copied into
+every `poc-summary.json` as `parameter_space`).
+
+```bash
+uv run scripts/merge-nested-sampling-runs.py \
+  results/nested-sampling-poc/r2d2-vlaa-AAA \
+  results/nested-sampling-poc/r2d2-vlaa-BBB
+
+make merge-nested-sampling RUNS="results/nested-sampling-poc/r2d2-vlaa-AAA results/nested-sampling-poc/r2d2-vlaa-BBB"
+```
+
+Writes `results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json`
+(pass `--out DIR` to pick a different output directory). Refuses with a
+non-zero exit and a clear message on fewer than two runs, a run missing
+`poc-summary.json` or `chains/`, or any must-match field above differing.
+`polychord.nlive` in the merged summary is the sum of source nlives;
+`num_repeats` / `max_ndead` / `seed` stay a single value when all sources
+agree, else become a list. Pooled `evaluations` keep source argument order,
+are renumbered `eval_id` `1..N` (originals kept as `source_eval_id` /
+`source_run`), and keep their original absolute `paths`.
+
+`make nested-sampling-report` and `make anesthetic-gui RUN=<merged-dir>` both
+treat the merged directory as a completed run - see the sections above.
 
 ## Deferred
 
