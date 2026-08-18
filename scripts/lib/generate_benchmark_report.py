@@ -958,13 +958,34 @@ def render_benchmark_body():
     )
 
 
-def render_nested_sampling_body(limit=None):
-    nested_paths = sorted(
-        glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
-        key=nested_sampling_run_sort_key,
+def resolve_nested_sampling_summary(run):
+    """Accept a run dir, poc-summary.json path, or directory name under nested-sampling-poc/."""
+    raw = Path(run)
+    name = raw.parent.name if raw.name == "poc-summary.json" else raw.name
+    candidates = []
+    if raw.name == "poc-summary.json":
+        candidates.append(raw)
+    candidates.append(raw / "poc-summary.json")
+    candidates.append(Path(NESTED_SAMPLING_DIR) / name / "poc-summary.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise SystemExit(
+        f"No poc-summary.json for run {run!r} "
+        f"(looked under {NESTED_SAMPLING_DIR}/{name}/)"
     )
-    if limit is not None:
-        nested_paths = nested_paths[:limit]
+
+
+def render_nested_sampling_body(limit=None, run=None):
+    if run:
+        nested_paths = [resolve_nested_sampling_summary(run)]
+    else:
+        nested_paths = sorted(
+            glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
+            key=nested_sampling_run_sort_key,
+        )
+        if limit is not None:
+            nested_paths = nested_paths[:limit]
     nested_cards = [render_nested_sampling_run(p) for p in nested_paths]
     if nested_cards:
         return "".join(nested_cards)
@@ -1014,6 +1035,11 @@ def parse_args(argv=None):
         default=None,
         help="Nested-sampling only: newest N runs (timestamp sort). Omit for all.",
     )
+    parser.add_argument(
+        "--run",
+        default=None,
+        help="Nested-sampling only: one run directory or name under nested-sampling-poc/.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1033,19 +1059,24 @@ def main(argv=None):
     else:
         out_path = args.out_path or "/workspace/out/nested-sampling-report.html"
         limit = args.limit
+        run = args.run
+        if limit is not None and run:
+            raise SystemExit("refuse: --limit and --run cannot be used together")
         if limit is not None and limit < 1:
             raise SystemExit("--limit must be >= 1")
         subtitle = (
             "Generated from <code>results/nested-sampling-poc/*/poc-summary.json</code> - "
             "regenerate with <code>make nested-sampling-report</code>."
         )
-        if limit is not None:
+        if run:
+            subtitle += f" Showing run <code>{html.escape(Path(run).name)}</code> only."
+        elif limit is not None:
             subtitle += f" Showing newest {limit} run{'s' if limit != 1 else ''} only."
         write_html_doc(
             out_path,
             title="ri-reproducibility nested-sampling report",
             subtitle=subtitle,
-            body=render_nested_sampling_body(limit=limit),
+            body=render_nested_sampling_body(limit=limit, run=run),
         )
 
 

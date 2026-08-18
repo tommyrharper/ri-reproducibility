@@ -4,32 +4,39 @@
 # Usage:
 #   scripts/generate-benchmark-report.sh benchmarks
 #   scripts/generate-benchmark-report.sh nested-sampling
-#   scripts/generate-benchmark-report.sh nested-sampling 1
+#   LAST=1 scripts/generate-benchmark-report.sh nested-sampling
+#   RUN=results/nested-sampling-poc/<id> scripts/generate-benchmark-report.sh nested-sampling
 #
 # Outputs:
 #   benchmarks/report.html
 #   benchmarks/nested-sampling-report.html
-#   benchmarks/nested-sampling-report-last.html  (when a limit is given)
+#   benchmarks/nested-sampling-report-last.html  (when LAST or RUN is set)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
 KIND="${1:-}"
-LIMIT="${2:-}"
+LIMIT="${LAST:-}"
+RUN_SEL="${RUN:-}"
 
 case "${KIND}" in
   benchmarks)
     OUT_NAME="report.html"
     ;;
   nested-sampling)
-    if [[ -n "${LIMIT}" ]]; then
+    if [[ -n "${LIMIT}" && -n "${RUN_SEL}" ]]; then
+      echo "refuse: LAST= and RUN= cannot be used together" >&2
+      exit 1
+    fi
+    if [[ -n "${LIMIT}" || -n "${RUN_SEL}" ]]; then
       OUT_NAME="nested-sampling-report-last.html"
     else
       OUT_NAME="nested-sampling-report.html"
     fi
     ;;
   *)
-    echo "usage: $0 {benchmarks|nested-sampling} [limit]" >&2
+    echo "usage: $0 {benchmarks|nested-sampling}" >&2
+    echo "  nested-sampling also reads LAST=N and RUN=<run dir or name>" >&2
     exit 1
     ;;
 esac
@@ -40,6 +47,9 @@ source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 REPORT_ARGS=(--kind "${KIND}" "/workspace/out/${OUT_NAME}")
 if [[ -n "${LIMIT}" ]]; then
   REPORT_ARGS+=(--limit "${LIMIT}")
+fi
+if [[ -n "${RUN_SEL}" ]]; then
+  REPORT_ARGS+=(--run "${RUN_SEL}")
 fi
 
 docker run --rm --platform linux/arm64 \
