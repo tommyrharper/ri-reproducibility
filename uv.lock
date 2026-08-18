@@ -430,7 +430,7 @@ wheels = [
 [[package]]
 name = "ri-reproducibility"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "anesthetic" },
 ]
