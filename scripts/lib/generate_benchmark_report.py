@@ -18,7 +18,6 @@ import json
 import os
 import re
 import sys
-import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +31,8 @@ import matplotlib.pyplot as plt
 REPO_ROOT = "/workspace/repo"
 MANIFEST_DIR = os.path.join(REPO_ROOT, "benchmarks/manifests")
 NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling-poc")
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
 
 LOG_Z_RE = re.compile(
     r"log\(Z\)\s*=\s*([-\d.]+E[+-]\d+)\s*\+/-\s*([-\d.]+E[+-]\d+)",
@@ -200,48 +201,44 @@ def resolve_run_path(run_dir, path):
     return None
 
 
-def label_chain_samples(samples, param_names):
-    """Map PolyChord's numeric columns onto parameter_space names."""
-    import pandas as pd
-
-    new_tuples = []
-    for col in samples.columns:
-        if isinstance(col, tuple) and isinstance(col[0], (int, np.integer)):
-            idx = int(col[0])
-            if idx < len(param_names):
-                new_tuples.append((param_names[idx], col[1]))
-                continue
-        new_tuples.append(col)
-    labelled = samples.copy()
-    labelled.columns = pd.MultiIndex.from_tuples(new_tuples, names=samples.columns.names)
-    return labelled
+def resolve_eval_path(run_dirs, path):
+    """resolve_run_path against each candidate run dir (own dir, then merge sources)."""
+    for run_dir in run_dirs:
+        resolved = resolve_run_path(run_dir, path)
+        if resolved:
+            return resolved
+    return None
 
 
-def render_posterior_plot(chain_root, param_names):
+def merged_source_run_dirs(summary):
+    """Container-mounted directories of a merged run's source runs (see merged_from)."""
+    dirs = []
+    for entry in summary.get("merged_from") or []:
+        name = entry.get("name") if isinstance(entry, dict) else str(entry)
+        rel_path = entry.get("path") if isinstance(entry, dict) else None
+        candidate = os.path.join(REPO_ROOT, rel_path) if rel_path else None
+        if not (candidate and os.path.isdir(candidate)) and name:
+            candidate = os.path.join(NESTED_SAMPLING_DIR, name)
+        if candidate and os.path.isdir(candidate):
+            dirs.append(candidate)
+    return dirs
+
+
+def render_posterior_plot(run_dir, param_names):
     try:
-        import anesthetic
+        from anesthetic_io import load_nested_samples
     except ImportError:
         return None
 
     try:
-        # Finished PolyChord runs sometimes leave an empty *_phys_live-birth.txt;
-        # anesthetic emits a numpy loadtxt UserWarning for those. Harmless.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r"loadtxt: input contained no data:.*_phys_live-birth\.txt",
-                category=UserWarning,
-            )
-            samples = anesthetic.read_chains(chain_root)
+        samples = load_nested_samples(run_dir)
     except Exception:
         return None
 
-    samples = label_chain_samples(samples, param_names)
     plot_params = [name for name in param_names if name in samples.columns]
     if len(plot_params) < 2:
         return None
 
-    plot_params = plot_params[: min(4, len(plot_params))]
     # ncompress=False: anesthetic triangular compression fails on some PoC chains.
     for kind, extra in (("kde", {"ncompress": False}), ("scatter", {})):
         try:
@@ -330,10 +327,10 @@ def render_shared_truth_image(image_path, source_flux_jy, figsize=(3.2, 3.2), dp
     )
 
 
-def render_eval_card(ev, parameter_space, run_dir, metric, is_best):
+def render_eval_card(ev, parameter_space, run_dirs, metric, is_best):
     eval_id = ev.get("eval_id", "?")
     params = ev.get("params") or {}
-    image_path = resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
+    image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
     metric_label = html.escape(metric or "objective")
     best_class = " is-best" if is_best else ""
     params_caption = format_searched_params(params, parameter_space)
@@ -407,7 +404,7 @@ def render_eval_glance_summary(evaluations, metric, failed_count):
     return f'<div class="eval-glance">{headline_html}{strip_html}</div>'
 
 
-def render_eval_images(evaluations, metric, run_dir, parameter_space):
+def render_eval_images(evaluations, metric, run_dirs, parameter_space):
     if not evaluations:
         return ""
 
@@ -416,17 +413,17 @@ def render_eval_images(evaluations, metric, run_dir, parameter_space):
         (
             ev
             for ev in evaluations
-            if resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
+            if resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
         ),
         evaluations[0],
     )
-    truth_image_path = resolve_run_path(run_dir, (truth_ref_ev.get("paths") or {}).get("image"))
+    truth_image_path = resolve_eval_path(run_dirs, (truth_ref_ev.get("paths") or {}).get("image"))
     truth_source_flux_jy = float((truth_ref_ev.get("params") or {}).get("source_flux_jy", 1.0))
     truth_html = render_shared_truth_image(truth_image_path, truth_source_flux_jy)
 
     best_eval_id = best.get("eval_id")
     cards = [
-        render_eval_card(ev, parameter_space, run_dir, metric, ev.get("eval_id") == best_eval_id)
+        render_eval_card(ev, parameter_space, run_dirs, metric, ev.get("eval_id") == best_eval_id)
         for ev in evaluations
     ]
     cards_html = f'<div class="eval-gallery">{"".join(cards)}</div>'
@@ -440,6 +437,7 @@ def render_nested_sampling_run(poc_summary_path):
     tab_id = run_tab_id(run_name)
     with open(poc_summary_path) as f:
         summary = json.load(f)
+    run_dirs = [run_dir] + merged_source_run_dirs(summary)
 
     algorithm = summary.get("algorithm", "?")
     vla_config = summary.get("vla_config", "?")
@@ -478,6 +476,7 @@ def render_nested_sampling_run(poc_summary_path):
         {duration_html}
       </div>
       <div class="badges">
+        {'<span class="badge badge-ok">merged</span>' if summary.get('merged_from') else ''}
         <span class="badge">{html.escape(str(vla_config))}</span>
         <span class="badge">nlive {html.escape(str(polychord.get('nlive', '?')))}</span>
         <span class="badge">repeats {html.escape(str(polychord.get('num_repeats', '?')))}</span>
@@ -497,25 +496,41 @@ def render_nested_sampling_run(poc_summary_path):
     if meta_bits:
         meta_html = f'<p class="purpose">{" · ".join(meta_bits)}</p>'
 
-    stats_path, chain_root = find_chain_stats(run_dir)
-    evidence_html = '<section><h3>Evidence</h3><p class="empty">Global evidence unavailable (no chains/*.stats file).</p></section>'
-    if stats_path:
-        parsed = parse_log_evidence(stats_path)
-        if parsed:
-            log_z, log_z_err = parsed
-            evidence_html = f"""
-            <section>
-              <h3>Evidence</h3>
-              <div class="headline">log(Z) = <strong>{log_z:.4g}</strong>
-                <span class="delta">± {log_z_err:.4g}</span></div>
-              <p class="purpose">Parsed from {html.escape(os.path.relpath(stats_path, REPO_ROOT))}</p>
-            </section>
-            """
-        else:
-            evidence_html = (
-                '<section><h3>Evidence</h3>'
-                f'<p class="empty">Could not parse log(Z) from {html.escape(os.path.basename(stats_path))}.</p></section>'
-            )
+    summary_log_z = summary.get("log_z")
+    if summary_log_z is not None:
+        summary_log_z_err = summary.get("log_z_err")
+        err_html = (
+            f'<span class="delta">± {float(summary_log_z_err):.4g}</span>'
+            if summary_log_z_err is not None
+            else ""
+        )
+        evidence_html = f"""
+        <section>
+          <h3>Evidence</h3>
+          <div class="headline">log(Z) = <strong>{float(summary_log_z):.4g}</strong>{err_html}</div>
+          <p class="purpose">From poc-summary.json log_z</p>
+        </section>
+        """
+    else:
+        evidence_html = '<section><h3>Evidence</h3><p class="empty">Global evidence unavailable (no chains/*.stats file).</p></section>'
+        stats_path, _ = find_chain_stats(run_dir)
+        if stats_path:
+            parsed = parse_log_evidence(stats_path)
+            if parsed:
+                log_z, log_z_err = parsed
+                evidence_html = f"""
+                <section>
+                  <h3>Evidence</h3>
+                  <div class="headline">log(Z) = <strong>{log_z:.4g}</strong>
+                    <span class="delta">± {log_z_err:.4g}</span></div>
+                  <p class="purpose">Parsed from {html.escape(os.path.relpath(stats_path, REPO_ROOT))}</p>
+                </section>
+                """
+            else:
+                evidence_html = (
+                    '<section><h3>Evidence</h3>'
+                    f'<p class="empty">Could not parse log(Z) from {html.escape(os.path.basename(stats_path))}.</p></section>'
+                )
 
     metric_keys = []
     for ev in evaluations:
@@ -533,7 +548,7 @@ def render_nested_sampling_run(poc_summary_path):
     for ev in evaluations:
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
-        image_path = resolve_run_path(run_dir, (ev.get("paths") or {}).get("image"))
+        image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
         thumb = render_eval_recon(image_path, ev.get("eval_id", "?"), figsize=(2.2, 2.2), dpi=100)
         eval_rows.append(
             "<tr>"
@@ -561,20 +576,19 @@ def render_nested_sampling_run(poc_summary_path):
         """
 
     posterior_html = '<section><h3>Posterior</h3><p class="empty">Posterior plot unavailable.</p></section>'
-    if chain_root:
-        uri = render_posterior_plot(chain_root, space_names)
-        if uri:
-            posterior_html = f"""
-            <section>
-              <h3>Posterior</h3>
-              <figure class="posterior-plot"><img src="{uri}" alt="posterior corner plot"></figure>
-            </section>
-            """
+    uri = render_posterior_plot(run_dir, space_names)
+    if uri:
+        posterior_html = f"""
+        <section>
+          <h3>Posterior</h3>
+          <figure class="posterior-plot"><img src="{uri}" alt="posterior corner plot"></figure>
+        </section>
+        """
 
     evaluations_html = ""
     if eval_rows:
         glance_summary_html = render_eval_glance_summary(evaluations, metric, len(failed))
-        eval_images_html = render_eval_images(evaluations, metric, run_dir, parameter_space)
+        eval_images_html = render_eval_images(evaluations, metric, run_dirs, parameter_space)
         images_collapsible = render_images_posterior_collapsible(
             tab_id, eval_images_html, posterior_html
         )
