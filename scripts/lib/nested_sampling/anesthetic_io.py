@@ -158,6 +158,14 @@ def read_chains_at(chain_root: Path):
             return read_chains(str(chain_root))
 
 
+def _mathtext_label(tex: str) -> str:
+    """Wrap a GetDist-style tex fragment in $...$ for matplotlib / anesthetic."""
+    tex = str(tex).strip()
+    if tex.startswith("$") and tex.endswith("$") and len(tex) >= 2:
+        return tex
+    return f"${tex}$"
+
+
 def label_chain_samples(samples, param_names: list[str]):
     """Stamp (name, tex_label) for every column matching param_names.
 
@@ -181,7 +189,7 @@ def label_chain_samples(samples, param_names: list[str]):
             elif col[0] in param_names:
                 name = col[0]
         if name is not None:
-            new_tuples.append((name, PARAMETER_TEX_LABELS.get(name, name)))
+            new_tuples.append((name, _mathtext_label(PARAMETER_TEX_LABELS.get(name, name))))
         else:
             new_tuples.append(col)
     labelled = samples.copy()

@@ -74,9 +74,12 @@ def main() -> None:
         samples = load_nested_samples(merged_dir)
 
         top_level_names = [c[0] if isinstance(c, tuple) else c for c in samples.columns]
+        tex_labels = [c[1] for c in samples.columns if isinstance(c, tuple) and c[0] in PARAM_NAMES]
         for name in PARAM_NAMES:
             count = top_level_names.count(name)
             assert count == 1, f"expected exactly one {name!r} column, found {count}"
+        for tex in tex_labels:
+            assert str(tex).startswith("$") and str(tex).endswith("$"), tex
 
         import matplotlib
 

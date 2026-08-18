@@ -54,9 +54,9 @@ def _image_norm_for_display(data):
     return ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
 
 
-def figure_to_data_uri(fig):
+def figure_to_data_uri(fig, **savefig_kw):
     buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    fig.savefig(buf, format="png", **savefig_kw)
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
@@ -244,7 +244,8 @@ def render_posterior_plot(run_dir, param_names):
         try:
             grid = samples.plot_2d(plot_params, kind=kind, **extra)
             fig = grid.iloc[0, 0].figure
-            return figure_to_data_uri(fig)
+            fig.tight_layout()
+            return figure_to_data_uri(fig, bbox_inches="tight")
         except Exception:
             pass
     return None
