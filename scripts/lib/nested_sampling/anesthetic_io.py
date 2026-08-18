@@ -16,6 +16,20 @@ from typing import Any, Iterator
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
 
+# GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic). Mirrors
+# poc_common.PARAMETER_TEX_LABELS; duplicated (not imported) because this
+# module is also used host-side, where poc_common's astropy import isn't
+# installed.
+PARAMETER_TEX_LABELS = {
+    "log10_dynamic_range": r"\mathrm{log}_{10}(\rho_{DR})",
+    "observation_minutes": r"t_{\mathrm{obs}}\,[\mathrm{min}]",
+    "channel_count": r"n_{\mathrm{freq}}",
+    "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
+    "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
+    "wsclean_niter": r"N_{\mathrm{iter}}",
+    "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
+}
+
 
 def _similar_run_dirs(name: str) -> list[str]:
     """Suggest nearby run directory names when RUN= looks like a typo."""
@@ -145,22 +159,31 @@ def read_chains_at(chain_root: Path):
 
 
 def label_chain_samples(samples, param_names: list[str]):
-    """Map PolyChord's positional numeric columns onto parameter_space names.
+    """Stamp (name, tex_label) for every column matching param_names.
 
-    A no-op for columns anesthetic already labelled from an on-disk
-    .paramnames file.
+    Always overwrites both the name and the tex label, whether the column
+    started as a raw positional PolyChord index or was already named from
+    an on-disk .paramnames file, so every merge source presents identical
+    column tuples before merge_nested_samples runs (mismatched tex labels
+    otherwise make pandas.concat treat same-named columns as duplicates).
     """
     import numpy as np
     import pandas as pd
 
     new_tuples = []
     for col in samples.columns:
-        if isinstance(col, tuple) and isinstance(col[0], (int, np.integer)):
-            idx = int(col[0])
-            if idx < len(param_names):
-                new_tuples.append((param_names[idx], col[1]))
-                continue
-        new_tuples.append(col)
+        name = None
+        if isinstance(col, tuple):
+            if isinstance(col[0], (int, np.integer)):
+                idx = int(col[0])
+                if idx < len(param_names):
+                    name = param_names[idx]
+            elif col[0] in param_names:
+                name = col[0]
+        if name is not None:
+            new_tuples.append((name, PARAMETER_TEX_LABELS.get(name, name)))
+        else:
+            new_tuples.append(col)
     labelled = samples.copy()
     labelled.columns = pd.MultiIndex.from_tuples(new_tuples, names=samples.columns.names)
     return labelled
