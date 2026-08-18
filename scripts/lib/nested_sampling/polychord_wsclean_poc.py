@@ -131,8 +131,17 @@ def evaluate(
         }
 
     image_path = wsclean_dir / "recon-image.fits"
+    dirty_path = wsclean_dir / "recon-dirty.fits"
+    residual_dirty_path = wsclean_dir / "recon-residual.fits"
     try:
-        metrics = compute_image_metrics(image_path, params["source_flux_jy"], run_result.wall_seconds, peak_memory_bytes)
+        metrics = compute_image_metrics(
+            image_path,
+            params["source_flux_jy"],
+            run_result.wall_seconds,
+            peak_memory_bytes,
+            dirty_path=dirty_path,
+            residual_dirty_path=residual_dirty_path,
+        )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
         return {
@@ -153,7 +162,8 @@ def evaluate(
             "measurement_set": str(ms_path),
             "simulation_metadata": str(eval_dir / "simulation.json"),
             "image": str(image_path),
-            "residual": str(wsclean_dir / "recon-residual.fits"),
+            "dirty": str(dirty_path),
+            "residual": str(residual_dirty_path),
             "time": str(wsclean_time),
         },
         "commands": {

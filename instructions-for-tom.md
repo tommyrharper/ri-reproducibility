@@ -12,7 +12,9 @@
   - 8 should be the most i can handle
   - Don't have to configure, should be derived from `NS_NLIVE`
 - `NS_METRIC` which metric we are maximising (default `off_source_rms_jy`)
-  - can set to a bunch of other metrics
+  - `total_rms_jy` RMS of (cleaned image − truth) over the whole image
+  - `sigma_res` paper data-fidelity `||residual_dirty||_2 / ||dirty||_2`
+  - PolyChord maximises, which looks for the worst images 
 - `OUTPUT_DIR` where the results are saved (default `results/nested-sampling-poc/wsclean-vlaa-<UTC>` or `r2d2-vlaa-<UTC>`)
   - leave empty
 

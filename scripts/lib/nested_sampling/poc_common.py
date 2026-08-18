@@ -22,9 +22,11 @@ METRIC_NAMES = (
     "snr",
     "log_snr",
     "off_source_rms_jy",
+    "total_rms_jy",
     "peak_jy_per_beam",
     "relative_l2_error",
     "peak_flux_abs_error_jy",
+    "sigma_res",
     "wall_seconds",
     "peak_memory_bytes",
 )
@@ -180,11 +182,32 @@ def run_docker_monitored(cmd: list[str], container_name: str, stdout_path: Path,
     return DockerRunResult(returncode=returncode, wall_seconds=wall, peak_memory_bytes=peak_memory)
 
 
-def compute_image_metrics(image_path: Path, source_flux_jy: float, wall_seconds: float, peak_memory_bytes: int) -> dict[str, float]:
-    data, header = fits.getdata(image_path, header=True)
+def load_fits_2d(path: Path) -> tuple[np.ndarray, Any]:
+    data, header = fits.getdata(path, header=True)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
     if image.ndim != 2:
-        raise ValueError(f"{image_path} is not 2-D after squeezing; shape={image.shape}")
+        raise ValueError(f"{path} is not 2-D after squeezing; shape={image.shape}")
+    return image, header
+
+
+def rms(values: np.ndarray) -> float:
+    return float(np.sqrt(np.nanmean(values * values))) if values.size else 0.0
+
+
+def sigma_res(residual: np.ndarray, dirty: np.ndarray) -> float:
+    """R2D2-paper data-fidelity: ||residual_dirty||_2 / ||dirty||_2."""
+    return float(np.linalg.norm(residual) / max(np.linalg.norm(dirty), 1e-12))
+
+
+def compute_image_metrics(
+    image_path: Path,
+    source_flux_jy: float,
+    wall_seconds: float,
+    peak_memory_bytes: int,
+    dirty_path: Path | None = None,
+    residual_dirty_path: Path | None = None,
+) -> dict[str, float]:
+    image, header = load_fits_2d(image_path)
 
     y_size, x_size = image.shape
     cx = int(round(float(header.get("CRPIX1", x_size / 2.0)) - 1.0))
@@ -198,24 +221,30 @@ def compute_image_metrics(image_path: Path, source_flux_jy: float, wall_seconds:
 
     yy, xx = np.ogrid[:y_size, :x_size]
     off_source = (yy - cy) ** 2 + (xx - cx) ** 2 > 25
-    off_values = image[off_source]
-    rms = float(np.sqrt(np.nanmean(off_values * off_values))) if off_values.size else 0.0
+    off_rms = rms(image[off_source])
+    total_rms = rms(residual)
     peak = float(np.nanmax(np.abs(image)))
-    snr = peak / rms if rms > 0 else float("inf")
+    snr = peak / off_rms if off_rms > 0 else float("inf")
     log_snr = math.log10(snr) if math.isfinite(snr) and snr > 0 else 99.0
     relative_l2_error = float(np.linalg.norm(residual) / max(np.linalg.norm(truth), 1e-12))
     peak_flux_error = abs(float(image[cy, cx]) - source_flux_jy)
 
-    return {
+    metrics = {
         "snr": float(snr),
         "log_snr": float(log_snr),
-        "off_source_rms_jy": rms,
+        "off_source_rms_jy": off_rms,
+        "total_rms_jy": total_rms,
         "peak_jy_per_beam": peak,
         "relative_l2_error": relative_l2_error,
         "peak_flux_abs_error_jy": peak_flux_error,
         "wall_seconds": float(wall_seconds),
         "peak_memory_bytes": float(peak_memory_bytes),
     }
+    if dirty_path is not None and residual_dirty_path is not None:
+        dirty, _ = load_fits_2d(dirty_path)
+        residual_dirty, _ = load_fits_2d(residual_dirty_path)
+        metrics["sigma_res"] = sigma_res(residual_dirty, dirty)
+    return metrics
 
 
 def read_gnu_time_peak_memory(time_path: Path) -> int:
@@ -400,6 +429,12 @@ def self_check_metric_resolution() -> None:
 
     snr_fn, _ = resolve_metric("snr")
     assert snr_fn(sample) == sample["snr"]
+    total_fn, _ = resolve_metric("total_rms_jy")
+    assert total_fn(sample) == sample["total_rms_jy"]
+    sigma_fn, _ = resolve_metric("sigma_res")
+    assert sigma_fn(sample) == sample["sigma_res"]
+    assert abs(rms(np.array([3.0, 4.0])) - 5.0 / math.sqrt(2.0)) < 1e-12
+    assert abs(sigma_res(np.array([3.0, 4.0]), np.array([0.0, 2.0])) - 2.5) < 1e-12
 
     expr_fn, _ = resolve_metric("log_snr + 0.1 * wall_seconds")
     assert expr_fn(sample) == sample["log_snr"] + 0.1 * sample["wall_seconds"]

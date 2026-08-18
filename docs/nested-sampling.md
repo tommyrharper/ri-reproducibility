@@ -52,6 +52,8 @@ NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
 NS_MPI_PROCS=4 make nested-sampling-poc
 NS_METRIC=badness make nested-sampling-poc
 NS_METRIC=snr make nested-sampling-poc
+NS_METRIC=total_rms_jy make nested-sampling-r2d2-poc
+NS_METRIC=sigma_res make nested-sampling-r2d2-poc
 OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
 ```
 
@@ -157,9 +159,11 @@ For each sample, the pipeline records:
 | `snr` | Reconstructed image peak divided by off-source RMS |
 | `log_snr` | `log10(snr)` |
 | `off_source_rms_jy` | Off-source RMS in Jy/beam |
+| `total_rms_jy` | RMS of (reconstructed image − one-pixel truth) over all pixels |
 | `peak_jy_per_beam` | Peak absolute flux in the reconstructed image |
 | `relative_l2_error` | Image residual versus the one-pixel point-source truth |
 | `peak_flux_abs_error_jy` | Absolute centre-pixel flux error |
+| `sigma_res` | Paper data-fidelity \(\overline{\sigma}_{\textrm{res.}}=\|\widehat{\mathbf{r}}\|_2/\|\mathbf{x}_{\textrm{d}}\|_2\) (final residual dirty over dirty) |
 | `wall_seconds` | Imaging container runtime |
 | `peak_memory_bytes` | Peak imaging memory from Docker stats (WSClean also records GNU `time` when available) |
 
@@ -199,8 +203,10 @@ PolyChord always maximizes the returned value with no automatic sign flip. The
 natural orientation: the default `off_source_rms_jy` search prefers higher
 off-source RMS, `--metric snr` searches for the highest-SNR corner, and a
 worst-SNR search must negate explicitly (`--metric "-snr"` or
-`--metric "1/snr"`). Failed simulations or imaging runs still receive objective
-`100.0`.
+`--metric "1/snr"`). `total_rms_jy` and `sigma_res` are also higher-is-worse
+(noisier reconstruction / worse data fidelity); search for the best corner
+with `--metric "-total_rms_jy"` or `--metric "-sigma_res"`. Failed simulations
+or imaging runs still receive objective `100.0`.
 
 Each evaluation record and `poc-summary.json` store the chosen value in an
 `objective` field. `poc-summary.json` also records the `--metric` string and a
@@ -216,6 +222,7 @@ Each likelihood evaluation:
 evaluations/eval-*/sim.ms
 evaluations/eval-*/simulation.json
 evaluations/eval-*/wsclean/recon-image.fits
+evaluations/eval-*/wsclean/recon-dirty.fits
 evaluations/eval-*/wsclean/recon-residual.fits
 evaluations/eval-*/metrics.json
 ```
@@ -230,6 +237,8 @@ evaluations/eval-*/simulation.json
 evaluations/eval-*/r2d2_data.mat
 evaluations/eval-*/r2d2_config.yaml
 evaluations/eval-*/r2d2/r2d2_data/R2D2_model_image.fits
+evaluations/eval-*/r2d2/r2d2_data/dirty_normalised.fits
+evaluations/eval-*/r2d2/r2d2_data/R2D2_residual_dirty_image.fits
 evaluations/eval-*/metrics.json
 ```
 

@@ -179,8 +179,17 @@ def evaluate(
         }
 
     image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
+    dirty_path = r2d2_dir / "r2d2_data" / "dirty_normalised.fits"
+    residual_dirty_path = r2d2_dir / "r2d2_data" / "R2D2_residual_dirty_image.fits"
     try:
-        metrics = compute_image_metrics(image_path, params["source_flux_jy"], run_result.wall_seconds, peak_memory_bytes)
+        metrics = compute_image_metrics(
+            image_path,
+            params["source_flux_jy"],
+            run_result.wall_seconds,
+            peak_memory_bytes,
+            dirty_path=dirty_path,
+            residual_dirty_path=residual_dirty_path,
+        )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
         return {
@@ -207,6 +216,8 @@ def evaluate(
             "simulation_metadata": str(eval_dir / "simulation.json"),
             "mat": str(mat_path),
             "image": str(image_path),
+            "dirty": str(dirty_path),
+            "residual": str(residual_dirty_path),
         },
         "commands": {
             "simulate": sim_cmd,
