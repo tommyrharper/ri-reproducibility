@@ -13,6 +13,27 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
+
+
+def _similar_run_dirs(name: str) -> list[str]:
+    """Suggest nearby run directory names when RUN= looks like a typo."""
+    if not NESTED_SAMPLING_DIR.is_dir():
+        return []
+    runs = [p.name for p in NESTED_SAMPLING_DIR.iterdir() if p.is_dir()]
+    scored = []
+    for run in runs:
+        common = 0
+        for a, b in zip(name, run):
+            if a != b:
+                break
+            common += 1
+        if common >= 8 or name.rstrip("0123456789") == run or run.startswith(name[:16]):
+            scored.append((common, run))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [f"results/nested-sampling-poc/{run}" for _, run in scored[:5]]
+
 
 def find_chain_root(target: Path) -> Path:
     """Return PolyChord file root (path without _dead-birth.txt suffix)."""
@@ -23,7 +44,11 @@ def find_chain_root(target: Path) -> Path:
         target = target.resolve()
 
     if not target.exists() and not Path(str(target) + "_dead-birth.txt").is_file():
-        raise SystemExit(f"Path does not exist: {target}")
+        suggestions = _similar_run_dirs(target.name)
+        hint = ""
+        if suggestions:
+            hint = " Did you mean:\n  " + "\n  ".join(suggestions)
+        raise SystemExit(f"Path does not exist: {target}{hint}")
 
     if target.is_file():
         name = target.name
@@ -161,12 +186,14 @@ def load_nested_samples(run_dir: Path):
         for entry in merged_from:
             source_dir = _resolve_source_run_dir(run_dir, entry)
             chain_root = find_chain_root(source_dir)
-            sub_samples.append(read_chains_at(chain_root))
+            sub = read_chains_at(chain_root)
+            if param_names:
+                sub = label_chain_samples(sub, param_names)
+            sub_samples.append(sub)
         samples = merge_nested_samples(sub_samples)
     else:
         chain_root = find_chain_root(run_dir)
         samples = read_chains_at(chain_root)
-
-    if param_names:
-        samples = label_chain_samples(samples, param_names)
+        if param_names:
+            samples = label_chain_samples(samples, param_names)
     return samples

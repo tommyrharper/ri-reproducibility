@@ -52,6 +52,13 @@ def resolve_run_dir(raw: str) -> Path:
     return path
 
 
+def relative_to_repo_root(run_dir: Path) -> str:
+    try:
+        return str(run_dir.relative_to(REPO_ROOT))
+    except ValueError:
+        raise SystemExit(f"refuse: {run_dir} is outside the repo root ({REPO_ROOT})")
+
+
 def load_summary(run_dir: Path) -> dict[str, Any]:
     if not run_dir.is_dir():
         raise SystemExit(f"refuse: not a directory: {run_dir}")
@@ -164,8 +171,7 @@ def main() -> None:
         "polychord": merged_polychord(summaries),
         "parameter_space": first.get("parameter_space"),
         "merged_from": [
-            {"name": run_dir.name, "path": str(run_dir.relative_to(REPO_ROOT))}
-            for run_dir in run_dirs
+            {"name": run_dir.name, "path": relative_to_repo_root(run_dir)} for run_dir in run_dirs
         ],
         "evaluations": evaluations,
         "worst_evaluation": worst_evaluation,
