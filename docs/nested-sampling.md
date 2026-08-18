@@ -264,7 +264,7 @@ each run's total wall-clock duration (from `total_wall_seconds`, when present)
 top-right in the card header. Per-run images - the shared synthesized
 ground-truth image and a per-evaluation card gallery (reconstruction,
 objective, and searched parameters) - sit in an Images tab, and the
-best-effort `anesthetic` posterior plot sits in a Posterior tab, both inside
+best-effort `anesthetic` KDE contour corner plot sits in a Posterior tab, both inside
 one collapsed-by-default details block, separate from the collapsed raw
 metrics table. Runs are ordered newest-first by the UTC timestamp in the
 run directory name.

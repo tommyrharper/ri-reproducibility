@@ -242,29 +242,15 @@ def render_posterior_plot(chain_root, param_names):
         return None
 
     plot_params = plot_params[: min(4, len(plot_params))]
-    try:
-        grid = samples.plot_2d(plot_params, kind="scatter_2d")
-        fig = grid.iloc[0, 0].figure
-        return figure_to_data_uri(fig)
-    except Exception:
-        pass
-
-    try:
-        fig, axes = anesthetic.make_2d_axes(plot_params)
-        for yi, y in enumerate(plot_params):
-            for xi, x in enumerate(plot_params):
-                ax = axes.iloc[yi, xi]
-                if yi == xi:
-                    values = samples[x].values
-                    ax.hist(values, bins=min(max(len(values), 1), 8))
-                elif yi > xi:
-                    ax.scatter(samples[x].values, samples[y].values, s=14, alpha=0.85)
-                else:
-                    ax.axis("off")
-        fig.tight_layout()
-        return figure_to_data_uri(fig)
-    except Exception:
-        return None
+    # ncompress=False: anesthetic triangular compression fails on some PoC chains.
+    for kind, extra in (("kde", {"ncompress": False}), ("scatter", {})):
+        try:
+            grid = samples.plot_2d(plot_params, kind=kind, **extra)
+            fig = grid.iloc[0, 0].figure
+            return figure_to_data_uri(fig)
+        except Exception:
+            pass
+    return None
 
 
 def objective_fill(objective, obj_min, obj_max):
