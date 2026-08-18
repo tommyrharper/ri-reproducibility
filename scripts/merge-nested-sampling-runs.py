@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Merge two or more compatible nested-sampling PoC runs into one run directory.
+"""Merge compatible nested-sampling PoC runs into one run directory.
 
 Post-processing only: concatenates PolyChord dead points via
 anesthetic.samples.merge_nested_samples and writes a new
 results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json
 that points back at the source runs. Does not copy evaluations/ or chains/.
 
-Run on the host (needs anesthetic), e.g.:
+Discover every compatible group (no args):
+
+  uv run scripts/merge-nested-sampling-runs.py
+
+Merge an explicit list (>= 2 dirs; refuses if any pair is incompatible):
 
   uv run scripts/merge-nested-sampling-runs.py \\
       results/nested-sampling-poc/r2d2-vlaa-AAA \\
@@ -18,7 +22,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +41,16 @@ LOGZ_NSAMPLES = 1000
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("runs", nargs="+", help="Run directories to merge (>= 2)")
+    parser.add_argument(
+        "runs",
+        nargs="*",
+        help="Run directories to merge (>= 2). Omit to discover all compatible groups.",
+    )
     parser.add_argument(
         "--out",
         default=None,
-        help="Output directory. Default: results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>",
+        help="Output directory (explicit run list only). "
+        "Default: results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>",
     )
     return parser.parse_args()
 
@@ -99,6 +109,21 @@ def check_compatible(run_dirs: list[Path], summaries: list[dict[str, Any]]) -> N
             )
 
 
+def compatibility_key(summary: dict[str, Any]) -> str:
+    hp_key, hp = fixed_hyperparameters_field(summary)
+    return json.dumps(
+        {
+            "algorithm": summary.get("algorithm"),
+            "vla_config": summary.get("vla_config"),
+            "metric": summary.get("metric"),
+            "parameter_space": summary.get("parameter_space"),
+            "hp_key": hp_key,
+            "hp": hp,
+        },
+        sort_keys=True,
+    )
+
+
 def merged_polychord(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     polychords = [s.get("polychord", {}) for s in summaries]
     nlive_values = [p.get("nlive") for p in polychords]
@@ -133,22 +158,22 @@ def merged_nested_samples(run_dirs: list[Path]):
     return merge_nested_samples(sub_samples)
 
 
-def main() -> None:
-    args = parse_args()
-    if len(args.runs) < 2:
-        raise SystemExit("refuse: need at least two run directories to merge")
+def unique_merged_out_dir(algorithm: str) -> Path:
+    stamp = datetime.now(timezone.utc)
+    while True:
+        candidate = NESTED_SAMPLING_DIR / f"{algorithm}-vlaa-merged-{stamp.strftime('%Y%m%dT%H%M%SZ')}"
+        if not candidate.exists():
+            return candidate
+        stamp += timedelta(seconds=1)
 
-    run_dirs = [resolve_run_dir(raw) for raw in args.runs]
-    summaries = [load_summary(run_dir) for run_dir in run_dirs]
+
+def merge_run_dirs(run_dirs: list[Path], summaries: list[dict[str, Any]], out_dir: Path) -> Path:
     check_compatible(run_dirs, summaries)
-
-    first = summaries[0]
-    algorithm = first["algorithm"]
-    utc_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = Path(args.out).resolve() if args.out else NESTED_SAMPLING_DIR / f"{algorithm}-vlaa-merged-{utc_stamp}"
     if out_dir.exists():
         raise SystemExit(f"refuse: output directory already exists: {out_dir}")
 
+    first = summaries[0]
+    algorithm = first["algorithm"]
     samples = merged_nested_samples(run_dirs)
     logz_samples = samples.logZ(LOGZ_NSAMPLES)
     log_z = float(logz_samples.mean())
@@ -186,6 +211,69 @@ def main() -> None:
     summary_path = out_dir / "poc-summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"wrote {summary_path}")
+    return out_dir
+
+
+def discover_sources() -> list[tuple[Path, dict[str, Any]]]:
+    if not NESTED_SAMPLING_DIR.is_dir():
+        return []
+    sources: list[tuple[Path, dict[str, Any]]] = []
+    for run_dir in sorted(p for p in NESTED_SAMPLING_DIR.iterdir() if p.is_dir()):
+        summary_path = run_dir / "poc-summary.json"
+        summary: dict[str, Any] | None = None
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text())
+            if summary.get("merged_from"):
+                print(f"skip {run_dir.name}: already a merge (merged_from)")
+                continue
+        if summary is None or not (run_dir / "chains").is_dir():
+            print(f"skip {run_dir.name}: incomplete (missing poc-summary.json or chains/)")
+            continue
+        sources.append((run_dir, summary))
+    return sources
+
+
+def discover_and_merge() -> None:
+    groups: dict[str, list[tuple[Path, dict[str, Any]]]] = defaultdict(list)
+    for run_dir, summary in discover_sources():
+        groups[compatibility_key(summary)].append((run_dir, summary))
+
+    merged_any = False
+    for group in groups.values():
+        if len(group) < 2:
+            print(f"skip {group[0][0].name}: no compatible partner")
+            continue
+        run_dirs = [run_dir for run_dir, _ in group]
+        summaries = [summary for _, summary in group]
+        print(f"merging {', '.join(run_dir.name for run_dir in run_dirs)}")
+        merge_run_dirs(run_dirs, summaries, unique_merged_out_dir(summaries[0]["algorithm"]))
+        merged_any = True
+
+    if not merged_any:
+        rel = NESTED_SAMPLING_DIR.relative_to(REPO_ROOT)
+        raise SystemExit(f"refuse: no compatible groups of 2+ source runs under {rel}")
+
+
+def main() -> None:
+    args = parse_args()
+    if not args.runs:
+        if args.out:
+            raise SystemExit("refuse: --out is only valid when listing run directories")
+        discover_and_merge()
+        return
+
+    if len(args.runs) < 2:
+        raise SystemExit("refuse: need at least two run directories to merge")
+
+    run_dirs = [resolve_run_dir(raw) for raw in args.runs]
+    summaries = [load_summary(run_dir) for run_dir in run_dirs]
+    utc_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = (
+        Path(args.out).resolve()
+        if args.out
+        else NESTED_SAMPLING_DIR / f"{summaries[0]['algorithm']}-vlaa-merged-{utc_stamp}"
+    )
+    merge_run_dirs(run_dirs, summaries, out_dir)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@
 
 ```zsh
 make anesthetic-gui
+make merge-nested-sampling
 make nested-sampling-poc
 make nested-sampling-r2d2-poc
 NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-poc

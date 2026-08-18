@@ -322,7 +322,17 @@ different `--metric` / `NS_METRIC` or a different prior box (the prior box is
 `PARAMETER_SPACE` in `scripts/lib/nested_sampling/poc_common.py`, copied into
 every `poc-summary.json` as `parameter_space`).
 
+With no directories, every completed source run under
+`results/nested-sampling-poc/` is grouped by the must-match fields above
+and one merged directory is written per group of 2+. Incomplete dirs,
+previous merges (`merged_from`), and singleton groups are skipped.
+Zero groups of 2+ exits non-zero. `--out` is only valid with an explicit
+directory list.
+
 ```bash
+uv run scripts/merge-nested-sampling-runs.py
+make merge-nested-sampling
+
 uv run scripts/merge-nested-sampling-runs.py \
   results/nested-sampling-poc/r2d2-vlaa-AAA \
   results/nested-sampling-poc/r2d2-vlaa-BBB
@@ -331,9 +341,9 @@ make merge-nested-sampling RUNS="results/nested-sampling-poc/r2d2-vlaa-AAA resul
 ```
 
 Writes `results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json`
-(pass `--out DIR` to pick a different output directory). Refuses with a
-non-zero exit and a clear message on fewer than two runs, a run missing
-`poc-summary.json` or `chains/`, or any must-match field above differing.
+(pass `--out DIR` on the explicit form to pick a different output directory).
+The explicit form refuses with a non-zero exit on fewer than two runs, a run
+missing `poc-summary.json` or `chains/`, or any must-match field above differing.
 `polychord.nlive` in the merged summary is the sum of source nlives;
 `num_repeats` / `max_ndead` / `seed` stay a single value when all sources
 agree, else become a list. Pooled `evaluations` keep source argument order,
