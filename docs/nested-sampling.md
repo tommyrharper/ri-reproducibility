@@ -256,7 +256,14 @@ reconstructions) in the nested-sampling HTML report:
 ```bash
 make nested-sampling-report
 # open benchmarks/nested-sampling-report.html
+
+make nested-sampling-report LAST=1
+# open benchmarks/nested-sampling-report-last.html
 ```
+
+`LAST=N` renders only the newest N runs (timestamp sort) into
+`benchmarks/nested-sampling-report-last.html` and does not overwrite the
+full report. Make cannot take `--last`; use `LAST=1`.
 
 The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
 (no manifest join), so a merged run directory (see **Merge runs** below) shows

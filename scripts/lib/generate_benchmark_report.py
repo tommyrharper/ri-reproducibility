@@ -958,11 +958,13 @@ def render_benchmark_body():
     )
 
 
-def render_nested_sampling_body():
+def render_nested_sampling_body(limit=None):
     nested_paths = sorted(
         glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
         key=nested_sampling_run_sort_key,
     )
+    if limit is not None:
+        nested_paths = nested_paths[:limit]
     nested_cards = [render_nested_sampling_run(p) for p in nested_paths]
     if nested_cards:
         return "".join(nested_cards)
@@ -1006,6 +1008,12 @@ def parse_args(argv=None):
         default=None,
         help="Output HTML path (defaults depend on --kind).",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Nested-sampling only: newest N runs (timestamp sort). Omit for all.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1024,14 +1032,20 @@ def main(argv=None):
         )
     else:
         out_path = args.out_path or "/workspace/out/nested-sampling-report.html"
+        limit = args.limit
+        if limit is not None and limit < 1:
+            raise SystemExit("--limit must be >= 1")
+        subtitle = (
+            "Generated from <code>results/nested-sampling-poc/*/poc-summary.json</code> - "
+            "regenerate with <code>make nested-sampling-report</code>."
+        )
+        if limit is not None:
+            subtitle += f" Showing newest {limit} run{'s' if limit != 1 else ''} only."
         write_html_doc(
             out_path,
             title="ri-reproducibility nested-sampling report",
-            subtitle=(
-                "Generated from <code>results/nested-sampling-poc/*/poc-summary.json</code> - "
-                "regenerate with <code>make nested-sampling-report</code>."
-            ),
-            body=render_nested_sampling_body(),
+            subtitle=subtitle,
+            body=render_nested_sampling_body(limit=limit),
         )
 
 

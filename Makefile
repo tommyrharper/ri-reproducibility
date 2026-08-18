@@ -70,8 +70,10 @@ plot-fits:
 benchmark-report:
 	scripts/generate-benchmark-report.sh benchmarks
 
+# LAST=1 writes benchmarks/nested-sampling-report-last.html (newest N runs)
+# and leaves nested-sampling-report.html alone.
 nested-sampling-report:
-	scripts/generate-benchmark-report.sh nested-sampling
+	scripts/generate-benchmark-report.sh nested-sampling $(LAST)
 
 # Host-side anesthetic GUI (needs a display). Optional RUN= path to a PoC
 # run dir, chains/, or PolyChord file root; default is the latest PoC run.
