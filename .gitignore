@@ -9,8 +9,7 @@ results/*
 benchmarks/manifests/*
 !benchmarks/manifests/.gitkeep
 benchmarks/report.html
-benchmarks/nested-sampling-report.html
-benchmarks/nested-sampling-report-last.html
+benchmarks/nested-sampling-report*.html
 vendor/*
 !vendor/README.md
 

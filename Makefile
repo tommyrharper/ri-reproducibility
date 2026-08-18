@@ -70,8 +70,8 @@ plot-fits:
 benchmark-report:
 	scripts/generate-benchmark-report.sh benchmarks
 
-# LAST=1 or RUN=<dir> writes benchmarks/nested-sampling-report-last.html
-# and leaves nested-sampling-report.html alone.
+# LAST=1 -> nested-sampling-report-last.html
+# RUN=<dir> -> nested-sampling-report-<run>.html
 nested-sampling-report:
 	LAST="$(LAST)" RUN="$(RUN)" scripts/generate-benchmark-report.sh nested-sampling
 

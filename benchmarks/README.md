@@ -23,10 +23,10 @@ at least one baseline run each (see `REPRODUCTION_PLAN.md`).
   `make nested-sampling-report` for nested-sampling PoC cards from
   `results/nested-sampling-poc/*/poc-summary.json` (PolyChord log(Z),
   evaluation image grid, posterior plot; see `docs/nested-sampling.md`).
-  `make nested-sampling-report LAST=1` or
+  `make nested-sampling-report LAST=1` writes
+  `nested-sampling-report-last.html`;
   `make nested-sampling-report RUN=results/nested-sampling-poc/<id>` writes
-  `nested-sampling-report-last.html` (preview; does not overwrite
-  the full report).
+  `nested-sampling-report-<id>.html`. Neither overwrites the full report.
   Both reports use the r2d2 image's astropy + matplotlib + anesthetic
   (`scripts/generate-benchmark-report.sh`, same approach as
   `scripts/plot-fits.sh`), so no host Python environment is needed; open

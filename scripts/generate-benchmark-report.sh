@@ -10,7 +10,8 @@
 # Outputs:
 #   benchmarks/report.html
 #   benchmarks/nested-sampling-report.html
-#   benchmarks/nested-sampling-report-last.html  (when LAST or RUN is set)
+#   benchmarks/nested-sampling-report-last.html       (LAST=N)
+#   benchmarks/nested-sampling-report-<run>.html      (RUN=)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,7 +29,15 @@ case "${KIND}" in
       echo "refuse: LAST= and RUN= cannot be used together" >&2
       exit 1
     fi
-    if [[ -n "${LIMIT}" || -n "${RUN_SEL}" ]]; then
+    if [[ -n "${RUN_SEL}" ]]; then
+      run_base="${RUN_SEL%/}"
+      run_base="${run_base##*/}"
+      if [[ "${run_base}" == "poc-summary.json" ]]; then
+        run_base="$(basename "$(dirname "${RUN_SEL}")")"
+      fi
+      run_base="${run_base//[^A-Za-z0-9._-]/_}"
+      OUT_NAME="nested-sampling-report-${run_base}.html"
+    elif [[ -n "${LIMIT}" ]]; then
       OUT_NAME="nested-sampling-report-last.html"
     else
       OUT_NAME="nested-sampling-report.html"

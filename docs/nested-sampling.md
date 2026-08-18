@@ -258,14 +258,17 @@ make nested-sampling-report
 # open benchmarks/nested-sampling-report.html
 
 make nested-sampling-report LAST=1
-make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
 # open benchmarks/nested-sampling-report-last.html
+
+make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
+# open benchmarks/nested-sampling-report-r2d2-vlaa-merged-20260818T125604Z.html
 ```
 
-`LAST=N` renders only the newest N runs (timestamp sort). `RUN=` renders
-one named run (directory, repo-relative path, or directory name). Both
-write `benchmarks/nested-sampling-report-last.html` and do not overwrite
-the full report. They cannot be combined. Make cannot take `--last`; use
+`LAST=N` renders only the newest N runs (timestamp sort) into
+`benchmarks/nested-sampling-report-last.html`. `RUN=` renders one named
+run (directory, repo-relative path, or directory name) into
+`benchmarks/nested-sampling-report-<run>.html`. Neither overwrites the
+full report. They cannot be combined. Make cannot take `--last`; use
 `LAST=1`.
 
 The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
