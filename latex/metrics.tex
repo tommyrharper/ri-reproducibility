@@ -69,17 +69,27 @@ F_A(\boldsymbol\theta)
 where larger $F_A$ means worse reconstruction, higher residuals, or greater computational cost.
 The high-scoring samples identify regions of observing conditions where R2D2, CLEAN, or both are likely to fail.
 
+\subsection{Failure-Score Plots}
+
+The images on the next page show the nested-sampling objective for the current R2D2 and CLEAN searches.
+This is not a traditional likelihood or posterior: the quantity passed to nested sampling as the likelihood is the failure score $F_A$.
+Bright regions therefore indicate parameter combinations with worse reconstructions, while dark regions indicate comparatively good performance.
+White areas have the worst performance.
+The merged plot shows combined failure structure, and the side-by-side plot separates algorithm-specific behaviour.
+
+WSClean has been used for CLEAN, using default out of the box call time parameters without fine-tuning.
+
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{../benchmarks/merged-r2d2-wsclean-likelihood.png}
-\caption{Merged nested-sampling likelihood for the R2D2 and CLEAN searches. Contours show where the failure objective (PolyChord log-likelihood) is high in observing-parameter space. White is the worst performance. Dark is the best performance.}
+\caption{Merged nested-sampling failure score for the R2D2 and CLEAN searches. The plotted objective is the failure score used in place of a traditional likelihood. White is the worst performance. Dark is the best performance.}
 \label{fig:merged-r2d2-wsclean-likelihood}
 \end{figure}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{../benchmarks/merged-r2d2-wsclean-likelihood-side-by-side.png}
-\caption{Side-by-side likelihood comparison for merged R2D2 and CLEAN nested-sampling runs. The comparison separates the algorithms so shared failure regions and algorithm-specific failure regions can be inspected directly.  White is the worst performance. Dark is the best performance.}
+\caption{Side-by-side failure-score comparison for merged R2D2 and CLEAN nested-sampling runs. The comparison separates the algorithms so shared failure regions and algorithm-specific failure regions can be inspected directly. White is the worst performance. Dark is the best performance.}
 \label{fig:merged-r2d2-wsclean-likelihood-side-by-side}
 \end{figure}
 
