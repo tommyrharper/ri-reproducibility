@@ -344,6 +344,17 @@ Thus lower $\rho_{\text{DR}}$ produces noisier visibilities before R2D2 or CLEAN
 \subsection{Observation and Fourier-Sampling Parameters}
 
 \subsubsection{VLA Configuration}
+\label{sec:param-vla-configuration}
+
+The simulator supports the four standard VLA configurations:
+\begin{itemize}
+    \item \texttt{vla.a}
+    \item \texttt{vla.b}
+    \item \texttt{vla.c}
+    \item \texttt{vla.d}
+\end{itemize}
+These change the baseline distribution and therefore the Fourier coverage and dirty beam.
+For the first PoC runs, we plan to fix this parameter to \texttt{vla.a} before expanding the search over configuration.
 
 \subsubsection{Declination}
 
