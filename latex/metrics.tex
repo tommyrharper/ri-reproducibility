@@ -9,6 +9,7 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{float}
+\usepackage{graphicx}
 
 \newcommand{\dnn}{\boldsymbol{\mathsf N}}
 \newcommand{\dnnlayer}[1][i]{\dnn_{\boldsymbol{\hat\theta}^{(#1)}}}
@@ -67,6 +68,33 @@ F_A(\boldsymbol\theta)
 \end{itemize}
 where larger $F_A$ means worse reconstruction, higher residuals, or greater computational cost.
 The high-scoring samples identify regions of observing conditions where R2D2, CLEAN, or both are likely to fail.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{../benchmarks/merged-r2d2-wsclean-posterior.png}
+\caption{Merged nested-sampling posterior for the R2D2 and CLEAN searches. The plot shows where the sampled failure objective concentrates in the observing-parameter space, highlighting regions where the reconstructions are most likely to degrade.
+White means the worst algorithm performance. Dark areas are the best configurations for the algorithms performance.}
+\label{fig:merged-r2d2-wsclean-posterior}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{../benchmarks/merged-r2d2-wsclean-posterior-side-by-side.png}
+\caption{Side-by-side posterior comparison for merged R2D2 and CLEAN nested-sampling runs. The comparison separates the algorithms so shared failure regions and algorithm-specific failure regions can be inspected directly.}
+\label{fig:merged-r2d2-wsclean-posterior-side-by-side}
+\end{figure}
+
+\section{Failure Score Overview}
+
+The failure score $F_A(\boldsymbol\theta)$ is built from metrics that expose different kinds of reconstruction failure.
+The currently defined metrics are:
+\begin{itemize}
+    \item \hyperref[sec:metric-snr]{Signal-to-noise ratio}: reconstruction error relative to the ground-truth image scale.
+    \item \hyperref[sec:metric-log-snr]{Logarithmic signal-to-noise ratio}: the R2D2 logarithmic-intensity version of SNR.
+    \item \hyperref[sec:metric-nmse]{Normalised mean squared error}: squared reconstruction error normalised by ground-truth image energy.
+    \item \hyperref[sec:metric-normalised-residual]{Normalised residual}: final dirty-image residual relative to the observed dirty image.
+\end{itemize}
+For each nested-sampling run, $\mathcal M$ is chosen from these metrics or a composite of them, with signs chosen so larger $F_A$ corresponds to worse performance.
 
 \section{Data Model}
 \label{sec:data-model}
@@ -154,6 +182,7 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 \subsection{Reconstruction Fidelity}
 
 \subsubsection{Signal-to-Noise Ratio}
+\label{sec:metric-snr}
 
 \begin{equation}
     \mathrm{SNR}(\estimate, \true)
@@ -166,6 +195,7 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 \end{equation}
 
 \subsubsection{Logarithmic Signal-to-Noise Ratio}
+\label{sec:metric-log-snr}
 
 \paragraph{R2D2 definition}
 
@@ -185,6 +215,7 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 \subsubsection{Dynamic Range}
 
 \subsubsection{Normalised Mean Squared Error}
+\label{sec:metric-nmse}
 
 \begin{equation}
     \operatorname{NMSE}(\estimate, \true)
@@ -205,6 +236,7 @@ Lower NMSE indicates better reconstruction fidelity.
 \subsection{Image-Domain Data Fidelity}
 
 \subsubsection{Normalised Residual}
+\label{sec:metric-normalised-residual}
 $$
 \bar\sigma_{\text{res.}}(\hat{\residual},\dirty)
 =
