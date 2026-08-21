@@ -181,6 +181,8 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 
 \paragraph{Standard definition}
 
+\subsubsection{Dynamic Range}
+
 \subsubsection{Normalized Mean Squared Error}
 
 \begin{equation}
@@ -217,6 +219,8 @@ As $\hat\x\to\true$, $\hat\residual\to0$, thus lower is better.
 Essentially this says, normalised by the true dirty image $\dirty$, how much is left in the dirty image residual $\hat\residual$.
 Ideally nothing is left because applying the dirty-image operator $\D$ to the predicted image $\estimate$ reproduces the dirty image $\dirty$, so $\D\estimate\approx\dirty$ and thus $\hat\residual=\dirty-\D\estimate\approx0$.
 
+In short: how closely does each model reproduce the dirty image?
+
 \subsection{Scientific Fidelity}
 
 \subsubsection{Flux Recovery}
@@ -230,6 +234,22 @@ Ideally nothing is left because applying the dirty-image operator $\D$ to the pr
 \subsection{Sky and Image Parameters}
 
 \subsubsection{Dynamic Range}
+
+In the nested-sampling search, dynamic range is a simulation parameter rather than a metric computed from the output image.
+MeqTrees predicts visibilities for a fixed point-source sky, then the simulator adds complex Gaussian thermal noise with
+\begin{equation}
+    \sigma_{\text{vis}}
+    =
+    \frac{S_{\text{src}}}{\rho_{\text{DR}}}.
+\end{equation}
+
+\begin{itemize}
+    \item $\rho_{\text{DR}}$ is the requested simulation dynamic range
+    \item $S_{\text{src}}$ is the true point-source flux, fixed to $1~\mathrm{Jy}$ in the current runs
+    \item $\sigma_{\text{vis}}$ is the complex visibility noise standard deviation
+\end{itemize}
+
+Thus lower $\rho_{\text{DR}}$ produces noisier visibilities before R2D2 or CLEAN sees the data.
 
 \subsubsection{Source Morphology}
 
