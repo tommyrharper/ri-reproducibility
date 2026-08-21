@@ -95,6 +95,26 @@ The currently defined metrics are:
 \end{itemize}
 For each nested-sampling run, $\mathcal M$ is chosen from these metrics or a composite of them, with signs chosen so larger $F_A$ corresponds to worse performance.
 
+\section{Parameter Search}
+
+Nested sampling searches over the following observing and simulation parameters.
+The detailed definitions are given in the linked sections of the search parameter space.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+Dimension & PoC range & Meaning \\
+\hline
+\hyperref[sec:param-dynamic-range]{\texttt{dynamic\_range}} & $10^2$--$10^3$ & One-Jy source divided by thermal-noise sigma \\
+\hyperref[sec:param-observation-duration]{\texttt{observation\_minutes}} & $4$--$10$ & Total requested observing time \\
+\hyperref[sec:param-channel-count]{\texttt{channel\_count}} & $2$--$6$ & Number of frequency channels \\
+\hyperref[sec:param-frequency-range]{\texttt{start\_frequency\_hz}} & $1.0\times10^9$--$1.1\times10^9$ & First channel frequency \\
+\hyperref[sec:param-frequency-range]{\texttt{channel\_width\_hz}} & $0.5\times10^6$--$2.0\times10^6$ & Uniform spacing between channels \\
+\end{tabular}
+\caption{Nested-sampling parameter dimensions used in the current PoC runs.}
+\label{tab:nested-sampling-parameters}
+\end{table}
+
 \section{Data Model}
 \label{sec:data-model}
 
@@ -279,6 +299,7 @@ In short: how closely does each model reproduce the observed dirty image? Lower 
 \subsection{Sky and Image Parameters}
 
 \subsubsection{Dynamic Range}
+\label{sec:param-dynamic-range}
 
 In the nested-sampling search, dynamic range is a simulation parameter rather than a metric computed from the output image.
 MeqTrees predicts visibilities for a fixed point-source sky, then the simulator adds complex Gaussian thermal noise with
@@ -307,6 +328,7 @@ Thus lower $\rho_{\text{DR}}$ produces noisier visibilities before R2D2 or CLEAN
 \subsubsection{Declination}
 
 \subsubsection{Observation Duration}
+\label{sec:param-observation-duration}
 
 VLA dynamic-scheduling timescales, EVLA Memo~232 \cite{faes2024evla232}:
 \begin{itemize}
@@ -321,8 +343,10 @@ Suggested search range: 20~s--20~min.
 \subsubsection{Observation Start Time and Hour-Angle Coverage}
 
 \subsubsection{Number of Frequency Channels}
+\label{sec:param-channel-count}
 
 \subsubsection{Frequency Range and Bandwidth}
+\label{sec:param-frequency-range}
 
 \begin{table}[H]
 \centering
