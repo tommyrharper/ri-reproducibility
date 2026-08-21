@@ -69,7 +69,7 @@ def main() -> None:
             )
         )
 
-        from anesthetic_io import load_nested_samples
+        from anesthetic_io import load_nested_samples, weight_by_likelihood
 
         samples = load_nested_samples(merged_dir)
 
@@ -81,10 +81,17 @@ def main() -> None:
         for tex in tex_labels:
             assert str(tex).startswith("$") and str(tex).endswith("$"), tex
 
+        like = weight_by_likelihood(samples)
+        logL = like["logL"].to_numpy(dtype=float).reshape(-1)
+        weights = like.get_weights()
+        expected = logL - logL.min()
+        assert abs(weights.sum() - expected.sum()) < 1e-9
+        assert abs((weights / weights.max()) - (expected / expected.max())).max() < 1e-9
+
         import matplotlib
 
         matplotlib.use("Agg")
-        axes = samples.plot_2d(PARAM_NAMES[:2])
+        axes = like.plot_2d(PARAM_NAMES[:2])
         assert axes is not None
 
         print("OK: merged mismatched-.paramnames sources without duplicate columns")

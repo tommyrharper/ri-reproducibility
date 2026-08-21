@@ -179,7 +179,7 @@ PolyChord to search parameter space by a configurable objective metric
 results metrics, output FITS). `make nested-sampling-report` builds
 `benchmarks/nested-sampling-report.html` from
 `results/nested-sampling-poc/*/poc-summary.json` (PolyChord log(Z),
-evaluation image grid, posterior plot; see `docs/nested-sampling.md`).
+evaluation image grid, likelihood plot; see `docs/nested-sampling.md`).
 Both reuse the r2d2 image's own astropy + matplotlib + anesthetic,
 same approach as `make plot-fits` (section 7), so no host Python
 environment is needed. Open the file directly in a browser afterward.

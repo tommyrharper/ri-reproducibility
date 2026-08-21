@@ -197,6 +197,29 @@ def label_chain_samples(samples, param_names: list[str]):
     return labelled
 
 
+def weight_by_likelihood(samples):
+    """Reweight samples by logL (the search objective), not the posterior.
+
+    Nested sampling's default weights are posterior, L × prior volume. PolyChord
+    is used here as a search, so logL is the failure score F_A and corner plots
+    should follow F_A rather than exp(F_A) × volume.
+    """
+    import numpy as np
+
+    logL = np.squeeze(np.asarray(samples["logL"], dtype=float)).reshape(-1)
+    weights = np.zeros(len(logL), dtype=float)
+    finite = np.isfinite(logL)
+    if not finite.any():
+        weights[:] = 1.0
+    else:
+        shifted = logL[finite] - np.min(logL[finite])
+        if np.max(shifted) > 0:
+            weights[finite] = shifted
+        else:
+            weights[finite] = 1.0
+    return samples.set_weights(weights)
+
+
 def load_nested_samples(run_dir: Path):
     """Load NestedSamples for a run directory, merging sources when needed."""
     run_dir = Path(run_dir).resolve()

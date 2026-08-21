@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare the latest comparable merged R2D2 and WSClean posteriors.
+"""Compare the latest comparable merged R2D2 and WSClean likelihoods.
 
 Picks the newest merged R2D2 run and newest merged WSClean run that share
 vla_config, metric, and parameter_space (imager hyperparameters may differ).
 
-  uv run scripts/plot-merged-posterior-compare.py
+  uv run scripts/plot-merged-likelihood-compare.py
 """
 
 from __future__ import annotations
@@ -23,7 +23,11 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
 
-from anesthetic_io import NESTED_SAMPLING_DIR, load_nested_samples  # noqa: E402
+from anesthetic_io import (  # noqa: E402
+    NESTED_SAMPLING_DIR,
+    load_nested_samples,
+    weight_by_likelihood,
+)
 
 FALLBACK_PARAMS = [
     "log10_dynamic_range",
@@ -32,8 +36,8 @@ FALLBACK_PARAMS = [
     "start_frequency_hz",
     "channel_width_hz",
 ]
-OUT_OVERLAY = REPO_ROOT / "benchmarks" / "merged-r2d2-wsclean-posterior.png"
-OUT_SIDE = REPO_ROOT / "benchmarks" / "merged-r2d2-wsclean-posterior-side-by-side.png"
+OUT_OVERLAY = REPO_ROOT / "benchmarks" / "merged-r2d2-wsclean-likelihood.png"
+OUT_SIDE = REPO_ROOT / "benchmarks" / "merged-r2d2-wsclean-likelihood-side-by-side.png"
 PLOT_KW = {"kind": "kde", "ncompress": False}
 
 
@@ -112,8 +116,8 @@ def main() -> None:
     print(f"WSClean: {wsclean_dir.name}")
     print(f"metric:  {r2d2_summary.get('metric')}  vla: {r2d2_summary.get('vla_config')}")
 
-    r2d2 = load_nested_samples(r2d2_dir)
-    wsclean = load_nested_samples(wsclean_dir)
+    r2d2 = weight_by_likelihood(load_nested_samples(r2d2_dir))
+    wsclean = weight_by_likelihood(load_nested_samples(wsclean_dir))
     r2d2.label = "R2D2"
     wsclean.label = "WSClean"
     params = [name for name in params if name in r2d2.columns and name in wsclean.columns]

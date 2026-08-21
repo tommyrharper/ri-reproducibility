@@ -224,14 +224,14 @@ def merged_source_run_dirs(summary):
     return dirs
 
 
-def render_posterior_plot(run_dir, param_names):
+def render_likelihood_plot(run_dir, param_names):
     try:
-        from anesthetic_io import load_nested_samples
+        from anesthetic_io import load_nested_samples, weight_by_likelihood
     except ImportError:
         return None
 
     try:
-        samples = load_nested_samples(run_dir)
+        samples = weight_by_likelihood(load_nested_samples(run_dir))
     except Exception:
         return None
 
@@ -264,24 +264,24 @@ def run_tab_id(run_name):
     return f"{sanitized}-{digest}"
 
 
-def render_images_posterior_collapsible(tab_id, eval_images_html, posterior_html):
-    """Collapsed-by-default Images / Posterior tabs for one nested-sampling run."""
-    if not eval_images_html and not posterior_html:
+def render_images_likelihood_collapsible(tab_id, eval_images_html, likelihood_html):
+    """Collapsed-by-default Images / Likelihood tabs for one nested-sampling run."""
+    if not eval_images_html and not likelihood_html:
         return ""
     safe_id = html.escape(tab_id)
     tabset = f"""
     <div class="run-media-tabset">
       <input type="radio" class="tab-images-radio" name="tabs-{safe_id}" id="tab-images-{safe_id}">
       <label for="tab-images-{safe_id}">Images</label>
-      <input type="radio" class="tab-posterior-radio" name="tabs-{safe_id}" id="tab-posterior-{safe_id}" checked>
-      <label for="tab-posterior-{safe_id}">Posterior</label>
+      <input type="radio" class="tab-likelihood-radio" name="tabs-{safe_id}" id="tab-likelihood-{safe_id}" checked>
+      <label for="tab-likelihood-{safe_id}">Likelihood</label>
       <div class="tab-panel tab-panel-images">{eval_images_html}</div>
-      <div class="tab-panel tab-panel-posterior">{posterior_html}</div>
+      <div class="tab-panel tab-panel-likelihood">{likelihood_html}</div>
     </div>
     """
     return f"""
     <details>
-      <summary>Run images and posterior</summary>
+      <summary>Run images and likelihood</summary>
       {tabset}
     </details>
     """
@@ -576,13 +576,13 @@ def render_nested_sampling_run(poc_summary_path):
         </details>
         """
 
-    posterior_html = '<section><h3>Posterior</h3><p class="empty">Posterior plot unavailable.</p></section>'
-    uri = render_posterior_plot(run_dir, space_names)
+    likelihood_html = '<section><h3>Likelihood</h3><p class="empty">Likelihood plot unavailable.</p></section>'
+    uri = render_likelihood_plot(run_dir, space_names)
     if uri:
-        posterior_html = f"""
+        likelihood_html = f"""
         <section>
-          <h3>Posterior</h3>
-          <figure class="posterior-plot"><img src="{uri}" alt="posterior corner plot"></figure>
+          <h3>Likelihood</h3>
+          <figure class="likelihood-plot"><img src="{uri}" alt="likelihood corner plot"></figure>
         </section>
         """
 
@@ -590,8 +590,8 @@ def render_nested_sampling_run(poc_summary_path):
     if eval_rows:
         glance_summary_html = render_eval_glance_summary(evaluations, metric, len(failed))
         eval_images_html = render_eval_images(evaluations, metric, run_dirs, parameter_space)
-        images_collapsible = render_images_posterior_collapsible(
-            tab_id, eval_images_html, posterior_html
+        images_collapsible = render_images_likelihood_collapsible(
+            tab_id, eval_images_html, likelihood_html
         )
         evaluations_html = f"""
         <section>
@@ -610,11 +610,11 @@ def render_nested_sampling_run(poc_summary_path):
           {failed_html}
         </section>
         """
-    elif posterior_html:
+    elif likelihood_html:
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
-          {render_images_posterior_collapsible(tab_id, "", posterior_html)}
+          {render_images_likelihood_collapsible(tab_id, "", likelihood_html)}
         </section>
         """
 
@@ -910,8 +910,8 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
   word-break: break-word;
 }
 .eval-table .eval-recon { min-width: 120px; }
-.posterior-plot { margin: 0.5rem 0; }
-.posterior-plot img { max-width: 100%; height: auto; border-radius: 6px; }
+.likelihood-plot { margin: 0.5rem 0; }
+.likelihood-plot img { max-width: 100%; height: auto; border-radius: 6px; }
 .run-media-tabset { margin-top: 0.5rem; }
 .run-media-tabset input[type="radio"] {
   position: absolute;
@@ -931,7 +931,7 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
   opacity: 0.65;
 }
 .run-media-tabset input.tab-images-radio:checked + label,
-.run-media-tabset input.tab-posterior-radio:checked + label {
+.run-media-tabset input.tab-likelihood-radio:checked + label {
   opacity: 1;
   background: color-mix(in srgb, CanvasText 6%, transparent);
   border-color: color-mix(in srgb, CanvasText 15%, transparent);
@@ -939,7 +939,7 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 }
 .run-media-tabset .tab-panel { display: none; padding-top: 0.75rem; }
 .run-media-tabset input.tab-images-radio:checked ~ .tab-panel-images { display: block; }
-.run-media-tabset input.tab-posterior-radio:checked ~ .tab-panel-posterior { display: block; }
+.run-media-tabset input.tab-likelihood-radio:checked ~ .tab-panel-likelihood { display: block; }
 .section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
 """
 

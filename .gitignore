@@ -10,7 +10,7 @@ benchmarks/manifests/*
 !benchmarks/manifests/.gitkeep
 benchmarks/report.html
 benchmarks/nested-sampling-report*.html
-benchmarks/merged-r2d2-wsclean-posterior*.png
+benchmarks/merged-r2d2-wsclean-*.png
 vendor/*
 !vendor/README.md
 

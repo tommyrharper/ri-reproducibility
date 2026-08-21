@@ -22,7 +22,7 @@ at least one baseline run each (see `REPRODUCTION_PLAN.md`).
 - `nested-sampling-report.html` - generated, gitignored; run
   `make nested-sampling-report` for nested-sampling PoC cards from
   `results/nested-sampling-poc/*/poc-summary.json` (PolyChord log(Z),
-  evaluation image grid, posterior plot; see `docs/nested-sampling.md`).
+  evaluation image grid, likelihood plot; see `docs/nested-sampling.md`).
   `make nested-sampling-report LAST=1` writes
   `nested-sampling-report-last.html`;
   `make nested-sampling-report RUN=results/nested-sampling-poc/<id>` writes
