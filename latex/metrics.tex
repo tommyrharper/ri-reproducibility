@@ -205,22 +205,35 @@ Lower NMSE indicates better reconstruction fidelity.
 \subsection{Image-Domain Data Fidelity}
 
 \subsubsection{Normalised Residual}
-
 $$
-\bar\sigma_{\text{res.}}(\hat{\residual},\dirty)=\frac{\|\hat{\residual}\|_2}{\|\dirty\|_2}
+\bar\sigma_{\text{res.}}(\hat{\residual},\dirty)
+=
+\frac{\|\hat{\residual}\|_2}{\|\dirty\|_2}
 $$
 
 \begin{itemize}
-\item $\hat\residual$ - final dirty image residual
-\item $\dirty$ - true dirty image
+\item $\hat\residual$ - final dirty-image residual
+\item $\dirty$ - observed noisy dirty image
 \end{itemize}
 
-As $\hat\x\to\true$, $\hat\residual\to0$, thus lower is better.
+The normalized residual measures the magnitude of the final dirty-image residual relative to the magnitude of the original dirty image. Lower values therefore indicate greater data fidelity: the reconstructed sky model more closely reproduces the observed data.
 
-Essentially this says, normalised by the true dirty image $\dirty$, how much is left in the dirty image residual $\hat\residual$.
-Ideally nothing is left because applying the dirty-image operator $\D$ to the predicted image $\estimate$ reproduces the dirty image $\dirty$, so $\D\estimate\approx\dirty$ and thus $\hat\residual=\dirty-\D\estimate\approx0$.
+For noisy observations, however, the ideal residual is not necessarily zero. The dirty image can be written as
+$$
+\dirty = \D\true + \noise,
+$$
+where $\noise$ is the image-domain noise. Therefore, even for a perfect reconstruction $\estimate=\true$,
+$$
+\hat\residual
+=
+\dirty-\D\estimate
+=
+\noise.
+$$
 
-In short: how closely does each model reproduce the dirty image?
+The appropriate target is thus a residual consistent with the noise level rather than a residual of zero. Driving the residual substantially below the expected noise level may indicate that the reconstruction is fitting noise rather than recovering the underlying sky.
+
+In short: how closely does each model reproduce the observed dirty image? Lower is better as a measure of data fidelity, but should be interpreted relative to the expected noise level.
 
 \subsection{Scientific Fidelity}
 
