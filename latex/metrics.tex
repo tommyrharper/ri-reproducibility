@@ -1,0 +1,253 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+% \usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{float}
+
+\newcommand{\dnn}{\boldsymbol{\mathsf N}}
+\newcommand{\dnnlayer}[1][i]{\dnn_{\boldsymbol{\hat\theta}^{(#1)}}}
+\newcommand{\D}{\boldsymbol{\mathsf D}}
+\makeatletter
+\newcommand{\@varsup}[1]{\@ifnextchar\bgroup{\@varsup@arg{#1}}{#1}}
+\newcommand{\@varsup@arg}[2]{#1^{(#2)}}
+\newcommand{\residual}{\@varsup{\boldsymbol r}}
+\newcommand{\x}{\@varsup{\boldsymbol x}}
+\newcommand{\estimate}{\@varsup{\boldsymbol{\hat x}}}
+\newcommand{\dirty}{\boldsymbol x_{\text{d}}}
+\newcommand{\true}{\boldsymbol{x^{*}}}
+\makeatother
+
+\title{Radio Interferometry Metrics and Parameters}
+\author{Thomas Harper}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\newpage
+\tableofcontents
+\newpage
+
+\section{Overview}
+
+\section{Data Model}
+\label{sec:data-model}
+
+\begin{equation}
+\boldsymbol y = \boldsymbol\Phi \true + \boldsymbol n
+\end{equation}
+\begin{itemize}
+    \item $\boldsymbol y\in \mathbb C^M$ is the measured visibilities
+    \item $\boldsymbol\Phi: \mathbb R^N \to \mathbb C^M$  is the measurement operator
+    \item $\true\in\mathbb R_+^N$ is the true sky image
+    \item $\boldsymbol n\in\mathbb C^M$ is Gaussian noise with s.d. $\tau>0$ and mean $0$
+\end{itemize}
+
+\begin{equation}
+\dirty = \kappa\operatorname{Re}\{\boldsymbol\Phi^\dagger \boldsymbol y\} = \D\true + \boldsymbol{b}
+\end{equation}
+
+\begin{itemize}
+    \item $\dirty$ is the dirty image including noise
+    \item $\kappa=\max(\operatorname{Re}{\boldsymbol\Phi^\dagger\boldsymbol\Phi\boldsymbol\delta})^{-1}>0$ is the normalisation factor ensuring the PSF ($\boldsymbol{h}=\kappa \operatorname{Re}\left\{\boldsymbol{\Phi}^{\dagger} \boldsymbol{\Phi} \boldsymbol{\delta}\right\} \in \mathbb{R}^N$) has peak value 1, where $\boldsymbol{\mathbf\delta} \in \mathbb R^N$ a discrete Dirac delta centred in the image (1 at the centre, 0 elsewhere)
+    \item $\boldsymbol\Phi^\dagger$ is the adjoint of the measurement operator
+    \item $\D:\mathbb R^N\to\mathbb R^N,\quad \D \triangleq \kappa\operatorname{Re}\{\boldsymbol{\Phi}^{\dagger}\boldsymbol{\Phi}\}$ is a normalised map for the true image to the noise free dirty image, encoding the non-uniform Fourier sampling, gridding, de-gridding and Fourier transform operations
+    \item $\D\true$ is the noise-free dirty image
+    \item $\boldsymbol{b} = \kappa\operatorname{Re}\{\boldsymbol\Phi^\dagger\boldsymbol n\}\in\mathbf R^N$ is the normalised back projected noise
+\end{itemize}
+
+\section{Reconstruction Algorithms}
+
+\subsection{R2D2}
+
+\begin{gather}
+    \residual{i} = \dirty - \D\x{i}\\
+    \x{i} = \x{i-1} + \dnnlayer(\residual{i-1}, \x{i-1})
+\end{gather}
+
+\begin{itemize}
+    \item $\residual{i}$ is a residual dirty image. It is the difference between the original noisy dirty image $\dirty$ and the one derived from the $i^\text{th}$ estimation of the night sky $\D\x{i}$
+    \item $\x{i}$ is the $i^\text{th}$ estimate of the night sky produced by R2D2
+    \item $\dnnlayer$ is the $i^\text{th}$ deep neural network layer in R2D2
+    \item $\boldsymbol{\hat\theta}^{(i)}\in\mathbb R^Q$ are the learned parameters for a given DNN layer.
+\end{itemize}
+
+\begin{equation}
+\estimate \triangleq \x{I} = \sum_{i=1}^I\dnnlayer(\residual{i-1}, \x{i-1})
+\end{equation}
+
+\begin{itemize}
+    \item $\estimate$ is R2D2s final reconstruction
+    \item $I$ is the total number of DNN layers
+\end{itemize}
+
+\subsection{Högbom CLEAN}
+
+\begin{gather}
+    \residual{i} = \dirty - \D\x{i}\\
+    \x{i} = \x{i-1} + \gamma\,\residual{i-1}_{p^{(i)}}\,\boldsymbol{\delta}_{p^{(i)}}
+\end{gather}
+
+\begin{itemize}
+    \item $\residual{i}$ is a residual dirty image. It is the difference between the original noisy dirty image $\dirty$ and the one derived from the $i^\text{th}$ CLEAN component model $\D\x{i}$
+    \item $\x{i}$ is the $i^\text{th}$ CLEAN component model of the sky image, initialised at $\x{0}=\boldsymbol 0$
+    \item $p^{(i)}=\arg\max_{n}\lvert\residual{i-1}_{n}\rvert$ is the pixel of the peak residual
+    \item $\boldsymbol{\delta}_{p^{(i)}}$ is a discrete Dirac delta at pixel $p^{(i)}$
+    \item $\gamma\in(0,1]$ is the loop gain
+\end{itemize}
+
+\begin{equation}
+\x{I} = \sum_{i=1}^{I}\gamma\,\residual{i-1}_{p^{(i)}}\,\boldsymbol{\delta}_{p^{(i)}}
+\end{equation}
+
+\begin{equation}
+\estimate \triangleq \boldsymbol g \ast \x{I} + \residual{I}
+\end{equation}
+
+\begin{itemize}
+    \item $\x{I}$ is the CLEAN component model after $I$ iterations
+    \item $\boldsymbol g$ is the restoring beam, typically a Gaussian fit to the main lobe of the PSF
+    \item $\estimate$ is the restored CLEAN image
+    \item $I$ is the number of CLEAN iterations
+\end{itemize}
+
+\section{Evaluation Metrics}
+
+\subsection{Reconstruction Fidelity}
+
+\subsubsection{Signal-to-Noise Ratio}
+
+\begin{equation}
+    \mathrm{SNR}(\estimate, \true)
+    =
+    20\log_{10}
+    \left(
+    \frac{\|\true\|_2}
+    {\|\true - \estimate\|_2}
+    \right)
+\end{equation}
+
+\subsubsection{Logarithmic Signal-to-Noise Ratio}
+
+\paragraph{R2D2 definition}
+
+\begin{gather}
+    \operatorname{rlog}(\x)=x_{\max} \log _a\left(\frac{a}{x_{\max}} \x+\mathbf{1}\right)\\
+    \operatorname{logSNR}(\estimate, \true)=\operatorname{SNR}(\operatorname{rlog}(\estimate), \operatorname{rlog}(\true))
+\end{gather}
+
+\begin{itemize}
+    \item $a$ is a parameter set to $\rho_\text{DR}$, the dynamic range of the ground truth image
+    \item $x_\text{max}$ is the peak pixel value of the image $\x$
+    \item $\mathbf 1\in\mathbb R^N$ is a vector of values equal to 1
+\end{itemize}
+
+\paragraph{Standard definition}
+
+\subsubsection{Normalized Mean Squared Error}
+
+\subsubsection{Structural Similarity Index}
+
+\subsection{Image-Domain Data Fidelity}
+
+\subsubsection{Normalized Residual}
+
+$$
+\bar\sigma_{\text{res.}}(\hat{\residual},\dirty)=\frac{\|\hat{\residual}\|_2}{\|\dirty\|_2}
+$$
+
+\begin{itemize}
+\item $\hat\residual$ - final dirty image residual
+\item $\dirty$ - true dirty image
+\end{itemize}
+
+As $\hat\x\to\true$, $\hat\residual\to0$, thus lower is better.
+
+Essentially this says, normalised by the true dirty image $\dirty$, how much is left in the dirty image residual $\hat\residual$.
+Ideally nothing is left because applying the dirty-image operator $\D$ to the predicted image $\estimate$ reproduces the dirty image $\dirty$, so $\D\estimate\approx\dirty$ and thus $\hat\residual=\dirty-\D\estimate\approx0$.
+
+\subsection{Scientific Fidelity}
+
+\subsubsection{Flux Recovery}
+
+\subsubsection{Astrometric Error}
+
+\subsubsection{Source Detection and Completeness}
+
+\section{Search Parameter Space}
+
+\subsection{Sky and Image Parameters}
+
+\subsubsection{Dynamic Range}
+
+\subsubsection{Source Morphology}
+
+\subsubsection{Source Position}
+
+\subsection{Observation and Fourier-Sampling Parameters}
+
+\subsubsection{VLA Configuration}
+
+\subsubsection{Declination}
+
+\subsubsection{Observation Duration}
+
+VLA dynamic-scheduling timescales, EVLA Memo~232 \cite{faes2024evla232}:
+\begin{itemize}
+    \item Scan length: 0--10~min (Fig.~7)
+    \item Single tracking (same target, consecutive scans): 0--10~min (Fig.~11)
+    \item Time on source per scheduling block (even if interrupted): 0--20~min (Fig.~17)
+\end{itemize}
+
+For regular (standard observing) scans, no less than 20~seconds on source after slewing (Static Report Tab) \cite{nrao-vla-obsguide}.
+Suggested search range: 20~s--20~min.
+
+\subsubsection{Observation Start Time and Hour-Angle Coverage}
+
+\subsubsection{Number of Frequency Channels}
+
+\subsubsection{Frequency Range and Bandwidth}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{ll}
+4  & 54--86~MHz \\
+P  & 224--480~MHz \\
+L  & 1--2~GHz \\
+S  & 2--4~GHz \\
+C  & 4--8~GHz \\
+X  & 8--12~GHz \\
+Ku & 12--18~GHz \\
+K  & 18--26.5~GHz \\
+Ka & 26.5--40~GHz \\
+Q  & 40--50~GHz \\
+\end{tabular}
+\caption{VLA receiver bands. Recommended calibrator cycle times by configuration are in Table~3.1 \cite{nrao-vla-obsguide}.}
+\label{tab:vla-bands}
+\end{table}
+
+\subsubsection{Flagging Fraction}
+
+\subsubsection{Visibility Weighting}
+
+\section{Proposed Search}
+
+\subsection{Search Variables}
+
+\subsection{Parameter Ranges}
+
+\subsection{Objective Metrics}
+
+\subsection{Failure Criteria}
+
+\nocite{*}
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

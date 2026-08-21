@@ -44,3 +44,17 @@ CMakeFiles/
 # Benchmark / profiling artefacts
 *.prof
 *.trace
+
+# latex
+latex/*.aux
+latex/*.log
+latex/*.synctex.gz
+latex/*.synctex(busy)
+latex/*.pdf
+latex/*.out
+latex/*.fdb_latexmk
+latex/*.fls
+latex/*.log
+latex/*.bbl
+latex/*.blg
+latex/*.toc
