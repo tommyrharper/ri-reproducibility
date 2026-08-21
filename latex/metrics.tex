@@ -183,6 +183,22 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 
 \subsubsection{Normalized Mean Squared Error}
 
+\begin{equation}
+    \operatorname{NMSE}(\estimate, \true)
+    =
+    \frac{\|\estimate - \true\|_2^2}
+    {\|\true\|_2^2}
+\end{equation}
+
+\begin{itemize}
+    \item $\estimate$ is the reconstructed image
+    \item $\true$ is the ground-truth sky image
+    \item $\|\estimate - \true\|_2^2$ is the squared reconstruction error
+    \item $\|\true\|_2^2$ normalises the error by the ground-truth image energy
+\end{itemize}
+
+Lower NMSE indicates better reconstruction fidelity.
+
 \subsubsection{Structural Similarity Index}
 
 \subsection{Image-Domain Data Fidelity}
