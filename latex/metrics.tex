@@ -23,7 +23,7 @@
 \newcommand{\true}{\boldsymbol{x^{*}}}
 \makeatother
 
-\title{Radio Interferometry Metrics and Parameters}
+\title{Finding failure modes of R2D2 and CLEAN}
 \author{Thomas Harper}
 \date{\today}
 
@@ -35,6 +35,37 @@
 \newpage
 
 \section{Overview}
+
+We search for failure modes by treating the observing setup as a parameter vector
+\begin{equation}
+\boldsymbol\theta =
+(\rho_{\text{DR}}, t_{\text{obs}}, \nu_0, \Delta\nu, C, \ldots),
+\end{equation}
+\begin{itemize}
+    \item $\boldsymbol\theta$ is the observing setup searched by nested sampling
+    \item $\rho_{\text{DR}}$ is the target dynamic range
+    \item $t_{\text{obs}}$ is the observation duration
+    \item $\nu_0$ is the start frequency
+    \item $\Delta\nu$ is the channel width
+    \item $C$ is the telescope configuration
+\end{itemize}
+then we simulate data $\boldsymbol y(\boldsymbol\theta)$ using the MeqTrees software and attempt to reconstruct it with R2D2 and CLEAN.
+For an algorithm $A$, nested sampling targets a failure score
+\begin{equation}
+F_A(\boldsymbol\theta)
+=
+\mathcal M\left(\estimate_A(\boldsymbol y(\boldsymbol\theta)), \true(\boldsymbol\theta)\right),
+\end{equation}
+\begin{itemize}
+    \item $A$ is the reconstruction algorithm, either R2D2 or CLEAN
+    \item $F_A(\boldsymbol\theta)$ is the failure score for algorithm $A$ at setup $\boldsymbol\theta$
+    \item $\boldsymbol y(\boldsymbol\theta)$ is the simulated visibility data
+    \item $\estimate_A$ is the reconstruction produced by algorithm $A$
+    \item $\true(\boldsymbol\theta)$ is the ground-truth sky (for the moment simply a point source)
+    \item $\mathcal M$ is the chosen metric or composite failure score
+\end{itemize}
+where larger $F_A$ means worse reconstruction, higher residuals, or greater computational cost.
+The high-scoring samples identify regions of observing conditions where R2D2, CLEAN, or both are likely to fail.
 
 \section{Data Model}
 \label{sec:data-model}
