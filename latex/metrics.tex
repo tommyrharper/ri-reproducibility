@@ -38,7 +38,7 @@
 
 \section{Overview}
 
-We search for failure modes by treating the observing setup as a parameter vector
+We search for failure modes of R2D2 and WSClean by treating the observing setup as a parameter vector
 \begin{equation}
 \boldsymbol\theta =
 (\rho_{\text{DR}}, t_{\text{obs}}, \nu_0, \Delta\nu, C, \ldots),
@@ -51,7 +51,7 @@ We search for failure modes by treating the observing setup as a parameter vecto
     \item $\Delta\nu$ is the channel width
     \item $C$ is the telescope configuration
 \end{itemize}
-then we simulate data $\boldsymbol y(\boldsymbol\theta)$ using the MeqTrees software and attempt to reconstruct it with R2D2 \cite{aghabiglou2024r2d2} and CLEAN.
+then we simulate visibility data $\boldsymbol y(\boldsymbol\theta)$ using the MeqTrees software and attempt to reconstruct it with R2D2 \cite{aghabiglou2024r2d2} and CLEAN.
 For an algorithm $A$, nested sampling targets a failure score
 \begin{equation}
 F_A(\boldsymbol\theta)
@@ -73,23 +73,24 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 
 The images on the next page show the nested-sampling objective for the current R2D2 and CLEAN searches.
 This is not a traditional likelihood or posterior: the quantity passed to nested sampling as the likelihood is the failure score $F_A$.
-Bright regions therefore indicate parameter combinations with worse reconstructions, while dark regions indicate comparatively good performance.
-White areas have the worst performance.
+Bright regions therefore indicate parameter combinations with worse reconstructions (white being the worst), while dark regions indicate comparatively good performance.
 The merged plot shows combined failure structure, and the side-by-side plot separates algorithm-specific behaviour.
+
+These triangle plots allow us to see a landscape in parameter space showing what combinations of parameters lead to poor reconstruction.
 
 WSClean \cite{offringa2014wsclean} has been used for CLEAN, using default out of the box call time parameters without fine-tuning.
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{../benchmarks/merged-r2d2-wsclean-likelihood.png}
-\caption{Merged nested-sampling failure score for the R2D2 and CLEAN searches. The plotted objective is the failure score used in place of a traditional likelihood. White is the worst performance. Dark is the best performance.}
+\caption{Merged nested-sampling failure score for the R2D2 and CLEAN searches. The plotted objective is the failure score used in place of a traditional likelihood.}
 \label{fig:merged-r2d2-wsclean-likelihood}
 \end{figure}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.95\textwidth]{../benchmarks/merged-r2d2-wsclean-likelihood-side-by-side.png}
-\caption{Side-by-side failure-score comparison for merged R2D2 and CLEAN nested-sampling runs. The comparison separates the algorithms so shared failure regions and algorithm-specific failure regions can be inspected directly. White is the worst performance. Dark is the best performance.}
+\caption{Side-by-side failure-score comparison for merged R2D2 and CLEAN nested-sampling runs. The comparison separates the algorithms so shared failure regions and algorithm-specific failure regions can be inspected directly.}
 \label{fig:merged-r2d2-wsclean-likelihood-side-by-side}
 \end{figure}
 
