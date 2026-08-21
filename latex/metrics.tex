@@ -51,7 +51,7 @@ We search for failure modes by treating the observing setup as a parameter vecto
     \item $\Delta\nu$ is the channel width
     \item $C$ is the telescope configuration
 \end{itemize}
-then we simulate data $\boldsymbol y(\boldsymbol\theta)$ using the MeqTrees software and attempt to reconstruct it with R2D2 and CLEAN.
+then we simulate data $\boldsymbol y(\boldsymbol\theta)$ using the MeqTrees software and attempt to reconstruct it with R2D2 \cite{aghabiglou2024r2d2} and CLEAN.
 For an algorithm $A$, nested sampling targets a failure score
 \begin{equation}
 F_A(\boldsymbol\theta)
@@ -77,7 +77,7 @@ Bright regions therefore indicate parameter combinations with worse reconstructi
 White areas have the worst performance.
 The merged plot shows combined failure structure, and the side-by-side plot separates algorithm-specific behaviour.
 
-WSClean has been used for CLEAN, using default out of the box call time parameters without fine-tuning.
+WSClean \cite{offringa2014wsclean} has been used for CLEAN, using default out of the box call time parameters without fine-tuning.
 
 \begin{figure}[H]
 \centering
@@ -410,7 +410,6 @@ Q  & 40--50~GHz \\
 
 % \subsection{Failure Criteria}
 
-\nocite{*}
 \bibliographystyle{plain}
 \bibliography{references}
 
