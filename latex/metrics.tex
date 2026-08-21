@@ -21,6 +21,7 @@
 \newcommand{\estimate}{\@varsup{\boldsymbol{\hat x}}}
 \newcommand{\dirty}{\boldsymbol x_{\text{d}}}
 \newcommand{\true}{\boldsymbol{x^{*}}}
+\newcommand{\noise}{\boldsymbol{b}}
 \makeatother
 
 \title{Finding failure modes of R2D2 and CLEAN}
@@ -81,7 +82,7 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
 \end{itemize}
 
 \begin{equation}
-\dirty = \kappa\operatorname{Re}\{\boldsymbol\Phi^\dagger \boldsymbol y\} = \D\true + \boldsymbol{b}
+\dirty = \kappa\operatorname{Re}\{\boldsymbol\Phi^\dagger \boldsymbol y\} = \D\true + \noise
 \end{equation}
 
 \begin{itemize}
@@ -90,7 +91,7 @@ The high-scoring samples identify regions of observing conditions where R2D2, CL
     \item $\boldsymbol\Phi^\dagger$ is the adjoint of the measurement operator
     \item $\D:\mathbb R^N\to\mathbb R^N,\quad \D \triangleq \kappa\operatorname{Re}\{\boldsymbol{\Phi}^{\dagger}\boldsymbol{\Phi}\}$ is a normalised map for the true image to the noise free dirty image, encoding the non-uniform Fourier sampling, gridding, de-gridding and Fourier transform operations
     \item $\D\true$ is the noise-free dirty image
-    \item $\boldsymbol{b} = \kappa\operatorname{Re}\{\boldsymbol\Phi^\dagger\boldsymbol n\}\in\mathbf R^N$ is the normalised back projected noise
+    \item $\noise = \kappa\operatorname{Re}\{\boldsymbol\Phi^\dagger\boldsymbol n\}\in\mathbf R^N$ is the normalised back projected noise
 \end{itemize}
 
 \section{Reconstruction Algorithms}
