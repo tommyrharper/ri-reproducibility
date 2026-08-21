@@ -289,13 +289,13 @@ The appropriate target is thus a residual consistent with the noise level rather
 
 In short: how closely does each model reproduce the observed dirty image? Lower is better as a measure of data fidelity, but should be interpreted relative to the expected noise level.
 
-\subsection{Scientific Fidelity}
+% \subsection{Scientific Fidelity}
 
-\subsubsection{Flux Recovery}
+% \subsubsection{Flux Recovery}
 
-\subsubsection{Astrometric Error}
+% \subsubsection{Astrometric Error}
 
-\subsubsection{Source Detection and Completeness}
+% \subsubsection{Source Detection and Completeness}
 
 \section{Search Parameter Space}
 
@@ -320,9 +320,9 @@ MeqTrees predicts visibilities for a fixed point-source sky, then the simulator 
 
 Thus lower $\rho_{\text{DR}}$ produces noisier visibilities before R2D2 or CLEAN sees the data.
 
-\subsubsection{Source Morphology}
+% \subsubsection{Source Morphology}
 
-\subsubsection{Source Position}
+% \subsubsection{Source Position}
 
 \subsection{Observation and Fourier-Sampling Parameters}
 
@@ -348,6 +348,12 @@ Suggested search range: 20~s--20~min.
 \subsubsection{Number of Frequency Channels}
 \label{sec:param-channel-count}
 
+The VLA can support channel counts of the form $2^n$ in relevant correlator modes, but practical limits depend on the observing mode and correlator setup.
+For example, the OSS notes that phased-array pulsar subbands can be divided into an arbitrary $2^n$ number of channels \cite{nrao-vla-oss}.
+For WIDAR spectral-line setups, Table~4.2.2 of the OSS gives example Baseline Board Pair configurations with spectral-channel counts ranging from 64 channels to 16384 channels, including examples at 2048 channels and above \cite{nrao-vla-oss}.
+In practice, 64 channels is a common modest/default scale for setup exploration, while thousands of channels may be computationally infeasible for the present MeqTrees, R2D2, and CLEAN nested-sampling simulations.
+Even 64 may computationally infeasible.
+
 \subsubsection{Frequency Range and Bandwidth}
 \label{sec:param-frequency-range}
 
@@ -369,19 +375,19 @@ Q  & 40--50~GHz \\
 \label{tab:vla-bands}
 \end{table}
 
-\subsubsection{Flagging Fraction}
+% \subsubsection{Flagging Fraction}
 
-\subsubsection{Visibility Weighting}
+% \subsubsection{Visibility Weighting}
 
-\section{Proposed Search}
+% \section{Proposed Search}
 
-\subsection{Search Variables}
+% \subsection{Search Variables}
 
-\subsection{Parameter Ranges}
+% \subsection{Parameter Ranges}
 
-\subsection{Objective Metrics}
+% \subsection{Objective Metrics}
 
-\subsection{Failure Criteria}
+% \subsection{Failure Criteria}
 
 \nocite{*}
 \bibliographystyle{plain}
