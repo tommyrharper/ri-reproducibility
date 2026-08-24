@@ -306,11 +306,9 @@ def summarize_profiling(
     evaluations that errored out before a stage ran simply omit that field).
     `image_container_overhead_seconds` is the docker round-trip minus the
     binary's own GNU-time-reported elapsed time, i.e. container create/start/
-    teardown plus the `docker stats` polling loop. `polychord_overhead_seconds`
-    is whatever's left of total_wall_seconds once every accounted evaluation
-    stage is subtracted out - PolyChord's own sampling/bookkeeping plus (at
-    mpi_procs > 1) any cross-rank idle time, so it is only a clean serial
-    figure when mpi_procs == 1.
+    teardown plus the `docker stats` polling loop. Stage totals are summed
+    worker-seconds; only serial runs can subtract them from run wall time to
+    estimate PolyChord's own sampling/bookkeeping overhead.
     """
     totals: dict[str, float] = {field: 0.0 for field in PROFILING_STAGE_FIELDS}
     counts: dict[str, int] = {field: 0 for field in PROFILING_STAGE_FIELDS}
@@ -339,7 +337,7 @@ def summarize_profiling(
         + totals["image_container_seconds"]
         + totals["metrics_seconds"]
     )
-    polychord_overhead = total_wall_seconds - accounted
+    polychord_overhead = total_wall_seconds - accounted if mpi_procs == 1 else None
 
     return {
         "mpi_procs": mpi_procs,
@@ -353,12 +351,12 @@ def summarize_profiling(
             "metrics": totals["metrics_seconds"],
         },
         "stage_eval_counts": counts,
-        "accounted_seconds": accounted,
+        "accounted_worker_seconds": accounted,
+        "accounted_seconds": accounted if mpi_procs == 1 else None,
         "polychord_overhead_seconds": polychord_overhead,
         "note": (
-            "polychord_overhead_seconds is a clean serial figure only when "
-            "mpi_procs == 1; at higher mpi_procs it also folds in cross-rank "
-            "idle/imbalance time."
+            "stage totals are summed worker-seconds; accounted_seconds and "
+            "polychord_overhead_seconds are only emitted for mpi_procs == 1."
         ),
     }
 
@@ -593,4 +591,10 @@ def self_check_profiling() -> None:
     assert empty_profiling["stage_totals_seconds"]["image_binary"] is None
     assert empty_profiling["stage_totals_seconds"]["image_container_overhead"] is None
     assert empty_profiling["accounted_seconds"] == 0.0
+    assert empty_profiling["accounted_worker_seconds"] == 0.0
     assert empty_profiling["polychord_overhead_seconds"] == 5.0
+
+    mpi_profiling = summarize_profiling(evaluations, total_wall_seconds=5.0, mpi_procs=4)
+    assert mpi_profiling["accounted_worker_seconds"] == 19.5
+    assert mpi_profiling["accounted_seconds"] is None
+    assert mpi_profiling["polychord_overhead_seconds"] is None

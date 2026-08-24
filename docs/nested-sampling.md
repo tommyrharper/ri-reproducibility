@@ -237,13 +237,16 @@ blob.
 `poc-summary.json` also gets a run-level `profiling` block: each field above
 summed across every evaluation, plus:
 
-- `accounted_seconds` - sum of every stage total.
+- `accounted_worker_seconds` - sum of every stage total across all evaluated
+  points.
+- `accounted_seconds` - same value as `accounted_worker_seconds`, but emitted
+  only for serial runs where `NS_MPI_PROCS=1`.
 - `polychord_overhead_seconds` = `total_wall_seconds - accounted_seconds`.
   This is whatever PolyChord itself is doing outside likelihood calls (its own
   slice-sampling bookkeeping, live-point management, I/O to `chains/`). It is
-  only a clean serial figure at `NS_MPI_PROCS=1`; at higher MPI process counts
-  it also folds in cross-rank idle/imbalance time, since ranks run likelihood
-  evaluations concurrently.
+  emitted only for serial runs where `NS_MPI_PROCS=1`; at higher MPI process
+  counts, ranks run likelihood evaluations concurrently, so summed
+  worker-seconds cannot be subtracted from rank-0 elapsed wall time.
 
 ### Running the profiler
 

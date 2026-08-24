@@ -51,21 +51,25 @@ def print_report(summary: dict[str, Any]) -> None:
         )
 
     total = profiling["total_wall_seconds"]
+    mpi_procs = int(profiling["mpi_procs"])
+    show_wall_shares = mpi_procs == 1
     stages = profiling["stage_totals_seconds"]
     counts = profiling["stage_eval_counts"]
     n_evals = len(summary.get("evaluations", []))
 
     print(f"algorithm:        {summary.get('algorithm')}")
     print(f"evaluations:      {n_evals}")
-    print(f"mpi_procs:        {profiling['mpi_procs']}")
+    print(f"mpi_procs:        {mpi_procs}")
     print(f"total_wall:       {format_seconds(total)}")
     print()
-    print(f"{'stage':<28} {'total':>10} {'share':>8}  evals")
+    total_heading = "wall" if show_wall_shares else "worker-s"
+    print(f"{'stage':<28} {total_heading:>10} {'share':>8}  evals")
     print("-" * 58)
 
     def row(label: str, key: str, count_key: str) -> None:
         value = stages.get(key)
-        print(f"{label:<28} {format_seconds(value):>10} {format_pct(value, total):>8}  {counts.get(count_key, 0)}")
+        share = format_pct(value, total) if show_wall_shares else ""
+        print(f"{label:<28} {format_seconds(value):>10} {share:>8}  {counts.get(count_key, 0)}")
 
     row("simulate (MeqTrees)", "simulate", "simulate_seconds")
     if stages.get("convert") is not None:
@@ -76,11 +80,13 @@ def print_report(summary: dict[str, Any]) -> None:
         row("  of which: container overhead", "image_container_overhead", "image_container_overhead_seconds")
     row("metrics computation", "metrics", "metrics_seconds")
     print("-" * 58)
-    accounted = profiling["accounted_seconds"]
-    print(f"{'accounted (sum above)':<28} {format_seconds(accounted):>10} {format_pct(accounted, total):>8}")
+    accounted = profiling.get("accounted_worker_seconds", profiling.get("accounted_seconds"))
+    accounted_share = format_pct(accounted, total) if show_wall_shares else ""
+    print(f"{'accounted (sum above)':<28} {format_seconds(accounted):>10} {accounted_share:>8}")
 
     overhead = profiling["polychord_overhead_seconds"]
-    print(f"{'PolyChord overhead (unaccounted)':<28} {format_seconds(overhead):>10} {format_pct(overhead, total):>8}")
+    overhead_share = format_pct(overhead, total) if show_wall_shares else ""
+    print(f"{'PolyChord overhead (unaccounted)':<28} {format_seconds(overhead):>10} {overhead_share:>8}")
     print()
     print(f"note: {profiling['note']}")
 
