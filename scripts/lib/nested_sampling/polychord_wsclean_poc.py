@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pypolychord
-from pypolychord.settings import PolyChordSettings
 
 from poc_common import (
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
@@ -37,6 +35,7 @@ from poc_common import (
     simulate_measurement_set,
     stable_seed,
     summarize_profiling,
+    write_evaluation_record,
     write_polychord_paramnames,
 )
 
@@ -67,13 +66,15 @@ def evaluate(
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
     simulate_seconds = time.perf_counter() - sim_start
     if sim_error is not None:
-        return {
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
             "error": f"simulation failed with exit {sim_error.returncode}",
             "paths": {"eval_dir": str(eval_dir)},
-        }
+            "commands": {"simulate": sim_cmd},
+            "timing": {"simulate_seconds": simulate_seconds},
+        })
 
     wsclean_dir = eval_dir / "wsclean"
     wsclean_dir.mkdir()
@@ -126,7 +127,7 @@ def evaluate(
     peak_memory_bytes = max(run_result.peak_memory_bytes, read_gnu_time_peak_memory(wsclean_time))
     image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
     if run_result.returncode != 0:
-        return {
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
@@ -139,7 +140,7 @@ def evaluate(
                 "image_container_seconds": run_result.wall_seconds,
                 "image_binary_seconds": image_binary_seconds,
             },
-        }
+        })
 
     image_path = wsclean_dir / "recon-image.fits"
     dirty_path = wsclean_dir / "recon-dirty.fits"
@@ -156,7 +157,7 @@ def evaluate(
         )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
-        return {
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
@@ -167,7 +168,7 @@ def evaluate(
                 "image_container_seconds": run_result.wall_seconds,
                 "image_binary_seconds": image_binary_seconds,
             },
-        }
+        })
     metrics_seconds = time.perf_counter() - metrics_start
 
     record = {
@@ -195,11 +196,42 @@ def evaluate(
             "metrics_seconds": metrics_seconds,
         },
     }
-    (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
-    return record
+    return write_evaluation_record(eval_dir, record)
+
+
+def self_check_failure_record_persistence() -> None:
+    import subprocess
+    import tempfile
+
+    original_simulate = globals()["simulate_measurement_set"]
+
+    def failing_simulate(
+        params: dict[str, Any],
+        eval_dir: Path,
+        meqtrees_image: str,
+        platform: str,
+    ) -> tuple[Path, list[str], subprocess.CalledProcessError]:
+        eval_dir.mkdir(parents=True, exist_ok=False)
+        return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
+
+    try:
+        globals()["simulate_measurement_set"] = failing_simulate
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(meqtrees_image="meqtrees", platform="linux/arm64")
+            record = evaluate({}, args, root / "eval-0001-deadbeef", 1, lambda metrics: 0.0)
+            loaded = load_evaluations_from_dir(root)
+            assert loaded == [record]
+            assert loaded[0]["objective"] == FAILURE_OBJECTIVE
+            assert loaded[0]["timing"]["simulate_seconds"] >= 0.0
+    finally:
+        globals()["simulate_measurement_set"] = original_simulate
 
 
 def main() -> None:
+    import pypolychord
+    from pypolychord.settings import PolyChordSettings
+
     args = parse_args()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
     output_dir = Path(args.output_dir).resolve()
@@ -284,6 +316,7 @@ if __name__ == "__main__":
     if os.environ.get("POLYCHORD_WSCLEAN_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
         self_check_profiling()
+        self_check_failure_record_persistence()
         print("metric resolution self-check passed")
     else:
         main()

@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from astropy.io import fits
 
 
 METRIC_NAMES = (
@@ -183,6 +182,8 @@ def run_docker_monitored(cmd: list[str], container_name: str, stdout_path: Path,
 
 
 def load_fits_2d(path: Path) -> tuple[np.ndarray, Any]:
+    from astropy.io import fits
+
     data, header = fits.getdata(path, header=True)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
     if image.ndim != 2:
@@ -313,6 +314,8 @@ def summarize_profiling(
     """
     totals: dict[str, float] = {field: 0.0 for field in PROFILING_STAGE_FIELDS}
     counts: dict[str, int] = {field: 0 for field in PROFILING_STAGE_FIELDS}
+    image_container_overhead = 0.0
+    image_container_overhead_count = 0
     for record in evaluations:
         timing = record.get("timing") or {}
         for field in PROFILING_STAGE_FIELDS:
@@ -320,12 +323,15 @@ def summarize_profiling(
             if value is not None:
                 totals[field] += float(value)
                 counts[field] += 1
+        image_container_value = timing.get("image_container_seconds")
+        image_binary_value = timing.get("image_binary_seconds")
+        if image_container_value is not None and image_binary_value is not None:
+            image_container_overhead += float(image_container_value) - float(image_binary_value)
+            image_container_overhead_count += 1
 
     image_binary_total = totals["image_binary_seconds"]
     image_container_total = totals["image_container_seconds"]
-    image_container_overhead = (
-        image_container_total - image_binary_total if counts["image_binary_seconds"] else None
-    )
+    counts["image_container_overhead_seconds"] = image_container_overhead_count
 
     accounted = (
         totals["simulate_seconds"]
@@ -343,7 +349,7 @@ def summarize_profiling(
             "convert": totals["convert_seconds"] if counts["convert_seconds"] else None,
             "image_container": image_container_total,
             "image_binary": image_binary_total if counts["image_binary_seconds"] else None,
-            "image_container_overhead": image_container_overhead,
+            "image_container_overhead": image_container_overhead if image_container_overhead_count else None,
             "metrics": totals["metrics_seconds"],
         },
         "stage_eval_counts": counts,
@@ -422,6 +428,11 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
     for metrics_path in sorted(evaluations_dir.glob("eval-*/metrics.json")):
         records.append(json.loads(metrics_path.read_text()))
     return records
+
+
+def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
+    (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
+    return record
 
 
 def simulate_measurement_set(
@@ -565,18 +576,21 @@ def self_check_profiling() -> None:
     evaluations = [
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
+        {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "metrics_seconds": 0.5}},
         {"error": "simulation failed", "paths": {}},
     ]
-    profiling = summarize_profiling(evaluations, total_wall_seconds=20.0, mpi_procs=1)
-    assert profiling["stage_totals_seconds"]["simulate"] == 2.0
-    assert profiling["stage_totals_seconds"]["image_container"] == 10.0
+    profiling = summarize_profiling(evaluations, total_wall_seconds=25.0, mpi_procs=1)
+    assert profiling["stage_totals_seconds"]["simulate"] == 3.0
+    assert profiling["stage_totals_seconds"]["image_container"] == 15.0
     assert profiling["stage_totals_seconds"]["image_binary"] == 6.0
     assert profiling["stage_totals_seconds"]["image_container_overhead"] == 4.0
-    assert profiling["accounted_seconds"] == 13.0
-    assert abs(profiling["polychord_overhead_seconds"] - 7.0) < 1e-9
-    assert profiling["stage_eval_counts"]["simulate_seconds"] == 2
+    assert profiling["accounted_seconds"] == 19.5
+    assert abs(profiling["polychord_overhead_seconds"] - 5.5) < 1e-9
+    assert profiling["stage_eval_counts"]["simulate_seconds"] == 3
+    assert profiling["stage_eval_counts"]["image_container_overhead_seconds"] == 2
 
     empty_profiling = summarize_profiling([], total_wall_seconds=5.0, mpi_procs=1)
     assert empty_profiling["stage_totals_seconds"]["image_binary"] is None
+    assert empty_profiling["stage_totals_seconds"]["image_container_overhead"] is None
     assert empty_profiling["accounted_seconds"] == 0.0
     assert empty_profiling["polychord_overhead_seconds"] == 5.0

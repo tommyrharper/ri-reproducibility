@@ -73,7 +73,7 @@ def print_report(summary: dict[str, Any]) -> None:
     row("image container (total)", "image_container", "image_container_seconds")
     if stages.get("image_binary") is not None:
         row("  of which: binary run", "image_binary", "image_binary_seconds")
-        row("  of which: container overhead", "image_container_overhead", "image_binary_seconds")
+        row("  of which: container overhead", "image_container_overhead", "image_container_overhead_seconds")
     row("metrics computation", "metrics", "metrics_seconds")
     print("-" * 58)
     accounted = profiling["accounted_seconds"]
