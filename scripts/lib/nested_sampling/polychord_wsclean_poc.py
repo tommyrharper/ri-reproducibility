@@ -29,11 +29,14 @@ from poc_common import (
     params_key,
     prior_vector,
     read_gnu_time_peak_memory,
+    read_gnu_time_wall_seconds,
     resolve_metric,
     run_docker_monitored,
     self_check_metric_resolution,
+    self_check_profiling,
     simulate_measurement_set,
     stable_seed,
+    summarize_profiling,
     write_polychord_paramnames,
 )
 
@@ -60,7 +63,9 @@ def evaluate(
     eval_id: int,
     objective_from_metrics: Callable[[dict[str, float]], float],
 ) -> dict[str, Any]:
+    sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
+    simulate_seconds = time.perf_counter() - sim_start
     if sim_error is not None:
         return {
             "eval_id": eval_id,
@@ -119,6 +124,7 @@ def evaluate(
     ]
     run_result = run_docker_monitored(wsclean_cmd, container_name, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = max(run_result.peak_memory_bytes, read_gnu_time_peak_memory(wsclean_time))
+    image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
     if run_result.returncode != 0:
         return {
             "eval_id": eval_id,
@@ -128,11 +134,17 @@ def evaluate(
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
             "wall_seconds": run_result.wall_seconds,
             "peak_memory_bytes": peak_memory_bytes,
+            "timing": {
+                "simulate_seconds": simulate_seconds,
+                "image_container_seconds": run_result.wall_seconds,
+                "image_binary_seconds": image_binary_seconds,
+            },
         }
 
     image_path = wsclean_dir / "recon-image.fits"
     dirty_path = wsclean_dir / "recon-dirty.fits"
     residual_dirty_path = wsclean_dir / "recon-residual.fits"
+    metrics_start = time.perf_counter()
     try:
         metrics = compute_image_metrics(
             image_path,
@@ -150,7 +162,13 @@ def evaluate(
             "objective": FAILURE_OBJECTIVE,
             "error": f"metric computation failed: {exc}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path), "image": str(image_path)},
+            "timing": {
+                "simulate_seconds": simulate_seconds,
+                "image_container_seconds": run_result.wall_seconds,
+                "image_binary_seconds": image_binary_seconds,
+            },
         }
+    metrics_seconds = time.perf_counter() - metrics_start
 
     record = {
         "eval_id": eval_id,
@@ -169,6 +187,12 @@ def evaluate(
         "commands": {
             "simulate": sim_cmd,
             "wsclean": wsclean_cmd,
+        },
+        "timing": {
+            "simulate_seconds": simulate_seconds,
+            "image_container_seconds": run_result.wall_seconds,
+            "image_binary_seconds": image_binary_seconds,
+            "metrics_seconds": metrics_seconds,
         },
     }
     (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -249,6 +273,7 @@ def main() -> None:
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs),
         }
         summary_path = output_dir / "poc-summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -258,6 +283,7 @@ def main() -> None:
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_WSCLEAN_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
+        self_check_profiling()
         print("metric resolution self-check passed")
     else:
         main()

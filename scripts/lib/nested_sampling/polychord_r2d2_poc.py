@@ -32,9 +32,11 @@ from poc_common import (
     run_checked,
     run_docker_monitored,
     self_check_metric_resolution,
+    self_check_profiling,
     self_check_r2d2_thread_env,
     simulate_measurement_set,
     stable_seed,
+    summarize_profiling,
     write_polychord_paramnames,
 )
 
@@ -96,7 +98,9 @@ def evaluate(
     eval_id: int,
     objective_from_metrics: Callable[[dict[str, float]], float],
 ) -> dict[str, Any]:
+    sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
+    simulate_seconds = time.perf_counter() - sim_start
     if sim_error is not None:
         return {
             "eval_id": eval_id,
@@ -126,6 +130,7 @@ def evaluate(
         "--mat-path",
         "/work/r2d2_data.mat",
     ]
+    convert_start = time.perf_counter()
     try:
         run_checked(convert_cmd, convert_stdout, convert_stderr)
     except subprocess.CalledProcessError as exc:
@@ -135,7 +140,9 @@ def evaluate(
             "objective": FAILURE_OBJECTIVE,
             "error": f"ms_to_r2d2_mat failed with exit {exc.returncode}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
+            "timing": {"simulate_seconds": simulate_seconds},
         }
+    convert_seconds = time.perf_counter() - convert_start
 
     r2d2_dir = eval_dir / "r2d2"
     r2d2_dir.mkdir()
@@ -176,11 +183,17 @@ def evaluate(
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path), "mat": str(mat_path)},
             "wall_seconds": run_result.wall_seconds,
             "peak_memory_bytes": peak_memory_bytes,
+            "timing": {
+                "simulate_seconds": simulate_seconds,
+                "convert_seconds": convert_seconds,
+                "image_container_seconds": run_result.wall_seconds,
+            },
         }
 
     image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
     dirty_path = r2d2_dir / "r2d2_data" / "dirty_normalised.fits"
     residual_dirty_path = r2d2_dir / "r2d2_data" / "R2D2_residual_dirty_image.fits"
+    metrics_start = time.perf_counter()
     try:
         metrics = compute_image_metrics(
             image_path,
@@ -203,7 +216,13 @@ def evaluate(
                 "mat": str(mat_path),
                 "image": str(image_path),
             },
+            "timing": {
+                "simulate_seconds": simulate_seconds,
+                "convert_seconds": convert_seconds,
+                "image_container_seconds": run_result.wall_seconds,
+            },
         }
+    metrics_seconds = time.perf_counter() - metrics_start
 
     record = {
         "eval_id": eval_id,
@@ -223,6 +242,12 @@ def evaluate(
             "simulate": sim_cmd,
             "ms_to_r2d2_mat": convert_cmd,
             "r2d2": r2d2_cmd,
+        },
+        "timing": {
+            "simulate_seconds": simulate_seconds,
+            "convert_seconds": convert_seconds,
+            "image_container_seconds": run_result.wall_seconds,
+            "metrics_seconds": metrics_seconds,
         },
     }
     (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -311,6 +336,7 @@ def main() -> None:
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs),
         }
         summary_path = output_dir / "poc-summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -321,6 +347,7 @@ if __name__ == "__main__":
     if os.environ.get("POLYCHORD_R2D2_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
         self_check_r2d2_thread_env()
+        self_check_profiling()
         print("metric resolution self-check passed")
     else:
         main()

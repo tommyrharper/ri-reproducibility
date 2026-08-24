@@ -257,6 +257,106 @@ def read_gnu_time_peak_memory(time_path: Path) -> int:
     return 0
 
 
+def read_gnu_time_wall_seconds(time_path: Path) -> float | None:
+    """Parse GNU time -v's own elapsed wall clock, in [h:]mm:ss(.cc) form.
+
+    This is the binary's actual run time inside the container, separate from
+    docker create/start/teardown overhead measured around the whole `docker
+    run` invocation.
+    """
+    if not time_path.is_file():
+        return None
+    for line in time_path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("Elapsed (wall clock) time"):
+            continue
+        # Label itself contains colons (e.g. "(h:mm:ss or m:ss): 1:02.50"), so
+        # split on the literal "): " marker instead of the last colon.
+        _, _, value = line.partition("): ")
+        parts = value.strip().split(":")
+        try:
+            parts = [float(p) for p in parts]
+        except ValueError:
+            return None
+        seconds = 0.0
+        for part in parts:
+            seconds = seconds * 60.0 + part
+        return seconds
+    return None
+
+
+PROFILING_STAGE_FIELDS = (
+    "simulate_seconds",
+    "convert_seconds",
+    "image_container_seconds",
+    "image_binary_seconds",
+    "metrics_seconds",
+)
+
+
+def summarize_profiling(
+    evaluations: list[dict[str, Any]],
+    total_wall_seconds: float,
+    mpi_procs: int,
+) -> dict[str, Any]:
+    """Aggregate per-evaluation stage timing into a run-level breakdown.
+
+    Sums each `timing.*` field across every evaluation that has one (failed
+    evaluations that errored out before a stage ran simply omit that field).
+    `image_container_overhead_seconds` is the docker round-trip minus the
+    binary's own GNU-time-reported elapsed time, i.e. container create/start/
+    teardown plus the `docker stats` polling loop. `polychord_overhead_seconds`
+    is whatever's left of total_wall_seconds once every accounted evaluation
+    stage is subtracted out - PolyChord's own sampling/bookkeeping plus (at
+    mpi_procs > 1) any cross-rank idle time, so it is only a clean serial
+    figure when mpi_procs == 1.
+    """
+    totals: dict[str, float] = {field: 0.0 for field in PROFILING_STAGE_FIELDS}
+    counts: dict[str, int] = {field: 0 for field in PROFILING_STAGE_FIELDS}
+    for record in evaluations:
+        timing = record.get("timing") or {}
+        for field in PROFILING_STAGE_FIELDS:
+            value = timing.get(field)
+            if value is not None:
+                totals[field] += float(value)
+                counts[field] += 1
+
+    image_binary_total = totals["image_binary_seconds"]
+    image_container_total = totals["image_container_seconds"]
+    image_container_overhead = (
+        image_container_total - image_binary_total if counts["image_binary_seconds"] else None
+    )
+
+    accounted = (
+        totals["simulate_seconds"]
+        + totals["convert_seconds"]
+        + totals["image_container_seconds"]
+        + totals["metrics_seconds"]
+    )
+    polychord_overhead = total_wall_seconds - accounted
+
+    return {
+        "mpi_procs": mpi_procs,
+        "total_wall_seconds": total_wall_seconds,
+        "stage_totals_seconds": {
+            "simulate": totals["simulate_seconds"],
+            "convert": totals["convert_seconds"] if counts["convert_seconds"] else None,
+            "image_container": image_container_total,
+            "image_binary": image_binary_total if counts["image_binary_seconds"] else None,
+            "image_container_overhead": image_container_overhead,
+            "metrics": totals["metrics_seconds"],
+        },
+        "stage_eval_counts": counts,
+        "accounted_seconds": accounted,
+        "polychord_overhead_seconds": polychord_overhead,
+        "note": (
+            "polychord_overhead_seconds is a clean serial figure only when "
+            "mpi_procs == 1; at higher mpi_procs it also folds in cross-rank "
+            "idle/imbalance time."
+        ),
+    }
+
+
 def badness_from_metrics(metrics: dict[str, float]) -> float:
     log_snr_loss = max(0.0, 3.0 - metrics["log_snr"])
     fidelity_loss = min(metrics["relative_l2_error"], 10.0)
@@ -446,3 +546,37 @@ def self_check_metric_resolution() -> None:
             pass
         else:
             raise AssertionError(f"expected SystemExit for invalid metric {invalid!r}")
+
+
+def self_check_profiling() -> None:
+    import tempfile
+
+    gnu_time_text = (
+        "\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:02.50\n"
+        "\tMaximum resident set size (kbytes): 4096\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        time_path = Path(tmp) / "time.txt"
+        time_path.write_text(gnu_time_text)
+        assert abs(read_gnu_time_wall_seconds(time_path) - 62.5) < 1e-9
+        assert read_gnu_time_peak_memory(time_path) == 4096 * 1024
+        assert read_gnu_time_wall_seconds(Path(tmp) / "missing.txt") is None
+
+    evaluations = [
+        {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
+        {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
+        {"error": "simulation failed", "paths": {}},
+    ]
+    profiling = summarize_profiling(evaluations, total_wall_seconds=20.0, mpi_procs=1)
+    assert profiling["stage_totals_seconds"]["simulate"] == 2.0
+    assert profiling["stage_totals_seconds"]["image_container"] == 10.0
+    assert profiling["stage_totals_seconds"]["image_binary"] == 6.0
+    assert profiling["stage_totals_seconds"]["image_container_overhead"] == 4.0
+    assert profiling["accounted_seconds"] == 13.0
+    assert abs(profiling["polychord_overhead_seconds"] - 7.0) < 1e-9
+    assert profiling["stage_eval_counts"]["simulate_seconds"] == 2
+
+    empty_profiling = summarize_profiling([], total_wall_seconds=5.0, mpi_procs=1)
+    assert empty_profiling["stage_totals_seconds"]["image_binary"] is None
+    assert empty_profiling["accounted_seconds"] == 0.0
+    assert empty_profiling["polychord_overhead_seconds"] == 5.0
