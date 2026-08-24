@@ -208,6 +208,7 @@ def evaluate(
         )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
+        metrics_seconds = time.perf_counter() - metrics_start
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
@@ -223,6 +224,7 @@ def evaluate(
                 "simulate_seconds": simulate_seconds,
                 "convert_seconds": convert_seconds,
                 "image_container_seconds": run_result.wall_seconds,
+                "metrics_seconds": metrics_seconds,
             },
         })
     metrics_seconds = time.perf_counter() - metrics_start
@@ -259,6 +261,9 @@ def evaluate(
 def self_check_failure_record_persistence() -> None:
     import tempfile
 
+    original_compute_metrics = globals()["compute_image_metrics"]
+    original_run_checked = globals()["run_checked"]
+    original_run_docker = globals()["run_docker_monitored"]
     original_simulate = globals()["simulate_measurement_set"]
 
     def failing_simulate(
@@ -280,7 +285,52 @@ def self_check_failure_record_persistence() -> None:
             assert loaded == [record]
             assert loaded[0]["objective"] == FAILURE_OBJECTIVE
             assert loaded[0]["timing"]["simulate_seconds"] >= 0.0
+
+        def successful_simulate(
+            params: dict[str, Any],
+            eval_dir: Path,
+            meqtrees_image: str,
+            platform: str,
+        ) -> tuple[Path, list[str], None]:
+            eval_dir.mkdir(parents=True, exist_ok=False)
+            return eval_dir / "sim.ms", ["simulate"], None
+
+        def successful_convert(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
+            return None
+
+        def successful_r2d2(
+            cmd: list[str],
+            container_name: str,
+            stdout_path: Path,
+            stderr_path: Path,
+        ) -> argparse.Namespace:
+            return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
+
+        def failing_metrics(*args: Any, **kwargs: Any) -> dict[str, float]:
+            raise ValueError("bad fits")
+
+        globals()["simulate_measurement_set"] = successful_simulate
+        globals()["run_checked"] = successful_convert
+        globals()["run_docker_monitored"] = successful_r2d2
+        globals()["compute_image_metrics"] = failing_metrics
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            params = {"source_flux_jy": 1.0}
+            args = argparse.Namespace(
+                meqtrees_image="meqtrees",
+                r2d2_image="r2d2",
+                checkpoints_dir="/checkpoints",
+                platform="linux/arm64",
+            )
+            record = evaluate(params, args, root / "eval-0002-deadbeef", 2, lambda metrics: 0.0)
+            loaded = load_evaluations_from_dir(root)
+            assert loaded == [record]
+            assert loaded[0]["objective"] == FAILURE_OBJECTIVE
+            assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
+        globals()["compute_image_metrics"] = original_compute_metrics
+        globals()["run_checked"] = original_run_checked
+        globals()["run_docker_monitored"] = original_run_docker
         globals()["simulate_measurement_set"] = original_simulate
 
 
