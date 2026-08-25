@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -502,30 +503,74 @@ def simulate(args: argparse.Namespace) -> None:
     print(json.dumps(metadata, indent=2))
 
 
-def serve() -> None:
-    """Run one simulate per JSON request line on stdin, reusing this process.
+def warm_forest() -> None:
+    """Compile the forest and run one predict, so evaluation one does not.
+
+    Even against a warm skeleton cache the first simulate in a fresh worker
+    costs ~0.17s where the next one costs ~0.03s; the difference is the TDL
+    compile and the meqserver's first predict, and the forest is identical for
+    every evaluation of this PoC (see run_meqtrees_predict()). Only worth doing
+    when there is a window to hide it in - which is why serve() does this under
+    --fifo, where the worker is the meqtrees container's own startup command and
+    the run has three containers, a manifest and mpirun still to go, and not on
+    the stdin path, where the rank that spawned the worker is already waiting.
+
+    All the workers warm on the same shape, so seven of the eight lose the
+    skeleton cache's publish race; that costs ~0.11s of an idle core each,
+    inside the window, and the winner leaves an entry the run goes on to use.
+    Baking a ready-made Measurement Set into the image to skip those makems runs
+    was measured and moves worker-ready time by nothing.
+    """
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        ms = Path(scratch) / "sim.ms"
+        args = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", "4.0",
+            "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+            "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(args, ms), ms, args)
+        corr_sel, _ = determine_corr_selection(ms)
+        run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
+
+
+def serve(fifo_base: str | None = None) -> None:
+    """Run one simulate per JSON request line, reusing this process.
 
     A one-shot `docker exec` of this script spent ~0.45s of its ~0.7s on process
     and meqserver startup that every evaluation repeated. A request is
     `{"argv": [...], "stdout": path, "stderr": path}`; everything the run prints
     goes to those two files, exactly as the caller's `docker exec` redirection
-    did, and the reply is one JSON line - `{"returncode": int}` - on the
-    process's original stdout.
+    did, and the reply is one JSON line - `{"returncode": int}`.
+
+    Requests arrive on stdin and replies go to the process's original stdout,
+    unless `fifo_base` is given: then they arrive on `<fifo_base>.in` and the
+    replies go to `<fifo_base>.out`, a pair of FIFOs on the bind mount both
+    containers share. That is what lets run-nested-sampling-poc.sh start this
+    worker as the meqtrees container's command - and pay all of the warm-up
+    below - before the rank that will use it even exists.
     """
-    replies = os.fdopen(os.dup(1), "w")
     # meqserver_session() is otherwise first called inside request one, so every
     # rank paid ~0.3s of Timba import and meqserver startup in front of its first
     # evaluation - and because PolyChord asks all ranks for their initial live
     # points at once, all of it landed on the wall clock. Nothing has been asked
     # of this worker yet, so starting the server here instead overlaps it with
     # the caller's own sampler startup. Under redirect_fds because Timba prints
-    # to fd 1 on startup, which is the reply pipe.
+    # to fd 1 on startup, which is the stdin path's reply pipe.
     with redirect_fds(Path(os.devnull)):
         try:
             meqserver_session()
+            if fifo_base is not None:
+                warm_forest()
         except Exception:
             traceback.print_exc()
-    for line in sys.stdin:
+    if fifo_base is None:
+        requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
+    else:
+        # Same order the caller opens them in: opening a FIFO blocks until the
+        # other end is opened, so a mismatch here deadlocks both processes.
+        requests = open(f"{fifo_base}.in")
+        replies = open(f"{fifo_base}.out", "w")
+    for line in requests:
         request = json.loads(line)
         if "prebuild" in request:
             # Deliberately unanswered: the caller sends this while it is still
@@ -658,17 +703,57 @@ def self_check_serve_reply_stream() -> None:
     print("serve reply stream self-check passed")
 
 
+def self_check_serve_fifo() -> None:
+    """A `--fifo` worker must answer on its FIFO pair without deadlocking.
+
+    Both ends block on open until the other side opens, so the request pipe has
+    to be opened first by both processes; get that backwards and the run hangs
+    with no error. The caller side here is the same O_NONBLOCK retry
+    poc_common._connect_shell_started_worker() uses.
+    """
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        base = Path(scratch) / "0"
+        os.mkfifo(f"{base}.in")
+        os.mkfifo(f"{base}.out")
+        worker = subprocess.Popen([sys.executable, __file__, "--serve", "--fifo", str(base)])
+        deadline = time.monotonic() + 120.0
+        while True:
+            try:
+                write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "the --fifo worker never opened its request pipe"
+                time.sleep(0.01)
+        os.set_blocking(write_fd, True)
+        with os.fdopen(write_fd, "w") as requests, open(f"{base}.out") as replies:
+            request = {
+                "argv": ["--not-a-real-option"],
+                "stdout": str(Path(scratch) / "out.log"),
+                "stderr": str(Path(scratch) / "err.log"),
+            }
+            requests.write(json.dumps(request) + "\n")
+            requests.flush()
+            reply = replies.readline()
+        assert json.loads(reply)["returncode"] != 0, f"a bogus request should report failure: {reply!r}"
+        # Closing the request pipe is the only shutdown signal the worker gets.
+        assert worker.wait(timeout=120) == 0, "the --fifo worker did not exit on EOF"
+    print("serve fifo self-check passed")
+
+
 if __name__ == "__main__":
     # --serve and --self-check take no other arguments, so they are checked before
     # argparse, which requires the full simulate argument set.
     try:
-        if sys.argv[1:] == ["--serve"]:
-            serve()
+        if sys.argv[1:2] == ["--serve"]:
+            # `--serve` / `--serve --fifo <base>`; neither takes the simulate
+            # argument set, so they are dispatched before argparse.
+            serve(sys.argv[3] if sys.argv[2:3] == ["--fifo"] else None)
         elif sys.argv[1:] == ["--self-check"]:
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
             self_check_forest_reuse()
             self_check_serve_reply_stream()
+            self_check_serve_fifo()
         else:
             simulate(parse_args())
     finally:

@@ -654,10 +654,61 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     return record
 
 
-_SIMULATE_WORKERS: dict[str, subprocess.Popen] = {}
+_SIMULATE_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
 
 
-def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen:
+class FifoWorker:
+    """A `simulate_point_source_ms.py --serve` worker the shell already started.
+
+    Same `.stdin`/`.stdout`/`.terminate()` surface as the `subprocess.Popen`
+    below, over the FIFO pair the worker is serving on. Closing stdin is what
+    ends it: the worker's request loop sees EOF and exits.
+    """
+
+    def __init__(self, write_fd: int, reply_path: Path) -> None:
+        self.stdin = os.fdopen(write_fd, "w")
+        # Opening a FIFO blocks until the other end is open, so this must be the
+        # same order serve() uses - request pipe first, reply pipe second.
+        self.stdout = reply_path.open("r")
+
+    def terminate(self) -> None:
+        self.stdin.close()
+
+
+def _connect_shell_started_worker() -> FifoWorker | None:
+    """Attach to this rank's pre-warmed worker, or None if there is not one.
+
+    A rank-started worker needs ~0.3s before it can answer - interpreter, Timba,
+    meqserver, the first TDL compile and the first predict - and PolyChord asks
+    every rank for a live point at once, so all of it used to land on the wall
+    clock in front of evaluation one (~0.33s against a ~0.05s steady state).
+    run-nested-sampling-poc.sh makes one warm worker per rank the meqtrees
+    container's own startup command instead, and this connects to it. Falling
+    back to a rank-started worker is what happens when there is no pool - the
+    R2D2 PoC, or an OUTPUT_DIR outside the bind mount.
+    """
+    fifo_dir = os.environ.get("NS_SIMULATE_FIFO_DIR")
+    if not fifo_dir:
+        return None
+    base = Path(fifo_dir) / str(mpi_rank())
+    # O_NONBLOCK is how a FIFO write-open says "no reader yet" (ENXIO) instead of
+    # blocking forever, which is what a worker that never started would do. The
+    # deadline is generous because it is only ever reached when something is
+    # broken, and the fallback below is correct, just slower.
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(0.002)
+            continue
+        os.set_blocking(write_fd, True)
+        return FifoWorker(write_fd, Path(f"{base}.out"))
+
+
+def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | FifoWorker:
     """This rank's long-lived `simulate_point_source_ms.py --serve` process.
 
     Even inside a reused sidecar container, a per-evaluation `docker exec` of the
@@ -667,13 +718,15 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen:
     compile, RIME predict and noise fill.
     """
     if meqtrees_image not in _SIMULATE_WORKERS:
-        repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
-        worker = subprocess.Popen(
-            [*sidecar_exec(meqtrees_image, platform, repo_root, interactive=True), "--serve"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
+        worker = _connect_shell_started_worker()
+        if worker is None:
+            repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
+            worker = subprocess.Popen(
+                [*sidecar_exec(meqtrees_image, platform, repo_root, interactive=True), "--serve"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
         # The container itself is torn down by sidecar_container()'s own atexit
         # hook, which is registered first and so runs last.
         atexit.register(worker.terminate)

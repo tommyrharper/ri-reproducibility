@@ -21,9 +21,14 @@
 # or, when a container needs extra `docker run` arguments or the caller has
 # work to overlap with the startup,
 #
-#   sidecar_launch <platform> <image> [docker args...]
+#   sidecar_launch <platform> <image> [docker args...] [-- command...]
 #   ...other setup...
 #   sidecar_wait                                         # before the first exec
+#
+# Everything after `--` replaces the container's default `sleep infinity`. That
+# is how the meqtrees sidecar starts its simulate workers: a `docker exec` can
+# only be issued once `docker run` has returned, and the container's own command
+# starts ~0.1s earlier than that, on work whose whole value is head start.
 #
 # `sidecar_launch` returns immediately and leaves the container's name in
 # SIDECAR_NAME. Requires REPO_ROOT. Every container started is removed by an
@@ -40,7 +45,17 @@ _SIDECAR_JSON=""
 
 sidecar_launch() {
   local platform="$1" image="$2" name
+  local -a args=() command=(sleep infinity)
   shift 2
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--" ]; then
+      shift
+      command=("$@")
+      break
+    fi
+    args+=("$1")
+    shift
+  done
   name="ri-ns-sidecar-$$-${#SIDECAR_NAMES[@]}"
   SIDECAR_NAME="${name}"
   docker run --detach --rm --name "${name}" \
@@ -48,8 +63,8 @@ sidecar_launch() {
     --shm-size 512m \
     --platform "${platform}" \
     -v "${REPO_ROOT}:${REPO_ROOT}" \
-    "$@" \
-    --entrypoint sleep "${image}" infinity >/dev/null &
+    "${args[@]}" \
+    --entrypoint "${command[0]}" "${image}" "${command[@]:1}" >/dev/null &
   _SIDECAR_PIDS+=("$!")
   SIDECAR_NAMES+=("${SIDECAR_NAME}")
   _SIDECAR_JSON="${_SIDECAR_JSON}${_SIDECAR_JSON:+,}\"${image}\":\"${SIDECAR_NAME}\""
@@ -91,11 +106,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   docker() { printf '%s\n' "$*" >>"${_log}"; }
   sidecar_launch linux/amd64 img:a -v /sock:/sock
   sidecar_launch linux/amd64 img:b
+  sidecar_launch linux/amd64 img:c -- sh -c 'echo hi' sh /some/dir
   sidecar_wait
   grep -q -- '-v /sock:/sock --entrypoint sleep img:a infinity' "${_log}"
   grep -q -- '--entrypoint sleep img:b infinity' "${_log}"
   ! grep -q -- 'img:b.*/sock' "${_log}"
-  [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1"}' ]
+  grep -q -- "--entrypoint sh img:c -c echo hi sh /some/dir" "${_log}"
+  [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1","img:c":"ri-ns-sidecar-'"$$"'-2"}' ]
   rm -f "${_log}"
   echo "start-sidecars self-check passed"
 fi

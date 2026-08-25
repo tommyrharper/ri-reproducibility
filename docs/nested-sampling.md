@@ -283,11 +283,11 @@ evaluations, not committed) profiles as:
 | Metrics computation | 0.12s | 1.1% |
 | PolyChord overhead (unaccounted) | 0.26s | 2.5% |
 
-Total wall time 10.2s (~0.16s/eval; ~2.5s on the default 8 ranks). That is
+Total wall time 10.2s (~0.16s/eval; ~1.8s on the default 8 ranks). That is
 `poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
-~1.1s more on one rank and ~1.3s more on eight, for starting and removing the
-containers (8-rank end to end is ~3.1s). No fixed overhead of any
+~1.1s more on one rank and ~1.2s more on eight, for starting and removing the
+containers (8-rank end to end is ~3.0s). No fixed overhead of any
 size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the ~12 evaluations of a run that
@@ -533,6 +533,59 @@ friends), and fd 1 is the reply pipe, so without the redirect the first
 sends one deliberately invalid request and asserts its stdout is a single JSON
 line - verified to fail when the redirect is removed.
 
+##### The workers are started by the container, not by the ranks
+
+Starting the meqserver eagerly still leaves the worker unable to answer for
+~0.5s after it is launched, measured across eight launched at once: ~0.11s of
+`docker exec`, ~0.07s of interpreter and imports, ~0.11s of meqserver, and the
+rest the first TDL compile and first predict (a fresh worker's first simulate
+is ~0.17s against ~0.03s for its second, even against a warm skeleton cache).
+No amount of eager work *inside* the worker can hide that, because the rank
+that launched it asks for its first evaluation ~0.2s later.
+
+So the ranks no longer launch them. `run-nested-sampling-poc.sh` creates one
+`<rank>.in`/`<rank>.out` FIFO pair per rank under
+`<output-dir>/.simulate-workers`, and the meqtrees sidecar's *container
+command* - `sidecar_launch ... -- sh -c ...`, in place of the default `sleep
+infinity` - spawns one `simulate_point_source_ms.py --serve --fifo <base>` per
+pair. `poc_common._connect_shell_started_worker()` opens that pair instead of
+spawning anything, and `FifoWorker` presents the same
+`.stdin`/`.stdout`/`.terminate()` surface as the `subprocess.Popen` it replaces,
+so nothing downstream changed. The FIFOs reach across containers because the
+PolyChord container and the meqtrees sidecar both bind-mount `REPO_ROOT`: a FIFO
+on a bind mount is one host inode both of them open.
+
+It has to be the container's command rather than a `docker exec` into it. A
+`docker exec` cannot be issued until `docker run` has returned, which is ~0.02s
+after the container's own command has already started and ~0.1s before the
+exec's process does; an earlier version that retried `docker exec --detach`
+into the container as soon as it would accept one measured -0.06s end to end
+over 14 pairs on a ~2.95s baseline, against -0.15s for this one. Under `--fifo` the worker also
+compiles the forest and runs one throwaway predict before it opens its request
+pipe (`warm_forest()`); on the stdin path it deliberately does not, because
+there the rank that started it is already waiting.
+
+The price is that `docker info` moves back in front of the sidecar launches
+(~0.06s of serial delay, undone from an earlier iteration) because the FIFOs
+have to exist before the container's command globs for them.
+
+Measured on the default 8-rank run: the eight `eval_id == 1` `simulate_seconds`
+records go from 0.18-0.41s (median ~0.33s) to 0.05-0.11s against a ~0.05s
+steady state, `total_wall_seconds` from ~2.4s to ~1.8s, and end to end 3.40s to
+3.25s - -4.4%, 20 of 24 interleaved pairs, sd of the paired difference 0.18s -
+with bit-identical `.stats`, `.txt` and `_dead-birth.txt` chains and identical
+per-evaluation params and metrics.
+
+Two sharp edges. Opening a FIFO blocks until the other end opens, so both sides
+must open the request pipe first and the reply pipe second; reverse either and
+the run hangs with no error at all. `--self-check`'s `self_check_serve_fifo()`
+is the guard, verified to fail (rather than hang) when `serve()`'s two opens are
+swapped. And the rank's side opens with `O_NONBLOCK`, which is how a FIFO
+write-open reports "no reader yet" (`ENXIO`) instead of blocking forever: it
+retries for 10s and then falls back to starting its own worker, so a missing or
+broken pool costs latency, not the run. That fallback is also what the R2D2 PoC
+uses - it does not set `NS_SIMULATE_FIFO_DIR` at all.
+
 One sharp edge: Timba registers `stop_default_mqs()` with `atexit`, but CPython
 joins non-daemon threads - including octopussy's event thread, which only exits
 once the server is stopped - *before* it runs `atexit` handlers, so a process
@@ -593,15 +646,22 @@ the join: `_SIMULATE_WORKERS`, `_SIDECAR_SHELLS` and `_IMAGE_ENTRYPOINTS` are
 plain dicts with no lock, and a lazy start racing the prewarm thread would leave
 a second, orphaned worker.
 
-**What is still left in evaluation one.** Per-evaluation `simulate_seconds` from
-`poc-summary.json` shows the eight `eval_id == 1` records (one per rank, all
-issued at the same moment) at 0.23-0.49s against a 0.05-0.07s median for the
-rest of the run - roughly +0.25s each, and `eval_id == 2` still carries about
-+0.06s. That residue is the `--serve` worker's meqserver finishing its start
-plus the MeqTrees container's own first-touch cost, and it is the largest single
-item left in a ~2.5s `total_wall_seconds`. It is also why making the ranks
-reach `run_polychord()` earlier returns much less than it costs to measure: the
-first evaluation waits on the sidecar, not on the rank.
+**What is still left in evaluation one.** Per-evaluation `simulate_seconds`
+from `poc-summary.json` used to show the eight `eval_id == 1` records (one per
+rank, all issued at the same moment) at 0.18-0.41s against a ~0.05s median for
+the rest of the run - the `--serve` worker's startup, finishing inside the first
+request because the rank that started it had nothing else to do meanwhile. The
+run script now starts those workers as the meqtrees container's own command
+(see above) and the same records read 0.05-0.11s, so this is no longer the
+largest item on the critical path.
+
+What replaced it is the prewarm join itself: the rank reaches it ~0.2s into its
+`docker exec` and the worker is ready ~0.4s after the container starts, so the
+rank still waits for the remainder. Closing that gap needs the worker to be
+*ready* sooner, not started sooner - the remaining ~0.4s is ~0.07s of
+interpreter and imports, ~0.11s of meqserver and ~0.2s of first compile and
+first predict. Baking a ready-made Measurement Set into the image to skip the
+warm-up's `makems` was measured and moves worker-ready time by nothing.
 
 #### FITS images are read without astropy
 
