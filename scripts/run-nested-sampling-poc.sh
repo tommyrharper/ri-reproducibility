@@ -53,7 +53,7 @@ sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}"
 sidecar_launch "${PLATFORM}" "${WSCLEAN_IMAGE}"
 sidecar_launch "${PLATFORM}" "${POLYCHORD_IMAGE}" \
   -v "${DOCKER_SOCKET}:/var/run/docker.sock" \
-  -- python3 -c "import numpy, pypolychord"
+  -- python3 -c "import sys; sys.path.insert(0, '/opt/ri-nested-sampling'); import numpy, pypolychord, poc_common, argparse; argparse.ArgumentParser()"
 POLYCHORD_CONTAINER="${SIDECAR_NAME}"
 
 RUN_COMMAND=(
