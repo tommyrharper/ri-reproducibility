@@ -212,6 +212,83 @@ Each evaluation record and `poc-summary.json` store the chosen value in an
 `objective` field. `poc-summary.json` also records the `--metric` string and a
 `likelihood_framing` sentence describing what was optimized.
 
+## Profiling: where does the wall time actually go?
+
+Both `polychord_wsclean_poc.py` and `polychord_r2d2_poc.py` time every stage of
+each likelihood evaluation with plain `time.perf_counter()` calls around the
+existing subprocess/docker invocations already in `evaluate()` - no separate
+profiling framework, no changes to the container images' entrypoints. Each
+evaluation's `metrics.json` (and the aggregated `poc-summary.json`) gets a
+`timing` block:
+
+| Field | Meaning |
+|---|---|
+| `simulate_seconds` | Wall time for the MeqTrees `docker run` that produces `sim.ms` (container start + RIME simulation, not split further) |
+| `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion `docker run` |
+| `image_container_seconds` | Wall time for the imaging `docker run` round trip (WSClean or R2D2) |
+| `image_binary_seconds` | WSClean only: the binary's own elapsed time from `/usr/bin/time -v` inside the container, i.e. excluding docker create/start/teardown |
+| `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
+
+`image_container_overhead_seconds` (container round trip minus binary time) is
+only available for WSClean, because only its image installs GNU `time`; R2D2
+and MeqTrees containers report only the round-trip `docker run` time as one
+blob.
+
+`poc-summary.json` also gets a run-level `profiling` block: each field above
+summed across every evaluation, plus:
+
+- `accounted_worker_seconds` - sum of every stage total across all evaluated
+  points.
+- `accounted_seconds` - same value as `accounted_worker_seconds`, but emitted
+  only for serial runs where `NS_MPI_PROCS=1`.
+- `polychord_overhead_seconds` = `total_wall_seconds - accounted_seconds`.
+  This is whatever PolyChord itself is doing outside likelihood calls (its own
+  slice-sampling bookkeeping, live-point management, I/O to `chains/`). It is
+  emitted only for serial runs where `NS_MPI_PROCS=1`; at higher MPI process
+  counts, ranks run likelihood evaluations concurrently, so summed
+  worker-seconds cannot be subtracted from rank-0 elapsed wall time.
+
+### Running the profiler
+
+The instrumentation runs automatically as part of every PoC run - there's no
+separate flag. To read the breakdown of a completed run:
+
+```bash
+make nested-sampling-profile RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+# or directly:
+uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp> --json
+```
+
+`scripts/profile-nested-sampling-run.py` only reads `poc-summary.json` and
+prints a table (or the raw `profiling` dict with `--json`); it does not launch
+anything itself. Runs written before this instrumentation existed have no
+`profiling` block and must be re-run to get one.
+
+### What a real bounded run showed
+
+A single-rank (`NS_MPI_PROCS=1`), 5-dimensional, `NS_NLIVE=3 NS_MAX_NDEAD=4`
+WSClean PoC run (14 likelihood evaluations, `results/nested-sampling-poc/
+wsclean-vlaa-profiler-smoke`, not committed) profiled as:
+
+| Stage | Total | Share |
+|---|---:|---:|
+| MeqTrees simulate | 162.7s | 92.6% |
+| WSClean image container (total) | 12.8s | 7.3% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.7s | 3.8% |
+| &nbsp;&nbsp;of which: container overhead | 6.2s | 3.5% |
+| Metrics computation | 0.08s | 0.0% |
+| PolyChord overhead (unaccounted) | 0.11s | 0.1% |
+
+**The MeqTrees RIME simulation dominates wall time by more than an order of
+magnitude over everything else combined** (~11.6s/eval vs ~0.9s/eval for
+WSClean imaging). PolyChord's own sampling/bookkeeping overhead is negligible
+(0.1% of total wall time) at this scale, and roughly half of the WSClean stage
+is docker container overhead rather than the imaging binary itself. Any
+speedup effort on this pipeline should target the MeqTrees simulation step
+first; optimizing WSClean invocation or PolyChord settings would not move the
+needle at this parameter-space scale.
+
 ## Output files
 
 ### WSClean

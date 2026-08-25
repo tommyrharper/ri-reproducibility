@@ -2,7 +2,7 @@
         smoke-test smoke-test-wsclean smoke-test-r2d2 nested-sampling-poc nested-sampling-r2d2-poc \
         shell-wsclean shell-r2d2 shell-meqtrees shell-polychord \
         fetch-r2d2-checkpoints record-environment plot-fits \
-        benchmark-report nested-sampling-report anesthetic-gui merge-nested-sampling \
+        benchmark-report nested-sampling-report nested-sampling-profile anesthetic-gui merge-nested-sampling \
         config clean disk-usage
 
 SHELL := /usr/bin/env bash
@@ -74,6 +74,11 @@ benchmark-report:
 # RUN=<dir> -> nested-sampling-report-<run>.html
 nested-sampling-report:
 	LAST="$(LAST)" RUN="$(RUN)" scripts/generate-benchmark-report.sh nested-sampling
+
+# Per-stage timing breakdown for a completed nested-sampling PoC run.
+# RUN=results/nested-sampling-poc/<run-dir> (required).
+nested-sampling-profile:
+	uv run scripts/profile-nested-sampling-run.py $(RUN)
 
 # Host-side anesthetic GUI (needs a display). Optional RUN= path to a PoC
 # run dir, chains/, or PolyChord file root; default is the latest PoC run.

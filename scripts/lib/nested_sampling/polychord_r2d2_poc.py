@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pypolychord
-from pypolychord.settings import PolyChordSettings
 
 from poc_common import (
     FAILURE_OBJECTIVE,
@@ -32,9 +30,12 @@ from poc_common import (
     run_checked,
     run_docker_monitored,
     self_check_metric_resolution,
+    self_check_profiling,
     self_check_r2d2_thread_env,
     simulate_measurement_set,
     stable_seed,
+    summarize_profiling,
+    write_evaluation_record,
     write_polychord_paramnames,
 )
 
@@ -96,15 +97,19 @@ def evaluate(
     eval_id: int,
     objective_from_metrics: Callable[[dict[str, float]], float],
 ) -> dict[str, Any]:
+    sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
+    simulate_seconds = time.perf_counter() - sim_start
     if sim_error is not None:
-        return {
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
             "error": f"simulation failed with exit {sim_error.returncode}",
             "paths": {"eval_dir": str(eval_dir)},
-        }
+            "commands": {"simulate": sim_cmd},
+            "timing": {"simulate_seconds": simulate_seconds},
+        })
 
     mat_path = eval_dir / "r2d2_data.mat"
     convert_stdout = eval_dir / "convert.stdout.log"
@@ -126,16 +131,21 @@ def evaluate(
         "--mat-path",
         "/work/r2d2_data.mat",
     ]
+    convert_start = time.perf_counter()
     try:
         run_checked(convert_cmd, convert_stdout, convert_stderr)
     except subprocess.CalledProcessError as exc:
-        return {
+        convert_seconds = time.perf_counter() - convert_start
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
             "error": f"ms_to_r2d2_mat failed with exit {exc.returncode}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
-        }
+            "commands": {"simulate": sim_cmd, "ms_to_r2d2_mat": convert_cmd},
+            "timing": {"simulate_seconds": simulate_seconds, "convert_seconds": convert_seconds},
+        })
+    convert_seconds = time.perf_counter() - convert_start
 
     r2d2_dir = eval_dir / "r2d2"
     r2d2_dir.mkdir()
@@ -168,7 +178,7 @@ def evaluate(
     run_result = run_docker_monitored(r2d2_cmd, container_name, r2d2_stdout, r2d2_stderr)
     peak_memory_bytes = run_result.peak_memory_bytes
     if run_result.returncode != 0:
-        return {
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
@@ -176,11 +186,17 @@ def evaluate(
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path), "mat": str(mat_path)},
             "wall_seconds": run_result.wall_seconds,
             "peak_memory_bytes": peak_memory_bytes,
-        }
+            "timing": {
+                "simulate_seconds": simulate_seconds,
+                "convert_seconds": convert_seconds,
+                "image_container_seconds": run_result.wall_seconds,
+            },
+        })
 
     image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
     dirty_path = r2d2_dir / "r2d2_data" / "dirty_normalised.fits"
     residual_dirty_path = r2d2_dir / "r2d2_data" / "R2D2_residual_dirty_image.fits"
+    metrics_start = time.perf_counter()
     try:
         metrics = compute_image_metrics(
             image_path,
@@ -192,7 +208,8 @@ def evaluate(
         )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
-        return {
+        metrics_seconds = time.perf_counter() - metrics_start
+        return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
@@ -203,7 +220,14 @@ def evaluate(
                 "mat": str(mat_path),
                 "image": str(image_path),
             },
-        }
+            "timing": {
+                "simulate_seconds": simulate_seconds,
+                "convert_seconds": convert_seconds,
+                "image_container_seconds": run_result.wall_seconds,
+                "metrics_seconds": metrics_seconds,
+            },
+        })
+    metrics_seconds = time.perf_counter() - metrics_start
 
     record = {
         "eval_id": eval_id,
@@ -224,12 +248,96 @@ def evaluate(
             "ms_to_r2d2_mat": convert_cmd,
             "r2d2": r2d2_cmd,
         },
+        "timing": {
+            "simulate_seconds": simulate_seconds,
+            "convert_seconds": convert_seconds,
+            "image_container_seconds": run_result.wall_seconds,
+            "metrics_seconds": metrics_seconds,
+        },
     }
-    (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
-    return record
+    return write_evaluation_record(eval_dir, record)
+
+
+def self_check_failure_record_persistence() -> None:
+    import tempfile
+
+    original_compute_metrics = globals()["compute_image_metrics"]
+    original_run_checked = globals()["run_checked"]
+    original_run_docker = globals()["run_docker_monitored"]
+    original_simulate = globals()["simulate_measurement_set"]
+
+    def failing_simulate(
+        params: dict[str, Any],
+        eval_dir: Path,
+        meqtrees_image: str,
+        platform: str,
+    ) -> tuple[Path, list[str], subprocess.CalledProcessError]:
+        eval_dir.mkdir(parents=True, exist_ok=False)
+        return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
+
+    try:
+        globals()["simulate_measurement_set"] = failing_simulate
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(meqtrees_image="meqtrees", platform="linux/arm64")
+            record = evaluate({}, args, root / "eval-0001-deadbeef", 1, lambda metrics: 0.0)
+            loaded = load_evaluations_from_dir(root)
+            assert loaded == [record]
+            assert loaded[0]["objective"] == FAILURE_OBJECTIVE
+            assert loaded[0]["timing"]["simulate_seconds"] >= 0.0
+
+        def successful_simulate(
+            params: dict[str, Any],
+            eval_dir: Path,
+            meqtrees_image: str,
+            platform: str,
+        ) -> tuple[Path, list[str], None]:
+            eval_dir.mkdir(parents=True, exist_ok=False)
+            return eval_dir / "sim.ms", ["simulate"], None
+
+        def successful_convert(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
+            return None
+
+        def successful_r2d2(
+            cmd: list[str],
+            container_name: str,
+            stdout_path: Path,
+            stderr_path: Path,
+        ) -> argparse.Namespace:
+            return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
+
+        def failing_metrics(*args: Any, **kwargs: Any) -> dict[str, float]:
+            raise ValueError("bad fits")
+
+        globals()["simulate_measurement_set"] = successful_simulate
+        globals()["run_checked"] = successful_convert
+        globals()["run_docker_monitored"] = successful_r2d2
+        globals()["compute_image_metrics"] = failing_metrics
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            params = {"source_flux_jy": 1.0}
+            args = argparse.Namespace(
+                meqtrees_image="meqtrees",
+                r2d2_image="r2d2",
+                checkpoints_dir="/checkpoints",
+                platform="linux/arm64",
+            )
+            record = evaluate(params, args, root / "eval-0002-deadbeef", 2, lambda metrics: 0.0)
+            loaded = load_evaluations_from_dir(root)
+            assert loaded == [record]
+            assert loaded[0]["objective"] == FAILURE_OBJECTIVE
+            assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
+    finally:
+        globals()["compute_image_metrics"] = original_compute_metrics
+        globals()["run_checked"] = original_run_checked
+        globals()["run_docker_monitored"] = original_run_docker
+        globals()["simulate_measurement_set"] = original_simulate
 
 
 def main() -> None:
+    import pypolychord
+    from pypolychord.settings import PolyChordSettings
+
     args = parse_args()
     args.repo_root = str(Path(args.repo_root).resolve())
     if not args.checkpoints_dir:
@@ -311,6 +419,7 @@ def main() -> None:
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs),
         }
         summary_path = output_dir / "poc-summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -321,6 +430,8 @@ if __name__ == "__main__":
     if os.environ.get("POLYCHORD_R2D2_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
         self_check_r2d2_thread_env()
+        self_check_profiling()
+        self_check_failure_record_persistence()
         print("metric resolution self-check passed")
     else:
         main()
