@@ -102,6 +102,13 @@ RUN_COMMAND=(
   # 8 default ranks spent ~10 cores spinning and starved the real work.
   -e OMP_NUM_THREADS=1
   -e OPENBLAS_NUM_THREADS=1
+  # Open MPI's default point-to-point selection opens the cm PML, which opens
+  # the MTL framework, which has libfabric scan every provider it can find -
+  # ~0.19s of MPI_Init on this host, on every rank at the same moment, for a job
+  # that never leaves one container. ob1 over shared memory is what it settles on
+  # anyway; naming it skips the search. Measured: slowest rank's `from mpi4py
+  # import MPI` 0.25s -> 0.05s at 8 ranks.
+  -e OMPI_MCA_pml=ob1
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   "${POLYCHORD_CONTAINER}"

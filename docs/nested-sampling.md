@@ -655,11 +655,11 @@ run script now starts those workers as the meqtrees container's own command
 (see above) and the same records read 0.05-0.11s, so this is no longer the
 largest item on the critical path.
 
-What replaced it is the prewarm join itself: the rank reaches it ~0.2s into its
-`docker exec` and the worker is ready ~0.4s after the container starts, so the
-rank still waits for the remainder. Closing that gap needs the worker to be
-*ready* sooner, not started sooner - the remaining ~0.4s is ~0.07s of
-interpreter and imports, ~0.11s of meqserver and ~0.2s of first compile and
+What replaced it is the prewarm join itself, and two-sided timestamps have since
+shown that the join is the whole critical path - see "The critical path is the
+simulate worker's warm-up, not the rank" below. Closing it needs the worker to
+be *ready* sooner, not started sooner: the remaining ~0.4s is ~0.07s of
+interpreter and imports, ~0.10s of meqserver and ~0.25s of first compile and
 first predict. Baking a ready-made Measurement Set into the image to skip the
 warm-up's `makems` was measured and moves worker-ready time by nothing.
 
@@ -804,6 +804,84 @@ MPI - it splits the skeleton prebuild across the workers by rank - so calling
 it hid from `total_wall_seconds` (measured around `run_polychord()`) and showed
 up only end to end. `mpi_rank()` therefore reads `OMPI_COMM_WORLD_RANK`, which
 OpenMPI's launcher exports, and only falls back to `mpi4py`.
+
+#### MPI picks its transport by search unless it is told not to
+
+`from mpi4py import MPI` runs `MPI_Init`, and on this host that cost 0.25s on
+every one of the eight ranks at the same moment. Nothing in this repo imports it
+on the sampler path any more (see above), so where it lands is inside PolyChord:
+`pypolychord` imports `mpi4py` lazily, and the whole 0.25s therefore shows up as
+the first `run_polychord()` call taking that long to reach its first likelihood,
+with a second call in the same process reaching it in ~0.3ms. `strace` on the
+first call is what identifies it - 2796 `openat`s and 903 `clock_nanosleep`s
+worth 0.17s, none of them PolyChord's. It is not the transport itself:
+`OMPI_MCA_pml=ob1` takes the slowest rank's `MPI_Init` to 0.05s, and
+`OMPI_MCA_pml=^ucx,cm` - the image's `/etc/openmpi/openmpi-mca-params.conf`
+already excludes `ucx` - to 0.046s, so the 0.19s is Open MPI opening the `cm`
+PML, which opens the MTL framework, which has libfabric probe every provider it
+can find. This job never leaves one container, and `ob1` over shared memory is
+what the search settles on anyway, so both PoC run scripts name it:
+
+```
+docker exec ... -e OMPI_MCA_pml=ob1 ...
+```
+
+Adding `-e OMPI_MCA_btl=self,vader` on top buys a further ~0.007s and was left
+out. Output is bit-identical: the same 41 evaluations with the same metrics, and
+`.stats`, `.txt`, `_dead-birth.txt`, `_phys_live.txt` and `_equal_weights.txt`
+all compare equal against a run without it.
+
+Forty interleaved A/B pairs: 3.205s -> 3.068s median, paired difference
+-0.136s +/- 0.029s, 29/40 pairs. Instrumented runs put the rank's
+`run_polychord()`-to-first-likelihood gap at 0.234-0.266s without the setting
+and 0.022-0.053s with it, 6/6 pairs; end to end recovers rather less than that
+because the ranks reach the join spread over ~0.2s.
+
+An earlier 24-pair A/B of this same change read -0.007s and nearly sent it to
+the bin. Both arms had been run against a meqtrees image left over from a
+reverted experiment that moved `warm_forest()` to the other side of the worker's
+FIFO open - which is precisely where the rank's wait comes from, so it masked
+the effect. **Rebuild every image the arms depend on before an A/B, not just the
+one being changed**; `scripts/build.sh` is ~2s per image against runs that are
+~3s each.
+
+#### The critical path is the simulate worker's warm-up, not the rank
+
+Absolute timestamps taken on both sides of the FIFO at once - in the rank's
+`prewarm()` and inside the `--serve --fifo` worker - line up like this on a
+default 8-rank run (seconds from the run script starting, worker running from
+the bind mount so its imports are ~0.15s slower than the baked-in copy):
+
+| Marker | When |
+|---|---:|
+| worker process enters `serve()` | 0.58-0.66 |
+| worker's `meqserver_session()` returns | 0.69-0.88 |
+| rank reaches `prewarm()`'s join | 0.76-0.93 |
+| worker's `warm_forest()` returns, worker opens its FIFOs | **1.00-1.20** |
+| rank's `simulate_worker()` returns | 1.00-1.20, to the millisecond |
+| worker reads request one | 1.00-1.20, to the millisecond |
+
+Every rank-side marker lands *before* the worker is ready, and the rank's
+connect and the worker's FIFO open are the same instant, so the rank spends
+0.2-0.3s blocked in the join. Anything a rank does *before* the join is
+therefore free, and anything after it is not: `OMPI_MCA_pml=ob1` (above) sits
+after the join and is worth 0.136s end to end, while paying PolyChord's one-time
+setup with a throwaway `run_polychord()` before the join was measured at
+-0.007s +/- 0.026s over 20 pairs and dropped, as was opening the worker's FIFOs
+before its warm-up instead of after (0.35s off the join, 0.00s end to end - it
+only moves the same wait into evaluation one).
+
+It also explains an apparent regression: `OMPI_MCA_pml=ob1` takes the eight
+`eval_id == 1` `simulate_seconds` records from ~0.06s to ~0.14s and summed
+simulate worker-seconds from 2.25 to 2.88. Nothing got slower. The rank starts
+timing when it writes the request and the worker reads it at the same absolute
+moment either way, so a rank that reaches evaluation one earlier simply measures
+more of the wait. Steady-state `simulate_seconds` is ~0.05-0.06s in both.
+
+The next lever is therefore inside the worker: ~0.32s of `docker run` before its
+command starts, then ~0.07s of interpreter and imports (with the baked-in,
+byte-compiled copy), ~0.10s of meqserver, and ~0.25s of `warm_forest()`. Only
+the last two are ours.
 
 #### Long-lived sidecar containers, one per image
 
