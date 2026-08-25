@@ -268,26 +268,47 @@ anything itself. Runs written before this instrumentation existed have no
 ### What a real bounded run showed
 
 A single-rank (`NS_MPI_PROCS=1`), 5-dimensional, `NS_NLIVE=3 NS_MAX_NDEAD=4`
-WSClean PoC run (14 likelihood evaluations, not committed) profiled as:
+WSClean PoC run (19 likelihood evaluations, not committed) profiled as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 25.2s | 66.2% |
-| WSClean image container (total) | 12.4s | 32.4% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 1.8s | 4.6% |
-| &nbsp;&nbsp;of which: container overhead | 10.6s | 27.8% |
+| MeqTrees simulate | 29.7s | 69.0% |
+| WSClean image container (total) | 12.8s | 29.7% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.3s | 5.3% |
+| &nbsp;&nbsp;of which: container overhead | 10.5s | 24.4% |
 | Metrics computation | 0.3s | 0.7% |
-| PolyChord overhead (unaccounted) | 0.25s | 0.6% |
+| PolyChord overhead (unaccounted) | 0.27s | 0.6% |
 
-The MeqTrees RIME simulation is still the single largest stage (~1.8s/eval),
-but docker container start/teardown for the imaging sidecar is now the second
-(~0.76s/eval, roughly 6x the `wsclean` binary's own runtime). PolyChord's own
-sampling/bookkeeping overhead stays negligible (0.6%) at this scale.
+Total wall time 43.0s (~2.3s/eval). The MeqTrees RIME simulation is still the
+single largest stage (~1.6s/eval), but docker container start/teardown for the
+imaging sidecar is the second (~0.55s/eval, roughly 4.5x the `wsclean` binary's
+own runtime). PolyChord's own sampling/bookkeeping overhead stays negligible
+(0.6%) at this scale.
+
+The remaining container overhead is `docker run` create/start/teardown itself,
+measured at ~0.45s per container on this host regardless of image, mounts, or
+`--platform`. `docker exec` into an already-running container costs ~0.02s, so a
+long-lived per-rank sidecar container is the natural next step - two `docker
+run` calls per evaluation currently cost ~0.9s of the ~2.3s.
+
+#### Sidecar containers run with `--network none`
+
+Every per-evaluation sidecar (MeqTrees simulate, MS-to-`.mat` convert, WSClean,
+R2D2) is launched with `--network none`. None of them talks to the network:
+inputs and outputs are bind-mounted, and MeqTrees' `meqserver` only needs the
+loopback interface, which `none` still provides.
+
+Docker's default bridge network costs ~0.65s per container to set up and tear
+down here versus ~0.45s with `--network none` - about 0.2s per container, or
+0.44s per evaluation across the simulate and imaging sidecars. On the profiled
+run that cut total wall time from 51.5s to 43.0s (-16.5%) with byte-identical
+per-evaluation metrics and the same log(Z). The gap is largest under rootless
+Docker, where bridge setup goes through a userspace network stack.
 
 #### The meqserver shutdown sleep
 
-The same run originally profiled at 162.7s of MeqTrees simulate (~11.6s/eval,
-92.6% of wall time). Almost none of that was RIME work: makems takes ~0.5s, the
+An equivalent run before this fix profiled at 162.7s of MeqTrees simulate
+(~11.6s/eval, 92.6% of wall time). Almost none of that was RIME work: makems takes ~0.5s, the
 container start ~0.8s, and the TDL compile plus predict ~0.4s. The remaining
 ~10s per evaluation was Timba's `stop_default_mqs()`, which reaps the meqserver
 child with a single `waitpid(WNOHANG)` and then sleeps a fixed 10 seconds before

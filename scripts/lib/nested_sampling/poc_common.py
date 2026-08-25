@@ -447,6 +447,11 @@ def simulate_measurement_set(
         "docker",
         "run",
         "--rm",
+        # No sidecar needs networking, and docker's default bridge setup costs
+        # ~0.7s per container under rootless Docker - 35x the container's own
+        # runtime here. "none" still gives a loopback interface for meqserver.
+        "--network",
+        "none",
         "--platform",
         platform,
         "-v",

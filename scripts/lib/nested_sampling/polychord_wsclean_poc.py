@@ -86,6 +86,11 @@ def evaluate(
         "docker",
         "run",
         "--rm",
+        # No sidecar needs networking, and docker's default bridge setup costs
+        # ~0.7s per container under rootless Docker - 35x the container's own
+        # runtime here. "none" still gives a loopback interface for meqserver.
+        "--network",
+        "none",
         "--name",
         container_name,
         "--platform",
