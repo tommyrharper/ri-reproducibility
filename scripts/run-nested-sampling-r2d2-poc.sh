@@ -62,6 +62,12 @@ RUN_COMMAND=(
   -e CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
+  # host CPU, in every rank. Nothing here has a BLAS call big enough to want
+  # them (the largest is a norm over a 128x128 image), so on a 20-CPU host the
+  # 8 default ranks spent ~10 cores spinning and starved the real work.
+  -e OMP_NUM_THREADS=1
+  -e OPENBLAS_NUM_THREADS=1
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   -e R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"

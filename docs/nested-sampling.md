@@ -274,14 +274,14 @@ evaluations, not committed) profiles as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| WSClean image container (total) | 6.7s | 61.0% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.3s | 57.3% |
-| &nbsp;&nbsp;of which: container overhead | 0.40s | 3.6% |
-| MeqTrees simulate | 3.4s | 30.7% |
-| Metrics computation | 0.30s | 2.8% |
-| PolyChord overhead (unaccounted) | 0.60s | 5.5% |
+| WSClean image container (total) | 6.8s | 59.7% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.4s | 56.5% |
+| &nbsp;&nbsp;of which: container overhead | 0.39s | 3.5% |
+| MeqTrees simulate | 3.7s | 32.4% |
+| Metrics computation | 0.29s | 2.6% |
+| PolyChord overhead (unaccounted) | 0.57s | 5.1% |
 
-Total wall time 10.9s (~0.18s/eval; 8.2s on the default 8 ranks). No fixed
+Total wall time 11.3s (~0.18s/eval; 5.3s on the default 8 ranks). No fixed
 overhead of any size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
@@ -296,6 +296,34 @@ against ~0.018s of process startup, and moving `-temp-dir` to `/dev/shm`
 changes nothing measurable (the reordered scratch files never reach the ext4
 journal). `-j 4` buys ~5ms but would multiply threads by the MPI rank count
 and make the gridding sum order - and so the image - non-deterministic.
+
+#### The PolyChord ranks run with one BLAS thread each
+
+`numpy`'s bundled OpenBLAS spawns one busy-waiting worker thread per host CPU,
+in every process that touches it. Each MPI rank is one such process, so on this
+20-CPU host the default 8 ranks carried ~160 spinning threads between them and
+burnt ~10 cores waiting for work that never arrives - nothing in this pipeline
+has a BLAS call big enough to want them, the largest being a norm over a
+128x128 image. The starvation showed up as every stage inflating under MPI:
+`metrics_seconds` averaged 0.28s per evaluation on 8 ranks against 0.005s on
+one, for 1.5ms of actual arithmetic.
+
+Both run scripts therefore pass `OMP_NUM_THREADS=1` and
+`OPENBLAS_NUM_THREADS=1` to the PolyChord container. Measured over 3 runs each,
+the default 8-rank run went 8.25s -> 5.26s (-36%) and its summed metrics
+computation 11.3s -> 1.3s. This is not worth pushing down into the sidecars:
+the MeqTrees image's system `numpy` spawns no BLAS threads at all, and `wsclean`
+already runs `-j 1`.
+
+Single-rank is ~3% *slower* with the pin (10.95s -> 11.28s, consistent across
+interleaved A/B runs) - with no contention to remove, the spinning threads were
+keeping cores out of idle states. The default configuration is 8 ranks, so the
+pin stays.
+
+`log(Z)` and every evaluation's objective are unchanged. `sigma_res` moves in
+its last bit, because a single-threaded `np.linalg.norm` reduces in a different
+order than a threaded one; that also makes it reproducible across hosts with
+different CPU counts, which it previously was not.
 
 #### `WEIGHT`/`SIGMA` are written row by row, not with `putcol`
 
