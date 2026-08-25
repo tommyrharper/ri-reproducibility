@@ -206,6 +206,10 @@ def redirect_fds(out_path: Path, err_path: Path | None = None):
 
 _MQS = None
 
+# The forest currently loaded into the meqserver, keyed on the tdlconf text
+# with the MS name removed - see run_meqtrees_predict().
+_FOREST: dict[str, object] = {}
+
 
 def meqserver_session():
     """The one meqserver this process talks to, started on first predict.
@@ -243,7 +247,21 @@ def stop_meqserver_session() -> None:
         from Timba.Apps import meqserver
 
         _MQS = None
+        # The forest lives in the server, not here.
+        _FOREST.clear()
         meqserver.stop_default_mqs()
+
+
+def point_to_measurement_set(module, output_ms: Path) -> None:
+    """Aim an already-compiled forest at a different Measurement Set."""
+    mssel = module.mssel
+    if not mssel._select_new_ms(str(output_ms)):
+        raise SystemExit(f"FATAL: MeqTrees could not read {output_ms}")
+    mssel.msname = str(output_ms)
+    # _select_new_ms() re-lists the MS's data columns, which resets the output
+    # column option that _define_forest set to DATA. Miss this and the sinks
+    # write to CORRECTED_DATA instead - no error, just an all-zero DATA column.
+    mssel.output_column = "DATA"
 
 
 def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, l_rad: float, m_rad: float) -> None:
@@ -264,13 +282,30 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
     mqs = meqserver_session()
     from Timba.TDL import Compile, TDLOptions
 
+    # Compiling the forest is ~0.034s of every evaluation and depends on every
+    # tdlconf key except ms_sel.msname: the antenna layout and phase centre come
+    # from the fixed antenna table and RightAscension/Declination that
+    # write_makems_config() hardcodes, and the MS shape is runtime data. So the
+    # forest is compiled once per distinct source/correlation setup and later
+    # evaluations just point it at their own MS. self_check_forest_reuse()
+    # is the guard on that claim.
+    key = "\n".join(line for line in tdlconf.read_text().splitlines() if not line.startswith("ms_sel.msname"))
     # Same sequence meqtree-pipeliner.py runs for
     # `-c <tdlconf> point_source_forest.py[predict] =predict`.
     with redirect_fds(output_ms.parent / "meqtree-pipeliner.log"):
-        TDLOptions.config.read(str(tdlconf))
-        TDLOptions.config.set_save_filename(None)
-        _module, _ns, msg = Compile.compile_file(mqs, str(TDL_SCRIPT), config="predict")
-        print("###", msg)
+        module = _FOREST.get(key)
+        if module is None:
+            TDLOptions.config.read(str(tdlconf))
+            TDLOptions.config.set_save_filename(None)
+            module, _ns, msg = Compile.compile_file(mqs, str(TDL_SCRIPT), config="predict")
+            print("###", msg)
+            # The meqserver holds one forest, so a new compile invalidates the
+            # previous entry rather than adding to it.
+            _FOREST.clear()
+            _FOREST[key] = module
+        else:
+            point_to_measurement_set(module, output_ms)
+            print("### reusing the compiled forest; only the Measurement Set changed")
         TDLOptions.get_job_func("predict")(mqs, None, wait=True)
         # get_error_log() flushes, so each request only sees its own errors.
         errors = mqs.get_error_log()
@@ -435,6 +470,38 @@ def self_check_skeleton_cache() -> None:
     print("MS skeleton cache self-check passed")
 
 
+def self_check_forest_reuse() -> None:
+    """Reusing a compiled forest must predict what a fresh compile predicts."""
+    shapes = ((2, 4.0), (6, 10.0), (3, 8.0))
+
+    def build(scratch: Path, name: str, n_chan: int, minutes: float) -> np.ndarray:
+        ms = scratch / name / "sim.ms"
+        built = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", str(minutes),
+            "--channel-count", str(n_chan), "--start-frequency-hz", "1.0e9",
+            "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(built, ms), ms, built)
+        corr_sel, _ = determine_corr_selection(ms)
+        run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
+        with table(str(ms), readonly=True, ack=False) as opened:
+            return np.asarray(opened.getcol("DATA"))
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        # One compile up front, then every shape runs off the cached forest.
+        _FOREST.clear()
+        reused = [build(Path(scratch), f"reused-{i}", *shape) for i, shape in enumerate(shapes)]
+        assert len(_FOREST) == 1, "the forest was recompiled for an identical source setup"
+        fresh = []
+        for i, shape in enumerate(shapes):
+            _FOREST.clear()
+            fresh.append(build(Path(scratch), f"fresh-{i}", *shape))
+        for shape, values, expected in zip(shapes, reused, fresh):
+            assert np.array_equal(values, expected), f"DATA differs after a forest reuse at {shape}"
+    _FOREST.clear()
+    print("forest reuse self-check passed")
+
+
 if __name__ == "__main__":
     # --serve and --self-check take no other arguments, so they are checked before
     # argparse, which requires the full simulate argument set.
@@ -443,6 +510,7 @@ if __name__ == "__main__":
             serve()
         elif sys.argv[1:] == ["--self-check"]:
             self_check_skeleton_cache()
+            self_check_forest_reuse()
         else:
             simulate(parse_args())
     finally:

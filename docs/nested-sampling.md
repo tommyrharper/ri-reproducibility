@@ -274,21 +274,49 @@ evaluations, not committed) profiles as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 9.0s | 53.0% |
-| WSClean image container (total) | 7.0s | 41.5% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.6s | 38.9% |
-| &nbsp;&nbsp;of which: container overhead | 0.43s | 2.5% |
-| Metrics computation | 0.31s | 1.8% |
-| PolyChord overhead (unaccounted) | 0.61s | 3.6% |
+| WSClean image container (total) | 6.8s | 51.6% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.4s | 48.5% |
+| &nbsp;&nbsp;of which: container overhead | 0.41s | 3.1% |
+| MeqTrees simulate | 5.5s | 41.7% |
+| Metrics computation | 0.31s | 2.3% |
+| PolyChord overhead (unaccounted) | 0.57s | 4.4% |
 
-Total wall time 16.9s (~0.27s/eval; 12.9s on 4 ranks). No fixed overhead of any
-size is left in either sidecar: what remains is the science. Warm, an
-evaluation is ~0.14s of simulate (~0.03s TDL compile, ~0.04s RIME predict, the
-rest noise fill and casacore table I/O, plus ~0.05s of `makems` on the
-evaluations that miss the MS skeleton cache) and ~0.11s of `wsclean`. The rest
-is one-off startup - ~0.66s for the first simulate (worker and meqserver),
-~0.17s for the first metrics call (`astropy` import) - plus PolyChord's own
-sampling and bookkeeping.
+Total wall time 13.2s (~0.21s/eval; 8.4s on the default 8 ranks). No fixed
+overhead of any size is left in either sidecar: what remains is the science.
+Warm, an evaluation is ~0.09s of simulate (~0.04s RIME predict, the rest noise
+fill and casacore table I/O, plus ~0.05s of `makems` on the evaluations that
+miss the MS skeleton cache) and ~0.11s of `wsclean`, which is now the larger
+half of the run. The rest is one-off startup - ~0.66s for the first simulate
+(worker, meqserver and the one TDL compile), ~0.17s for the first metrics call
+(`astropy` import) - plus PolyChord's own sampling and bookkeeping.
+
+#### The compiled TDL forest is reused across evaluations
+
+`Compile.compile_file()` was ~0.034s of every evaluation, and the forest it
+builds does not depend on the Measurement Set's shape: the antenna layout and
+phase centre come from the fixed antenna table and the hardcoded
+`RightAscension`/`Declination` in `write_makems_config()`, and the time and
+frequency axes are runtime data the `VisDataMux` reads per request. So
+`run_meqtrees_predict()` keys a process-level cache on the generated `.tdlconf`
+text with the `ms_sel.msname` line removed, and on a hit calls
+`point_to_measurement_set()` - which re-points the `MSSelector` at the new MS -
+instead of recompiling. Over a 62-evaluation run that is one compile and 61
+reuses.
+
+`MSSelector._select_new_ms()` re-lists the MS's data columns, which resets the
+output-column option that `_define_forest()` set to `DATA`; the reuse path has
+to re-assert it or the sinks quietly write `CORRECTED_DATA` and `DATA` comes
+back all zeros with no error anywhere. `simulate_point_source_ms.py
+--self-check` guards exactly that: it predicts three MS shapes off one cached
+forest and off three fresh compiles and asserts the `DATA` columns are equal.
+
+Measured over three runs each of the default single-rank configuration: 16.9s
+before, 13.2s after (-22%), with the simulate stage down 39% (9.0s -> 5.5s -
+more than the compile alone, because a reuse also skips the MS-metadata reads
+the compile did). The 8-rank default went 9.1s to 8.4s (-8%; with ~5
+evaluations per rank there is much less to amortise). All 62 images were
+pixel-identical, every science metric matched, the evaluation directories held
+the same file tree and `log(Z)` was unchanged.
 
 #### The `makems` skeleton is cached per MS shape
 
@@ -304,9 +332,10 @@ running `makems`. Only `observation_minutes` and `channel_count` reach the key,
 so the parameter space has 20 distinct shapes and a long-lived `--serve` worker
 hits the cache for most of its evaluations.
 
-`simulate_point_source_ms.py --self-check` is the guard on the rewrite formula:
-it builds each shape both ways and asserts a patched cache hit matches a fresh
-`makems` run column for column. Run it in the meqtrees image:
+`simulate_point_source_ms.py --self-check` is the guard on the rewrite formula
+(and on the forest reuse below): it builds each shape both ways and asserts a
+patched cache hit matches a fresh `makems` run column for column. Run it in the
+meqtrees image:
 
 ```bash
 docker run --rm --network none ri-reproducibility/meqtrees:kern-10 --self-check
