@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -623,6 +624,42 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen:
         atexit.register(worker.terminate)
         _SIMULATE_WORKERS[meqtrees_image] = worker
     return _SIMULATE_WORKERS[meqtrees_image]
+
+
+def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[[], None]:
+    """Start this rank's sidecar attachments concurrently; returns a joiner.
+
+    The first evaluation on a rank cost ~0.7s that later ones did not, and every
+    rank paid it at the same moment, so all of it landed on the wall clock in
+    front of evaluation one: the simulate worker's Python/Timba/meqserver
+    startup (~0.45s), two `docker inspect`s for the image entrypoints, the
+    wsclean shell's `docker exec`, and astropy's import (~0.2s) - one after the
+    other. Here they run in threads, so the rank pays the slowest instead of the
+    sum, and the caller can overlap them with PolyChord's own startup by joining
+    late.
+
+    Nothing may touch a sidecar between this call and the returned joiner: the
+    caches these threads fill are plain dicts with no lock.
+    """
+    def warm_astropy() -> None:
+        from astropy.io import fits  # noqa: F401
+
+    def warm_wsclean() -> None:
+        sidecar_command(wsclean_image)
+        sidecar_shell(wsclean_image, platform)
+
+    threads = [
+        threading.Thread(target=target, daemon=True)
+        for target in (lambda: simulate_worker(meqtrees_image, platform), warm_wsclean, warm_astropy)
+    ]
+    for thread in threads:
+        thread.start()
+
+    def join() -> None:
+        for thread in threads:
+            thread.join()
+
+    return join
 
 
 def simulate_measurement_set(

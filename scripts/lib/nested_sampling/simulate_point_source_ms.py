@@ -310,7 +310,10 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
         # get_error_log() flushes, so each request only sees its own errors.
         errors = mqs.get_error_log()
         for index, (_event, error) in enumerate(errors):
-            print(f"###   {index:03d}: {error}")
+            # !r, not str(): Timba's DMI record __str__ is still py2
+            # (`string.join`) and raises AttributeError, which would replace the
+            # meqserver's error with a traceback from the reporting path itself.
+            print(f"###   {index:03d}: {error!r}")
     if errors:
         raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
 

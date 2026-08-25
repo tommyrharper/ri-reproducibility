@@ -24,6 +24,7 @@ from poc_common import (
     load_evaluations_from_dir,
     mpi_rank,
     params_key,
+    prewarm,
     prior_vector,
     read_gnu_time_peak_memory,
     read_gnu_time_wall_seconds,
@@ -260,10 +261,15 @@ def self_check_failure_record_persistence() -> None:
 
 
 def main() -> None:
+    args = parse_args()
+    # Before `import pypolychord`, so the rank's sidecar attachments come up
+    # while the sampler is still loading. Joined just below, right before the
+    # first evaluation can ask for one.
+    warm = prewarm(args.meqtrees_image, args.wsclean_image, args.platform)
+
     import pypolychord
     from pypolychord.settings import PolyChordSettings
 
-    args = parse_args()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +313,7 @@ def main() -> None:
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    warm()
     run_start = time.monotonic()
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start

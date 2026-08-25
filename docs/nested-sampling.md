@@ -291,9 +291,10 @@ size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
 skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
-The rest is one-off startup - ~0.66s for the first simulate (worker, meqserver
-and the one TDL compile), ~0.17s for the first metrics call (`astropy` import) -
-plus PolyChord's own sampling and bookkeeping.
+The rest is one-off startup - the simulate worker, meqserver, the one TDL
+compile and the `astropy` import, now started concurrently before the sampler
+runs rather than serially inside the first evaluation - plus PolyChord's own
+sampling and bookkeeping.
 
 `wsclean` itself is at its floor for this problem size: it self-reports
 0.035s inversion + 0.023s prediction + 0.008s deconvolution per evaluation
@@ -457,7 +458,11 @@ inheriting the corpse.
 The predict itself moved in-process with it: `run_meqtrees_predict()` now runs
 the same `TDLOptions`/`Compile.compile_file`/job sequence `meqtree-pipeliner.py`
 runs, against a meqserver that survives between requests. `mqs.get_error_log()`
-flushes, so each request only ever sees its own errors.
+flushes, so each request only ever sees its own errors. Those errors are
+printed with `!r`, not `str()`: Timba's DMI record `__str__` is still py2
+(`string.join`) and raises `AttributeError`, which used to replace the
+meqserver's actual error with a traceback from the error-reporting path itself.
+`__repr__` on the same class is py3-clean.
 
 Measured cost per simulate dropped from 0.62s one-shot to ~0.18s served. On the
 profiled single-rank run that is 16.8s to 7.7s total (-54%), and on a 4-rank
@@ -502,6 +507,45 @@ Docker gives a container 64MB of `/dev/shm` by default, which is ~30x the
 largest MS this parameter space produces; a bigger parameter space needs
 `--shm-size` on the sidecar. `SCRATCH_ROOT` falls back to the `tempfile`
 default when `/dev/shm` is not writable.
+
+#### Each rank warms its sidecar attachments before the sampler starts
+
+The first evaluation on a rank used to cost ~0.7s that later ones did not, and
+every rank paid it at the same moment - PolyChord asks all `nlive` initial live
+points at once - so the whole thing landed on the wall clock in front of
+evaluation one. It was four independent startups run one after the other inside
+`evaluate()`:
+
+| Startup | Cost |
+|---|---:|
+| `simulate_point_source_ms.py --serve` worker (`docker exec`, Python, Timba, meqserver) | ~0.45s |
+| `astropy.io.fits` import, on the first metrics call | ~0.20s |
+| `docker inspect` of each image's `ENTRYPOINT`, twice | ~0.05s |
+| the WSClean sidecar's `sh` (`docker exec`) | ~0.03s |
+
+`poc_common.prewarm()` starts all of them in threads, so a rank pays the slowest
+instead of the sum. `main()` calls it before `import pypolychord` and joins it
+immediately before `run_polychord()`, so the remaining ~0.45s also overlaps the
+sampler's own import and setup. Nothing may touch a sidecar between the call and
+the join: `_SIMULATE_WORKERS`, `_SIDECAR_SHELLS` and `_IMAGE_ENTRYPOINTS` are
+plain dicts with no lock, and a lazy start racing the prewarm thread would leave
+a second, orphaned worker.
+
+#### Sidecar teardown does not block the run
+
+The EXIT trap's `docker rm --force` of the three containers costs ~0.4s, spent
+after every result is already on disk. It is now backgrounded (`... &`); the
+orphaned `docker rm` outlives the shell and finishes. On a `SIGKILL` of the run
+script the containers survive as before, and
+`docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)` still clears them.
+
+Measured together with four interleaved A/B runs of the default 8-rank
+configuration, end-to-end script wall time went 5.15s -> 4.42s (-14%), split
+roughly 0.5s to the prewarm and 0.2s to the backgrounded teardown.
+`total_wall_seconds` went 3.6s -> 2.8s, but only part of that is real: the
+prewarm happens *before* `run_start`, so it moves cost out of that window as
+well as shrinking it. All eight runs produced identical `log(Z)` and identical
+objectives for all 41 evaluations.
 
 #### The PolyChord container is a sidecar too
 

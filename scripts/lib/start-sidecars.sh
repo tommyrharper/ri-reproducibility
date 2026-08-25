@@ -72,7 +72,10 @@ sidecar_launch() {
   # is issued, so a caller can build the command that consumes it while the
   # containers are still coming up.
   export NS_SIDECARS="{${_SIDECAR_JSON}}"
-  trap 'docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 || true' EXIT
+  # Backgrounded: `docker rm --force` of the three containers costs ~0.4s, and
+  # waiting for it is 8% of the run's wall clock spent after every result is
+  # already on disk. The orphaned `docker rm` outlives this shell and finishes.
+  trap 'docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 &' EXIT
 }
 
 sidecar_wait() {
