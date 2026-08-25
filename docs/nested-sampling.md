@@ -268,26 +268,38 @@ anything itself. Runs written before this instrumentation existed have no
 ### What a real bounded run showed
 
 A single-rank (`NS_MPI_PROCS=1`), 5-dimensional, `NS_NLIVE=3 NS_MAX_NDEAD=4`
-WSClean PoC run (14 likelihood evaluations, `results/nested-sampling-poc/
-wsclean-vlaa-profiler-smoke`, not committed) profiled as:
+WSClean PoC run (14 likelihood evaluations, not committed) profiled as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 162.7s | 92.6% |
-| WSClean image container (total) | 12.8s | 7.3% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.7s | 3.8% |
-| &nbsp;&nbsp;of which: container overhead | 6.2s | 3.5% |
-| Metrics computation | 0.08s | 0.0% |
-| PolyChord overhead (unaccounted) | 0.11s | 0.1% |
+| MeqTrees simulate | 25.2s | 66.2% |
+| WSClean image container (total) | 12.4s | 32.4% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 1.8s | 4.6% |
+| &nbsp;&nbsp;of which: container overhead | 10.6s | 27.8% |
+| Metrics computation | 0.3s | 0.7% |
+| PolyChord overhead (unaccounted) | 0.25s | 0.6% |
 
-**The MeqTrees RIME simulation dominates wall time by more than an order of
-magnitude over everything else combined** (~11.6s/eval vs ~0.9s/eval for
-WSClean imaging). PolyChord's own sampling/bookkeeping overhead is negligible
-(0.1% of total wall time) at this scale, and roughly half of the WSClean stage
-is docker container overhead rather than the imaging binary itself. Any
-speedup effort on this pipeline should target the MeqTrees simulation step
-first; optimizing WSClean invocation or PolyChord settings would not move the
-needle at this parameter-space scale.
+The MeqTrees RIME simulation is still the single largest stage (~1.8s/eval),
+but docker container start/teardown for the imaging sidecar is now the second
+(~0.76s/eval, roughly 6x the `wsclean` binary's own runtime). PolyChord's own
+sampling/bookkeeping overhead stays negligible (0.6%) at this scale.
+
+#### The meqserver shutdown sleep
+
+The same run originally profiled at 162.7s of MeqTrees simulate (~11.6s/eval,
+92.6% of wall time). Almost none of that was RIME work: makems takes ~0.5s, the
+container start ~0.8s, and the TDL compile plus predict ~0.4s. The remaining
+~10s per evaluation was Timba's `stop_default_mqs()`, which reaps the meqserver
+child with a single `waitpid(WNOHANG)` and then sleeps a fixed 10 seconds before
+re-checking - so every evaluation paid a full 10s of pure shutdown wait.
+
+`docker/meqtrees/Dockerfile` rewrites that poll loop in the installed
+`Timba/Apps/meqserver.py` to sleep 0.1s per iteration over 2000 iterations,
+keeping the same ~200s ceiling before the SIGKILL fallback. Simulate wall time
+drops from ~11.8s to ~1.9s per evaluation with bit-identical `DATA`, `UVW`,
+`WEIGHT`, `SIGMA` and `FLAG` columns. The patch asserts on the exact upstream
+source lines, so a KERN package bump that changes them fails the image build
+rather than silently reverting the speedup.
 
 ## Output files
 

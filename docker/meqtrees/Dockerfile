@@ -35,6 +35,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-numpy \
     && rm -rf /var/lib/apt/lists/*
 
+# Timba's stop_default_mqs() reaps the meqserver child with waitpid(WNOHANG)
+# and then sleeps a fixed 10s before re-checking, so every predict pays ~10s of
+# pure shutdown wait for a run whose real work takes <0.5s. Poll 100x finer,
+# same ~200s ceiling before the SIGKILL fallback.
+RUN python3 - <<'EOF'
+import pathlib
+
+path = pathlib.Path("/usr/lib/python3/dist-packages/Timba/Apps/meqserver.py")
+source = path.read_text()
+for old, new in (("      for i in range(20):", "      for i in range(2000):"),
+                 ("        time.sleep(10);", "        time.sleep(0.1);")):
+    assert source.count(old) == 1, f"meqserver.py shutdown poll changed upstream: {old!r}"
+    source = source.replace(old, new)
+path.write_text(source)
+EOF
+
 COPY scripts/lib/nested_sampling/simulate_point_source_ms.py /opt/ri-nested-sampling/simulate_point_source_ms.py
 COPY scripts/lib/nested_sampling/point_source_forest.py /opt/ri-nested-sampling/point_source_forest.py
 COPY scripts/lib/nested_sampling/ms_to_r2d2_mat.py /opt/ri-nested-sampling/ms_to_r2d2_mat.py
