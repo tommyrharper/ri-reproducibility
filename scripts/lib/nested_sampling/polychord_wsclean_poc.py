@@ -28,10 +28,10 @@ from poc_common import (
     read_gnu_time_peak_memory,
     read_gnu_time_wall_seconds,
     resolve_metric,
-    run_timed,
     self_check_metric_resolution,
     self_check_profiling,
-    sidecar_exec,
+    sidecar_command,
+    sidecar_run,
     simulate_measurement_set,
     stable_seed,
     summarize_profiling,
@@ -82,12 +82,7 @@ def evaluate(
     wsclean_stderr = eval_dir / "wsclean.stderr.log"
     wsclean_time = wsclean_dir / "time.txt"
     wsclean_cmd = [
-        *sidecar_exec(
-            args.wsclean_image,
-            args.platform,
-            eval_dir,
-            prefix=["/usr/bin/time", "-v", "-o", str(wsclean_time)],
-        ),
+        *sidecar_command(args.wsclean_image, prefix=["/usr/bin/time", "-v", "-o", str(wsclean_time)]),
         "-name",
         str(wsclean_dir / "recon"),
         "-temp-dir",
@@ -115,7 +110,7 @@ def evaluate(
     # No `docker stats` polling loop here: GNU `time -v` inside the container
     # reports an exact peak RSS, where the 0.2s-interval stats sampler both
     # missed short peaks and delayed noticing the process had exited.
-    run_result = run_timed(wsclean_cmd, wsclean_stdout, wsclean_stderr)
+    run_result = sidecar_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = read_gnu_time_peak_memory(wsclean_time)
     image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
     if run_result.returncode != 0:
@@ -198,9 +193,9 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_run_timed = globals()["run_timed"]
+    original_sidecar_run = globals()["sidecar_run"]
     original_simulate = globals()["simulate_measurement_set"]
-    original_sidecar = globals()["sidecar_exec"]
+    original_sidecar_command = globals()["sidecar_command"]
 
     def failing_simulate(
         params: dict[str, Any],
@@ -212,7 +207,7 @@ def self_check_failure_record_persistence() -> None:
         return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
 
     try:
-        globals()["sidecar_exec"] = lambda image, platform, workdir, prefix=None: ["stub-exec"]
+        globals()["sidecar_command"] = lambda image, prefix=None: ["stub-wsclean"]
         globals()["simulate_measurement_set"] = failing_simulate
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -233,6 +228,9 @@ def self_check_failure_record_persistence() -> None:
             return eval_dir / "sim.ms", ["simulate"], None
 
         def successful_wsclean(
+            image: str,
+            platform: str,
+            workdir: Path,
             cmd: list[str],
             stdout_path: Path,
             stderr_path: Path,
@@ -243,7 +241,7 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["run_timed"] = successful_wsclean
+        globals()["sidecar_run"] = successful_wsclean
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -256,9 +254,9 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["run_timed"] = original_run_timed
+        globals()["sidecar_run"] = original_sidecar_run
         globals()["simulate_measurement_set"] = original_simulate
-        globals()["sidecar_exec"] = original_sidecar
+        globals()["sidecar_command"] = original_sidecar_command
 
 
 def main() -> None:

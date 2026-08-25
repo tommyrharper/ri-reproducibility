@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -198,6 +199,17 @@ def sidecar_exec(
     relative to the cwd stays per-evaluation, as it did when every evaluation
     had its own container.
     """
+    return [
+        "docker", "exec",
+        *(["--interactive"] if interactive else []),
+        "--workdir", str(workdir),
+        sidecar_container(image, platform),
+        *sidecar_command(image, prefix),
+    ]
+
+
+def sidecar_command(image: str, prefix: list[str] | None = None) -> list[str]:
+    """The in-container argv `docker run <image>` would execute, without arguments."""
     if image not in _IMAGE_ENTRYPOINTS:
         inspected = subprocess.run(
             ["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", image],
@@ -207,33 +219,73 @@ def sidecar_exec(
         ).stdout.strip()
         entrypoint = json.loads(inspected)
         if not entrypoint:
-            raise SystemExit(f"FATAL: {image} has no ENTRYPOINT to run under `docker exec`")
+            raise SystemExit(f"FATAL: {image} has no ENTRYPOINT to run inside a sidecar")
         _IMAGE_ENTRYPOINTS[image] = entrypoint
-    return [
-        "docker", "exec",
-        *(["--interactive"] if interactive else []),
-        "--workdir", str(workdir),
-        sidecar_container(image, platform),
-        *(prefix or []),
-        *_IMAGE_ENTRYPOINTS[image],
-    ]
+    return [*(prefix or []), *_IMAGE_ENTRYPOINTS[image]]
+
+
+_SIDECAR_SHELLS: dict[str, subprocess.Popen] = {}
+
+
+def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
+    """This rank's long-lived `sh` inside the sidecar, one `docker exec` per run.
+
+    `docker exec` costs ~0.033s on this host - a third of the `wsclean` binary's
+    own ~0.107s - and every evaluation paid it again. One `sh` reading command
+    lines from its stdin pays it once per rank; a request costs a pipe write and
+    a `read`.
+    """
+    if image not in _SIDECAR_SHELLS:
+        shell = subprocess.Popen(
+            # Not sidecar_exec(): this one deliberately bypasses the image
+            # ENTRYPOINT, and each request cd's to its own evaluation directory.
+            ["docker", "exec", "--interactive", sidecar_container(image, platform), "sh"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        # The container itself is torn down by sidecar_container()'s own atexit
+        # hook, which is registered first and so runs last.
+        atexit.register(shell.terminate)
+        _SIDECAR_SHELLS[image] = shell
+    return _SIDECAR_SHELLS[image]
+
+
+def sidecar_run(
+    image: str,
+    platform: str,
+    workdir: Path,
+    cmd: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> DockerRunResult:
+    """Run `cmd` in this rank's sidecar, same shape as run_docker_monitored().
+
+    The command's own output goes to the log files, so only the exit code `echo`
+    comes back down the shell's stdout and nothing a sidecar prints can be
+    mistaken for a reply. A shell that dies without answering is dropped from
+    the cache so the next evaluation starts a fresh one.
+    """
+    shell = sidecar_shell(image, platform)
+    request = (
+        f"cd {shlex.quote(str(workdir))} && {shlex.join(cmd)}"
+        f" >{shlex.quote(str(stdout_path))} 2>{shlex.quote(str(stderr_path))}; echo $?\n"
+    )
+    started = time.perf_counter()
+    shell.stdin.write(request)
+    shell.stdin.flush()
+    reply = shell.stdout.readline()
+    wall_seconds = time.perf_counter() - started
+    if not reply:
+        _SIDECAR_SHELLS.pop(image, None)
+        stderr_path.write_text(f"FATAL: {image} sidecar shell exited without a reply\n")
+        return DockerRunResult(returncode=1, wall_seconds=wall_seconds, peak_memory_bytes=0)
+    return DockerRunResult(returncode=int(reply), wall_seconds=wall_seconds, peak_memory_bytes=0)
 
 
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
     with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
         subprocess.run(cmd, stdout=stdout, stderr=stderr, check=True)
-
-
-def run_timed(cmd: list[str], stdout_path: Path, stderr_path: Path) -> DockerRunResult:
-    """Run `cmd` to completion, recording its exit code and wall time.
-
-    Same shape as run_docker_monitored() without the `docker stats` sampler, for
-    callers that get an exact peak RSS from GNU `time -v` instead.
-    """
-    started = time.perf_counter()
-    with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
-        returncode = subprocess.run(cmd, stdout=stdout, stderr=stderr, check=False).returncode
-    return DockerRunResult(returncode=returncode, wall_seconds=time.perf_counter() - started, peak_memory_bytes=0)
 
 
 MEM_RE = re.compile(r"(?P<value>[0-9.]+)\s*(?P<unit>[KMGT]?i?B)")

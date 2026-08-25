@@ -273,18 +273,39 @@ WSClean PoC run (19 likelihood evaluations, not committed) profiled as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 4.1s | 53.5% |
-| WSClean image container (total) | 2.8s | 36.1% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.0s | 26.3% |
-| &nbsp;&nbsp;of which: container overhead | 0.8s | 9.8% |
-| Metrics computation | 0.2s | 2.8% |
-| PolyChord overhead (unaccounted) | 0.59s | 7.6% |
+| MeqTrees simulate | 4.2s | 59.3% |
+| WSClean image container (total) | 2.1s | 29.7% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 1.9s | 27.1% |
+| &nbsp;&nbsp;of which: container overhead | 0.18s | 2.6% |
+| Metrics computation | 0.2s | 3.0% |
+| PolyChord overhead (unaccounted) | 0.56s | 8.0% |
 
-Total wall time 7.7s (~0.41s/eval). Simulate is down to ~0.22s/eval and is no
-longer dominated by startup, so the two remaining costs are comparable: the
-RIME predict plus `makems` on one side, and the `wsclean` binary plus ~0.04s of
-`docker exec` per evaluation on the other. PolyChord's own sampling/bookkeeping
-overhead stays negligible at this scale.
+Total wall time 7.0s (~0.37s/eval). No fixed overhead of any size is left in
+either sidecar: what remains is the science. Warm, an evaluation is ~0.18s of
+simulate (~0.05s `makems`, ~0.03s TDL compile, ~0.04s RIME predict, the rest
+noise fill and casacore table I/O) and ~0.11s of `wsclean`. The rest of the
+7.0s is one-off startup - ~0.66s for the first simulate (worker and meqserver),
+~0.17s for the first metrics call (`astropy` import) - plus PolyChord's own
+sampling and bookkeeping.
+
+#### Sidecar commands go through one long-lived `sh` per rank
+
+`docker exec` costs ~0.033s on this host, a third of the `wsclean` binary's own
+~0.107s, and every evaluation paid it again. `sidecar_shell()` in
+`poc_common.py` therefore `docker exec -i`s a single `sh` into the rank's
+sidecar on first use, and `sidecar_run()` sends each later evaluation one
+command line - `cd <eval_dir> && <cmd> >stdout.log 2>stderr.log; echo $?` - and
+reads the exit code back. Arguments are `shlex.quote`d, the command's own output
+goes to the log files, so nothing a sidecar prints can be mistaken for a reply,
+and a shell that dies without answering is dropped from the cache the same way
+the simulate worker is.
+
+A round trip costs ~0.0003s against ~0.033s for `docker exec`, taking WSClean
+container overhead from 0.78s to 0.18s over 19 evaluations and the profiled run
+from 7.88s to 7.04s (medians of three runs each, -10.6%). A 4-rank
+54-evaluation run went 14.0s to 13.4s. Metrics, `log(Z)` and the reconstructed
+FITS images are pixel-identical; only the recorded `commands.wsclean` changes,
+from the `docker exec` argv to the in-container command it wrapped.
 
 #### The simulate sidecar is a long-lived worker process
 
@@ -360,25 +381,27 @@ image, mounts or `--platform`, while `docker exec` into an already-running
 container costs ~0.03s. The MeqTrees simulate and WSClean imaging sidecars are
 both short work against bind-mounted paths, so `sidecar_container()` in
 `poc_common.py` starts one detached `sleep infinity` container per rank per
-image on first use, and every later evaluation is a `docker exec` into it.
+image on first use, and every later evaluation runs inside it - through the
+long-lived `sh` above for WSClean, through the `--serve` worker for simulate.
 
 That container mounts `REPO_ROOT` at its own host path (the same trick the
 PolyChord container already uses), so sidecar arguments are plain absolute
 paths instead of the old per-evaluation `-v {eval_dir}:/work` plus `/work/...`.
-`sidecar_exec()` reads the image's `ENTRYPOINT` back with `docker inspect`
-rather than restating the Dockerfile, since `docker exec` ignores it, and
-passes `--workdir {eval_dir}` so anything a sidecar writes relative to the cwd
-still stays per-evaluation - except the simulate worker, which outlives any one
-evaluation and so runs in `REPO_ROOT` and writes only absolute paths.
+`sidecar_command()` reads the image's `ENTRYPOINT` back with `docker inspect`
+rather than restating the Dockerfile, since neither `docker exec` nor the
+sidecar shell applies it, and each evaluation runs in its own working directory
+so anything a sidecar writes relative to the cwd still stays per-evaluation -
+except the simulate worker, which outlives any one evaluation and so runs in
+`REPO_ROOT` and writes only absolute paths.
 Containers are removed via `atexit`; a `SIGKILL`ed
 rank leaks one sleeping container, cleaned up with
 `docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
 
-The WSClean call also swapped `run_docker_monitored()` for `run_timed()`,
-dropping the `docker stats` sampler. GNU `time -v` already runs inside that
-container and reports an exact peak RSS, where the 0.2s-interval sampler both
-missed short peaks and delayed noticing the process had exited. R2D2 still uses
-`run_docker_monitored()`; its image has no GNU `time`.
+The WSClean call also dropped `run_docker_monitored()`'s `docker stats`
+sampler. GNU `time -v` already runs inside that container and reports an exact
+peak RSS, where the 0.2s-interval sampler both missed short peaks and delayed
+noticing the process had exited. R2D2 still uses `run_docker_monitored()`; its
+image has no GNU `time`.
 
 Together these took the profiled run from 43.5s to 27.5s (-37%) with identical
 per-evaluation metrics, identical `log(Z)`, and the same set of files in every
