@@ -272,17 +272,48 @@ WSClean PoC run (19 likelihood evaluations, not committed) profiled as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 23.7s | 86.1% |
-| WSClean image container (total) | 3.1s | 11.1% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.2s | 7.9% |
-| &nbsp;&nbsp;of which: container overhead | 0.9s | 3.2% |
-| Metrics computation | 0.2s | 0.8% |
-| PolyChord overhead (unaccounted) | 0.55s | 2.0% |
+| MeqTrees simulate | 13.3s | 78.7% |
+| WSClean image container (total) | 2.8s | 16.7% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.1s | 12.2% |
+| &nbsp;&nbsp;of which: container overhead | 0.8s | 4.6% |
+| Metrics computation | 0.2s | 1.3% |
+| PolyChord overhead (unaccounted) | 0.56s | 3.3% |
 
-Total wall time 27.5s (~1.4s/eval). The MeqTrees RIME simulation now dominates
-(~1.2s/eval); the imaging sidecar's non-`wsclean` overhead is down to
-~0.04s/eval. PolyChord's own sampling/bookkeeping overhead stays negligible at
-this scale.
+Total wall time 16.9s (~0.9s/eval). The MeqTrees RIME simulation still
+dominates (~0.7s/eval), but almost all of what is left is process startup:
+`meqtree-pipeliner.py` takes ~0.45s end to end, of which the actual RIME
+predict is ~0.14s. PolyChord's own sampling/bookkeeping overhead stays
+negligible at this scale.
+
+#### The Measurement Set is built in tmpfs
+
+`makems` and casacore `fsync` on nearly every table write, so on the
+bind-mounted repo the simulate sidecar spends most of its wall time parked in
+`jbd2_log_wait_commit` waiting for ext4 journal commits - sampling
+`/proc/<pid>/wchan` during a `makems` run put it in journal wait for ~75% of
+the samples. The cost is entirely fixed overhead, not data volume: `makems`
+takes 0.54s for a 1-time-sample, 1-channel MS and 0.55s for the largest MS this
+parameter space produces, but only 0.046s when the same run happens on tmpfs.
+
+`simulate_point_source_ms.py`'s `main()` therefore builds everything -
+`makems.cfg`, the unpacked `VLAA_ANT` table, the MS, the MeqTrees predict and
+the noise fill - inside a `tempfile.TemporaryDirectory(dir="/dev/shm")`, then
+moves the finished directory contents to the real output path in one go. The
+whole MS is ~1MB, so the copy out is ~2ms, and every artifact a run used to
+leave in the evaluation directory (including `makems.log`,
+`meqtree-pipeliner.log` and `point_source_forest.tdlconf`) still lands there -
+verified by `find`-diffing evaluation directories before and after.
+
+Measured per-simulate cost dropped from 1.12s to 0.55s standalone, and on the
+profiled run from 23.7s to 13.3s of simulate (27.5s to 16.9s total, -38%) with
+identical per-evaluation metrics and identical `log(Z)`. Under 8-way MPI the
+win is larger still - the ranks were contending for the same journal - taking
+an 8-rank 41-evaluation run from 19.9s to 13.8s.
+
+Docker gives a container 64MB of `/dev/shm` by default, which is ~30x the
+largest MS this parameter space produces; a bigger parameter space needs
+`--shm-size` on the sidecar. `SCRATCH_ROOT` falls back to the `tempfile`
+default when `/dev/shm` is not writable.
 
 #### Long-lived per-rank sidecar containers
 

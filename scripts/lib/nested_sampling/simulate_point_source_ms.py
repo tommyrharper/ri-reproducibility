@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +26,14 @@ from casacore.tables import table
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
 ANTENNA_TABLE_NAME = "VLAA_ANT"
 TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
+
+# makems and casacore fsync on nearly every table write. On the bind-mounted
+# repo that is ~0.5s of ext4 journal wait per run (makems alone: 0.54s on the
+# bind mount vs 0.05s here), so build everything in RAM and copy the finished
+# artifacts out once at the end - ~2ms for a ~1MB Measurement Set.
+# ponytail: Docker gives /dev/shm 64MB by default, which is ~30x this PoC's
+# largest MS; raise --shm-size on the sidecar if the parameter space grows.
+SCRATCH_ROOT = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -216,13 +226,25 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
 
 def main() -> None:
     args = parse_args()
-    output_ms = Path(args.output_ms)
-    require_clean_output(output_ms)
-    write_makems_config(args, output_ms)
-    run_makems(output_ms)
-    metadata = fill_point_source_visibilities(args, output_ms)
+    final_ms = Path(args.output_ms)
+    require_clean_output(final_ms)
+    final_ms.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = Path(args.metadata_json) if args.metadata_json else final_ms.parent / "simulation.json"
 
-    metadata_path = Path(args.metadata_json) if args.metadata_json else output_ms.parent / "simulation.json"
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        scratch_ms = Path(scratch) / final_ms.name
+        write_makems_config(args, scratch_ms)
+        run_makems(scratch_ms)
+        metadata = fill_point_source_visibilities(args, scratch_ms)
+        metadata["measurement_set"] = str(final_ms)
+        for produced in sorted(Path(scratch).iterdir()):
+            destination = final_ms.parent / produced.name
+            if destination.is_dir():
+                # shutil.move() nests into an existing directory instead of
+                # replacing it; the unpacked VLAA_ANT table can already be there.
+                shutil.rmtree(destination)
+            shutil.move(str(produced), destination)
+
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     print(json.dumps(metadata, indent=2))
 
