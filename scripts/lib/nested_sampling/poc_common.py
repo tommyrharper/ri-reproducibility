@@ -181,7 +181,13 @@ def sidecar_container(image: str, platform: str) -> str:
     return _SIDECAR_CONTAINERS[image]
 
 
-def sidecar_exec(image: str, platform: str, workdir: Path, prefix: list[str] | None = None) -> list[str]:
+def sidecar_exec(
+    image: str,
+    platform: str,
+    workdir: Path,
+    prefix: list[str] | None = None,
+    interactive: bool = False,
+) -> list[str]:
     """`docker exec` argv prefix equivalent to `docker run <image>` in `workdir`.
 
     `docker exec` ignores the image ENTRYPOINT, so read it back from the image
@@ -205,6 +211,7 @@ def sidecar_exec(image: str, platform: str, workdir: Path, prefix: list[str] | N
         _IMAGE_ENTRYPOINTS[image] = entrypoint
     return [
         "docker", "exec",
+        *(["--interactive"] if interactive else []),
         "--workdir", str(workdir),
         sidecar_container(image, platform),
         *(prefix or []),
@@ -526,6 +533,33 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     return record
 
 
+_SIMULATE_WORKERS: dict[str, subprocess.Popen] = {}
+
+
+def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen:
+    """This rank's long-lived `simulate_point_source_ms.py --serve` process.
+
+    Even inside a reused sidecar container, a per-evaluation `docker exec` of the
+    simulate script paid ~0.45s of the ~0.7s it took: the Python interpreter,
+    numpy/casacore and Timba imports, starting a meqserver and reaping it again.
+    One worker per rank keeps all of that warm and leaves only the per-evaluation
+    compile, RIME predict and noise fill.
+    """
+    if meqtrees_image not in _SIMULATE_WORKERS:
+        repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
+        worker = subprocess.Popen(
+            [*sidecar_exec(meqtrees_image, platform, repo_root, interactive=True), "--serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        # The container itself is torn down by sidecar_container()'s own atexit
+        # hook, which is registered first and so runs last.
+        atexit.register(worker.terminate)
+        _SIMULATE_WORKERS[meqtrees_image] = worker
+    return _SIMULATE_WORKERS[meqtrees_image]
+
+
 def simulate_measurement_set(
     params: dict[str, Any],
     eval_dir: Path,
@@ -537,7 +571,6 @@ def simulate_measurement_set(
     sim_stdout = eval_dir / "simulate.stdout.log"
     sim_stderr = eval_dir / "simulate.stderr.log"
     sim_cmd = [
-        *sidecar_exec(meqtrees_image, platform, eval_dir),
         "--output-ms",
         str(ms_path),
         "--metadata-json",
@@ -563,10 +596,20 @@ def simulate_measurement_set(
         "--seed",
         str(params["noise_seed"]),
     ]
-    try:
-        run_checked(sim_cmd, sim_stdout, sim_stderr)
-    except subprocess.CalledProcessError as exc:
-        return ms_path, sim_cmd, exc
+    worker = simulate_worker(meqtrees_image, platform)
+    request = {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)}
+    worker.stdin.write(json.dumps(request) + "\n")
+    worker.stdin.flush()
+    reply = worker.stdout.readline()
+    if not reply:
+        # The worker died mid-request; drop it so the next evaluation gets a
+        # fresh one instead of every later evaluation inheriting the corpse.
+        _SIMULATE_WORKERS.pop(meqtrees_image, None)
+        sim_stderr.write_text("FATAL: simulate worker exited without a reply\n")
+        return ms_path, sim_cmd, subprocess.CalledProcessError(1, sim_cmd)
+    returncode = json.loads(reply)["returncode"]
+    if returncode != 0:
+        return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
 
 

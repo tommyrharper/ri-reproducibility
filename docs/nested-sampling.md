@@ -31,7 +31,8 @@ top of that clean MeqTrees prediction.
 
 Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see WSClean below).
 Each target builds its required images first, then runs the PolyChord container,
-which mounts the Docker socket and launches per-evaluation sidecar containers.
+which mounts the Docker socket and drives one long-lived sidecar container per
+image per rank (see "Long-lived per-rank sidecar containers" below).
 
 ### WSClean
 
@@ -63,8 +64,8 @@ PolyChord container. `NS_MPI_PROCS` sets the rank count (default
 evaluations for debugging.
 
 The target builds any missing WSClean, MeqTrees, and PolyChord images first.
-Each likelihood evaluation launches one MeqTrees simulation container plus one
-WSClean imaging container.
+Each likelihood evaluation runs one MeqTrees simulate and one WSClean imaging
+step in this rank's already-running sidecar containers.
 
 ### R2D2
 
@@ -79,8 +80,8 @@ results/nested-sampling-poc/r2d2-vlaa-<UTC timestamp>/
 ```
 
 The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
-evaluation launches one MeqTrees simulation container, one MeqTrees-hosted
-MS-to-`.mat` conversion, and one R2D2 imaging container.
+evaluation runs one MeqTrees simulate, one MeqTrees-hosted MS-to-`.mat`
+conversion, and one R2D2 imaging container.
 
 R2D2 requires pretrained checkpoints at `checkpoints/R2D2_A1/R2D2_UNet_N*.ckpt`
 (see `make fetch-r2d2-checkpoints` and `make smoke-test-r2d2`).
@@ -272,18 +273,55 @@ WSClean PoC run (19 likelihood evaluations, not committed) profiled as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 13.3s | 78.7% |
-| WSClean image container (total) | 2.8s | 16.7% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.1s | 12.2% |
-| &nbsp;&nbsp;of which: container overhead | 0.8s | 4.6% |
-| Metrics computation | 0.2s | 1.3% |
-| PolyChord overhead (unaccounted) | 0.56s | 3.3% |
+| MeqTrees simulate | 4.1s | 53.5% |
+| WSClean image container (total) | 2.8s | 36.1% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.0s | 26.3% |
+| &nbsp;&nbsp;of which: container overhead | 0.8s | 9.8% |
+| Metrics computation | 0.2s | 2.8% |
+| PolyChord overhead (unaccounted) | 0.59s | 7.6% |
 
-Total wall time 16.9s (~0.9s/eval). The MeqTrees RIME simulation still
-dominates (~0.7s/eval), but almost all of what is left is process startup:
-`meqtree-pipeliner.py` takes ~0.45s end to end, of which the actual RIME
-predict is ~0.14s. PolyChord's own sampling/bookkeeping overhead stays
-negligible at this scale.
+Total wall time 7.7s (~0.41s/eval). Simulate is down to ~0.22s/eval and is no
+longer dominated by startup, so the two remaining costs are comparable: the
+RIME predict plus `makems` on one side, and the `wsclean` binary plus ~0.04s of
+`docker exec` per evaluation on the other. PolyChord's own sampling/bookkeeping
+overhead stays negligible at this scale.
+
+#### The simulate sidecar is a long-lived worker process
+
+Even inside a reused sidecar container, a per-evaluation `docker exec` of
+`simulate_point_source_ms.py` spent ~0.45s of its ~0.7s on startup the next
+evaluation would immediately repeat: 0.10s of Python plus numpy/casacore
+imports, 0.14s of Timba imports, 0.04s starting a meqserver and ~0.10s reaping
+it again, against ~0.14s of actual RIME predict and ~0.05s of `makems`.
+
+`simulate_point_source_ms.py --serve` therefore reads one JSON request per
+stdin line - `{"argv": [...], "stdout": path, "stderr": path}` - and replies
+with `{"returncode": int}` on its original stdout, with fds 1 and 2 pointed at
+the request's log files for the duration so `makems` and the meqserver still log
+per-evaluation exactly as they did when each was its own process.
+`simulate_worker()` in `poc_common.py` starts one such process per rank on first
+use and writes to its stdin from then on; a worker that dies without replying is
+dropped from the cache so the next evaluation starts a fresh one instead of
+inheriting the corpse.
+
+The predict itself moved in-process with it: `run_meqtrees_predict()` now runs
+the same `TDLOptions`/`Compile.compile_file`/job sequence `meqtree-pipeliner.py`
+runs, against a meqserver that survives between requests. `mqs.get_error_log()`
+flushes, so each request only ever sees its own errors.
+
+Measured cost per simulate dropped from 0.62s one-shot to ~0.18s served. On the
+profiled single-rank run that is 16.8s to 7.7s total (-54%), and on a 4-rank
+54-evaluation run 25.2s to 13.7s (-45%), with identical science metrics,
+identical `log(Z)` and identical per-evaluation artifact file sets. Only
+`wall_seconds` and `peak_memory_bytes` - the WSClean timing metrics - differ,
+as they do between any two runs.
+
+One sharp edge: Timba registers `stop_default_mqs()` with `atexit`, but CPython
+joins non-daemon threads - including octopussy's event thread, which only exits
+once the server is stopped - *before* it runs `atexit` handlers, so a process
+that leaves meqserver teardown to `atexit` finishes all its work and then hangs
+at exit forever. `meqtree-pipeliner.py` avoids that by calling
+`stop_default_mqs()` explicitly, and so does `stop_meqserver_session()` here.
 
 #### The Measurement Set is built in tmpfs
 
@@ -330,7 +368,9 @@ paths instead of the old per-evaluation `-v {eval_dir}:/work` plus `/work/...`.
 `sidecar_exec()` reads the image's `ENTRYPOINT` back with `docker inspect`
 rather than restating the Dockerfile, since `docker exec` ignores it, and
 passes `--workdir {eval_dir}` so anything a sidecar writes relative to the cwd
-still stays per-evaluation. Containers are removed via `atexit`; a `SIGKILL`ed
+still stays per-evaluation - except the simulate worker, which outlives any one
+evaluation and so runs in `REPO_ROOT` and writes only absolute paths.
+Containers are removed via `atexit`; a `SIGKILL`ed
 rank leaks one sleeping container, cleaned up with
 `docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
 

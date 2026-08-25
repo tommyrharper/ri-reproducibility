@@ -11,12 +11,15 @@ added on top of that clean MeqTrees prediction.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +39,7 @@ TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
 SCRATCH_ROOT = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-ms", required=True, help="Measurement Set path to create")
     parser.add_argument("--metadata-json", help="Optional JSON metadata path")
@@ -51,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-m-arcsec", type=float, default=0.0)
     parser.add_argument("--dynamic-range", type=float, required=True)
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def require_clean_output(output_ms: Path) -> None:
@@ -127,6 +130,76 @@ def determine_corr_selection(output_ms: Path) -> tuple[str, int]:
     return corr_sel, n_corr
 
 
+@contextlib.contextmanager
+def redirect_fds(out_path: Path, err_path: Path | None = None):
+    """Point fds 1 and 2 - so child processes too - at files for this block.
+
+    `err_path=None` sends stderr to the stdout file, the way
+    `subprocess.run(stderr=STDOUT)` did when each stage was its own process.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out, saved_err = os.dup(1), os.dup(2)
+    out = out_path.open("w")
+    err = err_path.open("w") if err_path else None
+    try:
+        os.dup2(out.fileno(), 1)
+        os.dup2((err or out).fileno(), 2)
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+        out.close()
+        if err:
+            err.close()
+
+
+_MQS = None
+
+
+def meqserver_session():
+    """The one meqserver this process talks to, started on first predict.
+
+    `meqtree-pipeliner.py` spent ~0.32s of its ~0.46s on Timba imports, starting
+    a meqserver and reaping it again, against ~0.14s of actual RIME predict, and
+    paid all of it again on every evaluation. Under `--serve` the imports and the
+    meqserver survive between requests; only the per-evaluation compile and run
+    remain. stop_meqserver_session() shuts it down again.
+    """
+    global _MQS
+    if _MQS is None:
+        import Timba.utils
+
+        # Timba parses sys.argv for verbosity flags unless told not to.
+        Timba.utils.verbosity.disable_argv()
+        from Timba.Apps import meqserver
+        from Timba.TDL import TDLOptions
+
+        TDLOptions.enable_save_config(False)
+        _MQS = meqserver.default_mqs(wait_init=10, extra=["-mt", "1"])
+    return _MQS
+
+
+def stop_meqserver_session() -> None:
+    """Shut the meqserver down explicitly, the way meqtree-pipeliner.py does.
+
+    Timba registers stop_default_mqs() with atexit, but CPython joins non-daemon
+    threads - including octopussy's event thread, which only exits once the
+    server is stopped - before it runs atexit handlers, so leaving it to atexit
+    hangs the interpreter at exit forever.
+    """
+    global _MQS
+    if _MQS is not None:
+        from Timba.Apps import meqserver
+
+        _MQS = None
+        meqserver.stop_default_mqs()
+
+
 def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, l_rad: float, m_rad: float) -> None:
     tdlconf = output_ms.parent / "point_source_forest.tdlconf"
     tdlconf.write_text(
@@ -142,14 +215,23 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
             ]
         )
     )
-    log_path = output_ms.parent / "meqtree-pipeliner.log"
-    with log_path.open("w") as log:
-        subprocess.run(
-            ["meqtree-pipeliner.py", "-c", str(tdlconf), f"{TDL_SCRIPT}[predict]", "=predict"],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            check=True,
-        )
+    mqs = meqserver_session()
+    from Timba.TDL import Compile, TDLOptions
+
+    # Same sequence meqtree-pipeliner.py runs for
+    # `-c <tdlconf> point_source_forest.py[predict] =predict`.
+    with redirect_fds(output_ms.parent / "meqtree-pipeliner.log"):
+        TDLOptions.config.read(str(tdlconf))
+        TDLOptions.config.set_save_filename(None)
+        _module, _ns, msg = Compile.compile_file(mqs, str(TDL_SCRIPT), config="predict")
+        print("###", msg)
+        TDLOptions.get_job_func("predict")(mqs, None, wait=True)
+        # get_error_log() flushes, so each request only sees its own errors.
+        errors = mqs.get_error_log()
+        for index, (_event, error) in enumerate(errors):
+            print(f"###   {index:03d}: {error}")
+    if errors:
+        raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
 
 
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -224,8 +306,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     }
 
 
-def main() -> None:
-    args = parse_args()
+def simulate(args: argparse.Namespace) -> None:
     final_ms = Path(args.output_ms)
     require_clean_output(final_ms)
     final_ms.parent.mkdir(parents=True, exist_ok=True)
@@ -249,5 +330,40 @@ def main() -> None:
     print(json.dumps(metadata, indent=2))
 
 
+def serve() -> None:
+    """Run one simulate per JSON request line on stdin, reusing this process.
+
+    A one-shot `docker exec` of this script spent ~0.45s of its ~0.7s on process
+    and meqserver startup that every evaluation repeated. A request is
+    `{"argv": [...], "stdout": path, "stderr": path}`; everything the run prints
+    goes to those two files, exactly as the caller's `docker exec` redirection
+    did, and the reply is one JSON line - `{"returncode": int}` - on the
+    process's original stdout.
+    """
+    replies = os.fdopen(os.dup(1), "w")
+    for line in sys.stdin:
+        request = json.loads(line)
+        returncode = 0
+        with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
+            try:
+                simulate(parse_args(request["argv"]))
+            except Exception:
+                traceback.print_exc()
+                returncode = 1
+            except SystemExit as exc:
+                print(exc, file=sys.stderr)
+                returncode = exc.code if isinstance(exc.code, int) else 1
+        replies.write(json.dumps({"returncode": returncode}) + "\n")
+        replies.flush()
+
+
 if __name__ == "__main__":
-    main()
+    # --serve takes no other arguments, so it is checked before argparse, which
+    # requires the full simulate argument set.
+    try:
+        if sys.argv[1:] == ["--serve"]:
+            serve()
+        else:
+            simulate(parse_args())
+    finally:
+        stop_meqserver_session()
