@@ -274,21 +274,51 @@ evaluations, not committed) profiles as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| WSClean image container (total) | 6.8s | 51.6% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.4s | 48.5% |
-| &nbsp;&nbsp;of which: container overhead | 0.41s | 3.1% |
-| MeqTrees simulate | 5.5s | 41.7% |
-| Metrics computation | 0.31s | 2.3% |
-| PolyChord overhead (unaccounted) | 0.57s | 4.4% |
+| WSClean image container (total) | 6.7s | 61.0% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.3s | 57.3% |
+| &nbsp;&nbsp;of which: container overhead | 0.40s | 3.6% |
+| MeqTrees simulate | 3.4s | 30.7% |
+| Metrics computation | 0.30s | 2.8% |
+| PolyChord overhead (unaccounted) | 0.60s | 5.5% |
 
-Total wall time 13.2s (~0.21s/eval; 8.4s on the default 8 ranks). No fixed
+Total wall time 10.9s (~0.18s/eval; 8.2s on the default 8 ranks). No fixed
 overhead of any size is left in either sidecar: what remains is the science.
-Warm, an evaluation is ~0.09s of simulate (~0.04s RIME predict, the rest noise
-fill and casacore table I/O, plus ~0.05s of `makems` on the evaluations that
-miss the MS skeleton cache) and ~0.11s of `wsclean`, which is now the larger
-half of the run. The rest is one-off startup - ~0.66s for the first simulate
-(worker, meqserver and the one TDL compile), ~0.17s for the first metrics call
-(`astropy` import) - plus PolyChord's own sampling and bookkeeping.
+Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
+casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
+skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
+The rest is one-off startup - ~0.66s for the first simulate (worker, meqserver
+and the one TDL compile), ~0.17s for the first metrics call (`astropy` import) -
+plus PolyChord's own sampling and bookkeeping.
+
+`wsclean` itself is at its floor for this problem size: it self-reports
+0.035s inversion + 0.023s prediction + 0.008s deconvolution per evaluation
+against ~0.018s of process startup, and moving `-temp-dir` to `/dev/shm`
+changes nothing measurable (the reordered scratch files never reach the ext4
+journal). `-j 4` buys ~5ms but would multiply threads by the MPI rank count
+and make the gridding sum order - and so the image - non-deterministic.
+
+#### `WEIGHT`/`SIGMA` are written row by row, not with `putcol`
+
+`putcol` on these two columns was 42ms of the 81ms simulate - more than the
+RIME predict. Both are *variable-shaped* array columns in the `ISMData`
+`IncrementalStMan` group of a makems MS, and python-casacore's `putcol` on
+that combination is quadratic in rows: at this MS size 100 rows cost 0.06ms,
+500 rows 1.4ms and all 1755 rows 17ms per column. It is the storage manager,
+not the disk - a `TiledColumnStMan` column of the same size (`DATA`, `FLAG`,
+`UVW`) writes in 0.1ms, and an `IncrementalStMan` *scalar* column (`TIME`) in
+0.05ms. `setmaxcachesize()` does not help, and the columns cannot be dropped
+and re-added under another storage manager because the whole ISM group would
+have to go with them.
+
+`fill_point_source_visibilities()` therefore writes each column with a
+`putcell()` loop, which is linear: 7.9ms for the pair. Keep the two loops
+separate - interleaving the columns costs 19ms, because each column's ISM
+buckets get evicted between rows. Measured 13.1s -> 10.9s single-rank (-16%,
+simulate 5.5s -> 3.4s) and 8.5s -> 8.2s on the default 8 ranks, where wsclean
+dominates and each rank runs only ~5 evaluations. Verified by comparing every
+column of all 62 Measurement Sets between a before and after run (identical),
+the artifact trees (identical), all 62 evaluations' science metrics
+(identical) and `log(Z)` (identical).
 
 #### The compiled TDL forest is reused across evaluations
 

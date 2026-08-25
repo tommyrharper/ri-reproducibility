@@ -353,12 +353,19 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
                 ms.putcol(optional_col, data)
         if "FLAG" in ms.colnames():
             ms.putcol("FLAG", np.zeros(ms.getcol("FLAG").shape, dtype=bool))
-        if "WEIGHT" in ms.colnames():
-            weight = np.full(ms.getcol("WEIGHT").shape, 1.0 / (noise_sigma_jy * noise_sigma_jy), dtype=np.float32)
-            ms.putcol("WEIGHT", weight)
-        if "SIGMA" in ms.colnames():
-            sigma = np.full(ms.getcol("SIGMA").shape, noise_sigma_jy, dtype=np.float32)
-            ms.putcol("SIGMA", sigma)
+        # WEIGHT and SIGMA are variable-shaped IncrementalStMan columns in a
+        # makems MS, and python-casacore's putcol on those is quadratic in rows
+        # (1755 rows: 42ms for the pair, against 8ms for these putcell loops -
+        # half the whole simulate). Keep the two loops separate: interleaving
+        # the columns thrashes the ISM buckets and costs 19ms.
+        # ponytail: a Python row loop, fine at PoC MS sizes; for large MSes
+        # rebuild the skeleton's WEIGHT/SIGMA under StandardStMan instead.
+        for column, value in (("WEIGHT", 1.0 / (noise_sigma_jy * noise_sigma_jy)), ("SIGMA", noise_sigma_jy)):
+            if column not in ms.colnames():
+                continue
+            row_value = np.full(ms.getcell(column, 0).shape, value, dtype=np.float32)
+            for row in range(ms.nrows()):
+                ms.putcell(column, row, row_value)
 
     return {
         "measurement_set": str(output_ms),
