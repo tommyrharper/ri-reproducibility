@@ -27,8 +27,23 @@ if [ -z "${DOCKER_SOCKET:-}" ]; then
     *) DOCKER_SOCKET="/var/run/docker.sock" ;;
   esac
 fi
-# Doubles as the daemon-availability check: `docker info` costs ~0.08s and
-# there is no reason to pay for it twice.
+# Shared by every rank, started here so the daemon is not hit by one
+# `docker run` per rank per image the moment the ranks come up. The PolyChord
+# container joins them: `docker run` of it costs ~0.7s where `docker exec` into
+# a running one costs ~0.03s, and starting it here overlaps that cost with the
+# sidecars and the manifest write instead of paying it in front of rank 0.
+. "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
+sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}"
+sidecar_launch "${PLATFORM}" "${WSCLEAN_IMAGE}"
+sidecar_launch "${PLATFORM}" "${POLYCHORD_IMAGE}" \
+  -v "${DOCKER_SOCKET}:/var/run/docker.sock"
+POLYCHORD_CONTAINER="${SIDECAR_NAME}"
+
+# After the launches, not before: `docker info` is ~0.06s of pure serial delay
+# in front of a ~0.4s container start that does not need its answer. Nothing
+# below the launches touches a sidecar until sidecar_wait. It doubles as the
+# daemon-availability check - a dead daemon fails the launches too, but this is
+# where the run says so.
 if ! HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null)"; then
   echo "FATAL: Docker daemon is not available" >&2
   exit 1
@@ -42,18 +57,6 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
 fi
 
 mkdir -p "${OUTPUT_DIR}"
-
-# Shared by every rank, started here so the daemon is not hit by one
-# `docker run` per rank per image the moment the ranks come up. The PolyChord
-# container joins them: `docker run` of it costs ~0.7s where `docker exec` into
-# a running one costs ~0.03s, and starting it here overlaps that cost with the
-# sidecars and the manifest write instead of paying it in front of rank 0.
-. "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
-sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}"
-sidecar_launch "${PLATFORM}" "${WSCLEAN_IMAGE}"
-sidecar_launch "${PLATFORM}" "${POLYCHORD_IMAGE}" \
-  -v "${DOCKER_SOCKET}:/var/run/docker.sock"
-POLYCHORD_CONTAINER="${SIDECAR_NAME}"
 
 RUN_COMMAND=(
   docker exec

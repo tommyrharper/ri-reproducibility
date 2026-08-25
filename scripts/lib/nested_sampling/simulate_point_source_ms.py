@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 from pathlib import Path
 
@@ -30,6 +31,9 @@ from casacore.tables import table
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
 ANTENNA_TABLE_NAME = "VLAA_ANT"
 TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
+# The MS time grid step. Shared with prebuild_skeletons(), which has to
+# enumerate the same NTimes values a run's evaluations will ask for.
+DEFAULT_INTEGRATION_SECONDS = 120.0
 
 # makems and casacore fsync on nearly every table write. On the bind-mounted
 # repo that is ~0.5s of ext4 journal wait per run (makems alone: 0.54s on the
@@ -46,7 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metadata-json", help="Optional JSON metadata path")
     parser.add_argument("--vla-config", default="VLA.A", choices=["VLA.A"])
     parser.add_argument("--observation-minutes", type=float, required=True)
-    parser.add_argument("--integration-seconds", type=float, default=120.0)
+    parser.add_argument("--integration-seconds", type=float, default=DEFAULT_INTEGRATION_SECONDS)
     parser.add_argument("--channel-count", type=int, required=True)
     parser.add_argument("--start-frequency-hz", type=float, required=True)
     parser.add_argument("--channel-width-hz", type=float, required=True)
@@ -199,6 +203,48 @@ def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace) -> No
     shutil.copytree(cached, output_ms, symlinks=True)
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
     (output_ms.parent / "makems.log").write_text(f"reused a cached makems skeleton for:\n{key}\n")
+
+
+def prebuild_skeletons(space: dict) -> None:
+    """Build the cache entries for the shapes this worker was given.
+
+    A fresh makems run is ~0.11s against ~0.002s for a cache hit, and a default
+    run first touches ~12 of the parameter space's 20 (NTimes, NFrequencies)
+    shapes spread over the whole run, so most of those 0.11s land in the middle
+    of the sampler's critical path. The ranks share one cache, so they split the
+    shapes between their workers - `offset`/`stride` - and each builds its slice
+    in a background thread while the sampler is still starting up.
+
+    The MS name is part of the cache key, so this has to build under the same
+    name a real evaluation uses; self_check_skeleton_prebuild() is the guard.
+
+    ponytail: the whole space is built, ~2.2s of makems split across the ranks,
+    with no attempt to guess which shapes a run will actually visit. That is a
+    win while there are spare cores; cap it against the host CPU count if this
+    ever runs somewhere with fewer cores than ranks.
+    """
+    minutes_lo, minutes_hi = space["observation_minutes"]
+    chan_lo, chan_hi = space["channel_count"]
+    step = DEFAULT_INTEGRATION_SECONDS
+    shapes = [
+        (n_times * step / 60.0, n_chan)
+        for n_times in range(
+            max(1, math.ceil(minutes_lo * 60.0 / step)),
+            max(1, math.ceil(minutes_hi * 60.0 / step)) + 1,
+        )
+        for n_chan in range(chan_lo, chan_hi + 1)
+    ]
+    for minutes, n_chan in shapes[space["offset"] :: space["stride"]]:
+        with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+            ms = Path(scratch) / "sim.ms"
+            # StartFreq/StepFreq are outside the cache key and are rewritten on
+            # every hit, so any value builds a reusable entry.
+            built = parse_args([
+                "--output-ms", str(ms), "--observation-minutes", repr(minutes),
+                "--channel-count", str(n_chan), "--start-frequency-hz", "1.0e9",
+                "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+            ])
+            make_ms_skeleton(write_makems_config(built, ms), ms, built)
 
 
 def determine_corr_selection(output_ms: Path) -> tuple[str, int]:
@@ -481,6 +527,15 @@ def serve() -> None:
             traceback.print_exc()
     for line in sys.stdin:
         request = json.loads(line)
+        if "prebuild" in request:
+            # Deliberately unanswered: the caller sends this while it is still
+            # starting its own sampler and must not block on ~0.1s per shape.
+            # Nothing in prebuild_skeletons() writes to fd 1, which is the reply
+            # pipe the real requests answer on.
+            threading.Thread(
+                target=prebuild_skeletons, args=(request["prebuild"],), daemon=True
+            ).start()
+            continue
         returncode = 0
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             try:
@@ -527,6 +582,29 @@ def self_check_skeleton_cache() -> None:
                         assert np.array_equal(values, expected), f"{sub or 'MAIN'}.{column} differs after a cached skeleton reuse"
     use_skeleton_cache(None)
     print("MS skeleton cache self-check passed")
+
+
+def self_check_skeleton_prebuild() -> None:
+    """A prebuilt shape must be the entry a real evaluation of it looks up."""
+    space = {"observation_minutes": [4.0, 6.0], "channel_count": [2, 3], "offset": 0, "stride": 2}
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        use_skeleton_cache(Path(scratch) / "cache")
+        prebuild_skeletons(space)
+        # Shapes are (NTimes, NFrequencies) = (2,2) (2,3) (3,2) (3,3); this
+        # worker owns every second one.
+        built = list(skeleton_dir().iterdir())
+        assert len(built) == 2, f"prebuild published {len(built)} entries, expected 2"
+        ms = Path(scratch) / "hit" / "sim.ms"
+        args = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", "4.0", "--channel-count", "2",
+            "--start-frequency-hz", "1.0374e9", "--channel-width-hz", "1.3331e6",
+            "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(args, ms), ms, args)
+        assert "reused a cached" in (ms.parent / "makems.log").read_text(), \
+            "a prebuilt shape was not reused by a real evaluation of it"
+    use_skeleton_cache(None)
+    print("MS skeleton prebuild self-check passed")
 
 
 def self_check_forest_reuse() -> None:
@@ -588,6 +666,7 @@ if __name__ == "__main__":
             serve()
         elif sys.argv[1:] == ["--self-check"]:
             self_check_skeleton_cache()
+            self_check_skeleton_prebuild()
             self_check_forest_reuse()
             self_check_serve_reply_stream()
         else:

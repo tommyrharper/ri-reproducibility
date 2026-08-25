@@ -410,6 +410,35 @@ the meqtrees image between arms): summed simulate worker-seconds 5.38s -> 4.68s
 (-13%, 6/6 pairs) and end to end 3.65s -> 3.38s (-7%, 5/6 pairs). All 41
 evaluations matched on every science metric and `log(Z)` was bit-identical.
 
+##### The shapes are built before the sampler asks for them
+
+Waiting for an evaluation to miss puts the ~0.11s of a fresh `makems` in the
+middle of the sampler's critical path, and a default run first touches ~12
+shapes that way. `prewarm()` therefore sends the worker a
+`{"prebuild": {...}}` request - the parameter space's `observation_minutes` and
+`channel_count` ranges plus this rank's `offset`/`stride` - and the worker
+enumerates the shapes it owns and builds them in a background thread while the
+rank is still starting PolyChord. Eight workers split 20 shapes, so each builds
+two or three. The request is deliberately unanswered: the caller must not block
+on it, and a reply would desynchronise the one-reply-per-evaluation protocol.
+
+The MS name is part of the cache key, so a prebuilt entry is only useful if it
+is built under the name a real evaluation uses (`sim.ms`).
+`self_check_skeleton_prebuild()` is the guard: it prebuilds a two-shape slice
+and then asserts a real `make_ms_skeleton()` call for one of those shapes
+reports a cache hit. It fails if the prebuild builds under any other name.
+
+Measured over 20 interleaved A/B pairs of the default 8-rank run (rebuilding
+both images between arms): summed simulate worker-seconds 4.69s -> 4.13s (-12%,
+12/12 pairs where in-process profiling was collected) and end to end 3.09s ->
+3.01s (-2.4%, 14/20 pairs, sd of the paired difference 0.18s). All 41
+evaluations matched on every science metric and `log(Z)` was bit-identical.
+The end-to-end effect is much smaller than the worker-seconds effect because
+the 8-rank run is only ~50% busy - a bind-mounted skeleton cache that was
+already warm from a previous run, i.e. the ceiling for this change, moved
+in-process `total_wall_seconds` by only ~0.17s while removing 1.07s of
+worker-seconds.
+
 `simulate_point_source_ms.py --self-check` is the guard on the rewrite formula
 (and on the forest reuse below): it builds each shape both ways and asserts a
 patched cache hit matches a fresh `makems` run column for column. Run it in the
@@ -633,6 +662,11 @@ containers are up. `NS_SIDECARS` is exported by `sidecar_launch` rather than
 `sidecar_wait` because the container names are known as soon as the launches
 are issued.
 
+The `docker info` that resolves `HOST_CPUS` (and doubles as the
+daemon-availability check) now runs *after* the launches for the same reason:
+nothing between the launches and `sidecar_wait` touches a sidecar, and shell
+markers put `launches-issued` at ~0.005s after script start instead of ~0.075s.
+
 Measured with four interleaved A/B runs of the default 8-rank configuration,
 end-to-end script wall time went 6.82s -> 5.29s (-22%); single-rank went 13.1s
 -> 12.2s (-7%). All eight runs produced identical `log(Z)` and byte-identical
@@ -691,6 +725,25 @@ worth it even before `compileall` (cold-vs-warm first exec 0.17s vs 0.13s and
 0.09s vs 0.08s, and warming the Timba/casacore imports moved eight concurrent
 `--serve` worker startups only 0.34s -> 0.32s for 0.22s of warm-up); warming
 with `mpirun -np 8` cost 1.0s instead of 0.28s with no gain in the real exec.
+
+Also measured and rejected: **`wsclean -j 2` and above.** The imaging binary is
+the largest per-evaluation stage (~0.11s of a ~0.16s warm evaluation) and
+`-j 4` runs it in ~0.09s on an idle host, but multi-threaded gridding changes
+the summation order: the image, dirty, residual and PSF pixels differ from the
+`-j 1` run at the float32 rounding level (~1e-7 on a peak of 1.0). The
+objective is `off_source_rms_jy` ~ 8e-6, so a 1e-7 pixel shift moves the
+likelihood and takes the whole sampler down a different path. This repository
+is about reproducibility; `-j 1` stays.
+
+#### `mpi_rank()` reads the launcher's environment first
+
+`from mpi4py import MPI` initialises MPI, and eight ranks doing that at once
+costs 0.24s each. `prewarm()` needs the rank before anything else has touched
+MPI - it splits the skeleton prebuild across the workers by rank - so calling
+`mpi_rank()` there added that 0.24s to every rank's pre-sampler startup, where
+it hid from `total_wall_seconds` (measured around `run_polychord()`) and showed
+up only end to end. `mpi_rank()` therefore reads `OMPI_COMM_WORLD_RANK`, which
+OpenMPI's launcher exports, and only falls back to `mpi4py`.
 
 #### Long-lived sidecar containers, one per image
 
