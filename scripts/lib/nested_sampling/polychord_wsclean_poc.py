@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import time
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,9 +28,10 @@ from poc_common import (
     read_gnu_time_peak_memory,
     read_gnu_time_wall_seconds,
     resolve_metric,
-    run_docker_monitored,
+    run_timed,
     self_check_metric_resolution,
     self_check_profiling,
+    sidecar_exec,
     simulate_measurement_set,
     stable_seed,
     summarize_profiling,
@@ -78,36 +78,20 @@ def evaluate(
 
     wsclean_dir = eval_dir / "wsclean"
     wsclean_dir.mkdir()
-    container_name = f"ri-ns-wsclean-{uuid.uuid4().hex[:12]}"
     wsclean_stdout = eval_dir / "wsclean.stdout.log"
     wsclean_stderr = eval_dir / "wsclean.stderr.log"
     wsclean_time = wsclean_dir / "time.txt"
     wsclean_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        # No sidecar needs networking, and docker's default bridge setup costs
-        # ~0.7s per container under rootless Docker - 35x the container's own
-        # runtime here. "none" still gives a loopback interface for meqserver.
-        "--network",
-        "none",
-        "--name",
-        container_name,
-        "--platform",
-        args.platform,
-        "-v",
-        f"{eval_dir}:/work",
-        "--entrypoint",
-        "/usr/bin/time",
-        args.wsclean_image,
-        "-v",
-        "-o",
-        "/work/wsclean/time.txt",
-        "wsclean",
+        *sidecar_exec(
+            args.wsclean_image,
+            args.platform,
+            eval_dir,
+            prefix=["/usr/bin/time", "-v", "-o", str(wsclean_time)],
+        ),
         "-name",
-        "/work/wsclean/recon",
+        str(wsclean_dir / "recon"),
         "-temp-dir",
-        "/work/wsclean",
+        str(wsclean_dir),
         "-size",
         "128",
         "128",
@@ -126,10 +110,13 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
-        "/work/sim.ms",
+        str(ms_path),
     ]
-    run_result = run_docker_monitored(wsclean_cmd, container_name, wsclean_stdout, wsclean_stderr)
-    peak_memory_bytes = max(run_result.peak_memory_bytes, read_gnu_time_peak_memory(wsclean_time))
+    # No `docker stats` polling loop here: GNU `time -v` inside the container
+    # reports an exact peak RSS, where the 0.2s-interval stats sampler both
+    # missed short peaks and delayed noticing the process had exited.
+    run_result = run_timed(wsclean_cmd, wsclean_stdout, wsclean_stderr)
+    peak_memory_bytes = read_gnu_time_peak_memory(wsclean_time)
     image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
@@ -211,8 +198,9 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_run_docker = globals()["run_docker_monitored"]
+    original_run_timed = globals()["run_timed"]
     original_simulate = globals()["simulate_measurement_set"]
+    original_sidecar = globals()["sidecar_exec"]
 
     def failing_simulate(
         params: dict[str, Any],
@@ -224,6 +212,7 @@ def self_check_failure_record_persistence() -> None:
         return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
 
     try:
+        globals()["sidecar_exec"] = lambda image, platform, workdir, prefix=None: ["stub-exec"]
         globals()["simulate_measurement_set"] = failing_simulate
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -245,7 +234,6 @@ def self_check_failure_record_persistence() -> None:
 
         def successful_wsclean(
             cmd: list[str],
-            container_name: str,
             stdout_path: Path,
             stderr_path: Path,
         ) -> argparse.Namespace:
@@ -255,7 +243,7 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["run_docker_monitored"] = successful_wsclean
+        globals()["run_timed"] = successful_wsclean
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -268,8 +256,9 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["run_docker_monitored"] = original_run_docker
+        globals()["run_timed"] = original_run_timed
         globals()["simulate_measurement_set"] = original_simulate
+        globals()["sidecar_exec"] = original_sidecar
 
 
 def main() -> None:

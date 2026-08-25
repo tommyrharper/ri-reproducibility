@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
 import re
 import subprocess
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,9 +133,100 @@ def stable_seed(global_seed: int, key: str) -> int:
     return (global_seed + int(key[:8], 16)) % (2**31 - 1)
 
 
+_SIDECAR_CONTAINERS: dict[str, str] = {}
+_IMAGE_ENTRYPOINTS: dict[str, list[str]] = {}
+
+
+def sidecar_container(image: str, platform: str) -> str:
+    """Name of this rank's long-lived container for `image`, started on first use.
+
+    A per-evaluation `docker run` costs ~0.40s of create/start/teardown on this
+    host regardless of image, mounts or platform; `docker exec` into an
+    already-running container costs ~0.03s. Every sidecar here is short work
+    against bind-mounted paths, so one container per rank reused across
+    evaluations removes ~0.75s of the ~2.3s per evaluation.
+
+    The whole repo is mounted at its host path (as the PolyChord container
+    already does), so callers pass absolute paths where they previously passed
+    `/work/...` against a per-evaluation `-v {eval_dir}:/work`.
+    """
+    if image not in _SIDECAR_CONTAINERS:
+        repo_root = os.environ.get("REPO_ROOT", os.getcwd())
+        name = f"ri-ns-sidecar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        subprocess.run(
+            [
+                "docker", "run", "--detach", "--rm", "--name", name,
+                # No sidecar needs networking, and docker's default bridge setup
+                # costs ~0.2s per container under rootless Docker. "none" still
+                # gives a loopback interface for meqserver.
+                "--network", "none",
+                "--platform", platform,
+                "-v", f"{repo_root}:{repo_root}",
+                "--entrypoint", "sleep", image, "infinity",
+            ],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        # ponytail: covers normal exit and SystemExit; a SIGKILLed rank leaks one
+        # sleeping container, cleaned up with
+        # `docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
+        atexit.register(
+            subprocess.run,
+            ["docker", "rm", "--force", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        _SIDECAR_CONTAINERS[image] = name
+    return _SIDECAR_CONTAINERS[image]
+
+
+def sidecar_exec(image: str, platform: str, workdir: Path, prefix: list[str] | None = None) -> list[str]:
+    """`docker exec` argv prefix equivalent to `docker run <image>` in `workdir`.
+
+    `docker exec` ignores the image ENTRYPOINT, so read it back from the image
+    rather than restating the Dockerfile here. `prefix` runs ahead of the
+    entrypoint, the way `docker run --entrypoint` would (e.g. GNU `time`).
+
+    Each evaluation gets its own working directory so anything a sidecar writes
+    relative to the cwd stays per-evaluation, as it did when every evaluation
+    had its own container.
+    """
+    if image not in _IMAGE_ENTRYPOINTS:
+        inspected = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", image],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        entrypoint = json.loads(inspected)
+        if not entrypoint:
+            raise SystemExit(f"FATAL: {image} has no ENTRYPOINT to run under `docker exec`")
+        _IMAGE_ENTRYPOINTS[image] = entrypoint
+    return [
+        "docker", "exec",
+        "--workdir", str(workdir),
+        sidecar_container(image, platform),
+        *(prefix or []),
+        *_IMAGE_ENTRYPOINTS[image],
+    ]
+
+
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
     with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
         subprocess.run(cmd, stdout=stdout, stderr=stderr, check=True)
+
+
+def run_timed(cmd: list[str], stdout_path: Path, stderr_path: Path) -> DockerRunResult:
+    """Run `cmd` to completion, recording its exit code and wall time.
+
+    Same shape as run_docker_monitored() without the `docker stats` sampler, for
+    callers that get an exact peak RSS from GNU `time -v` instead.
+    """
+    started = time.perf_counter()
+    with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
+        returncode = subprocess.run(cmd, stdout=stdout, stderr=stderr, check=False).returncode
+    return DockerRunResult(returncode=returncode, wall_seconds=time.perf_counter() - started, peak_memory_bytes=0)
 
 
 MEM_RE = re.compile(r"(?P<value>[0-9.]+)\s*(?P<unit>[KMGT]?i?B)")
@@ -444,23 +537,11 @@ def simulate_measurement_set(
     sim_stdout = eval_dir / "simulate.stdout.log"
     sim_stderr = eval_dir / "simulate.stderr.log"
     sim_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        # No sidecar needs networking, and docker's default bridge setup costs
-        # ~0.7s per container under rootless Docker - 35x the container's own
-        # runtime here. "none" still gives a loopback interface for meqserver.
-        "--network",
-        "none",
-        "--platform",
-        platform,
-        "-v",
-        f"{eval_dir}:/work",
-        meqtrees_image,
+        *sidecar_exec(meqtrees_image, platform, eval_dir),
         "--output-ms",
-        "/work/sim.ms",
+        str(ms_path),
         "--metadata-json",
-        "/work/simulation.json",
+        str(eval_dir / "simulation.json"),
         "--vla-config",
         params["vla_config"],
         "--observation-minutes",

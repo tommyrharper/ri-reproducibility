@@ -165,7 +165,7 @@ For each sample, the pipeline records:
 | `peak_flux_abs_error_jy` | Absolute centre-pixel flux error |
 | `sigma_res` | Paper data-fidelity \(\overline{\sigma}_{\textrm{res.}}=\|\widehat{\mathbf{r}}\|_2/\|\mathbf{x}_{\textrm{d}}\|_2\) (final residual dirty over dirty) |
 | `wall_seconds` | Imaging container runtime |
-| `peak_memory_bytes` | Peak imaging memory from Docker stats (WSClean also records GNU `time` when available) |
+| `peak_memory_bytes` | Peak imaging memory: GNU `time -v` for WSClean, sampled Docker stats for R2D2 |
 
 PolyChord maximizes whatever value the run returns as its log-likelihood. The
 default objective is `off_source_rms_jy` (off-source RMS in Jy/beam).
@@ -272,24 +272,50 @@ WSClean PoC run (19 likelihood evaluations, not committed) profiled as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 29.7s | 69.0% |
-| WSClean image container (total) | 12.8s | 29.7% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.3s | 5.3% |
-| &nbsp;&nbsp;of which: container overhead | 10.5s | 24.4% |
-| Metrics computation | 0.3s | 0.7% |
-| PolyChord overhead (unaccounted) | 0.27s | 0.6% |
+| MeqTrees simulate | 23.7s | 86.1% |
+| WSClean image container (total) | 3.1s | 11.1% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 2.2s | 7.9% |
+| &nbsp;&nbsp;of which: container overhead | 0.9s | 3.2% |
+| Metrics computation | 0.2s | 0.8% |
+| PolyChord overhead (unaccounted) | 0.55s | 2.0% |
 
-Total wall time 43.0s (~2.3s/eval). The MeqTrees RIME simulation is still the
-single largest stage (~1.6s/eval), but docker container start/teardown for the
-imaging sidecar is the second (~0.55s/eval, roughly 4.5x the `wsclean` binary's
-own runtime). PolyChord's own sampling/bookkeeping overhead stays negligible
-(0.6%) at this scale.
+Total wall time 27.5s (~1.4s/eval). The MeqTrees RIME simulation now dominates
+(~1.2s/eval); the imaging sidecar's non-`wsclean` overhead is down to
+~0.04s/eval. PolyChord's own sampling/bookkeeping overhead stays negligible at
+this scale.
 
-The remaining container overhead is `docker run` create/start/teardown itself,
-measured at ~0.45s per container on this host regardless of image, mounts, or
-`--platform`. `docker exec` into an already-running container costs ~0.02s, so a
-long-lived per-rank sidecar container is the natural next step - two `docker
-run` calls per evaluation currently cost ~0.9s of the ~2.3s.
+#### Long-lived per-rank sidecar containers
+
+`docker run` costs ~0.40s of create/start/teardown on this host regardless of
+image, mounts or `--platform`, while `docker exec` into an already-running
+container costs ~0.03s. The MeqTrees simulate and WSClean imaging sidecars are
+both short work against bind-mounted paths, so `sidecar_container()` in
+`poc_common.py` starts one detached `sleep infinity` container per rank per
+image on first use, and every later evaluation is a `docker exec` into it.
+
+That container mounts `REPO_ROOT` at its own host path (the same trick the
+PolyChord container already uses), so sidecar arguments are plain absolute
+paths instead of the old per-evaluation `-v {eval_dir}:/work` plus `/work/...`.
+`sidecar_exec()` reads the image's `ENTRYPOINT` back with `docker inspect`
+rather than restating the Dockerfile, since `docker exec` ignores it, and
+passes `--workdir {eval_dir}` so anything a sidecar writes relative to the cwd
+still stays per-evaluation. Containers are removed via `atexit`; a `SIGKILL`ed
+rank leaks one sleeping container, cleaned up with
+`docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
+
+The WSClean call also swapped `run_docker_monitored()` for `run_timed()`,
+dropping the `docker stats` sampler. GNU `time -v` already runs inside that
+container and reports an exact peak RSS, where the 0.2s-interval sampler both
+missed short peaks and delayed noticing the process had exited. R2D2 still uses
+`run_docker_monitored()`; its image has no GNU `time`.
+
+Together these took the profiled run from 43.5s to 27.5s (-37%) with identical
+per-evaluation metrics, identical `log(Z)`, and the same set of files in every
+evaluation directory. The R2D2 PoC picks up the simulate half of this through
+the shared `simulate_measurement_set()`; its own convert and imaging containers
+are still one `docker run` each - the imaging one needs the extra
+`checkpoints/` mount and per-run thread env vars, and is dominated by R2D2's own
+runtime anyway.
 
 #### Sidecar containers run with `--network none`
 
