@@ -883,6 +883,56 @@ command starts, then ~0.07s of interpreter and imports (with the baked-in,
 byte-compiled copy), ~0.10s of meqserver, and ~0.25s of `warm_forest()`. Only
 the last two are ours.
 
+##### How much slack each branch of the startup has
+
+Two independent branches converge before the first likelihood, and only the
+slower one is on the clock. Measured with `PS4='+[${EPOCHREALTIME}] ' bash -x`
+on the run script plus in-process markers, seconds from the script starting:
+
+| Branch | Steps | Ready at |
+|---|---|---:|
+| worker | `docker info` 0.045 -> `docker run -d` issued -> container command starts +0.26-0.35 -> worker ready +0.51 | **0.85-0.95** |
+| rank | ... -> all three `docker run -d` return +0.30-0.53 (the manifest's 0.24-0.42s hides inside it) -> `docker exec` + `mpirun` + interpreter + imports +0.20-0.27 | 0.55-0.80 |
+
+So the rank branch has 0.25-0.40s of slack: work moved onto it is free until it
+becomes the binding branch, and work taken off it buys nothing. The worker
+branch is what to attack, and inside the worker's 0.51s the split is ~0.13s of
+interpreter and imports, ~0.15s of `meqserver_session()`, ~0.12s of `makems` and
+~0.20s of TDL compile plus first predict.
+
+The tail is 0.085s: that is what elapses between the last rank's `atexit` and
+`docker exec` returning - CPython finalisation, `MPI_Finalize`, `mpirun` reaping
+and the exec stream closing. Nothing in the repo runs during it.
+
+##### Measured and rejected inside the worker's warm-up
+
+- **Building the warm-up MS while the meqserver starts.** `makems` is a
+  subprocess this process only waits on and `meqserver_session()` is Timba
+  imports plus another child, so running them in two threads should have taken
+  ~0.12s off the serial path. It does - for the *fastest* worker. Time to ready
+  across eight concurrent workers went min 0.489 -> 0.413 but max 0.504 ->
+  0.508, and 30 interleaved end-to-end pairs read +0.020s +/- 0.030s. The eight
+  workers contend (one worker alone is ready in 0.35-0.40s against 0.50-0.54s
+  for eight), so reordering within a worker just concentrates the contention
+  instead of removing work. This is the same null result as baking a ready-made
+  MS into the image, for the same reason.
+- **Importing `mpi4py` eagerly, before `prewarm()`'s join.** `mpirun -np 8
+  python3 -c "from mpi4py import MPI"` costs 0.20s against 0.07s for `-c pass`,
+  so `MPI_Init` looked like ~0.13s sitting after the join. It is not: markers
+  show only ~0.02s between the last rank leaving the join and the first
+  likelihood call, and forcing the import early made first-likelihood 0.417 ->
+  0.447. Whatever the standalone `mpirun` measurement is paying for, the real
+  run does not pay it there.
+- **Further Open MPI MCA tuning.** On top of `OMPI_MCA_pml=ob1`, none of
+  `btl=self,vader`, `osc=sm`, `coll=basic,libnbc,self`,
+  `hwloc_base_binding_policy=none` or `rmaps_base_mapping_policy=slot` moves
+  `mpirun -np 8 python3 -c "from mpi4py import MPI"` outside 0.19-0.22s.
+- **Container `docker run` options.** Best-of-four time from `docker run
+  --detach` to the container's command running is 0.26s minimal, 0.26s with
+  `--shm-size 512m`, 0.26s with the repo bind mount added and 0.34s on the
+  default bridge network. `--network none` is the only one that matters and is
+  already in use; 0.26s is this host's rootless-Docker floor.
+
 #### Long-lived sidecar containers, one per image
 
 `docker run` costs ~0.40s of create/start/teardown on this host regardless of
