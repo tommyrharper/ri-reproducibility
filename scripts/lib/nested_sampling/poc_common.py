@@ -161,6 +161,10 @@ def sidecar_container(image: str, platform: str) -> str:
                 # costs ~0.2s per container under rootless Docker. "none" still
                 # gives a loopback interface for meqserver.
                 "--network", "none",
+                # Everything the simulate builds - the working MS and the cached
+                # makems skeletons - lives in /dev/shm, and docker's 64MB default
+                # is only ~3x the largest cache this parameter space fills.
+                "--shm-size", "512m",
                 "--platform", platform,
                 "-v", f"{repo_root}:{repo_root}",
                 "--entrypoint", "sleep", image, "infinity",

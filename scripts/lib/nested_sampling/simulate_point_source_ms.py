@@ -11,6 +11,7 @@ added on top of that clean MeqTrees prediction.
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import math
@@ -118,6 +119,51 @@ def run_makems(output_ms: Path) -> None:
     if output_ms.exists():
         return
     raise SystemExit(f"FATAL: makems did not create {output_ms.name}_p0, {output_ms.name}_p1, or {output_ms}")
+
+
+# makems' output depends on every config field except StartFreq/StepFreq, which
+# only move six SPECTRAL_WINDOW columns. Copying a cached skeleton and rewriting
+# those columns costs ~0.002s against ~0.05s for a makems run, and reproduces a
+# fresh run's tables exactly (see --self-check). The parameter space has 20
+# (NTimes, NFrequencies) shapes, so a long-lived --serve worker hits this cache
+# for most of its evaluations.
+_SKELETONS: dict[str, Path] = {}
+_SKELETON_DIR: Path | None = None
+
+
+def skeleton_dir() -> Path:
+    global _SKELETON_DIR
+    if _SKELETON_DIR is None:
+        _SKELETON_DIR = Path(tempfile.mkdtemp(prefix="ms-skeleton-", dir=SCRATCH_ROOT))
+        atexit.register(shutil.rmtree, str(_SKELETON_DIR), True)
+    return _SKELETON_DIR
+
+
+def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_width_hz: float) -> None:
+    """Rewrite the only columns makems derives from StartFreq/StepFreq."""
+    with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=False, ack=False) as spw:
+        n_chan = int(spw.getcol("NUM_CHAN")[0])
+        spw.putcol("CHAN_FREQ", (start_frequency_hz + (np.arange(n_chan) + 0.5) * channel_width_hz)[None, :])
+        widths = np.full((1, n_chan), channel_width_hz)
+        for column in ("CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION"):
+            spw.putcol(column, widths)
+        spw.putcol("REF_FREQUENCY", np.array([start_frequency_hz + n_chan * channel_width_hz / 2.0]))
+        spw.putcol("TOTAL_BANDWIDTH", np.array([n_chan * channel_width_hz]))
+
+
+def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace) -> None:
+    """run_makems(), reusing a cached run for configs that differ only in frequency."""
+    key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
+    cached = _SKELETONS.get(key)
+    if cached is None:
+        run_makems(output_ms)
+        cached = Path(tempfile.mkdtemp(dir=skeleton_dir())) / "ms"
+        shutil.copytree(output_ms, cached, symlinks=True)
+        _SKELETONS[key] = cached
+        return
+    shutil.copytree(cached, output_ms, symlinks=True)
+    patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
+    (output_ms.parent / "makems.log").write_text(f"reused a cached makems skeleton for:\n{key}\n")
 
 
 def determine_corr_selection(output_ms: Path) -> tuple[str, int]:
@@ -314,8 +360,8 @@ def simulate(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
-        write_makems_config(args, scratch_ms)
-        run_makems(scratch_ms)
+        cfg = write_makems_config(args, scratch_ms)
+        make_ms_skeleton(cfg, scratch_ms, args)
         metadata = fill_point_source_visibilities(args, scratch_ms)
         metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
@@ -357,12 +403,46 @@ def serve() -> None:
         replies.flush()
 
 
+def self_check_skeleton_cache() -> None:
+    """A patched cache hit must reproduce a fresh makems run column for column."""
+
+    def build(ms: Path, start_hz: float, step_hz: float, n_chan: int, minutes: float) -> Path:
+        built = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", str(minutes),
+            "--channel-count", str(n_chan), "--start-frequency-hz", repr(start_hz),
+            "--channel-width-hz", repr(step_hz), "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(built, ms), ms, built)
+        return ms
+
+    for n_chan, minutes, start_hz, step_hz in ((2, 4.0, 1.0374e9, 1.3331e6), (6, 10.0, 1.1e9, 2.0e6)):
+        with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+            _SKELETONS.clear()
+            build(Path(scratch) / "seed" / "sim.ms", 1.0e9, 1.0e6, n_chan, minutes)
+            reused = build(Path(scratch) / "reused" / "sim.ms", start_hz, step_hz, n_chan, minutes)
+            _SKELETONS.clear()
+            fresh = build(Path(scratch) / "fresh" / "sim.ms", start_hz, step_hz, n_chan, minutes)
+            for sub in ("", "SPECTRAL_WINDOW", "ANTENNA", "FIELD", "DATA_DESCRIPTION", "POLARIZATION", "OBSERVATION", "FEED", "POINTING", "PROCESSOR", "STATE"):
+                with table(str(reused / sub if sub else reused), readonly=True, ack=False) as left, \
+                     table(str(fresh / sub if sub else fresh), readonly=True, ack=False) as right:
+                    for column in left.colnames():
+                        try:
+                            values, expected = np.asarray(left.getcol(column)), np.asarray(right.getcol(column))
+                        except RuntimeError:
+                            continue  # optional array column left unset by makems
+                        assert np.array_equal(values, expected), f"{sub or 'MAIN'}.{column} differs after a cached skeleton reuse"
+    _SKELETONS.clear()
+    print("MS skeleton cache self-check passed")
+
+
 if __name__ == "__main__":
-    # --serve takes no other arguments, so it is checked before argparse, which
-    # requires the full simulate argument set.
+    # --serve and --self-check take no other arguments, so they are checked before
+    # argparse, which requires the full simulate argument set.
     try:
         if sys.argv[1:] == ["--serve"]:
             serve()
+        elif sys.argv[1:] == ["--self-check"]:
+            self_check_skeleton_cache()
         else:
             simulate(parse_args())
     finally:

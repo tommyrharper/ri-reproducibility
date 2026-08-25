@@ -268,25 +268,62 @@ anything itself. Runs written before this instrumentation existed have no
 
 ### What a real bounded run showed
 
-A single-rank (`NS_MPI_PROCS=1`), 5-dimensional, `NS_NLIVE=3 NS_MAX_NDEAD=4`
-WSClean PoC run (19 likelihood evaluations, not committed) profiled as:
+A single-rank (`NS_MPI_PROCS=1`), 5-dimensional run at the default sampler
+settings (`NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12`, 62 likelihood
+evaluations, not committed) profiles as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| MeqTrees simulate | 4.2s | 59.3% |
-| WSClean image container (total) | 2.1s | 29.7% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 1.9s | 27.1% |
-| &nbsp;&nbsp;of which: container overhead | 0.18s | 2.6% |
-| Metrics computation | 0.2s | 3.0% |
-| PolyChord overhead (unaccounted) | 0.56s | 8.0% |
+| MeqTrees simulate | 9.0s | 53.0% |
+| WSClean image container (total) | 7.0s | 41.5% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.6s | 38.9% |
+| &nbsp;&nbsp;of which: container overhead | 0.43s | 2.5% |
+| Metrics computation | 0.31s | 1.8% |
+| PolyChord overhead (unaccounted) | 0.61s | 3.6% |
 
-Total wall time 7.0s (~0.37s/eval). No fixed overhead of any size is left in
-either sidecar: what remains is the science. Warm, an evaluation is ~0.18s of
-simulate (~0.05s `makems`, ~0.03s TDL compile, ~0.04s RIME predict, the rest
-noise fill and casacore table I/O) and ~0.11s of `wsclean`. The rest of the
-7.0s is one-off startup - ~0.66s for the first simulate (worker and meqserver),
+Total wall time 16.9s (~0.27s/eval; 12.9s on 4 ranks). No fixed overhead of any
+size is left in either sidecar: what remains is the science. Warm, an
+evaluation is ~0.14s of simulate (~0.03s TDL compile, ~0.04s RIME predict, the
+rest noise fill and casacore table I/O, plus ~0.05s of `makems` on the
+evaluations that miss the MS skeleton cache) and ~0.11s of `wsclean`. The rest
+is one-off startup - ~0.66s for the first simulate (worker and meqserver),
 ~0.17s for the first metrics call (`astropy` import) - plus PolyChord's own
 sampling and bookkeeping.
+
+#### The `makems` skeleton is cached per MS shape
+
+`makems` is ~0.05s of every simulate and its output depends on the whole
+`makems.cfg` except `StartFreq`/`StepFreq`, which move exactly six
+`SPECTRAL_WINDOW` columns (`CHAN_FREQ`, `CHAN_WIDTH`, `EFFECTIVE_BW`,
+`RESOLUTION`, `REF_FREQUENCY`, `TOTAL_BANDWIDTH`) and nothing else - verified
+by comparing every column of every subtable across two frequency settings.
+`make_ms_skeleton()` in `simulate_point_source_ms.py` therefore keys a cache on
+the config text with those two lines removed, and on a hit copies the cached
+skeleton inside `/dev/shm` (~0.002s) and rewrites those six columns instead of
+running `makems`. Only `observation_minutes` and `channel_count` reach the key,
+so the parameter space has 20 distinct shapes and a long-lived `--serve` worker
+hits the cache for most of its evaluations.
+
+`simulate_point_source_ms.py --self-check` is the guard on the rewrite formula:
+it builds each shape both ways and asserts a patched cache hit matches a fresh
+`makems` run column for column. Run it in the meqtrees image:
+
+```bash
+docker run --rm --network none ri-reproducibility/meqtrees:kern-10 --self-check
+```
+
+Measured over three runs each of the default single-rank configuration above:
+19.8s before, 16.9s after (-15%), with the simulate stage down 26% (12.2s ->
+9.0s). All 62 images were pixel-identical, every science metric matched, the
+evaluation directories held the same file tree, and log(Z) was unchanged.
+`copytree(..., symlinks=True)` matters here: `makems` leaves `vis.DATA`,
+`vis.uvw` and `vis.flg` as symlinks into the tiled storage manager files, and
+copying them as regular files leaves stale duplicates of the visibilities in
+every evaluation directory.
+
+Because the cache lives in `/dev/shm` alongside the working MS, the sidecar
+containers are started with `--shm-size 512m`; docker's 64MB default is only
+about 3x what 20 cached skeletons need.
 
 #### Sidecar commands go through one long-lived `sh` per rank
 
