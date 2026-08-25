@@ -51,6 +51,13 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
+# Shared by every rank, started here so the daemon is not hit by one
+# `docker run` per rank per image the moment the ranks come up.
+. "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
+# Only the simulate runs in a sidecar here; the convert and R2D2 imaging steps
+# are still one `docker run` each.
+start_sidecars "${PLATFORM}" "${MEQTREES_IMAGE}"
+
 RUN_COMMAND=(
   docker run --rm --platform "${PLATFORM}"
   -v "${REPO_ROOT}:${REPO_ROOT}"
@@ -62,6 +69,7 @@ RUN_COMMAND=(
   -e CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  -e NS_SIDECARS="${NS_SIDECARS}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
   # host CPU, in every rank. Nothing here has a BLAS call big enough to want
   # them (the largest is a norm over a 128x128 image), so on a 20-CPU host the

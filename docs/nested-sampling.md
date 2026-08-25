@@ -30,9 +30,10 @@ top of that clean MeqTrees prediction.
 ## Run the PoC
 
 Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see WSClean below).
-Each target builds its required images first, then runs the PolyChord container,
-which mounts the Docker socket and drives one long-lived sidecar container per
-image per rank (see "Long-lived per-rank sidecar containers" below).
+Each target builds its required images first, starts one long-lived sidecar
+container per image, then runs the PolyChord container, which mounts the Docker
+socket and drives those sidecars (see "Long-lived sidecar containers, one per
+image" below).
 
 ### WSClean
 
@@ -274,14 +275,14 @@ evaluations, not committed) profiles as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| WSClean image container (total) | 6.8s | 59.7% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.4s | 56.5% |
-| &nbsp;&nbsp;of which: container overhead | 0.39s | 3.5% |
-| MeqTrees simulate | 3.7s | 32.4% |
-| Metrics computation | 0.29s | 2.6% |
-| PolyChord overhead (unaccounted) | 0.57s | 5.1% |
+| WSClean image container (total) | 6.7s | 63.0% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.3s | 59.1% |
+| &nbsp;&nbsp;of which: container overhead | 0.41s | 3.9% |
+| MeqTrees simulate | 3.4s | 31.7% |
+| Metrics computation | 0.29s | 2.7% |
+| PolyChord overhead (unaccounted) | 0.29s | 2.7% |
 
-Total wall time 11.3s (~0.18s/eval; 5.3s on the default 8 ranks). No fixed
+Total wall time 10.6s (~0.17s/eval; 3.6s on the default 8 ranks). No fixed
 overhead of any size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
@@ -498,15 +499,18 @@ largest MS this parameter space produces; a bigger parameter space needs
 `--shm-size` on the sidecar. `SCRATCH_ROOT` falls back to the `tempfile`
 default when `/dev/shm` is not writable.
 
-#### Long-lived per-rank sidecar containers
+#### Long-lived sidecar containers, one per image
 
 `docker run` costs ~0.40s of create/start/teardown on this host regardless of
 image, mounts or `--platform`, while `docker exec` into an already-running
 container costs ~0.03s. The MeqTrees simulate and WSClean imaging sidecars are
-both short work against bind-mounted paths, so `sidecar_container()` in
-`poc_common.py` starts one detached `sleep infinity` container per rank per
-image on first use, and every later evaluation runs inside it - through the
-long-lived `sh` above for WSClean, through the `--serve` worker for simulate.
+both short work against bind-mounted paths, so each runs in a detached `sleep
+infinity` container that lives for the whole run - through the long-lived `sh`
+above for WSClean, through the `--serve` worker for simulate. Both run scripts
+source `scripts/lib/start-sidecars.sh` and start those containers before the
+PolyChord container, handing the names to every rank in `NS_SIDECARS`;
+`sidecar_container()` in `poc_common.py` still starts one itself for any image
+that is not in there.
 
 That container mounts `REPO_ROOT` at its own host path (the same trick the
 PolyChord container already uses), so sidecar arguments are plain absolute
@@ -517,9 +521,19 @@ sidecar shell applies it, and each evaluation runs in its own working directory
 so anything a sidecar writes relative to the cwd still stays per-evaluation -
 except the simulate worker, which outlives any one evaluation and so runs in
 `REPO_ROOT` and writes only absolute paths.
-Containers are removed via `atexit`; a `SIGKILL`ed
-rank leaks one sleeping container, cleaned up with
-`docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
+Pre-started containers are removed by the run script's `EXIT` trap, and any a
+rank started itself via `atexit`; a `SIGKILL`ed run leaks sleeping containers,
+cleaned up with `docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
+
+One container per image, rather than one per rank, is what makes the start
+cheap. A single `docker run` of these images costs ~0.36s here, but 16 of them
+at once - which is what 8 ranks x 2 images did the moment the ranks came up -
+costs 1.3s, and all of it lands in front of the first evaluation. Separate
+`docker exec` processes in one container are already isolated: 8 concurrent
+`--serve` workers in a single MeqTrees container, each with its own meqserver,
+run without interfering. Measured over 3 runs each, the default 8-rank run went
+5.44s -> 3.64s (-33%) with identical `log(Z)`, the same 41 evaluations and
+byte-identical metrics for every one of them.
 
 The WSClean call also dropped `run_docker_monitored()`'s `docker stats`
 sampler. GNU `time -v` already runs inside that container and reports an exact

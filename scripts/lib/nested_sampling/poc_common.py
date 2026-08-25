@@ -134,22 +134,31 @@ def stable_seed(global_seed: int, key: str) -> int:
     return (global_seed + int(key[:8], 16)) % (2**31 - 1)
 
 
-_SIDECAR_CONTAINERS: dict[str, str] = {}
+# Pre-started by scripts/lib/start-sidecars.sh, one container per image shared by
+# every rank; anything missing here is started by this rank on first use.
+_SIDECAR_CONTAINERS: dict[str, str] = json.loads(os.environ.get("NS_SIDECARS", "{}"))
 _IMAGE_ENTRYPOINTS: dict[str, list[str]] = {}
 
 
 def sidecar_container(image: str, platform: str) -> str:
-    """Name of this rank's long-lived container for `image`, started on first use.
+    """Name of the run's long-lived container for `image`.
 
     A per-evaluation `docker run` costs ~0.40s of create/start/teardown on this
     host regardless of image, mounts or platform; `docker exec` into an
     already-running container costs ~0.03s. Every sidecar here is short work
-    against bind-mounted paths, so one container per rank reused across
-    evaluations removes ~0.75s of the ~2.3s per evaluation.
+    against bind-mounted paths, so one reused container removes ~0.75s of the
+    ~2.3s per evaluation.
 
     The whole repo is mounted at its host path (as the PolyChord container
     already does), so callers pass absolute paths where they previously passed
     `/work/...` against a per-evaluation `-v {eval_dir}:/work`.
+
+    One container per image is enough for the whole run - separate `docker exec`
+    processes are already isolated from each other - so the run script starts
+    them before the PolyChord container and hands them over in `NS_SIDECARS`.
+    Starting them per rank instead meant 16 concurrent `docker run`s on the
+    default 8 ranks, which cost 1.3s against 0.36s for a single one, all of it
+    in front of the first evaluation.
     """
     if image not in _SIDECAR_CONTAINERS:
         repo_root = os.environ.get("REPO_ROOT", os.getcwd())
