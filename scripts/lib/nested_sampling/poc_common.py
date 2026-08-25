@@ -347,10 +347,59 @@ def run_docker_monitored(cmd: list[str], container_name: str, stdout_path: Path,
     return DockerRunResult(returncode=returncode, wall_seconds=wall, peak_memory_bytes=peak_memory)
 
 
-def load_fits_2d(path: Path) -> tuple[np.ndarray, Any]:
-    from astropy.io import fits
+def _fits_card_value(field: str) -> Any:
+    """The value half of a FITS card, comment stripped.
 
-    data, header = fits.getdata(path, header=True)
+    A quoted string may contain the `/` that otherwise starts the comment
+    (`BUNIT = 'JY/BEAM '`), so quotes are closed before the comment is cut.
+    """
+    field = field.lstrip()
+    if field.startswith("'"):
+        end = field.index("'", 1)
+        return field[1:end].strip()
+    value = field.split("/")[0].strip()
+    return value == "T" if value in ("T", "F") else float(value)
+
+
+def load_fits_2d(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
+    """Read the primary HDU of a WSClean/R2D2 image as a 2-D float64 array.
+
+    `from astropy.io import fits` costs ~0.45s when the 8 default ranks import
+    it at once - more than every other per-rank startup put together, and more
+    than 10% of the run's wall clock - to read a single-HDU uncompressed float
+    image. Everything needed here is 30 lines of the FITS standard: 2880-byte
+    header blocks of 80-column cards, then big-endian samples in C order.
+    Anything outside that (a scaled or integer image, an extension) raises
+    rather than being guessed at.
+    """
+    header: dict[str, Any] = {}
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(2880)
+            if len(block) < 2880:
+                raise ValueError(f"{path}: FITS header ended mid-block")
+            for start in range(0, 2880, 80):
+                card = block[start:start + 80].decode("ascii")
+                key = card[:8].strip()
+                if key == "END":
+                    block = None
+                    break
+                if card[8:10] != "= ":
+                    continue  # COMMENT, HISTORY and blank cards carry no value
+                header[key] = _fits_card_value(card[10:])
+            if block is None:
+                break
+        bitpix = int(header["BITPIX"])
+        if bitpix not in (-32, -64):
+            raise ValueError(f"{path}: BITPIX {bitpix} is not a float image")
+        if float(header.get("BSCALE", 1.0)) != 1.0 or float(header.get("BZERO", 0.0)) != 0.0:
+            raise ValueError(f"{path}: scaled FITS data (BSCALE/BZERO) is not supported")
+        shape = [int(header[f"NAXIS{axis}"]) for axis in range(int(header["NAXIS"]), 0, -1)]
+        count = int(np.prod(shape))
+        raw = handle.read(count * (abs(bitpix) // 8))
+    if len(raw) != count * (abs(bitpix) // 8):
+        raise ValueError(f"{path}: FITS data block is short")
+    data = np.frombuffer(raw, dtype=">f4" if bitpix == -32 else ">f8").reshape(shape)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
     if image.ndim != 2:
         raise ValueError(f"{path} is not 2-D after squeezing; shape={image.shape}")
@@ -632,25 +681,21 @@ def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[
     The first evaluation on a rank cost ~0.7s that later ones did not, and every
     rank paid it at the same moment, so all of it landed on the wall clock in
     front of evaluation one: the simulate worker's Python/Timba/meqserver
-    startup (~0.45s), two `docker inspect`s for the image entrypoints, the
-    wsclean shell's `docker exec`, and astropy's import (~0.2s) - one after the
-    other. Here they run in threads, so the rank pays the slowest instead of the
-    sum, and the caller can overlap them with PolyChord's own startup by joining
-    late.
+    startup, two `docker inspect`s for the image entrypoints and the wsclean
+    shell's `docker exec` - one after the other. Here they run in threads, so
+    the rank pays the slowest instead of the sum, and the caller can overlap
+    them with PolyChord's own startup by joining late.
 
     Nothing may touch a sidecar between this call and the returned joiner: the
     caches these threads fill are plain dicts with no lock.
     """
-    def warm_astropy() -> None:
-        from astropy.io import fits  # noqa: F401
-
     def warm_wsclean() -> None:
         sidecar_command(wsclean_image)
         sidecar_shell(wsclean_image, platform)
 
     threads = [
         threading.Thread(target=target, daemon=True)
-        for target in (lambda: simulate_worker(meqtrees_image, platform), warm_wsclean, warm_astropy)
+        for target in (lambda: simulate_worker(meqtrees_image, platform), warm_wsclean)
     ]
     for thread in threads:
         thread.start()
@@ -755,6 +800,36 @@ def self_check_r2d2_thread_env() -> None:
             os.environ.pop("R2D2_OMP_THREADS", None)
         else:
             os.environ["R2D2_OMP_THREADS"] = saved
+
+
+def self_check_fits_reader() -> None:
+    """load_fits_2d() against astropy on a WSClean-shaped image.
+
+    astropy is still in the polychord image; it is just not imported on the hot
+    path. The trap this guards is card parsing, not the data block: a quoted
+    value may contain the `/` that starts a comment (`BUNIT = 'JY/BEAM '`).
+    """
+    import tempfile
+
+    from astropy.io import fits
+
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((1, 1, 8, 6)).astype(np.float32)
+    hdu = fits.PrimaryHDU(data)
+    hdu.header["BUNIT"] = ("JY/BEAM", "Units are in Jansky per beam")
+    hdu.header["CRPIX1"] = 4.0
+    hdu.header["CRPIX2"] = 5.0
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "check.fits"
+        hdu.writeto(path)
+        image, header = load_fits_2d(path)
+        expected, expected_header = fits.getdata(path, header=True)
+    assert image.shape == (8, 6), image.shape
+    assert np.array_equal(image, np.squeeze(np.asarray(expected, dtype=np.float64)))
+    assert header["BUNIT"] == "JY/BEAM", header["BUNIT"]
+    assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
+    assert header["SIMPLE"] is True
+    assert int(header["NAXIS"]) == int(expected_header["NAXIS"])
 
 
 def self_check_metric_resolution() -> None:

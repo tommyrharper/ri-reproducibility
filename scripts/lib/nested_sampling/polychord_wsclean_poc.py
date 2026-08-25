@@ -29,6 +29,7 @@ from poc_common import (
     read_gnu_time_peak_memory,
     read_gnu_time_wall_seconds,
     resolve_metric,
+    self_check_fits_reader,
     self_check_metric_resolution,
     self_check_profiling,
     sidecar_command,
@@ -353,6 +354,7 @@ def main() -> None:
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_WSCLEAN_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
+        self_check_fits_reader()
         self_check_profiling()
         self_check_failure_record_persistence()
         print("metric resolution self-check passed")

@@ -287,15 +287,14 @@ Total wall time 10.2s (~0.16s/eval; ~2.5s on the default 8 ranks). That is
 `poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
 ~1.1s more on one rank and ~1.6s more on eight, for starting and removing the
-containers (8-rank end to end is ~4.1s). No fixed overhead of any
+containers (8-rank end to end is ~3.6s). No fixed overhead of any
 size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
 skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
-The rest is one-off startup - the simulate worker, meqserver, the one TDL
-compile and the `astropy` import, now started concurrently before the sampler
-runs rather than serially inside the first evaluation - plus PolyChord's own
-sampling and bookkeeping.
+The rest is one-off startup - the simulate worker, meqserver and the one TDL
+compile, now started concurrently before the sampler runs rather than serially
+inside the first evaluation - plus PolyChord's own sampling and bookkeeping.
 
 `wsclean` itself is at its floor for this problem size: it self-reports
 0.035s inversion + 0.023s prediction + 0.008s deconvolution per evaluation
@@ -539,17 +538,45 @@ evaluation one. It was four independent startups run one after the other inside
 | Startup | Cost |
 |---|---:|
 | `simulate_point_source_ms.py --serve` worker (`docker exec`, Python, Timba, meqserver) | ~0.45s, now started eagerly by the worker itself |
-| `astropy.io.fits` import, on the first metrics call | ~0.20s |
+| `astropy.io.fits` import, on the first metrics call | ~0.45s on 8 ranks, now gone - see below |
 | `docker inspect` of each image's `ENTRYPOINT`, twice | ~0.05s |
 | the WSClean sidecar's `sh` (`docker exec`) | ~0.03s |
 
 `poc_common.prewarm()` starts all of them in threads, so a rank pays the slowest
 instead of the sum. `main()` calls it before `import pypolychord` and joins it
-immediately before `run_polychord()`, so the remaining ~0.45s also overlaps the
+immediately before `run_polychord()`, so the remainder also overlaps the
 sampler's own import and setup. Nothing may touch a sidecar between the call and
 the join: `_SIMULATE_WORKERS`, `_SIDECAR_SHELLS` and `_IMAGE_ENTRYPOINTS` are
 plain dicts with no lock, and a lazy start racing the prewarm thread would leave
 a second, orphaned worker.
+
+#### FITS images are read without astropy
+
+`from astropy.io import fits` was the single largest per-rank startup left, and
+it dominated the prewarm join: ~0.45s when the 8 default ranks import it at
+once, against ~0.07s for both sidecar startups put together. Instrumenting the
+prewarm threads is what showed it - the other two only `Popen`, so they return
+in milliseconds and the join was pure astropy.
+
+All it was doing is reading a single-HDU, uncompressed, `BITPIX = -32` image and
+two header cards (`CRPIX1`/`CRPIX2`). `poc_common.load_fits_2d()` now does that
+directly: 2880-byte header blocks of 80-column cards, then big-endian samples in
+C order. Anything outside that shape - an integer or `BSCALE`/`BZERO`-scaled
+image, a short data block - raises instead of being guessed at. astropy is still
+installed in the image and still used by the self-check.
+
+The trap is card parsing, not the data block: a quoted value may contain the `/`
+that otherwise starts the comment (`BUNIT = 'JY/BEAM '`), so `_fits_card_value()`
+closes the quote before cutting the comment. `self_check_fits_reader()` (run by
+`POLYCHORD_WSCLEAN_POC_SELF_CHECK=1`) writes exactly that card with astropy and
+asserts the reader agrees; it fails if the quote handling is removed.
+
+Verified against astropy on all 16833 FITS files this repo's results tree
+contains - identical pixels and identical values for every non-comment header
+card. Eight interleaved A/B pairs (rebuild between arms) gave 3.91s -> 3.61s end
+to end on the default 8 ranks, -7.8%, 8/8 pairs, with a bit-identical
+`chains/wsclean_vlaa_poc.stats` and bit-identical metrics for all 41
+evaluations.
 
 #### Sidecar teardown does not block the run
 
