@@ -55,6 +55,12 @@ COPY scripts/lib/nested_sampling/simulate_point_source_ms.py /opt/ri-nested-samp
 COPY scripts/lib/nested_sampling/point_source_forest.py /opt/ri-nested-sampling/point_source_forest.py
 COPY scripts/lib/nested_sampling/ms_to_r2d2_mat.py /opt/ri-nested-sampling/ms_to_r2d2_mat.py
 
+# Same reason as the polychord image: anything without a valid .pyc is
+# recompiled by the first process in each fresh container. Ubuntu ships .pyc for
+# its own python3 packages, so here this is only these three files and the
+# Timba module the patch above rewrote.
+RUN python3 -m compileall -q /opt/ri-nested-sampling /usr/lib/python3/dist-packages/Timba/Apps || true
+
 WORKDIR /workspace
 VOLUME ["/data", "/results"]
 

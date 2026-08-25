@@ -49,7 +49,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/venv /opt/venv
+
+# python:3.11-slim ships no .pyc for most of the stdlib, and pip left the venv
+# with .pyc whose recorded mtimes no longer match after the COPY above. So the
+# first Python process in a fresh container recompiled ~60 modules and wrote
+# them into the container layer: an 8-rank `mpirun python3 -c "import numpy,
+# pypolychord, poc_common"` cost 0.99s cold against 0.22s once one process had
+# paid it. Compiling here makes every container start warm, which is what the
+# run script would otherwise have to buy with a throwaway warm-up exec on the
+# critical path. `|| true`: compileall fails the build on any module that is not
+# valid source for this interpreter, and the venv carries a few.
+RUN python3 -m compileall -q /usr/local/lib/python3.11 /opt/venv/lib || true
+
 COPY scripts/lib/nested_sampling /opt/ri-nested-sampling
+RUN python3 -m compileall -q /opt/ri-nested-sampling
 
 WORKDIR /workspace
 VOLUME ["/data", "/results"]

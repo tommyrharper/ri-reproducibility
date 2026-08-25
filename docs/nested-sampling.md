@@ -286,8 +286,8 @@ evaluations, not committed) profiles as:
 Total wall time 10.2s (~0.16s/eval; ~2.5s on the default 8 ranks). That is
 `poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
-~1.1s more on one rank and ~1.6s more on eight, for starting and removing the
-containers (8-rank end to end is ~3.4s). No fixed overhead of any
+~1.1s more on one rank and ~1.3s more on eight, for starting and removing the
+containers (8-rank end to end is ~3.1s). No fixed overhead of any
 size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the ~12 evaluations of a run that
@@ -626,51 +626,17 @@ exec mpirun ...`. A `docker run` of this image costs ~0.7s of create, start,
 wait and `--rm` teardown; the `docker exec` costs ~0.03s, and the container's
 own startup now happens concurrently with the MeqTrees and WSClean ones.
 
-Two more things ride on that:
-
-- **A warm-up command.** The first process in a fresh container faults the
-  whole dynamic-linker path of whatever it runs through the image's overlay
-  mount. The real 8-rank `mpirun python3` exec measured 0.85s cold against
-  0.19s once one throwaway `python3 -c "import numpy, pypolychord"` had paid
-  that; `docker exec <container> true` first does *not* help, so it is the
-  libraries, not the container. `sidecar_launch` takes that warm-up after a
-  `--` and runs it inside the same background job as the `docker run`, so it is
-  hidden behind the other containers coming up. The MeqTrees and WSClean
-  sidecars are not worth warming: their cold-vs-warm first exec is 0.17s vs
-  0.13s and 0.09s vs 0.08s, and warming the MeqTrees Timba/casacore imports
-  moved eight concurrent `--serve` worker startups only 0.34s -> 0.32s for
-  0.22s of warm-up.
-
-  The warm-up imports what the ranks import, not just what PolyChord needs.
-  `import numpy, pypolychord` alone left the first-touch cost of `poc_common`
-  and `argparse` to be paid by all eight ranks at once: measured inside the
-  container, an 8-rank `mpirun python3` importing numpy, `poc_common`,
-  `argparse` and constructing an `ArgumentParser` cost 0.19s the first time
-  and 0.05s afterwards, with `ArgumentParser(description=...)` alone at 0.076s
-  (it is the `gettext` lookup behind `-h`'s help string). Adding
-  `poc_common, argparse; argparse.ArgumentParser()` to the warm-up costs it
-  ~0.04s and takes the ranks' pre-sampler imports from ~0.19s to ~0.05s -
-  markers inside the run put `run_polychord()`'s start ~0.23s earlier.
-  Warming with `mpirun -np 8` instead of one process is not worth it: the
-  warm-up goes 0.28s -> 1.0s and the real exec does not get faster.
-- **The manifest write moved into the gap.** `scripts/record-environment.sh` is
-  ~0.4s of `git` and `docker image inspect`, and now runs between
-  `sidecar_launch` and `sidecar_wait` instead of after the containers are up.
-  `NS_SIDECARS` is exported by `sidecar_launch` rather than `sidecar_wait`
-  because the container names are known as soon as the launches are issued.
+One more thing rides on that: **the manifest write moved into the gap.**
+`scripts/record-environment.sh` is ~0.4s of `git` and `docker image inspect`,
+and now runs between `sidecar_launch` and `sidecar_wait` instead of after the
+containers are up. `NS_SIDECARS` is exported by `sidecar_launch` rather than
+`sidecar_wait` because the container names are known as soon as the launches
+are issued.
 
 Measured with four interleaved A/B runs of the default 8-rank configuration,
 end-to-end script wall time went 6.82s -> 5.29s (-22%); single-rank went 13.1s
 -> 12.2s (-7%). All eight runs produced identical `log(Z)` and byte-identical
 objectives for all 41 evaluations.
-
-Widening the warm-up to the ranks' own imports is worth much less than the
-in-container measurement suggests: 20 interleaved A/B pairs of the default run
-gave -0.05s on ~3.7s, and 10 pairs at `NS_MAX_NDEAD=1` (where fixed cost is a
-larger share) gave -0.10s on ~2.65s, 8/10 in the right direction. Reaching
-`run_polychord()` 0.23s earlier does not buy 0.23s end to end because the first
-evaluation on every rank is gated on its `--serve` worker's meqserver coming
-up, not on the rank being ready - see the first-evaluation cost below.
 
 Note which clock that is. `poc-summary.json`'s `total_wall_seconds` - the
 number the profile table above totals - is measured around
@@ -683,6 +649,48 @@ Only the WSClean run script does this. The R2D2 one still uses
 `start_sidecars`, which is now a wrapper over `sidecar_launch` + `sidecar_wait`
 and behaves exactly as before; ~0.7s is not worth re-validating a PoC whose
 runs take 20 minutes.
+
+#### The images ship byte-compiled, so no container needs a warm-up
+
+`sidecar_launch` used to run a throwaway `python3 -c "import numpy,
+pypolychord, poc_common, argparse; argparse.ArgumentParser()"` in the fresh
+PolyChord container before `sidecar_wait` returned, because the *first* Python
+process in a container cost far more than the next one: the real 8-rank
+`mpirun python3` exec measured 0.99s cold against 0.22s warm.
+
+That was byte compilation, not the overlay mount. `python:3.11-slim` ships no
+`.pyc` for most of the stdlib, and pip left `/opt/venv` with `.pyc` whose
+recorded source mtimes no longer match after the image's `COPY`. `docker diff`
+on a container that has done nothing but one import shows 60 freshly written
+`.pyc` files; eight ranks starting at once each compile the same modules and
+race to write them. Reading every file in `/opt/venv` first (`cat` over the
+`.so` and `.pyc` files, 0.12s) leaves the 8-rank exec at 0.91s, so it is not
+page cache; a `python3 -c pass` first does not help either.
+
+So both images now run `python3 -m compileall` at build time
+(`docker/polychord/Dockerfile`, `docker/meqtrees/Dockerfile`). A fresh
+container's 8-rank cold import is then 0.22-0.26s with no warm-up at all and
+writes zero `.pyc`, and `sidecar_launch` lost its warm-up hook entirely -
+`sidecar_wait` now only waits for `docker run`, which the manifest write
+already hides. Shell markers put `sidecars-ready` at ~0.47s after script start
+instead of ~0.70s.
+
+The MeqTrees image only wrote two `.pyc` (Ubuntu ships them for its own
+`python3` packages, and one of the two is the `Timba` module the Dockerfile
+patches), so `compileall` there is cheap insurance rather than a measured win.
+
+Ten interleaved A/B pairs of the default 8-rank run, rebuilding both images
+between arms: 3.31s -> 3.11s end to end (-6%), 9/10 pairs in the right
+direction. The 41 evaluations' parameter sets, science metrics and objectives
+and the PolyChord `.stats` output are identical; only `eval_id` ordering and
+the per-evaluation `wall_seconds`/`peak_memory_bytes` differ, as they do
+between any two runs.
+
+Also measured and rejected: warming the MeqTrees and WSClean sidecars is not
+worth it even before `compileall` (cold-vs-warm first exec 0.17s vs 0.13s and
+0.09s vs 0.08s, and warming the Timba/casacore imports moved eight concurrent
+`--serve` worker startups only 0.34s -> 0.32s for 0.22s of warm-up); warming
+with `mpirun -np 8` cost 1.0s instead of 0.28s with no gain in the real exec.
 
 #### Long-lived sidecar containers, one per image
 

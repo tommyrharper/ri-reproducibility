@@ -21,7 +21,7 @@
 # or, when a container needs extra `docker run` arguments or the caller has
 # work to overlap with the startup,
 #
-#   sidecar_launch <platform> <image> [docker args...] [-- warm-up command...]
+#   sidecar_launch <platform> <image> [docker args...]
 #   ...other setup...
 #   sidecar_wait                                         # before the first exec
 #
@@ -29,13 +29,11 @@
 # SIDECAR_NAME. Requires REPO_ROOT. Every container started is removed by an
 # EXIT trap.
 #
-# A warm-up command after `--` is run once in the new container, still inside
-# the background job, before `sidecar_wait` returns. The first process in a
-# fresh container faults the whole dynamic-linker path of whatever it runs
-# through the image's overlay mount: for the PolyChord container an 8-rank
-# `mpirun python3` costs 0.85s cold against 0.19s once a single throwaway
-# `python3 -c "import numpy, pypolychord"` has paid that, and doing it here
-# hides it behind the other containers coming up.
+# There is deliberately no warm-up hook here. A fresh container's first Python
+# process used to cost ~0.8s more than the next one, which this file paid for
+# with a throwaway `docker exec` before `sidecar_wait` returned; that cost was
+# the interpreter byte-compiling modules the image shipped without a valid
+# .pyc, and the images now compile them at build time instead.
 SIDECAR_NAMES=()
 _SIDECAR_PIDS=()
 _SIDECAR_JSON=""
@@ -43,28 +41,15 @@ _SIDECAR_JSON=""
 sidecar_launch() {
   local platform="$1" image="$2" name
   shift 2
-  local docker_args=()
-  while [ $# -gt 0 ] && [ "$1" != "--" ]; do
-    docker_args+=("$1")
-    shift
-  done
-  if [ $# -gt 0 ]; then
-    shift  # the "--" itself; anything left is the warm-up command
-  fi
   name="ri-ns-sidecar-$$-${#SIDECAR_NAMES[@]}"
   SIDECAR_NAME="${name}"
-  {
-    docker run --detach --rm --name "${name}" \
-      --network none \
-      --shm-size 512m \
-      --platform "${platform}" \
-      -v "${REPO_ROOT}:${REPO_ROOT}" \
-      "${docker_args[@]}" \
-      --entrypoint sleep "${image}" infinity >/dev/null
-    if [ $# -gt 0 ]; then
-      docker exec "${name}" "$@" >/dev/null 2>&1
-    fi
-  } &
+  docker run --detach --rm --name "${name}" \
+    --network none \
+    --shm-size 512m \
+    --platform "${platform}" \
+    -v "${REPO_ROOT}:${REPO_ROOT}" \
+    "$@" \
+    --entrypoint sleep "${image}" infinity >/dev/null &
   _SIDECAR_PIDS+=("$!")
   SIDECAR_NAMES+=("${SIDECAR_NAME}")
   _SIDECAR_JSON="${_SIDECAR_JSON}${_SIDECAR_JSON:+,}\"${image}\":\"${SIDECAR_NAME}\""
@@ -95,21 +80,21 @@ start_sidecars() {
   sidecar_wait
 }
 
-# `bash scripts/lib/start-sidecars.sh --self-check` - guards the `--` split, the
-# one piece of parsing here: extra `docker run` arguments must not leak into the
-# warm-up command or vice versa. Stubs `docker` so nothing is actually started.
+# `bash scripts/lib/start-sidecars.sh --self-check` - guards the two things a
+# caller depends on: per-container `docker run` arguments must reach that
+# container's command line and no other's, and NS_SIDECARS must map every image
+# to its container. Stubs `docker` so nothing is actually started.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   REPO_ROOT="${REPO_ROOT:-$(pwd)}"
   _log="$(mktemp)"
   docker() { printf '%s\n' "$*" >>"${_log}"; }
-  sidecar_launch linux/amd64 img:a -v /sock:/sock -- python3 -c "import numpy"
+  sidecar_launch linux/amd64 img:a -v /sock:/sock
   sidecar_launch linux/amd64 img:b
   sidecar_wait
   grep -q -- '-v /sock:/sock --entrypoint sleep img:a infinity' "${_log}"
-  grep -q -- 'exec ri-ns-sidecar-'"$$"'-0 python3 -c import numpy' "${_log}"
   grep -q -- '--entrypoint sleep img:b infinity' "${_log}"
-  ! grep -q -- 'img:b.*python3' "${_log}"
+  ! grep -q -- 'img:b.*/sock' "${_log}"
   [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1"}' ]
   rm -f "${_log}"
   echo "start-sidecars self-check passed"
