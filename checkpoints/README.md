@@ -30,7 +30,13 @@ realisation of one architecture, e.g. `R2D2_A1_T2_Realisation1.zip`
 - https://researchportal.hw.ac.uk/files/146289536/R2D2_A1_T2_Realisation1.zip
 
 After extraction, each `.ckpt` must be placed so that
-`$CHECKPOINT_DIR/R2D2_UNet_N<k>.ckpt` (k = 1..25) exists, matching
-`config/r2d2/R2D2_U-Net.yaml`'s `ckpt_path`. See R2D2-RI's README section
-"VLA-trained DNN series" for the full naming convention and the U-WDSR
-equivalent.
+`checkpoints/R2D2_A1/R2D2_UNet_N<k>.ckpt` (k = 1..25) exists - the
+architecture subdirectory is part of the path, not optional: it is what
+`config/r2d2/R2D2_U-Net.yaml`'s `ckpt_path: /checkpoints/R2D2_A1`,
+`scripts/lib/nested_sampling/polychord_r2d2_poc.py`, and
+`scripts/smoke-test-r2d2.sh`'s stage-5 probe all look for (the
+`checkpoints/` directory itself is what gets bind-mounted at
+`/checkpoints`). The U-WDSR series is the same shape one directory over:
+`checkpoints/R2D2_A2/R2D2_UWDSR_N<k>.ckpt`, per
+`config/r2d2/R2D2_U-WDSR.yaml`. See R2D2-RI's README section "VLA-trained
+DNN series" for the full upstream naming convention.

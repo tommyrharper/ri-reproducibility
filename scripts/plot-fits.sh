@@ -44,7 +44,7 @@ else
   fi
 fi
 
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
   -v "${RESULTS_DIR}:/results" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \

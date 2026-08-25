@@ -61,7 +61,7 @@ if [[ -n "${RUN_SEL}" ]]; then
   REPORT_ARGS+=(--run "${RUN_SEL}")
 fi
 
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   -v "${REPO_ROOT}/benchmarks:/workspace/out:rw" \

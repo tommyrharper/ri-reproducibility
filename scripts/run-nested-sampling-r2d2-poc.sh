@@ -19,7 +19,14 @@ NS_SEED="${NS_SEED:-41}"
 NS_METRIC="${NS_METRIC:-off_source_rms_jy}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
-  DOCKER_SOCKET="/var/run/docker.sock"
+  # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
+  # /var/run/docker.sock, and the sidecar containers this run launches need
+  # the real host path to bind-mount. DOCKER_HOST is what points the CLI at
+  # it, so derive from that and fall back to the rootful default.
+  case "${DOCKER_HOST:-}" in
+    unix://*) DOCKER_SOCKET="${DOCKER_HOST#unix://}" ;;
+    *) DOCKER_SOCKET="/var/run/docker.sock" ;;
+  esac
 fi
 if ! docker info >/dev/null 2>&1; then
   echo "FATAL: Docker daemon is not available" >&2
