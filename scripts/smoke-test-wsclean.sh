@@ -19,7 +19,7 @@ OUTPUT_DIR="${REPO_ROOT}/results/smoke-test-wsclean"
 mkdir -p "${FIXTURE_DIR}" "${OUTPUT_DIR}"
 
 echo "==> [1/3] wsclean --version"
-docker run --rm --platform linux/arm64 "${IMAGE}" --version
+docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" "${IMAGE}" --version
 
 echo "==> [2/3] fetching + verifying test Measurement Set fixture"
 if [ ! -d "${FIXTURE_DIR}/${MS_DIR_NAME}" ]; then
@@ -40,7 +40,7 @@ WSCLEAN_ARGS=()
 while IFS= read -r line; do
   WSCLEAN_ARGS+=("${line}")
 done < <(grep -v '^[[:space:]]*#' "${ARGS_FILE}" | grep -v '^[[:space:]]*$')
-docker run --rm --platform linux/arm64 \
+docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
   -v "${FIXTURE_DIR}:/data:ro" \
   -v "${OUTPUT_DIR}:/results" \
   --entrypoint wsclean \

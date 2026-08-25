@@ -36,24 +36,24 @@ nested-sampling-r2d2-poc: build-r2d2 build-meqtrees build-polychord
 	scripts/run-nested-sampling-r2d2-poc.sh
 
 shell-wsclean:
-	docker run --rm -it --platform linux/arm64 \
+	docker run --rm -it --platform "$${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
 		-v "$$(pwd)/data:/data" -v "$$(pwd)/results:/results" \
 		--entrypoint bash ri-reproducibility/wsclean:v3.7
 
 shell-r2d2:
 	@. scripts/lib/r2d2-docker-thread-env.sh; \
-	docker run --rm -it --platform linux/arm64 \
+	docker run --rm -it --platform "$${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
 		"$${R2D2_DOCKER_ENV_FLAGS[@]}" \
 		-v "$$(pwd)/data:/data" -v "$$(pwd)/checkpoints:/checkpoints" -v "$$(pwd)/results:/results" \
 		--entrypoint bash ri-reproducibility/r2d2:cpu
 
 shell-meqtrees:
-	docker run --rm -it --platform linux/arm64 \
+	docker run --rm -it --platform "$${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
 		-v "$$(pwd)/data:/data" -v "$$(pwd)/results:/results" \
 		--entrypoint bash ri-reproducibility/meqtrees:kern-10
 
 shell-polychord:
-	docker run --rm -it --platform linux/arm64 \
+	docker run --rm -it --platform "$${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
 		-v "$$(pwd):$$(pwd)" -w "$$(pwd)" \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		--entrypoint bash ri-reproducibility/polychord:lite

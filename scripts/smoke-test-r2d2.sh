@@ -16,7 +16,7 @@ source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 mkdir -p "${RESULTS_DIR}/smoke-test-r2d2"
 
 run() {
-  docker run --rm --platform linux/arm64 \
+  docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
     "${R2D2_DOCKER_ENV_FLAGS[@]}" \
     -v "${CHECKPOINTS_DIR}:/checkpoints:ro" \
     -v "${RESULTS_DIR}/smoke-test-r2d2:/results" \
