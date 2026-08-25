@@ -11,8 +11,8 @@ added on top of that clean MeqTrees prediction.
 from __future__ import annotations
 
 import argparse
-import atexit
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -127,16 +127,53 @@ def run_makems(output_ms: Path) -> None:
 # fresh run's tables exactly (see --self-check). The parameter space has 20
 # (NTimes, NFrequencies) shapes, so a long-lived --serve worker hits this cache
 # for most of its evaluations.
-_SKELETONS: dict[str, Path] = {}
+#
+# The cache lives on disk, not in this process, because all of the run's ranks
+# `docker exec` their --serve worker into one shared meqtrees sidecar: they see
+# the same /dev/shm, so a shape any rank has built is a copy away for all the
+# others. A run only visits ~12 distinct shapes but does ~41 evaluations, so
+# per-process caches missed on most of them.
+# ponytail: no eviction - the sidecar is torn down at the end of the run and the
+# whole parameter space is ~20MB of skeletons. Add an LRU sweep if a longer-lived
+# container ever reuses one.
 _SKELETON_DIR: Path | None = None
 
 
 def skeleton_dir() -> Path:
     global _SKELETON_DIR
     if _SKELETON_DIR is None:
-        _SKELETON_DIR = Path(tempfile.mkdtemp(prefix="ms-skeleton-", dir=SCRATCH_ROOT))
-        atexit.register(shutil.rmtree, str(_SKELETON_DIR), True)
+        _SKELETON_DIR = Path(SCRATCH_ROOT or tempfile.gettempdir()) / "ms-skeletons"
+        _SKELETON_DIR.mkdir(parents=True, exist_ok=True)
     return _SKELETON_DIR
+
+
+def use_skeleton_cache(directory: Path | None) -> None:
+    """Point the cache at `directory`, or back at the default when None.
+
+    A fresh directory is how the self-checks force a rebuild.
+    """
+    global _SKELETON_DIR
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
+    _SKELETON_DIR = directory
+
+
+def publish_skeleton(built_ms: Path, cached: Path) -> None:
+    """Copy a fresh makems run into the shared cache under its final name.
+
+    Staged then renamed, so a concurrent worker either does not see the entry or
+    sees a complete one. Losing the rename race is normal - the winner's copy is
+    equivalent - so the loser just drops its own.
+    """
+    staging = Path(tempfile.mkdtemp(dir=skeleton_dir()))
+    try:
+        shutil.copytree(built_ms, staging / "ms", symlinks=True)
+        try:
+            os.rename(staging / "ms", cached)
+        except OSError:
+            pass
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_width_hz: float) -> None:
@@ -154,12 +191,10 @@ def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_wi
 def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace) -> None:
     """run_makems(), reusing a cached run for configs that differ only in frequency."""
     key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
-    cached = _SKELETONS.get(key)
-    if cached is None:
+    cached = skeleton_dir() / hashlib.sha256(key.encode()).hexdigest()[:32]
+    if not cached.exists():
         run_makems(output_ms)
-        cached = Path(tempfile.mkdtemp(dir=skeleton_dir())) / "ms"
-        shutil.copytree(output_ms, cached, symlinks=True)
-        _SKELETONS[key] = cached
+        publish_skeleton(output_ms, cached)
         return
     shutil.copytree(cached, output_ms, symlinks=True)
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
@@ -474,10 +509,12 @@ def self_check_skeleton_cache() -> None:
 
     for n_chan, minutes, start_hz, step_hz in ((2, 4.0, 1.0374e9, 1.3331e6), (6, 10.0, 1.1e9, 2.0e6)):
         with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
-            _SKELETONS.clear()
+            use_skeleton_cache(Path(scratch) / "cache")
             build(Path(scratch) / "seed" / "sim.ms", 1.0e9, 1.0e6, n_chan, minutes)
+            assert list(skeleton_dir().iterdir()), "the seed build published no cache entry"
             reused = build(Path(scratch) / "reused" / "sim.ms", start_hz, step_hz, n_chan, minutes)
-            _SKELETONS.clear()
+            assert "reused a cached" in (reused.parent / "makems.log").read_text(), "the second build missed the cache"
+            use_skeleton_cache(Path(scratch) / "cache-fresh")
             fresh = build(Path(scratch) / "fresh" / "sim.ms", start_hz, step_hz, n_chan, minutes)
             for sub in ("", "SPECTRAL_WINDOW", "ANTENNA", "FIELD", "DATA_DESCRIPTION", "POLARIZATION", "OBSERVATION", "FEED", "POINTING", "PROCESSOR", "STATE"):
                 with table(str(reused / sub if sub else reused), readonly=True, ack=False) as left, \
@@ -488,7 +525,7 @@ def self_check_skeleton_cache() -> None:
                         except RuntimeError:
                             continue  # optional array column left unset by makems
                         assert np.array_equal(values, expected), f"{sub or 'MAIN'}.{column} differs after a cached skeleton reuse"
-    _SKELETONS.clear()
+    use_skeleton_cache(None)
     print("MS skeleton cache self-check passed")
 
 

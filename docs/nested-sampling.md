@@ -287,11 +287,11 @@ Total wall time 10.2s (~0.16s/eval; ~2.5s on the default 8 ranks). That is
 `poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
 ~1.1s more on one rank and ~1.6s more on eight, for starting and removing the
-containers (8-rank end to end is ~3.6s). No fixed overhead of any
+containers (8-rank end to end is ~3.4s). No fixed overhead of any
 size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
-casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
-skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
+casacore table I/O, plus ~0.05s of `makems` on the ~12 evaluations of a run that
+miss the shared MS skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
 The rest is one-off startup - the simulate worker, meqserver and the one TDL
 compile, now started concurrently before the sampler runs rather than serially
 inside the first evaluation - plus PolyChord's own sampling and bookkeeping.
@@ -393,8 +393,22 @@ by comparing every column of every subtable across two frequency settings.
 the config text with those two lines removed, and on a hit copies the cached
 skeleton inside `/dev/shm` (~0.002s) and rewrites those six columns instead of
 running `makems`. Only `observation_minutes` and `channel_count` reach the key,
-so the parameter space has 20 distinct shapes and a long-lived `--serve` worker
-hits the cache for most of its evaluations.
+so the parameter space has 20 distinct shapes.
+
+The cache is a directory in `/dev/shm`, not a dict in the worker process, and
+that matters on the default 8 ranks: all eight `--serve` workers `docker exec`
+into the same meqtrees sidecar, so they share `/dev/shm`, and a shape any one of
+them has built is a `copytree` away for the other seven. A default run makes 41
+evaluations over only ~12 distinct shapes, so per-process caches missed on most
+of them - each rank sees ~5 evaluations and almost every one was a fresh
+`makems`. Entries are staged in a scratch directory and `rename`d into place
+under `sha256(key)`, so a concurrent worker either does not see an entry or sees
+a complete one; losing that race is normal and the loser just drops its copy.
+
+Measured over six interleaved A/B pairs of the default 8-rank run (rebuilding
+the meqtrees image between arms): summed simulate worker-seconds 5.38s -> 4.68s
+(-13%, 6/6 pairs) and end to end 3.65s -> 3.38s (-7%, 5/6 pairs). All 41
+evaluations matched on every science metric and `log(Z)` was bit-identical.
 
 `simulate_point_source_ms.py --self-check` is the guard on the rewrite formula
 (and on the forest reuse below): it builds each shape both ways and asserts a
