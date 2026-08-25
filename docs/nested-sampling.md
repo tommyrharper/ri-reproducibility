@@ -276,17 +276,18 @@ evaluations, not committed) profiles as:
 
 | Stage | Total | Share |
 |---|---:|---:|
-| WSClean image container (total) | 6.7s | 63.0% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.3s | 59.1% |
-| &nbsp;&nbsp;of which: container overhead | 0.41s | 3.9% |
-| MeqTrees simulate | 3.4s | 31.7% |
-| Metrics computation | 0.29s | 2.7% |
-| PolyChord overhead (unaccounted) | 0.29s | 2.7% |
+| WSClean image container (total) | 6.8s | 66.5% |
+| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.4s | 62.9% |
+| &nbsp;&nbsp;of which: container overhead | 0.37s | 3.6% |
+| MeqTrees simulate | 3.0s | 29.8% |
+| Metrics computation | 0.12s | 1.1% |
+| PolyChord overhead (unaccounted) | 0.26s | 2.5% |
 
-Total wall time 10.6s (~0.17s/eval; 3.6s on the default 8 ranks). That is
+Total wall time 10.2s (~0.16s/eval; ~2.5s on the default 8 ranks). That is
 `poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
-~1.2s more, for starting and removing the containers. No fixed overhead of any
+~1.1s more on one rank and ~1.6s more on eight, for starting and removing the
+containers (8-rank end to end is ~4.1s). No fixed overhead of any
 size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
@@ -471,6 +472,25 @@ identical `log(Z)` and identical per-evaluation artifact file sets. Only
 `wall_seconds` and `peak_memory_bytes` - the WSClean timing metrics - differ,
 as they do between any two runs.
 
+The worker starts its meqserver before it reads its first request. It used to
+be started lazily, inside `meqserver_session()`, which meant the ~0.3s of Timba
+imports plus server startup was paid *inside* evaluation one on every rank -
+and since PolyChord asks all ranks for their initial live points at once, all of
+it landed on the wall clock. Nothing has been asked of a freshly spawned worker,
+so `serve()` pays it up front instead, concurrently with the rank's own
+PolyChord import and setup. Interleaved A/B over 9 pairs (rebuilding the
+`meqtrees` image between arms) put the default 8-rank run at 4.52s before and
+4.11s after, -9%, with B faster in all 9 pairs and bit-identical `log(Z)` and
+per-evaluation objectives.
+
+That warm-up runs under `redirect_fds(os.devnull)`: Timba prints to fd 1 while
+it starts (`Qt not available, substituting proxy types for QObject` and
+friends), and fd 1 is the reply pipe, so without the redirect the first
+`{"returncode": ...}` line arrives behind three lines of chatter and
+`json.loads` fails. `--self-check` covers exactly that: it runs a worker,
+sends one deliberately invalid request and asserts its stdout is a single JSON
+line - verified to fail when the redirect is removed.
+
 One sharp edge: Timba registers `stop_default_mqs()` with `atexit`, but CPython
 joins non-daemon threads - including octopussy's event thread, which only exits
 once the server is stopped - *before* it runs `atexit` handlers, so a process
@@ -518,7 +538,7 @@ evaluation one. It was four independent startups run one after the other inside
 
 | Startup | Cost |
 |---|---:|
-| `simulate_point_source_ms.py --serve` worker (`docker exec`, Python, Timba, meqserver) | ~0.45s |
+| `simulate_point_source_ms.py --serve` worker (`docker exec`, Python, Timba, meqserver) | ~0.45s, now started eagerly by the worker itself |
 | `astropy.io.fits` import, on the first metrics call | ~0.20s |
 | `docker inspect` of each image's `ENTRYPOINT`, twice | ~0.05s |
 | the WSClean sidecar's `sh` (`docker exec`) | ~0.03s |

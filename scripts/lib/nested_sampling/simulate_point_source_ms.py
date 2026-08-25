@@ -432,6 +432,18 @@ def serve() -> None:
     process's original stdout.
     """
     replies = os.fdopen(os.dup(1), "w")
+    # meqserver_session() is otherwise first called inside request one, so every
+    # rank paid ~0.3s of Timba import and meqserver startup in front of its first
+    # evaluation - and because PolyChord asks all ranks for their initial live
+    # points at once, all of it landed on the wall clock. Nothing has been asked
+    # of this worker yet, so starting the server here instead overlaps it with
+    # the caller's own sampler startup. Under redirect_fds because Timba prints
+    # to fd 1 on startup, which is the reply pipe.
+    with redirect_fds(Path(os.devnull)):
+        try:
+            meqserver_session()
+        except Exception:
+            traceback.print_exc()
     for line in sys.stdin:
         request = json.loads(line)
         returncode = 0
@@ -512,6 +524,25 @@ def self_check_forest_reuse() -> None:
     print("forest reuse self-check passed")
 
 
+def self_check_serve_reply_stream() -> None:
+    """A worker's stdout must carry replies only, never meqserver startup chatter."""
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        worker = subprocess.Popen(
+            [sys.executable, __file__, "--serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        request = {
+            "argv": ["--not-a-real-option"],
+            "stdout": str(Path(scratch) / "out.log"),
+            "stderr": str(Path(scratch) / "err.log"),
+        }
+        stdout, _ = worker.communicate(json.dumps(request) + "\n", timeout=120)
+    lines = stdout.splitlines()
+    assert len(lines) == 1, f"worker stdout was not one reply line: {lines!r}"
+    assert json.loads(lines[0])["returncode"] != 0, "a bogus request should report failure"
+    print("serve reply stream self-check passed")
+
+
 if __name__ == "__main__":
     # --serve and --self-check take no other arguments, so they are checked before
     # argparse, which requires the full simulate argument set.
@@ -521,6 +552,7 @@ if __name__ == "__main__":
         elif sys.argv[1:] == ["--self-check"]:
             self_check_skeleton_cache()
             self_check_forest_reuse()
+            self_check_serve_reply_stream()
         else:
             simulate(parse_args())
     finally:
