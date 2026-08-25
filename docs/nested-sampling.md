@@ -30,10 +30,11 @@ top of that clean MeqTrees prediction.
 ## Run the PoC
 
 Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see WSClean below).
-Each target builds its required images first, starts one long-lived sidecar
-container per image, then runs the PolyChord container, which mounts the Docker
-socket and drives those sidecars (see "Long-lived sidecar containers, one per
-image" below).
+Each target builds its required images first and starts one long-lived sidecar
+container per image; the PolyChord container mounts the Docker socket and
+drives those sidecars. The WSClean target starts the PolyChord container the
+same way and `docker exec`s the run into it (see "The PolyChord container is a
+sidecar too" and "Long-lived sidecar containers, one per image" below).
 
 ### WSClean
 
@@ -282,8 +283,11 @@ evaluations, not committed) profiles as:
 | Metrics computation | 0.29s | 2.7% |
 | PolyChord overhead (unaccounted) | 0.29s | 2.7% |
 
-Total wall time 10.6s (~0.17s/eval; 3.6s on the default 8 ranks). No fixed
-overhead of any size is left in either sidecar: what remains is the science.
+Total wall time 10.6s (~0.17s/eval; 3.6s on the default 8 ranks). That is
+`poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
+inside the PolyChord container - the end-to-end `time` of the run script is
+~1.2s more, for starting and removing the containers. No fixed overhead of any
+size is left in either sidecar: what remains is the science.
 Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
 casacore table I/O, plus ~0.05s of `makems` on the evaluations that miss the MS
 skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
@@ -498,6 +502,49 @@ Docker gives a container 64MB of `/dev/shm` by default, which is ~30x the
 largest MS this parameter space produces; a bigger parameter space needs
 `--shm-size` on the sidecar. `SCRATCH_ROOT` falls back to the `tempfile`
 default when `/dev/shm` is not writable.
+
+#### The PolyChord container is a sidecar too
+
+The run scripts do not `docker run` the PolyChord container either: they start
+it detached alongside the two data-plane sidecars and enter it with `docker
+exec mpirun ...`. A `docker run` of this image costs ~0.7s of create, start,
+wait and `--rm` teardown; the `docker exec` costs ~0.03s, and the container's
+own startup now happens concurrently with the MeqTrees and WSClean ones.
+
+Two more things ride on that:
+
+- **A warm-up command.** The first process in a fresh container faults the
+  whole dynamic-linker path of whatever it runs through the image's overlay
+  mount. The real 8-rank `mpirun python3` exec measured 0.85s cold against
+  0.19s once one throwaway `python3 -c "import numpy, pypolychord"` had paid
+  that; `docker exec <container> true` first does *not* help, so it is the
+  libraries, not the container. `sidecar_launch` takes that warm-up after a
+  `--` and runs it inside the same background job as the `docker run`, so it is
+  hidden behind the other containers coming up. The MeqTrees and WSClean
+  sidecars are not worth warming: their cold-vs-warm first exec is 0.17s vs
+  0.13s and 0.09s vs 0.08s.
+- **The manifest write moved into the gap.** `scripts/record-environment.sh` is
+  ~0.4s of `git` and `docker image inspect`, and now runs between
+  `sidecar_launch` and `sidecar_wait` instead of after the containers are up.
+  `NS_SIDECARS` is exported by `sidecar_launch` rather than `sidecar_wait`
+  because the container names are known as soon as the launches are issued.
+
+Measured with four interleaved A/B runs of the default 8-rank configuration,
+end-to-end script wall time went 6.82s -> 5.29s (-22%); single-rank went 13.1s
+-> 12.2s (-7%). All eight runs produced identical `log(Z)` and byte-identical
+objectives for all 41 evaluations.
+
+Note which clock that is. `poc-summary.json`'s `total_wall_seconds` - the
+number the profile table above totals - is measured around
+`run_polychord()` *inside* the container, so it does not see container startup
+or teardown at all: it is 3.65s before and after this change. Only
+`time scripts/run-nested-sampling-poc.sh` shows it. Anything that moves fixed
+setup cost has to be measured end to end.
+
+Only the WSClean run script does this. The R2D2 one still uses
+`start_sidecars`, which is now a wrapper over `sidecar_launch` + `sidecar_wait`
+and behaves exactly as before; ~0.7s is not worth re-validating a PoC whose
+runs take 20 minutes.
 
 #### Long-lived sidecar containers, one per image
 

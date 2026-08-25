@@ -27,12 +27,12 @@ if [ -z "${DOCKER_SOCKET:-}" ]; then
     *) DOCKER_SOCKET="/var/run/docker.sock" ;;
   esac
 fi
-if ! docker info >/dev/null 2>&1; then
+# Doubles as the daemon-availability check: `docker info` costs ~0.08s and
+# there is no reason to pay for it twice.
+if ! HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null)"; then
   echo "FATAL: Docker daemon is not available" >&2
   exit 1
 fi
-
-HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -44,14 +44,20 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 
 # Shared by every rank, started here so the daemon is not hit by one
-# `docker run` per rank per image the moment the ranks come up.
+# `docker run` per rank per image the moment the ranks come up. The PolyChord
+# container joins them: `docker run` of it costs ~0.7s where `docker exec` into
+# a running one costs ~0.03s, and starting it here overlaps that cost with the
+# sidecars and the manifest write instead of paying it in front of rank 0.
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
-start_sidecars "${PLATFORM}" "${MEQTREES_IMAGE}" "${WSCLEAN_IMAGE}"
+sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}"
+sidecar_launch "${PLATFORM}" "${WSCLEAN_IMAGE}"
+sidecar_launch "${PLATFORM}" "${POLYCHORD_IMAGE}" \
+  -v "${DOCKER_SOCKET}:/var/run/docker.sock" \
+  -- python3 -c "import numpy, pypolychord"
+POLYCHORD_CONTAINER="${SIDECAR_NAME}"
 
 RUN_COMMAND=(
-  docker run --rm --platform "${PLATFORM}"
-  -v "${REPO_ROOT}:${REPO_ROOT}"
-  -v "${DOCKER_SOCKET}:/var/run/docker.sock"
+  docker exec
   -w "${REPO_ROOT}"
   -e REPO_ROOT="${REPO_ROOT}"
   -e MEQTREES_IMAGE="${MEQTREES_IMAGE}"
@@ -67,8 +73,8 @@ RUN_COMMAND=(
   -e OPENBLAS_NUM_THREADS=1
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-  --entrypoint mpirun
-  "${POLYCHORD_IMAGE}"
+  "${POLYCHORD_CONTAINER}"
+  mpirun
   --allow-run-as-root
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_wsclean_poc.py
@@ -89,6 +95,10 @@ scripts/record-environment.sh \
   --image "${POLYCHORD_IMAGE}" \
   --config docs/nested-sampling.md \
   -- "${RUN_COMMAND[@]}"
+
+# Only now: writing the manifest above is ~0.4s of `docker image inspect` and
+# `git` that overlaps with the containers coming up.
+sidecar_wait
 
 "${RUN_COMMAND[@]}"
 
