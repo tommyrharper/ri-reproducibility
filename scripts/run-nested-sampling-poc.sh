@@ -73,6 +73,9 @@ done
 # issued until `docker run` has returned, ~0.1s after the container's command
 # has already started, and head start is the entire point here.
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
+# The single quotes are deliberate: $1 and ${fifo} are for the container's
+# own sh, which gets the fifo directory as its argument below, not for this one.
+# shellcheck disable=SC2016
 sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}" -- sh -c '
   for fifo in "$1"/*.in; do
     [ -e "${fifo}" ] || continue
