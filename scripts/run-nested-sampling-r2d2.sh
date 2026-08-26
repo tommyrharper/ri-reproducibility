@@ -10,12 +10,12 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/r2d2-vlaa-${RUN_ID}}"
 
-if ! docker info >/dev/null 2>&1; then
+# Also the daemon-availability check - a dead daemon fails the sidecar launches
+# too, but this is where the run says so.
+if ! HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null)"; then
   echo "FATAL: Docker daemon is not available" >&2
   exit 1
 fi
-
-HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -32,6 +32,18 @@ if [ -z "${R2D2_OMP_THREADS:-}" ]; then
 fi
 
 mkdir -p "${OUTPUT_DIR}"
+# The workers are reached over FIFOs, so these have to sit on the bind mount the
+# rank's container and the sidecars both see - REPO_ROOT, which OUTPUT_DIR is
+# under by default. Point OUTPUT_DIR outside the repo and the ranks simply fall
+# back to starting their own workers.
+SIMULATE_FIFO_DIR="${OUTPUT_DIR}/.simulate-workers"
+R2D2_FIFO_DIR="${OUTPUT_DIR}/.r2d2-workers"
+rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+mkdir -p "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+for ((rank = 0; rank < NS_MPI_PROCS; rank++)); do
+  mkfifo "${SIMULATE_FIFO_DIR}/${rank}.in" "${SIMULATE_FIFO_DIR}/${rank}.out"
+  mkfifo "${R2D2_FIFO_DIR}/${rank}.in" "${R2D2_FIFO_DIR}/${rank}.out"
+done
 
 # Shared by every rank, started here so the daemon is not hit by one
 # `docker run` per rank per image the moment the ranks come up.
@@ -41,8 +53,47 @@ mkdir -p "${OUTPUT_DIR}"
 # checkpoint mount point stays `/checkpoints` so that the `ckpt_path` every
 # `poc-summary.json` records - and merge-nested-sampling-runs.py compares - is
 # not a host path.
-sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}"
-sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" -v "${CHECKPOINTS_DIR}:/checkpoints:ro"
+#
+# Both containers run one worker per rank as their own command instead of the
+# default `sleep infinity`. Neither worker can answer for a while after it
+# starts - ~0.5s of Timba, meqserver, the first TDL compile and the first
+# predict for simulate, ~1.3s of `import torch` and the R2D2 modules for
+# imaging - and PolyChord asks every rank for its first live point at the same
+# moment, so all of it used to land on the wall clock inside evaluation one
+# (measured ~2.3s of imaging on evaluation one against a ~0.25s steady state).
+# Started as the containers' commands it runs while the PolyChord container, the
+# manifest, mpirun and PolyChord's own setup still have to happen. It is the
+# command and not a `docker exec` because an exec cannot be issued until `docker
+# run` has returned, ~0.1s after the container's command has already started,
+# and head start is the entire point here.
+#
+# The single quotes are deliberate: $1, $2 and ${fifo} are for the container's
+# own sh, which gets its arguments below, not for this one.
+# shellcheck disable=SC2016
+sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}" -- sh -c '
+  for fifo in "$1"/*.in; do
+    [ -e "${fifo}" ] || continue
+    python3 /opt/ri-nested-sampling/simulate_point_source_ms.py \
+      --serve --fifo "${fifo%.in}" &
+  done
+  exec sleep infinity
+' sh "${SIMULATE_FIFO_DIR}"
+# The thread caps are on the container here rather than on a per-rank `docker
+# exec`: torch and finufft read them at import time and every rank gets the same
+# value anyway.
+# shellcheck disable=SC2016
+sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
+  -v "${CHECKPOINTS_DIR}:/checkpoints:ro" \
+  -e OMP_NUM_THREADS="${R2D2_OMP_THREADS}" \
+  -e MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
+  -e OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
+  -- sh -c '
+  for fifo in "$1"/*.in; do
+    [ -e "${fifo}" ] || continue
+    python3 "$2" --fifo "${fifo%.in}" &
+  done
+  exec sleep infinity
+' sh "${R2D2_FIFO_DIR}" "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py"
 sidecar_wait
 
 RUN_COMMAND=(
@@ -57,6 +108,8 @@ RUN_COMMAND=(
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
   -e NS_SIDECARS="${NS_SIDECARS}"
+  -e NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
+  -e NS_R2D2_FIFO_DIR="${R2D2_FIFO_DIR}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
   # host CPU, in every rank. Nothing here has a BLAS call big enough to want
   # them (the largest is a norm over a 128x128 image), so on a 20-CPU host the

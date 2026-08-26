@@ -8,7 +8,10 @@ process keeps both alive inside the shared R2D2 sidecar. A request is
 `{"argv": [...], "stdout": path, "stderr": path}` on stdin - everything the
 imaging run prints goes to those two files, exactly as the caller's `docker run`
 redirection did - and the reply is one JSON line on stdout,
-`{"returncode": int, "peak_memory_bytes": int}`.
+`{"returncode": int, "peak_memory_bytes": int}`. With `--fifo <base>` the same
+conversation happens over the FIFO pair `<base>.in` / `<base>.out` instead, which
+is what lets the run script start this worker as the R2D2 container's own command,
+before the rank that will use it exists.
 
 Upstream's `src/imager.py` has no importable entry point (its whole body sits
 under `if __name__ == "__main__"`), so each request re-runs that body with
@@ -66,7 +69,15 @@ def peak_memory_bytes() -> int:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 
-def serve() -> None:
+def serve(fifo_base: str | None = None) -> None:
+    """Answer imaging requests until the request stream ends.
+
+    `import torch` plus the R2D2 modules is ~1.3s, and with one worker per rank
+    every rank used to pay it at the same moment - inside evaluation one, where
+    it landed on the sampler's wall clock. Started over a FIFO pair as the R2D2
+    container's own command it runs while the PolyChord container, mpirun and
+    PolyChord's own setup still have to happen.
+    """
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
     # imager.py's own import block, minus the parts it re-imports for free.
@@ -79,8 +90,14 @@ def serve() -> None:
             import utils  # noqa: F401
         except Exception:
             traceback.print_exc()
-    replies = os.fdopen(os.dup(1), "w")
-    for line in sys.stdin:
+    if fifo_base is None:
+        requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
+    else:
+        # Same order the caller opens them in: opening a FIFO blocks until the
+        # other end is opened, so a mismatch here deadlocks both processes.
+        requests = open(f"{fifo_base}.in")
+        replies = open(f"{fifo_base}.out", "w")
+    for line in requests:
         request = json.loads(line)
         returncode = 0
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
@@ -134,8 +151,45 @@ def self_check_serve_reply_stream() -> None:
     print("r2d2 serve reply stream self-check passed")
 
 
+def self_check_serve_fifo() -> None:
+    """A `--fifo` worker must answer on its FIFO pair without deadlocking."""
+    import subprocess
+    import tempfile
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        imager = root / "imager.py"
+        imager.write_text("import sys\nsys.exit(int(sys.argv[1]))\n")
+        base = root / "0"
+        os.mkfifo(f"{base}.in")
+        os.mkfifo(f"{base}.out")
+        worker = subprocess.Popen(
+            [sys.executable, __file__, "--fifo", str(base)],
+            env={**os.environ, "R2D2_IMAGER": str(imager), "R2D2_HOME": str(root)},
+        )
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "the --fifo worker never opened its request pipe"
+                time.sleep(0.01)
+        os.set_blocking(write_fd, True)
+        with os.fdopen(write_fd, "w") as requests, open(f"{base}.out") as replies:
+            for code in (3, 0):
+                request = {"argv": [str(code)], "stdout": str(root / "o.log"), "stderr": str(root / "e.log")}
+                requests.write(json.dumps(request) + "\n")
+                requests.flush()
+                assert json.loads(replies.readline())["returncode"] == code
+        assert worker.wait(timeout=30) == 0, "the --fifo worker did not exit on EOF"
+    print("r2d2 serve fifo self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_serve_reply_stream()
+        self_check_serve_fifo()
     else:
-        serve()
+        serve(sys.argv[2] if sys.argv[1:2] == ["--fifo"] else None)

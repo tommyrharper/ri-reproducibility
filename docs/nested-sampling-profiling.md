@@ -426,8 +426,9 @@ is the guard, verified to fail (rather than hang) when `serve()`'s two opens are
 swapped. And the rank's side opens with `O_NONBLOCK`, which is how a FIFO
 write-open reports "no reader yet" (`ENXIO`) instead of blocking forever: it
 retries for 10s and then falls back to starting its own worker, so a missing or
-broken pool costs latency, not the run. That fallback is also what the R2D2 run
-uses - it does not set `NS_SIMULATE_FIFO_DIR` at all.
+broken pool costs latency, not the run. That fallback is what an `OUTPUT_DIR`
+outside `REPO_ROOT` gets, since the FIFOs are then not visible in both
+containers.
 
 One sharp edge: Timba registers `stop_default_mqs()` with `atexit`, but CPython
 joins non-daemon threads - including octopussy's event thread, which only exits
@@ -995,10 +996,51 @@ before and after, three runs each):
 
 What is left in evaluation one is what the overlap window could not cover: the
 imaging worker's `import torch` is ~1.3s and eight of them run at once, so
-`image_container_seconds` on the first evaluation is still ~1.2-1.7s. Closing
-that needs the workers started earlier still - as the R2D2 sidecar's own command
-over a FIFO pair per rank, the way `run-nested-sampling-poc.sh` already starts
-the simulate workers - which buys another container start of head room.
+`image_container_seconds` on the first evaluation is still ~1.2-1.7s. The next
+section closes that.
+
+### Both R2D2 worker pools are started by their container, not by the ranks
+
+`run-nested-sampling-poc.sh` had started the simulate workers as the meqtrees
+container's own command over a FIFO pair per rank since "The workers are started
+by the container, not by the ranks" above; `run-nested-sampling-r2d2-poc.sh` had
+neither pool, so even after `prewarm()` its ranks still started both workers
+themselves, inside a PolyChord container that does not exist until both sidecars
+are up.
+
+It now creates `<output-dir>/.simulate-workers` and `<output-dir>/.r2d2-workers`
+with one `<rank>.in`/`<rank>.out` pair each, and gives both sidecars a container
+command that spawns one worker per pair - the same
+`simulate_point_source_ms.py --serve --fifo <base>` line the WSClean script
+uses, and a new `r2d2_serve.py --fifo <base>`. The head start is everything the
+run still has to do afterwards: the manifest, the PolyChord `docker run`,
+`mpirun`, `import pypolychord` and PolyChord's own setup. Measured
+(`NS_MPI_PROCS=8`, 38 evaluations, identical evaluation set and log(Z) to the
+digit, three runs each):
+
+| | eval 1 `image_container_seconds` | eval 1 `simulate_seconds` | Sampler wall clock | End to end |
+|---|---:|---:|---:|---:|
+| ranks start both workers | ~2.0-2.7s | ~0.5-0.7s | 5.49s, 4.88s, 5.55s | 7.37s, 6.58s, 7.63s |
+| containers start both pools | ~0.24-0.28s | ~0.05-0.07s | 2.58s, 2.49s, 2.28s | 5.65s, 5.51s, 5.14s |
+
+Evaluation one is now indistinguishable from the steady state (imaging median
+0.242s, first-evaluation maximum 0.279s), so no R2D2 startup cost reaches the
+sampler's wall clock at all - it is 2.2x faster for that reason alone, and the
+~2.9s that remains end to end is image-build checks, `docker info`, the three
+container starts and the manifest, none of which is per-evaluation.
+
+Two details differ from the WSClean pool. `r2d2_serve.py` takes its thread caps
+(`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) from the
+container's `docker run -e` rather than from a per-rank `docker exec -e`, which
+loses nothing: torch and finufft read them at import time and every rank was
+given the same value anyway. And `serve()`'s FIFO branch does no extra warm-up
+before opening its pipes the way the simulate worker's `warm_forest()` does -
+the imports it already does eagerly are the whole cost, and the remaining
+per-request work needs the request's parameters.
+
+`_connect_shell_started_worker()` now takes the name of the environment variable
+holding its pool directory, so `simulate_worker()` and `r2d2_worker()` share it;
+both keep the "spawn my own if there is no pool" fallback unchanged.
 
 ### Sidecar containers run with `--network none`
 

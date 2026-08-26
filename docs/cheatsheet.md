@@ -104,8 +104,8 @@ run. A flag beats an exported variable, and both beat `defaults.toml`.
 | `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1 |
 | `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
 
-`NS_SIDECARS` and `NS_SIMULATE_FIFO_DIR` are wiring the run scripts export, not
-knobs to set by hand.
+`NS_SIDECARS`, `NS_SIMULATE_FIFO_DIR` and `NS_R2D2_FIFO_DIR` are wiring the run
+scripts export, not knobs to set by hand.
 
 ```bash
 ./ri search wsclean --nlive 8 --num-repeats 2 --max-ndead 12

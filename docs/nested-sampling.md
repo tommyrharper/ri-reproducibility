@@ -99,11 +99,14 @@ Before a full end-to-end run, validate the MS-to-`.mat` bridge:
 
 `run-nested-sampling-r2d2.sh` runs `NS_MPI_PROCS` PolyChord ranks
 concurrently, each with its own `r2d2_serve.py` imaging worker inside the
-shared R2D2 sidecar (see "R2D2 imaging runs in a long-lived worker" in
-[nested-sampling-profiling.md](nested-sampling-profiling.md)). Each worker is
-started with OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`,
-`MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set from the host's available CPU
-count, overridable via `R2D2_OMP_THREADS`. The previous image default of
+shared R2D2 sidecar and its own simulate worker inside the MeqTrees one. Both
+pools are started by their container's own command, over one FIFO pair per rank,
+before the PolyChord container exists (see "R2D2 imaging runs in a long-lived
+worker" and "The workers are started by the container, not by the ranks" in
+[nested-sampling-profiling.md](nested-sampling-profiling.md)). The workers get
+OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
+`OPENBLAS_NUM_THREADS`) set from the host's available CPU count, overridable via
+`R2D2_OMP_THREADS`. The previous image default of
 `OMP_NUM_THREADS=4` capped finufft/OpenMP work when the Docker VM exposed more
 CPUs than four. To avoid CPU oversubscription, the script defaults
 `R2D2_OMP_THREADS` to `host CPUs / NS_MPI_PROCS` (minimum `1`) when not set
@@ -135,10 +138,11 @@ yourself still works and still wins over `defaults.toml`; a flag wins over both.
 | `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
 | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `docker info` |
 | `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh`. Unset means `{}`: each rank starts its own container per image |
-| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by the WSClean run script only. No default: unset (as in the R2D2 run script) means each rank starts its own simulate worker |
+| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by both run scripts. No default: unset means each rank starts its own simulate worker |
+| `NS_R2D2_FIFO_DIR` | Same, for the pre-warmed `r2d2_serve.py` imaging workers | `${OUTPUT_DIR}/.r2d2-workers`, set by the R2D2 run script. No default: unset means each rank `docker exec`s its own imaging worker |
 
-`NS_SIDECARS` and `NS_SIMULATE_FIFO_DIR` are wiring the run scripts export for
-the containers they start, not knobs to set by hand.
+`NS_SIDECARS`, `NS_SIMULATE_FIFO_DIR` and `NS_R2D2_FIFO_DIR` are wiring the run
+scripts export for the containers they start, not knobs to set by hand.
 
 ## Parameter space
 
