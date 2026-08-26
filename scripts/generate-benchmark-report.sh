@@ -6,6 +6,7 @@
 #   scripts/generate-benchmark-report.sh nested-sampling
 #   LAST=1 scripts/generate-benchmark-report.sh nested-sampling
 #   RUN=results/nested-sampling-poc/<id> scripts/generate-benchmark-report.sh nested-sampling
+#   UPGRADE=1 scripts/generate-benchmark-report.sh nested-sampling
 #   FORCE=1 scripts/generate-benchmark-report.sh nested-sampling
 #
 # Outputs:
@@ -13,8 +14,9 @@
 #   benchmarks/nested-sampling-report/index.html   (links to every run)
 #   benchmarks/nested-sampling-report/<run>.html   (one page per run)
 #
-# Nested-sampling run pages that already exist are skipped; FORCE=1 (or a
-# RUN= selection) rebuilds them. The index is always rebuilt.
+# Each page records the report version that wrote it. Up-to-date pages are
+# skipped; UPGRADE=1 rebuilds the ones an older report version wrote, and
+# FORCE=1 (or a RUN= selection) rebuilds them all. The index is always rebuilt.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +28,7 @@ KIND="${1:-}"
 LIMIT="${LAST:-}"
 RUN_SEL="${RUN:-}"
 FORCE_SEL="${FORCE:-}"
+UPGRADE_SEL="${UPGRADE:-}"
 
 REPORT_ARGS=(--kind "${KIND}")
 
@@ -52,10 +55,13 @@ case "${KIND}" in
     if [[ -n "${FORCE_SEL}" ]]; then
       REPORT_ARGS+=(--force)
     fi
+    if [[ -n "${UPGRADE_SEL}" ]]; then
+      REPORT_ARGS+=(--upgrade)
+    fi
     ;;
   *)
     echo "usage: $0 {benchmarks|nested-sampling}" >&2
-    echo "  nested-sampling also reads LAST=N, RUN=<run dir or name> and FORCE=1" >&2
+    echo "  nested-sampling also reads LAST=N, RUN=<run dir or name>, UPGRADE=1 and FORCE=1" >&2
     exit 1
     ;;
 esac

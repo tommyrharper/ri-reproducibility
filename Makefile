@@ -71,12 +71,14 @@ benchmark-report:
 	scripts/generate-benchmark-report.sh benchmarks
 
 # One page per run in benchmarks/nested-sampling-report/, plus index.html.
-# Existing run pages are skipped; the index is always rebuilt.
-# LAST=N   -> only consider the newest N runs
+# Each page is stamped with the report version that wrote it; up-to-date pages
+# are skipped and the index is always rebuilt.
+# LAST=N    -> only consider the newest N runs
 # RUN=<dir> -> rebuild just that run's page
-# FORCE=1  -> rebuild pages that already exist
+# UPGRADE=1 -> rebuild pages written by an older report version
+# FORCE=1   -> rebuild every page in scope
 nested-sampling-report:
-	LAST="$(LAST)" RUN="$(RUN)" FORCE="$(FORCE)" scripts/generate-benchmark-report.sh nested-sampling
+	LAST="$(LAST)" RUN="$(RUN)" FORCE="$(FORCE)" UPGRADE="$(UPGRADE)" scripts/generate-benchmark-report.sh nested-sampling
 
 # Per-stage timing breakdown for a completed nested-sampling PoC run.
 # RUN=results/nested-sampling-poc/<run-dir> (required).
