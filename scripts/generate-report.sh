@@ -21,7 +21,8 @@
 # delete the whole report directory to force those to be drawn again. A rebuild
 # that draws nothing skips the astropy/matplotlib import as well. Pages that
 # do need building are built in parallel: each run is two concurrent tasks, its
-# corner plot and the rest of its page.
+# corner plot and the rest of its page, in two pools forked either side of the
+# astropy import so only the parent pays for it.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1474,6 +1474,7 @@ def main(argv=None):
     force = args.force or bool(run)
     skipped = 0
     outdated = 0
+    drawing = False
     todo = []
     for summary_path in nested_sampling_run_paths(limit=limit, run=run):
         run_name = os.path.basename(os.path.dirname(summary_path))
@@ -1488,27 +1489,37 @@ def main(argv=None):
             continue
         todo.append((summary_path, page_path, run_name))
         # A run with no page yet has no images either, so every worker would
-        # otherwise import matplotlib separately after the fork. Load it once
-        # here instead and let them inherit it. Only the matplotlib half: the
-        # corner plot is the longest task and never touches astropy or PIL, so
-        # those stay off the parent's serial prologue and load inside the (much
-        # shorter) eval-raster tasks instead.
+        # otherwise import the drawing stack separately after the fork. Load it
+        # once here instead and let them inherit it. Only the matplotlib half
+        # now, though: the corner plot is the longest task and never touches
+        # astropy or PIL, so those wait until the plots are already running
+        # (below) rather than sitting on the parent's serial prologue.
         if status == "missing":
+            drawing = True
             load_plot_libs()
 
     # Pages are independent, and within a page the corner plot and the eval
-    # rasters are independent too, so every run contributes two pool tasks that
-    # run concurrently. The image store is written with write-then-rename, so
-    # two workers racing on the same PNG is harmless.
+    # rasters are independent too, so every run contributes two concurrent
+    # tasks. Two pools rather than one, so that astropy can be imported in
+    # between: the corner plots - the build's critical path - are already
+    # running by then, and the eval-raster workers forked after it inherit the
+    # import instead of each repeating it while the plots want the CPU. The
+    # image store is written with write-then-rename, so two workers racing on
+    # the same PNG is harmless.
     written = len(todo)
     if todo:
-        with multiprocessing.Pool(min(2 * len(todo), os.cpu_count() or 1)) as pool:
-            plots = [pool.apply_async(likelihood_task, (item,)) for item in todo]
-            bodies = [pool.apply_async(run_body_task, (item,)) for item in todo]
-            for item, plot, body in zip(todo, plots, bodies):
-                write_run_page(
-                    item, body.get().replace(LIKELIHOOD_SLOT, likelihood_section(plot.get()))
-                )
+        workers = min(len(todo), os.cpu_count() or 1)
+        with multiprocessing.Pool(workers) as plot_pool:
+            plots = [plot_pool.apply_async(likelihood_task, (item,)) for item in todo]
+            if drawing:
+                load_render_libs()
+            with multiprocessing.Pool(workers) as body_pool:
+                bodies = [body_pool.apply_async(run_body_task, (item,)) for item in todo]
+                for item, plot, body in zip(todo, plots, bodies):
+                    write_run_page(
+                        item,
+                        body.get().replace(LIKELIHOOD_SLOT, likelihood_section(plot.get())),
+                    )
 
     # The index is cheap and must reflect every run on disk, so always rebuild it.
     write_html_doc(
