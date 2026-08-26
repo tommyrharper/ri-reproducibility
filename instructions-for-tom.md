@@ -21,19 +21,19 @@
 ## key commands
 
 ```zsh
-make anesthetic-gui
-make merge-nested-sampling
-make nested-sampling-poc
-make nested-sampling-r2d2-poc
-NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-poc
-NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-r2d2-poc
-make nested-sampling-report
-make nested-sampling-report LAST=1
-make nested-sampling-report RUN=wsclean-vlaa-merged-20260818T125606Z
-make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-20260817T120607Z
-make nested-sampling-report UPGRADE=1
-make nested-sampling-report FORCE=1
-make anesthetic-gui RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
-uv run scripts/plot-merged-likelihood-compare.py # make the overlay image
+./ri plot gui
+./ri merge
+./ri search wsclean
+./ri search r2d2
+./ri search wsclean --nlive 20 --num-repeats 5 --max-ndead 20
+./ri search r2d2 --nlive 20 --num-repeats 5 --max-ndead 20
+./ri report
+./ri report --last 1
+./ri report --run wsclean-vlaa-merged-20260818T125606Z
+./ri report --run results/nested-sampling-poc/r2d2-vlaa-20260817T120607Z
+./ri report --upgrade
+./ri report --force
+./ri plot gui results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
+./ri plot likelihood # the R2D2 vs WSClean overlay image
 
 ```

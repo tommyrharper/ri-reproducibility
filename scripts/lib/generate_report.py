@@ -1126,13 +1126,13 @@ def render_index_entry(poc_summary_path, status):
     if status == "missing":
         return (
             f'<div class="card index-entry index-entry-missing">{body}'
-            '<p class="empty">Page not generated yet - run <code>make nested-sampling-report</code>.</p></div>'
+            '<p class="empty">Page not generated yet - run <code>./ri report</code>.</p></div>'
         )
     stale_html = ""
     if status == "outdated":
         stale_html = (
             '<p class="empty">Page built by an older report version - run '
-            "<code>make nested-sampling-report UPGRADE=1</code>.</p>"
+            "<code>./ri report --upgrade</code>.</p>"
         )
     return (
         f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}">'
@@ -1254,9 +1254,9 @@ def main(argv=None):
         title="ri-reproducibility nested-sampling runs",
         subtitle=(
             "One page per run under <code>results/nested-sampling-poc/</code> - "
-            "regenerate with <code>make nested-sampling-report</code> "
-            "(up-to-date pages are skipped; <code>UPGRADE=1</code> rebuilds "
-            "the ones an older report version wrote, <code>FORCE=1</code> "
+            "regenerate with <code>./ri report</code> "
+            "(up-to-date pages are skipped; <code>--upgrade</code> rebuilds "
+            "the ones an older report version wrote, <code>--force</code> "
             f"rebuilds every page). Report version <code>{REPORT_VERSION}</code>."
         ),
         body=render_nested_sampling_index(

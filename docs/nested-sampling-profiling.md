@@ -50,7 +50,7 @@ The instrumentation runs automatically as part of every PoC run - there's no
 separate flag. To read the breakdown of a completed run:
 
 ```bash
-make nested-sampling-profile RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+./ri profile results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 # or directly:
 uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp> --json

@@ -11,13 +11,13 @@ visibilities.
 ## Images
 
 ```bash
-make build-wsclean
-make build-r2d2
-make build-meqtrees
-make build-polychord
+./ri build wsclean
+./ri build r2d2
+./ri build meqtrees
+./ri build polychord
 ```
 
-`make build` also builds the MeqTrees and PolyChord images.
+`./ri build` also builds the MeqTrees and PolyChord images.
 
 The MeqTrees image uses KERN 10 packages on Ubuntu 24.04. The VLA.A antenna table
 is unpacked from makems' bundled `VLAA_ANT` example inside the image, so antenna
@@ -41,7 +41,7 @@ per image" in
 ### WSClean
 
 ```bash
-make nested-sampling-poc
+./ri search wsclean
 ```
 
 Outputs:
@@ -53,13 +53,13 @@ results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>/
 Useful overrides:
 
 ```bash
-NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
-NS_MPI_PROCS=4 make nested-sampling-poc
-NS_METRIC=badness make nested-sampling-poc
-NS_METRIC=snr make nested-sampling-poc
-NS_METRIC=off_source_rms_jy make nested-sampling-r2d2-poc
-NS_METRIC=sigma_res make nested-sampling-r2d2-poc
-OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
+./ri search wsclean --nlive 8 --num-repeats 2 --max-ndead 12
+./ri search wsclean --mpi-procs 4
+./ri search wsclean --metric badness
+./ri search wsclean --metric snr
+./ri search r2d2 --metric off_source_rms_jy
+./ri search r2d2 --metric sigma_res
+./ri search wsclean --output-dir results/nested-sampling-poc/manual
 ```
 
 PolyChord likelihood evaluations run in parallel across MPI ranks inside the
@@ -74,7 +74,7 @@ step in this rank's already-running sidecar containers.
 ### R2D2
 
 ```bash
-make nested-sampling-r2d2-poc
+./ri search r2d2
 ```
 
 Outputs:
@@ -88,12 +88,12 @@ evaluation runs one MeqTrees simulate, one MeqTrees-hosted MS-to-`.mat`
 conversion, and one R2D2 imaging container.
 
 R2D2 requires pretrained checkpoints at `checkpoints/R2D2_A1/R2D2_UNet_N*.ckpt`
-(see `make fetch-r2d2-checkpoints` and `make smoke-test-r2d2`).
+(see `./ri fetch-checkpoints` and `./ri smoke r2d2`).
 
 Before a full end-to-end run, validate the MS-to-`.mat` bridge:
 
 ```bash
-scripts/check-ms-to-r2d2-mat.sh
+./ri smoke ms-to-mat                 # or: scripts/check-ms-to-r2d2-mat.sh
 ```
 
 `run-nested-sampling-r2d2-poc.sh` runs `NS_MPI_PROCS` PolyChord ranks
@@ -114,6 +114,11 @@ Both run scripts read the same `NS_*` variables and forward them to
 `polychord_wsclean_poc.py` / `polychord_r2d2_poc.py` as command-line flags.
 The defaults live in `defaults.toml` at the repository root, loaded by
 `scripts/lib/defaults.sh`, which both scripts source.
+
+`./ri search` exposes each of them as a flag (`--nlive`, `--num-repeats`,
+`--max-ndead`, `--seed`, `--metric`, `--mpi-procs`, `--omp-threads`,
+`--output-dir`) which sets the variable for that run. Setting the variable
+yourself still works and still wins over `defaults.toml`; a flag wins over both.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -247,7 +252,7 @@ Every PoC run times each stage of every likelihood evaluation automatically -
 there is no separate flag. To read the breakdown of a completed run:
 
 ```bash
-make nested-sampling-profile RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+./ri profile results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 # or directly:
 uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp> [--json]
 ```
@@ -313,13 +318,13 @@ View completed runs (settings, evidence, per-evaluation metrics and
 reconstructions) in the nested-sampling HTML report:
 
 ```bash
-make nested-sampling-report
+./ri report
 # open reports/nested-sampling-report/index.html
 
-make nested-sampling-report LAST=1
-make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
-make nested-sampling-report UPGRADE=1
-make nested-sampling-report FORCE=1
+./ri report --last 1
+./ri report --run results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
+./ri report --upgrade
+./ri report --force
 ```
 
 Each run gets its own page, `reports/nested-sampling-report/<run>.html`,
@@ -366,8 +371,8 @@ tempering) with human-readable parameter labels, run on the **host** (needs a
 display; not inside Docker/Colima):
 
 ```bash
-make anesthetic-gui
-make anesthetic-gui RUN=results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+./ri plot gui
+./ri plot gui results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
 ```
 
@@ -418,13 +423,13 @@ directory list.
 
 ```bash
 uv run scripts/merge-nested-sampling-runs.py
-make merge-nested-sampling
+./ri merge
 
 uv run scripts/merge-nested-sampling-runs.py \
   results/nested-sampling-poc/r2d2-vlaa-AAA \
   results/nested-sampling-poc/r2d2-vlaa-BBB
 
-make merge-nested-sampling RUNS="results/nested-sampling-poc/r2d2-vlaa-AAA results/nested-sampling-poc/r2d2-vlaa-BBB"
+./ri merge results/nested-sampling-poc/r2d2-vlaa-AAA results/nested-sampling-poc/r2d2-vlaa-BBB
 ```
 
 Writes `results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json`
@@ -437,7 +442,7 @@ agree, else become a list. Pooled `evaluations` keep source argument order,
 are renumbered `eval_id` `1..N` (originals kept as `source_eval_id` /
 `source_run`), and keep their original absolute `paths`.
 
-`make nested-sampling-report` and `make anesthetic-gui RUN=<merged-dir>` both
+`./ri report` and `./ri plot gui <merged-dir>` both
 treat the merged directory as a completed run - see the sections above.
 
 ## Deferred

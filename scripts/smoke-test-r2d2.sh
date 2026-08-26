@@ -76,11 +76,11 @@ SKIPPED: no pretrained checkpoints found at ${CKPT_DIR_A1}/R2D2_UNet_N1.ckpt
 Real inference was NOT attempted. This is expected out of the box.
 
 To run real inference:
-  1. make fetch-r2d2-checkpoints   (prints manual-download instructions -
+  1. ./ri fetch-checkpoints   (prints manual-download instructions -
      the checkpoint host is behind Cloudflare and cannot be curl'd)
   2. Extract the realisation you downloaded so that
      ${CKPT_DIR_A1}/R2D2_UNet_N<k>.ckpt exists for k = 1..25
-  3. Re-run this script, or: make smoke-test-r2d2
+  3. Re-run this script, or: ./ri smoke r2d2
 EOF
   echo "OK: smoke test stages 1-4 passed; stage 5 (inference) skipped as documented above."
   exit 0
