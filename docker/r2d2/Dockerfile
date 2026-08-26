@@ -73,8 +73,8 @@ RUN pip install -r requirements.txt
 # recorded here rather than silently patching requirements.txt itself.
 RUN pip install scipy
 
-# Posterior/corner plots for nested-sampling PoC cards in
-# scripts/lib/generate_benchmark_report.py (make benchmark-report).
+# Posterior/corner plots for nested-sampling run pages in
+# scripts/lib/generate_report.py (make nested-sampling-report).
 RUN pip install anesthetic
 
 # Resolved, fully-pinned environment snapshot - the "lock file" mandated

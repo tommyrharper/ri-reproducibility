@@ -2,7 +2,7 @@
         smoke-test smoke-test-wsclean smoke-test-r2d2 nested-sampling-poc nested-sampling-r2d2-poc \
         shell-wsclean shell-r2d2 shell-meqtrees shell-polychord \
         fetch-r2d2-checkpoints record-environment plot-fits \
-        benchmark-report nested-sampling-report nested-sampling-profile anesthetic-gui merge-nested-sampling \
+        nested-sampling-report nested-sampling-profile anesthetic-gui merge-nested-sampling \
         config clean disk-usage
 
 SHELL := /usr/bin/env bash
@@ -69,10 +69,7 @@ record-environment:
 plot-fits:
 	scripts/plot-fits.sh $(FILES)
 
-benchmark-report:
-	scripts/generate-benchmark-report.sh benchmarks
-
-# One page per run in benchmarks/nested-sampling-report/, plus index.html.
+# One page per run in reports/nested-sampling-report/, plus index.html.
 # Each page is stamped with the report version that wrote it; up-to-date pages
 # are skipped and the index is always rebuilt.
 # LAST=N    -> only consider the newest N runs
@@ -80,7 +77,7 @@ benchmark-report:
 # UPGRADE=1 -> rebuild pages written by an older report version
 # FORCE=1   -> rebuild every page in scope
 nested-sampling-report:
-	LAST="$(LAST)" RUN="$(RUN)" FORCE="$(FORCE)" UPGRADE="$(UPGRADE)" scripts/generate-benchmark-report.sh nested-sampling
+	LAST="$(LAST)" RUN="$(RUN)" FORCE="$(FORCE)" UPGRADE="$(UPGRADE)" scripts/generate-report.sh
 
 # Per-stage timing breakdown for a completed nested-sampling PoC run.
 # RUN=results/nested-sampling-poc/<run-dir> (required).

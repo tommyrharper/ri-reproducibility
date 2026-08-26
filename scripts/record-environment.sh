@@ -15,7 +15,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MANIFEST_DIR="${REPO_ROOT}/benchmarks/manifests"
+MANIFEST_DIR="${REPO_ROOT}/reports/manifests"
 mkdir -p "${MANIFEST_DIR}"
 
 TOOL=""

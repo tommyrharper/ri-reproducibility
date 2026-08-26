@@ -8,8 +8,8 @@
 #   docker build --platform linux/arm64 -f docker/wsclean/Dockerfile \
 #     --build-arg WSCLEAN_PORTABLE=ON -t ri-reproducibility/wsclean .
 #
-# Build (host-optimized, for benchmarking on THIS machine only - see
-# README.md "portable vs optimized builds"):
+# Build (host-optimized, runs on THIS machine's CPU only - see README.md
+# "Portable vs. host-optimized WSClean"):
 #   docker build --platform linux/arm64 -f docker/wsclean/Dockerfile \
 #     --build-arg WSCLEAN_PORTABLE=OFF -t ri-reproducibility/wsclean:native .
 

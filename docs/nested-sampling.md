@@ -314,7 +314,7 @@ reconstructions) in the nested-sampling HTML report:
 
 ```bash
 make nested-sampling-report
-# open benchmarks/nested-sampling-report/index.html
+# open reports/nested-sampling-report/index.html
 
 make nested-sampling-report LAST=1
 make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
@@ -322,7 +322,7 @@ make nested-sampling-report UPGRADE=1
 make nested-sampling-report FORCE=1
 ```
 
-Each run gets its own page, `benchmarks/nested-sampling-report/<run>.html`,
+Each run gets its own page, `reports/nested-sampling-report/<run>.html`,
 plus an `index.html` that lists every run on disk and links into them; each
 run page links back to the index. Rendering a run means reading its FITS
 output, so **run pages that are already up to date are skipped** - a re-run
@@ -330,7 +330,7 @@ only builds pages for new runs. The index is always rebuilt, so it picks up
 new runs immediately.
 
 Every page carries the version of the report generator that wrote it (the
-hash of `scripts/lib/generate_benchmark_report.py`, in a
+hash of `scripts/lib/generate_report.py`, in a
 `<meta name="report-version">` tag), so changing the card design, the CSS or
 anything else in that file makes existing pages **outdated** rather than
 silently stale. Outdated pages are still skipped by a plain run - it says how

@@ -27,7 +27,6 @@ make nested-sampling-poc
 make nested-sampling-r2d2-poc
 NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-poc
 NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-r2d2-poc
-make benchmark-report
 make nested-sampling-report
 make nested-sampling-report LAST=1
 make nested-sampling-report RUN=wsclean-vlaa-merged-20260818T125606Z

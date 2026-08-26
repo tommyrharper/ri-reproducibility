@@ -23,9 +23,9 @@ script records the SHA-256 of whatever you place here (self-recorded, not
 verified against an upstream value) into `checkpoints/CHECKSUMS.sha256`.
 
 Ten realisation archives exist (5 U-Net "A1_T2", 5 U-WDSR "A2_T2"), each
-~3.5-5.3 GB. For the smoke test / baseline you only need **one**
-realisation of one architecture, e.g. `R2D2_A1_T2_Realisation1.zip`
-(~5.25 GB):
+~3.5-5.3 GB. The smoke test and the R2D2 nested-sampling search both run
+with **one** realisation of one architecture (`ckpt_realisations: 1`),
+e.g. `R2D2_A1_T2_Realisation1.zip` (~5.25 GB):
 
 - https://researchportal.hw.ac.uk/files/146289536/R2D2_A1_T2_Realisation1.zip
 

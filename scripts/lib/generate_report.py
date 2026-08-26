@@ -1,12 +1,10 @@
 """
-Builds self-contained HTML reports from either:
-  - benchmarks/manifests/*.json (pipeline benchmark manifests), or
-  - results/nested-sampling-poc/*/poc-summary.json (nested-sampling PoC runs).
+Builds a self-contained HTML report from the nested-sampling runs under
+results/nested-sampling-poc/*/poc-summary.json - one page per run plus an index.
 
-Run via scripts/generate-benchmark-report.sh with --kind benchmarks|nested-sampling,
-which wraps this in the r2d2 image so it can reuse the pipeline's own
-astropy + matplotlib + anesthetic rather than requiring a host Python
-environment - same approach as scripts/plot-fits.sh.
+Run via scripts/generate-report.sh, which wraps this in the r2d2 image so it
+can reuse the imager's own astropy + matplotlib + anesthetic rather than
+requiring a host Python environment - same approach as scripts/plot-fits.sh.
 """
 import argparse
 import base64
@@ -31,7 +29,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REPO_ROOT = "/workspace/repo"
-MANIFEST_DIR = os.path.join(REPO_ROOT, "benchmarks/manifests")
 NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling-poc")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
@@ -119,10 +116,6 @@ def synthesize_truth_array(image_path, source_flux_jy):
     truth = np.zeros_like(image)
     truth[cy, cx] = source_flux_jy
     return truth
-
-
-def short(s, n=12):
-    return s[:n] if isinstance(s, str) else s
 
 
 def format_wall_duration(seconds):
@@ -795,125 +788,6 @@ def render_nested_sampling_run(poc_summary_path):
     """
 
 
-def render_manifest(manifest, path):
-    tool = manifest.get("tool", "?")
-    ts = manifest.get("timestamp_utc", "?")
-    repo = manifest.get("repository", {})
-    image = manifest.get("image", {})
-    host = manifest.get("host", {})
-    experiment = manifest.get("experiment", {})
-    results = experiment.get("results", {})
-
-    dirty_badge = (
-        '<span class="badge badge-warn">dirty tree</span>'
-        if repo.get("dirty_working_tree")
-        else '<span class="badge badge-ok">clean tree</span>'
-    )
-
-    header = f"""
-    <header class="card-header">
-      <h2>{html.escape(tool)} <span class="ts">{html.escape(ts)}</span></h2>
-      <div class="badges">
-        {dirty_badge}
-        <span class="badge">rev {html.escape(short(repo.get('git_revision', '?')))}</span>
-        <span class="badge">{html.escape(host.get('cpu_model', '?'))} ({html.escape(str(host.get('cpu_count', '?')))} cores)</span>
-        <span class="badge">{html.escape(image.get('container_architecture', '?'))}</span>
-      </div>
-    </header>
-    """
-
-    purpose_html = ""
-    if experiment.get("purpose"):
-        purpose_html = f'<p class="purpose">{html.escape(experiment["purpose"])}</p>'
-
-    results_html = ""
-    if results:
-        snr = results.get("snr_db")
-        paper_snr = results.get("paper_table4_mean_snr_db_R2D2_A1_T2")
-        headline = ""
-        if snr is not None:
-            headline = f'<div class="headline">SNR <strong>{snr:.2f} dB</strong>'
-            if paper_snr is not None:
-                delta = snr - paper_snr
-                sign = "+" if delta >= 0 else ""
-                headline += f' <span class="delta">({sign}{delta:.2f} dB vs. paper mean {paper_snr:.1f} dB)</span>'
-            headline += "</div>"
-        rows = "".join(
-            f"<tr><td>{html.escape(k)}</td><td>{fmt_value(v)}</td></tr>"
-            for k, v in metrics_table_rows(results)
-        )
-        results_html = f"""
-        <section>
-          <h3>Results</h3>
-          {headline}
-          <table class="kv">{rows}</table>
-        </section>
-        """
-
-    provenance_rows = "".join(
-        f"<tr><td>{html.escape(k)}</td><td>{fmt_value(v)}</td></tr>"
-        for k, v in metrics_table_rows(
-            {
-                k: v
-                for k, v in experiment.items()
-                if k not in ("results", "purpose")
-            }
-        )
-    )
-    provenance_html = ""
-    if provenance_rows:
-        provenance_html = f"""
-        <details>
-          <summary>Input / checkpoint provenance</summary>
-          <table class="kv">{provenance_rows}</table>
-        </details>
-        """
-
-    env_rows = "".join(
-        f"<tr><td>{html.escape(k)}</td><td>{fmt_value(v)}</td></tr>"
-        for k, v in metrics_table_rows(
-            {"image": image, "host": host, "config_file": manifest.get("config_file"),
-             "config_file_sha256": manifest.get("config_file_sha256")}
-        )
-    )
-    env_html = f"""
-    <details>
-      <summary>Environment</summary>
-      <table class="kv">{env_rows}</table>
-    </details>
-    """
-
-    gallery_html = ""
-    images_dir = results.get("output_images_dir")
-    if images_dir:
-        abs_dir = os.path.join(REPO_ROOT, images_dir)
-        fits_files = sorted(glob.glob(os.path.join(abs_dir, "*.fits")))
-        cards = []
-        for f in fits_files:
-            uri = render_fits_to_data_uri(f)
-            if uri is None:
-                continue
-            cards.append(
-                f'<figure><img src="{uri}" alt="{html.escape(os.path.basename(f))}">'
-                f'<figcaption>{html.escape(os.path.basename(f))}</figcaption></figure>'
-            )
-        if cards:
-            gallery_html = f'<section><h3>Output images</h3><div class="gallery">{"".join(cards)}</div></section>'
-
-    manifest_name = os.path.basename(path)
-    return f"""
-    <article class="card">
-      {header}
-      {purpose_html}
-      {results_html}
-      {gallery_html}
-      {provenance_html}
-      {env_html}
-      <p class="manifest-name">benchmarks/manifests/{html.escape(manifest_name)}</p>
-    </article>
-    """
-
-
 CSS = """
 :root {
   color-scheme: light dark;
@@ -1130,7 +1004,6 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .run-media-tabset .tab-panel { display: none; padding-top: 0.75rem; }
 .run-media-tabset input.tab-images-radio:checked ~ .tab-panel-images { display: block; }
 .run-media-tabset input.tab-likelihood-radio:checked ~ .tab-panel-likelihood { display: block; }
-.section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
 .nav { font-size: 0.9rem; margin: 0 0 1rem; }
 .nav a { color: inherit; opacity: 0.7; text-decoration: none; }
 .nav a:hover { opacity: 1; text-decoration: underline; }
@@ -1142,21 +1015,6 @@ a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transpare
 .index-evidence { font-size: 0.95rem; margin-top: 0.6rem; }
 .index-evidence .delta { font-size: 0.8rem; opacity: 0.7; margin-left: 0.35rem; }
 """
-
-
-def render_benchmark_body():
-    manifest_paths = sorted(glob.glob(os.path.join(MANIFEST_DIR, "*.json")), reverse=True)
-    cards = []
-    for p in manifest_paths:
-        with open(p) as f:
-            manifest = json.load(f)
-        cards.append(render_manifest(manifest, p))
-    if cards:
-        return "".join(cards)
-    return (
-        '<p class="empty">No manifests found in benchmarks/manifests/ yet - '
-        "run scripts/record-environment.sh as part of a benchmark run.</p>"
-    )
 
 
 def resolve_nested_sampling_summary(run):
@@ -1320,39 +1178,33 @@ def write_html_doc(out_path, title, subtitle, body):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--kind",
-        choices=("benchmarks", "nested-sampling"),
-        required=True,
-        help="Which report to generate.",
-    )
-    parser.add_argument(
         "out_path",
         nargs="?",
         default=None,
-        help="Output HTML file (benchmarks) or output directory (nested-sampling).",
+        help="Output directory for the report pages.",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Nested-sampling only: newest N runs (timestamp sort). Omit for all.",
+        help="Newest N runs (timestamp sort). Omit for all.",
     )
     parser.add_argument(
         "--run",
         default=None,
-        help="Nested-sampling only: one run directory or name under nested-sampling-poc/.",
+        help="One run directory or name under nested-sampling-poc/.",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Nested-sampling only: rebuild run pages that already exist.",
+        help="Rebuild run pages that already exist.",
     )
     parser.add_argument(
         "--upgrade",
         action="store_true",
         help=(
-            "Nested-sampling only: rebuild run pages written by an older report "
-            "version, leaving up-to-date ones alone."
+            "Rebuild run pages written by an older report version, leaving "
+            "up-to-date ones alone."
         ),
     )
     return parser.parse_args(argv)
@@ -1360,75 +1212,63 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.kind == "benchmarks":
-        out_path = args.out_path or "/workspace/out/report.html"
-        write_html_doc(
-            out_path,
-            title="ri-reproducibility benchmark report",
-            subtitle=(
-                "Generated from <code>benchmarks/manifests/</code> - "
-                "regenerate with <code>make benchmark-report</code>."
-            ),
-            body=render_benchmark_body(),
-        )
-    else:
-        out_dir = args.out_path or "/workspace/out/nested-sampling-report"
-        limit = args.limit
-        run = args.run
-        if limit is not None and run:
-            raise SystemExit("refuse: --limit and --run cannot be used together")
-        if limit is not None and limit < 1:
-            raise SystemExit("--limit must be >= 1")
-        os.makedirs(out_dir, exist_ok=True)
+    out_dir = args.out_path or "/workspace/out/nested-sampling-report"
+    limit = args.limit
+    run = args.run
+    if limit is not None and run:
+        raise SystemExit("refuse: --limit and --run cannot be used together")
+    if limit is not None and limit < 1:
+        raise SystemExit("--limit must be >= 1")
+    os.makedirs(out_dir, exist_ok=True)
 
-        # An explicit --run is a deliberate "rebuild this one" request.
-        force = args.force or bool(run)
-        written = 0
-        skipped = 0
-        outdated = 0
-        for summary_path in nested_sampling_run_paths(limit=limit, run=run):
-            run_name = os.path.basename(os.path.dirname(summary_path))
-            page_path = os.path.join(out_dir, run_page_name(run_name))
-            status = page_status(out_dir, run_name)
-            if status == "current" and not force:
-                skipped += 1
-                continue
-            if status == "outdated" and not (force or args.upgrade):
-                outdated += 1
-                skipped += 1
-                continue
-            write_html_doc(
-                page_path,
-                title=f"nested-sampling run: {run_name}",
-                subtitle=(
-                    f"Generated from <code>results/nested-sampling-poc/{html.escape(run_name)}/"
-                    "poc-summary.json</code>."
-                ),
-                body=index_nav_html() + render_nested_sampling_run(summary_path),
-            )
-            written += 1
-
-        # The index is cheap and must reflect every run on disk, so always rebuild it.
+    # An explicit --run is a deliberate "rebuild this one" request.
+    force = args.force or bool(run)
+    written = 0
+    skipped = 0
+    outdated = 0
+    for summary_path in nested_sampling_run_paths(limit=limit, run=run):
+        run_name = os.path.basename(os.path.dirname(summary_path))
+        page_path = os.path.join(out_dir, run_page_name(run_name))
+        status = page_status(out_dir, run_name)
+        if status == "current" and not force:
+            skipped += 1
+            continue
+        if status == "outdated" and not (force or args.upgrade):
+            outdated += 1
+            skipped += 1
+            continue
         write_html_doc(
-            os.path.join(out_dir, "index.html"),
-            title="ri-reproducibility nested-sampling runs",
+            page_path,
+            title=f"nested-sampling run: {run_name}",
             subtitle=(
-                "One page per run under <code>results/nested-sampling-poc/</code> - "
-                "regenerate with <code>make nested-sampling-report</code> "
-                "(up-to-date pages are skipped; <code>UPGRADE=1</code> rebuilds "
-                "the ones an older report version wrote, <code>FORCE=1</code> "
-                f"rebuilds every page). Report version <code>{REPORT_VERSION}</code>."
+                f"Generated from <code>results/nested-sampling-poc/{html.escape(run_name)}/"
+                "poc-summary.json</code>."
             ),
-            body=render_nested_sampling_index(
-                lambda p: page_status(out_dir, os.path.basename(os.path.dirname(p)))
-            ),
+            body=index_nav_html() + render_nested_sampling_run(summary_path),
         )
-        print(f"{written} run page(s) written, {skipped} skipped")
-        if outdated:
-            print(
-                f"{outdated} page(s) built by an older report version - rerun with "
-                "UPGRADE=1 to bring them up to the current design"
-            )
+        written += 1
+
+    # The index is cheap and must reflect every run on disk, so always rebuild it.
+    write_html_doc(
+        os.path.join(out_dir, "index.html"),
+        title="ri-reproducibility nested-sampling runs",
+        subtitle=(
+            "One page per run under <code>results/nested-sampling-poc/</code> - "
+            "regenerate with <code>make nested-sampling-report</code> "
+            "(up-to-date pages are skipped; <code>UPGRADE=1</code> rebuilds "
+            "the ones an older report version wrote, <code>FORCE=1</code> "
+            f"rebuilds every page). Report version <code>{REPORT_VERSION}</code>."
+        ),
+        body=render_nested_sampling_index(
+            lambda p: page_status(out_dir, os.path.basename(os.path.dirname(p)))
+        ),
+    )
+    print(f"{written} run page(s) written, {skipped} skipped")
+    if outdated:
+        print(
+            f"{outdated} page(s) built by an older report version - rerun with "
+            "UPGRADE=1 to bring them up to the current design"
+        )
 
 
 def _self_check_log_evidence_parser():
@@ -1510,11 +1350,11 @@ def _self_check_run_page_name():
 
 
 if __name__ == "__main__":
-    if os.environ.get("GENERATE_BENCHMARK_REPORT_SELF_CHECK") == "1":
+    if os.environ.get("GENERATE_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
         _self_check_profiling()
         _self_check_page_status()
-        print("generate_benchmark_report self-check passed")
+        print("generate_report self-check passed")
     else:
         main()

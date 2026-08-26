@@ -1,5 +1,7 @@
 # Project agent memory
 
+**This repo's purpose: run nested sampling (PolyChord) over the parameter space of R2D2 and WSClean to find their failure modes.** Everything else (Docker images, smoke tests, pinned upstream revisions) exists to serve that. It is not a paper-reproduction or benchmarking harness.
+
 This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
 
 - Nested-sampling PoC infrastructure, run commands, and the per-stage profiler (`make nested-sampling-profile RUN=...`) are documented in `docs/nested-sampling.md`; use those Makefile/script entrypoints instead of ad hoc container wiring.
