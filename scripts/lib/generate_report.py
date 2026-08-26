@@ -447,6 +447,52 @@ def memoize_matplotlib_tick_updates():
     return True
 
 
+# anesthetic's labelled frames resolve every `df[key]` by trying the lookup
+# against each of four label-stripped views and keeping the best answer, and
+# each attempt rebuilds the axis' paramname -> label mapping from scratch. Over
+# one corner plot that is ~420 rebuilds of a handful of Series, so cache them.
+# The mapping is a pure function of the pandas Index it is read off, and an
+# Index is immutable - anything that adds or drops a column swaps in a new one,
+# which misses the cache. The entry holds the Index alive so its id() cannot be
+# recycled under the key. fill=False is deliberately not cached: that is the
+# variant set_label() mutates in place.
+# Best-effort: if anesthetic moves the private class, the plot is just slower.
+_labels_map_memoized = False
+
+
+def memoize_anesthetic_labels_map():
+    global _labels_map_memoized
+    if _labels_map_memoized:
+        return True
+    _labels_map_memoized = True
+    try:
+        from anesthetic.labelled_pandas import _LabelledObject
+
+        get_labels_map = _LabelledObject.get_labels_map
+    except (ImportError, AttributeError):
+        return False
+
+    cache = {}
+
+    def memoized(self, axis=0, fill=True):
+        try:
+            index = self._get_axis(axis)
+        except (ValueError, TypeError):
+            # Multi-axis and axis=None lookups have no single index; anesthetic
+            # relies on the raised error, so leave those alone.
+            return get_labels_map(self, axis, fill)
+        if not fill:
+            return get_labels_map(self, axis, fill)
+        key = (id(index), self._labels)
+        hit = cache.get(key)
+        if hit is None:
+            hit = cache[key] = (index, get_labels_map(self, axis, fill))
+        return hit[1]
+
+    _LabelledObject.get_labels_map = memoized
+    return True
+
+
 def _render_likelihood_png(run_dir, param_names):
     load_plot_libs()
     try:
@@ -456,6 +502,7 @@ def _render_likelihood_png(run_dir, param_names):
 
     dedupe_pandas_tick_housekeeping()
     memoize_matplotlib_tick_updates()
+    memoize_anesthetic_labels_map()
 
     try:
         samples = weight_by_likelihood(load_nested_samples(run_dir))
@@ -1809,6 +1856,27 @@ def _self_check_tick_memo():
     plt.close(fig)
 
 
+def _self_check_labels_map_memo():
+    """The labels-map memo must hit while the frame's columns are unchanged and
+    miss once a new column swaps the Index out, so a stale mapping can't stick."""
+    if not memoize_anesthetic_labels_map():
+        return
+    from anesthetic.labelled_pandas import LabelledDataFrame
+    from pandas import MultiIndex
+
+    columns = MultiIndex.from_tuples(
+        [("a", "$a$"), ("b", "$b$")], names=["params", "labels"]
+    )
+    df = LabelledDataFrame([[0.0, 1.0]], columns=columns)
+    first = df.get_labels_map(axis=1)
+    assert list(first) == ["$a$", "$b$"]
+    assert df.get_labels_map(axis=1) is first, "memo missed on an unchanged frame"
+    df[("c", "$c$")] = 2.0
+    second = df.get_labels_map(axis=1)
+    assert second is not first, "memo hit after a column was added"
+    assert list(second) == ["$a$", "$b$", "$c$"]
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1825,6 +1893,7 @@ if __name__ == "__main__":
         _self_check_page_status()
         _self_check_tick_housekeeping()
         _self_check_tick_memo()
+        _self_check_labels_map_memo()
         print("generate_report self-check passed")
     else:
         main()
