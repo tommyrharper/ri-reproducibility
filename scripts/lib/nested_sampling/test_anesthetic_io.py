@@ -91,7 +91,10 @@ def main() -> None:
         import matplotlib
 
         matplotlib.use("Agg")
-        axes = like.plot_2d(PARAM_NAMES[:2])
+        # ncompress=False for the same reason generate_report.py sets it: on a
+        # chain this small anesthetic's triangular compression intermittently
+        # builds a probability vector that does not sum to 1.
+        axes = like.plot_2d(PARAM_NAMES[:2], ncompress=False)
         assert axes is not None
 
         print("OK: merged mismatched-.paramnames sources without duplicate columns")
