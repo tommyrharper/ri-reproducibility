@@ -735,9 +735,12 @@ containers are up. `NS_SIDECARS` is exported by `sidecar_launch` rather than
 are issued.
 
 The `docker info` that resolves `HOST_CPUS` (and doubles as the
-daemon-availability check) now runs *after* the launches for the same reason:
-nothing between the launches and `sidecar_wait` touches a sidecar, and shell
-markers put `launches-issued` at ~0.005s after script start instead of ~0.075s.
+daemon-availability check) moved *after* the launches for the same reason -
+nothing between the launches and `sidecar_wait` touches a sidecar - which put
+`launches-issued` at ~0.005s after script start instead of ~0.075s. The WSClean
+script has since moved it back in front of them, because the FIFO pairs the
+meqtrees container's command globs for have to exist first (see "The workers are
+started by the container, not by the ranks" above).
 
 Measured with four interleaved A/B runs of the default 8-rank configuration,
 end-to-end script wall time went 6.82s -> 5.29s (-22%); single-rank went 13.1s
