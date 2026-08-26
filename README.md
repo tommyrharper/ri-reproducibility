@@ -302,9 +302,10 @@ build stages only - grep any `Dockerfile` for the full list. To verify
 nothing leaked: `which wsclean` and `python3 -c "import torch"` (system
 Python, not a venv you made for something else) should both fail outside
 a container built from this repo. The only host-side tools required are
-Docker, Git, `uv` and a Python 3 for `./ri` itself - and `uv` installs nothing into the system Python:
-the scripts invoke it as `uv run --no-project`, which uses a
-self-contained interpreter under `uv`'s own cache.
+Docker, Git, `uv` and a Python 3 for `./ri` itself - and `uv` installs
+nothing into the system Python: the scripts invoke it as `uv run
+--no-project`, which uses a self-contained interpreter under `uv`'s own
+cache.
 
 ## 12. Reclaiming disk space
 
