@@ -6,12 +6,15 @@
 #   scripts/generate-benchmark-report.sh nested-sampling
 #   LAST=1 scripts/generate-benchmark-report.sh nested-sampling
 #   RUN=results/nested-sampling-poc/<id> scripts/generate-benchmark-report.sh nested-sampling
+#   FORCE=1 scripts/generate-benchmark-report.sh nested-sampling
 #
 # Outputs:
 #   benchmarks/report.html
-#   benchmarks/nested-sampling-report.html
-#   benchmarks/nested-sampling-report-last.html       (LAST=N)
-#   benchmarks/nested-sampling-report-<run>.html      (RUN=)
+#   benchmarks/nested-sampling-report/index.html   (links to every run)
+#   benchmarks/nested-sampling-report/<run>.html   (one page per run)
+#
+# Nested-sampling run pages that already exist are skipped; FORCE=1 (or a
+# RUN= selection) rebuilds them. The index is always rebuilt.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,47 +22,43 @@ IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
 KIND="${1:-}"
 LIMIT="${LAST:-}"
 RUN_SEL="${RUN:-}"
+FORCE_SEL="${FORCE:-}"
+
+REPORT_ARGS=(--kind "${KIND}")
 
 case "${KIND}" in
   benchmarks)
-    OUT_NAME="report.html"
+    OUT_REL="report.html"
+    REPORT_ARGS+=("/workspace/out/${OUT_REL}")
     ;;
   nested-sampling)
     if [[ -n "${LIMIT}" && -n "${RUN_SEL}" ]]; then
       echo "refuse: LAST= and RUN= cannot be used together" >&2
       exit 1
     fi
+    OUT_REL="nested-sampling-report/index.html"
+    # Create on the host so the directory isn't owned by the container's root.
+    mkdir -p "${REPO_ROOT}/benchmarks/nested-sampling-report"
+    REPORT_ARGS+=("/workspace/out/nested-sampling-report")
+    if [[ -n "${LIMIT}" ]]; then
+      REPORT_ARGS+=(--limit "${LIMIT}")
+    fi
     if [[ -n "${RUN_SEL}" ]]; then
-      run_base="${RUN_SEL%/}"
-      run_base="${run_base##*/}"
-      if [[ "${run_base}" == "poc-summary.json" ]]; then
-        run_base="$(basename "$(dirname "${RUN_SEL}")")"
-      fi
-      run_base="${run_base//[^A-Za-z0-9._-]/_}"
-      OUT_NAME="nested-sampling-report-${run_base}.html"
-    elif [[ -n "${LIMIT}" ]]; then
-      OUT_NAME="nested-sampling-report-last.html"
-    else
-      OUT_NAME="nested-sampling-report.html"
+      REPORT_ARGS+=(--run "${RUN_SEL}")
+    fi
+    if [[ -n "${FORCE_SEL}" ]]; then
+      REPORT_ARGS+=(--force)
     fi
     ;;
   *)
     echo "usage: $0 {benchmarks|nested-sampling}" >&2
-    echo "  nested-sampling also reads LAST=N and RUN=<run dir or name>" >&2
+    echo "  nested-sampling also reads LAST=N, RUN=<run dir or name> and FORCE=1" >&2
     exit 1
     ;;
 esac
 
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
-
-REPORT_ARGS=(--kind "${KIND}" "/workspace/out/${OUT_NAME}")
-if [[ -n "${LIMIT}" ]]; then
-  REPORT_ARGS+=(--limit "${LIMIT}")
-fi
-if [[ -n "${RUN_SEL}" ]]; then
-  REPORT_ARGS+=(--run "${RUN_SEL}")
-fi
 
 docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
@@ -69,4 +68,4 @@ docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
   "${IMAGE}" /workspace/repo/scripts/lib/generate_benchmark_report.py \
   "${REPORT_ARGS[@]}"
 
-echo "OK: open ${REPO_ROOT}/benchmarks/${OUT_NAME} in a browser"
+echo "OK: open ${REPO_ROOT}/benchmarks/${OUT_REL} in a browser"
