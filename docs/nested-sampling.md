@@ -352,11 +352,13 @@ is most of what is left of a page-only rebuild. The index is always rebuilt, so
 it picks up new runs immediately.
 
 Run pages are built in parallel, and each run splits into two concurrent
-tasks - the anesthetic corner plot and the rest of the page, which are roughly
-half the cost each - so the pool has twice as many pages to overlap. The
-container is given a single BLAS thread (the work is matplotlib rasterisation, not linear
-algebra, and multi-threaded BLAS only oversubscribes the CPU). Override with
-`R2D2_OMP_THREADS=`.
+tasks - the anesthetic corner plot and the rest of the page - so the pool has
+twice as many pages to overlap. The container is given a single BLAS thread
+(the work is matplotlib rasterisation, not linear algebra, and multi-threaded
+BLAS only oversubscribes the CPU). Override with `R2D2_OMP_THREADS=`. It also
+runs with `--network none`: the report only reads the repo and writes
+`reports/`, and setting up the container's network is ~0.3s of every
+invocation - most of the cost of a build that draws nothing.
 
 Every page carries the version of the report generator that wrote it (the
 hash of `scripts/lib/generate_report.py`, in a

@@ -64,7 +64,9 @@ R2D2_OMP_THREADS="${R2D2_OMP_THREADS:-1}"
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 
-docker run --rm --platform "${PLATFORM}" \
+# --network none: the report only reads the repo and writes reports/, and
+# skipping the container network setup is ~0.3s of every invocation.
+docker run --rm --network none --platform "${PLATFORM}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   -v "${REPO_ROOT}/reports:/workspace/out:rw" \
