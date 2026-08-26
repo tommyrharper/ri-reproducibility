@@ -170,9 +170,10 @@ Fixed hyperparameters (not searched) on every evaluation:
 R2D2-RI reads visibilities from a MATLAB `.mat` file via `load_data_to_tensor()`
 in the upstream `src/utils.py`. The nested-sampling simulator produces a CASA
 Measurement Set (`sim.ms`) that WSClean consumes directly. The R2D2 run adds
-`scripts/lib/nested_sampling/ms_to_r2d2_mat.py`, which runs inside the MeqTrees
-image (python3-casacore plus scipy) and writes the minimal field set R2D2 loads
-without flag metadata:
+`scripts/lib/nested_sampling/ms_to_r2d2_mat.py`, which the rank's simulate
+worker runs in-process inside the MeqTrees sidecar (python3-casacore plus
+scipy), and which writes the minimal field set R2D2 loads without flag
+metadata:
 
 | Field | Meaning |
 |---|---|

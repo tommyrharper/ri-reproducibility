@@ -20,6 +20,7 @@ from common import (
     cube_like_from_theta,
     cube_to_params,
     compute_image_metrics,
+    convert_ms_to_mat,
     load_evaluations_from_dir,
     mpi_rank,
     params_key,
@@ -30,7 +31,6 @@ from common import (
     self_check_metric_resolution,
     self_check_profiling,
     self_check_r2d2_thread_env,
-    sidecar_run,
     simulate_measurement_set,
     stable_seed,
     summarize_profiling,
@@ -111,30 +111,19 @@ def evaluate(
         })
 
     mat_path = eval_dir / "r2d2_data.mat"
-    convert_stdout = eval_dir / "convert.stdout.log"
-    convert_stderr = eval_dir / "convert.stderr.log"
-    # Runs in the MeqTrees sidecar the simulate step already keeps warm: a fresh
-    # `docker run` of this image costs ~0.55s against ~0.12s for a `docker exec`,
-    # and the conversion itself is a fraction of a second.
-    convert_cmd = [
-        "python3",
-        "/opt/ri-nested-sampling/ms_to_r2d2_mat.py",
-        "--ms-path",
-        str(ms_path),
-        "--mat-path",
-        str(mat_path),
-    ]
+    # ms_to_r2d2_mat.py argv for the simulate worker that just wrote this MS (see
+    # convert_ms_to_mat): its own `docker exec` cost ~0.15s, of which only ~0.01s
+    # was the conversion and the rest a fresh interpreter and its imports.
+    convert_cmd = ["--ms-path", str(ms_path), "--mat-path", str(mat_path)]
     convert_start = time.perf_counter()
-    convert_result = sidecar_run(
-        args.meqtrees_image, args.platform, eval_dir, convert_cmd, convert_stdout, convert_stderr
-    )
+    convert_returncode = convert_ms_to_mat(convert_cmd, eval_dir, args.meqtrees_image, args.platform)
     convert_seconds = time.perf_counter() - convert_start
-    if convert_result.returncode != 0:
+    if convert_returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
-            "error": f"ms_to_r2d2_mat failed with exit {convert_result.returncode}",
+            "error": f"ms_to_r2d2_mat failed with exit {convert_returncode}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
             "commands": {"simulate": sim_cmd, "ms_to_r2d2_mat": convert_cmd},
             "timing": {"simulate_seconds": simulate_seconds, "convert_seconds": convert_seconds},
@@ -245,7 +234,7 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_sidecar_run = globals()["sidecar_run"]
+    original_convert = globals()["convert_ms_to_mat"]
     original_run_r2d2 = globals()["run_r2d2_imaging"]
     original_simulate = globals()["simulate_measurement_set"]
 
@@ -278,8 +267,8 @@ def self_check_failure_record_persistence() -> None:
             eval_dir.mkdir(parents=True, exist_ok=False)
             return eval_dir / "sim.ms", ["simulate"], None
 
-        def successful_convert(*args: Any, **kwargs: Any) -> argparse.Namespace:
-            return argparse.Namespace(returncode=0, wall_seconds=0.1, peak_memory_bytes=0)
+        def successful_convert(*args: Any, **kwargs: Any) -> int:
+            return 0
 
         def successful_r2d2(*args: Any, **kwargs: Any) -> argparse.Namespace:
             return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
@@ -288,7 +277,7 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["sidecar_run"] = successful_convert
+        globals()["convert_ms_to_mat"] = successful_convert
         globals()["run_r2d2_imaging"] = successful_r2d2
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,7 +296,7 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["sidecar_run"] = original_sidecar_run
+        globals()["convert_ms_to_mat"] = original_convert
         globals()["run_r2d2_imaging"] = original_run_r2d2
         globals()["simulate_measurement_set"] = original_simulate
 

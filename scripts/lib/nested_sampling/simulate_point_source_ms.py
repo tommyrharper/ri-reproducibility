@@ -533,6 +533,25 @@ def warm_forest() -> None:
         run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
 
 
+def handle_request(request: dict) -> None:
+    """Run one request's work in this process.
+
+    The MS-to-`.mat` convert used to be its own `docker exec` of
+    ms_to_r2d2_mat.py at ~0.15s, of which ~0.01s was the conversion - the rest
+    was the exec, a fresh interpreter and the numpy/casacore/scipy imports.
+    This worker has all of that live and has just written the MS, so the R2D2
+    PoC asks it to convert too.
+    """
+    if request.get("action") == "convert":
+        # Imported on first use, not at module scope: only the R2D2 PoC
+        # converts, and the WSClean PoC's worker should not pay for scipy.
+        from ms_to_r2d2_mat import main as convert
+
+        convert(request["argv"])
+    else:
+        simulate(parse_args(request["argv"]))
+
+
 def serve(fifo_base: str | None = None) -> None:
     """Run one simulate per JSON request line, reusing this process.
 
@@ -540,7 +559,8 @@ def serve(fifo_base: str | None = None) -> None:
     and meqserver startup that every evaluation repeated. A request is
     `{"argv": [...], "stdout": path, "stderr": path}`; everything the run prints
     goes to those two files, exactly as the caller's `docker exec` redirection
-    did, and the reply is one JSON line - `{"returncode": int}`.
+    did, and the reply is one JSON line - `{"returncode": int}`. A request with
+    `"action": "convert"` runs handle_request()'s other entry point instead.
 
     Requests arrive on stdin and replies go to the process's original stdout,
     unless `fifo_base` is given: then they arrive on `<fifo_base>.in` and the
@@ -575,7 +595,7 @@ def serve(fifo_base: str | None = None) -> None:
         returncode = 0
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             try:
-                simulate(parse_args(request["argv"]))
+                handle_request(request)
             except Exception:
                 traceback.print_exc()
                 returncode = 1
