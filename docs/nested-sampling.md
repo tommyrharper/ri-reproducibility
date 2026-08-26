@@ -341,8 +341,10 @@ redraws nothing that its inputs still match - only deleting the report
 directory forces a full redraw. The index is always rebuilt, so it picks up
 new runs immediately.
 
-Run pages are built in parallel, one process per page, and the container is
-given a single BLAS thread (the work is matplotlib rasterisation, not linear
+Run pages are built in parallel, and each run splits into two concurrent
+tasks - the anesthetic corner plot and the rest of the page, which are roughly
+half the cost each - so the pool has twice as many pages to overlap. The
+container is given a single BLAS thread (the work is matplotlib rasterisation, not linear
 algebra, and multi-threaded BLAS only oversubscribes the CPU). Override with
 `R2D2_OMP_THREADS=`.
 
