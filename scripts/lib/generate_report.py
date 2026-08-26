@@ -402,6 +402,51 @@ def dedupe_pandas_tick_housekeeping():
     return True
 
 
+# Drawing the corner plot makes matplotlib recompute every axis' tick positions
+# and label text from scratch ~930 times: once per axis per layout pass, and the
+# figure gets several (tight_layout, the tight-bbox draw, the render draw, plus
+# each spine and axis-label placement in between). That is a third of the plot's
+# cost for a pure function of the axis' view interval, data interval and its
+# locator/formatter pair, so cache the result per axis against exactly those.
+# Reading get_view_interval() to build the key keeps _update_ticks' own viewLim
+# un-staling side effect, which the shared diagonal/CDF axes depend on (see
+# dedupe_pandas_tick_housekeeping above).
+# Best-effort: if matplotlib renames the private method, the plot is just slower.
+_tick_updates_memoized = False
+
+
+def memoize_matplotlib_tick_updates():
+    global _tick_updates_memoized
+    if _tick_updates_memoized:
+        return True
+    _tick_updates_memoized = True
+    try:
+        from matplotlib.axis import Axis
+
+        update_ticks = Axis._update_ticks
+    except (ImportError, AttributeError):
+        return False
+
+    def memoized(self):
+        key = (
+            tuple(self.get_view_interval()),
+            tuple(self.get_data_interval()),
+            self.major.locator,
+            self.major.formatter,
+            self.minor.locator,
+            self.minor.formatter,
+        )
+        cached = getattr(self, "_report_tick_memo", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        ticks = update_ticks(self)
+        self._report_tick_memo = (key, ticks)
+        return ticks
+
+    Axis._update_ticks = memoized
+    return True
+
+
 def _render_likelihood_png(run_dir, param_names):
     load_plot_libs()
     try:
@@ -410,6 +455,7 @@ def _render_likelihood_png(run_dir, param_names):
         return None
 
     dedupe_pandas_tick_housekeeping()
+    memoize_matplotlib_tick_updates()
 
     try:
         samples = weight_by_likelihood(load_nested_samples(run_dir))
@@ -1746,6 +1792,23 @@ def _self_check_tick_housekeeping():
     plt.close(fig)
 
 
+def _self_check_tick_memo():
+    """The tick memo must hit while the axis is unchanged, miss once its view
+    limits move, and keep un-staling the shared view limits either way."""
+    load_plot_libs()
+    if not memoize_matplotlib_tick_updates():
+        return
+    fig, ax = plt.subplots()
+    ax.plot([0, 1], [0, 1])
+    first = ax.xaxis._update_ticks()
+    ax._stale_viewlims["x"] = True
+    assert ax.xaxis._update_ticks() is first, "memo missed on an unchanged axis"
+    assert not ax._stale_viewlims["x"], "memo hit lost the viewLim un-stale"
+    ax.set_xlim(0, 10)
+    assert ax.xaxis._update_ticks() is not first, "memo hit after the view moved"
+    plt.close(fig)
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1761,6 +1824,7 @@ if __name__ == "__main__":
         _self_check_profiling()
         _self_check_page_status()
         _self_check_tick_housekeeping()
+        _self_check_tick_memo()
         print("generate_report self-check passed")
     else:
         main()
