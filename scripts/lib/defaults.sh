@@ -9,8 +9,8 @@
 #
 # uv is used rather than the system python3 because reading TOML needs
 # tomllib, which is stdlib from 3.11 onwards and the system python3 is older
-# on some hosts. uv is already required to run the host-side scripts (see the
-# Makefile), and `--no-project` keeps this off the project venv, so it costs
+# on some hosts. uv is already required to run the host-side scripts (see
+# README.md), and `--no-project` keeps this off the project venv, so it costs
 # ~30ms and installs nothing.
 
 if ! command -v uv >/dev/null 2>&1; then

@@ -39,7 +39,7 @@ else
     fi
   done
   if [ "${#targets[@]}" -eq 0 ]; then
-    echo "FATAL: no smoke-test FITS output found. Run make smoke-test first." >&2
+    echo "FATAL: no smoke-test FITS output found. Run ./ri smoke first." >&2
     exit 1
   fi
 fi

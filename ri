@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""ri - drive the failure-mode search over R2D2 and WSClean.
+
+This repo runs nested sampling (PolyChord) over the observing-parameter space
+of the R2D2-RI and WSClean imagers to find the setups they reconstruct worst.
+This script is the front door: it builds the Docker images, runs the searches,
+and turns their output into reports, profiles and plots.
+
+It is a thin dispatcher. Every command below runs a script under scripts/ (or
+docker directly); the behaviour lives there. Flags that configure a search set
+the matching environment variable and then delegate, so the layering stays
+
+    flag  >  environment variable  >  defaults.toml
+
+exactly as before: a flag exports the variable, an unset flag leaves whatever
+the environment already had, and scripts/lib/defaults.sh fills in the rest.
+"""
+
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+IMAGES = ("wsclean", "r2d2", "meqtrees", "polychord")
+
+# The images a search needs built before it can start.
+SEARCH_IMAGES = {
+    "wsclean": ("wsclean", "meqtrees", "polychord"),
+    "r2d2": ("r2d2", "meqtrees", "polychord"),
+}
+
+SEARCH_SCRIPT = {
+    "wsclean": "scripts/run-nested-sampling-poc.sh",
+    "r2d2": "scripts/run-nested-sampling-r2d2-poc.sh",
+}
+
+# Search flags, as (destination, environment variable). Documented in
+# docs/nested-sampling.md; defaults live in defaults.toml.
+SEARCH_ENV = (
+    ("nlive", "NS_NLIVE"),
+    ("num_repeats", "NS_NUM_REPEATS"),
+    ("max_ndead", "NS_MAX_NDEAD"),
+    ("seed", "NS_SEED"),
+    ("metric", "NS_METRIC"),
+    ("mpi_procs", "NS_MPI_PROCS"),
+    ("omp_threads", "R2D2_OMP_THREADS"),
+    ("output_dir", "OUTPUT_DIR"),
+)
+
+
+def env_from(args, pairs):
+    """Environment overrides for the flags that were actually given.
+
+    A flag left unset contributes nothing, so an environment variable the
+    caller exported by hand survives, and defaults.toml supplies the rest.
+    """
+    return {
+        var: str(getattr(args, dest))
+        for dest, var in pairs
+        if getattr(args, dest) is not None
+    }
+
+
+def uv(script, *args):
+    return ["uv", "run", script, *args]
+
+
+# --- command handlers: each returns (env overrides, commands to run) ---------
+
+
+def do_build(args):
+    env = {"WSCLEAN_PORTABLE": "OFF"} if args.native else {}
+    return env, [["scripts/build.sh", args.target]]
+
+
+def do_smoke(args):
+    if args.target == "ms-to-mat":
+        env = {"MS_PATH": args.ms_path} if args.ms_path else {}
+        return env, [["scripts/check-ms-to-r2d2-mat.sh"]]
+    targets = ("wsclean", "r2d2") if args.target == "all" else (args.target,)
+    return {}, [[f"scripts/smoke-test-{t}.sh"] for t in targets]
+
+
+def do_shell(args):
+    return {}, [["scripts/shell.sh", args.image]]
+
+
+def do_search(args):
+    env = env_from(args, SEARCH_ENV)
+    commands = []
+    if not args.no_build:
+        commands += [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]]
+    commands.append([SEARCH_SCRIPT[args.imager]])
+    return env, commands
+
+
+def do_report(args):
+    env = env_from(args, (("last", "LAST"), ("run", "RUN")))
+    if args.force:
+        env["FORCE"] = "1"
+    if args.upgrade:
+        env["UPGRADE"] = "1"
+    return env, [["scripts/generate-report.sh"]]
+
+
+def do_profile(args):
+    return {}, [uv("scripts/profile-nested-sampling-run.py", args.run,
+                   *(["--json"] if args.json else []))]
+
+
+def do_merge(args):
+    out = ["--out", args.out] if args.out else []
+    return {}, [uv("scripts/merge-nested-sampling-runs.py", *args.runs, *out)]
+
+
+def do_plot_fits(args):
+    return {}, [["scripts/plot-fits.sh", *args.files]]
+
+
+def do_plot_likelihood(args):
+    return {}, [uv("scripts/plot-merged-likelihood-compare.py")]
+
+
+def do_plot_gui(args):
+    return {}, [uv("scripts/anesthetic-gui.py", *([args.run] if args.run else []))]
+
+
+def do_fetch_checkpoints(args):
+    return {}, [["scripts/fetch-r2d2-checkpoints.sh", args.realisation]]
+
+
+def do_record(args):
+    command = ["scripts/record-environment.sh", "--tool", args.tool, "--image", args.image]
+    if args.config:
+        command += ["--config", args.config]
+    if args.command:
+        command += ["--", *args.command]
+    return {}, [command]
+
+
+def do_clean(args):
+    return {}, [["scripts/clean.sh"]]
+
+
+def do_disk_usage(args):
+    return {}, [["docker", "system", "df", "-v"]]
+
+
+# --- argument parsing --------------------------------------------------------
+
+
+def build_parser():
+    # --dry-run is accepted before or after the subcommand. SUPPRESS is what
+    # makes the second form work: without it argparse would copy the
+    # subparser's own `False` default back over a `-n` given up front.
+    dry_run = argparse.ArgumentParser(add_help=False)
+    dry_run.add_argument(
+        "-n", "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="print the environment and commands instead of running them",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="./ri",
+        description=(
+            "Search the observing-parameter space of the R2D2-RI and WSClean "
+            "imagers with nested sampling (PolyChord) to find where they fail."
+        ),
+        epilog=(
+            "Typical session:\n"
+            "  ./ri build                  # the four Docker images (slow, once)\n"
+            "  ./ri smoke                  # can the imagers actually image?\n"
+            "  ./ri search wsclean         # run a search\n"
+            "  ./ri report                 # one HTML page per run\n"
+            "\n"
+            "Defaults come from defaults.toml; an exported environment variable\n"
+            "overrides those, and a flag here overrides both. --dry-run prints\n"
+            "what would be run without running it.\n"
+            "\n"
+            "Details: docs/cheatsheet.md, docs/nested-sampling.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true", default=False,
+        help="print the environment and commands instead of running them",
+    )
+    # No dest: the `record` subcommand has its own `command` positional.
+    subs = parser.add_subparsers(metavar="<command>", required=True)
+
+    def add(name, handler, help_text, **kwargs):
+        description = kwargs.pop("description", help_text)
+        sub = subs.add_parser(
+            name, help=help_text, description=description, parents=[dry_run],
+            # Prose is wrapped to the terminal; anything already laid out by
+            # hand (the examples above, the search command below) is not.
+            formatter_class=(
+                argparse.RawDescriptionHelpFormatter if "\n" in description
+                else argparse.HelpFormatter
+            ),
+            **kwargs
+        )
+        if handler is not None:
+            sub.set_defaults(handler=handler)
+        return sub
+
+    # Images
+    build = add("build", do_build, "build the Docker images",
+                description="Build the Docker images (docker build, so re-running "
+                            "just hits the layer cache).")
+    build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES),
+                       help="which image to build (default: all)")
+    build.add_argument("--native", action="store_true",
+                       help="WSClean tuned for this exact CPU (tags :native, "
+                            "WSCLEAN_PORTABLE=OFF); faster but not portable, and "
+                            "not comparable with a portable build")
+
+    smoke = add("smoke", do_smoke, "check the imagers actually image",
+                description="Cheap end-to-end checks to run after a rebuild, before "
+                            "starting a search that calls an imager thousands of times.")
+    smoke.add_argument("target", nargs="?", default="all",
+                       choices=("all", "wsclean", "r2d2", "ms-to-mat"),
+                       help="all (both imagers, the default), wsclean, r2d2, or "
+                            "ms-to-mat for the MS -> R2D2 .mat bridge")
+    smoke.add_argument("--ms-path", help="ms-to-mat only: convert this MS instead of "
+                                         "simulating one (MS_PATH)")
+
+    shell = add("shell", do_shell, "open a shell inside an image",
+                description="Interactive bash in one of the built images, with this "
+                            "repo's usual mounts.")
+    shell.add_argument("image", choices=IMAGES, help="which image to enter")
+
+    # Searches
+    search = add(
+        "search", do_search, "run a nested-sampling search",
+        description=(
+            "Run PolyChord over the VLA.A observing-parameter space, scoring each\n"
+            "sample by how badly the imager reconstructs a known 1 Jy point source.\n"
+            "Output: results/nested-sampling-poc/<imager>-vlaa-<UTC>/\n"
+            "\n"
+            "Every flag below maps to the environment variable in brackets, so\n"
+            "  ./ri search wsclean --nlive 8\n"
+            "  NS_NLIVE=8 ./ri search wsclean\n"
+            "are the same run. Unset flags fall through to the environment and\n"
+            "then to defaults.toml."
+        ),
+    )
+    search.add_argument("imager", choices=("wsclean", "r2d2"),
+                        help="which imager to search")
+    search.add_argument("--nlive", type=int, help="PolyChord live points [NS_NLIVE]")
+    search.add_argument("--num-repeats", type=int,
+                        help="exploration per replacement live point [NS_NUM_REPEATS]")
+    search.add_argument("--max-ndead", type=int,
+                        help="dead-point budget, terminates the run [NS_MAX_NDEAD]")
+    search.add_argument("--seed", type=int, help="PolyChord seed [NS_SEED]")
+    search.add_argument("--metric",
+                        help="objective to maximise: badness, a bare metric name such "
+                             "as total_rms_jy or sigma_res, or an arithmetic expression "
+                             "over them. A leading minus needs the = form, "
+                             "--metric=-snr, to search the worst corner [NS_METRIC]")
+    search.add_argument("--mpi-procs", type=int,
+                        help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
+    search.add_argument("--omp-threads", type=int,
+                        help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
+    search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")
+    search.add_argument("--no-build", action="store_true",
+                        help="skip the image builds this search would do first")
+
+    # Results
+    report = add("report", do_report, "build the HTML run report",
+                 description="Write reports/nested-sampling-report/: one page per run "
+                             "plus index.html. Up-to-date pages are skipped and the "
+                             "index is always rebuilt.")
+    report.add_argument("--last", type=int, metavar="N",
+                        help="only consider the newest N runs [LAST]")
+    report.add_argument("--run", metavar="DIR",
+                        help="rebuild just this run's page [RUN]")
+    report.add_argument("--force", action="store_true",
+                        help="rebuild every page in scope [FORCE=1]")
+    report.add_argument("--upgrade", action="store_true",
+                        help="rebuild pages written by an older report version "
+                             "[UPGRADE=1]")
+
+    profile = add("profile", do_profile, "per-stage timing for one run",
+                  description="Break a finished run down by stage. Field meanings: "
+                              "docs/nested-sampling-profiling.md.")
+    profile.add_argument("run", metavar="RUN", help="run directory or poc-summary.json")
+    profile.add_argument("--json", action="store_true", help="raw JSON instead of a table")
+
+    merge = add("merge", do_merge, "merge compatible runs into one",
+                description="Post-processing only. Sources must agree on imager, "
+                            "VLA config, metric and parameter space; sampler effort "
+                            "may differ. With no arguments, auto-groups every "
+                            "completed run.")
+    merge.add_argument("runs", nargs="*", metavar="RUN", help="run directories to merge")
+    merge.add_argument("--out", metavar="DIR",
+                       help="output directory (only with an explicit run list)")
+
+    plot = add("plot", None, "render figures and open the sample viewer")
+    plot_subs = plot.add_subparsers(dest="plot_command", metavar="<what>", required=True)
+
+    plot_fits = plot_subs.add_parser(
+        "fits", parents=[dry_run], help="render FITS images to PNG in results/",
+        description="Render FITS to PNG using the r2d2 image's astropy and "
+                    "matplotlib, so no host Python environment is needed. With no "
+                    "arguments, renders whichever standard smoke-test output exists.",
+    )
+    plot_fits.add_argument("files", nargs="*", metavar="FITS",
+                           help="paths in the repo, or absolute paths inside the image")
+    plot_fits.set_defaults(handler=do_plot_fits)
+
+    plot_likelihood = plot_subs.add_parser(
+        "likelihood", parents=[dry_run], help="R2D2 vs WSClean failure-score figures into reports/",
+        description="Plot the newest comparable merged R2D2 and WSClean runs against "
+                    "each other, into reports/ where latex/notes.tex includes them from.",
+    )
+    plot_likelihood.set_defaults(handler=do_plot_likelihood)
+
+    plot_gui = plot_subs.add_parser(
+        "gui", parents=[dry_run], help="interactive corner plots of a run (needs a display)",
+        description="Open the run's samples in anesthetic's GUI. Host-side and needs "
+                    "a display, so not inside Docker or Colima.",
+    )
+    plot_gui.add_argument("run", nargs="?", metavar="RUN",
+                          help="run directory, chains/, or PolyChord file root "
+                               "(default: the newest completed run)")
+    plot_gui.set_defaults(handler=do_plot_gui)
+
+    # Everything else
+    fetch = add("fetch-checkpoints", do_fetch_checkpoints,
+                "fetch the pretrained R2D2 checkpoints",
+                description="Cannot be fully automated: the host is behind a "
+                            "Cloudflare challenge. The script tries, and otherwise "
+                            "prints the URL and where to put the file.")
+    fetch.add_argument("realisation", nargs="?", default="R2D2_A1_T2_Realisation1.zip",
+                       help="checkpoint archive (default: %(default)s)")
+
+    record = add("record", do_record, "write an environment manifest for a run",
+                 description="Write reports/manifests/<run>.json: repo revision, image "
+                             "digest, host and the exact command. It records only - it "
+                             "does not run the command, so run the pipeline yourself "
+                             "and pass the same command verbatim after --. The search "
+                             "commands call this themselves.")
+    record.add_argument("--tool", required=True,
+                        choices=("wsclean", "r2d2", "meqtrees", "polychord"))
+    record.add_argument("--image", required=True, metavar="IMAGE[:TAG]")
+    record.add_argument("--config", metavar="PATH", help="config file to hash and record")
+    record.add_argument("command", nargs=argparse.REMAINDER, metavar="-- COMMAND",
+                        help="the exact command that was run, recorded verbatim")
+
+    add("clean", do_clean, "remove this repo's images and smoke-test output",
+        description="Removes the images built here and the generated smoke-test "
+                    "output. Your data/, checkpoints/, results/ and reports/ are left "
+                    "alone. Run 'docker builder prune' to reclaim build cache.")
+    add("disk-usage", do_disk_usage, "what Docker is using on disk")
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    # argparse.REMAINDER keeps the `--` separator; record-environment.sh adds
+    # its own, so drop it here.
+    if args.handler is do_record and args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+
+    env, commands = args.handler(args)
+
+    if args.dry_run:
+        # Quoted so a printed line can be pasted into a shell as it stands.
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(env.items()))
+        for command in commands:
+            print(prefix + shlex.join(command))
+        return 0
+
+    child_env = {**os.environ, **env}
+    for command in commands:
+        result = subprocess.run(command, cwd=REPO_ROOT, env=child_env, check=False)
+        if result.returncode != 0:
+            return result.returncode
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

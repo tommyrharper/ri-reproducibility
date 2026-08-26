@@ -1,5 +1,5 @@
 # Primarily used for `docker compose config` validation and interactive
-# shells (`make shell-wsclean` / `make shell-r2d2`). Actual smoke-test and
+# shells (`./ri shell wsclean` / `./ri shell r2d2`). Actual smoke-test and
 # nested-sampling runs use plain `docker run` (see scripts/) so that per-run
 # bind mounts and commands stay explicit and easy to reason about
 # individually.

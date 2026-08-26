@@ -7,6 +7,18 @@ badly. Everything else here - the Docker images, the smoke tests, the
 pinned upstream revisions - exists to make those searches runnable and
 their results trustworthy.
 
+`./ri` is the front door - one command for every part of that:
+
+```bash
+./ri --help            # the whole surface, and --help on every subcommand
+./ri build             # the four Docker images
+./ri search wsclean    # run a search
+./ri report            # read what came out
+```
+
+It is a thin dispatcher over `scripts/`, so anything it does can also be
+run by hand, and `./ri --dry-run <command>` prints exactly what it would run.
+
 The write-up of the science is `latex/notes.tex` ("Finding failure modes
 of R2D2 and CLEAN"). The operational detail is
 [`docs/nested-sampling.md`](docs/nested-sampling.md); this file is the
@@ -52,12 +64,13 @@ documented there too, with the values actually worth using in
 ## 2. Running a search
 
 ```bash
-cp .env.example .env      # adjust HOST_UID/HOST_GID/paths if needed
-make nested-sampling-poc         # WSClean search (builds its images first)
-make nested-sampling-r2d2-poc    # R2D2 search (needs checkpoints, section 6)
+cp .env.example .env    # adjust HOST_UID/HOST_GID/paths if needed
+./ri search wsclean     # WSClean search (builds its images first)
+./ri search r2d2        # R2D2 search (needs checkpoints, section 6)
 
-NS_NLIVE=20 NS_NUM_REPEATS=5 NS_MAX_NDEAD=20 make nested-sampling-poc
-NS_METRIC=sigma_res make nested-sampling-r2d2-poc
+./ri search wsclean --nlive 20 --num-repeats 5 --max-ndead 20
+./ri search r2d2 --metric sigma_res
+NS_NLIVE=20 ./ri search wsclean    # same thing; every flag has a variable
 ```
 
 Output lands in `results/nested-sampling-poc/<tool>-vlaa-<UTC>/`: one
@@ -68,20 +81,20 @@ Two runs of the same shape can be combined, and the profiler breaks a
 finished run down per stage:
 
 ```bash
-make merge-nested-sampling RUNS="results/nested-sampling-poc/A results/nested-sampling-poc/B"
-make nested-sampling-profile RUN=results/nested-sampling-poc/<run>
+./ri merge results/nested-sampling-poc/A results/nested-sampling-poc/B
+./ri profile results/nested-sampling-poc/<run>
 ```
 
 ## 3. Reading the results
 
 ```bash
-make nested-sampling-report            # all runs
-make nested-sampling-report LAST=1     # newest run only
-make anesthetic-gui                    # interactive corner plots (needs a display)
-uv run scripts/plot-merged-likelihood-compare.py   # R2D2 vs WSClean overlay
+./ri report             # all runs
+./ri report --last 1    # newest run only
+./ri plot gui           # interactive corner plots (needs a display)
+./ri plot likelihood    # R2D2 vs WSClean overlay
 ```
 
-`make nested-sampling-report` writes `reports/nested-sampling-report/`:
+`./ri report` writes `reports/nested-sampling-report/`:
 one page per run - PolyChord log(Z), the searched parameters and metrics
 for every evaluation, the reconstructions rendered inline next to the
 truth, the likelihood plot, and a collapsible per-stage timing table -
@@ -89,15 +102,15 @@ plus an `index.html` linking to them all. Open the index in a browser.
 
 Rendering a page means reading that run's FITS output, so pages already
 up to date are skipped and only new runs are built. Each page is stamped
-with the report generator's version; `UPGRADE=1` rebuilds the ones an
-older version wrote, `FORCE=1` rebuilds everything, `RUN=<run>` rebuilds
+with the report generator's version; `--upgrade` rebuilds the ones an
+older version wrote, `--force` rebuilds everything, `--run <run>` rebuilds
 one. The report runs inside the r2d2 image (its astropy + matplotlib +
 anesthetic), so no host Python environment is needed. Details in
 `docs/nested-sampling.md` ("Run summary and reports").
 
-`scripts/plot-merged-likelihood-compare.py` writes the merged-failure-score
-figures into `reports/`, which is where `latex/notes.tex` includes them
-from.
+`./ri plot likelihood` (`scripts/plot-merged-likelihood-compare.py`) writes
+the merged-failure-score figures into `reports/`, which is where
+`latex/notes.tex` includes them from.
 
 ## 4. Host prerequisites
 
@@ -106,32 +119,32 @@ from.
 - `git`.
 - [`uv`](https://docs.astral.sh/uv/). The scripts read their shared
   defaults from `defaults.toml` and `uv` supplies the Python that parses
-  it; it also runs the host-side analysis scripts (`make
-  nested-sampling-profile`, `make anesthetic-gui`, `make
-  merge-nested-sampling`).
+  it; it also runs the host-side analysis commands (`./ri profile`,
+  `./ri plot gui`, `./ri merge`).
+- Python 3 for `./ri` itself, which is stdlib-only argparse over the
+  scripts below.
 - Nothing else - see section 11.
 
 ## 5. Building the images
 
 ```bash
-make build              # all four
-make build-wsclean      # WSClean
-make build-r2d2         # R2D2-RI
-make build-meqtrees     # MeqTrees/Cattery MS simulator
-make build-polychord    # PolyChord nested-sampling driver
+./ri build              # all four
+./ri build wsclean      # WSClean
+./ri build r2d2         # R2D2-RI
+./ri build meqtrees     # MeqTrees/Cattery MS simulator
+./ri build polychord    # PolyChord nested-sampling driver
 ```
 
-The `nested-sampling-*` targets build what they need first, so this is
-only for building ahead of time. Equivalent to `scripts/build.sh
+`./ri search` builds what it needs first, so this is only for building
+ahead of time. Equivalent to `scripts/build.sh
 [all|wsclean|r2d2|meqtrees|polychord]`, which wraps `docker build`
 directly (not `docker compose build`) so build args stay explicit.
-`docker compose config` (`make config`) is for validation and for
-`make shell-*`, not as the primary build path.
+`docker compose config` is for validating `compose.yaml`, not a build path.
 
 **Portable vs. host-optimized WSClean**: `WSCLEAN_PORTABLE=ON` (default)
 builds a binary that runs on any CPU of the build architecture, per
-WSClean's own documented `-DPORTABLE` CMake option. `WSCLEAN_PORTABLE=OFF
-scripts/build.sh wsclean` tags `ri-reproducibility/wsclean:native`, built
+WSClean's own documented `-DPORTABLE` CMake option. `./ri build wsclean
+--native` (`WSCLEAN_PORTABLE=OFF`) tags `ri-reproducibility/wsclean:native`, built
 for the building machine's exact instruction set - faster, but it will
 die with an illegal-instruction error anywhere else, and it changes
 WSClean's timings, so do not mix the two within one search.
@@ -139,23 +152,23 @@ WSClean's timings, so do not mix the two within one search.
 ### Does the imager under test actually run?
 
 ```bash
-make smoke-test            # both
-make smoke-test-wsclean    # wsclean --version + a real tiny imaging run
-make smoke-test-r2d2       # imports -> app modules -> bundled data load ->
-                           # config validation -> (real inference if
-                           # checkpoints are present)
+./ri smoke              # both
+./ri smoke wsclean      # wsclean --version + a real tiny imaging run
+./ri smoke r2d2         # imports -> app modules -> bundled data load ->
+                        # config validation -> (real inference if
+                        # checkpoints are present)
+./ri smoke ms-to-mat    # the MS -> R2D2 .mat bridge, before an R2D2 search
 ```
 
 These answer one question: is the image capable of imaging at all? Run
 them after a rebuild, before starting a search that will call the imager
-thousands of times. `make plot-fits` renders their FITS output (or any
-`FILES="..."` you pass) to PNG using the r2d2 image's own astropy +
-matplotlib.
+thousands of times. `./ri plot fits` renders their FITS output (or any
+paths you pass) to PNG using the r2d2 image's own astropy + matplotlib.
 
 ## 6. Fetching R2D2 checkpoints
 
 ```bash
-make fetch-r2d2-checkpoints REALISATION=R2D2_A1_T2_Realisation1.zip
+./ri fetch-checkpoints R2D2_A1_T2_Realisation1.zip
 ```
 
 **This cannot be fully automated.** The checkpoint host
@@ -272,7 +285,7 @@ meaningless; comparing it within one run is fine, which is what the
 
 ## 11. Reproducibility metadata
 
-`scripts/record-environment.sh` writes a JSON manifest per run to
+`./ri record` (`scripts/record-environment.sh`) writes a JSON manifest per run to
 `reports/manifests/` capturing: timestamp, this repo's Git revision,
 Docker image ID/digest/creation time, host OS/arch/kernel/CPU/allocated
 Docker resources, the config file used and its SHA-256, relevant
@@ -289,20 +302,20 @@ build stages only - grep any `Dockerfile` for the full list. To verify
 nothing leaked: `which wsclean` and `python3 -c "import torch"` (system
 Python, not a venv you made for something else) should both fail outside
 a container built from this repo. The only host-side tools required are
-Docker, Git and `uv` - and `uv` installs nothing into the system Python:
+Docker, Git, `uv` and a Python 3 for `./ri` itself - and `uv` installs nothing into the system Python:
 the scripts invoke it as `uv run --no-project`, which uses a
 self-contained interpreter under `uv`'s own cache.
 
 ## 12. Reclaiming disk space
 
 ```bash
-make clean            # this repo's images + generated smoke-test outputs
-make disk-usage       # docker system df -v
+./ri clean            # this repo's images + generated smoke-test outputs
+./ri disk-usage       # docker system df -v
 docker builder prune  # BuildKit cache (asks first)
 docker system prune   # Docker-wide - affects OTHER projects too, use with care
 ```
 
-`make clean` leaves `data/`, `checkpoints/`, `results/` and `reports/`
+`./ri clean` leaves `data/`, `checkpoints/`, `results/` and `reports/`
 alone. `docker builder prune -a` before a rebuild forces a fully cold
 build.
 

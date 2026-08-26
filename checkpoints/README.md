@@ -5,7 +5,7 @@ directory (other than this file) is tracked by Git.
 
 ## R2D2 VLA-trained DNN series
 
-Fetched with `make fetch-r2d2-checkpoints` (wraps
+Fetched with `./ri fetch-checkpoints` (wraps
 `scripts/fetch-r2d2-checkpoints.sh`).
 
 Source: Aghabiglou et al., DOI

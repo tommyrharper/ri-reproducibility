@@ -36,3 +36,6 @@ jobs:
 
       - name: Check shared defaults
         run: scripts/test-defaults.sh
+
+      - name: Check the CLI
+        run: uv run --no-project scripts/test_cli.py
