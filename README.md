@@ -145,6 +145,8 @@ ahead of time. Equivalent to `scripts/build.sh
 [all|wsclean|r2d2|meqtrees|polychord]`, which wraps `docker build`
 directly (not `docker compose build`) so build args stay explicit.
 `docker compose config` is for validating `compose.yaml`, not a build path.
+Re-running a build whose inputs have not changed skips `docker build` outright
+(~0.08s rather than ~2s of cache-walking); `FORCE_BUILD=1` overrides that.
 
 **Portable vs. host-optimized WSClean**: `WSCLEAN_PORTABLE=ON` (default)
 builds a binary that runs on any CPU of the build architecture, per

@@ -30,6 +30,12 @@ cp .env.example .env    # mounts, HOST_UID/HOST_GID, thread counts
 | `./ri build meqtrees` | `scripts/build.sh meqtrees` | `ri-reproducibility/meqtrees:kern-10` |
 | `./ri build polychord` | `scripts/build.sh polychord` | `ri-reproducibility/polychord:lite` |
 
+A build whose inputs (Dockerfile + whatever it copies from the context +
+platform + build args) hash to what the existing image's `ri.build-inputs`
+label already says is skipped: ~0.08s instead of ~2s. `FORCE_BUILD=1` builds
+anyway, for the drift Docker's layer cache does not see either (`apt-get`/`pip`
+output under a pinned base image, a moved upstream git ref).
+
 ```bash
 # CPU-native WSClean for benchmarking on THIS machine -> tag :native
 ./ri build wsclean --native      # WSCLEAN_PORTABLE=OFF scripts/build.sh wsclean

@@ -712,8 +712,9 @@ the bin. Both arms had been run against a meqtrees image left over from a
 reverted experiment that moved `warm_forest()` to the other side of the worker's
 FIFO open - which is precisely where the rank's wait comes from, so it masked
 the effect. **Rebuild every image the arms depend on before an A/B, not just the
-one being changed**; `scripts/build.sh` is ~2s per image against runs that are
-~3s each.
+one being changed**. That used to cost ~2s per image against runs that are
+~3s each; since builds skip on an unchanged input hash it is ~0.08s, so there
+is no longer a reason not to.
 
 ### The critical path is the simulate worker's warm-up, not the rank
 
@@ -1124,6 +1125,47 @@ parallelism without the caller having to remember `-j`. Interleaved A/B of
 
 ~1.9-2.8s in every pair, ~23% of the command. The build step itself goes
 3.3-4.2s to ~2.05s; the rest of the spread is the run.
+
+#### And then they do not run at all unless an input changed
+
+Concurrency only shrinks three no-op builds down to the slowest one, ~2.05s,
+which was still ~37% of the command. `scripts/build.sh` now hashes the files a
+build actually reads - the Dockerfile plus whatever it `COPY`s or bind-mounts
+from the context, with the platform and build args mixed in - records that hash
+in an `ri.build-inputs` label on the image it produces, and skips `docker build`
+entirely when the tag already names an image carrying that hash. One `docker
+image inspect` answers both questions that matter, "built from these inputs?"
+and "does it still exist?", so a `docker rmi` cannot leave a stale skip behind.
+`FORCE_BUILD=1` builds regardless.
+
+| `scripts/build.sh <image>` | build | skip |
+|---|---:|---:|
+| r2d2 | 2.04s | 0.09s |
+| meqtrees | 1.80s | 0.08s |
+| polychord | 1.57s | 0.09s |
+| wsclean | 2.46s | 0.08s |
+
+`make -j3 build-r2d2 build-meqtrees build-polychord` goes 2.07s to 0.08s, and
+`make build` - all four images - to 0.28s. Interleaved A/B of the whole command,
+with `FORCE_BUILD=1` as the always-build arm:
+
+| | End to end |
+|---|---:|
+| always build | 5.80s, 5.39s, 5.40s |
+| skip unchanged | 3.38s, 3.46s, 3.40s |
+
+~2.0s in 3 of 3 pairs, ~37% of `make nested-sampling-r2d2-poc`. `log(Z)` and the
+38-evaluation parameter set are bit-identical to a run from before the change,
+which they have to be - the images are the same images.
+
+Two caveats worth keeping in mind. The input list is written out per image in
+`build.sh` and has to stay in step with the Dockerfiles; `grep -n 'COPY\|--mount=type=bind' docker/*/Dockerfile`
+is the check, and file *names* go into the hash as well as contents so that
+renaming a file inside a `COPY`ed directory is a rebuild rather than a false
+skip. And the hash deliberately does not cover what Docker's own layer cache
+does not cover either - `apt-get`/`pip` output drifting under a pinned base
+image, or a moved upstream git ref - so those still need `FORCE_BUILD=1` or a
+`docker rmi`, exactly as they previously needed `--no-cache`.
 
 #### Where the remaining R2D2 wall clock is, and why it is a floor
 
