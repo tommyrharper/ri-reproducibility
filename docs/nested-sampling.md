@@ -359,8 +359,11 @@ tasks - the anesthetic corner plot and the rest of the page - so the pool has
 twice as many pages to overlap. The two kinds of task go into two pools, forked
 either side of the astropy import: the corner plots - the critical path - start
 first, and the eval-raster workers forked afterwards inherit astropy rather than
-each importing it again while the plots want the CPU. That is ~11% less CPU on
-a five-run cold build for the same output.
+each importing it again while the plots want the CPU. anesthetic is imported in
+the parent for the same reason, just before the first fork, so every corner-plot
+worker inherits it instead of repeating the same 0.34s. Together that is ~25%
+less CPU on a five-run cold build for the same output, and once there are more
+runs to draw than cores it is wall-clock too (20 runs: 5.25s -> 4.75s).
 The container is given a single BLAS thread
 (the work is matplotlib rasterisation, not linear algebra, and multi-threaded
 BLAS only oversubscribes the CPU). Override with `R2D2_OMP_THREADS=`. It also

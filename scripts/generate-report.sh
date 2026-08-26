@@ -22,7 +22,9 @@
 # that draws nothing skips the astropy/matplotlib import as well. Pages that
 # do need building are built in parallel: each run is two concurrent tasks, its
 # corner plot and the rest of its page, in two pools forked either side of the
-# astropy import so only the parent pays for it.
+# astropy import so only the parent pays for it. anesthetic is imported in the
+# parent too, so the corner-plot workers inherit it rather than each repeating
+# the import.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
