@@ -928,6 +928,43 @@ evaluation, so that ~1.5s lands on the wall clock in front of evaluation one on
 every rank. The WSClean PoC hides the same cost behind PolyChord's own startup
 with `prewarm()`; the R2D2 PoC calls neither that nor anything like it.
 
+### R2D2 sizes its own torch thread pool, and ignored the env that limited it
+
+Every measurement above was taken one worker at a time. Under the default 8
+ranks the same imaging step took **29.1s per evaluation**, not 0.15s, and the
+run was 3m 06s of wall clock for 38 evaluations.
+
+The cause is upstream's `set_common_args()` in `src/utils/args.py`: it calls
+`torch.set_num_threads(len(psutil.Process().cpu_affinity()))` on every imaging
+run unless `ncpus` is set. `torch.set_num_threads()` overrides `OMP_NUM_THREADS`
+- which is the only lever the worker's `docker exec` had - so each rank asked
+torch for all 20 host CPUs regardless, and the 8 ranks ran ~160 compute threads
+on 20 cores. Iteration-1's measurement of `get_op_norm()` at 3.67s on 20 threads
+against 0.09s on one is the same effect inside a single process.
+
+`polychord_r2d2_poc.py` therefore writes `ncpus: <R2D2_OMP_THREADS>` into every
+per-evaluation `r2d2_config.yaml`; `ImagingArgs` takes it straight from the
+YAML, so no new flag is needed, and the imaging log now says `avaiable cpus 20,
+request cpus 2` instead of `avaiable cpus 20`. Measured end to end
+(`NS_MPI_PROCS=8`, 38 evaluations, identical parameters and objectives before
+and after):
+
+| | Wall clock | r2d2 per evaluation |
+|---|---:|---:|
+| `OMP_NUM_THREADS` only | 3m 06s, 3m 55s | 29.1s |
+| plus `ncpus` | 8.4s, 8.4s | 0.56s |
+
+That 0.56s still carries each rank's ~1.5s first request; steady state is ~0.3s.
+
+The oversubscription cliff is sharp, and it is about the product not the
+per-rank count. Sweeping `R2D2_OMP_THREADS` at 8 ranks on this 20-CPU host:
+1 thread 7.7s, 2 threads (the `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
+threads 24.2s - 32 threads over 20 cores is already most of the way back to the
+old behaviour. The default divides the host among the ranks, which is the right
+shape; do not raise it above it. Whether 1 thread beats 2 once real checkpoints
+make the 25 UNet forward passes run is untested, and is the one part of this
+that checkpoint-less timing cannot answer.
+
 ### Sidecar containers run with `--network none`
 
 Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`
