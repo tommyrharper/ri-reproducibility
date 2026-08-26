@@ -576,6 +576,131 @@ def summarize_profiling(
     }
 
 
+def format_duration(seconds: float | None) -> str:
+    """Human-readable duration: '47ms', '1.44s', '12.3s', '7m 36s', '2h 05m 09s'.
+
+    Seconds stop being readable at both ends of the range a profile spans - a
+    per-eval metrics stage is milliseconds, a run total is hours - so each
+    magnitude gets the unit that carries its digits.
+    """
+    if seconds is None:
+        return "n/a"
+    value = max(0.0, float(seconds))
+    if value < 1.0:
+        milliseconds = round(value * 1000)
+        # 0.9996s rounds up to 1000ms, which belongs in the seconds branch.
+        if milliseconds < 1000:
+            return f"{milliseconds}ms"
+    if value < 10.0:
+        return f"{value:.2f}s"
+    if value < 60.0:
+        return f"{value:.1f}s"
+    total = int(round(value))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
+
+
+def format_share(fraction: float | None) -> str:
+    """A share of the worker-time budget as a percentage, e.g. '64.6%'."""
+    if fraction is None:
+        return ""
+    pct = 100.0 * fraction
+    if 0.0 < pct < 0.05:
+        return "<0.1%"
+    return f"{pct:.1f}%"
+
+
+# (stage key, eval-count key, label, indented under the row above it).
+# `{imager}` is filled in with the run's algorithm so the table says "wsclean
+# container" or "r2d2 container" rather than the uninformative "image container".
+PROFILING_VIEW_STAGES = (
+    ("simulate", "simulate_seconds", "simulate (MeqTrees)", False),
+    ("convert", "convert_seconds", "convert (MS -> .mat)", False),
+    ("image_container", "image_container_seconds", "{imager} container (total)", False),
+    ("image_binary", "image_binary_seconds", "of which: {imager} itself", True),
+    ("image_container_overhead", "image_container_overhead_seconds", "of which: container overhead", True),
+    ("metrics", "metrics_seconds", "metrics computation", False),
+)
+
+UNACCOUNTED_LABEL = "unaccounted (PolyChord sampling + idle)"
+
+PROFILING_VIEW_NOTE = (
+    "stage totals are summed worker-seconds across every evaluation; shares are "
+    "of the run's worker-time budget (wall clock x mpi_procs), so the top-level "
+    "stages plus the unaccounted remainder come to 100%."
+)
+
+
+def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None) -> dict[str, Any]:
+    """Rows and denominators for the per-stage timing view.
+
+    Shared by the HTML report and scripts/profile-nested-sampling-run.py so the
+    two cannot drift apart. Every share is a fraction of the run's total
+    worker-time budget - wall clock x mpi_procs - so the top-level stages plus
+    the unaccounted remainder add up to 100% of what the whole process spent.
+    That holds for serial and MPI runs alike: at mpi_procs == 1 the budget is
+    just the wall clock and the remainder is PolyChord's own sampling, while at
+    mpi_procs > 1 the remainder also absorbs the time workers sat idle.
+    """
+    imager = algorithm or "image"
+    mpi_procs = int(profiling.get("mpi_procs") or 1)
+    total_wall = profiling.get("total_wall_seconds")
+    total_wall = None if total_wall is None else float(total_wall)
+    stages = profiling.get("stage_totals_seconds") or {}
+    counts = profiling.get("stage_eval_counts") or {}
+    accounted = profiling.get("accounted_worker_seconds")
+    if accounted is None:
+        accounted = profiling.get("accounted_seconds")
+    accounted = float(accounted or 0.0)
+
+    budget = None if total_wall is None else total_wall * mpi_procs
+    # A budget below what the stages already accounted for would push shares
+    # over 100%; an oversubscribed host or a clock jump can produce one, so fall
+    # back to the accounted total and keep the breakdown adding up.
+    denominator = accounted if budget is None else max(budget, accounted)
+    denominator = denominator or None
+
+    def share(value: float | None) -> float | None:
+        if value is None or not denominator:
+            return None
+        return value / denominator
+
+    rows = []
+    for key, count_key, label, is_sub in PROFILING_VIEW_STAGES:
+        value = stages.get(key)
+        if value is None:
+            continue
+        value = float(value)
+        evals = int(counts.get(count_key) or 0)
+        rows.append({
+            "key": key,
+            "label": label.format(imager=imager),
+            "seconds": value,
+            "evals": evals,
+            "per_eval_seconds": value / evals if evals else None,
+            "share": share(value),
+            "is_sub": is_sub,
+        })
+
+    unaccounted = None if denominator is None else max(0.0, denominator - accounted)
+    return {
+        "imager": imager,
+        "mpi_procs": mpi_procs,
+        "evals": max((row["evals"] for row in rows), default=0),
+        "total_wall_seconds": total_wall,
+        "worker_seconds_budget": denominator,
+        "accounted_seconds": accounted,
+        "accounted_share": share(accounted),
+        "unaccounted_label": UNACCOUNTED_LABEL,
+        "unaccounted_seconds": unaccounted,
+        "unaccounted_share": share(unaccounted),
+        "rows": rows,
+    }
+
+
 def badness_from_metrics(metrics: dict[str, float]) -> float:
     log_snr_loss = max(0.0, 3.0 - metrics["log_snr"])
     fidelity_loss = min(metrics["relative_l2_error"], 10.0)
@@ -966,3 +1091,50 @@ def self_check_profiling() -> None:
     assert mpi_profiling["accounted_worker_seconds"] == 19.5
     assert mpi_profiling["accounted_seconds"] is None
     assert mpi_profiling["polychord_overhead_seconds"] is None
+
+    assert format_duration(None) == "n/a"
+    assert format_duration(0.0) == "0ms"
+    assert format_duration(0.0474) == "47ms"
+    assert format_duration(0.9996) == "1.00s"
+    assert format_duration(1.4351) == "1.44s"
+    assert format_duration(33.03) == "33.0s"
+    assert format_duration(455.58) == "7m 36s"
+    assert format_duration(3600 + 5 * 60 + 9) == "1h 05m 09s"
+    assert format_share(None) == ""
+    assert format_share(0.6462) == "64.6%"
+    assert format_share(0.0001) == "<0.1%"
+    assert format_share(0.0) == "0.0%"
+
+    # Serial run: budget is the wall clock, so stages + unaccounted make 100%.
+    serial = profiling_breakdown(profiling, algorithm="wsclean")
+    assert serial["worker_seconds_budget"] == 25.0
+    assert serial["evals"] == 3
+    labels = [row["label"] for row in serial["rows"]]
+    assert "wsclean container (total)" in labels and "of which: wsclean itself" in labels
+    assert "convert (MS -> .mat)" not in labels
+    container = next(row for row in serial["rows"] if row["key"] == "image_container")
+    assert container["seconds"] == 15.0 and container["evals"] == 3
+    assert abs(container["per_eval_seconds"] - 5.0) < 1e-9
+    assert abs(container["share"] - 0.6) < 1e-9
+    assert abs(serial["unaccounted_seconds"] - 5.5) < 1e-9
+    top_level = sum(row["share"] for row in serial["rows"] if not row["is_sub"])
+    assert abs(top_level + serial["unaccounted_share"] - 1.0) < 1e-9
+
+    # MPI run: budget is wall clock x workers, and idle time lands in unaccounted.
+    mpi = profiling_breakdown(mpi_profiling, algorithm="r2d2")
+    assert mpi["worker_seconds_budget"] == 20.0
+    assert abs(mpi["accounted_share"] - 0.975) < 1e-9
+    assert abs(mpi["unaccounted_seconds"] - 0.5) < 1e-9
+    assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
+
+    # Accounted time above the nominal budget must not push shares over 100%.
+    oversubscribed = profiling_breakdown(summarize_profiling(evaluations, total_wall_seconds=1.0, mpi_procs=2))
+    assert oversubscribed["worker_seconds_budget"] == 19.5
+    assert oversubscribed["unaccounted_seconds"] == 0.0
+    assert oversubscribed["rows"][0]["label"] == "simulate (MeqTrees)"
+
+    # A run with no timings at all still renders rather than dividing by zero.
+    degenerate = profiling_breakdown({"mpi_procs": 1, "total_wall_seconds": 0.0, "stage_totals_seconds": {}})
+    assert degenerate["worker_seconds_budget"] is None
+    assert degenerate["unaccounted_seconds"] is None
+    assert degenerate["rows"] == []
