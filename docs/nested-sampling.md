@@ -112,7 +112,8 @@ per-rank default.
 
 Both run scripts read the same `NS_*` variables and forward them to
 `polychord_wsclean_poc.py` / `polychord_r2d2_poc.py` as command-line flags.
-The defaults live in `scripts/lib/defaults.sh`, which both scripts source.
+The defaults live in `defaults.toml` at the repository root, loaded by
+`scripts/lib/defaults.sh`, which both scripts source.
 
 | Variable | Meaning | Default |
 |---|---|---|
