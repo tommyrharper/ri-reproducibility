@@ -24,8 +24,10 @@ from common import (
     load_evaluations_from_dir,
     mpi_rank,
     params_key,
+    prewarm,
     prior_vector,
     r2d2_thread_count,
+    r2d2_worker,
     resolve_metric,
     run_r2d2_imaging,
     self_check_lazy_numpy,
@@ -33,6 +35,7 @@ from common import (
     self_check_profiling,
     self_check_r2d2_thread_env,
     simulate_measurement_set,
+    simulate_worker,
     stable_seed,
     summarize_profiling,
     write_evaluation_record,
@@ -326,14 +329,23 @@ def self_check_failure_record_persistence() -> None:
 
 
 def main() -> None:
-    import pypolychord
-    from pypolychord.settings import PolyChordSettings
-
     args = parse_args()
     args.repo_root = str(Path(args.repo_root).resolve())
     if not args.checkpoints_dir:
         args.checkpoints_dir = str(Path(args.repo_root) / "checkpoints")
     args.checkpoints_dir = str(Path(args.checkpoints_dir).resolve())
+
+    # Before `import pypolychord`, so both workers do their startup - Timba plus
+    # a meqserver on the simulate side, `import torch` and the R2D2 modules on
+    # the imaging side - while the sampler is still loading. Joined just below,
+    # right before the first evaluation can ask for one.
+    warm = prewarm(
+        lambda: simulate_worker(args.meqtrees_image, args.platform),
+        lambda: r2d2_worker(args.r2d2_image, args.platform, args.checkpoints_dir),
+    )
+
+    import pypolychord
+    from pypolychord.settings import PolyChordSettings
 
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
     output_dir = Path(args.output_dir).resolve()
@@ -375,6 +387,7 @@ def main() -> None:
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    warm()
     run_start = time.monotonic()
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start

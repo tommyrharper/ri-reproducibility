@@ -965,6 +965,41 @@ shape; do not raise it above it. Whether 1 thread beats 2 once real checkpoints
 make the 25 UNet forward passes run is untested, and is the one part of this
 that checkpoint-less timing cannot answer.
 
+### The R2D2 PoC warms its two workers before the sampler starts
+
+`polychord_wsclean_poc.py` had called `prewarm()` since the section above;
+`polychord_r2d2_poc.py` never had, so both of its workers were started lazily by
+the first request that needed one, and every rank hit that moment together.
+`poc-summary.json` showed it plainly: across the eight `eval_id == 1` records,
+`simulate_seconds` was ~0.58s against a ~0.045s median for the rest of the run
+and `image_container_seconds` was ~1.78s against ~0.19s - ~2.3s of pure startup
+sitting in front of evaluation one on every rank at once.
+
+Neither worker needs to be *ready* for the prewarm to pay: spawning the process
+is enough, because the expensive part happens inside it. `r2d2_serve.py` imports
+torch and the R2D2 modules before it reads its first request line, and the
+simulate worker starts its meqserver the same way, so both run while the rank is
+still doing `import pypolychord` and PolyChord's own setup.
+
+`prewarm()` therefore now takes callables rather than the two image names it was
+hard-coded to - the R2D2 PoC warms `simulate_worker()` and `r2d2_worker()`, the
+WSClean PoC warms `simulate_worker()` and its wsclean `sh`, and the same
+no-touching-a-sidecar-between-call-and-join rule applies to both. Measured
+(`NS_MPI_PROCS=8`, 38 evaluations, byte-identical evaluation set and log(Z)
+before and after, three runs each):
+
+| | Sampler wall clock | End to end |
+|---|---:|---:|
+| lazy worker start | 6.9s, 7.5s | 9.2s, 9.7s, 10.3s |
+| prewarmed | 5.0s, 4.9s, 4.5s | 6.8s, 7.2s, 6.6s |
+
+What is left in evaluation one is what the overlap window could not cover: the
+imaging worker's `import torch` is ~1.3s and eight of them run at once, so
+`image_container_seconds` on the first evaluation is still ~1.2-1.7s. Closing
+that needs the workers started earlier still - as the R2D2 sidecar's own command
+over a FIFO pair per rank, the way `run-nested-sampling-poc.sh` already starts
+the simulate workers - which buys another container start of head room.
+
 ### Sidecar containers run with `--network none`
 
 Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`

@@ -35,7 +35,9 @@ from common import (
     self_check_profiling,
     sidecar_command,
     sidecar_run,
+    sidecar_shell,
     simulate_measurement_set,
+    simulate_worker,
     stable_seed,
     summarize_profiling,
     write_evaluation_record,
@@ -264,10 +266,18 @@ def self_check_failure_record_persistence() -> None:
 
 def main() -> None:
     args = parse_args()
+
+    def warm_wsclean() -> None:
+        sidecar_command(args.wsclean_image)
+        sidecar_shell(args.wsclean_image, args.platform)
+
     # Before `import pypolychord`, so the rank's sidecar attachments come up
     # while the sampler is still loading. Joined just below, right before the
     # first evaluation can ask for one.
-    warm = prewarm(args.meqtrees_image, args.wsclean_image, args.platform)
+    warm = prewarm(
+        lambda: simulate_worker(args.meqtrees_image, args.platform),
+        warm_wsclean,
+    )
 
     import pypolychord
     from pypolychord.settings import PolyChordSettings
