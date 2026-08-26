@@ -1172,6 +1172,91 @@ measurement does settle is that this is a shared-host contention question and
 not another thread-pool bug like the `ncpus` one: an imaging worker holds 5
 threads, and torch's inter-op pool is never created.
 
+### The operator norm is solved with Lanczos, not a power iteration
+
+With `get_op_norm()` at 85-96% of an R2D2 imaging request, it is the whole
+per-evaluation cost worth attacking. Upstream's
+`MeasOp.get_op_norm` is a plain power iteration: start from `torch.randn`,
+apply the forward/adjoint NUFFT pair, stop when the norm's relative change
+drops below 1e-5. The measurement operator's spectrum is tightly clustered, so
+that converges badly - over this parameter space it takes **39 to 305**
+operator applications, and which end of that range an evaluation lands on is
+decided by the unseeded random start, not by the parameters. Measured against a
+tight-tolerance reference, the answer it stops at is only accurate to ~1e-4,
+and it differs from run to run for the same evaluation.
+
+That tail is exactly what the sampler pays for. A PolyChord round costs the
+*slowest* rank's evaluation: on a baseline 8-rank run the per-round maxima of
+`image_container_seconds` summed to 2.47s while the medians summed to 1.48s, so
+the straggler was ~40% of the sampler wall clock.
+
+`r2d2_serve.py`'s `patch_op_norm()` replaces the method with an ARPACK Lanczos
+solve (`scipy.sparse.linalg.eigsh`, `k=1`, `ncv=8`, `tol=1e-5`) over the same
+`adjoint_op(forward_op(.))`, started from a deterministic `ones` vector. It
+computes the same quantity under the same caching contract - `_op_norm`,
+`compute_flag`, and therefore `get_op_norm_prime` too - and falls back to the
+original power iteration if ARPACK ever fails to converge within 100 restarts.
+The patch is applied in `warm_imports()`, so every request on every pool worker
+gets it, and `r2d2_serve.py` runs from the repository bind mount, so it needs no
+image rebuild.
+
+Measured over 12 evaluations of this parameter space, per operator:
+
+| | Operator applications | Time | Relative error |
+|---|---:|---:|---:|
+| power iteration (upstream) | 39-305 | 0.065-0.316s | ~1e-4 |
+| Lanczos, `ncv=8`, `tol=1e-5` | 25-40 | 0.044-0.069s | ~1e-10 |
+
+An `ncv` sweep (6, 8, 10, 12, 20 at `tol` 1e-5 and 1e-4) is flat to within
+noise; 8 has the lowest maximum, which is the number that matters here.
+
+Across a whole 8-rank, 38-evaluation run, `image_container_seconds`:
+
+| | sum | median | max |
+|---|---:|---:|---:|
+| power iteration | 9.40s | 0.235s | 0.694s |
+| Lanczos | 5.70s | 0.142s | 0.237s |
+
+The maximum falls by 66% - more than the median's 40% - because the lottery is
+what the tail was. Interleaved A/B of `scripts/run-nested-sampling-r2d2-poc.sh`
+end to end, `NS_MPI_PROCS=8`, alternating the two `r2d2_serve.py`:
+
+| | End to end |
+|---|---:|
+| power iteration | 3.92s, 4.28s, 4.63s, 4.76s, 4.64s |
+| Lanczos | 3.62s, 3.64s, 3.71s, 3.52s, 3.59s |
+
+5 pairs of 5, ~1.0s at the median (4.63s -> 3.62s, -22%). The evaluation set is
+identical; `target_dynamic_range` moves by a median 2.0e-4 and at most 2.0e-3,
+which is the power iteration's own error being removed, and it is now the same
+number on every run.
+
+`python3 scripts/lib/nested_sampling/r2d2_serve.py --self-check` guards it on a
+synthetic 400x400 spectrum with the same 0.999 eigenvalue ratio: Lanczos must
+land within 1e-7 while the 1e-5 relative-change test the power iteration uses
+stops more than 1e-4 out. It needs scipy, so run it in the R2D2 image
+(`docker run --rm -v "$PWD:$PWD" --entrypoint python3 ri-reproducibility/r2d2:cpu
+"$PWD/scripts/lib/nested_sampling/r2d2_serve.py" --self-check`); on a host
+without scipy that one check prints that it was skipped and the other three
+still run.
+
+#### Warm and deterministic start vectors, measured and rejected
+
+Before the Lanczos solve, three cheaper ideas were measured on the same
+operators and all failed:
+
+- **Warm start from the previous evaluation's eigenvector.** ~1.9x fewer
+  iterations on average (472 to 252 over 8 evaluations) but wildly unreliable -
+  2 iterations on one operator, 90 on the next - and it makes the answer depend
+  on which rank ran which evaluation in what order, which is worse than the
+  seed noise it would replace.
+- **Deterministic seeds:** `ones`, the PSF, and a cosine at the argmax of
+  `fft2(psf)` (the circulant approximation's top eigenvector). None beat
+  `randn` consistently, and the cosine seed was off by 5e-2 on two operators.
+- The reason all of them disappoint is the same one Lanczos fixes: the spectral
+  gap is so small that a power iteration started anywhere crawls. A tight
+  reference run needs >2000 applications to reach 1e-9.
+
 ### Sidecar containers run with `--network none`
 
 Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`

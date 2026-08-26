@@ -103,7 +103,11 @@ pools are started by their container's own command, over one FIFO pair per rank,
 before the PolyChord container exists - the imaging pool as one `--fifo-dir`
 process that imports torch once and forks a worker per pair (see "R2D2 imaging runs in a long-lived
 worker" and "The workers are started by the container, not by the ranks" in
-[nested-sampling-profiling.md](nested-sampling-profiling.md)). The workers get
+[nested-sampling-profiling.md](nested-sampling-profiling.md)). That process also
+patches R2D2's `MeasOp.get_op_norm` to solve the operator norm with Lanczos
+rather than upstream's power iteration - the same quantity, ~2.5x fewer NUFFT
+pairs and ~1e-10 relative accuracy instead of ~1e-4, and no longer a different
+answer on every run (see "The operator norm is solved with Lanczos" there). The workers get
 OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`) set from the host's available CPU count, overridable via
 `R2D2_OMP_THREADS`. The previous image default of
