@@ -32,10 +32,9 @@ top of that clean MeqTrees prediction.
 Both algorithms share the same `NS_*` and `OUTPUT_DIR` overrides (see "Environment
 overrides" below). Each target builds its required images first and starts one
 long-lived sidecar container per image; the PolyChord container mounts the
-Docker socket and drives those sidecars. The WSClean target starts the
-PolyChord container the same way and `docker exec`s the run into it (see "The
-PolyChord container is a sidecar too" and "Long-lived sidecar containers, one
-per image" in
+Docker socket and drives those sidecars. It is started the same way as the
+others and the run is `docker exec`ed into it (see "The PolyChord container is
+a sidecar too" and "Long-lived sidecar containers, one per image" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)).
 
 ### WSClean

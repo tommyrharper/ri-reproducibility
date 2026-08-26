@@ -94,12 +94,17 @@ sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
   done
   exec sleep infinity
 ' sh "${R2D2_FIFO_DIR}" "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py"
-sidecar_wait
+# The PolyChord container joins the sidecars: `docker run` of it costs ~0.7s
+# where `docker exec` into a running one costs ~0.03s, and starting it here
+# overlaps that cost with the two workers' containers and the manifest write
+# instead of paying it in front of rank 0. It keeps the socket mount because a
+# rank whose FIFO pool is missing falls back to `docker exec`ing its own worker.
+sidecar_launch "${PLATFORM}" "${POLYCHORD_IMAGE}" \
+  -v "${DOCKER_SOCKET}:/var/run/docker.sock"
+POLYCHORD_CONTAINER="${SIDECAR_NAME}"
 
 RUN_COMMAND=(
-  docker run --rm --platform "${PLATFORM}"
-  -v "${REPO_ROOT}:${REPO_ROOT}"
-  -v "${DOCKER_SOCKET}:/var/run/docker.sock"
+  docker exec
   -w "${REPO_ROOT}"
   -e REPO_ROOT="${REPO_ROOT}"
   -e MEQTREES_IMAGE="${MEQTREES_IMAGE}"
@@ -126,8 +131,8 @@ RUN_COMMAND=(
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   -e R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
-  --entrypoint mpirun
-  "${POLYCHORD_IMAGE}"
+  "${POLYCHORD_CONTAINER}"
+  mpirun
   --allow-run-as-root
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_r2d2.py
@@ -150,6 +155,11 @@ scripts/record-environment.sh \
   --config docs/nested-sampling.md \
   -- "${RUN_COMMAND[@]}"
 
+# Only now: writing the manifest above is ~0.4s of `docker image inspect` and
+# `git` that overlaps with the containers coming up.
+sidecar_wait
+
 "${RUN_COMMAND[@]}"
 
+rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
 echo "OK: nested-sampling R2D2 output in ${OUTPUT_DIR}"
