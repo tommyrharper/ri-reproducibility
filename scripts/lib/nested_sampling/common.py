@@ -113,6 +113,13 @@ def r2d2_thread_count() -> int:
 
 
 def r2d2_docker_thread_env_flags() -> list[str]:
+    """Thread settings for a rank-started imaging worker.
+
+    PASSIVE mirrors the pre-warmed pool's container (see the R2D2 run script):
+    libgomp spins after every parallel region by default, and the regions here
+    are single 128x128 NUFFTs, so with one worker per rank the spinning is a
+    whole core per rank burning on nothing.
+    """
     threads = str(r2d2_thread_count())
     return [
         "-e",
@@ -121,6 +128,8 @@ def r2d2_docker_thread_env_flags() -> list[str]:
         f"MKL_NUM_THREADS={threads}",
         "-e",
         f"OPENBLAS_NUM_THREADS={threads}",
+        "-e",
+        "OMP_WAIT_POLICY=PASSIVE",
     ]
 
 
@@ -1084,6 +1093,8 @@ def self_check_r2d2_thread_env() -> None:
             "MKL_NUM_THREADS=6",
             "-e",
             "OPENBLAS_NUM_THREADS=6",
+            "-e",
+            "OMP_WAIT_POLICY=PASSIVE",
         ]
         del os.environ["R2D2_OMP_THREADS"]
         count = r2d2_thread_count()

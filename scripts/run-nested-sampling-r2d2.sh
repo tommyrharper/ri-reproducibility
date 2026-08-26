@@ -82,12 +82,22 @@ sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}" -- sh -c '
 # The thread caps are on the container here rather than on a per-rank `docker
 # exec`: torch and finufft read them at import time and every rank gets the same
 # value anyway.
+#
+# OMP_WAIT_POLICY=PASSIVE because the parallel regions here are tiny - a 128x128
+# NUFFT - and libgomp's default is to spin for the rest of its timeslice after
+# each one. With one worker per rank that spinning is a second thread per rank
+# burning a core it never uses: 8 workers imaging at 2 threads each measured
+# 27.7 requests/s spinning against 50.4 passive, and the sampler's wall clock
+# fell 17-22% (10 of 10 interleaved A/B pairs). Do not translate this into a
+# lower R2D2_OMP_THREADS - passive 2 threads matches 1 thread here and the
+# checkpointed UNet passes, which this parameter space cannot run, want them.
 # shellcheck disable=SC2016
 sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
   -v "${CHECKPOINTS_DIR}:/checkpoints:ro" \
   -e OMP_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
+  -e OMP_WAIT_POLICY=PASSIVE \
   -- sh -c '
   python3 "$2" --fifo-dir "$1" &
   exec sleep infinity
