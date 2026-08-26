@@ -309,8 +309,19 @@ PROFILING_STAGE_COLOURS = {
 }
 
 
-def render_profiling_bar(segments):
-    """One 100%-wide stacked bar plus its legend: where the run's worker-time went.
+# Enough lanes to read as "the workers ran side by side" without turning a
+# 64-rank run into a wall of identical stripes.
+PROFILING_LANE_CAP = 8
+
+
+def render_profiling_lanes(segments, mpi_procs, wall_seconds):
+    """Stacked worker lanes plus legend: how the stage times fit inside the wall clock.
+
+    Each lane is one worker's averaged timeline, so the stages along a single
+    lane add up to the end-to-end wall clock shown on the run header, while the
+    lanes stacked on top of each other add up to the worker-time budget. That
+    is the parallelisation made visible: the table's worker-seconds only reach
+    the wall clock once they are spread across the lanes they ran on.
 
     Segments are flex-grown in proportion to their share, so the 2px gaps
     between them come out of the available width rather than overflowing it.
@@ -319,7 +330,16 @@ def render_profiling_bar(segments):
         return ""
     bars, legend = [], []
     for label, seconds, share, colour in segments:
-        title = f"{label} - {format_duration(seconds)} ({format_share(share)})"
+        lane_seconds = seconds / mpi_procs
+        title = (
+            f"{label} - {format_duration(lane_seconds)} of each worker's "
+            f"{format_duration(wall_seconds)} ({format_share(share)}), "
+            f"{format_duration(seconds)} of worker-time in total"
+        )
+        lane_time = (
+            f"{format_duration(lane_seconds)} per worker" if mpi_procs != 1
+            else format_duration(lane_seconds)
+        )
         bars.append(
             f'<span class="profile-seg" style="--seg-share: {share:.6f}; --seg-colour: {colour}"'
             f' title="{html.escape(title)}"></span>'
@@ -328,12 +348,31 @@ def render_profiling_bar(segments):
             f'<li><span class="profile-swatch" style="--seg-colour: {colour}"></span>'
             f'<span>{html.escape(label)}</span>'
             f'<strong>{html.escape(format_share(share))}</strong>'
-            f'<span class="profile-legend-time">{html.escape(format_duration(seconds))}</span></li>'
+            f'<span class="profile-legend-time">{html.escape(lane_time)}</span></li>'
         )
+    shown = max(1, min(mpi_procs, PROFILING_LANE_CAP))
+    lane = f'<div class="profile-bar">{"".join(bars)}</div>'
     summary_text = ", ".join(f"{label} {format_share(share)}" for label, _, share, _ in segments)
+    if mpi_procs == 1:
+        caption = "one worker, so its timeline is the run's wall clock"
+    else:
+        caption = (
+            f"one lane per worker, {mpi_procs} of them running side by side, each spanning"
+            f" the run's {format_duration(wall_seconds)} wall clock (averaged across workers)"
+        )
+        if shown != mpi_procs:
+            caption += f" - showing {shown} of {mpi_procs} identical lanes"
+    aria = (
+        f"Each of the {mpi_procs} workers spends its {format_duration(wall_seconds)} "
+        f"wall clock like this: {summary_text}"
+    )
     return f"""
-      <div class="profile-bar" role="img"
-           aria-label="Share of worker-time by stage: {html.escape(summary_text)}">{''.join(bars)}</div>
+      <div class="profile-lanes" role="img" aria-label="{html.escape(aria)}">
+        <div class="profile-lane-scale"><span>0</span>
+          <span>{html.escape(format_duration(wall_seconds))} wall clock</span></div>
+        <div class="profile-lane-stack">{lane * shown}</div>
+      </div>
+      <p class="profile-lane-caption">{html.escape(caption)}</p>
       <ul class="profile-legend">{''.join(legend)}</ul>
     """
 
@@ -350,11 +389,19 @@ def render_profiling(summary):
     budget = breakdown["worker_seconds_budget"]
     evals = breakdown["evals"]
 
+    # Worker-seconds and wall-clock seconds only differ once the run is
+    # parallel, so a serial run keeps the narrower table.
+    show_wall = mpi_procs != 1
+
     def row(label, seconds, share, per_eval=None, evals_count="", indent=False, emphasis=False):
+        # A missing stage total leaves the cell blank rather than dropping it,
+        # which would shift every later cell into the wrong column.
+        wall = [format_duration(seconds / mpi_procs) if seconds is not None else ""] if show_wall else []
         # format_share can return "<0.1%", so every cell goes through escaping.
         cells = [html.escape(text) for text in (
             label,
             format_duration(seconds),
+            *wall,
             format_duration(per_eval) if per_eval is not None else "",
             format_share(share),
             str(evals_count),
@@ -390,6 +437,15 @@ def render_profiling(summary):
         breakdown["unaccounted_share"],
         emphasis=True,
     )
+    # The row the whole table exists to land on: divided across the workers, the
+    # stages above come to the end-to-end wall clock on the run header.
+    wall_seconds = (budget / mpi_procs) if budget else 0.0
+    body += row(
+        "end-to-end (accounted + unaccounted)",
+        budget,
+        1.0 if budget else None,
+        emphasis=True,
+    )
 
     segments = [
         (r["label"], r["seconds"], r["share"], PROFILING_STAGE_COLOURS.get(r["key"], "var(--series-1)"))
@@ -410,15 +466,32 @@ def render_profiling(summary):
         f"worker-time {format_duration(budget)} ({mpi_procs} × wall clock)",
         f"{evals} evaluations",
     ])
+    # Spelled out left to right so the arithmetic behind the run header's wall
+    # clock is readable without doing any of it yourself; the term it lands on
+    # is the one the header shows, so that term carries the emphasis.
+    terms = [
+        f"{format_duration(accounted)} accounted",
+        f"+ {format_duration(breakdown['unaccounted_seconds'])} unaccounted",
+    ]
+    if mpi_procs != 1:
+        terms.append(f"= {format_duration(budget)} of worker-time")
+        terms.append(f"÷ {mpi_procs} workers")
+    equation = " ".join(html.escape(term) for term in terms)
+    equation += (
+        f' <strong>= {html.escape(format_duration(wall_seconds))}'
+        " end-to-end wall clock</strong>"
+    )
+    wall_header = '<th class="num">wall clock</th>' if show_wall else ""
     return f"""
     <details>
       <summary>Profiling (where the run's time went)</summary>
       <p class="purpose">{html.escape(heading)}</p>
-      {render_profiling_bar(segments)}
+      {render_profiling_lanes(segments, mpi_procs, wall_seconds)}
+      <p class="profile-equation">{equation}</p>
       <div class="eval-table-wrap">
         <table class="eval-table">
           <thead><tr>
-            <th>stage</th><th class="num">total</th><th class="num">per eval</th>
+            <th>stage</th><th class="num">worker-time</th>{wall_header}<th class="num">per eval</th>
             <th class="num">share</th><th class="num">evals</th>
           </tr></thead>
           <tbody>{body}</tbody>
@@ -883,6 +956,25 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .profile-legend li { display: flex; align-items: center; gap: 0.35rem; }
 .profile-swatch { width: 0.7rem; height: 0.7rem; border-radius: 3px; background: var(--seg-colour); flex: none; }
 .profile-legend-time { opacity: 0.65; font-variant-numeric: tabular-nums; }
+.profile-lanes { margin: 0.75rem 0 0.4rem; }
+.profile-lane-scale {
+  display: flex; justify-content: space-between;
+  font-size: 0.7rem; opacity: 0.55; font-variant-numeric: tabular-nums;
+  padding-bottom: 0.2rem;
+  border-bottom: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+}
+.profile-lane-stack { display: flex; flex-direction: column; gap: 2px; padding-top: 0.25rem; }
+.profile-lane-stack .profile-bar { height: 0.6rem; margin: 0; }
+.profile-lane-caption { font-size: 0.75rem; opacity: 0.7; margin: 0 0 0.5rem; }
+.profile-equation {
+  font-size: 0.82rem; margin: 0 0 0.75rem;
+  font-variant-numeric: tabular-nums;
+  padding: 0.4rem 0.6rem;
+  /* Neutral, not a series colour - the line is about the total, not one stage. */
+  border-left: 3px solid color-mix(in srgb, CanvasText 35%, transparent);
+  background: color-mix(in srgb, CanvasText 5%, transparent);
+  border-radius: 0 4px 4px 0;
+}
 .eval-glance { margin: 0.75rem 0 1rem; }
 .eval-images { margin: 0.75rem 0; }
 .eval-strip-wrap { margin: 0.75rem 0; }
@@ -1303,11 +1395,24 @@ def _self_check_profiling():
     assert "&lt;0.1%" in html_out and "<0.1%" not in html_out, html_out
     assert "8 workers" in html_out and "1h 00m 45s" in html_out, html_out
     assert "convert" not in html_out, html_out
-    # Every top-level stage plus the unaccounted remainder is charted and adds to 100%.
-    assert html_out.count('class="profile-seg"') == 4, html_out
+    # Every top-level stage plus the unaccounted remainder is charted, adds to
+    # 100%, and is repeated once per worker lane.
+    assert html_out.count('class="profile-bar"') == 8, html_out
+    assert html_out.count('class="profile-seg"') == 4 * 8, html_out
     assert "unaccounted (PolyChord sampling + idle)" in html_out, html_out
     shares = [float(s) for s in re.findall(r"--seg-share: ([\d.]+)", html_out)]
-    assert abs(sum(shares) - 1.0) < 1e-6, shares
+    assert abs(sum(shares) / 8 - 1.0) < 1e-6, shares
+    # The parallelisation arithmetic is spelled out and lands on the wall clock
+    # the run header shows, and the table carries the wall-clock column that
+    # turns each stage's worker-seconds into its cost in wall time.
+    assert (
+        "39m 49s accounted + 20m 55s unaccounted = 1h 00m 45s of worker-time ÷ 8 workers"
+        " <strong>= 7m 36s end-to-end wall clock</strong>"
+    ) in html_out, html_out
+    assert "8 of them running side by side" in html_out, html_out
+    assert ">wall clock</th>" in html_out, html_out
+    assert "4m 54s" in html_out, html_out  # r2d2's 39m 15s of worker-time, in wall clock
+    assert "end-to-end (accounted + unaccounted)" in html_out, html_out
     # Serial run: the budget is just the wall clock, so shares are of wall time.
     single = render_profiling({"algorithm": "wsclean", "profiling": {
         "mpi_procs": 1, "total_wall_seconds": 10.0,
@@ -1317,7 +1422,13 @@ def _self_check_profiling():
     }})
     assert '<td class="num">50.0%</td>' in single, single
     assert single.count("--seg-share: 0.500000") == 2, single  # the one stage, and the remainder
+    assert single.count('class="profile-bar"') == 1, single  # one worker, one lane
     assert "1 worker ·" in single, single
+    # Serial: worker-time is the wall clock, so no redundant column and no division.
+    assert ">wall clock</th>" not in single, single
+    assert (
+        "5.00s accounted + 5.00s unaccounted <strong>= 10.0s end-to-end wall clock</strong>"
+    ) in single, single
     # No profiling block: nothing rendered.
     assert render_profiling({}) == ""
     # A profiling block with nothing in it must not divide by zero.
