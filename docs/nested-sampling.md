@@ -84,9 +84,9 @@ results/nested-sampling/r2d2-vlaa-<UTC timestamp>/
 ```
 
 The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
-evaluation runs one MeqTrees simulate and one MeqTrees-hosted MS-to-`.mat`
-conversion - both inside the shared MeqTrees sidecar - plus one R2D2 imaging
-container.
+evaluation runs one MeqTrees simulate, one MeqTrees-hosted MS-to-`.mat`
+conversion and one R2D2 imaging job, each a request to a long-lived process
+inside one of the run's two sidecar containers.
 
 R2D2 requires pretrained checkpoints at `checkpoints/R2D2_A1/R2D2_UNet_N*.ckpt`
 (see `./ri fetch-checkpoints` and `./ri smoke r2d2`).
@@ -98,14 +98,16 @@ Before a full end-to-end run, validate the MS-to-`.mat` bridge:
 ```
 
 `run-nested-sampling-r2d2.sh` runs `NS_MPI_PROCS` PolyChord ranks
-concurrently, each launching its own R2D2 container. Each R2D2 imaging
-container is launched with OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`,
+concurrently, each with its own `r2d2_serve.py` imaging worker inside the
+shared R2D2 sidecar (see "R2D2 imaging runs in a long-lived worker" in
+[nested-sampling-profiling.md](nested-sampling-profiling.md)). Each worker is
+started with OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`,
 `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set from the host's available CPU
 count, overridable via `R2D2_OMP_THREADS`. The previous image default of
 `OMP_NUM_THREADS=4` capped finufft/OpenMP work when the Docker VM exposed more
 CPUs than four. To avoid CPU oversubscription, the script defaults
 `R2D2_OMP_THREADS` to `host CPUs / NS_MPI_PROCS` (minimum `1`) when not set
-explicitly, so each rank's R2D2 container gets a fair share of the host's cores
+explicitly, so each rank's imaging worker gets a fair share of the host's cores
 instead of all of them. Set `R2D2_OMP_THREADS` explicitly to override this
 per-rank default.
 
@@ -197,7 +199,7 @@ For each sample, the pipeline records:
 | `peak_flux_abs_error_jy` | Absolute centre-pixel flux error |
 | `sigma_res` | Paper data-fidelity \(\overline{\sigma}_{\textrm{res.}}=\|\widehat{\mathbf{r}}\|_2/\|\mathbf{x}_{\textrm{d}}\|_2\) (final residual dirty over dirty) |
 | `wall_seconds` | Imaging container runtime |
-| `peak_memory_bytes` | Peak imaging memory: GNU `time -v` for WSClean, sampled Docker stats for R2D2 |
+| `peak_memory_bytes` | Peak imaging memory: GNU `time -v` for WSClean; for R2D2 the imaging worker's own high-water RSS, which is a running maximum across that rank's evaluations |
 
 PolyChord maximizes whatever value the run returns as its log-likelihood. The
 default objective is `total_rms_jy` (RMS of the reconstructed image minus

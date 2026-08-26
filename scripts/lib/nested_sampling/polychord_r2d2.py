@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 import time
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,9 +24,8 @@ from common import (
     mpi_rank,
     params_key,
     prior_vector,
-    r2d2_docker_thread_env_flags,
     resolve_metric,
-    run_docker_monitored,
+    run_r2d2_imaging,
     self_check_lazy_numpy,
     self_check_metric_resolution,
     self_check_profiling,
@@ -145,37 +143,22 @@ def evaluate(
     r2d2_dir = eval_dir / "r2d2"
     r2d2_dir.mkdir()
     config_path = eval_dir / "r2d2_config.yaml"
-    write_r2d2_config(config_path, "/work/r2d2_data.mat", "/work/r2d2")
+    write_r2d2_config(config_path, str(mat_path), str(r2d2_dir))
 
-    container_name = f"ri-ns-r2d2-{uuid.uuid4().hex[:12]}"
     r2d2_stdout = eval_dir / "r2d2.stdout.log"
     r2d2_stderr = eval_dir / "r2d2.stderr.log"
+    # `imager.py` argv for this rank's long-lived R2D2 worker (see
+    # run_r2d2_imaging): a fresh `docker run` of this image cost ~2.4s warm, of
+    # which ~1.8s was container start plus torch and R2D2 imports.
     r2d2_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        # No sidecar needs networking, and docker's default bridge setup costs
-        # ~0.7s per container under rootless Docker - 35x the container's own
-        # runtime here. "none" still gives a loopback interface for meqserver.
-        "--network",
-        "none",
-        "--name",
-        container_name,
-        "--platform",
-        args.platform,
-        *r2d2_docker_thread_env_flags(),
-        "-v",
-        f"{eval_dir}:/work",
-        "-v",
-        f"{args.checkpoints_dir}:/checkpoints:ro",
-        args.r2d2_image,
-        "./src/imager.py",
         "--config",
-        "/work/r2d2_config.yaml",
+        str(config_path),
         "--ckpt_path",
         "/checkpoints/R2D2_A1",
     ]
-    run_result = run_docker_monitored(r2d2_cmd, container_name, r2d2_stdout, r2d2_stderr)
+    run_result = run_r2d2_imaging(
+        args.r2d2_image, args.platform, args.checkpoints_dir, r2d2_cmd, r2d2_stdout, r2d2_stderr
+    )
     peak_memory_bytes = run_result.peak_memory_bytes
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
@@ -263,7 +246,7 @@ def self_check_failure_record_persistence() -> None:
 
     original_compute_metrics = globals()["compute_image_metrics"]
     original_sidecar_run = globals()["sidecar_run"]
-    original_run_docker = globals()["run_docker_monitored"]
+    original_run_r2d2 = globals()["run_r2d2_imaging"]
     original_simulate = globals()["simulate_measurement_set"]
 
     def failing_simulate(
@@ -298,12 +281,7 @@ def self_check_failure_record_persistence() -> None:
         def successful_convert(*args: Any, **kwargs: Any) -> argparse.Namespace:
             return argparse.Namespace(returncode=0, wall_seconds=0.1, peak_memory_bytes=0)
 
-        def successful_r2d2(
-            cmd: list[str],
-            container_name: str,
-            stdout_path: Path,
-            stderr_path: Path,
-        ) -> argparse.Namespace:
+        def successful_r2d2(*args: Any, **kwargs: Any) -> argparse.Namespace:
             return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
 
         def failing_metrics(*args: Any, **kwargs: Any) -> dict[str, float]:
@@ -311,7 +289,7 @@ def self_check_failure_record_persistence() -> None:
 
         globals()["simulate_measurement_set"] = successful_simulate
         globals()["sidecar_run"] = successful_convert
-        globals()["run_docker_monitored"] = successful_r2d2
+        globals()["run_r2d2_imaging"] = successful_r2d2
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -330,7 +308,7 @@ def self_check_failure_record_persistence() -> None:
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
         globals()["sidecar_run"] = original_sidecar_run
-        globals()["run_docker_monitored"] = original_run_docker
+        globals()["run_r2d2_imaging"] = original_run_r2d2
         globals()["simulate_measurement_set"] = original_simulate
 
 

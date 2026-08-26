@@ -76,3 +76,15 @@ PLATFORM="${DOCKER_DEFAULT_PLATFORM}"
 # Generated per run rather than configured, so it stays here and not in
 # defaults.toml.
 : "${RUN_ID:=$(date -u +%Y%m%dT%H%M%SZ)}"
+
+# Host path of the Docker socket, for the containers that drive other
+# containers. Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
+# /var/run/docker.sock, and a bind mount needs the real host path; DOCKER_HOST
+# is what points the CLI at it. Also not in defaults.toml - a property of the
+# host, not the project.
+if [ -z "${DOCKER_SOCKET:-}" ]; then
+  case "${DOCKER_HOST:-}" in
+    unix://*) DOCKER_SOCKET="${DOCKER_HOST#unix://}" ;;
+    *) DOCKER_SOCKET="/var/run/docker.sock" ;;
+  esac
+fi

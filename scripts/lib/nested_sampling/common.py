@@ -7,7 +7,6 @@ import atexit
 import json
 import math
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -164,7 +163,7 @@ _SIDECAR_CONTAINERS: dict[str, str] = json.loads(os.environ.get("NS_SIDECARS", "
 _IMAGE_ENTRYPOINTS: dict[str, list[str]] = {}
 
 
-def sidecar_container(image: str, platform: str) -> str:
+def sidecar_container(image: str, platform: str, extra_args: list[str] | None = None) -> str:
     """Name of the run's long-lived container for `image`.
 
     A per-evaluation `docker run` costs ~0.40s of create/start/teardown on this
@@ -183,6 +182,11 @@ def sidecar_container(image: str, platform: str) -> str:
     Starting them per rank instead meant 16 concurrent `docker run`s on the
     default 8 ranks, which cost 1.3s against 0.36s for a single one, all of it
     in front of the first evaluation.
+
+    `extra_args` are `docker run` arguments this image needs on top of the repo
+    mount (the R2D2 image's read-only `/checkpoints`), and only apply when this
+    process is the one starting the container - the run script passes the same
+    arguments through `sidecar_launch`.
     """
     if image not in _SIDECAR_CONTAINERS:
         repo_root = os.environ.get("REPO_ROOT", os.getcwd())
@@ -200,6 +204,7 @@ def sidecar_container(image: str, platform: str) -> str:
                 "--shm-size", "512m",
                 "--platform", platform,
                 "-v", f"{repo_root}:{repo_root}",
+                *(extra_args or []),
                 "--entrypoint", "sleep", image, "infinity",
             ],
             stdout=subprocess.DEVNULL,
@@ -296,7 +301,7 @@ def sidecar_run(
     stdout_path: Path,
     stderr_path: Path,
 ) -> DockerRunResult:
-    """Run `cmd` in this rank's sidecar, same shape as run_docker_monitored().
+    """Run `cmd` in this rank's sidecar and report its exit code and wall time.
 
     The command's own output goes to the log files, so only the exit code `echo`
     comes back down the shell's stdout and nothing a sidecar prints can be
@@ -323,51 +328,6 @@ def sidecar_run(
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
     with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
         subprocess.run(cmd, stdout=stdout, stderr=stderr, check=True)
-
-
-MEM_RE = re.compile(r"(?P<value>[0-9.]+)\s*(?P<unit>[KMGT]?i?B)")
-
-
-def memory_to_bytes(text: str) -> int:
-    first = text.split("/", 1)[0].strip()
-    match = MEM_RE.search(first)
-    if not match:
-        return 0
-    value = float(match.group("value"))
-    unit = match.group("unit")
-    factors = {
-        "B": 1,
-        "KB": 1000,
-        "MB": 1000**2,
-        "GB": 1000**3,
-        "TB": 1000**4,
-        "KiB": 1024,
-        "MiB": 1024**2,
-        "GiB": 1024**3,
-        "TiB": 1024**4,
-    }
-    return int(value * factors.get(unit, 1))
-
-
-def run_docker_monitored(cmd: list[str], container_name: str, stdout_path: Path, stderr_path: Path) -> DockerRunResult:
-    started = time.perf_counter()
-    peak_memory = 0
-    with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
-        proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
-        while proc.poll() is None:
-            stats = subprocess.run(
-                ["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}", container_name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                check=False,
-            )
-            if stats.returncode == 0 and stats.stdout.strip():
-                peak_memory = max(peak_memory, memory_to_bytes(stats.stdout.strip()))
-            time.sleep(0.2)
-        returncode = proc.wait()
-    wall = time.perf_counter() - started
-    return DockerRunResult(returncode=returncode, wall_seconds=wall, peak_memory_bytes=peak_memory)
 
 
 def _fits_card_value(field: str) -> Any:
@@ -883,6 +843,85 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | Fi
         atexit.register(worker.terminate)
         _SIMULATE_WORKERS[meqtrees_image] = worker
     return _SIMULATE_WORKERS[meqtrees_image]
+
+
+_R2D2_WORKERS: dict[str, subprocess.Popen] = {}
+
+
+def r2d2_checkpoint_mount(checkpoints_dir: str) -> list[str]:
+    """`docker run` arguments putting the host checkpoints at `/checkpoints`.
+
+    The mount point stays `/checkpoints` rather than becoming a host path so
+    that `ckpt_path` - which every `poc-summary.json` records and
+    merge-nested-sampling-runs.py compares across runs - keeps its
+    machine-independent value.
+    """
+    return ["-v", f"{checkpoints_dir}:/checkpoints:ro"]
+
+
+def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> subprocess.Popen:
+    """This rank's long-lived `r2d2_serve.py` process inside the R2D2 sidecar.
+
+    A per-evaluation `docker run` of this image cost ~2.4s warm on this host and
+    only ~0.6s of it was science: ~0.5s of container create/start plus ~1.3s of
+    `import torch` and the R2D2 module imports, repeated every evaluation. One
+    worker per rank pays both once.
+
+    The thread limits go on the `docker exec`, not the container, because torch
+    and finufft read them at import time and each rank gets its own share.
+    """
+    if r2d2_image not in _R2D2_WORKERS:
+        repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
+        container = sidecar_container(r2d2_image, platform, r2d2_checkpoint_mount(checkpoints_dir))
+        worker = subprocess.Popen(
+            [
+                "docker", "exec", "--interactive",
+                *r2d2_docker_thread_env_flags(),
+                container,
+                "python3",
+                # Read live off the repo bind mount: the R2D2 image bakes in no
+                # copy of this repo's scripts, so there is nothing to rebuild.
+                str(repo_root / "scripts" / "lib" / "nested_sampling" / "r2d2_serve.py"),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        # The container itself is torn down by sidecar_container()'s own atexit
+        # hook, which is registered first and so runs last.
+        atexit.register(worker.terminate)
+        _R2D2_WORKERS[r2d2_image] = worker
+    return _R2D2_WORKERS[r2d2_image]
+
+
+def run_r2d2_imaging(
+    r2d2_image: str,
+    platform: str,
+    checkpoints_dir: str,
+    argv: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> DockerRunResult:
+    """Run one `imager.py` in this rank's R2D2 worker, same shape as sidecar_run()."""
+    worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
+    request = {"argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}
+    started = time.perf_counter()
+    worker.stdin.write(json.dumps(request) + "\n")
+    worker.stdin.flush()
+    reply = worker.stdout.readline()
+    wall_seconds = time.perf_counter() - started
+    if not reply:
+        # The worker died mid-request; drop it so the next evaluation gets a
+        # fresh one instead of every later evaluation inheriting the corpse.
+        _R2D2_WORKERS.pop(r2d2_image, None)
+        stderr_path.write_text("FATAL: r2d2 worker exited without a reply\n")
+        return DockerRunResult(returncode=1, wall_seconds=wall_seconds, peak_memory_bytes=0)
+    answer = json.loads(reply)
+    return DockerRunResult(
+        returncode=answer["returncode"],
+        wall_seconds=wall_seconds,
+        peak_memory_bytes=answer["peak_memory_bytes"],
+    )
 
 
 def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[[], None]:

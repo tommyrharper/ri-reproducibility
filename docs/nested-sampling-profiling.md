@@ -21,14 +21,13 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 |---|---|
 | `simulate_seconds` | Wall time for the MeqTrees `docker run` that produces `sim.ms` (container start + RIME simulation, not split further) |
 | `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion in the MeqTrees sidecar |
-| `image_container_seconds` | Wall time for the imaging `docker run` round trip (WSClean or R2D2) |
+| `image_container_seconds` | Wall time for the imaging round trip: a `docker run` for WSClean, one request to this rank's R2D2 worker for R2D2 |
 | `image_binary_seconds` | WSClean only: the binary's own elapsed time from `/usr/bin/time -v` inside the container, i.e. excluding docker create/start/teardown |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
 
 `image_container_overhead_seconds` (container round trip minus binary time) is
 only available for WSClean, because only its image installs GNU `time`; R2D2
-and MeqTrees containers report only the round-trip `docker run` time as one
-blob.
+and MeqTrees report only the round-trip time as one blob.
 
 `summary.json` also gets a run-level `profiling` block: each field above
 summed across every evaluation, plus:
@@ -819,16 +818,16 @@ byte-identical metrics for every one of them.
 The WSClean call also dropped `run_docker_monitored()`'s `docker stats`
 sampler. GNU `time -v` already runs inside that container and reports an exact
 peak RSS, where the 0.2s-interval sampler both missed short peaks and delayed
-noticing the process had exited. R2D2 still uses `run_docker_monitored()`; its
-image has no GNU `time`.
+noticing the process had exited. R2D2 later stopped using
+`run_docker_monitored()` too - see "R2D2 imaging runs in a long-lived worker"
+below - and with no callers left the helper and its `docker stats` parsing are
+gone from `poc_common.py`.
 
 Together these took the profiled run from 43.5s to 27.5s (-37%) with identical
 per-evaluation metrics, identical `log(Z)`, and the same set of files in every
 evaluation directory. The R2D2 run picks up the simulate half of this through
-the shared `simulate_measurement_set()`, and its MS-to-`.mat` convert now goes
-through the same sidecar via `sidecar_run()` (see below). Only its imaging
-container is still one `docker run` each: that one needs the extra
-`checkpoints/` mount and per-run thread env vars.
+the shared `simulate_measurement_set()`; its MS-to-`.mat` convert and imaging
+step now go through sidecars of their own (see below).
 
 ### The R2D2 MS-to-`.mat` convert runs in the MeqTrees sidecar
 
@@ -848,10 +847,68 @@ directly instead of the old per-evaluation `/work` mount. Measured
 the `docker run` path (~0.55s of container start plus the converter's own
 ~0.25s of casacore and scipy imports). The `.mat` files are unchanged.
 
-That leaves the converter's own import cost as the next thing in this stage; it
-would need a `--serve` worker like the simulate side's, which is not worth it
-while the R2D2 container next door still pays ~1.3s of `import torch` and ~0.5s
-of container start per evaluation.
+That leaves the converter's own import cost as the next thing in this stage. It
+would need a `--serve` worker like the simulate side's; at ~0.25s a request it
+is now the largest per-evaluation fixed cost left in an R2D2 evaluation, the
+R2D2 imaging step below having dropped below it.
+
+### R2D2 imaging runs in a long-lived worker, not a container per evaluation
+
+`polychord_r2d2_poc.py` used to image with one `docker run` of the R2D2 image
+per evaluation. Warm (the 5.6GB image already in page cache - a cold cache makes
+the first few evaluations take 84s, 29s, 31s, 18s, and any timing taken there is
+meaningless) that round trip costs ~2.1s on this host, of which almost none is
+science: ~0.5s of container create/start and ~1.3s of `import torch` plus the
+R2D2 module imports, repeated every time.
+
+`scripts/lib/nested_sampling/r2d2_serve.py` is the R2D2 equivalent of the
+simulate side's `--serve` worker: one process per rank, inside a shared R2D2
+sidecar, running one imaging job per JSON request line
+(`{"argv": [...], "stdout": path, "stderr": path}` in, `{"returncode": int,
+"peak_memory_bytes": int}` out). Upstream's `src/imager.py` has no importable
+entry point - its whole body sits under `if __name__ == "__main__"` - so each
+request re-runs that body with `runpy.run_path(..., run_name="__main__")`, and
+its imports come back from `sys.modules`. `poc_common.run_r2d2_imaging()` is the
+caller-side half, shaped like `sidecar_run()`.
+
+Measured against the same `.mat`, `--ckpt_path` pointing at an empty
+`checkpoints/R2D2_A1` so both paths stop at the same place (`get_DNNs`, "Checkpoint
+for N1 not found"), `R2D2_OMP_THREADS=1`:
+
+| Path | Per evaluation |
+|---|---|
+| `docker run` per evaluation | 2.08s, 2.15s, 2.15s |
+| worker, first request on a rank | 1.49s |
+| worker, steady state | 0.10s, 0.15s, 0.15s |
+
+So ~1.95s per evaluation, against a total ~2.3s of measured fixed overhead
+before it. What is left in the 0.10-0.15s is the whole of the actual imaging
+work - data load, imaging weights, measurement operator, operator norm - plus,
+once checkpoints are present, the 25 UNet forward passes this measurement could
+not run. That part is unchanged; only the fixed cost in front of it is gone.
+
+Two consequences of a worker holding a whole rank rather than one evaluation:
+
+- `peak_memory_bytes` for R2D2 is now the worker's own high-water RSS
+  (`ru_maxrss`), not a `docker stats` sample of a per-evaluation container. It is
+  a running maximum across a rank's evaluations, so only the first evaluation on
+  a worker reports exactly what the container did. `docker stats` was a poor
+  source anyway: each `--no-stream` call takes ~2.0s on this host because the CLI
+  waits for two samples.
+- The checkpoints mount point stays `/checkpoints` rather than becoming the host
+  path, because `ckpt_path` is recorded in every `poc-summary.json` and compared
+  across runs by `merge-nested-sampling-runs.py`; a host path there would stop
+  runs from different checkouts merging. The evaluation's own `data_file` and
+  `output_path` do become absolute host paths, the same way the convert step's
+  did.
+
+`r2d2_serve.py` runs from the repository bind mount, not from a copy baked into
+the R2D2 image, so editing it needs no 5.6GB rebuild.
+
+Not done here, and worth a look next: the worker is started on this rank's first
+evaluation, so that ~1.5s lands on the wall clock in front of evaluation one on
+every rank. The WSClean PoC hides the same cost behind PolyChord's own startup
+with `prewarm()`; the R2D2 PoC calls neither that nor anything like it.
 
 ### Sidecar containers run with `--network none`
 

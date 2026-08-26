@@ -10,16 +10,6 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/wsclean-vlaa-${RUN_ID}}"
 
-if [ -z "${DOCKER_SOCKET:-}" ]; then
-  # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
-  # /var/run/docker.sock, and the sidecar containers this run launches need
-  # the real host path to bind-mount. DOCKER_HOST is what points the CLI at
-  # it, so derive from that and fall back to the rootful default.
-  case "${DOCKER_HOST:-}" in
-    unix://*) DOCKER_SOCKET="${DOCKER_HOST#unix://}" ;;
-    *) DOCKER_SOCKET="/var/run/docker.sock" ;;
-  esac
-fi
 # Before the launches, because the meqtrees container's command below needs one
 # FIFO pair per rank to already exist - which costs ~0.06s of serial `docker
 # info` in front of a ~0.4s container start that does not otherwise need its

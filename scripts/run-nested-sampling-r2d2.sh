@@ -10,16 +10,6 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/r2d2-vlaa-${RUN_ID}}"
 
-if [ -z "${DOCKER_SOCKET:-}" ]; then
-  # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
-  # /var/run/docker.sock, and the sidecar containers this run launches need
-  # the real host path to bind-mount. DOCKER_HOST is what points the CLI at
-  # it, so derive from that and fall back to the rootful default.
-  case "${DOCKER_HOST:-}" in
-    unix://*) DOCKER_SOCKET="${DOCKER_HOST#unix://}" ;;
-    *) DOCKER_SOCKET="/var/run/docker.sock" ;;
-  esac
-fi
 if ! docker info >/dev/null 2>&1; then
   echo "FATAL: Docker daemon is not available" >&2
   exit 1
@@ -46,9 +36,14 @@ mkdir -p "${OUTPUT_DIR}"
 # Shared by every rank, started here so the daemon is not hit by one
 # `docker run` per rank per image the moment the ranks come up.
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
-# The simulate and the MS-to-`.mat` convert both run in this sidecar; only the
-# R2D2 imaging step is still one `docker run` each.
-start_sidecars "${PLATFORM}" "${MEQTREES_IMAGE}"
+# Every stage of an evaluation runs in one of these two: simulate and the
+# MS-to-`.mat` convert in the MeqTrees container, imaging in the R2D2 one. The
+# checkpoint mount point stays `/checkpoints` so that the `ckpt_path` every
+# `poc-summary.json` records - and merge-nested-sampling-runs.py compares - is
+# not a host path.
+sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}"
+sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" -v "${CHECKPOINTS_DIR}:/checkpoints:ro"
+sidecar_wait
 
 RUN_COMMAND=(
   docker run --rm --platform "${PLATFORM}"
