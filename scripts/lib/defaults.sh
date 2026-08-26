@@ -50,8 +50,27 @@ fi
 eval "${_ri_defaults}"
 unset _ri_defaults
 
-# DOCKER_DEFAULT_PLATFORM is what Docker itself reads and what .env.example
-# documents; PLATFORM is what the scripts pass to `--platform`.
+# The Docker platform is deliberately not in defaults.toml: it is a property
+# of the host, not of the project, so any committed value is wrong on half
+# the machines this repo runs on. Derived from the host architecture here and
+# still overridable from the environment, which is what a host cross-building
+# for the other architecture needs.
+#
+# DOCKER_DEFAULT_PLATFORM is what Docker itself reads (so `docker build`,
+# `docker run`, and compose.yaml all pick it up once it is exported);
+# PLATFORM is what the scripts pass to an explicit `--platform`.
+if [[ -z "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
+  case "$(uname -m)" in
+    x86_64 | amd64) DOCKER_DEFAULT_PLATFORM="linux/amd64" ;;
+    aarch64 | arm64) DOCKER_DEFAULT_PLATFORM="linux/arm64" ;;
+    *)
+      echo "defaults.sh: no image is built for host architecture '$(uname -m)';" \
+        "set DOCKER_DEFAULT_PLATFORM explicitly to override" >&2
+      exit 1
+      ;;
+  esac
+fi
+export DOCKER_DEFAULT_PLATFORM
 PLATFORM="${DOCKER_DEFAULT_PLATFORM}"
 
 # Generated per run rather than configured, so it stays here and not in

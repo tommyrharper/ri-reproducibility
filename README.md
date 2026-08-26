@@ -51,9 +51,11 @@ with "it reproduced the paper."
 
 ## 4. Apple Silicon limitations
 
-- All images are built and run as `linux/arm64` natively (Docker
-  Desktop on Apple Silicon runs an arm64 Linux VM - no emulation, no
-  Rosetta needed for `linux/arm64` images).
+- All images are built and run natively for the host architecture -
+  `linux/arm64` on Apple Silicon (Docker Desktop runs an arm64 Linux VM -
+  no emulation, no Rosetta needed for `linux/arm64` images), `linux/amd64`
+  on an x86_64 Linux host. The scripts derive this from `uname -m`; set
+  `DOCKER_DEFAULT_PLATFORM` only to cross-build for the other one.
 - **CUDA/GPU are not available.** Both images are CPU-only by design.
   R2D2 checkpoints trained on GPU load and run fine on CPU (slower);
   see `docker/r2d2/Dockerfile` for why the CPU-only PyTorch wheel is
@@ -92,7 +94,7 @@ explicit. `docker compose config` (`make config`) is provided for
 validation and for `make shell-*`, not as the primary build path.
 
 WSClean portability: `WSCLEAN_PORTABLE=ON` (default) builds a binary
-that runs on any `linux/arm64` CPU, per WSClean's own documented
+that runs on any CPU of the build architecture, per WSClean's own documented
 `-DPORTABLE` CMake option. For benchmarking *on the machine you will
 actually run benchmarks on*, rebuild with `WSCLEAN_PORTABLE=OFF`
 (`WSCLEAN_PORTABLE=OFF scripts/build.sh wsclean`, tagged
@@ -138,7 +140,7 @@ so it can be inspected and compared later:
 ```bash
 # 1. Run the pipeline for real, writing output to its own results/
 #    subdirectory (not the smoke test's, so they don't collide), e.g.:
-docker run --rm --platform linux/arm64 \
+docker run --rm \
   -v "$(pwd)/checkpoints:/checkpoints:ro" \
   -v "$(pwd)/results/<experiment-name>:/results" \
   -v "$(pwd)/config/r2d2:/workspace/config:ro" \
@@ -334,11 +336,12 @@ should not be treated as authoritative.
 ## Troubleshooting
 
 - **Docker architecture mismatch** (`exec format error`, or Docker
-  silently emulating): confirm `docker info | grep Architecture` says
-  `aarch64` and you did not pass `--platform linux/amd64` anywhere by
-  accident. Both Dockerfiles are `linux/arm64` native; forcing
-  `linux/amd64` triggers slow, unsupported QEMU emulation this repo
-  does not test against.
+  silently emulating): the images are host-native, so this means something
+  forced the other architecture. Check `echo $DOCKER_DEFAULT_PLATFORM` is
+  empty (or matches `docker info | grep Architecture`) and that you did not
+  pass `--platform` by hand. Forcing the non-host architecture triggers slow
+  QEMU emulation this repo does not test against, and fails outright on a
+  host with no `binfmt_misc` handler registered for it.
 - **Unavailable/unsupported ARM64 Python wheel**: check the PyPI JSON
   API (`https://pypi.org/pypi/<pkg>/json`) for a `*aarch64*.whl` before
   assuming a package needs a source build. `finufft` is the one

@@ -1,8 +1,13 @@
 # Primarily used for `docker compose config` validation and interactive
 # shells (`make shell-wsclean` / `make shell-r2d2`). Actual smoke-test and
 # benchmark runs use plain `docker run` (see scripts/) so that per-run
-# bind mounts, platform flags, and commands stay explicit and easy to
-# reason about individually.
+# bind mounts and commands stay explicit and easy to reason about
+# individually.
+#
+# No `platform:` is pinned here. Docker builds and runs for the host
+# architecture by default and applies DOCKER_DEFAULT_PLATFORM itself when it
+# is set, so pinning one would only hardcode the wrong architecture on half
+# the hosts this repo runs on.
 services:
   wsclean:
     build:
@@ -10,10 +15,7 @@ services:
       dockerfile: docker/wsclean/Dockerfile
       args:
         WSCLEAN_PORTABLE: ${WSCLEAN_PORTABLE:-ON}
-      platforms:
-        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     image: ri-reproducibility/wsclean:v3.7
-    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     entrypoint: ["wsclean"]
     command: ["--version"]
     volumes:
@@ -27,10 +29,7 @@ services:
     build:
       context: .
       dockerfile: docker/r2d2/Dockerfile
-      platforms:
-        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     image: ri-reproducibility/r2d2:cpu
-    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     entrypoint: ["python3"]
     command: ["--version"]
     volumes:
@@ -45,10 +44,7 @@ services:
     build:
       context: .
       dockerfile: docker/meqtrees/Dockerfile
-      platforms:
-        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     image: ri-reproducibility/meqtrees:kern-10
-    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     command: ["--help"]
     volumes:
       - ${DATA_DIR:-./data}:/data
@@ -58,10 +54,7 @@ services:
     build:
       context: .
       dockerfile: docker/polychord/Dockerfile
-      platforms:
-        - ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     image: ri-reproducibility/polychord:lite
-    platform: ${DOCKER_DEFAULT_PLATFORM:-linux/arm64}
     command: ["--help"]
     volumes:
       - .:/workspace/repo
