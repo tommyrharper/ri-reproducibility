@@ -22,7 +22,8 @@ at least one baseline run each (see `REPRODUCTION_PLAN.md`).
 - `nested-sampling-report/` - generated, gitignored; run
   `make nested-sampling-report` for one page per nested-sampling PoC run
   from `results/nested-sampling-poc/*/poc-summary.json` (PolyChord log(Z),
-  evaluation image grid, likelihood plot; see `docs/nested-sampling.md`),
+  evaluation image grid, likelihood plot, and a collapsible per-stage
+  profiling table when the run recorded one; see `docs/nested-sampling.md`),
   plus an `index.html` listing and linking to every run. Existing run pages
   are skipped on re-run, so only new runs are rendered; `FORCE=1` rebuilds
   them, `RUN=<run>` rebuilds one, `LAST=N` limits to the newest N runs.

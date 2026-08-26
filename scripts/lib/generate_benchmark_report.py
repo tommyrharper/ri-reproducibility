@@ -287,6 +287,67 @@ def render_images_likelihood_collapsible(tab_id, eval_images_html, likelihood_ht
     """
 
 
+PROFILING_STAGES = [
+    ("simulate (MeqTrees)", "simulate", "simulate_seconds"),
+    ("convert (MS -> .mat)", "convert", "convert_seconds"),
+    ("image container (total)", "image_container", "image_container_seconds"),
+    ("&nbsp;&nbsp;of which: binary run", "image_binary", "image_binary_seconds"),
+    ("&nbsp;&nbsp;of which: container overhead", "image_container_overhead", "image_container_overhead_seconds"),
+    ("metrics computation", "metrics", "metrics_seconds"),
+]
+
+
+def render_profiling(summary):
+    """Collapsed per-stage timing table, mirroring scripts/profile-nested-sampling-run.py."""
+    profiling = summary.get("profiling")
+    if not profiling:
+        return ""
+
+    total = profiling.get("total_wall_seconds")
+    mpi_procs = profiling.get("mpi_procs", 1)
+    # Shares are only meaningful against wall time when there is a single worker.
+    show_shares = mpi_procs == 1 and total
+
+    def row(label, seconds, evals="", emphasis=False):
+        value = "n/a" if seconds is None else f"{float(seconds):.2f}s"
+        if emphasis:
+            label, value = f"<strong>{label}</strong>", f"<strong>{value}</strong>"
+        share = ""
+        if show_shares:
+            pct = f"{100.0 * seconds / total:.1f}%" if seconds is not None else ""
+            share = f"<td>{pct}</td>"
+        return f"<tr><td>{label}</td><td>{value}</td>{share}<td>{html.escape(str(evals))}</td></tr>"
+
+    stages = profiling.get("stage_totals_seconds", {})
+    counts = profiling.get("stage_eval_counts", {})
+    body = "".join(
+        row(label, stages.get(key), counts.get(count_key, 0))
+        for label, key, count_key in PROFILING_STAGES
+        if stages.get(key) is not None
+    )
+    accounted = profiling.get("accounted_worker_seconds", profiling.get("accounted_seconds"))
+    body += row("accounted (sum above)", accounted, emphasis=True)
+    body += row("PolyChord overhead (unaccounted)", profiling.get("polychord_overhead_seconds"), emphasis=True)
+
+    total_heading = "wall" if mpi_procs == 1 else "worker-s"
+    share_heading = "<th>share</th>" if show_shares else ""
+    note = profiling.get("note", "")
+    return f"""
+    <details>
+      <summary>Profiling (per-stage timing)</summary>
+      <p class="purpose">mpi_procs {html.escape(str(mpi_procs))} ·
+        total wall {'n/a' if total is None else f'{float(total):.2f}s'}</p>
+      <div class="eval-table-wrap">
+        <table class="eval-table">
+          <thead><tr><th>stage</th><th>{total_heading}</th>{share_heading}<th>evals</th></tr></thead>
+          <tbody>{body}</tbody>
+        </table>
+      </div>
+      {f'<p class="purpose">{html.escape(note)}</p>' if note else ''}
+    </details>
+    """
+
+
 def format_searched_params(params, parameter_space):
     parts = []
     for spec in parameter_space:
@@ -639,6 +700,7 @@ def render_nested_sampling_run(poc_summary_path):
       {meta_html}
       {evidence_html}
       {evaluations_html}
+      {render_profiling(summary)}
       {fixed_html}
       <p class="manifest-name">{html.escape(rel_summary)}</p>
     </article>
@@ -1213,6 +1275,34 @@ log(Z)       =   0.145917983191460E+001 +/-   0.309608121862379E-001
     assert parsed == (1.4591798319146, 0.0309608121862379), parsed
 
 
+def _self_check_profiling():
+    # mpi_procs > 1: no wall-share column values, null stages dropped.
+    html_out = render_profiling({"profiling": {
+        "mpi_procs": 8, "total_wall_seconds": 1.5,
+        "stage_totals_seconds": {"simulate": 1.88, "convert": None, "metrics": 0.047},
+        "stage_eval_counts": {"simulate_seconds": 41, "metrics_seconds": 41},
+        "accounted_worker_seconds": 6.74, "polychord_overhead_seconds": None,
+        "note": "worker-seconds",
+    }})
+    assert "1.88s" in html_out and "worker-s" in html_out, html_out
+    assert "convert" not in html_out, html_out
+    assert "6.74s" in html_out and "n/a" in html_out, html_out
+    assert "%" not in html_out, html_out
+    assert "<th>share</th>" not in html_out, html_out
+    # mpi_procs == 1: shares are computed against total wall time.
+    single = render_profiling({"profiling": {
+        "mpi_procs": 1, "total_wall_seconds": 10.0,
+        "stage_totals_seconds": {"simulate": 5.0},
+        "stage_eval_counts": {"simulate_seconds": 2},
+        "accounted_worker_seconds": 5.0, "polychord_overhead_seconds": 5.0,
+        "note": "",
+    }})
+    assert "50.0%" in single, single
+    assert "<th>share</th>" in single, single
+    # No profiling block: nothing rendered.
+    assert render_profiling({}) == ""
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1223,6 +1313,7 @@ if __name__ == "__main__":
     if os.environ.get("GENERATE_BENCHMARK_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
+        _self_check_profiling()
         print("generate_benchmark_report self-check passed")
     else:
         main()

@@ -252,6 +252,11 @@ uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclea
 The numbers come from the `timing` block in each evaluation's `metrics.json`
 and the run-level `profiling` block in that run's `poc-summary.json`.
 
+The same breakdown is available without the CLI: a run's HTML report page has a
+collapsible "Profiling (per-stage timing)" section, shown whenever that run's
+`poc-summary.json` carries a `profiling` block (runs predating the profiler
+instrumentation simply omit the section).
+
 See [nested-sampling-profiling.md](nested-sampling-profiling.md) for what each
 field means and for every measured (and rejected) optimisation behind the
 current run scripts and images.
