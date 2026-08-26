@@ -396,6 +396,18 @@ above relies on. Corner plot 0.86s -> 0.69s, five-run cold build 1.65s -> 1.43s
 in-container and 18% less CPU, with byte-identical PNGs. Best-effort in the same
 way: a matplotlib that renames the private method just draws slower.
 
+anesthetic repeats work of its own. Its labelled frames resolve every `df[key]`
+by attempting the lookup against each of four label-stripped views of the frame
+and keeping the best answer, and each attempt rebuilds that axis' paramname ->
+label mapping from the index. One corner plot does that ~420 times.
+`memoize_anesthetic_labels_map()` caches `_LabelledObject.get_labels_map` on the
+pandas `Index` it is read off. An `Index` is immutable and anything that adds or
+drops a column swaps in a new one, so a mutated frame misses the cache rather
+than seeing a stale mapping; the `fill=False` variant, which `set_label()`
+mutates in place, is deliberately never cached. Corner plot 0.66s -> 0.62s,
+five-run cold build 1.43s -> 1.37s in-container and 5% less CPU, with
+byte-identical PNGs. Best-effort like the two above.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the
