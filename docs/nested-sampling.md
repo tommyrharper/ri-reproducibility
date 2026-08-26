@@ -371,6 +371,13 @@ runs with `--network none`: the report only reads the repo and writes
 `reports/`, and setting up the container's network is ~0.3s of every
 invocation - most of the cost of a build that draws nothing.
 
+The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
+(`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
+`import matplotlib.pyplot` in every one of them rebuilds that list from the
+installed fonts - ~0.07s, on the report's serial prologue, on every cold
+build. Rebuild with `scripts/build.sh r2d2` to pick it up; an image without
+it still works, just that much slower.
+
 Every page carries the version of the report generator that wrote it (the
 hash of `scripts/lib/generate_report.py`, in a
 `<meta name="report-version">` tag), so changing the card design, the CSS or

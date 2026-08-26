@@ -104,7 +104,19 @@ COPY --from=build /opt/venv /opt/venv
 COPY --from=build /opt/r2d2 /opt/r2d2
 
 ENV PATH=/opt/venv/bin:${PATH} \
-    R2D2_HOME=/opt/r2d2/R2D2-RI
+    R2D2_HOME=/opt/r2d2/R2D2-RI \
+    MPLCONFIGDIR=/opt/matplotlib
+
+# Bake matplotlib's font list into the image. It is derived from the fonts
+# installed here, so it never changes at runtime - but containers are run with
+# --rm, so without this the first `import matplotlib.pyplot` in every one of
+# them rebuilds it from scratch (~0.07s, on the report's serial prologue).
+# World-writable so the same cache still works if the container runs as a
+# non-root user; matplotlib silently falls back to a temporary directory (and
+# rebuilds) when MPLCONFIGDIR is not writable.
+RUN mkdir -p "${MPLCONFIGDIR}" \
+    && python3 -c "import matplotlib.pyplot" \
+    && chmod -R a+rwX "${MPLCONFIGDIR}"
 
 WORKDIR /opt/r2d2/R2D2-RI
 VOLUME ["/data", "/checkpoints", "/results"]
