@@ -341,6 +341,11 @@ redraws nothing that its inputs still match - only deleting the report
 directory forces a full redraw. The index is always rebuilt, so it picks up
 new runs immediately.
 
+Run pages are built in parallel, one process per page, and the container is
+given a single BLAS thread (the work is matplotlib rasterisation, not linear
+algebra, and multi-threaded BLAS only oversubscribes the CPU). Override with
+`R2D2_OMP_THREADS=`.
+
 Every page carries the version of the report generator that wrote it (the
 hash of `scripts/lib/generate_report.py`, in a
 `<meta name="report-version">` tag), so changing the card design, the CSS or

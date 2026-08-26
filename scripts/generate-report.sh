@@ -18,7 +18,8 @@
 # skipped; UPGRADE=1 rebuilds the ones an older report version wrote, and
 # FORCE=1 (or a RUN= selection) rebuilds them all. The index is always rebuilt.
 # Rebuilding a page reuses the PNGs under images/, which is most of the cost -
-# delete the whole report directory to force those to be drawn again.
+# delete the whole report directory to force those to be drawn again. Pages that
+# do need building are built in parallel, one process per page.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,6 +55,10 @@ if [[ -n "${UPGRADE_SEL}" ]]; then
   REPORT_ARGS+=(--upgrade)
 fi
 
+# The report is matplotlib rasters, not linear algebra: multi-threaded BLAS buys
+# it nothing (measured slightly slower) and badly oversubscribes the CPU once the
+# run pages are built in parallel processes. One thread each, unless overridden.
+R2D2_OMP_THREADS="${R2D2_OMP_THREADS:-1}"
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 
