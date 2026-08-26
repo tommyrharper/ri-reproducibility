@@ -2,7 +2,7 @@
 
 This repo uses PolyChord as a targeted search tool, not as a Bayesian posterior
 fit. PolyChord maximizes a configurable objective metric (default
-`off_source_rms_jy`).
+`total_rms_jy`).
 
 Ground truth for every run is one unpolarized 1 Jy point source at phase centre.
 Dynamic range is controlled by complex Gaussian thermal noise in the simulated
@@ -57,7 +57,7 @@ NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 make nested-sampling-poc
 NS_MPI_PROCS=4 make nested-sampling-poc
 NS_METRIC=badness make nested-sampling-poc
 NS_METRIC=snr make nested-sampling-poc
-NS_METRIC=total_rms_jy make nested-sampling-r2d2-poc
+NS_METRIC=off_source_rms_jy make nested-sampling-r2d2-poc
 NS_METRIC=sigma_res make nested-sampling-r2d2-poc
 OUTPUT_DIR=results/nested-sampling-poc/manual make nested-sampling-poc
 ```
@@ -121,7 +121,7 @@ The defaults live in `defaults.toml` at the repository root, loaded by
 | `NS_NUM_REPEATS` | How much PolyChord explores inside the likelihood constraint before generating a replacement live point (`--num-repeats`) | `2` |
 | `NS_MAX_NDEAD` | Dead-point budget that terminates the run (`--max-ndead`) | `12` |
 | `NS_SEED` | PolyChord random seed (`--seed`) | `41` |
-| `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `off_source_rms_jy` |
+| `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
 | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `docker info` |
 | `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh`. Unset means `{}`: each rank starts its own container per image |
 | `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by the WSClean run script only. No default: unset (as in the R2D2 PoC) means each rank starts its own simulate worker |
@@ -194,7 +194,8 @@ For each sample, the pipeline records:
 | `peak_memory_bytes` | Peak imaging memory: GNU `time -v` for WSClean, sampled Docker stats for R2D2 |
 
 PolyChord maximizes whatever value the run returns as its log-likelihood. The
-default objective is `off_source_rms_jy` (off-source RMS in Jy/beam).
+default objective is `total_rms_jy` (RMS of the reconstructed image minus
+the one-pixel truth, over all pixels).
 
 An optional composite `badness` score is also available (higher means worse
 reconstruction or a more expensive run):
@@ -209,12 +210,13 @@ max(0, 3 - log_snr)
 ### Choosing the objective (`--metric` / `NS_METRIC`)
 
 Both `polychord_wsclean_poc.py` and `polychord_r2d2_poc.py` accept
-`--metric <value>` (default `off_source_rms_jy`). The shell wrappers forward
-`NS_METRIC` with the same default. Resolution order:
+`--metric <value>` (default `total_rms_jy`). The shell wrappers forward
+`NS_METRIC`, whose default lives in `defaults.toml`, with the same value.
+Resolution order:
 
 1. `badness` - the composite formula above.
 2. Any bare metric name from the table - use that raw value directly as the
-   objective (including the default `off_source_rms_jy`).
+   objective (including the default `total_rms_jy`).
 3. Any other string - treat it as an arithmetic expression over the same metric
    names (for example `log_snr + 0.1 * wall_seconds`, or the composite formula
    rewritten by hand).
@@ -226,13 +228,14 @@ immediately at startup.
 
 PolyChord always maximizes the returned value with no automatic sign flip. The
 `badness` composite is oriented so higher is worse. Raw metrics keep their
-natural orientation: the default `off_source_rms_jy` search prefers higher
-off-source RMS, `--metric snr` searches for the highest-SNR corner, and a
-worst-SNR search must negate explicitly (`--metric "-snr"` or
-`--metric "1/snr"`). `total_rms_jy` and `sigma_res` are also higher-is-worse
-(noisier reconstruction / worse data fidelity); search for the best corner
-with `--metric "-total_rms_jy"` or `--metric "-sigma_res"`. Failed simulations
-or imaging runs still receive objective `100.0`.
+natural orientation: the default `total_rms_jy` search prefers higher
+whole-image RMS error, `--metric snr` searches for the highest-SNR corner, and
+a worst-SNR search must negate explicitly (`--metric "-snr"` or
+`--metric "1/snr"`). `off_source_rms_jy` and `sigma_res` are also
+higher-is-worse (noisier reconstruction / worse data fidelity); search for the
+best corner with `--metric "-total_rms_jy"`, `--metric "-off_source_rms_jy"`
+or `--metric "-sigma_res"`. Failed simulations or imaging runs still receive
+objective `100.0`.
 
 Each evaluation record and `poc-summary.json` store the chosen value in an
 `objective` field. `poc-summary.json` also records the `--metric` string and a

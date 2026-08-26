@@ -175,7 +175,7 @@ For the WSClean and R2D2 x VLA.A nested-sampling infrastructure PoCs, see
 `make nested-sampling-r2d2-poc` (R2D2). Each run uses MeqTrees/Cattery's
 VLA.A makems data to create noisy single-point-source Measurement Sets, then
 PolyChord to search parameter space by a configurable objective metric
-(`--metric`/`NS_METRIC`, default `off_source_rms_jy`; an optional composite
+(`--metric`/`NS_METRIC`, default `total_rms_jy`; an optional composite
 `badness` score is also available).
 
 `make benchmark-report` builds `benchmarks/report.html` from
