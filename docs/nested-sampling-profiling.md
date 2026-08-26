@@ -586,10 +586,33 @@ or teardown at all: it is 3.65s before and after this change. Only
 `time scripts/run-nested-sampling.sh` shows it. Anything that moves fixed
 setup cost has to be measured end to end.
 
-Only the WSClean run script does this. The R2D2 one still uses
-`start_sidecars`, which is now a wrapper over `sidecar_launch` + `sidecar_wait`
-and behaves exactly as before; ~0.7s is not worth re-validating a run whose
-runs take 20 minutes.
+`run-nested-sampling-r2d2.sh` now does the same - it was the last
+`docker run` in either PoC. Measured over six interleaved A/B runs of the
+default 8-rank configuration (38 evaluations, identical evaluation multiset and
+objectives), end-to-end script wall time went from a 5.93s median (mean 5.96s)
+to 5.68s (mean 5.54s), while `total_wall_seconds` was unchanged at ~2.9s - the
+whole saving is fixed setup, exactly as the note above predicts.
+
+The R2D2 saving is smaller than the WSClean one because a different cost now
+sets the floor. Stage timestamps printed from inside `polychord_r2d2_poc.py`
+put the R2D2 PoC's in-container time at ~3.9s, of which:
+
+| From script start | Stage |
+|---:|---|
+| ~0.1s | the three `sidecar_launch`es are issued |
+| ~0.9s | the ranks are up, through `import pypolychord`, and call `warm()` |
+| ~2.3s | `warm()` returns: the R2D2 worker has finished importing |
+| ~4.7s | `run_polychord()` returns and the summary is written |
+
+`warm()` blocks for ~1.4s, over a third of the in-container time, because
+opening a FIFO blocks until the other end is opened and `serve()` opens its
+pipes only after its imports. The worker cannot be ready sooner than ~1.9s
+after the script starts: ~0.5s for the R2D2 container itself plus ~1.3s of
+imports (`python3 -X importtime` in that image: torch 0.89s, `utils` 0.31s of
+which lightning 0.07s, torchmetrics 0.05s and scipy 0.06s). So every remaining
+front-end saving is capped by that number - shaving setup only makes the ranks
+wait longer - and the next real lever is the import itself, or overlapping the
+wait with work the sampler could be doing.
 
 ### The images ship byte-compiled, so no container needs a warm-up
 
