@@ -5,24 +5,23 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
-CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-${REPO_ROOT}/checkpoints}"
-RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/results}"
 CONFIG_DIR="${REPO_ROOT}/config/r2d2"
 
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 
 mkdir -p "${RESULTS_DIR}/smoke-test-r2d2"
 
 run() {
-  docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
+  docker run --rm --platform "${PLATFORM}" \
     "${R2D2_DOCKER_ENV_FLAGS[@]}" \
     -v "${CHECKPOINTS_DIR}:/checkpoints:ro" \
     -v "${RESULTS_DIR}/smoke-test-r2d2:/results" \
     -v "${CONFIG_DIR}:/workspace/config:ro" \
     --entrypoint python3 \
-    "${IMAGE}" "$@"
+    "${R2D2_IMAGE}" "$@"
 }
 
 echo "==> [1/5] importing critical third-party Python packages"

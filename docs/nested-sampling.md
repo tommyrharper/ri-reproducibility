@@ -112,8 +112,7 @@ per-rank default.
 
 Both run scripts read the same `NS_*` variables and forward them to
 `polychord_wsclean_poc.py` / `polychord_r2d2_poc.py` as command-line flags.
-The defaults are the ones in `scripts/run-nested-sampling-poc.sh` and
-`scripts/run-nested-sampling-r2d2-poc.sh`.
+The defaults live in `scripts/lib/defaults.sh`, which both scripts source.
 
 | Variable | Meaning | Default |
 |---|---|---|

@@ -5,9 +5,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/arm64}"
-MEQTREES_IMAGE="${MEQTREES_IMAGE:-ri-reproducibility/meqtrees:kern-10}"
-R2D2_IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 if ! docker info >/dev/null 2>&1; then
   echo "FATAL: Docker daemon is not available" >&2

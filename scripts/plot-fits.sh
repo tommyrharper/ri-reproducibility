@@ -10,9 +10,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${R2D2_IMAGE:-ri-reproducibility/r2d2:cpu}"
-RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/results}"
 
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 
@@ -44,12 +44,12 @@ else
   fi
 fi
 
-docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
+docker run --rm --platform "${PLATFORM}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
   -v "${RESULTS_DIR}:/results" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   --entrypoint python3 \
-  "${IMAGE}" -c "
+  "${R2D2_IMAGE}" -c "
 import sys, os
 import numpy as np
 from astropy.io import fits

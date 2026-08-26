@@ -7,8 +7,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
+
 TARGET="${1:-all}"
-PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/arm64}"
 WSCLEAN_PORTABLE="${WSCLEAN_PORTABLE:-ON}"
 
 build_wsclean() {
