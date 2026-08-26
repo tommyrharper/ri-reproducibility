@@ -17,7 +17,9 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +41,24 @@ LOG_Z_RE = re.compile(
     re.IGNORECASE,
 )
 RUN_ID_TS_RE = re.compile(r"(\d{8}T\d{6}Z)$")
+
+# Every generated page records the version of the code that produced it, so a
+# later run can tell "already rendered" from "rendered by an older report".
+# The version is the hash of this file: editing the rendering or the CSS bumps
+# it by itself, which is one less thing to remember than a hand-kept number.
+REPORT_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+REPORT_VERSION_RE = re.compile(r'<meta name="report-version" content="([0-9a-f]+)">')
+
+
+def page_report_version(path):
+    """Version stamped into an already-written page, or None if absent/unreadable."""
+    try:
+        with open(path) as f:
+            head = f.read(2048)
+    except OSError:
+        return None
+    m = REPORT_VERSION_RE.search(head)
+    return m.group(1) if m else None
 
 
 def _image_norm_for_display(data):
@@ -1065,6 +1085,14 @@ def run_page_name(run_name):
     return re.sub(r"[^A-Za-z0-9._-]", "_", run_name) + ".html"
 
 
+def page_status(out_dir, run_name):
+    """Page state for a run under out_dir: missing, outdated or current."""
+    path = os.path.join(out_dir, run_page_name(run_name))
+    if not os.path.exists(path):
+        return "missing"
+    return "current" if page_report_version(path) == REPORT_VERSION else "outdated"
+
+
 def run_log_evidence(run_dir, summary):
     """(log_z, log_z_err) from the summary, falling back to the chains .stats file."""
     if summary.get("log_z") is not None:
@@ -1078,7 +1106,7 @@ def run_log_evidence(run_dir, summary):
     return None
 
 
-def render_index_entry(poc_summary_path, page_exists):
+def render_index_entry(poc_summary_path, status):
     run_dir = os.path.dirname(poc_summary_path)
     run_name = os.path.basename(run_dir)
     with open(poc_summary_path) as f:
@@ -1109,6 +1137,8 @@ def render_index_entry(poc_summary_path, page_exists):
     badges.append(f'<span class="badge badge-ok">{len(succeeded)} evals</span>')
     if failed_count:
         badges.append(f'<span class="badge badge-warn">{failed_count} failed</span>')
+    if status == "outdated":
+        badges.append('<span class="badge badge-warn">outdated page</span>')
 
     evidence = run_log_evidence(run_dir, summary)
     if evidence:
@@ -1127,22 +1157,31 @@ def render_index_entry(poc_summary_path, page_exists):
       <div class="badges">{"".join(badges)}</div>
       {evidence_html}
     """
-    if page_exists:
-        return f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}">{body}</a>'
+    if status == "missing":
+        return (
+            f'<div class="card index-entry index-entry-missing">{body}'
+            '<p class="empty">Page not generated yet - run <code>make nested-sampling-report</code>.</p></div>'
+        )
+    stale_html = ""
+    if status == "outdated":
+        stale_html = (
+            '<p class="empty">Page built by an older report version - run '
+            "<code>make nested-sampling-report UPGRADE=1</code>.</p>"
+        )
     return (
-        f'<div class="card index-entry index-entry-missing">{body}'
-        '<p class="empty">Page not generated yet - run <code>make nested-sampling-report</code>.</p></div>'
+        f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}">'
+        f"{body}{stale_html}</a>"
     )
 
 
-def render_nested_sampling_index(page_exists_for):
+def render_nested_sampling_index(status_for):
     paths = nested_sampling_run_paths()
     if not paths:
         return (
             '<p class="empty">No nested-sampling PoC runs found under '
             "results/nested-sampling-poc/*/poc-summary.json yet.</p>"
         )
-    return "".join(render_index_entry(p, page_exists_for(p)) for p in paths)
+    return "".join(render_index_entry(p, status_for(p)) for p in paths)
 
 
 def index_nav_html():
@@ -1154,6 +1193,7 @@ def write_html_doc(out_path, title, subtitle, body):
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="report-version" content="{REPORT_VERSION}">
 <title>{html.escape(title)}</title>
 <style>{CSS}</style>
 </head>
@@ -1199,6 +1239,14 @@ def parse_args(argv=None):
         action="store_true",
         help="Nested-sampling only: rebuild run pages that already exist.",
     )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help=(
+            "Nested-sampling only: rebuild run pages written by an older report "
+            "version, leaving up-to-date ones alone."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1229,10 +1277,16 @@ def main(argv=None):
         force = args.force or bool(run)
         written = 0
         skipped = 0
+        outdated = 0
         for summary_path in nested_sampling_run_paths(limit=limit, run=run):
             run_name = os.path.basename(os.path.dirname(summary_path))
             page_path = os.path.join(out_dir, run_page_name(run_name))
-            if os.path.exists(page_path) and not force:
+            status = page_status(out_dir, run_name)
+            if status == "current" and not force:
+                skipped += 1
+                continue
+            if status == "outdated" and not (force or args.upgrade):
+                outdated += 1
                 skipped += 1
                 continue
             write_html_doc(
@@ -1253,15 +1307,20 @@ def main(argv=None):
             subtitle=(
                 "One page per run under <code>results/nested-sampling-poc/</code> - "
                 "regenerate with <code>make nested-sampling-report</code> "
-                "(existing pages are skipped; <code>FORCE=1</code> rebuilds them)."
+                "(up-to-date pages are skipped; <code>UPGRADE=1</code> rebuilds "
+                "the ones an older report version wrote, <code>FORCE=1</code> "
+                f"rebuilds every page). Report version <code>{REPORT_VERSION}</code>."
             ),
             body=render_nested_sampling_index(
-                lambda p: os.path.exists(
-                    os.path.join(out_dir, run_page_name(os.path.basename(os.path.dirname(p))))
-                )
+                lambda p: page_status(out_dir, os.path.basename(os.path.dirname(p)))
             ),
         )
-        print(f"{written} run page(s) written, {skipped} already up to date")
+        print(f"{written} run page(s) written, {skipped} skipped")
+        if outdated:
+            print(
+                f"{outdated} page(s) built by an older report version - rerun with "
+                "UPGRADE=1 to bring them up to the current design"
+            )
 
 
 def _self_check_log_evidence_parser():
@@ -1303,6 +1362,24 @@ def _self_check_profiling():
     assert render_profiling({}) == ""
 
 
+def _self_check_page_status():
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    assert page_status(tmp_dir, "run-a") == "missing"
+    path = os.path.join(tmp_dir, run_page_name("run-a"))
+    write_html_doc(path, "t", "s", "<p>b</p>")
+    assert page_status(tmp_dir, "run-a") == "current"
+    with open(path) as f:
+        stale = f.read().replace(REPORT_VERSION, "deadbeef0000")
+    with open(path, "w") as f:
+        f.write(stale)
+    assert page_status(tmp_dir, "run-a") == "outdated"
+    # A page written before versioning existed carries no meta tag at all.
+    with open(os.path.join(tmp_dir, run_page_name("run-b")), "w") as f:
+        f.write("<!doctype html><html><head><title>old</title></head></html>")
+    assert page_status(tmp_dir, "run-b") == "outdated"
+    shutil.rmtree(tmp_dir)
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1314,6 +1391,7 @@ if __name__ == "__main__":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
         _self_check_profiling()
+        _self_check_page_status()
         print("generate_benchmark_report self-check passed")
     else:
         main()

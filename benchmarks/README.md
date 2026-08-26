@@ -24,9 +24,11 @@ at least one baseline run each (see `REPRODUCTION_PLAN.md`).
   from `results/nested-sampling-poc/*/poc-summary.json` (PolyChord log(Z),
   evaluation image grid, likelihood plot, and a collapsible per-stage
   profiling table when the run recorded one; see `docs/nested-sampling.md`),
-  plus an `index.html` listing and linking to every run. Existing run pages
-  are skipped on re-run, so only new runs are rendered; `FORCE=1` rebuilds
-  them, `RUN=<run>` rebuilds one, `LAST=N` limits to the newest N runs.
+  plus an `index.html` listing and linking to every run. Pages are stamped
+  with the report version that wrote them and up-to-date ones are skipped on
+  re-run, so only new runs are rendered; `UPGRADE=1` rebuilds the pages an
+  older report version wrote, `FORCE=1` rebuilds them all, `RUN=<run>`
+  rebuilds one, `LAST=N` limits to the newest N runs.
   Both reports use the r2d2 image's astropy + matplotlib + anesthetic
   (`scripts/generate-benchmark-report.sh`, same approach as
   `scripts/plot-fits.sh`), so no host Python environment is needed; open

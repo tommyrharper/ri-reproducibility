@@ -32,6 +32,7 @@ make nested-sampling-report
 make nested-sampling-report LAST=1
 make nested-sampling-report RUN=wsclean-vlaa-merged-20260818T125606Z
 make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-20260817T120607Z
+make nested-sampling-report UPGRADE=1
 make nested-sampling-report FORCE=1
 make anesthetic-gui RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
 uv run scripts/plot-merged-likelihood-compare.py # make the overlay image
