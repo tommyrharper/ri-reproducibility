@@ -106,7 +106,8 @@ up to date are skipped and only new runs are built. Each page is stamped
 with the report generator's version; `--upgrade` rebuilds the ones an
 older version wrote, `--force` rebuilds everything, `--run <run>` rebuilds
 one. Rebuilding reuses the PNGs already under `images/`, so a design
-change costs page HTML rather than redrawing every evaluation. Each run
+change costs page HTML rather than redrawing every evaluation - such a
+rebuild skips the astropy/matplotlib import too. Each run
 is built as two concurrent processes - its corner plot and the rest of its
 page - so a full redraw scales with the cores you have. The report runs inside the r2d2 image (its astropy + matplotlib +
 anesthetic), so no host Python environment is needed. Details in

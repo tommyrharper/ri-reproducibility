@@ -338,8 +338,10 @@ The plots themselves are PNG files under
 were drawn from, and the pages link to them rather than inlining them. That
 is where almost all of the report's time goes, so rebuilding a page (below)
 redraws nothing that its inputs still match - only deleting the report
-directory forces a full redraw. The index is always rebuilt, so it picks up
-new runs immediately.
+directory forces a full redraw. A rebuild that redraws nothing does not even
+import astropy or matplotlib - they are loaded on the first missing PNG - which
+is most of what is left of a page-only rebuild. The index is always rebuilt, so
+it picks up new runs immediately.
 
 Run pages are built in parallel, and each run splits into two concurrent
 tasks - the anesthetic corner plot and the rest of the page, which are roughly

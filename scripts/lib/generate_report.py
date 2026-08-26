@@ -22,13 +22,6 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
-from astropy.io import fits
-from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 REPO_ROOT = "/workspace/repo"
 NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling")
 
@@ -64,6 +57,23 @@ def page_report_version(path):
         return None
     m = REPORT_VERSION_RE.search(head)
     return m.group(1) if m else None
+
+
+# astropy + matplotlib are ~0.5s of import and are only touched when a PNG has
+# to be drawn. Every drawing path goes through cached_png, so importing there on
+# a miss keeps them out of the runs that reuse the image store entirely - the
+# page-only rebuild after a REPORT_VERSION bump, and the all-current no-op.
+def load_render_libs():
+    global np, fits, AsinhStretch, ImageNormalize, ZScaleInterval, plt
+    if "plt" in globals():
+        return
+    import numpy as np
+    from astropy.io import fits
+    from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
 
 def _image_norm_for_display(data):
@@ -104,6 +114,7 @@ def cached_png(key, render):
     name = hashlib.sha1(key.encode()).hexdigest()[:16] + ".png"
     path = os.path.join(image_dir, name)
     if not os.path.exists(path):
+        load_render_libs()
         data = render()
         if data is None:
             return None
@@ -1439,6 +1450,11 @@ def main(argv=None):
             skipped += 1
             continue
         todo.append((summary_path, page_path, run_name))
+        # A run with no page yet has no images either, so every worker would
+        # otherwise import the drawing stack separately after the fork. Load it
+        # once here instead and let them inherit it.
+        if status == "missing":
+            load_render_libs()
 
     # Pages are independent, and within a page the corner plot and the eval
     # rasters are independent too, so every run contributes two pool tasks that
