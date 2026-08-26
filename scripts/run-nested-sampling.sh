@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the cheap WSClean x VLA.A PolyChord proof of concept.
+# Run the WSClean x VLA.A PolyChord nested-sampling search.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling-poc/wsclean-vlaa-${RUN_ID}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/wsclean-vlaa-${RUN_ID}}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
   # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
@@ -111,7 +111,7 @@ RUN_COMMAND=(
   mpirun
   --allow-run-as-root
   -np "${NS_MPI_PROCS}"
-  python3 /opt/ri-nested-sampling/polychord_wsclean_poc.py
+  python3 /opt/ri-nested-sampling/polychord_wsclean.py
   --output-dir "${OUTPUT_DIR}"
   --repo-root "${REPO_ROOT}"
   --meqtrees-image "${MEQTREES_IMAGE}"
@@ -137,4 +137,4 @@ sidecar_wait
 "${RUN_COMMAND[@]}"
 
 rm -rf "${SIMULATE_FIFO_DIR}"
-echo "OK: nested-sampling PoC output in ${OUTPUT_DIR}"
+echo "OK: nested-sampling output in ${OUTPUT_DIR}"

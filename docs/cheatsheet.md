@@ -81,8 +81,8 @@ PNGs land flat in `results/`, named after the source FITS file.
 ## Searches
 
 ```bash
-./ri search wsclean    # WSClean x VLA.A -> results/nested-sampling-poc/wsclean-vlaa-<UTC>/
-./ri search r2d2       # R2D2 x VLA.A    -> results/nested-sampling-poc/r2d2-vlaa-<UTC>/
+./ri search wsclean    # WSClean x VLA.A -> results/nested-sampling/wsclean-vlaa-<UTC>/
+./ri search r2d2       # R2D2 x VLA.A    -> results/nested-sampling/r2d2-vlaa-<UTC>/
 ./ri smoke ms-to-mat   # validate the MS -> .mat bridge before an R2D2 search
 ```
 
@@ -102,7 +102,7 @@ run. A flag beats an exported variable, and both beat `defaults.toml`.
 | `--metric` | `NS_METRIC` | Objective, see below | `total_rms_jy` |
 | `--mpi-procs` | `NS_MPI_PROCS` | Rank count; `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)` |
 | `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS threads | `host CPUs / NS_MPI_PROCS`, min 1 |
-| `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling-poc/<algo>-vlaa-<UTC>` |
+| `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
 
 `NS_SIDECARS` and `NS_SIMULATE_FIFO_DIR` are wiring the run scripts export, not
 knobs to set by hand.
@@ -114,7 +114,7 @@ knobs to set by hand.
 ./ri search wsclean --metric badness
 ./ri search wsclean --metric snr
 ./ri search r2d2 --metric sigma_res
-./ri search wsclean --output-dir results/nested-sampling-poc/manual
+./ri search wsclean --output-dir results/nested-sampling/manual
 
 NS_NLIVE=8 ./ri search wsclean                       # the same, from the environment
 ```
@@ -151,8 +151,8 @@ Failed simulate/imaging evaluations score `100.0`.
 | `start_frequency_hz` | `1.0e9` - `1.1e9` |
 | `channel_width_hz` | `0.5e6` - `2.0e6` |
 
-Defined as `PARAMETER_SPACE` in `scripts/lib/nested_sampling/poc_common.py`,
-copied into every `poc-summary.json`.
+Defined as `PARAMETER_SPACE` in `scripts/lib/nested_sampling/common.py`,
+copied into every `summary.json`.
 
 ## Reports
 
@@ -164,7 +164,7 @@ Report selectors:
 
 ```bash
 ./ri report --last 1                                   # newest N runs only
-./ri report --run results/nested-sampling-poc/<run>    # one run, always rebuilt
+./ri report --run results/nested-sampling/<run>    # one run, always rebuilt
 ./ri report --upgrade                                  # rebuild pages from an older report version
 ./ri report --force                                    # rebuild everything in scope
 ```
@@ -176,8 +176,8 @@ copy if you want one version-controlled.
 ## Profiling
 
 ```bash
-./ri profile results/nested-sampling-poc/<run> [--json]
-uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/<run> [--json]
+./ri profile results/nested-sampling/<run> [--json]
+uv run scripts/profile-nested-sampling-run.py results/nested-sampling/<run> [--json]
 ```
 
 Every run is profiled automatically; the same breakdown appears in that run's
@@ -190,11 +190,11 @@ Post-processing only. Sources must match on `algorithm`, `vla_config`,
 
 ```bash
 ./ri merge                                                      # auto-group every completed run
-./ri merge results/nested-sampling-poc/A results/nested-sampling-poc/B [--out DIR]
+./ri merge results/nested-sampling/A results/nested-sampling/B [--out DIR]
 uv run scripts/merge-nested-sampling-runs.py RUN_A RUN_B [--out DIR]
 ```
 
-Writes `results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json`.
+Writes `results/nested-sampling/<algorithm>-vlaa-merged-<UTC>/summary.json`.
 `--out` is only valid with an explicit run list. Merged directories are treated
 as completed runs by the report and the GUI.
 
@@ -202,8 +202,8 @@ as completed runs by the report and the GUI.
 
 ```bash
 ./ri plot gui                                           # latest completed run
-./ri plot gui results/nested-sampling-poc/<run>
-uv run scripts/anesthetic-gui.py results/nested-sampling-poc/<run>
+./ri plot gui results/nested-sampling/<run>
+uv run scripts/anesthetic-gui.py results/nested-sampling/<run>
 ```
 
 Not inside Docker/Colima. Needs `anesthetic` (`uv add anesthetic` if missing).
@@ -268,9 +268,9 @@ uv run --no-project scripts/test_cli.py
 | `config/r2d2/`, `config/wsclean/` | Per-tool configs |
 | `data/` -> `/data` | Measurement Sets, `.mat` files, ground-truth FITS |
 | `checkpoints/` -> `/checkpoints` | R2D2 pretrained checkpoints |
-| `results/` -> `/results` | Run output, smoke-test output, PoC runs |
+| `results/` -> `/results` | Run output, smoke-test output, nested-sampling runs |
 | `reports/manifests/` | One JSON manifest per recorded run |
-| `docs/nested-sampling.md` | PoC design, metrics, output files |
+| `docs/nested-sampling.md` | Nested-sampling design, metrics, output files |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 

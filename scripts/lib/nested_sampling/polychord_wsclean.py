@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from poc_common import (
+from common import (
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_NITER,
     FAILURE_OBJECTIVE,
@@ -288,7 +288,7 @@ def main() -> None:
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
         # ponytail: theta values are rounded back to the documented parameter
         # space here; a later science run should keep integer/discrete handling
-        # in one sampler-aware transform instead of this PoC bridge.
+        # in one sampler-aware transform instead of this bridge.
         params = cube_to_params(cube_like_from_theta(theta))
         key = params_key(params)
         params["noise_seed"] = stable_seed(args.seed, key)
@@ -304,7 +304,7 @@ def main() -> None:
 
     settings = PolyChordSettings(len(PARAMETER_SPACE), 0)
     settings.base_dir = str(output_dir / "chains")
-    settings.file_root = "wsclean_vlaa_poc"
+    settings.file_root = "wsclean_vlaa"
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
@@ -326,7 +326,7 @@ def main() -> None:
         summary = {
             "algorithm": "wsclean",
             "vla_config": "VLA.A",
-            "run_type": "cheap infrastructure PoC",
+            "run_type": "nested-sampling run",
             "metric": args.metric,
             "likelihood_framing": likelihood_framing,
             "polychord": {
@@ -346,13 +346,13 @@ def main() -> None:
             "total_wall_seconds": total_wall_seconds,
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs),
         }
-        summary_path = output_dir / "poc-summary.json"
+        summary_path = output_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
         print(f"wrote {summary_path}")
 
 
 if __name__ == "__main__":
-    if os.environ.get("POLYCHORD_WSCLEAN_POC_SELF_CHECK") == "1":
+    if os.environ.get("POLYCHORD_WSCLEAN_SELF_CHECK") == "1":
         self_check_metric_resolution()
         self_check_fits_reader()
         self_check_profiling()

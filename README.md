@@ -73,16 +73,16 @@ cp .env.example .env    # adjust HOST_UID/HOST_GID/paths if needed
 NS_NLIVE=20 ./ri search wsclean    # same thing; every flag has a variable
 ```
 
-Output lands in `results/nested-sampling-poc/<tool>-vlaa-<UTC>/`: one
+Output lands in `results/nested-sampling/<tool>-vlaa-<UTC>/`: one
 directory per likelihood evaluation (the MS, the reconstruction FITS, and
-`metrics.json`), plus a run-level `poc-summary.json`.
+`metrics.json`), plus a run-level `summary.json`.
 
 Two runs of the same shape can be combined, and the profiler breaks a
 finished run down per stage:
 
 ```bash
-./ri merge results/nested-sampling-poc/A results/nested-sampling-poc/B
-./ri profile results/nested-sampling-poc/<run>
+./ri merge results/nested-sampling/A results/nested-sampling/B
+./ri profile results/nested-sampling/<run>
 ```
 
 ## 3. Reading the results

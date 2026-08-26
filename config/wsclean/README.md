@@ -11,6 +11,6 @@ run is diffable the same way a config file would be.
 
 The nested-sampling search does not read from here: its per-evaluation
 WSClean flags are built in
-`scripts/lib/nested_sampling/polychord_wsclean_poc.py`, and the fixed
-ones are recorded in each run's `poc-summary.json` under
+`scripts/lib/nested_sampling/polychord_wsclean.py`, and the fixed
+ones are recorded in each run's `summary.json` under
 `wsclean_fixed_hyperparameters`.

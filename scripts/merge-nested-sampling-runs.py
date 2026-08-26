@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Merge compatible nested-sampling PoC runs into one run directory.
+"""Merge compatible nested-sampling runs into one run directory.
 
 Post-processing only: concatenates PolyChord dead points via
 anesthetic.samples.merge_nested_samples and writes a new
-results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json
+results/nested-sampling/<algorithm>-vlaa-merged-<UTC>/summary.json
 that points back at the source runs. Does not copy evaluations/ or chains/.
 
 Discover every compatible group (no args):
@@ -13,8 +13,8 @@ Discover every compatible group (no args):
 Merge an explicit list (>= 2 dirs; refuses if any pair is incompatible):
 
   uv run scripts/merge-nested-sampling-runs.py \\
-      results/nested-sampling-poc/r2d2-vlaa-AAA \\
-      results/nested-sampling-poc/r2d2-vlaa-BBB
+      results/nested-sampling/r2d2-vlaa-AAA \\
+      results/nested-sampling/r2d2-vlaa-BBB
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
+NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
 
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--out",
         default=None,
         help="Output directory (explicit run list only). "
-        "Default: results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>",
+        "Default: results/nested-sampling/<algorithm>-vlaa-merged-<UTC>",
     )
     return parser.parse_args()
 
@@ -72,9 +72,9 @@ def relative_to_repo_root(run_dir: Path) -> str:
 def load_summary(run_dir: Path) -> dict[str, Any]:
     if not run_dir.is_dir():
         raise SystemExit(f"refuse: not a directory: {run_dir}")
-    summary_path = run_dir / "poc-summary.json"
+    summary_path = run_dir / "summary.json"
     if not summary_path.is_file():
-        raise SystemExit(f"refuse: {run_dir} is missing poc-summary.json")
+        raise SystemExit(f"refuse: {run_dir} is missing summary.json")
     if not (run_dir / "chains").is_dir():
         raise SystemExit(f"refuse: {run_dir} is missing chains/")
     return json.loads(summary_path.read_text())
@@ -208,7 +208,7 @@ def merge_run_dirs(run_dirs: list[Path], summaries: list[dict[str, Any]], out_di
         summary[hp_key] = hp
 
     out_dir.mkdir(parents=True)
-    summary_path = out_dir / "poc-summary.json"
+    summary_path = out_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"wrote {summary_path}")
     return out_dir
@@ -219,7 +219,7 @@ def discover_sources() -> list[tuple[Path, dict[str, Any]]]:
         return []
     sources: list[tuple[Path, dict[str, Any]]] = []
     for run_dir in sorted(p for p in NESTED_SAMPLING_DIR.iterdir() if p.is_dir()):
-        summary_path = run_dir / "poc-summary.json"
+        summary_path = run_dir / "summary.json"
         summary: dict[str, Any] | None = None
         if summary_path.is_file():
             summary = json.loads(summary_path.read_text())
@@ -227,7 +227,7 @@ def discover_sources() -> list[tuple[Path, dict[str, Any]]]:
                 print(f"skip {run_dir.name}: already a merge (merged_from)")
                 continue
         if summary is None or not (run_dir / "chains").is_dir():
-            print(f"skip {run_dir.name}: incomplete (missing poc-summary.json or chains/)")
+            print(f"skip {run_dir.name}: incomplete (missing summary.json or chains/)")
             continue
         sources.append((run_dir, summary))
     return sources

@@ -33,8 +33,8 @@ SEARCH_IMAGES = {
 }
 
 SEARCH_SCRIPT = {
-    "wsclean": "scripts/run-nested-sampling-poc.sh",
-    "r2d2": "scripts/run-nested-sampling-r2d2-poc.sh",
+    "wsclean": "scripts/run-nested-sampling.sh",
+    "r2d2": "scripts/run-nested-sampling-r2d2.sh",
 }
 
 # Search flags, as (destination, environment variable). Documented in
@@ -238,7 +238,7 @@ def build_parser():
         description=(
             "Run PolyChord over the VLA.A observing-parameter space, scoring each\n"
             "sample by how badly the imager reconstructs a known 1 Jy point source.\n"
-            "Output: results/nested-sampling-poc/<imager>-vlaa-<UTC>/\n"
+            "Output: results/nested-sampling/<imager>-vlaa-<UTC>/\n"
             "\n"
             "Every flag below maps to the environment variable in brackets, so\n"
             "  ./ri search wsclean --nlive 8\n"
@@ -286,7 +286,7 @@ def build_parser():
     profile = add("profile", do_profile, "per-stage timing for one run",
                   description="Break a finished run down by stage. Field meanings: "
                               "docs/nested-sampling-profiling.md.")
-    profile.add_argument("run", metavar="RUN", help="run directory or poc-summary.json")
+    profile.add_argument("run", metavar="RUN", help="run directory or summary.json")
     profile.add_argument("--json", action="store_true", help="raw JSON instead of a table")
 
     merge = add("merge", do_merge, "merge compatible runs into one",

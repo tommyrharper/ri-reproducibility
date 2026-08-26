@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the cheap R2D2 x VLA.A PolyChord proof of concept.
+# Run the R2D2 x VLA.A PolyChord nested-sampling search.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling-poc/r2d2-vlaa-${RUN_ID}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/r2d2-vlaa-${RUN_ID}}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
   # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
@@ -82,7 +82,7 @@ RUN_COMMAND=(
   "${POLYCHORD_IMAGE}"
   --allow-run-as-root
   -np "${NS_MPI_PROCS}"
-  python3 /opt/ri-nested-sampling/polychord_r2d2_poc.py
+  python3 /opt/ri-nested-sampling/polychord_r2d2.py
   --output-dir "${OUTPUT_DIR}"
   --repo-root "${REPO_ROOT}"
   --meqtrees-image "${MEQTREES_IMAGE}"
@@ -104,4 +104,4 @@ scripts/record-environment.sh \
 
 "${RUN_COMMAND[@]}"
 
-echo "OK: nested-sampling R2D2 PoC output in ${OUTPUT_DIR}"
+echo "OK: nested-sampling R2D2 output in ${OUTPUT_DIR}"

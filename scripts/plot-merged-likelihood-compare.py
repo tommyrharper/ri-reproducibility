@@ -55,7 +55,7 @@ def compare_key(summary: dict) -> str:
 def merged_runs() -> list[tuple[Path, dict]]:
     found = []
     for path in NESTED_SAMPLING_DIR.glob("*-vlaa-merged-*"):
-        summary_path = path / "poc-summary.json"
+        summary_path = path / "summary.json"
         if not path.is_dir() or not summary_path.is_file():
             continue
         summary = json.loads(summary_path.read_text())

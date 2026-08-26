@@ -5,7 +5,7 @@
 # Usage:
 #   scripts/generate-report.sh
 #   LAST=1 scripts/generate-report.sh
-#   RUN=results/nested-sampling-poc/<id> scripts/generate-report.sh
+#   RUN=results/nested-sampling/<id> scripts/generate-report.sh
 #   UPGRADE=1 scripts/generate-report.sh
 #   FORCE=1 scripts/generate-report.sh
 #

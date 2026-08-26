@@ -68,14 +68,14 @@ check(
         ["scripts/build.sh", "r2d2"],
         ["scripts/build.sh", "meqtrees"],
         ["scripts/build.sh", "polychord"],
-        ["scripts/run-nested-sampling-r2d2-poc.sh"],
+        ["scripts/run-nested-sampling-r2d2.sh"],
     ],
     plan("search", "r2d2")[1],
 )
 
 check(
     "--no-build skips straight to the run",
-    [["scripts/run-nested-sampling-poc.sh"]],
+    [["scripts/run-nested-sampling.sh"]],
     plan("search", "wsclean", "--no-build")[1],
 )
 
@@ -133,7 +133,7 @@ dry = subprocess.run(
 )
 check(
     "--dry-run prints the environment with the command",
-    "NS_SEED=7 scripts/run-nested-sampling-poc.sh\n",
+    "NS_SEED=7 scripts/run-nested-sampling.sh\n",
     dry.stdout,
 )
 

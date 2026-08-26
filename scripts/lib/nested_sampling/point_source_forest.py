@@ -28,7 +28,7 @@ TDLCompileOption("source_m_rad", "Point source m offset (rad)", 0.0, more=float)
 
 def _define_forest(ns, **kw):
     array, observation = mssel.setup_observation_context(ns)
-    # Write straight to DATA: this PoC's MS has no MODEL_DATA/CORRECTED_DATA
+    # Write straight to DATA: this run's MS has no MODEL_DATA/CORRECTED_DATA
     # imaging columns (makems writes only the base columns).
     mssel.output_column = "DATA"
 

@@ -39,7 +39,7 @@ DEFAULT_INTEGRATION_SECONDS = 120.0
 # repo that is ~0.5s of ext4 journal wait per run (makems alone: 0.54s on the
 # bind mount vs 0.05s here), so build everything in RAM and copy the finished
 # artifacts out once at the end - ~2ms for a ~1MB Measurement Set.
-# ponytail: Docker gives /dev/shm 64MB by default, which is ~30x this PoC's
+# ponytail: Docker gives /dev/shm 64MB by default, which is ~30x this run's
 # largest MS; raise --shm-size on the sidecar if the parameter space grows.
 SCRATCH_ROOT = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
@@ -415,7 +415,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
         freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
 
-    # ponytail: this PoC supports one unpolarized point source; full Stokes
+    # ponytail: this simulator supports one unpolarized point source; full Stokes
     # models and multi-source dynamic-range stress cases are a follow-up ceiling.
     corr_sel, n_corr = determine_corr_selection(output_ms)
     run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
@@ -509,7 +509,7 @@ def warm_forest() -> None:
     Even against a warm skeleton cache the first simulate in a fresh worker
     costs ~0.17s where the next one costs ~0.03s; the difference is the TDL
     compile and the meqserver's first predict, and the forest is identical for
-    every evaluation of this PoC (see run_meqtrees_predict()). Only worth doing
+    every evaluation in a run (see run_meqtrees_predict()). Only worth doing
     when there is a window to hide it in - which is why serve() does this under
     --fifo, where the worker is the meqtrees container's own startup command and
     the run has three containers, a manifest and mpirun still to go, and not on
@@ -545,7 +545,7 @@ def serve(fifo_base: str | None = None) -> None:
     Requests arrive on stdin and replies go to the process's original stdout,
     unless `fifo_base` is given: then they arrive on `<fifo_base>.in` and the
     replies go to `<fifo_base>.out`, a pair of FIFOs on the bind mount both
-    containers share. That is what lets run-nested-sampling-poc.sh start this
+    containers share. That is what lets run-nested-sampling.sh start this
     worker as the meqtrees container's command - and pay all of the warm-up
     below - before the rank that will use it even exists.
     """
@@ -699,7 +699,7 @@ def self_check_serve_fifo() -> None:
     Both ends block on open until the other side opens, so the request pipe has
     to be opened first by both processes; get that backwards and the run hangs
     with no error. The caller side here is the same O_NONBLOCK retry
-    poc_common._connect_shell_started_worker() uses.
+    common._connect_shell_started_worker() uses.
     """
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         base = Path(scratch) / "0"
@@ -738,7 +738,7 @@ if __name__ == "__main__":
             # Build time only: fills BAKED_SKELETON_DIR from the one authoritative
             # copy of the parameter space, bind-mounted in for this step so the
             # runtime image still carries nothing but the three simulate scripts.
-            from poc_common import PARAMETER_SPACE
+            from common import PARAMETER_SPACE
 
             BAKED_SKELETON_DIR.mkdir(parents=True, exist_ok=True)
             prebuild_skeletons({spec["name"]: [spec["min"], spec["max"]] for spec in PARAMETER_SPACE})

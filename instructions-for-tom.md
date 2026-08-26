@@ -15,7 +15,7 @@
   - `off_source_rms_jy` off-source RMS in Jy/beam
   - `sigma_res` paper data-fidelity `||residual_dirty||_2 / ||dirty||_2`
   - PolyChord maximises, which looks for the worst images 
-- `OUTPUT_DIR` where the results are saved (default `results/nested-sampling-poc/wsclean-vlaa-<UTC>` or `r2d2-vlaa-<UTC>`)
+- `OUTPUT_DIR` where the results are saved (default `results/nested-sampling/wsclean-vlaa-<UTC>` or `r2d2-vlaa-<UTC>`)
   - leave empty
 
 ## key commands
@@ -30,10 +30,10 @@
 ./ri report
 ./ri report --last 1
 ./ri report --run wsclean-vlaa-merged-20260818T125606Z
-./ri report --run results/nested-sampling-poc/r2d2-vlaa-20260817T120607Z
+./ri report --run results/nested-sampling/r2d2-vlaa-20260817T120607Z
 ./ri report --upgrade
 ./ri report --force
-./ri plot gui results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
+./ri plot gui results/nested-sampling/r2d2-vlaa-merged-20260818T125604Z
 ./ri plot likelihood # the R2D2 vs WSClean overlay image
 
 ```

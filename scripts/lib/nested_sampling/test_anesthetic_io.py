@@ -49,7 +49,7 @@ def _write_source(nested_dir: Path, run_id: str, with_paramnames: bool) -> None:
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         repo_root = Path(tmp)
-        nested_dir = repo_root / "results" / "nested-sampling-poc"
+        nested_dir = repo_root / "results" / "nested-sampling"
         nested_dir.mkdir(parents=True)
 
         _write_source(nested_dir, "source-a", with_paramnames=False)
@@ -57,12 +57,12 @@ def main() -> None:
 
         merged_dir = nested_dir / "merged-run"
         merged_dir.mkdir()
-        (merged_dir / "poc-summary.json").write_text(
+        (merged_dir / "summary.json").write_text(
             json.dumps(
                 {
                     "merged_from": [
-                        {"path": "results/nested-sampling-poc/source-a"},
-                        {"path": "results/nested-sampling-poc/source-b"},
+                        {"path": "results/nested-sampling/source-a"},
+                        {"path": "results/nested-sampling/source-b"},
                     ],
                     "parameter_space": [{"name": name} for name in PARAM_NAMES],
                 }
