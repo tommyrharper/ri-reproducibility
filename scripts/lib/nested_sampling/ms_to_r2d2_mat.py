@@ -13,7 +13,7 @@ from scipy.io import savemat
 SPEED_OF_LIGHT = 299792458.0
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ms-path", required=True, help="Input Measurement Set path")
     parser.add_argument("--mat-path", required=True, help="Output .mat path")
@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Correlation index for Stokes-I parallel-hand visibility (default: 0)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def ms_to_r2d2_mat(ms_path: Path, mat_path: Path, corr_index: int = 0) -> dict[str, int]:
@@ -71,8 +71,8 @@ def ms_to_r2d2_mat(ms_path: Path, mat_path: Path, corr_index: int = 0) -> dict[s
     }
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     stats = ms_to_r2d2_mat(Path(args.ms_path), Path(args.mat_path), corr_index=args.corr_index)
     print(stats)
 

@@ -959,6 +959,29 @@ def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[
     return join
 
 
+def simulate_worker_request(
+    meqtrees_image: str,
+    platform: str,
+    request: dict[str, Any],
+    stderr_path: Path,
+) -> int:
+    """Send one request to this rank's simulate worker and report its exit code.
+
+    A worker that dies without answering is dropped from the cache so the next
+    evaluation gets a fresh one instead of every later evaluation inheriting the
+    corpse, and reports exit 1 with the reason in the caller's stderr log.
+    """
+    worker = simulate_worker(meqtrees_image, platform)
+    worker.stdin.write(json.dumps(request) + "\n")
+    worker.stdin.flush()
+    reply = worker.stdout.readline()
+    if not reply:
+        _SIMULATE_WORKERS.pop(meqtrees_image, None)
+        stderr_path.write_text("FATAL: simulate worker exited without a reply\n")
+        return 1
+    return json.loads(reply)["returncode"]
+
+
 def simulate_measurement_set(
     params: dict[str, Any],
     eval_dir: Path,
@@ -995,21 +1018,41 @@ def simulate_measurement_set(
         "--seed",
         str(params["noise_seed"]),
     ]
-    worker = simulate_worker(meqtrees_image, platform)
-    request = {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)}
-    worker.stdin.write(json.dumps(request) + "\n")
-    worker.stdin.flush()
-    reply = worker.stdout.readline()
-    if not reply:
-        # The worker died mid-request; drop it so the next evaluation gets a
-        # fresh one instead of every later evaluation inheriting the corpse.
-        _SIMULATE_WORKERS.pop(meqtrees_image, None)
-        sim_stderr.write_text("FATAL: simulate worker exited without a reply\n")
-        return ms_path, sim_cmd, subprocess.CalledProcessError(1, sim_cmd)
-    returncode = json.loads(reply)["returncode"]
+    returncode = simulate_worker_request(
+        meqtrees_image,
+        platform,
+        {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)},
+        sim_stderr,
+    )
     if returncode != 0:
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
+
+
+def convert_ms_to_mat(
+    argv: list[str],
+    eval_dir: Path,
+    meqtrees_image: str,
+    platform: str,
+) -> int:
+    """Convert this evaluation's MS to R2D2's `.mat` in the warm simulate worker.
+
+    Its own `docker exec` of ms_to_r2d2_mat.py cost ~0.15s and only ~0.01s of
+    that was the conversion; the rest was the exec, a fresh interpreter and the
+    numpy/casacore/scipy imports. The simulate worker already has all of that
+    live and has just written the MS, so it does the convert too.
+    """
+    return simulate_worker_request(
+        meqtrees_image,
+        platform,
+        {
+            "action": "convert",
+            "argv": argv,
+            "stdout": str(eval_dir / "convert.stdout.log"),
+            "stderr": str(eval_dir / "convert.stderr.log"),
+        },
+        eval_dir / "convert.stderr.log",
+    )
 
 
 def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:

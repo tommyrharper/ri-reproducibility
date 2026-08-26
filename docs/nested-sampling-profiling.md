@@ -20,7 +20,7 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 | Field | Meaning |
 |---|---|
 | `simulate_seconds` | Wall time for the MeqTrees `docker run` that produces `sim.ms` (container start + RIME simulation, not split further) |
-| `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion in the MeqTrees sidecar |
+| `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion in the rank's simulate worker |
 | `image_container_seconds` | Wall time for the imaging round trip: a `docker run` for WSClean, one request to this rank's R2D2 worker for R2D2 |
 | `image_binary_seconds` | WSClean only: the binary's own elapsed time from `/usr/bin/time -v` inside the container, i.e. excluding docker create/start/teardown |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
@@ -847,10 +847,28 @@ directly instead of the old per-evaluation `/work` mount. Measured
 the `docker run` path (~0.55s of container start plus the converter's own
 ~0.25s of casacore and scipy imports). The `.mat` files are unchanged.
 
-That leaves the converter's own import cost as the next thing in this stage. It
-would need a `--serve` worker like the simulate side's; at ~0.25s a request it
-is now the largest per-evaluation fixed cost left in an R2D2 evaluation, the
-R2D2 imaging step below having dropped below it.
+#### And then into the simulate worker itself
+
+A `docker exec` still bought a fresh interpreter and a fresh set of imports.
+Measured inside the warm sidecar against a four-channel `sim.ms`, the whole
+`docker exec python3 ms_to_r2d2_mat.py` round trip is 0.13-0.16s, of which the
+conversion itself - `table.getcol` through `savemat` - is 0.009-0.027s. The rest
+is the exec, the interpreter and ~0.10s of numpy, casacore and scipy imports
+that the rank's simulate worker already holds live, having just written the MS.
+
+`simulate_point_source_ms.py`'s serve loop therefore takes a second kind of
+request, `{"action": "convert", "argv": [...], ...}`, dispatched by
+`handle_request()` to `ms_to_r2d2_mat.main(argv)`; `poc_common.convert_ms_to_mat()`
+is the caller-side half, over the same worker pipe `simulate_measurement_set()`
+uses. `ms_to_r2d2_mat` is imported on first convert rather than at module scope,
+so the WSClean PoC's worker never pays for scipy. Measured over four requests to
+one worker: 0.49s for the first (cold container filesystem; the import itself is
+0.032s), then 0.011s, 0.019s, 0.011s - against 0.13-0.16s each for the
+`docker exec` path. The `.mat` contents are identical field for field; the files
+differ only in the creation timestamp `savemat` writes into the header.
+
+That leaves nothing fixed in this stage: at ~0.015s a request the convert is now
+the cheapest of the three per-evaluation stages.
 
 ### R2D2 imaging runs in a long-lived worker, not a container per evaluation
 
@@ -912,8 +930,8 @@ with `prewarm()`; the R2D2 PoC calls neither that nor anything like it.
 
 ### Sidecar containers run with `--network none`
 
-Every per-evaluation sidecar (MeqTrees simulate, MS-to-`.mat` convert, WSClean,
-R2D2) is launched with `--network none`. None of them talks to the network:
+Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`
+convert; WSClean; R2D2) is launched with `--network none`. None of them talks to the network:
 inputs and outputs are bind-mounted, and MeqTrees' `meqserver` only needs the
 loopback interface, which `none` still provides.
 
