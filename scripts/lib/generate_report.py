@@ -77,6 +77,18 @@ def load_plot_libs():
     import matplotlib.pyplot as plt
 
 
+def load_chain_libs():
+    """anesthetic, which every corner-plot worker needs. Imported in the parent
+    so the forked pool inherits it once instead of each worker repeating the
+    same 0.34s - with more runs to draw than cores, that repetition is what the
+    build spends its extra CPU on. A missing anesthetic is not fatal - the
+    corner plot degrades to "unavailable" - so leave that to the worker."""
+    try:
+        import anesthetic  # noqa: F401
+    except ImportError:
+        pass
+
+
 def load_render_libs():
     global np, fits, AsinhStretch, ImageNormalize, ZScaleInterval, Image
     if "fits" in globals():
@@ -1509,6 +1521,8 @@ def main(argv=None):
     written = len(todo)
     if todo:
         workers = min(len(todo), os.cpu_count() or 1)
+        if drawing:
+            load_chain_libs()
         with multiprocessing.Pool(workers) as plot_pool:
             plots = [plot_pool.apply_async(likelihood_task, (item,)) for item in todo]
             if drawing:
