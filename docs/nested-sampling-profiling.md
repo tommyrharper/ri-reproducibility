@@ -20,7 +20,7 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 | Field | Meaning |
 |---|---|
 | `simulate_seconds` | Wall time for the MeqTrees `docker run` that produces `sim.ms` (container start + RIME simulation, not split further) |
-| `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion `docker run` |
+| `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion in the MeqTrees sidecar |
 | `image_container_seconds` | Wall time for the imaging `docker run` round trip (WSClean or R2D2) |
 | `image_binary_seconds` | WSClean only: the binary's own elapsed time from `/usr/bin/time -v` inside the container, i.e. excluding docker create/start/teardown |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
@@ -825,10 +825,33 @@ image has no GNU `time`.
 Together these took the profiled run from 43.5s to 27.5s (-37%) with identical
 per-evaluation metrics, identical `log(Z)`, and the same set of files in every
 evaluation directory. The R2D2 run picks up the simulate half of this through
-the shared `simulate_measurement_set()`; its own convert and imaging containers
-are still one `docker run` each - the imaging one needs the extra
-`checkpoints/` mount and per-run thread env vars, and is dominated by R2D2's own
-runtime anyway.
+the shared `simulate_measurement_set()`, and its MS-to-`.mat` convert now goes
+through the same sidecar via `sidecar_run()` (see below). Only its imaging
+container is still one `docker run` each: that one needs the extra
+`checkpoints/` mount and per-run thread env vars.
+
+### The R2D2 MS-to-`.mat` convert runs in the MeqTrees sidecar
+
+`polychord_r2d2.py` used to convert `sim.ms` to `r2d2_data.mat` with its own
+`docker run` of the MeqTrees image, once per evaluation - even though the same
+run already keeps a MeqTrees sidecar warm for the simulate worker. Measured on
+this host, a fresh `docker run --network none` of that image reaching a bare
+`python3 -c pass` costs 0.54-0.68s against 0.11-0.20s for a `docker exec` into
+the running sidecar.
+
+It now calls `sidecar_run()`, the same helper the WSClean run uses, so the
+request is a line written to this rank's already-attached `sh` rather than a new
+container. Because the sidecar bind-mounts `REPO_ROOT` at its host path, the
+converter takes the evaluation's absolute `sim.ms` / `r2d2_data.mat` paths
+directly instead of the old per-evaluation `/work` mount. Measured
+`convert_seconds` over a five-evaluation run: 0.245-0.296s, against ~0.8s for
+the `docker run` path (~0.55s of container start plus the converter's own
+~0.25s of casacore and scipy imports). The `.mat` files are unchanged.
+
+That leaves the converter's own import cost as the next thing in this stage; it
+would need a `--serve` worker like the simulate side's, which is not worth it
+while the R2D2 container next door still pays ~1.3s of `import torch` and ~0.5s
+of container start per evaluation.
 
 ### Sidecar containers run with `--network none`
 

@@ -27,12 +27,12 @@ from common import (
     prior_vector,
     r2d2_docker_thread_env_flags,
     resolve_metric,
-    run_checked,
     run_docker_monitored,
     self_check_lazy_numpy,
     self_check_metric_resolution,
     self_check_profiling,
     self_check_r2d2_thread_env,
+    sidecar_run,
     simulate_measurement_set,
     stable_seed,
     summarize_profiling,
@@ -115,43 +115,32 @@ def evaluate(
     mat_path = eval_dir / "r2d2_data.mat"
     convert_stdout = eval_dir / "convert.stdout.log"
     convert_stderr = eval_dir / "convert.stderr.log"
+    # Runs in the MeqTrees sidecar the simulate step already keeps warm: a fresh
+    # `docker run` of this image costs ~0.55s against ~0.12s for a `docker exec`,
+    # and the conversion itself is a fraction of a second.
     convert_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        # No sidecar needs networking, and docker's default bridge setup costs
-        # ~0.7s per container under rootless Docker - 35x the container's own
-        # runtime here. "none" still gives a loopback interface for meqserver.
-        "--network",
-        "none",
-        "--platform",
-        args.platform,
-        "-v",
-        f"{eval_dir}:/work",
-        "--entrypoint",
         "python3",
-        args.meqtrees_image,
         "/opt/ri-nested-sampling/ms_to_r2d2_mat.py",
         "--ms-path",
-        "/work/sim.ms",
+        str(ms_path),
         "--mat-path",
-        "/work/r2d2_data.mat",
+        str(mat_path),
     ]
     convert_start = time.perf_counter()
-    try:
-        run_checked(convert_cmd, convert_stdout, convert_stderr)
-    except subprocess.CalledProcessError as exc:
-        convert_seconds = time.perf_counter() - convert_start
+    convert_result = sidecar_run(
+        args.meqtrees_image, args.platform, eval_dir, convert_cmd, convert_stdout, convert_stderr
+    )
+    convert_seconds = time.perf_counter() - convert_start
+    if convert_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
             "params": params,
             "objective": FAILURE_OBJECTIVE,
-            "error": f"ms_to_r2d2_mat failed with exit {exc.returncode}",
+            "error": f"ms_to_r2d2_mat failed with exit {convert_result.returncode}",
             "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
             "commands": {"simulate": sim_cmd, "ms_to_r2d2_mat": convert_cmd},
             "timing": {"simulate_seconds": simulate_seconds, "convert_seconds": convert_seconds},
         })
-    convert_seconds = time.perf_counter() - convert_start
 
     r2d2_dir = eval_dir / "r2d2"
     r2d2_dir.mkdir()
@@ -273,7 +262,7 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_run_checked = globals()["run_checked"]
+    original_sidecar_run = globals()["sidecar_run"]
     original_run_docker = globals()["run_docker_monitored"]
     original_simulate = globals()["simulate_measurement_set"]
 
@@ -306,8 +295,8 @@ def self_check_failure_record_persistence() -> None:
             eval_dir.mkdir(parents=True, exist_ok=False)
             return eval_dir / "sim.ms", ["simulate"], None
 
-        def successful_convert(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
-            return None
+        def successful_convert(*args: Any, **kwargs: Any) -> argparse.Namespace:
+            return argparse.Namespace(returncode=0, wall_seconds=0.1, peak_memory_bytes=0)
 
         def successful_r2d2(
             cmd: list[str],
@@ -321,7 +310,7 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["run_checked"] = successful_convert
+        globals()["sidecar_run"] = successful_convert
         globals()["run_docker_monitored"] = successful_r2d2
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,7 +329,7 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["run_checked"] = original_run_checked
+        globals()["sidecar_run"] = original_sidecar_run
         globals()["run_docker_monitored"] = original_run_docker
         globals()["simulate_measurement_set"] = original_simulate
 

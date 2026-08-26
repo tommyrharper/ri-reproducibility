@@ -46,8 +46,8 @@ mkdir -p "${OUTPUT_DIR}"
 # Shared by every rank, started here so the daemon is not hit by one
 # `docker run` per rank per image the moment the ranks come up.
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
-# Only the simulate runs in a sidecar here; the convert and R2D2 imaging steps
-# are still one `docker run` each.
+# The simulate and the MS-to-`.mat` convert both run in this sidecar; only the
+# R2D2 imaging step is still one `docker run` each.
 start_sidecars "${PLATFORM}" "${MEQTREES_IMAGE}"
 
 RUN_COMMAND=(
