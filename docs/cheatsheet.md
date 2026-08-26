@@ -101,7 +101,7 @@ run. A flag beats an exported variable, and both beat `defaults.toml`.
 | `--seed` | `NS_SEED` | PolyChord seed | `41` |
 | `--metric` | `NS_METRIC` | Objective, see below | `total_rms_jy` |
 | `--mpi-procs` | `NS_MPI_PROCS` | Rank count; `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)` |
-| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS threads | `host CPUs / NS_MPI_PROCS`, min 1 |
+| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1 |
 | `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
 
 `NS_SIDECARS` and `NS_SIMULATE_FIFO_DIR` are wiring the run scripts export, not

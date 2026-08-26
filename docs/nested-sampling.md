@@ -109,7 +109,10 @@ CPUs than four. To avoid CPU oversubscription, the script defaults
 `R2D2_OMP_THREADS` to `host CPUs / NS_MPI_PROCS` (minimum `1`) when not set
 explicitly, so each rank's imaging worker gets a fair share of the host's cores
 instead of all of them. Set `R2D2_OMP_THREADS` explicitly to override this
-per-rank default.
+per-rank default. The same count is written into every per-evaluation
+`r2d2_config.yaml` as `ncpus`, because those env vars alone do not reach
+torch - see "R2D2 sizes its own torch thread pool" in
+[nested-sampling-profiling.md](nested-sampling-profiling.md).
 
 ### Environment overrides
 

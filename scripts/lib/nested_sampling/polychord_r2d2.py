@@ -25,6 +25,7 @@ from common import (
     mpi_rank,
     params_key,
     prior_vector,
+    r2d2_thread_count,
     resolve_metric,
     run_r2d2_imaging,
     self_check_lazy_numpy,
@@ -84,6 +85,11 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         "sigma_res_tol: 1e-4",
         "ckpt_path: /checkpoints/R2D2_A1",
         f"ckpt_realisations: {DEFAULT_R2D2_CKPT_REALISATIONS}",
+        # R2D2's set_common_args() calls torch.set_num_threads() itself, from
+        # psutil's CPU affinity, and that overrides the OMP_NUM_THREADS the
+        # worker's `docker exec` sets. Without this every rank asked torch for
+        # all 20 host CPUs, so the 8 default ranks ran 160 threads on 20 cores.
+        f"ncpus: {r2d2_thread_count()}",
         "",
     ]
     config_path.write_text("\n".join(lines))
@@ -228,6 +234,24 @@ def evaluate(
         },
     }
     return write_evaluation_record(eval_dir, record)
+
+
+def self_check_r2d2_config_thread_cap() -> None:
+    """`ncpus` must reach the config, or torch takes every host CPU per rank."""
+    import tempfile
+
+    saved = os.environ.get("R2D2_OMP_THREADS")
+    os.environ["R2D2_OMP_THREADS"] = "3"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "r2d2_config.yaml"
+            write_r2d2_config(config, "/data.mat", tmp)
+            assert "ncpus: 3" in config.read_text().splitlines()
+    finally:
+        if saved is None:
+            del os.environ["R2D2_OMP_THREADS"]
+        else:
+            os.environ["R2D2_OMP_THREADS"] = saved
 
 
 def self_check_failure_record_persistence() -> None:
@@ -398,6 +422,7 @@ if __name__ == "__main__":
         self_check_metric_resolution()
         self_check_lazy_numpy()
         self_check_r2d2_thread_env()
+        self_check_r2d2_config_thread_cap()
         self_check_profiling()
         self_check_failure_record_persistence()
         print("metric resolution self-check passed")
