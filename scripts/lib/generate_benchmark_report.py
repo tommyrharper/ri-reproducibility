@@ -941,6 +941,16 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .run-media-tabset input.tab-images-radio:checked ~ .tab-panel-images { display: block; }
 .run-media-tabset input.tab-likelihood-radio:checked ~ .tab-panel-likelihood { display: block; }
 .section-heading { font-size: 1rem; margin: 2rem 0 0.75rem; opacity: 0.85; }
+.nav { font-size: 0.9rem; margin: 0 0 1rem; }
+.nav a { color: inherit; opacity: 0.7; text-decoration: none; }
+.nav a:hover { opacity: 1; text-decoration: underline; }
+.index-entry { display: block; color: inherit; text-decoration: none; }
+a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transparent); }
+.index-entry h2 { font-size: 1.05rem; }
+.index-entry-missing { opacity: 0.6; }
+.index-run-name { font-size: 0.8rem; opacity: 0.6; margin: 0 0 0.5rem; word-break: break-all; }
+.index-evidence { font-size: 0.95rem; margin-top: 0.6rem; }
+.index-evidence .delta { font-size: 0.8rem; opacity: 0.7; margin-left: 0.35rem; }
 """
 
 
@@ -977,23 +987,104 @@ def resolve_nested_sampling_summary(run):
     )
 
 
-def render_nested_sampling_body(limit=None, run=None):
+def nested_sampling_run_paths(limit=None, run=None):
+    """poc-summary.json paths, newest first, optionally filtered to one run or newest N."""
     if run:
-        nested_paths = [resolve_nested_sampling_summary(run)]
-    else:
-        nested_paths = sorted(
-            glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
-            key=nested_sampling_run_sort_key,
-        )
-        if limit is not None:
-            nested_paths = nested_paths[:limit]
-    nested_cards = [render_nested_sampling_run(p) for p in nested_paths]
-    if nested_cards:
-        return "".join(nested_cards)
-    return (
-        '<p class="empty">No nested-sampling PoC runs found under '
-        "results/nested-sampling-poc/*/poc-summary.json yet.</p>"
+        return [resolve_nested_sampling_summary(run)]
+    paths = sorted(
+        glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
+        key=nested_sampling_run_sort_key,
     )
+    return paths[:limit] if limit is not None else paths
+
+
+def run_page_name(run_name):
+    """Filename for a run's own page - same sanitising the old RUN= output used."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", run_name) + ".html"
+
+
+def run_log_evidence(run_dir, summary):
+    """(log_z, log_z_err) from the summary, falling back to the chains .stats file."""
+    if summary.get("log_z") is not None:
+        err = summary.get("log_z_err")
+        return float(summary["log_z"]), (float(err) if err is not None else None)
+    stats_path, _ = find_chain_stats(run_dir)
+    if stats_path:
+        parsed = parse_log_evidence(stats_path)
+        if parsed:
+            return parsed
+    return None
+
+
+def render_index_entry(poc_summary_path, page_exists):
+    run_dir = os.path.dirname(poc_summary_path)
+    run_name = os.path.basename(run_dir)
+    with open(poc_summary_path) as f:
+        summary = json.load(f)
+
+    polychord = summary.get("polychord", {})
+    evaluations = summary.get("evaluations", [])
+    succeeded = [ev for ev in evaluations if "error" not in ev]
+    failed_count = len(evaluations) - len(succeeded)
+
+    title_bits = [html.escape(str(summary.get("algorithm", "?")))]
+    ts_label = format_run_id_timestamp(run_name)
+    if ts_label:
+        title_bits.append(f'<span class="ts">{html.escape(ts_label)}</span>')
+
+    duration_html = ""
+    duration_label = format_wall_duration(summary.get("total_wall_seconds"))
+    if duration_label:
+        duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>'
+
+    badges = []
+    if summary.get("merged_from"):
+        badges.append('<span class="badge badge-ok">merged</span>')
+    badges.append(f'<span class="badge">{html.escape(str(summary.get("vla_config", "?")))}</span>')
+    badges.append(f'<span class="badge">nlive {html.escape(str(polychord.get("nlive", "?")))}</span>')
+    if summary.get("metric"):
+        badges.append(f'<span class="badge">{html.escape(str(summary["metric"]))}</span>')
+    badges.append(f'<span class="badge badge-ok">{len(succeeded)} evals</span>')
+    if failed_count:
+        badges.append(f'<span class="badge badge-warn">{failed_count} failed</span>')
+
+    evidence = run_log_evidence(run_dir, summary)
+    if evidence:
+        log_z, log_z_err = evidence
+        err_html = f'<span class="delta">± {log_z_err:.4g}</span>' if log_z_err is not None else ""
+        evidence_html = f'<div class="index-evidence">log(Z) = <strong>{log_z:.4g}</strong>{err_html}</div>'
+    else:
+        evidence_html = '<div class="index-evidence empty">log(Z) unavailable</div>'
+
+    body = f"""
+      <div class="card-header-top">
+        <h2>{" ".join(title_bits)}</h2>
+        {duration_html}
+      </div>
+      <p class="index-run-name">{html.escape(run_name)}</p>
+      <div class="badges">{"".join(badges)}</div>
+      {evidence_html}
+    """
+    if page_exists:
+        return f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}">{body}</a>'
+    return (
+        f'<div class="card index-entry index-entry-missing">{body}'
+        '<p class="empty">Page not generated yet - run <code>make nested-sampling-report</code>.</p></div>'
+    )
+
+
+def render_nested_sampling_index(page_exists_for):
+    paths = nested_sampling_run_paths()
+    if not paths:
+        return (
+            '<p class="empty">No nested-sampling PoC runs found under '
+            "results/nested-sampling-poc/*/poc-summary.json yet.</p>"
+        )
+    return "".join(render_index_entry(p, page_exists_for(p)) for p in paths)
+
+
+def index_nav_html():
+    return '<p class="nav"><a href="index.html">&larr; All runs</a></p>'
 
 
 def write_html_doc(out_path, title, subtitle, body):
@@ -1028,7 +1119,7 @@ def parse_args(argv=None):
         "out_path",
         nargs="?",
         default=None,
-        help="Output HTML path (defaults depend on --kind).",
+        help="Output HTML file (benchmarks) or output directory (nested-sampling).",
     )
     parser.add_argument(
         "--limit",
@@ -1040,6 +1131,11 @@ def parse_args(argv=None):
         "--run",
         default=None,
         help="Nested-sampling only: one run directory or name under nested-sampling-poc/.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Nested-sampling only: rebuild run pages that already exist.",
     )
     return parser.parse_args(argv)
 
@@ -1058,27 +1154,52 @@ def main(argv=None):
             body=render_benchmark_body(),
         )
     else:
-        out_path = args.out_path or "/workspace/out/nested-sampling-report.html"
+        out_dir = args.out_path or "/workspace/out/nested-sampling-report"
         limit = args.limit
         run = args.run
         if limit is not None and run:
             raise SystemExit("refuse: --limit and --run cannot be used together")
         if limit is not None and limit < 1:
             raise SystemExit("--limit must be >= 1")
-        subtitle = (
-            "Generated from <code>results/nested-sampling-poc/*/poc-summary.json</code> - "
-            "regenerate with <code>make nested-sampling-report</code>."
-        )
-        if run:
-            subtitle += f" Showing run <code>{html.escape(Path(run).name)}</code> only."
-        elif limit is not None:
-            subtitle += f" Showing newest {limit} run{'s' if limit != 1 else ''} only."
+        os.makedirs(out_dir, exist_ok=True)
+
+        # An explicit --run is a deliberate "rebuild this one" request.
+        force = args.force or bool(run)
+        written = 0
+        skipped = 0
+        for summary_path in nested_sampling_run_paths(limit=limit, run=run):
+            run_name = os.path.basename(os.path.dirname(summary_path))
+            page_path = os.path.join(out_dir, run_page_name(run_name))
+            if os.path.exists(page_path) and not force:
+                skipped += 1
+                continue
+            write_html_doc(
+                page_path,
+                title=f"nested-sampling run: {run_name}",
+                subtitle=(
+                    f"Generated from <code>results/nested-sampling-poc/{html.escape(run_name)}/"
+                    "poc-summary.json</code>."
+                ),
+                body=index_nav_html() + render_nested_sampling_run(summary_path),
+            )
+            written += 1
+
+        # The index is cheap and must reflect every run on disk, so always rebuild it.
         write_html_doc(
-            out_path,
-            title="ri-reproducibility nested-sampling report",
-            subtitle=subtitle,
-            body=render_nested_sampling_body(limit=limit, run=run),
+            os.path.join(out_dir, "index.html"),
+            title="ri-reproducibility nested-sampling runs",
+            subtitle=(
+                "One page per run under <code>results/nested-sampling-poc/</code> - "
+                "regenerate with <code>make nested-sampling-report</code> "
+                "(existing pages are skipped; <code>FORCE=1</code> rebuilds them)."
+            ),
+            body=render_nested_sampling_index(
+                lambda p: os.path.exists(
+                    os.path.join(out_dir, run_page_name(os.path.basename(os.path.dirname(p))))
+                )
+            ),
         )
+        print(f"{written} run page(s) written, {skipped} already up to date")
 
 
 def _self_check_log_evidence_parser():
@@ -1092,9 +1213,16 @@ log(Z)       =   0.145917983191460E+001 +/-   0.309608121862379E-001
     assert parsed == (1.4591798319146, 0.0309608121862379), parsed
 
 
+def _self_check_run_page_name():
+    assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
+    # Anything that would escape the output directory is flattened.
+    assert run_page_name("../etc/passwd") == ".._etc_passwd.html"
+
+
 if __name__ == "__main__":
     if os.environ.get("GENERATE_BENCHMARK_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
+        _self_check_run_page_name()
         print("generate_benchmark_report self-check passed")
     else:
         main()

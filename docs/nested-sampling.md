@@ -299,21 +299,25 @@ reconstructions) in the nested-sampling HTML report:
 
 ```bash
 make nested-sampling-report
-# open benchmarks/nested-sampling-report.html
+# open benchmarks/nested-sampling-report/index.html
 
 make nested-sampling-report LAST=1
-# open benchmarks/nested-sampling-report-last.html
-
 make nested-sampling-report RUN=results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
-# open benchmarks/nested-sampling-report-r2d2-vlaa-merged-20260818T125604Z.html
+make nested-sampling-report FORCE=1
 ```
 
-`LAST=N` renders only the newest N runs (timestamp sort) into
-`benchmarks/nested-sampling-report-last.html`. `RUN=` renders one named
-run (directory, repo-relative path, or directory name) into
-`benchmarks/nested-sampling-report-<run>.html`. Neither overwrites the
-full report. They cannot be combined. Make cannot take `--last`; use
-`LAST=1`.
+Each run gets its own page, `benchmarks/nested-sampling-report/<run>.html`,
+plus an `index.html` that lists every run on disk and links into them; each
+run page links back to the index. Rendering a run means reading its FITS
+output, so **run pages that already exist are skipped** - a re-run only
+builds pages for new runs. The index is always rebuilt, so it picks up new
+runs immediately.
+
+`LAST=N` only considers the newest N runs (timestamp sort). `RUN=` targets
+one named run (directory, repo-relative path, or directory name) and always
+rebuilds its page. `FORCE=1` rebuilds every page in scope, for when the
+report code itself changed. `LAST=` and `RUN=` cannot be combined. Make
+cannot take `--last`; use `LAST=1`.
 
 The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
 (no manifest join), so a merged run directory (see **Merge runs** below) shows

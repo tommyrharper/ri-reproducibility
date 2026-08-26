@@ -70,10 +70,13 @@ plot-fits:
 benchmark-report:
 	scripts/generate-benchmark-report.sh benchmarks
 
-# LAST=1 -> nested-sampling-report-last.html
-# RUN=<dir> -> nested-sampling-report-<run>.html
+# One page per run in benchmarks/nested-sampling-report/, plus index.html.
+# Existing run pages are skipped; the index is always rebuilt.
+# LAST=N   -> only consider the newest N runs
+# RUN=<dir> -> rebuild just that run's page
+# FORCE=1  -> rebuild pages that already exist
 nested-sampling-report:
-	LAST="$(LAST)" RUN="$(RUN)" scripts/generate-benchmark-report.sh nested-sampling
+	LAST="$(LAST)" RUN="$(RUN)" FORCE="$(FORCE)" scripts/generate-benchmark-report.sh nested-sampling
 
 # Per-stage timing breakdown for a completed nested-sampling PoC run.
 # RUN=results/nested-sampling-poc/<run-dir> (required).
