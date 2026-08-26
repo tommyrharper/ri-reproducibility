@@ -5,17 +5,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/arm64}"
-MEQTREES_IMAGE="${MEQTREES_IMAGE:-ri-reproducibility/meqtrees:kern-10}"
-POLYCHORD_IMAGE="${POLYCHORD_IMAGE:-ri-reproducibility/polychord:lite}"
-WSCLEAN_IMAGE="${WSCLEAN_IMAGE:-ri-reproducibility/wsclean:v3.7}"
-RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
+
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling-poc/wsclean-vlaa-${RUN_ID}}"
-NS_NLIVE="${NS_NLIVE:-8}"
-NS_NUM_REPEATS="${NS_NUM_REPEATS:-2}"
-NS_MAX_NDEAD="${NS_MAX_NDEAD:-12}"
-NS_SEED="${NS_SEED:-41}"
-NS_METRIC="${NS_METRIC:-off_source_rms_jy}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
   # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not

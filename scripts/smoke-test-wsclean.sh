@@ -6,7 +6,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${WSCLEAN_IMAGE:-ri-reproducibility/wsclean:v3.7}"
+
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 MS_URL="https://support.astron.nl/software/ci_data/wsclean/JVLA-MultiBand-S1_C5-minimal.ms.tar.bz2"
 MS_SHA256="7c8d41b5ff59c8736b1223e6b855a96e410f27fb4be05d179c8292fdb78cdc7e"
@@ -19,7 +21,7 @@ OUTPUT_DIR="${REPO_ROOT}/results/smoke-test-wsclean"
 mkdir -p "${FIXTURE_DIR}" "${OUTPUT_DIR}"
 
 echo "==> [1/3] wsclean --version"
-docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" "${IMAGE}" --version
+docker run --rm --platform "${PLATFORM}" "${WSCLEAN_IMAGE}" --version
 
 echo "==> [2/3] fetching + verifying test Measurement Set fixture"
 if [ ! -d "${FIXTURE_DIR}/${MS_DIR_NAME}" ]; then
@@ -40,11 +42,11 @@ WSCLEAN_ARGS=()
 while IFS= read -r line; do
   WSCLEAN_ARGS+=("${line}")
 done < <(grep -v '^[[:space:]]*#' "${ARGS_FILE}" | grep -v '^[[:space:]]*$')
-docker run --rm --platform "${DOCKER_DEFAULT_PLATFORM:-linux/arm64}" \
+docker run --rm --platform "${PLATFORM}" \
   -v "${FIXTURE_DIR}:/data:ro" \
   -v "${OUTPUT_DIR}:/results" \
   --entrypoint wsclean \
-  "${IMAGE}" \
+  "${WSCLEAN_IMAGE}" \
   -name /results/smoke \
   -temp-dir /results \
   "${WSCLEAN_ARGS[@]}" \
