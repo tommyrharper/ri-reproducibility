@@ -59,22 +59,34 @@ def page_report_version(path):
     return m.group(1) if m else None
 
 
-# astropy + matplotlib are ~0.5s of import and are only touched when a PNG has
-# to be drawn. Every drawing path goes through cached_png, so importing there on
-# a miss keeps them out of the runs that reuse the image store entirely - the
-# page-only rebuild after a REPORT_VERSION bump, and the all-current no-op.
-def load_render_libs():
-    global np, fits, AsinhStretch, ImageNormalize, ZScaleInterval, plt, Image
+# The drawing stack is ~0.5s of import and is only touched when a PNG has to be
+# drawn, so it loads on demand and a run that reuses the whole image store - the
+# page-only rebuild after a REPORT_VERSION bump, and the all-current no-op -
+# never pays for it. It splits in two because the two kinds of PNG need
+# different halves: the corner plot needs only matplotlib (anesthetic pulls it
+# in regardless), the eval rasters need astropy + PIL on top. Keeping them apart
+# keeps astropy off the corner plot's critical path, which is the longest task
+# in a cold build.
+def load_plot_libs():
+    global plt
     if "plt" in globals():
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+
+def load_render_libs():
+    global np, fits, AsinhStretch, ImageNormalize, ZScaleInterval, Image
+    if "fits" in globals():
         return
     import numpy as np
     from astropy.io import fits
     from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
     from PIL import Image
-    import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    load_plot_libs()  # render_array_png colour-maps through plt.get_cmap
 
 
 def _image_norm_for_display(data):
@@ -120,7 +132,6 @@ def cached_png(key, render):
     name = hashlib.sha1(f"{IMAGE_RENDER_VERSION}|{key}".encode()).hexdigest()[:16] + ".png"
     path = os.path.join(image_dir, name)
     if not os.path.exists(path):
-        load_render_libs()
         data = render()
         if data is None:
             return None
@@ -152,6 +163,7 @@ def file_stamp(path):
 # are kept as the caller's pixel budget: an image larger than that is scaled down
 # to it, but nothing is ever scaled up.
 def render_array_png(data, figsize=(4, 4), dpi=130):
+    load_render_libs()
     data = np.squeeze(np.asarray(data, dtype=float))
     if data.ndim != 2:
         return None
@@ -168,15 +180,21 @@ def render_array_png(data, figsize=(4, 4), dpi=130):
     return buf.getvalue()
 
 
+def _render_fits_png(path, figsize, dpi):
+    load_render_libs()
+    return render_array_png(fits.getdata(path), figsize=figsize, dpi=dpi)
+
+
 def render_fits_image(path, figsize=(4, 4), dpi=130):
     return cached_png(
         f"fits|{path}|{file_stamp(path)}|{figsize}|{dpi}",
-        lambda: render_array_png(fits.getdata(path), figsize=figsize, dpi=dpi),
+        lambda: _render_fits_png(path, figsize, dpi),
     )
 
 
 def synthesize_truth_array(image_path, source_flux_jy):
     """Mirror common.compute_image_metrics truth construction."""
+    load_render_libs()
     data, header = fits.getdata(image_path, header=True)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
     if image.ndim != 2:
@@ -338,6 +356,7 @@ def likelihood_section(uri):
 
 
 def _render_likelihood_png(run_dir, param_names):
+    load_plot_libs()
     try:
         from anesthetic_io import load_nested_samples, weight_by_likelihood
     except ImportError:
@@ -1469,10 +1488,13 @@ def main(argv=None):
             continue
         todo.append((summary_path, page_path, run_name))
         # A run with no page yet has no images either, so every worker would
-        # otherwise import the drawing stack separately after the fork. Load it
-        # once here instead and let them inherit it.
+        # otherwise import matplotlib separately after the fork. Load it once
+        # here instead and let them inherit it. Only the matplotlib half: the
+        # corner plot is the longest task and never touches astropy or PIL, so
+        # those stay off the parent's serial prologue and load inside the (much
+        # shorter) eval-raster tasks instead.
         if status == "missing":
-            load_render_libs()
+            load_plot_libs()
 
     # Pages are independent, and within a page the corner plot and the eval
     # rasters are independent too, so every run contributes two pool tasks that
