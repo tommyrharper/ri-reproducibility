@@ -64,12 +64,13 @@ def page_report_version(path):
 # a miss keeps them out of the runs that reuse the image store entirely - the
 # page-only rebuild after a REPORT_VERSION bump, and the all-current no-op.
 def load_render_libs():
-    global np, fits, AsinhStretch, ImageNormalize, ZScaleInterval, plt
+    global np, fits, AsinhStretch, ImageNormalize, ZScaleInterval, plt, Image
     if "plt" in globals():
         return
     import numpy as np
     from astropy.io import fits
     from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
+    from PIL import Image
     import matplotlib
 
     matplotlib.use("Agg")
@@ -109,9 +110,14 @@ def figure_to_png_bytes(fig, **savefig_kw):
     return buf.getvalue()
 
 
+# Bump when a change to the drawing code should retire the PNGs already on
+# disk - keys describe the inputs, not how they were drawn.
+IMAGE_RENDER_VERSION = "2"
+
+
 def cached_png(key, render):
     """URL of the PNG for `key`, calling `render() -> bytes | None` only if absent."""
-    name = hashlib.sha1(key.encode()).hexdigest()[:16] + ".png"
+    name = hashlib.sha1(f"{IMAGE_RENDER_VERSION}|{key}".encode()).hexdigest()[:16] + ".png"
     path = os.path.join(image_dir, name)
     if not os.path.exists(path):
         load_render_libs()
@@ -137,17 +143,29 @@ def file_stamp(path):
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
+# The eval rasters are the bulk of the report. Drawing one through a matplotlib
+# Figure cost ~25ms - half of it tight_layout's trial draw - and upsampled the
+# 128x128 data into a ~336px antialiased raster, 224 KiB of PNG the browser then
+# scaled back down anyway. Normalising and colour-mapping straight into a PIL
+# image at the data's own resolution is ~16x faster for ~5x fewer bytes, and the
+# browser's own smoothing makes it indistinguishable at display size. figsize/dpi
+# are kept as the caller's pixel budget: an image larger than that is scaled down
+# to it, but nothing is ever scaled up.
 def render_array_png(data, figsize=(4, 4), dpi=130):
     data = np.squeeze(np.asarray(data, dtype=float))
     if data.ndim != 2:
         return None
     norm = _image_norm_for_display(data)
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.imshow(data, origin="lower", cmap="inferno", norm=norm)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    fig.tight_layout(pad=0.2)
-    return figure_to_png_bytes(fig)
+    # bad="white": matplotlib rendered non-finite pixels as the figure background.
+    cmap = plt.get_cmap("inferno").with_extremes(bad="white")
+    # [::-1]: FITS row 0 is the bottom of the image (imshow's origin="lower").
+    image = Image.fromarray(cmap(norm(data), bytes=True)[::-1, :, :3])
+    budget = int(round(min(figsize) * dpi))
+    if max(image.size) > budget:
+        image.thumbnail((budget, budget), Image.LANCZOS)
+    buf = io.BytesIO()
+    image.save(buf, format="png", compress_level=1)
+    return buf.getvalue()
 
 
 def render_fits_image(path, figsize=(4, 4), dpi=130):
@@ -1595,8 +1613,12 @@ def _self_check_cached_png():
         calls.append(1)
         return b"png-bytes"
 
+    def name_for(key):
+        digest = hashlib.sha1(f"{IMAGE_RENDER_VERSION}|{key}".encode()).hexdigest()
+        return f"{digest[:16]}.png"
+
     url = cached_png("k", render)
-    assert url == f"{IMAGE_SUBDIR}/{hashlib.sha1(b'k').hexdigest()[:16]}.png", url
+    assert url == f"{IMAGE_SUBDIR}/{name_for('k')}", url
     assert cached_png("k", render) == url
     assert len(calls) == 1, calls
     assert os.path.exists(os.path.join(tmp_dir, url)), url
@@ -1605,10 +1627,21 @@ def _self_check_cached_png():
     assert len(calls) == 2, calls
     assert cached_png("k3", lambda: None) is None
     assert sorted(os.listdir(image_dir)) == sorted(
-        f"{hashlib.sha1(k).hexdigest()[:16]}.png" for k in (b"k", b"k2")
+        name_for(k) for k in ("k", "k2")
     ), os.listdir(image_dir)
     shutil.rmtree(tmp_dir)
     image_dir = None
+
+
+def _self_check_render_array_png():
+    load_render_libs()
+    assert render_array_png(np.zeros((4,))) is None
+    # All-zero data is the degenerate ZScale case; it must still produce a PNG.
+    flat = Image.open(io.BytesIO(render_array_png(np.zeros((8, 8, 1)))))
+    assert flat.size == (8, 8), flat.size
+    # Data is stored at its own resolution, capped at the caller's pixel budget.
+    big = Image.open(io.BytesIO(render_array_png(np.arange(10000.0).reshape(100, 100), figsize=(1, 1), dpi=50)))
+    assert big.size == (50, 50), big.size
 
 
 def _self_check_run_page_name():
@@ -1622,6 +1655,7 @@ if __name__ == "__main__":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
         _self_check_cached_png()
+        _self_check_render_array_png()
         _self_check_profiling()
         _self_check_page_status()
         print("generate_report self-check passed")
