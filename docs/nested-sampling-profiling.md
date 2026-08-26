@@ -1101,6 +1101,77 @@ larger of that and the worker's own, which brings it back to 302MB - the metric
 once for two workers, and that a 64MB allocation made only during that warm-up
 still shows up in a child's reply.
 
+### The three no-op image builds run concurrently
+
+`make nested-sampling-r2d2-poc` builds its three images before the run. On an
+unchanged tree every one of them is a no-op, and a no-op build is not free:
+buildkit still resolves the `docker/dockerfile:1` frontend and the base image's
+metadata, walks ~20 `CACHED` steps and re-exports and re-tags the manifest.
+Measured on this host, `scripts/build.sh` costs 1.36-1.59s per image with
+nothing to do, so the three in series were ~4s in front of a ~4.5s run - the
+largest single cost left in the command a user actually types.
+
+They have no dependency on each other, so the two PoC targets now run them as
+`+$(MAKE) -j3 ...` rather than as prerequisites; the sub-make gets the
+parallelism without the caller having to remember `-j`. Interleaved A/B of
+`make nested-sampling-r2d2-poc`, alternating the two Makefiles:
+
+| | End to end |
+|---|---:|
+| builds in series | 8.10s, 8.13s, 8.76s, 8.23s |
+| builds concurrent | 6.26s, 6.28s, 5.95s, 6.43s |
+
+~1.9-2.8s in every pair, ~23% of the command. The build step itself goes
+3.3-4.2s to ~2.05s; the rest of the spread is the run.
+
+#### Where the remaining R2D2 wall clock is, and why it is a floor
+
+Stage timestamps from inside `polychord_r2d2_poc.py` on a 4.55s end-to-end run
+(`NS_MPI_PROCS=8`, 38 evaluations), relative to the run script starting:
+
+| | |
+|---|---:|
+| ranks reach `main()` | 0.78s |
+| `warm()` returns - the R2D2 worker is answering | 2.00s |
+| `run_polychord` returns | 3.66s |
+| script exits | 4.55s |
+
+Both halves are accounted for and neither has slack left:
+
+- **Worker readiness, ~2.0s.** Measured directly against a bare `docker run
+  --detach` of the R2D2 image: 0.36s until the container's own `python3` starts
+  and a further 1.24s of `import optimiser, utils`, of which `python3 -X
+  importtime` attributes 0.877s to `torch` alone and 0.309s to `utils`. The
+  ~0.15s left is the run script's own preamble (`defaults.sh` 0.02s, the
+  daemon-check `docker info` 0.08s). Everything else the script does before the
+  first evaluation - the manifest write, the other two containers, `mpirun`,
+  `import pypolychord` - already fits inside that window. Two things measured
+  and rejected: `OMP_WAIT_POLICY=PASSIVE` on the R2D2 sidecar (2 wins, 3 losses
+  over 5 pairs) and launching the R2D2 sidecar before the other two (worker
+  ready 2.03s either way over 6 pairs, because `sidecar_launch` already
+  backgrounds each `docker run`).
+- **Sampler, ~1.7s, which is one rank's evaluations.** The `eval_id` histogram
+  of a run is seven ranks with 5 evaluations and one with 7, and 7 x ~0.3s is
+  the whole sampler wall - PolyChord's own overhead is in the noise. Of that
+  ~0.3s, imaging is ~0.25s, simulate ~0.05s and the convert ~0.015s. The FIFO
+  round trip is not part of it: the worker's own measurement of each request
+  sums to within 0.1% of what the rank measures around it.
+
+The imaging request is ~0.10s on an idle worker and ~0.25s at the real
+concurrency; the gap is contention, not overhead. Eight forked workers running
+the same request in one container measure 0.104s solo against 0.352s eight-way
+at two threads each, and 0.129s against 0.181s at one thread - so one thread is
+27% faster per evaluation and ~38% higher aggregate throughput at eight ranks,
+which is the same direction the end-to-end A/B shows (1 thread won 4 of 5
+pairs). The default is still `HOST_CPUS / NS_MPI_PROCS`, unchanged: this is all
+checkpoint-less evidence, where the whole imaging run is 0.096s of
+`meas_op.get_op_norm()` - a ~47-step power iteration over 95 small finufft
+transforms that parallelises badly - and the 25 UNet forward passes that a real
+run adds are the part that might actually want the threads. What the
+measurement does settle is that this is a shared-host contention question and
+not another thread-pool bug like the `ncpus` one: an imaging worker holds 5
+threads, and torch's inter-op pool is never created.
+
 ### Sidecar containers run with `--network none`
 
 Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`
