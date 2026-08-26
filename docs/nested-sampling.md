@@ -84,8 +84,9 @@ results/nested-sampling/r2d2-vlaa-<UTC timestamp>/
 ```
 
 The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
-evaluation runs one MeqTrees simulate, one MeqTrees-hosted MS-to-`.mat`
-conversion, and one R2D2 imaging container.
+evaluation runs one MeqTrees simulate and one MeqTrees-hosted MS-to-`.mat`
+conversion - both inside the shared MeqTrees sidecar - plus one R2D2 imaging
+container.
 
 R2D2 requires pretrained checkpoints at `checkpoints/R2D2_A1/R2D2_UNet_N*.ckpt`
 (see `./ri fetch-checkpoints` and `./ri smoke r2d2`).
