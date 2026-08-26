@@ -19,7 +19,8 @@
 # FORCE=1 (or a RUN= selection) rebuilds them all. The index is always rebuilt.
 # Rebuilding a page reuses the PNGs under images/, which is most of the cost -
 # delete the whole report directory to force those to be drawn again. Pages that
-# do need building are built in parallel, one process per page.
+# do need building are built in parallel: each run is two concurrent tasks, its
+# corner plot and the rest of its page.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

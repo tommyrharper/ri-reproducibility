@@ -291,6 +291,23 @@ def render_likelihood_plot(run_dir, param_names):
     return cached_png(key, lambda: _render_likelihood_png(run_dir, param_names))
 
 
+# The corner plot is roughly half of a run page's cost and the eval rasters the
+# other half, so main() renders them as two independent pool tasks and stitches
+# the result in. The page body carries this slot where the plot's section goes.
+LIKELIHOOD_SLOT = "<!--likelihood-slot-->"
+
+
+def likelihood_section(uri):
+    if not uri:
+        return '<section><h3>Likelihood</h3><p class="empty">Likelihood plot unavailable.</p></section>'
+    return f"""
+        <section>
+          <h3>Likelihood</h3>
+          <figure class="likelihood-plot"><img src="{uri}" alt="likelihood corner plot"></figure>
+        </section>
+        """
+
+
 def _render_likelihood_png(run_dir, param_names):
     try:
         from anesthetic_io import load_nested_samples, weight_by_likelihood
@@ -710,7 +727,8 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
     return f'<div class="eval-images">{truth_html}{cards_html}</div>'
 
 
-def render_nested_sampling_run(summary_path):
+def render_nested_sampling_run(summary_path, likelihood_html=None):
+    """`likelihood_html` pre-rendered by the caller, or None to draw it inline."""
     run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
     tab_id = run_tab_id(run_name)
@@ -854,15 +872,8 @@ def render_nested_sampling_run(summary_path):
         </details>
         """
 
-    likelihood_html = '<section><h3>Likelihood</h3><p class="empty">Likelihood plot unavailable.</p></section>'
-    uri = render_likelihood_plot(run_dir, space_names)
-    if uri:
-        likelihood_html = f"""
-        <section>
-          <h3>Likelihood</h3>
-          <figure class="likelihood-plot"><img src="{uri}" alt="likelihood corner plot"></figure>
-        </section>
-        """
+    if likelihood_html is None:
+        likelihood_html = likelihood_section(render_likelihood_plot(run_dir, space_names))
 
     evaluations_html = ""
     if eval_rows:
@@ -1365,17 +1376,36 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def write_run_page(item):
-    """Render one run page. Top-level so multiprocessing.Pool can call it."""
-    summary_path, page_path, run_name = item
+def run_body_task(item):
+    """Page body with LIKELIHOOD_SLOT standing in for the corner plot section."""
+    summary_path = item[0]
+    return index_nav_html() + render_nested_sampling_run(
+        summary_path, likelihood_html=LIKELIHOOD_SLOT
+    )
+
+
+def likelihood_task(item):
+    """URL of one run's corner plot, or None. Runs alongside its page body."""
+    summary_path = item[0]
+    with open(summary_path) as f:
+        summary = json.load(f)
+    space_names = [
+        spec["name"] for spec in summary.get("parameter_space", []) if "name" in spec
+    ]
+    return render_likelihood_plot(os.path.dirname(summary_path), space_names)
+
+
+def write_run_page(item, body):
+    run_name = item[2]
+    assert LIKELIHOOD_SLOT not in body, "likelihood slot was never filled in"
     write_html_doc(
-        page_path,
+        item[1],
         title=f"nested-sampling run: {run_name}",
         subtitle=(
             f"Generated from <code>results/nested-sampling/{html.escape(run_name)}/"
             "summary.json</code>."
         ),
-        body=index_nav_html() + render_nested_sampling_run(summary_path),
+        body=body,
     )
 
 
@@ -1410,16 +1440,19 @@ def main(argv=None):
             continue
         todo.append((summary_path, page_path, run_name))
 
-    # Pages are independent and each one is dominated by matplotlib rasters, so
-    # build them in parallel processes. The image store is written with
-    # write-then-rename, so two workers racing on the same PNG is harmless.
+    # Pages are independent, and within a page the corner plot and the eval
+    # rasters are independent too, so every run contributes two pool tasks that
+    # run concurrently. The image store is written with write-then-rename, so
+    # two workers racing on the same PNG is harmless.
     written = len(todo)
-    if len(todo) > 1:
-        with multiprocessing.Pool(min(len(todo), os.cpu_count() or 1)) as pool:
-            pool.map(write_run_page, todo, chunksize=1)
-    else:
-        for item in todo:
-            write_run_page(item)
+    if todo:
+        with multiprocessing.Pool(min(2 * len(todo), os.cpu_count() or 1)) as pool:
+            plots = [pool.apply_async(likelihood_task, (item,)) for item in todo]
+            bodies = [pool.apply_async(run_body_task, (item,)) for item in todo]
+            for item, plot, body in zip(todo, plots, bodies):
+                write_run_page(
+                    item, body.get().replace(LIKELIHOOD_SLOT, likelihood_section(plot.get()))
+                )
 
     # The index is cheap and must reflect every run on disk, so always rebuild it.
     write_html_doc(
