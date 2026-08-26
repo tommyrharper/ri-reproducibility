@@ -287,11 +287,13 @@ Total wall time 10.2s (~0.16s/eval; ~1.8s on the default 8 ranks). That is
 `poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
 ~1.1s more on one rank and ~1.2s more on eight, for starting and removing the
-containers (8-rank end to end is ~3.0s). No fixed overhead of any
+containers (8-rank end to end is ~2.95s). No fixed overhead of any
 size is left in either sidecar: what remains is the science.
-Warm, an evaluation is ~0.05s of simulate (~0.02s RIME predict, the rest
-casacore table I/O, plus ~0.05s of `makems` on the ~12 evaluations of a run that
-miss the shared MS skeleton cache) and ~0.10s of `wsclean`, which is now well over half the run.
+Warm, an evaluation is ~0.05s of simulate (~0.022s RIME predict, ~0.007s
+re-pointing the forest at the new MS, ~0.008s of casacore table I/O, ~0.004s to
+copy a cached `makems` skeleton and ~0.005s to move the finished MS out of
+`/dev/shm`; no evaluation runs `makems` any more, the image ships every
+skeleton) and ~0.10s of `wsclean`, which is now well over half the run.
 The rest is one-off startup - the simulate worker, meqserver and the one TDL
 compile, now started concurrently before the sampler runs rather than serially
 inside the first evaluation - plus PolyChord's own sampling and bookkeeping.
@@ -331,7 +333,7 @@ its last bit, because a single-threaded `np.linalg.norm` reduces in a different
 order than a threaded one; that also makes it reproducible across hosts with
 different CPU counts, which it previously was not.
 
-#### `WEIGHT`/`SIGMA` are written row by row, not with `putcol`
+#### `WEIGHT`/`SIGMA` are written with one TaQL `UPDATE`, not `putcol`
 
 `putcol` on these two columns was 42ms of the 81ms simulate - more than the
 RIME predict. Both are *variable-shaped* array columns in the `ISMData`
@@ -344,15 +346,20 @@ not the disk - a `TiledColumnStMan` column of the same size (`DATA`, `FLAG`,
 and re-added under another storage manager because the whole ISM group would
 have to go with them.
 
-`fill_point_source_visibilities()` therefore writes each column with a
-`putcell()` loop, which is linear: 7.9ms for the pair. Keep the two loops
-separate - interleaving the columns costs 19ms, because each column's ISM
-buckets get evicted between rows. Measured 13.1s -> 10.9s single-rank (-16%,
-simulate 5.5s -> 3.4s) and 8.5s -> 8.2s on the default 8 ranks, where wsclean
-dominates and each rank runs only ~5 evaluations. Verified by comparing every
-column of all 62 Measurement Sets between a before and after run (identical),
-the artifact trees (identical), all 62 evaluations' science metrics
-(identical) and `log(Z)` (identical).
+A `putcell()` row loop is linear where `putcol` is quadratic - 7.9ms for the
+pair - and that was the fix for a while: measured 13.1s -> 10.9s single-rank
+(-16%, simulate 5.5s -> 3.4s) and 8.5s -> 8.2s on the default 8 ranks, with
+every column of all 62 Measurement Sets, the artifact trees, all 62
+evaluations' science metrics and `log(Z)` identical.
+
+`fill_point_source_visibilities()` now does the same row loop in C++ instead,
+as a single `taql("UPDATE $ms SET WEIGHT=..., SIGMA=...")`: 3.3ms for the pair
+against 7.9ms for the Python loop and 43ms for `putcol`, best of four on a
+1755-row MS, with both columns bit-identical to what the loop wrote. That is
+~4.6ms off every evaluation's ~0.06s of simulate. The `removecols` route stays
+closed: casacore refuses outright - `column WEIGHT cannot be removed from
+table` - because makems put `WEIGHT` and `SIGMA` in one ISM group with 15 other
+columns.
 
 #### The compiled TDL forest is reused across evaluations
 
@@ -410,34 +417,43 @@ the meqtrees image between arms): summed simulate worker-seconds 5.38s -> 4.68s
 (-13%, 6/6 pairs) and end to end 3.65s -> 3.38s (-7%, 5/6 pairs). All 41
 evaluations matched on every science metric and `log(Z)` was bit-identical.
 
-##### The shapes are built before the sampler asks for them
+##### The image ships every skeleton, so no run calls `makems`
 
 Waiting for an evaluation to miss puts the ~0.11s of a fresh `makems` in the
-middle of the sampler's critical path, and a default run first touches ~12
-shapes that way. `prewarm()` therefore sends the worker a
-`{"prebuild": {...}}` request - the parameter space's `observation_minutes` and
-`channel_count` ranges plus this rank's `offset`/`stride` - and the worker
-enumerates the shapes it owns and builds them in a background thread while the
-rank is still starting PolyChord. Eight workers split 20 shapes, so each builds
-two or three. The request is deliberately unanswered: the caller must not block
-on it, and a reply would desynchronise the one-reply-per-evaluation protocol.
+middle of the sampler's critical path. Building the shapes in the workers'
+background threads once the run had started only half-fixed that: a default
+8-rank run still took ~7 misses (0.06-0.10s each, in-worker timings) because
+the sampler asks for its first evaluations well before ~3 shapes per worker
+have been built, and all eight workers additionally raced on the same fresh
+`makems` inside `warm_forest()`.
+
+The parameter space only has 20 shapes and they cost ~1.2s and ~18MB to build,
+so the meqtrees image builds all of them at `docker build` time -
+`simulate_point_source_ms.py --prebuild-skeletons` into `/opt/ms-skeletons` -
+and `skeleton_dir()` prefers that directory when it exists. It is an ordinary
+writable container path, so a shape the image was not built with is still built
+and published there at runtime: the baked set is a head start, not a fixed set.
+`poc_common.py` is `--mount=type=bind`ed for that one build step rather than
+copied, so the shapes come from the single authoritative `PARAMETER_SPACE` and
+the runtime image still carries only the three simulate-side scripts.
 
 The MS name is part of the cache key, so a prebuilt entry is only useful if it
 is built under the name a real evaluation uses (`sim.ms`).
-`self_check_skeleton_prebuild()` is the guard: it prebuilds a two-shape slice
-and then asserts a real `make_ms_skeleton()` call for one of those shapes
+`self_check_skeleton_prebuild()` is the guard: it prebuilds a two-by-two slice
+of shapes and then asserts a real `make_ms_skeleton()` call for one of them
 reports a cache hit. It fails if the prebuild builds under any other name.
 
-Measured over 20 interleaved A/B pairs of the default 8-rank run (rebuilding
-both images between arms): summed simulate worker-seconds 4.69s -> 4.13s (-12%,
-12/12 pairs where in-process profiling was collected) and end to end 3.09s ->
-3.01s (-2.4%, 14/20 pairs, sd of the paired difference 0.18s). All 41
-evaluations matched on every science metric and `log(Z)` was bit-identical.
-The end-to-end effect is much smaller than the worker-seconds effect because
-the 8-rank run is only ~50% busy - a bind-mounted skeleton cache that was
-already warm from a previous run, i.e. the ceiling for this change, moved
-in-process `total_wall_seconds` by only ~0.17s while removing 1.07s of
-worker-seconds.
+Measured over 40 interleaved A/B pairs of the default 8-rank run against
+pre-tagged `:ab-old`/`:ab-new` images (which is also the TaQL `WEIGHT`/`SIGMA`
+change above): end to end 3.148s -> 2.955s (-6.1%, -0.193s +/- 0.029s, t = 6.7,
+33/40 pairs), summed simulate worker-seconds 2.73s -> 1.89s (-31%), and zero
+skeleton cache misses against seven before. All 41 evaluations' objectives were
+bit-identical.
+
+Because the workers still build into the cache directory when they miss, and
+because `/dev/shm` is where an unbaked image's cache lives, the sidecars keep
+`--shm-size 512m`; docker's 64MB default is only about 3x what 20 skeletons
+need.
 
 `simulate_point_source_ms.py --self-check` is the guard on the rewrite formula
 (and on the forest reuse below): it builds each shape both ways and asserts a
@@ -456,10 +472,6 @@ evaluation directories held the same file tree, and log(Z) was unchanged.
 `vis.uvw` and `vis.flg` as symlinks into the tiled storage manager files, and
 copying them as regular files leaves stale duplicates of the visibilities in
 every evaluation directory.
-
-Because the cache lives in `/dev/shm` alongside the working MS, the sidecar
-containers are started with `--shm-size 512m`; docker's 64MB default is only
-about 3x what 20 cached skeletons need.
 
 #### Sidecar commands go through one long-lived `sh` per rank
 
@@ -799,7 +811,7 @@ is about reproducibility; `-j 1` stays.
 
 `from mpi4py import MPI` initialises MPI, and eight ranks doing that at once
 costs 0.24s each. `prewarm()` needs the rank before anything else has touched
-MPI - it splits the skeleton prebuild across the workers by rank - so calling
+MPI - it is how a rank finds its own FIFO pair - so calling
 `mpi_rank()` there added that 0.24s to every rank's pre-sampler startup, where
 it hid from `total_wall_seconds` (measured around `run_polychord()`) and showed
 up only end to end. `mpi_rank()` therefore reads `OMPI_COMM_WORLD_RANK`, which

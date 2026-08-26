@@ -20,13 +20,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 from pathlib import Path
 
 import numpy as np
-from casacore.tables import table
+from casacore.tables import table, taql
 
 
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
@@ -143,11 +142,19 @@ def run_makems(output_ms: Path) -> None:
 # container ever reuses one.
 _SKELETON_DIR: Path | None = None
 
+# Where `--prebuild-skeletons` puts the whole parameter space at image build
+# time; see docker/meqtrees/Dockerfile. Every evaluation of a default run hits
+# it, so no run does any makems at all.
+BAKED_SKELETON_DIR = Path("/opt/ms-skeletons")
+
 
 def skeleton_dir() -> Path:
     global _SKELETON_DIR
     if _SKELETON_DIR is None:
-        _SKELETON_DIR = Path(SCRATCH_ROOT or tempfile.gettempdir()) / "ms-skeletons"
+        # The baked directory is a normal writable container path, so a shape
+        # the image was not built with is still built and published into it -
+        # it is a head start, not a fixed set.
+        _SKELETON_DIR = BAKED_SKELETON_DIR if BAKED_SKELETON_DIR.is_dir() else Path(SCRATCH_ROOT or tempfile.gettempdir()) / "ms-skeletons"
         _SKELETON_DIR.mkdir(parents=True, exist_ok=True)
     return _SKELETON_DIR
 
@@ -207,22 +214,17 @@ def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace) -> No
 
 
 def prebuild_skeletons(space: dict) -> None:
-    """Build the cache entries for the shapes this worker was given.
+    """Build a cache entry for every (NTimes, NFrequencies) the space can ask for.
 
-    A fresh makems run is ~0.11s against ~0.002s for a cache hit, and a default
-    run first touches ~12 of the parameter space's 20 (NTimes, NFrequencies)
-    shapes spread over the whole run, so most of those 0.11s land in the middle
-    of the sampler's critical path. The ranks share one cache, so they split the
-    shapes between their workers - `offset`/`stride` - and each builds its slice
-    in a background thread while the sampler is still starting up.
+    A fresh makems run is ~0.11s against ~0.004s for a cache hit, and a default
+    run touches ~12 of the parameter space's 20 shapes, first-touching most of
+    them mid-sampler where the miss lands straight on the wall clock. Run once
+    at image build time (see docker/meqtrees/Dockerfile) the whole space costs
+    ~1.2s and ~18MB and no run ever calls makems again - including the workers'
+    own warm_forest(), which all eight used to race on the same fresh build.
 
     The MS name is part of the cache key, so this has to build under the same
     name a real evaluation uses; self_check_skeleton_prebuild() is the guard.
-
-    ponytail: the whole space is built, ~2.2s of makems split across the ranks,
-    with no attempt to guess which shapes a run will actually visit. That is a
-    win while there are spare cores; cap it against the host CPU count if this
-    ever runs somewhere with fewer cores than ranks.
     """
     minutes_lo, minutes_hi = space["observation_minutes"]
     chan_lo, chan_hi = space["channel_count"]
@@ -235,7 +237,7 @@ def prebuild_skeletons(space: dict) -> None:
         )
         for n_chan in range(chan_lo, chan_hi + 1)
     ]
-    for minutes, n_chan in shapes[space["offset"] :: space["stride"]]:
+    for minutes, n_chan in shapes:
         with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
             ms = Path(scratch) / "sim.ms"
             # StartFreq/StepFreq are outside the cache key and are rewritten on
@@ -439,18 +441,16 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
         if "FLAG" in ms.colnames():
             ms.putcol("FLAG", np.zeros(ms.getcol("FLAG").shape, dtype=bool))
         # WEIGHT and SIGMA are variable-shaped IncrementalStMan columns in a
-        # makems MS, and python-casacore's putcol on those is quadratic in rows
-        # (1755 rows: 42ms for the pair, against 8ms for these putcell loops -
-        # half the whole simulate). Keep the two loops separate: interleaving
-        # the columns thrashes the ISM buckets and costs 19ms.
-        # ponytail: a Python row loop, fine at PoC MS sizes; for large MSes
-        # rebuild the skeleton's WEIGHT/SIGMA under StandardStMan instead.
-        for column, value in (("WEIGHT", 1.0 / (noise_sigma_jy * noise_sigma_jy)), ("SIGMA", noise_sigma_jy)):
-            if column not in ms.colnames():
-                continue
-            row_value = np.full(ms.getcell(column, 0).shape, value, dtype=np.float32)
-            for row in range(ms.nrows()):
-                ms.putcell(column, row, row_value)
+        # makems MS, and python-casacore's putcol on those is quadratic in rows:
+        # 1755 rows cost 43ms for the pair, against 8ms for a putcell row loop
+        # and 3ms for this TaQL UPDATE, which is the same row loop in C++.
+        # They cannot be moved to a cheaper storage manager - removecols refuses
+        # to break up the ISM group makems put them in with 15 other columns.
+        if "WEIGHT" in ms.colnames():
+            taql(
+                "UPDATE $ms SET WEIGHT=%r, SIGMA=%r"
+                % (1.0 / (noise_sigma_jy * noise_sigma_jy), noise_sigma_jy)
+            )
 
     return {
         "measurement_set": str(output_ms),
@@ -572,15 +572,6 @@ def serve(fifo_base: str | None = None) -> None:
         replies = open(f"{fifo_base}.out", "w")
     for line in requests:
         request = json.loads(line)
-        if "prebuild" in request:
-            # Deliberately unanswered: the caller sends this while it is still
-            # starting its own sampler and must not block on ~0.1s per shape.
-            # Nothing in prebuild_skeletons() writes to fd 1, which is the reply
-            # pipe the real requests answer on.
-            threading.Thread(
-                target=prebuild_skeletons, args=(request["prebuild"],), daemon=True
-            ).start()
-            continue
         returncode = 0
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             try:
@@ -631,14 +622,13 @@ def self_check_skeleton_cache() -> None:
 
 def self_check_skeleton_prebuild() -> None:
     """A prebuilt shape must be the entry a real evaluation of it looks up."""
-    space = {"observation_minutes": [4.0, 6.0], "channel_count": [2, 3], "offset": 0, "stride": 2}
+    space = {"observation_minutes": [4.0, 6.0], "channel_count": [2, 3]}
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         use_skeleton_cache(Path(scratch) / "cache")
         prebuild_skeletons(space)
-        # Shapes are (NTimes, NFrequencies) = (2,2) (2,3) (3,2) (3,3); this
-        # worker owns every second one.
+        # Shapes are (NTimes, NFrequencies) = (2,2) (2,3) (3,2) (3,3).
         built = list(skeleton_dir().iterdir())
-        assert len(built) == 2, f"prebuild published {len(built)} entries, expected 2"
+        assert len(built) == 4, f"prebuild published {len(built)} entries, expected 4"
         ms = Path(scratch) / "hit" / "sim.ms"
         args = parse_args([
             "--output-ms", str(ms), "--observation-minutes", "4.0", "--channel-count", "2",
@@ -744,7 +734,15 @@ if __name__ == "__main__":
     # --serve and --self-check take no other arguments, so they are checked before
     # argparse, which requires the full simulate argument set.
     try:
-        if sys.argv[1:2] == ["--serve"]:
+        if sys.argv[1:] == ["--prebuild-skeletons"]:
+            # Build time only: fills BAKED_SKELETON_DIR from the one authoritative
+            # copy of the parameter space, bind-mounted in for this step so the
+            # runtime image still carries nothing but the three simulate scripts.
+            from poc_common import PARAMETER_SPACE
+
+            BAKED_SKELETON_DIR.mkdir(parents=True, exist_ok=True)
+            prebuild_skeletons({spec["name"]: [spec["min"], spec["max"]] for spec in PARAMETER_SPACE})
+        elif sys.argv[1:2] == ["--serve"]:
             # `--serve` / `--serve --fifo <base>`; neither takes the simulate
             # argument set, so they are dispatched before argparse.
             serve(sys.argv[3] if sys.argv[2:3] == ["--fifo"] else None)

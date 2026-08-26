@@ -734,31 +734,6 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | Fi
     return _SIMULATE_WORKERS[meqtrees_image]
 
 
-def request_skeleton_prebuild(worker: subprocess.Popen) -> None:
-    """Ask this rank's worker to fill its share of the shared skeleton cache.
-
-    The ranks all `docker exec` their worker into one meqtrees sidecar and so
-    share its skeleton cache, but nothing fills it until an evaluation misses -
-    ~0.11s of makems, mid-run, on the sampler's critical path. Splitting the
-    parameter space's shapes across the workers by rank builds them up front
-    instead, in the worker's own background thread. Fire and forget: the worker
-    does not answer this request, so the next `simulate_measurement_set()` reply
-    is still that evaluation's own.
-    """
-    space = {spec["name"]: [spec["min"], spec["max"]] for spec in PARAMETER_SPACE}
-    stride = max(1, int(os.environ.get("NS_MPI_PROCS", "1")))
-    request = {
-        "prebuild": {
-            "observation_minutes": space["observation_minutes"],
-            "channel_count": space["channel_count"],
-            "offset": mpi_rank() % stride,
-            "stride": stride,
-        }
-    }
-    worker.stdin.write(json.dumps(request) + "\n")
-    worker.stdin.flush()
-
-
 def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[[], None]:
     """Start this rank's sidecar attachments concurrently; returns a joiner.
 
@@ -778,7 +753,7 @@ def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[
         sidecar_shell(wsclean_image, platform)
 
     def warm_simulate() -> None:
-        request_skeleton_prebuild(simulate_worker(meqtrees_image, platform))
+        simulate_worker(meqtrees_image, platform)
 
     threads = [
         threading.Thread(target=target, daemon=True)
