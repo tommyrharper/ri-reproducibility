@@ -138,8 +138,7 @@ copied into every `poc-summary.json`.
 ## Reports
 
 ```bash
-make benchmark-report          # benchmarks/report.html from benchmarks/manifests/
-make nested-sampling-report    # benchmarks/nested-sampling-report/index.html + one page per run
+make nested-sampling-report    # reports/nested-sampling-report/index.html + one page per run
 ```
 
 Nested-sampling report selectors:
@@ -219,7 +218,7 @@ make record-environment TOOL=r2d2 IMAGE=ri-reproducibility/r2d2:cpu CONFIG=confi
 ```
 
 Then hand-add an `"experiment"` object (`purpose`, provenance, `results`) to the
-written manifest in `benchmarks/manifests/` - see any existing `r2d2-*.json`.
+written manifest in `reports/manifests/`.
 
 ## Housekeeping
 
@@ -252,10 +251,10 @@ scripts/test-defaults.sh
 | `data/` -> `/data` | Measurement Sets, `.mat` files, ground-truth FITS |
 | `checkpoints/` -> `/checkpoints` | R2D2 pretrained checkpoints |
 | `results/` -> `/results` | Run output, smoke-test output, PoC runs |
-| `benchmarks/manifests/` | One JSON manifest per recorded run |
+| `reports/manifests/` | One JSON manifest per recorded run |
 | `docs/nested-sampling.md` | PoC design, metrics, output files |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
-| `benchmarks/REPRODUCTION_PLAN.md` | Which paper target, current status |
+| `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 
 ## Gotchas
 

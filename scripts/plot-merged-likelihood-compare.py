@@ -36,8 +36,8 @@ FALLBACK_PARAMS = [
     "start_frequency_hz",
     "channel_width_hz",
 ]
-OUT_OVERLAY = REPO_ROOT / "benchmarks" / "merged-r2d2-wsclean-likelihood.png"
-OUT_SIDE = REPO_ROOT / "benchmarks" / "merged-r2d2-wsclean-likelihood-side-by-side.png"
+OUT_OVERLAY = REPO_ROOT / "reports" / "merged-r2d2-wsclean-likelihood.png"
+OUT_SIDE = REPO_ROOT / "reports" / "merged-r2d2-wsclean-likelihood-side-by-side.png"
 PLOT_KW = {"kind": "kde", "ncompress": False}
 
 

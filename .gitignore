@@ -6,12 +6,10 @@ checkpoints/*
 !checkpoints/README.md
 results/*
 !results/.gitkeep
-benchmarks/manifests/*
-!benchmarks/manifests/.gitkeep
-benchmarks/report.html
-benchmarks/nested-sampling-report*.html
-benchmarks/nested-sampling-report/
-benchmarks/merged-r2d2-wsclean-*.png
+reports/manifests/*
+!reports/manifests/.gitkeep
+reports/nested-sampling-report/
+reports/merged-r2d2-wsclean-*.png
 vendor/*
 !vendor/README.md
 
@@ -42,7 +40,7 @@ CMakeFiles/
 # macOS
 .DS_Store
 
-# Benchmark / profiling artefacts
+# Profiling artefacts
 *.prof
 *.trace
 
