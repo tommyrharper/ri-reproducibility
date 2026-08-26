@@ -29,12 +29,13 @@ top of that clean MeqTrees prediction.
 
 ## Run the PoC
 
-Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see WSClean below).
-Each target builds its required images first and starts one long-lived sidecar
-container per image; the PolyChord container mounts the Docker socket and
-drives those sidecars. The WSClean target starts the PolyChord container the
-same way and `docker exec`s the run into it (see "The PolyChord container is a
-sidecar too" and "Long-lived sidecar containers, one per image" in
+Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see "Environment
+overrides" below). Each target builds its required images first and starts one
+long-lived sidecar container per image; the PolyChord container mounts the
+Docker socket and drives those sidecars. The WSClean target starts the
+PolyChord container the same way and `docker exec`s the run into it (see "The
+PolyChord container is a sidecar too" and "Long-lived sidecar containers, one
+per image" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)).
 
 ### WSClean
@@ -106,6 +107,27 @@ CPUs than four. To avoid CPU oversubscription, the script defaults
 explicitly, so each rank's R2D2 container gets a fair share of the host's cores
 instead of all of them. Set `R2D2_OMP_THREADS` explicitly to override this
 per-rank default.
+
+### Environment overrides
+
+Both run scripts read the same `NS_*` variables and forward them to
+`polychord_wsclean_poc.py` / `polychord_r2d2_poc.py` as command-line flags.
+The defaults are the ones in `scripts/run-nested-sampling-poc.sh` and
+`scripts/run-nested-sampling-r2d2-poc.sh`.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NS_NLIVE` | Number of PolyChord live points (`--nlive`) | `8` |
+| `NS_NUM_REPEATS` | How much PolyChord explores inside the likelihood constraint before generating a replacement live point (`--num-repeats`) | `2` |
+| `NS_MAX_NDEAD` | Dead-point budget that terminates the run (`--max-ndead`) | `12` |
+| `NS_SEED` | PolyChord random seed (`--seed`) | `41` |
+| `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `off_source_rms_jy` |
+| `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `docker info` |
+| `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh`. Unset means `{}`: each rank starts its own container per image |
+| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by the WSClean run script only. No default: unset (as in the R2D2 PoC) means each rank starts its own simulate worker |
+
+`NS_SIDECARS` and `NS_SIMULATE_FIFO_DIR` are wiring the run scripts export for
+the containers they start, not knobs to set by hand.
 
 ## Parameter space
 
