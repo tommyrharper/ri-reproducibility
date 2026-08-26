@@ -371,6 +371,19 @@ runs with `--network none`: the report only reads the repo and writes
 `reports/`, and setting up the container's network is ~0.3s of every
 invocation - most of the cost of a build that draws nothing.
 
+The corner plot itself is the build's longest task, and roughly a fifth of it
+was pandas repeating work. anesthetic draws the grid as 15 separate pandas plot
+calls, and pandas re-runs its shared-axis tick housekeeping over every axis in
+the figure after each one. `dedupe_pandas_tick_housekeeping()` in
+`scripts/lib/generate_report.py` makes that run once per axis. It is not a plain
+skip: reading an axis' tick labels un-stales matplotlib's shared view limits,
+and that side effect is what keeps each diagonal panel's CDF twin on its
+parent's x range, so the repeats still touch `viewLim` - drop that and the plot
+visibly changes. Corner plot 1.01s -> 0.81s, five-run cold build 2.01s -> 1.80s
+in-container and 15% less CPU, with byte-identical PNGs. The patch is
+best-effort: if pandas moves the private helper it is a no-op and the plot is
+just slower again.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the
