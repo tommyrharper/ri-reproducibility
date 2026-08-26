@@ -13,6 +13,7 @@ import hashlib
 import html
 import io
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -1364,6 +1365,20 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def write_run_page(item):
+    """Render one run page. Top-level so multiprocessing.Pool can call it."""
+    summary_path, page_path, run_name = item
+    write_html_doc(
+        page_path,
+        title=f"nested-sampling run: {run_name}",
+        subtitle=(
+            f"Generated from <code>results/nested-sampling/{html.escape(run_name)}/"
+            "summary.json</code>."
+        ),
+        body=index_nav_html() + render_nested_sampling_run(summary_path),
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
     out_dir = args.out_path or "/workspace/out/nested-sampling-report"
@@ -1379,9 +1394,9 @@ def main(argv=None):
 
     # An explicit --run is a deliberate "rebuild this one" request.
     force = args.force or bool(run)
-    written = 0
     skipped = 0
     outdated = 0
+    todo = []
     for summary_path in nested_sampling_run_paths(limit=limit, run=run):
         run_name = os.path.basename(os.path.dirname(summary_path))
         page_path = os.path.join(out_dir, run_page_name(run_name))
@@ -1393,16 +1408,18 @@ def main(argv=None):
             outdated += 1
             skipped += 1
             continue
-        write_html_doc(
-            page_path,
-            title=f"nested-sampling run: {run_name}",
-            subtitle=(
-                f"Generated from <code>results/nested-sampling/{html.escape(run_name)}/"
-                "summary.json</code>."
-            ),
-            body=index_nav_html() + render_nested_sampling_run(summary_path),
-        )
-        written += 1
+        todo.append((summary_path, page_path, run_name))
+
+    # Pages are independent and each one is dominated by matplotlib rasters, so
+    # build them in parallel processes. The image store is written with
+    # write-then-rename, so two workers racing on the same PNG is harmless.
+    written = len(todo)
+    if len(todo) > 1:
+        with multiprocessing.Pool(min(len(todo), os.cpu_count() or 1)) as pool:
+            pool.map(write_run_page, todo, chunksize=1)
+    else:
+        for item in todo:
+            write_run_page(item)
 
     # The index is cheap and must reflect every run on disk, so always rebuild it.
     write_html_doc(
