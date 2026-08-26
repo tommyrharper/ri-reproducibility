@@ -384,6 +384,18 @@ in-container and 15% less CPU, with byte-identical PNGs. The patch is
 best-effort: if pandas moves the private helper it is a no-op and the plot is
 just slower again.
 
+Matplotlib repeats work of its own on the same figure. Every layout pass -
+`tight_layout()`, the tight-bbox draw, the render draw, and each spine and axis
+label placed in between - recomputes every axis' tick positions and label text
+from scratch, ~930 times for one corner plot and about a third of its cost.
+`memoize_matplotlib_tick_updates()` caches `Axis._update_ticks` per axis against
+the axis' view interval, data interval and locator/formatter pair, which is
+everything the result depends on; building that key reads `get_view_interval()`,
+so a cache hit still performs the same `viewLim` un-staling the de-duplication
+above relies on. Corner plot 0.86s -> 0.69s, five-run cold build 1.65s -> 1.43s
+in-container and 18% less CPU, with byte-identical PNGs. Best-effort in the same
+way: a matplotlib that renames the private method just draws slower.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the
