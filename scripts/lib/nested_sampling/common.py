@@ -924,31 +924,21 @@ def run_r2d2_imaging(
     )
 
 
-def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[[], None]:
+def prewarm(*targets: Callable[[], None]) -> Callable[[], None]:
     """Start this rank's sidecar attachments concurrently; returns a joiner.
 
-    The first evaluation on a rank cost ~0.7s that later ones did not, and every
+    The first evaluation on a rank cost time that later ones did not, and every
     rank paid it at the same moment, so all of it landed on the wall clock in
     front of evaluation one: the simulate worker's Python/Timba/meqserver
-    startup, two `docker inspect`s for the image entrypoints and the wsclean
-    shell's `docker exec` - one after the other. Here they run in threads, so
-    the rank pays the slowest instead of the sum, and the caller can overlap
-    them with PolyChord's own startup by joining late.
+    startup, the R2D2 worker's `import torch`, and the `docker inspect`s for an
+    image entrypoint - one after the other. Here they run in threads, so the
+    rank pays the slowest instead of the sum, and the caller can overlap them
+    with PolyChord's own startup by joining late.
 
     Nothing may touch a sidecar between this call and the returned joiner: the
     caches these threads fill are plain dicts with no lock.
     """
-    def warm_wsclean() -> None:
-        sidecar_command(wsclean_image)
-        sidecar_shell(wsclean_image, platform)
-
-    def warm_simulate() -> None:
-        simulate_worker(meqtrees_image, platform)
-
-    threads = [
-        threading.Thread(target=target, daemon=True)
-        for target in (warm_simulate, warm_wsclean)
-    ]
+    threads = [threading.Thread(target=target, daemon=True) for target in targets]
     for thread in threads:
         thread.start()
 
