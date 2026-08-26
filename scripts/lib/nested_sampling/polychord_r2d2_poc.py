@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-repeats", type=int, default=2)
     parser.add_argument("--max-ndead", type=int, default=12)
     parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--metric", default="off_source_rms_jy", help="Objective metric: badness, a raw metric name, or an expression over metric names")
+    parser.add_argument("--metric", default="total_rms_jy", help="Objective metric: badness, a raw metric name, or an expression over metric names")
     parser.add_argument("--platform", default=os.environ.get("DOCKER_DEFAULT_PLATFORM", "linux/arm64"))
     return parser.parse_args()
 

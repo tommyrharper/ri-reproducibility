@@ -15,7 +15,7 @@ NS_NLIVE="${NS_NLIVE:-8}"
 NS_NUM_REPEATS="${NS_NUM_REPEATS:-2}"
 NS_MAX_NDEAD="${NS_MAX_NDEAD:-12}"
 NS_SEED="${NS_SEED:-41}"
-NS_METRIC="${NS_METRIC:-off_source_rms_jy}"
+NS_METRIC="${NS_METRIC:-total_rms_jy}"
 
 if [ -z "${DOCKER_SOCKET:-}" ]; then
   # Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
