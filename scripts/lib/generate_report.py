@@ -367,12 +367,49 @@ def likelihood_section(uri):
         """
 
 
+# anesthetic draws the corner plot as 15 separate pandas plot calls into one
+# 20-axes grid, and after every one of them pandas re-runs its shared-axis tick
+# housekeeping over *every* axis in the figure - 44% of plot_2d, for work that
+# is idempotent after the first pass. Do it once per axis instead. The repeats
+# are not entirely free, though: reading an axis' tick labels un-stales the
+# shared view limits, and that side effect is load-bearing - without it each
+# diagonal panel's CDF twin drifts off its parent's x range (~5%) and the plot
+# changes. Touching viewLim keeps exactly that and drops the rest.
+# Best-effort: if pandas moves the private helper, the plot is just slower.
+_tick_housekeeping_deduped = False
+
+
+def dedupe_pandas_tick_housekeeping():
+    global _tick_housekeeping_deduped
+    if _tick_housekeeping_deduped:
+        return True
+    _tick_housekeeping_deduped = True
+    try:
+        from pandas.plotting._matplotlib import tools
+
+        remove_labels = tools._remove_labels_from_axis
+    except (ImportError, AttributeError):
+        return False
+
+    def once(axis):
+        if getattr(axis, "_report_labels_removed", False):
+            axis.axes.viewLim  # noqa: B018 - un-stales the shared view limits
+            return
+        axis._report_labels_removed = True
+        remove_labels(axis)
+
+    tools._remove_labels_from_axis = once
+    return True
+
+
 def _render_likelihood_png(run_dir, param_names):
     load_plot_libs()
     try:
         from anesthetic_io import load_nested_samples, weight_by_likelihood
     except ImportError:
         return None
+
+    dedupe_pandas_tick_housekeeping()
 
     try:
         samples = weight_by_likelihood(load_nested_samples(run_dir))
@@ -1691,6 +1728,24 @@ def _self_check_render_array_png():
     assert big.size == (50, 50), big.size
 
 
+def _self_check_tick_housekeeping():
+    """The corner plot's speedup rests on one side effect - that the memoized
+    path still un-stales the shared view limits. Assert it directly."""
+    load_plot_libs()
+    if not dedupe_pandas_tick_housekeeping():
+        return
+    from pandas.plotting._matplotlib import tools
+
+    fig, (top, _bottom) = plt.subplots(2, sharex=True)
+    top.plot([0, 1], [0, 1])
+    tools._remove_labels_from_axis(top.xaxis)
+    assert not any(t.get_visible() for t in top.xaxis.get_majorticklabels())
+    top._stale_viewlims["x"] = True
+    tools._remove_labels_from_axis(top.xaxis)
+    assert not top._stale_viewlims["x"], "memoized path lost the viewLim un-stale"
+    plt.close(fig)
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1705,6 +1760,7 @@ if __name__ == "__main__":
         _self_check_render_array_png()
         _self_check_profiling()
         _self_check_page_status()
+        _self_check_tick_housekeeping()
         print("generate_report self-check passed")
     else:
         main()
