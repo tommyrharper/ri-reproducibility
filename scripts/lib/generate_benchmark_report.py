@@ -36,6 +36,13 @@ NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling-poc")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
 
+from poc_common import (  # noqa: E402
+    PROFILING_VIEW_NOTE,
+    format_duration,
+    format_share,
+    profiling_breakdown,
+)
+
 LOG_Z_RE = re.compile(
     r"log\(Z\)\s*=\s*([-\d.]+E[+-]\d+)\s*\+/-\s*([-\d.]+E[+-]\d+)",
     re.IGNORECASE,
@@ -119,17 +126,8 @@ def short(s, n=12):
 
 
 def format_wall_duration(seconds):
-    """Format run wall-clock seconds for display (e.g. 4m 12s)."""
-    if seconds is None:
-        return None
-    total = max(0, int(round(float(seconds))))
-    if total < 60:
-        return f"{total}s"
-    minutes, secs = divmod(total, 60)
-    if minutes < 60:
-        return f"{minutes}m {secs}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes}m {secs}s"
+    """Run wall-clock seconds for the card header (e.g. 4m 12s), or None when unknown."""
+    return None if seconds is None else format_duration(seconds)
 
 
 def format_run_id_timestamp(run_name):
@@ -307,63 +305,133 @@ def render_images_likelihood_collapsible(tab_id, eval_images_html, likelihood_ht
     """
 
 
-PROFILING_STAGES = [
-    ("simulate (MeqTrees)", "simulate", "simulate_seconds"),
-    ("convert (MS -> .mat)", "convert", "convert_seconds"),
-    ("image container (total)", "image_container", "image_container_seconds"),
-    ("&nbsp;&nbsp;of which: binary run", "image_binary", "image_binary_seconds"),
-    ("&nbsp;&nbsp;of which: container overhead", "image_container_overhead", "image_container_overhead_seconds"),
-    ("metrics computation", "metrics", "metrics_seconds"),
-]
+# Categorical slot per top-level stage, assigned by identity and never by size,
+# so a stage keeps its colour whether or not the other stages are present.
+PROFILING_STAGE_COLOURS = {
+    "simulate": "var(--series-1)",
+    "convert": "var(--series-2)",
+    "image_container": "var(--series-3)",
+    "metrics": "var(--series-4)",
+    "unaccounted": "var(--series-5)",
+}
+
+
+def render_profiling_bar(segments):
+    """One 100%-wide stacked bar plus its legend: where the run's worker-time went.
+
+    Segments are flex-grown in proportion to their share, so the 2px gaps
+    between them come out of the available width rather than overflowing it.
+    """
+    if not segments:
+        return ""
+    bars, legend = [], []
+    for label, seconds, share, colour in segments:
+        title = f"{label} - {format_duration(seconds)} ({format_share(share)})"
+        bars.append(
+            f'<span class="profile-seg" style="--seg-share: {share:.6f}; --seg-colour: {colour}"'
+            f' title="{html.escape(title)}"></span>'
+        )
+        legend.append(
+            f'<li><span class="profile-swatch" style="--seg-colour: {colour}"></span>'
+            f'<span>{html.escape(label)}</span>'
+            f'<strong>{html.escape(format_share(share))}</strong>'
+            f'<span class="profile-legend-time">{html.escape(format_duration(seconds))}</span></li>'
+        )
+    summary_text = ", ".join(f"{label} {format_share(share)}" for label, _, share, _ in segments)
+    return f"""
+      <div class="profile-bar" role="img"
+           aria-label="Share of worker-time by stage: {html.escape(summary_text)}">{''.join(bars)}</div>
+      <ul class="profile-legend">{''.join(legend)}</ul>
+    """
 
 
 def render_profiling(summary):
-    """Collapsed per-stage timing table, mirroring scripts/profile-nested-sampling-run.py."""
+    """Collapsed per-stage timing breakdown, sharing its numbers with
+    scripts/profile-nested-sampling-run.py via poc_common.profiling_breakdown."""
     profiling = summary.get("profiling")
     if not profiling:
         return ""
 
-    total = profiling.get("total_wall_seconds")
-    mpi_procs = profiling.get("mpi_procs", 1)
-    # Shares are only meaningful against wall time when there is a single worker.
-    show_shares = mpi_procs == 1 and total
+    breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
+    mpi_procs = breakdown["mpi_procs"]
+    budget = breakdown["worker_seconds_budget"]
+    evals = breakdown["evals"]
 
-    def row(label, seconds, evals="", emphasis=False):
-        value = "n/a" if seconds is None else f"{float(seconds):.2f}s"
+    def row(label, seconds, share, per_eval=None, evals_count="", indent=False, emphasis=False):
+        # format_share can return "<0.1%", so every cell goes through escaping.
+        cells = [html.escape(text) for text in (
+            label,
+            format_duration(seconds),
+            format_duration(per_eval) if per_eval is not None else "",
+            format_share(share),
+            str(evals_count),
+        )]
         if emphasis:
-            label, value = f"<strong>{label}</strong>", f"<strong>{value}</strong>"
-        share = ""
-        if show_shares:
-            pct = f"{100.0 * seconds / total:.1f}%" if seconds is not None else ""
-            share = f"<td>{pct}</td>"
-        return f"<tr><td>{label}</td><td>{value}</td>{share}<td>{html.escape(str(evals))}</td></tr>"
+            cells = [f"<strong>{cell}</strong>" if cell else cell for cell in cells]
+        stage_class = ' class="profile-stage-sub"' if indent else ""
+        numeric = "".join(f'<td class="num">{cell}</td>' for cell in cells[1:])
+        return f"<tr><td{stage_class}>{cells[0]}</td>{numeric}</tr>"
 
-    stages = profiling.get("stage_totals_seconds", {})
-    counts = profiling.get("stage_eval_counts", {})
     body = "".join(
-        row(label, stages.get(key), counts.get(count_key, 0))
-        for label, key, count_key in PROFILING_STAGES
-        if stages.get(key) is not None
+        row(
+            r["label"],
+            r["seconds"],
+            r["share"],
+            r["per_eval_seconds"],
+            r["evals"] or "",
+            indent=r["is_sub"],
+        )
+        for r in breakdown["rows"]
     )
-    accounted = profiling.get("accounted_worker_seconds", profiling.get("accounted_seconds"))
-    body += row("accounted (sum above)", accounted, emphasis=True)
-    body += row("PolyChord overhead (unaccounted)", profiling.get("polychord_overhead_seconds"), emphasis=True)
+    accounted = breakdown["accounted_seconds"]
+    body += row(
+        "accounted (sum of stages above)",
+        accounted,
+        breakdown["accounted_share"],
+        accounted / evals if evals else None,
+        emphasis=True,
+    )
+    body += row(
+        breakdown["unaccounted_label"],
+        breakdown["unaccounted_seconds"],
+        breakdown["unaccounted_share"],
+        emphasis=True,
+    )
 
-    total_heading = "wall" if mpi_procs == 1 else "worker-s"
-    share_heading = "<th>share</th>" if show_shares else ""
-    note = profiling.get("note", "")
+    segments = [
+        (r["label"], r["seconds"], r["share"], PROFILING_STAGE_COLOURS.get(r["key"], "var(--series-1)"))
+        for r in breakdown["rows"]
+        if not r["is_sub"] and r["share"]
+    ]
+    if breakdown["unaccounted_share"]:
+        segments.append((
+            breakdown["unaccounted_label"],
+            breakdown["unaccounted_seconds"],
+            breakdown["unaccounted_share"],
+            PROFILING_STAGE_COLOURS["unaccounted"],
+        ))
+
+    heading = " · ".join([
+        f"{mpi_procs} worker{'s' if mpi_procs != 1 else ''}",
+        f"wall clock {format_duration(breakdown['total_wall_seconds'])}",
+        f"worker-time {format_duration(budget)} ({mpi_procs} × wall clock)",
+        f"{evals} evaluations",
+    ])
     return f"""
     <details>
-      <summary>Profiling (per-stage timing)</summary>
-      <p class="purpose">mpi_procs {html.escape(str(mpi_procs))} ·
-        total wall {'n/a' if total is None else f'{float(total):.2f}s'}</p>
+      <summary>Profiling (where the run's time went)</summary>
+      <p class="purpose">{html.escape(heading)}</p>
+      {render_profiling_bar(segments)}
       <div class="eval-table-wrap">
         <table class="eval-table">
-          <thead><tr><th>stage</th><th>{total_heading}</th>{share_heading}<th>evals</th></tr></thead>
+          <thead><tr>
+            <th>stage</th><th class="num">total</th><th class="num">per eval</th>
+            <th class="num">share</th><th class="num">evals</th>
+          </tr></thead>
           <tbody>{body}</tbody>
         </table>
       </div>
-      {f'<p class="purpose">{html.escape(note)}</p>' if note else ''}
+      <p class="purpose">{html.escape(PROFILING_VIEW_NOTE)}</p>
     </details>
     """
 
@@ -847,7 +915,26 @@ def render_manifest(manifest, path):
 
 
 CSS = """
-:root { color-scheme: light dark; }
+:root {
+  color-scheme: light dark;
+  /* Categorical slots 1-5, validated for colour-vision deficiency against the
+     light surface; the dark column below is the same hues re-stepped for the
+     dark surface rather than an automatic flip. */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+  }
+}
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   max-width: 980px; margin: 2rem auto; padding: 0 1rem;
@@ -901,6 +988,27 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .eval-table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
 .eval-table th, .eval-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); text-align: left; vertical-align: top; }
 .eval-table th { opacity: 0.7; white-space: nowrap; }
+.eval-table td.num, .eval-table th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.profile-stage-sub { padding-left: 1.5rem; opacity: 0.8; }
+.profile-bar {
+  display: flex; gap: 2px;
+  width: 100%; height: 1.5rem;
+  margin: 0.75rem 0 0.5rem;
+}
+.profile-seg {
+  flex: var(--seg-share) 1 0;
+  min-width: 3px;
+  background: var(--seg-colour);
+  border-radius: 3px;
+}
+.profile-legend {
+  display: flex; flex-wrap: wrap; gap: 0.3rem 1.1rem;
+  list-style: none; padding: 0; margin: 0 0 0.5rem;
+  font-size: 0.78rem;
+}
+.profile-legend li { display: flex; align-items: center; gap: 0.35rem; }
+.profile-swatch { width: 0.7rem; height: 0.7rem; border-radius: 3px; background: var(--seg-colour); flex: none; }
+.profile-legend-time { opacity: 0.65; font-variant-numeric: tabular-nums; }
 .eval-glance { margin: 0.75rem 0 1rem; }
 .eval-images { margin: 0.75rem 0; }
 .eval-strip-wrap { margin: 0.75rem 0; }
@@ -1335,31 +1443,46 @@ log(Z)       =   0.145917983191460E+001 +/-   0.309608121862379E-001
 
 
 def _self_check_profiling():
-    # mpi_procs > 1: no wall-share column values, null stages dropped.
-    html_out = render_profiling({"profiling": {
-        "mpi_procs": 8, "total_wall_seconds": 1.5,
-        "stage_totals_seconds": {"simulate": 1.88, "convert": None, "metrics": 0.047},
-        "stage_eval_counts": {"simulate_seconds": 41, "metrics_seconds": 41},
-        "accounted_worker_seconds": 6.74, "polychord_overhead_seconds": None,
-        "note": "worker-seconds",
+    # MPI run: shares are of the worker-time budget, null stages are dropped,
+    # and the imaging rows are named after the run's algorithm.
+    html_out = render_profiling({"algorithm": "r2d2", "profiling": {
+        "mpi_procs": 8, "total_wall_seconds": 455.58,
+        "stage_totals_seconds": {
+            "simulate": 33.03, "convert": None, "image_container": 2354.9, "metrics": 1.44,
+        },
+        "stage_eval_counts": {
+            "simulate_seconds": 44, "image_container_seconds": 44, "metrics_seconds": 44,
+        },
+        "accounted_worker_seconds": 2389.37, "polychord_overhead_seconds": None,
     }})
-    assert "1.88s" in html_out and "worker-s" in html_out, html_out
+    # Minutes and hours where seconds stopped being readable, and a per-eval column.
+    assert "r2d2 container (total)" in html_out, html_out
+    assert "image container" not in html_out, html_out
+    assert "39m 15s" in html_out and "53.5s" in html_out, html_out
+    # A share that rounds to nothing still renders as escaped text, not as a tag.
+    assert "&lt;0.1%" in html_out and "<0.1%" not in html_out, html_out
+    assert "8 workers" in html_out and "1h 00m 45s" in html_out, html_out
     assert "convert" not in html_out, html_out
-    assert "6.74s" in html_out and "n/a" in html_out, html_out
-    assert "%" not in html_out, html_out
-    assert "<th>share</th>" not in html_out, html_out
-    # mpi_procs == 1: shares are computed against total wall time.
-    single = render_profiling({"profiling": {
+    # Every top-level stage plus the unaccounted remainder is charted and adds to 100%.
+    assert html_out.count('class="profile-seg"') == 4, html_out
+    assert "unaccounted (PolyChord sampling + idle)" in html_out, html_out
+    shares = [float(s) for s in re.findall(r"--seg-share: ([\d.]+)", html_out)]
+    assert abs(sum(shares) - 1.0) < 1e-6, shares
+    # Serial run: the budget is just the wall clock, so shares are of wall time.
+    single = render_profiling({"algorithm": "wsclean", "profiling": {
         "mpi_procs": 1, "total_wall_seconds": 10.0,
         "stage_totals_seconds": {"simulate": 5.0},
         "stage_eval_counts": {"simulate_seconds": 2},
         "accounted_worker_seconds": 5.0, "polychord_overhead_seconds": 5.0,
-        "note": "",
     }})
-    assert "50.0%" in single, single
-    assert "<th>share</th>" in single, single
+    assert '<td class="num">50.0%</td>' in single, single
+    assert single.count("--seg-share: 0.500000") == 2, single  # the one stage, and the remainder
+    assert "1 worker ·" in single, single
     # No profiling block: nothing rendered.
     assert render_profiling({}) == ""
+    # A profiling block with nothing in it must not divide by zero.
+    empty = render_profiling({"profiling": {"mpi_procs": 1, "total_wall_seconds": 0.0}})
+    assert 'class="profile-seg"' not in empty, empty
 
 
 def _self_check_page_status():

@@ -61,6 +61,29 @@ prints a table (or the raw `profiling` dict with `--json`); it does not launch
 anything itself. Runs written before this instrumentation existed have no
 `profiling` block and must be re-run to get one.
 
+### How the printed shares are computed
+
+The JSON fields above are raw sums. Turning them into something readable is
+`profiling_breakdown()` in `scripts/lib/nested_sampling/poc_common.py`, shared
+by the CLI and by the HTML report's "Profiling (where the run's time went)"
+section so the two cannot drift apart. It adds three things the raw block does
+not carry:
+
+- **A per-evaluation column** - each stage total divided by the number of
+  evaluations that recorded it, so "39m 15s of imaging" also reads as "53.5s an
+  image".
+- **A single share denominator that works at any MPI process count** - the run's
+  *worker-time budget*, `total_wall_seconds x mpi_procs`. Every top-level stage
+  plus the unaccounted remainder is a share of that, so the breakdown always
+  comes to 100% of what the whole process spent. At `NS_MPI_PROCS=1` the budget
+  is just the wall clock and the remainder is exactly
+  `polychord_overhead_seconds`; above 1 the remainder also absorbs the time
+  ranks sat idle waiting on the sampler, which is why it is labelled
+  "unaccounted (PolyChord sampling + idle)" rather than attributed to PolyChord
+  outright.
+- **Stage labels naming the actual imager** - "wsclean container" or "r2d2
+  container", taken from the summary's `algorithm`.
+
 ## What a real bounded run showed
 
 A single-rank (`NS_MPI_PROCS=1`), 5-dimensional run at the default sampler

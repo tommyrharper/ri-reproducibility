@@ -256,9 +256,16 @@ The numbers come from the `timing` block in each evaluation's `metrics.json`
 and the run-level `profiling` block in that run's `poc-summary.json`.
 
 The same breakdown is available without the CLI: a run's HTML report page has a
-collapsible "Profiling (per-stage timing)" section, shown whenever that run's
-`poc-summary.json` carries a `profiling` block (runs predating the profiler
-instrumentation simply omit the section).
+collapsible "Profiling (where the run's time went)" section, shown whenever that
+run's `poc-summary.json` carries a `profiling` block (runs predating the profiler
+instrumentation simply omit the section). It leads with a stacked bar of where
+the worker-time went and then the same rows as the CLI table, so the report page
+and `profile-nested-sampling-run.py` always agree - both call
+`profiling_breakdown()` in `scripts/lib/nested_sampling/poc_common.py`.
+
+Both views show, per stage: the total, the mean per evaluation, the share of the
+run's worker-time budget, and the evaluation count. Durations are rendered in
+whatever unit carries their digits (`33ms`, `1.44s`, `39m 15s`, `1h 00m 45s`).
 
 See [nested-sampling-profiling.md](nested-sampling-profiling.md) for what each
 field means and for every measured (and rejected) optimisation behind the

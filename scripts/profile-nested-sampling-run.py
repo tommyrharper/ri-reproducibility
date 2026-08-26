@@ -7,6 +7,11 @@ evaluation `timing.*` fields recorded around each pipeline stage) and renders
 it as a human-readable table, so you can see which stage actually dominates
 wall time without guessing.
 
+Every share is a fraction of the run's worker-time budget (wall clock x
+mpi_procs), so the top-level stages plus the unaccounted remainder add up to
+100% of what the whole process spent. The same breakdown - and the same
+numbers - back the Profiling section of the HTML run report.
+
 Usage:
 
   uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC>
@@ -22,24 +27,24 @@ import sys
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_sampling"))
+
+from poc_common import (  # noqa: E402
+    PROFILING_VIEW_NOTE,
+    format_duration,
+    format_share,
+    profiling_breakdown,
+)
+
+LABEL_WIDTH = 42
+COLUMN_WIDTH = 12
+
 
 def load_summary(target: Path) -> dict[str, Any]:
     summary_path = target / "poc-summary.json" if target.is_dir() else target
     if not summary_path.is_file():
         raise SystemExit(f"no poc-summary.json found at {summary_path}")
     return json.loads(summary_path.read_text())
-
-
-def format_seconds(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:8.2f}s"
-
-
-def format_pct(value: float | None, total: float) -> str:
-    if value is None or total <= 0:
-        return ""
-    return f"({100.0 * value / total:5.1f}%)"
 
 
 def print_report(summary: dict[str, Any]) -> None:
@@ -50,45 +55,55 @@ def print_report(summary: dict[str, Any]) -> None:
             "predating profiler instrumentation; re-run the PoC to get one."
         )
 
-    total = profiling["total_wall_seconds"]
-    mpi_procs = int(profiling["mpi_procs"])
-    show_wall_shares = mpi_procs == 1
-    stages = profiling["stage_totals_seconds"]
-    counts = profiling["stage_eval_counts"]
-    n_evals = len(summary.get("evaluations", []))
+    breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
+    mpi_procs = breakdown["mpi_procs"]
+    budget = breakdown["worker_seconds_budget"]
 
     print(f"algorithm:        {summary.get('algorithm')}")
-    print(f"evaluations:      {n_evals}")
+    print(f"evaluations:      {len(summary.get('evaluations', []))}")
     print(f"mpi_procs:        {mpi_procs}")
-    print(f"total_wall:       {format_seconds(total)}")
+    print(f"wall clock:       {format_duration(breakdown['total_wall_seconds'])}")
+    print(f"worker-time:      {format_duration(budget)}  ({mpi_procs} x wall clock)")
     print()
-    total_heading = "wall" if show_wall_shares else "worker-s"
-    print(f"{'stage':<28} {total_heading:>10} {'share':>8}  evals")
-    print("-" * 58)
 
-    def row(label: str, key: str, count_key: str) -> None:
-        value = stages.get(key)
-        share = format_pct(value, total) if show_wall_shares else ""
-        print(f"{label:<28} {format_seconds(value):>10} {share:>8}  {counts.get(count_key, 0)}")
+    header = (
+        f"{'stage':<{LABEL_WIDTH}}"
+        f"{'total':>{COLUMN_WIDTH}}"
+        f"{'per eval':>{COLUMN_WIDTH}}"
+        f"{'share':>{COLUMN_WIDTH}}"
+        f"{'evals':>8}"
+    )
+    rule = "-" * len(header)
+    print(header)
+    print(rule)
 
-    row("simulate (MeqTrees)", "simulate", "simulate_seconds")
-    if stages.get("convert") is not None:
-        row("convert (MS -> .mat)", "convert", "convert_seconds")
-    row("image container (total)", "image_container", "image_container_seconds")
-    if stages.get("image_binary") is not None:
-        row("  of which: binary run", "image_binary", "image_binary_seconds")
-        row("  of which: container overhead", "image_container_overhead", "image_container_overhead_seconds")
-    row("metrics computation", "metrics", "metrics_seconds")
-    print("-" * 58)
-    accounted = profiling.get("accounted_worker_seconds", profiling.get("accounted_seconds"))
-    accounted_share = format_pct(accounted, total) if show_wall_shares else ""
-    print(f"{'accounted (sum above)':<28} {format_seconds(accounted):>10} {accounted_share:>8}")
+    def line(label: str, seconds: float | None, share: float | None, per_eval: float | None = None, evals: str = "") -> None:
+        print(
+            (
+                f"{label:<{LABEL_WIDTH}}"
+                f"{format_duration(seconds):>{COLUMN_WIDTH}}"
+                f"{(format_duration(per_eval) if per_eval is not None else ''):>{COLUMN_WIDTH}}"
+                f"{format_share(share):>{COLUMN_WIDTH}}"
+                f"{evals:>8}"
+            ).rstrip()
+        )
 
-    overhead = profiling["polychord_overhead_seconds"]
-    overhead_share = format_pct(overhead, total) if show_wall_shares else ""
-    print(f"{'PolyChord overhead (unaccounted)':<28} {format_seconds(overhead):>10} {overhead_share:>8}")
+    for row in breakdown["rows"]:
+        label = f"  {row['label']}" if row["is_sub"] else row["label"]
+        line(label, row["seconds"], row["share"], row["per_eval_seconds"], str(row["evals"] or ""))
+
+    print(rule)
+    evals = breakdown["evals"]
+    accounted = breakdown["accounted_seconds"]
+    line(
+        "accounted (sum of stages above)",
+        accounted,
+        breakdown["accounted_share"],
+        accounted / evals if evals else None,
+    )
+    line(breakdown["unaccounted_label"], breakdown["unaccounted_seconds"], breakdown["unaccounted_share"])
     print()
-    print(f"note: {profiling['note']}")
+    print(f"note: {PROFILING_VIEW_NOTE}")
 
 
 def main() -> None:
