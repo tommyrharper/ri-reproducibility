@@ -6,6 +6,8 @@ imaging pipelines - **WSClean** (classical CLEAN-family imager, C++) and
 Apple Silicon, with the goal of eventually benchmarking both against
 their published papers under controlled conditions.
 
+Every command in one place: [`docs/cheatsheet.md`](docs/cheatsheet.md).
+
 ## 1. Scientific purpose
 
 Radio interferometers measure visibilities (Fourier-domain samples of
