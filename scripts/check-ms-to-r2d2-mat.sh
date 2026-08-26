@@ -13,10 +13,6 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ -z "${DOCKER_SOCKET:-}" ]; then
-  DOCKER_SOCKET="/var/run/docker.sock"
-fi
-
 docker run --rm --platform "${PLATFORM}" \
   -v "${REPO_ROOT}:${REPO_ROOT}" \
   -v "${DOCKER_SOCKET}:/var/run/docker.sock" \
