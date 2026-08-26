@@ -84,6 +84,22 @@ not carry:
 - **Stage labels naming the actual imager** - "wsclean container" or "r2d2
   container", taken from the summary's `algorithm`.
 
+### How the report ties those shares back to the wall clock
+
+Worker-seconds do not add up to the run duration on the page header - eight
+ranks spend eight seconds of worker-time per second of wall clock - so the
+report renders the same numbers a second way. Dividing any stage total by
+`mpi_procs` gives what that stage cost in wall clock; those wall-clock figures
+are the report's `wall clock` column (omitted at `mpi_procs == 1`, where it
+would repeat the worker-time column) and they add up to the run's end-to-end
+wall time. `render_profiling()` in `scripts/lib/generate_report.py` spells the
+arithmetic out in one line under the chart -
+`accounted + unaccounted = worker-time / workers = wall clock` - and charts it
+as one lane per worker: each lane spans the run's wall clock and carries the
+same stage proportions, so a single lane reads as the wall clock and the lanes
+stacked together read as the worker-time budget. The lanes are the average
+worker, not per-rank measurements, which the run summary does not record.
+
 ## What a real bounded run showed
 
 A single-rank (`NS_MPI_PROCS=1`), 5-dimensional run at the default sampler

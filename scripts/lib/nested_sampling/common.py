@@ -630,7 +630,10 @@ UNACCOUNTED_LABEL = "unaccounted (PolyChord sampling + idle)"
 PROFILING_VIEW_NOTE = (
     "stage totals are summed worker-seconds across every evaluation; shares are "
     "of the run's worker-time budget (wall clock x mpi_procs), so the top-level "
-    "stages plus the unaccounted remainder come to 100%."
+    "stages plus the unaccounted remainder come to 100%. Dividing a worker-second "
+    "total by mpi_procs gives what that stage cost in wall clock, since the workers "
+    "spend it side by side, and those wall-clock figures add up to the run's "
+    "end-to-end wall time."
 )
 
 

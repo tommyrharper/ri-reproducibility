@@ -103,6 +103,19 @@ def print_report(summary: dict[str, Any]) -> None:
     )
     line(breakdown["unaccounted_label"], breakdown["unaccounted_seconds"], breakdown["unaccounted_share"])
     print()
+    # The same arithmetic the HTML report prints under its chart: worker-seconds
+    # only reach the run's wall clock once they are spread across the workers.
+    terms = [
+        f"{format_duration(accounted)} accounted",
+        f"+ {format_duration(breakdown['unaccounted_seconds'])} unaccounted",
+    ]
+    if mpi_procs != 1:
+        terms.append(f"= {format_duration(budget)} of worker-time")
+        terms.append(f"/ {mpi_procs} workers")
+    wall = (budget / mpi_procs) if budget else 0.0
+    terms.append(f"= {format_duration(wall)} end-to-end wall clock")
+    print(" ".join(terms))
+    print()
     print(f"note: {PROFILING_VIEW_NOTE}")
 
 
