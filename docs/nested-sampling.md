@@ -331,7 +331,14 @@ Each run gets its own page, `reports/nested-sampling-report/<run>.html`,
 plus an `index.html` that lists every run on disk and links into them; each
 run page links back to the index. Rendering a run means reading its FITS
 output, so **run pages that are already up to date are skipped** - a re-run
-only builds pages for new runs. The index is always rebuilt, so it picks up
+only builds pages for new runs.
+
+The plots themselves are PNG files under
+`reports/nested-sampling-report/images/`, named after a hash of what they
+were drawn from, and the pages link to them rather than inlining them. That
+is where almost all of the report's time goes, so rebuilding a page (below)
+redraws nothing that its inputs still match - only deleting the report
+directory forces a full redraw. The index is always rebuilt, so it picks up
 new runs immediately.
 
 Every page carries the version of the report generator that wrote it (the

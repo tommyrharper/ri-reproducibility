@@ -12,10 +12,13 @@
 # Outputs:
 #   reports/nested-sampling-report/index.html   (links to every run)
 #   reports/nested-sampling-report/<run>.html   (one page per run)
+#   reports/nested-sampling-report/images/      (PNGs the pages reference)
 #
 # Each page records the report version that wrote it. Up-to-date pages are
 # skipped; UPGRADE=1 rebuilds the ones an older report version wrote, and
 # FORCE=1 (or a RUN= selection) rebuilds them all. The index is always rebuilt.
+# Rebuilding a page reuses the PNGs under images/, which is most of the cost -
+# delete the whole report directory to force those to be drawn again.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

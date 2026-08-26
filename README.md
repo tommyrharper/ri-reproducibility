@@ -96,15 +96,18 @@ finished run down per stage:
 
 `./ri report` writes `reports/nested-sampling-report/`:
 one page per run - PolyChord log(Z), the searched parameters and metrics
-for every evaluation, the reconstructions rendered inline next to the
-truth, the likelihood plot, and a collapsible per-stage timing table -
-plus an `index.html` linking to them all. Open the index in a browser.
+for every evaluation, the reconstructions rendered next to the truth, the
+likelihood plot, and a collapsible per-stage timing table - plus an
+`index.html` linking to them all and an `images/` directory of the PNGs
+they reference. Open the index in a browser.
 
 Rendering a page means reading that run's FITS output, so pages already
 up to date are skipped and only new runs are built. Each page is stamped
 with the report generator's version; `--upgrade` rebuilds the ones an
 older version wrote, `--force` rebuilds everything, `--run <run>` rebuilds
-one. The report runs inside the r2d2 image (its astropy + matplotlib +
+one. Rebuilding reuses the PNGs already under `images/`, so a design
+change costs page HTML rather than redrawing every evaluation. The report runs
+inside the r2d2 image (its astropy + matplotlib +
 anesthetic), so no host Python environment is needed. Details in
 `docs/nested-sampling.md` ("Run summary and reports").
 

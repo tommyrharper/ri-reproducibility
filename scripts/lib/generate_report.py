@@ -1,13 +1,13 @@
 """
-Builds a self-contained HTML report from the nested-sampling runs under
-results/nested-sampling/*/summary.json - one page per run plus an index.
+Builds an HTML report from the nested-sampling runs under
+results/nested-sampling/*/summary.json - one page per run, an index, and
+an images/ directory of the PNGs those pages reference.
 
 Run via scripts/generate-report.sh, which wraps this in the r2d2 image so it
 can reuse the imager's own astropy + matplotlib + anesthetic rather than
 requiring a host Python environment - same approach as scripts/plot-fits.sh.
 """
 import argparse
-import base64
 import glob
 import hashlib
 import html
@@ -78,14 +78,54 @@ def _image_norm_for_display(data):
     return ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
 
 
-def figure_to_data_uri(fig, **savefig_kw):
+# Images live in files next to the pages rather than inlined as base64 data
+# URIs. Rendering them is where nearly all of the report's time goes, and their
+# inputs (a run's FITS files and chains) never change once a run has finished -
+# so a page rebuilt for a report-code change reuses the PNGs it rendered last
+# time instead of redrawing every one. Files are content-addressed and never
+# deleted; `rm -rf reports/nested-sampling-report` is the way to reclaim space.
+IMAGE_SUBDIR = "images"
+image_dir = None  # set by main(); the self-checks point it at a temp dir
+
+
+def figure_to_png_bytes(fig, **savefig_kw):
     buf = io.BytesIO()
+    # compress_level=1: zlib's default (6) costs roughly double the CPU on these
+    # small rasters for ~10% fewer bytes.
+    savefig_kw.setdefault("pil_kwargs", {"compress_level": 1})
     fig.savefig(buf, format="png", **savefig_kw)
     plt.close(fig)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
 
 
-def render_array_to_data_uri(data, figsize=(4, 4), dpi=130):
+def cached_png(key, render):
+    """URL of the PNG for `key`, calling `render() -> bytes | None` only if absent."""
+    name = hashlib.sha1(key.encode()).hexdigest()[:16] + ".png"
+    path = os.path.join(image_dir, name)
+    if not os.path.exists(path):
+        data = render()
+        if data is None:
+            return None
+        os.makedirs(image_dir, exist_ok=True)
+        # Write-then-rename so an interrupted run can't leave a truncated PNG
+        # that every later run would then happily reuse.
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    return f"{IMAGE_SUBDIR}/{name}"
+
+
+def file_stamp(path):
+    """Identity of a file's contents for cache keys, without reading it."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "missing"
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def render_array_png(data, figsize=(4, 4), dpi=130):
     data = np.squeeze(np.asarray(data, dtype=float))
     if data.ndim != 2:
         return None
@@ -95,11 +135,14 @@ def render_array_to_data_uri(data, figsize=(4, 4), dpi=130):
     ax.set_xticks([])
     ax.set_yticks([])
     fig.tight_layout(pad=0.2)
-    return figure_to_data_uri(fig)
+    return figure_to_png_bytes(fig)
 
 
-def render_fits_to_data_uri(path, figsize=(4, 4), dpi=130):
-    return render_array_to_data_uri(fits.getdata(path), figsize=figsize, dpi=dpi)
+def render_fits_image(path, figsize=(4, 4), dpi=130):
+    return cached_png(
+        f"fits|{path}|{file_stamp(path)}|{figsize}|{dpi}",
+        lambda: render_array_png(fits.getdata(path), figsize=figsize, dpi=dpi),
+    )
 
 
 def synthesize_truth_array(image_path, source_flux_jy):
@@ -236,6 +279,18 @@ def merged_source_run_dirs(summary):
 
 
 def render_likelihood_plot(run_dir, param_names):
+    """URL of the run's corner plot. The anesthetic KDE is the single most
+    expensive thing the report draws, so it goes through the image store too."""
+    chains = sorted(glob.glob(os.path.join(run_dir, "chains", "*")))
+    key = "likelihood|{}|{}|{}".format(
+        run_dir,
+        ",".join(param_names),
+        ",".join(f"{os.path.basename(c)}:{file_stamp(c)}" for c in chains),
+    )
+    return cached_png(key, lambda: _render_likelihood_png(run_dir, param_names))
+
+
+def _render_likelihood_png(run_dir, param_names):
     try:
         from anesthetic_io import load_nested_samples, weight_by_likelihood
     except ImportError:
@@ -256,7 +311,7 @@ def render_likelihood_plot(run_dir, param_names):
             grid = samples.plot_2d(plot_params, kind=kind, **extra)
             fig = grid.iloc[0, 0].figure
             fig.tight_layout()
-            return figure_to_data_uri(fig, bbox_inches="tight")
+            return figure_to_png_bytes(fig, bbox_inches="tight")
         except Exception:
             pass
     return None
@@ -518,7 +573,7 @@ def format_searched_params(params, parameter_space):
 def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
     if not image_path:
         return '<span class="empty">—</span>'
-    recon_uri = render_fits_to_data_uri(image_path, figsize=figsize, dpi=dpi)
+    recon_uri = render_fits_image(image_path, figsize=figsize, dpi=dpi)
     if not recon_uri:
         return '<span class="empty">—</span>'
     return (
@@ -528,11 +583,18 @@ def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
     )
 
 
+def _render_truth_png(image_path, source_flux_jy, figsize, dpi):
+    truth_array = synthesize_truth_array(image_path, source_flux_jy)
+    return None if truth_array is None else render_array_png(truth_array, figsize=figsize, dpi=dpi)
+
+
 def render_shared_truth_image(image_path, source_flux_jy, figsize=(3.2, 3.2), dpi=120):
     if not image_path:
         return ""
-    truth_array = synthesize_truth_array(image_path, source_flux_jy)
-    truth_uri = render_array_to_data_uri(truth_array, figsize=figsize, dpi=dpi) if truth_array is not None else None
+    truth_uri = cached_png(
+        f"truth|{image_path}|{file_stamp(image_path)}|{source_flux_jy}|{figsize}|{dpi}",
+        lambda: _render_truth_png(image_path, source_flux_jy, figsize, dpi),
+    )
     if not truth_uri:
         return ""
     return (
@@ -765,7 +827,7 @@ def render_nested_sampling_run(summary_path):
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
         image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
-        thumb = render_eval_recon(image_path, ev.get("eval_id", "?"), figsize=(2.2, 2.2), dpi=100)
+        thumb = render_eval_recon(image_path, ev.get("eval_id", "?"))
         eval_rows.append(
             "<tr>"
             f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
@@ -1312,6 +1374,8 @@ def main(argv=None):
     if limit is not None and limit < 1:
         raise SystemExit("--limit must be >= 1")
     os.makedirs(out_dir, exist_ok=True)
+    global image_dir
+    image_dir = os.path.join(out_dir, IMAGE_SUBDIR)
 
     # An explicit --run is a deliberate "rebuild this one" request.
     force = args.force or bool(run)
@@ -1454,6 +1518,33 @@ def _self_check_page_status():
     shutil.rmtree(tmp_dir)
 
 
+def _self_check_cached_png():
+    """A second request for the same key reuses the file instead of re-rendering."""
+    global image_dir
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    image_dir = os.path.join(tmp_dir, IMAGE_SUBDIR)
+    calls = []
+
+    def render():
+        calls.append(1)
+        return b"png-bytes"
+
+    url = cached_png("k", render)
+    assert url == f"{IMAGE_SUBDIR}/{hashlib.sha1(b'k').hexdigest()[:16]}.png", url
+    assert cached_png("k", render) == url
+    assert len(calls) == 1, calls
+    assert os.path.exists(os.path.join(tmp_dir, url)), url
+    # A different key renders again, and a render that declines writes nothing.
+    assert cached_png("k2", render) != url
+    assert len(calls) == 2, calls
+    assert cached_png("k3", lambda: None) is None
+    assert sorted(os.listdir(image_dir)) == sorted(
+        f"{hashlib.sha1(k).hexdigest()[:16]}.png" for k in (b"k", b"k2")
+    ), os.listdir(image_dir)
+    shutil.rmtree(tmp_dir)
+    image_dir = None
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1464,6 +1555,7 @@ if __name__ == "__main__":
     if os.environ.get("GENERATE_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
+        _self_check_cached_png()
         _self_check_profiling()
         _self_check_page_status()
         print("generate_report self-check passed")
