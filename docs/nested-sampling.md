@@ -356,7 +356,12 @@ it picks up new runs immediately.
 
 Run pages are built in parallel, and each run splits into two concurrent
 tasks - the anesthetic corner plot and the rest of the page - so the pool has
-twice as many pages to overlap. The container is given a single BLAS thread
+twice as many pages to overlap. The two kinds of task go into two pools, forked
+either side of the astropy import: the corner plots - the critical path - start
+first, and the eval-raster workers forked afterwards inherit astropy rather than
+each importing it again while the plots want the CPU. That is ~11% less CPU on
+a five-run cold build for the same output.
+The container is given a single BLAS thread
 (the work is matplotlib rasterisation, not linear algebra, and multi-threaded
 BLAS only oversubscribes the CPU). Override with `R2D2_OMP_THREADS=`. It also
 runs with `--network none`: the report only reads the repo and writes
