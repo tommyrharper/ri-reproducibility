@@ -42,6 +42,10 @@ with "it reproduced the paper."
 - Docker Desktop (this environment was built/verified against Docker
   20.10.17 client / Docker Desktop's `desktop-linux` context on macOS).
 - `git`.
+- [`uv`](https://docs.astral.sh/uv/). The scripts read their shared
+  defaults from `defaults.toml`, and `uv` supplies the Python that parses
+  it; it also runs the host-side analysis scripts (`make profile`, `make
+  gui`, `make merge`).
 - Nothing else. See "15. Verifying no dependencies were installed on
   the host" below.
 
@@ -288,7 +292,10 @@ PyTorch, finufft, ...) is installed inside the Docker build stages only
 the host: `which wsclean`, `python3 -c "import torch"` (using your
 system Python, not a venv you made for something else) should both fail
 outside a container built from this repo. The only host-side tools this
-project's own instructions require are Docker and Git.
+project's own instructions require are Docker, Git and `uv` - and `uv`
+installs nothing into the system Python: the scripts invoke it as
+`uv run --no-project`, which uses a self-contained interpreter under
+`uv`'s own cache.
 
 ## 16. Docker Desktop on macOS - limitations for benchmarking
 

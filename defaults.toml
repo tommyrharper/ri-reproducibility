@@ -1,0 +1,35 @@
+# Default values for the scripts under scripts/.
+#
+# This file is the single source of truth for every runtime default those
+# scripts share. Change a value here and every script picks it up.
+#
+# Each key is the name of the environment variable it sets, and every one
+# stays overridable from the environment: a value here is only applied when
+# the variable is unset or empty, so
+#
+#     NS_SEED=7 make nested-sampling-poc
+#
+# still runs with seed 7. `{REPO_ROOT}` expands to the repository root.
+#
+# Loaded by scripts/lib/defaults.sh, which the scripts source. Upstream
+# software revisions are pinned in versions.env, not here.
+
+# Container images built by scripts/build.sh.
+R2D2_IMAGE = "ri-reproducibility/r2d2:cpu"
+WSCLEAN_IMAGE = "ri-reproducibility/wsclean:v3.7"
+MEQTREES_IMAGE = "ri-reproducibility/meqtrees:kern-10"
+POLYCHORD_IMAGE = "ri-reproducibility/polychord:lite"
+
+# Architecture the images are built for and run on.
+DOCKER_DEFAULT_PLATFORM = "linux/arm64"
+
+CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
+RESULTS_DIR = "{REPO_ROOT}/results"
+
+# PolyChord sampler settings for the nested sampling proof of concept.
+# See docs/nested-sampling.md for what each one does.
+NS_NLIVE = 8
+NS_NUM_REPEATS = 2
+NS_MAX_NDEAD = 12
+NS_SEED = 41
+NS_METRIC = "off_source_rms_jy"

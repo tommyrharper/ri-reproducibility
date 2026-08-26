@@ -1,32 +1,59 @@
-# Single source of truth for the runtime defaults shared by scripts/*.sh.
+# Loads the shared runtime defaults from defaults.toml at the repository root.
 #
-# Every value here stays overridable from the environment: `:=` only assigns
-# when the variable is unset or empty, so `NS_SEED=7 make nested-sampling-poc`
-# still runs with seed 7.
+# defaults.toml is the file to edit; this one only reads it. Every key there
+# names an environment variable and is applied only when that variable is
+# unset or empty, so overrides from the environment always win.
 #
-# Source this after REPO_ROOT is set (CHECKPOINTS_DIR and RESULTS_DIR are
-# relative to it). Values that genuinely differ per script - OUTPUT_DIR, for
-# instance - stay in that script.
+# Source this after REPO_ROOT is set - it is needed both to find the file and
+# to expand the `{REPO_ROOT}` placeholder in it.
 #
-# Upstream software revisions are pinned in versions.env, not here.
+# uv is used rather than the system python3 because reading TOML needs
+# tomllib, which is stdlib from 3.11 onwards and the system python3 is older
+# on some hosts. uv is already required to run the host-side scripts (see the
+# Makefile), and `--no-project` keeps this off the project venv, so it costs
+# ~30ms and installs nothing.
 
-# The one case where the internal name differs from the environment variable:
+if ! command -v uv >/dev/null 2>&1; then
+  echo "defaults.sh: uv is required to read defaults.toml - see README.md" >&2
+  exit 1
+fi
+
+# Assigned before being eval'd rather than `eval "$(...)"` directly: eval
+# succeeds on empty input, which would swallow a missing or malformed
+# defaults.toml and leave every default unset.
+if ! _ri_defaults="$(
+  REPO_ROOT="${REPO_ROOT}" uv run --no-project --python ">=3.11" python - <<'PYEOF'
+import os
+import shlex
+import sys
+import tomllib
+
+repo_root = os.environ["REPO_ROOT"]
+path = os.path.join(repo_root, "defaults.toml")
+
+with open(path, "rb") as handle:
+    defaults = tomllib.load(handle)
+
+for key, value in defaults.items():
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        sys.exit(f"{path}: {key} must be a string or number, got {type(value).__name__}")
+    # Environment wins: only fill in variables that are unset or empty.
+    if os.environ.get(key):
+        continue
+    print(f"export {key}={shlex.quote(str(value).replace('{REPO_ROOT}', repo_root))}")
+PYEOF
+)"; then
+  echo "defaults.sh: could not load ${REPO_ROOT}/defaults.toml" >&2
+  exit 1
+fi
+
+eval "${_ri_defaults}"
+unset _ri_defaults
+
 # DOCKER_DEFAULT_PLATFORM is what Docker itself reads and what .env.example
-# documents, PLATFORM is what the scripts pass to `--platform`.
-PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/arm64}"
+# documents; PLATFORM is what the scripts pass to `--platform`.
+PLATFORM="${DOCKER_DEFAULT_PLATFORM}"
 
-: "${R2D2_IMAGE:=ri-reproducibility/r2d2:cpu}"
-: "${WSCLEAN_IMAGE:=ri-reproducibility/wsclean:v3.7}"
-: "${MEQTREES_IMAGE:=ri-reproducibility/meqtrees:kern-10}"
-: "${POLYCHORD_IMAGE:=ri-reproducibility/polychord:lite}"
-
-: "${CHECKPOINTS_DIR:=${REPO_ROOT}/checkpoints}"
-: "${RESULTS_DIR:=${REPO_ROOT}/results}"
-
+# Generated per run rather than configured, so it stays here and not in
+# defaults.toml.
 : "${RUN_ID:=$(date -u +%Y%m%dT%H%M%SZ)}"
-
-: "${NS_NLIVE:=8}"
-: "${NS_NUM_REPEATS:=2}"
-: "${NS_MAX_NDEAD:=12}"
-: "${NS_SEED:=41}"
-: "${NS_METRIC:=off_source_rms_jy}"
