@@ -769,7 +769,7 @@ _SIMULATE_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
 
 
 class FifoWorker:
-    """A `simulate_point_source_ms.py --serve` worker the shell already started.
+    """A `--serve --fifo` worker the run script already started.
 
     Same `.stdin`/`.stdout`/`.terminate()` surface as the `subprocess.Popen`
     below, over the FIFO pair the worker is serving on. Closing stdin is what
@@ -786,19 +786,20 @@ class FifoWorker:
         self.stdin.close()
 
 
-def _connect_shell_started_worker() -> FifoWorker | None:
+def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
     """Attach to this rank's pre-warmed worker, or None if there is not one.
 
-    A rank-started worker needs ~0.3s before it can answer - interpreter, Timba,
-    meqserver, the first TDL compile and the first predict - and PolyChord asks
-    every rank for a live point at once, so all of it used to land on the wall
-    clock in front of evaluation one (~0.33s against a ~0.05s steady state).
-    run-nested-sampling.sh makes one warm worker per rank the meqtrees
-    container's own startup command instead, and this connects to it. Falling
-    back to a rank-started worker is what happens when there is no pool - the
-    R2D2 run script, or an OUTPUT_DIR outside the bind mount.
+    A rank-started worker is not ready to answer for a while - interpreter,
+    Timba, meqserver and the first TDL compile for simulate, ~1.3s of `import
+    torch` and the R2D2 modules for imaging - and PolyChord asks every rank for
+    a live point at once, so all of it used to land on the wall clock in front
+    of evaluation one. The run scripts make one warm worker per rank the
+    sidecar's own startup command instead, and this connects to it. Falling back
+    to a rank-started worker is what happens when there is no pool - an
+    OUTPUT_DIR outside the bind mount, so the FIFOs are not visible in both
+    containers.
     """
-    fifo_dir = os.environ.get("NS_SIMULATE_FIFO_DIR")
+    fifo_dir = os.environ.get(fifo_dir_var)
     if not fifo_dir:
         return None
     base = Path(fifo_dir) / str(mpi_rank())
@@ -829,7 +830,7 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | Fi
     compile, RIME predict and noise fill.
     """
     if meqtrees_image not in _SIMULATE_WORKERS:
-        worker = _connect_shell_started_worker()
+        worker = _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR")
         if worker is None:
             repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
             worker = subprocess.Popen(
@@ -845,7 +846,12 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | Fi
     return _SIMULATE_WORKERS[meqtrees_image]
 
 
-_R2D2_WORKERS: dict[str, subprocess.Popen] = {}
+_R2D2_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
+
+
+def r2d2_serve_path(repo_root: Path) -> str:
+    """The imaging worker script, read live off the repo bind mount."""
+    return str(repo_root / "scripts" / "lib" / "nested_sampling" / "r2d2_serve.py")
 
 
 def r2d2_checkpoint_mount(checkpoints_dir: str) -> list[str]:
@@ -859,7 +865,7 @@ def r2d2_checkpoint_mount(checkpoints_dir: str) -> list[str]:
     return ["-v", f"{checkpoints_dir}:/checkpoints:ro"]
 
 
-def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> subprocess.Popen:
+def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> "subprocess.Popen | FifoWorker":
     """This rank's long-lived `r2d2_serve.py` process inside the R2D2 sidecar.
 
     A per-evaluation `docker run` of this image cost ~2.4s warm on this host and
@@ -868,25 +874,29 @@ def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> subproc
     worker per rank pays both once.
 
     The thread limits go on the `docker exec`, not the container, because torch
-    and finufft read them at import time and each rank gets its own share.
+    and finufft read them at import time and each rank gets its own share. The
+    pre-warmed variant takes them from the container instead - every rank gets
+    the same value, so there is nothing per-rank to lose.
     """
     if r2d2_image not in _R2D2_WORKERS:
-        repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
-        container = sidecar_container(r2d2_image, platform, r2d2_checkpoint_mount(checkpoints_dir))
-        worker = subprocess.Popen(
-            [
-                "docker", "exec", "--interactive",
-                *r2d2_docker_thread_env_flags(),
-                container,
-                "python3",
-                # Read live off the repo bind mount: the R2D2 image bakes in no
-                # copy of this repo's scripts, so there is nothing to rebuild.
-                str(repo_root / "scripts" / "lib" / "nested_sampling" / "r2d2_serve.py"),
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
+        worker = _connect_shell_started_worker("NS_R2D2_FIFO_DIR")
+        if worker is None:
+            repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
+            container = sidecar_container(r2d2_image, platform, r2d2_checkpoint_mount(checkpoints_dir))
+            worker = subprocess.Popen(
+                [
+                    "docker", "exec", "--interactive",
+                    *r2d2_docker_thread_env_flags(),
+                    container,
+                    "python3",
+                    # Read live off the repo bind mount: the R2D2 image bakes in
+                    # no copy of this repo's scripts, so nothing to rebuild.
+                    r2d2_serve_path(repo_root),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
         # The container itself is torn down by sidecar_container()'s own atexit
         # hook, which is registered first and so runs last.
         atexit.register(worker.terminate)
