@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
 import re
+import shlex
 import subprocess
+import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,6 +135,168 @@ def stable_seed(global_seed: int, key: str) -> int:
     return (global_seed + int(key[:8], 16)) % (2**31 - 1)
 
 
+# Pre-started by scripts/lib/start-sidecars.sh, one container per image shared by
+# every rank; anything missing here is started by this rank on first use.
+_SIDECAR_CONTAINERS: dict[str, str] = json.loads(os.environ.get("NS_SIDECARS", "{}"))
+_IMAGE_ENTRYPOINTS: dict[str, list[str]] = {}
+
+
+def sidecar_container(image: str, platform: str) -> str:
+    """Name of the run's long-lived container for `image`.
+
+    A per-evaluation `docker run` costs ~0.40s of create/start/teardown on this
+    host regardless of image, mounts or platform; `docker exec` into an
+    already-running container costs ~0.03s. Every sidecar here is short work
+    against bind-mounted paths, so one reused container removes ~0.75s of the
+    ~2.3s per evaluation.
+
+    The whole repo is mounted at its host path (as the PolyChord container
+    already does), so callers pass absolute paths where they previously passed
+    `/work/...` against a per-evaluation `-v {eval_dir}:/work`.
+
+    One container per image is enough for the whole run - separate `docker exec`
+    processes are already isolated from each other - so the run script starts
+    them before the PolyChord container and hands them over in `NS_SIDECARS`.
+    Starting them per rank instead meant 16 concurrent `docker run`s on the
+    default 8 ranks, which cost 1.3s against 0.36s for a single one, all of it
+    in front of the first evaluation.
+    """
+    if image not in _SIDECAR_CONTAINERS:
+        repo_root = os.environ.get("REPO_ROOT", os.getcwd())
+        name = f"ri-ns-sidecar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        subprocess.run(
+            [
+                "docker", "run", "--detach", "--rm", "--name", name,
+                # No sidecar needs networking, and docker's default bridge setup
+                # costs ~0.2s per container under rootless Docker. "none" still
+                # gives a loopback interface for meqserver.
+                "--network", "none",
+                # Everything the simulate builds - the working MS and the cached
+                # makems skeletons - lives in /dev/shm, and docker's 64MB default
+                # is only ~3x the largest cache this parameter space fills.
+                "--shm-size", "512m",
+                "--platform", platform,
+                "-v", f"{repo_root}:{repo_root}",
+                "--entrypoint", "sleep", image, "infinity",
+            ],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        # ponytail: covers normal exit and SystemExit; a SIGKILLed rank leaks one
+        # sleeping container, cleaned up with
+        # `docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
+        atexit.register(
+            subprocess.run,
+            ["docker", "rm", "--force", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        _SIDECAR_CONTAINERS[image] = name
+    return _SIDECAR_CONTAINERS[image]
+
+
+def sidecar_exec(
+    image: str,
+    platform: str,
+    workdir: Path,
+    prefix: list[str] | None = None,
+    interactive: bool = False,
+) -> list[str]:
+    """`docker exec` argv prefix equivalent to `docker run <image>` in `workdir`.
+
+    `docker exec` ignores the image ENTRYPOINT, so read it back from the image
+    rather than restating the Dockerfile here. `prefix` runs ahead of the
+    entrypoint, the way `docker run --entrypoint` would (e.g. GNU `time`).
+
+    Each evaluation gets its own working directory so anything a sidecar writes
+    relative to the cwd stays per-evaluation, as it did when every evaluation
+    had its own container.
+    """
+    return [
+        "docker", "exec",
+        *(["--interactive"] if interactive else []),
+        "--workdir", str(workdir),
+        sidecar_container(image, platform),
+        *sidecar_command(image, prefix),
+    ]
+
+
+def sidecar_command(image: str, prefix: list[str] | None = None) -> list[str]:
+    """The in-container argv `docker run <image>` would execute, without arguments."""
+    if image not in _IMAGE_ENTRYPOINTS:
+        inspected = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", image],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        entrypoint = json.loads(inspected)
+        if not entrypoint:
+            raise SystemExit(f"FATAL: {image} has no ENTRYPOINT to run inside a sidecar")
+        _IMAGE_ENTRYPOINTS[image] = entrypoint
+    return [*(prefix or []), *_IMAGE_ENTRYPOINTS[image]]
+
+
+_SIDECAR_SHELLS: dict[str, subprocess.Popen] = {}
+
+
+def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
+    """This rank's long-lived `sh` inside the sidecar, one `docker exec` per run.
+
+    `docker exec` costs ~0.033s on this host - a third of the `wsclean` binary's
+    own ~0.107s - and every evaluation paid it again. One `sh` reading command
+    lines from its stdin pays it once per rank; a request costs a pipe write and
+    a `read`.
+    """
+    if image not in _SIDECAR_SHELLS:
+        shell = subprocess.Popen(
+            # Not sidecar_exec(): this one deliberately bypasses the image
+            # ENTRYPOINT, and each request cd's to its own evaluation directory.
+            ["docker", "exec", "--interactive", sidecar_container(image, platform), "sh"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        # The container itself is torn down by sidecar_container()'s own atexit
+        # hook, which is registered first and so runs last.
+        atexit.register(shell.terminate)
+        _SIDECAR_SHELLS[image] = shell
+    return _SIDECAR_SHELLS[image]
+
+
+def sidecar_run(
+    image: str,
+    platform: str,
+    workdir: Path,
+    cmd: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> DockerRunResult:
+    """Run `cmd` in this rank's sidecar, same shape as run_docker_monitored().
+
+    The command's own output goes to the log files, so only the exit code `echo`
+    comes back down the shell's stdout and nothing a sidecar prints can be
+    mistaken for a reply. A shell that dies without answering is dropped from
+    the cache so the next evaluation starts a fresh one.
+    """
+    shell = sidecar_shell(image, platform)
+    request = (
+        f"cd {shlex.quote(str(workdir))} && {shlex.join(cmd)}"
+        f" >{shlex.quote(str(stdout_path))} 2>{shlex.quote(str(stderr_path))}; echo $?\n"
+    )
+    started = time.perf_counter()
+    shell.stdin.write(request)
+    shell.stdin.flush()
+    reply = shell.stdout.readline()
+    wall_seconds = time.perf_counter() - started
+    if not reply:
+        _SIDECAR_SHELLS.pop(image, None)
+        stderr_path.write_text(f"FATAL: {image} sidecar shell exited without a reply\n")
+        return DockerRunResult(returncode=1, wall_seconds=wall_seconds, peak_memory_bytes=0)
+    return DockerRunResult(returncode=int(reply), wall_seconds=wall_seconds, peak_memory_bytes=0)
+
+
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
     with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
         subprocess.run(cmd, stdout=stdout, stderr=stderr, check=True)
@@ -181,10 +347,59 @@ def run_docker_monitored(cmd: list[str], container_name: str, stdout_path: Path,
     return DockerRunResult(returncode=returncode, wall_seconds=wall, peak_memory_bytes=peak_memory)
 
 
-def load_fits_2d(path: Path) -> tuple[np.ndarray, Any]:
-    from astropy.io import fits
+def _fits_card_value(field: str) -> Any:
+    """The value half of a FITS card, comment stripped.
 
-    data, header = fits.getdata(path, header=True)
+    A quoted string may contain the `/` that otherwise starts the comment
+    (`BUNIT = 'JY/BEAM '`), so quotes are closed before the comment is cut.
+    """
+    field = field.lstrip()
+    if field.startswith("'"):
+        end = field.index("'", 1)
+        return field[1:end].strip()
+    value = field.split("/")[0].strip()
+    return value == "T" if value in ("T", "F") else float(value)
+
+
+def load_fits_2d(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
+    """Read the primary HDU of a WSClean/R2D2 image as a 2-D float64 array.
+
+    `from astropy.io import fits` costs ~0.45s when the 8 default ranks import
+    it at once - more than every other per-rank startup put together, and more
+    than 10% of the run's wall clock - to read a single-HDU uncompressed float
+    image. Everything needed here is 30 lines of the FITS standard: 2880-byte
+    header blocks of 80-column cards, then big-endian samples in C order.
+    Anything outside that (a scaled or integer image, an extension) raises
+    rather than being guessed at.
+    """
+    header: dict[str, Any] = {}
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(2880)
+            if len(block) < 2880:
+                raise ValueError(f"{path}: FITS header ended mid-block")
+            for start in range(0, 2880, 80):
+                card = block[start:start + 80].decode("ascii")
+                key = card[:8].strip()
+                if key == "END":
+                    block = None
+                    break
+                if card[8:10] != "= ":
+                    continue  # COMMENT, HISTORY and blank cards carry no value
+                header[key] = _fits_card_value(card[10:])
+            if block is None:
+                break
+        bitpix = int(header["BITPIX"])
+        if bitpix not in (-32, -64):
+            raise ValueError(f"{path}: BITPIX {bitpix} is not a float image")
+        if float(header.get("BSCALE", 1.0)) != 1.0 or float(header.get("BZERO", 0.0)) != 0.0:
+            raise ValueError(f"{path}: scaled FITS data (BSCALE/BZERO) is not supported")
+        shape = [int(header[f"NAXIS{axis}"]) for axis in range(int(header["NAXIS"]), 0, -1)]
+        count = int(np.prod(shape))
+        raw = handle.read(count * (abs(bitpix) // 8))
+    if len(raw) != count * (abs(bitpix) // 8):
+        raise ValueError(f"{path}: FITS data block is short")
+    data = np.frombuffer(raw, dtype=">f4" if bitpix == -32 else ">f8").reshape(shape)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
     if image.ndim != 2:
         raise ValueError(f"{path} is not 2-D after squeezing; shape={image.shape}")
@@ -413,6 +628,12 @@ def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float
 
 
 def mpi_rank() -> int:
+    # The launcher's environment first: `import mpi4py` initialises MPI, which
+    # costs 0.24s per rank when eight of them do it at once, and prewarm() asks
+    # for the rank before anything else here has touched MPI.
+    launcher_rank = os.environ.get("OMPI_COMM_WORLD_RANK")
+    if launcher_rank is not None:
+        return int(launcher_rank)
     try:
         from mpi4py import MPI
 
@@ -433,6 +654,121 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     return record
 
 
+_SIMULATE_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
+
+
+class FifoWorker:
+    """A `simulate_point_source_ms.py --serve` worker the shell already started.
+
+    Same `.stdin`/`.stdout`/`.terminate()` surface as the `subprocess.Popen`
+    below, over the FIFO pair the worker is serving on. Closing stdin is what
+    ends it: the worker's request loop sees EOF and exits.
+    """
+
+    def __init__(self, write_fd: int, reply_path: Path) -> None:
+        self.stdin = os.fdopen(write_fd, "w")
+        # Opening a FIFO blocks until the other end is open, so this must be the
+        # same order serve() uses - request pipe first, reply pipe second.
+        self.stdout = reply_path.open("r")
+
+    def terminate(self) -> None:
+        self.stdin.close()
+
+
+def _connect_shell_started_worker() -> FifoWorker | None:
+    """Attach to this rank's pre-warmed worker, or None if there is not one.
+
+    A rank-started worker needs ~0.3s before it can answer - interpreter, Timba,
+    meqserver, the first TDL compile and the first predict - and PolyChord asks
+    every rank for a live point at once, so all of it used to land on the wall
+    clock in front of evaluation one (~0.33s against a ~0.05s steady state).
+    run-nested-sampling-poc.sh makes one warm worker per rank the meqtrees
+    container's own startup command instead, and this connects to it. Falling
+    back to a rank-started worker is what happens when there is no pool - the
+    R2D2 PoC, or an OUTPUT_DIR outside the bind mount.
+    """
+    fifo_dir = os.environ.get("NS_SIMULATE_FIFO_DIR")
+    if not fifo_dir:
+        return None
+    base = Path(fifo_dir) / str(mpi_rank())
+    # O_NONBLOCK is how a FIFO write-open says "no reader yet" (ENXIO) instead of
+    # blocking forever, which is what a worker that never started would do. The
+    # deadline is generous because it is only ever reached when something is
+    # broken, and the fallback below is correct, just slower.
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(0.002)
+            continue
+        os.set_blocking(write_fd, True)
+        return FifoWorker(write_fd, Path(f"{base}.out"))
+
+
+def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | FifoWorker:
+    """This rank's long-lived `simulate_point_source_ms.py --serve` process.
+
+    Even inside a reused sidecar container, a per-evaluation `docker exec` of the
+    simulate script paid ~0.45s of the ~0.7s it took: the Python interpreter,
+    numpy/casacore and Timba imports, starting a meqserver and reaping it again.
+    One worker per rank keeps all of that warm and leaves only the per-evaluation
+    compile, RIME predict and noise fill.
+    """
+    if meqtrees_image not in _SIMULATE_WORKERS:
+        worker = _connect_shell_started_worker()
+        if worker is None:
+            repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
+            worker = subprocess.Popen(
+                [*sidecar_exec(meqtrees_image, platform, repo_root, interactive=True), "--serve"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+        # The container itself is torn down by sidecar_container()'s own atexit
+        # hook, which is registered first and so runs last.
+        atexit.register(worker.terminate)
+        _SIMULATE_WORKERS[meqtrees_image] = worker
+    return _SIMULATE_WORKERS[meqtrees_image]
+
+
+def prewarm(meqtrees_image: str, wsclean_image: str, platform: str) -> Callable[[], None]:
+    """Start this rank's sidecar attachments concurrently; returns a joiner.
+
+    The first evaluation on a rank cost ~0.7s that later ones did not, and every
+    rank paid it at the same moment, so all of it landed on the wall clock in
+    front of evaluation one: the simulate worker's Python/Timba/meqserver
+    startup, two `docker inspect`s for the image entrypoints and the wsclean
+    shell's `docker exec` - one after the other. Here they run in threads, so
+    the rank pays the slowest instead of the sum, and the caller can overlap
+    them with PolyChord's own startup by joining late.
+
+    Nothing may touch a sidecar between this call and the returned joiner: the
+    caches these threads fill are plain dicts with no lock.
+    """
+    def warm_wsclean() -> None:
+        sidecar_command(wsclean_image)
+        sidecar_shell(wsclean_image, platform)
+
+    def warm_simulate() -> None:
+        simulate_worker(meqtrees_image, platform)
+
+    threads = [
+        threading.Thread(target=target, daemon=True)
+        for target in (warm_simulate, warm_wsclean)
+    ]
+    for thread in threads:
+        thread.start()
+
+    def join() -> None:
+        for thread in threads:
+            thread.join()
+
+    return join
+
+
 def simulate_measurement_set(
     params: dict[str, Any],
     eval_dir: Path,
@@ -444,18 +780,10 @@ def simulate_measurement_set(
     sim_stdout = eval_dir / "simulate.stdout.log"
     sim_stderr = eval_dir / "simulate.stderr.log"
     sim_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "--platform",
-        platform,
-        "-v",
-        f"{eval_dir}:/work",
-        meqtrees_image,
         "--output-ms",
-        "/work/sim.ms",
+        str(ms_path),
         "--metadata-json",
-        "/work/simulation.json",
+        str(eval_dir / "simulation.json"),
         "--vla-config",
         params["vla_config"],
         "--observation-minutes",
@@ -477,10 +805,20 @@ def simulate_measurement_set(
         "--seed",
         str(params["noise_seed"]),
     ]
-    try:
-        run_checked(sim_cmd, sim_stdout, sim_stderr)
-    except subprocess.CalledProcessError as exc:
-        return ms_path, sim_cmd, exc
+    worker = simulate_worker(meqtrees_image, platform)
+    request = {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)}
+    worker.stdin.write(json.dumps(request) + "\n")
+    worker.stdin.flush()
+    reply = worker.stdout.readline()
+    if not reply:
+        # The worker died mid-request; drop it so the next evaluation gets a
+        # fresh one instead of every later evaluation inheriting the corpse.
+        _SIMULATE_WORKERS.pop(meqtrees_image, None)
+        sim_stderr.write_text("FATAL: simulate worker exited without a reply\n")
+        return ms_path, sim_cmd, subprocess.CalledProcessError(1, sim_cmd)
+    returncode = json.loads(reply)["returncode"]
+    if returncode != 0:
+        return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
 
 
@@ -524,6 +862,36 @@ def self_check_r2d2_thread_env() -> None:
             os.environ.pop("R2D2_OMP_THREADS", None)
         else:
             os.environ["R2D2_OMP_THREADS"] = saved
+
+
+def self_check_fits_reader() -> None:
+    """load_fits_2d() against astropy on a WSClean-shaped image.
+
+    astropy is still in the polychord image; it is just not imported on the hot
+    path. The trap this guards is card parsing, not the data block: a quoted
+    value may contain the `/` that starts a comment (`BUNIT = 'JY/BEAM '`).
+    """
+    import tempfile
+
+    from astropy.io import fits
+
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((1, 1, 8, 6)).astype(np.float32)
+    hdu = fits.PrimaryHDU(data)
+    hdu.header["BUNIT"] = ("JY/BEAM", "Units are in Jansky per beam")
+    hdu.header["CRPIX1"] = 4.0
+    hdu.header["CRPIX2"] = 5.0
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "check.fits"
+        hdu.writeto(path)
+        image, header = load_fits_2d(path)
+        expected, expected_header = fits.getdata(path, header=True)
+    assert image.shape == (8, 6), image.shape
+    assert np.array_equal(image, np.squeeze(np.asarray(expected, dtype=np.float64)))
+    assert header["BUNIT"] == "JY/BEAM", header["BUNIT"]
+    assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
+    assert header["SIMPLE"] is True
+    assert int(header["NAXIS"]) == int(expected_header["NAXIS"])
 
 
 def self_check_metric_resolution() -> None:

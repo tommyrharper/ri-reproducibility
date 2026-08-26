@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import time
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,13 +24,16 @@ from poc_common import (
     load_evaluations_from_dir,
     mpi_rank,
     params_key,
+    prewarm,
     prior_vector,
     read_gnu_time_peak_memory,
     read_gnu_time_wall_seconds,
     resolve_metric,
-    run_docker_monitored,
+    self_check_fits_reader,
     self_check_metric_resolution,
     self_check_profiling,
+    sidecar_command,
+    sidecar_run,
     simulate_measurement_set,
     stable_seed,
     summarize_profiling,
@@ -78,31 +80,15 @@ def evaluate(
 
     wsclean_dir = eval_dir / "wsclean"
     wsclean_dir.mkdir()
-    container_name = f"ri-ns-wsclean-{uuid.uuid4().hex[:12]}"
     wsclean_stdout = eval_dir / "wsclean.stdout.log"
     wsclean_stderr = eval_dir / "wsclean.stderr.log"
     wsclean_time = wsclean_dir / "time.txt"
     wsclean_cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "--name",
-        container_name,
-        "--platform",
-        args.platform,
-        "-v",
-        f"{eval_dir}:/work",
-        "--entrypoint",
-        "/usr/bin/time",
-        args.wsclean_image,
-        "-v",
-        "-o",
-        "/work/wsclean/time.txt",
-        "wsclean",
+        *sidecar_command(args.wsclean_image, prefix=["/usr/bin/time", "-v", "-o", str(wsclean_time)]),
         "-name",
-        "/work/wsclean/recon",
+        str(wsclean_dir / "recon"),
         "-temp-dir",
-        "/work/wsclean",
+        str(wsclean_dir),
         "-size",
         "128",
         "128",
@@ -121,10 +107,13 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
-        "/work/sim.ms",
+        str(ms_path),
     ]
-    run_result = run_docker_monitored(wsclean_cmd, container_name, wsclean_stdout, wsclean_stderr)
-    peak_memory_bytes = max(run_result.peak_memory_bytes, read_gnu_time_peak_memory(wsclean_time))
+    # No `docker stats` polling loop here: GNU `time -v` inside the container
+    # reports an exact peak RSS, where the 0.2s-interval stats sampler both
+    # missed short peaks and delayed noticing the process had exited.
+    run_result = sidecar_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
+    peak_memory_bytes = read_gnu_time_peak_memory(wsclean_time)
     image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
@@ -206,8 +195,9 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_run_docker = globals()["run_docker_monitored"]
+    original_sidecar_run = globals()["sidecar_run"]
     original_simulate = globals()["simulate_measurement_set"]
+    original_sidecar_command = globals()["sidecar_command"]
 
     def failing_simulate(
         params: dict[str, Any],
@@ -219,6 +209,7 @@ def self_check_failure_record_persistence() -> None:
         return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
 
     try:
+        globals()["sidecar_command"] = lambda image, prefix=None: ["stub-wsclean"]
         globals()["simulate_measurement_set"] = failing_simulate
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -239,8 +230,10 @@ def self_check_failure_record_persistence() -> None:
             return eval_dir / "sim.ms", ["simulate"], None
 
         def successful_wsclean(
+            image: str,
+            platform: str,
+            workdir: Path,
             cmd: list[str],
-            container_name: str,
             stdout_path: Path,
             stderr_path: Path,
         ) -> argparse.Namespace:
@@ -250,7 +243,7 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["run_docker_monitored"] = successful_wsclean
+        globals()["sidecar_run"] = successful_wsclean
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -263,15 +256,21 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["run_docker_monitored"] = original_run_docker
+        globals()["sidecar_run"] = original_sidecar_run
         globals()["simulate_measurement_set"] = original_simulate
+        globals()["sidecar_command"] = original_sidecar_command
 
 
 def main() -> None:
+    args = parse_args()
+    # Before `import pypolychord`, so the rank's sidecar attachments come up
+    # while the sampler is still loading. Joined just below, right before the
+    # first evaluation can ask for one.
+    warm = prewarm(args.meqtrees_image, args.wsclean_image, args.platform)
+
     import pypolychord
     from pypolychord.settings import PolyChordSettings
 
-    args = parse_args()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +314,7 @@ def main() -> None:
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    warm()
     run_start = time.monotonic()
     pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start
@@ -354,6 +354,7 @@ def main() -> None:
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_WSCLEAN_POC_SELF_CHECK") == "1":
         self_check_metric_resolution()
+        self_check_fits_reader()
         self_check_profiling()
         self_check_failure_record_persistence()
         print("metric resolution self-check passed")
