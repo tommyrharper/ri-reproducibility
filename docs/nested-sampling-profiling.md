@@ -985,9 +985,10 @@ per-rank count. Sweeping `R2D2_OMP_THREADS` at 8 ranks on this 20-CPU host:
 1 thread 7.7s, 2 threads (the `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
 threads 24.2s - 32 threads over 20 cores is already most of the way back to the
 old behaviour. The default divides the host among the ranks, which is the right
-shape; do not raise it above it. Whether 1 thread beats 2 once real checkpoints
-make the 25 UNet forward passes run is untested, and is the one part of this
-that checkpoint-less timing cannot answer.
+shape; do not raise it above it. The 1-thread column of that sweep is
+misleading, though - most of what it was measuring was OpenMP spin-waiting, not
+the thread count; see "The imaging workers' OpenMP threads sleep between
+requests" below.
 
 ### The R2D2 PoC warms its two workers before the sampler starts
 
@@ -1256,6 +1257,70 @@ operators and all failed:
 - The reason all of them disappoint is the same one Lanczos fixes: the spectral
   gap is so small that a power iteration started anywhere crawls. A tight
   reference run needs >2000 applications to reach 1e-9.
+
+### The imaging workers' OpenMP threads sleep between requests, they do not spin
+
+With the operator norm down to ~30 NUFFT pairs, an imaging request that takes
+0.068s solo still took 0.158s inside a run - 2.3x, on a 20-CPU host where the 8
+ranks at `R2D2_OMP_THREADS=2` only ever ask for 16 threads. The gap is not
+oversubscription: it is libgomp's default `OMP_WAIT_POLICY=ACTIVE`, which spins
+the team's second thread for the rest of its timeslice after every parallel
+region rather than sleeping. A 128x128 NUFFT *is* the parallel region here, so
+each worker's second thread spends most of its life spinning on a core the
+other seven workers want.
+
+Measured with 8 forked pool workers each running 5 imaging requests off the
+same warm-up - the harness the run actually uses - on the same evaluation
+directories:
+
+| Threads per worker | Wait policy | Median request | Aggregate |
+|---|---|---:|---:|
+| 2 | ACTIVE (default) | 0.215s | 27.7 req/s |
+| 2 | PASSIVE | 0.118s | 50.4 req/s |
+| 2 | `GOMP_SPINCOUNT=0` | 0.123s | 47.8 req/s |
+| 1 | ACTIVE | 0.092s | 50.0 req/s |
+| 1 | PASSIVE | 0.097s | 43.0 req/s |
+| 3 | PASSIVE | 0.221s | 27.0 req/s |
+| 4 | PASSIVE | 0.429s | 13.2 req/s |
+
+`GOMP_SPINCOUNT=0` is the same fix by the libgomp-specific lever; `PASSIVE` is
+the portable spelling and is what the run script passes. The R2D2 sidecar
+therefore gets `-e OMP_WAIT_POLICY=PASSIVE` alongside its thread caps, and
+`r2d2_docker_thread_env_flags()` passes it on the fallback path where a rank
+starts its own worker.
+
+Note what the table does *not* say. Spinning at 1 thread is as fast as passive
+at 2 because a 1-thread team has nothing to spin; that is iteration 9's "1
+thread is 27% faster per evaluation" result, and it was measuring this, not the
+thread count. Once the spinning is gone, 2 threads is the better setting again,
+so `R2D2_OMP_THREADS = host CPUs / NS_MPI_PROCS` stays as it is - which matters
+because the 25 UNet forward passes a checkpointed run adds are exactly the
+large parallel regions that want the second thread. Above 2 the product really
+does exceed the host (8x3 = 24 threads on 20 CPUs) and passive does not save
+it, so the existing "do not raise it" rule is unchanged. Solo, passive is not a
+regression either: 0.072s against 0.078s for one worker at 2 threads.
+
+Interleaved A/B of `scripts/run-nested-sampling-r2d2-poc.sh`, `NS_MPI_PROCS=8`,
+38 evaluations, alternating the two run scripts, ten pairs over two batches:
+
+| | Sampler wall clock (median of 10) | Imaging worker-seconds (median of 5) | End to end (median of 5) |
+|---|---:|---:|---:|
+| ACTIVE | 1.634s | 6.58s | 3.70s |
+| PASSIVE | 1.318s | 4.93s | 3.52s |
+
+10 of 10 pairs favour PASSIVE on sampler wall clock (-19%) and 5 of 5 on
+imaging worker-seconds (-25%); end to end is 4 of 5 and only -5%, because at
+this problem size ~2.0s of the run is the fixed setup the section below
+describes and the sampler is now the smaller half. The evaluation set and
+objectives are identical across all ten runs.
+
+Iteration 9 tested `OMP_WAIT_POLICY=PASSIVE` end to end and called it a wash (2
+wins, 3 losses over 5 pairs). It was measuring the same real effect through the
+power iteration's 39-305-application lottery, whose run-to-run spread was
+larger than the ~0.3s the policy is worth. A per-worker microbenchmark of the
+imaging request would have shown it either way; end-to-end wall clock at this
+size will not resolve a change this small until the noise source above it is
+gone.
 
 ### Sidecar containers run with `--network none`
 
