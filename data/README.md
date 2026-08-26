@@ -5,7 +5,7 @@ Bind-mounted into the containers at `/data`. Nothing in this directory
 
 The nested-sampling searches do not use this directory: each likelihood
 evaluation simulates its own Measurement Set into that run's own
-`results/nested-sampling-poc/<run>/evaluations/eval-*/` directory.
+`results/nested-sampling/<run>/evaluations/eval-*/` directory.
 
 Expected contents, added by you if an experiment needs them:
 

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# PolyChordLite plus the repo's nested-sampling PoC driver.
+# PolyChordLite plus the repo's nested-sampling driver.
 #
 # Build:
 #   docker build --platform linux/arm64 -f docker/polychord/Dockerfile \
@@ -54,7 +54,7 @@ COPY --from=build /opt/venv /opt/venv
 # with .pyc whose recorded mtimes no longer match after the COPY above. So the
 # first Python process in a fresh container recompiled ~60 modules and wrote
 # them into the container layer: an 8-rank `mpirun python3 -c "import numpy,
-# pypolychord, poc_common"` cost 0.99s cold against 0.22s once one process had
+# pypolychord, common"` cost 0.99s cold against 0.22s once one process had
 # paid it. Compiling here makes every container start warm, which is what the
 # run script would otherwise have to buy with a throwaway warm-up exec on the
 # critical path. `|| true`: compileall fails the build on any module that is not
@@ -67,5 +67,5 @@ RUN python3 -m compileall -q /opt/ri-nested-sampling
 WORKDIR /workspace
 VOLUME ["/data", "/results"]
 
-ENTRYPOINT ["python3", "/opt/ri-nested-sampling/polychord_wsclean_poc.py"]
+ENTRYPOINT ["python3", "/opt/ri-nested-sampling/polychord_wsclean.py"]
 CMD ["--help"]

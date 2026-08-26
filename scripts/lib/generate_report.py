@@ -1,6 +1,6 @@
 """
 Builds a self-contained HTML report from the nested-sampling runs under
-results/nested-sampling-poc/*/poc-summary.json - one page per run plus an index.
+results/nested-sampling/*/summary.json - one page per run plus an index.
 
 Run via scripts/generate-report.sh, which wraps this in the r2d2 image so it
 can reuse the imager's own astropy + matplotlib + anesthetic rather than
@@ -29,11 +29,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REPO_ROOT = "/workspace/repo"
-NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling-poc")
+NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
 
-from poc_common import (  # noqa: E402
+from common import (  # noqa: E402
     PROFILING_VIEW_NOTE,
     format_duration,
     format_share,
@@ -103,7 +103,7 @@ def render_fits_to_data_uri(path, figsize=(4, 4), dpi=130):
 
 
 def synthesize_truth_array(image_path, source_flux_jy):
-    """Mirror poc_common.compute_image_metrics truth construction."""
+    """Mirror common.compute_image_metrics truth construction."""
     data, header = fits.getdata(image_path, header=True)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
     if image.ndim != 2:
@@ -135,9 +135,9 @@ def format_run_id_timestamp(run_name):
     return dt.strftime("%d %b %Y, %H:%M:%S UTC")
 
 
-def nested_sampling_run_sort_key(poc_summary_path):
+def nested_sampling_run_sort_key(summary_path):
     """Sort key for newest-first nested-sampling cards (run-id UTC, else mtime)."""
-    run_name = os.path.basename(os.path.dirname(poc_summary_path))
+    run_name = os.path.basename(os.path.dirname(summary_path))
     match = RUN_ID_TS_RE.search(run_name)
     if match:
         try:
@@ -146,7 +146,7 @@ def nested_sampling_run_sort_key(poc_summary_path):
         except ValueError:
             pass
     try:
-        mtime = os.path.getmtime(poc_summary_path)
+        mtime = os.path.getmtime(summary_path)
     except OSError:
         mtime = 0.0
     return (1, -mtime, run_name)
@@ -250,7 +250,7 @@ def render_likelihood_plot(run_dir, param_names):
     if len(plot_params) < 2:
         return None
 
-    # ncompress=False: anesthetic triangular compression fails on some PoC chains.
+    # ncompress=False: anesthetic triangular compression fails on some chains.
     for kind, extra in (("kde", {"ncompress": False}), ("scatter", {})):
         try:
             grid = samples.plot_2d(plot_params, kind=kind, **extra)
@@ -340,7 +340,7 @@ def render_profiling_bar(segments):
 
 def render_profiling(summary):
     """Collapsed per-stage timing breakdown, sharing its numbers with
-    scripts/profile-nested-sampling-run.py via poc_common.profiling_breakdown."""
+    scripts/profile-nested-sampling-run.py via common.profiling_breakdown."""
     profiling = summary.get("profiling")
     if not profiling:
         return ""
@@ -574,11 +574,11 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
     return f'<div class="eval-images">{truth_html}{cards_html}</div>'
 
 
-def render_nested_sampling_run(poc_summary_path):
-    run_dir = os.path.dirname(poc_summary_path)
+def render_nested_sampling_run(summary_path):
+    run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
     tab_id = run_tab_id(run_name)
-    with open(poc_summary_path) as f:
+    with open(summary_path) as f:
         summary = json.load(f)
     run_dirs = [run_dir] + merged_source_run_dirs(summary)
 
@@ -651,7 +651,7 @@ def render_nested_sampling_run(poc_summary_path):
         <section>
           <h3>Evidence</h3>
           <div class="headline">log(Z) = <strong>{float(summary_log_z):.4g}</strong>{err_html}</div>
-          <p class="purpose">From poc-summary.json log_z</p>
+          <p class="purpose">From summary.json log_z</p>
         </section>
         """
     else:
@@ -774,7 +774,7 @@ def render_nested_sampling_run(poc_summary_path):
         </details>
         """
 
-    rel_summary = os.path.relpath(poc_summary_path, REPO_ROOT)
+    rel_summary = os.path.relpath(summary_path, REPO_ROOT)
     return f"""
     <article class="card nested-sampling-card">
       {header}
@@ -1018,29 +1018,29 @@ a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transpare
 
 
 def resolve_nested_sampling_summary(run):
-    """Accept a run dir, poc-summary.json path, or directory name under nested-sampling-poc/."""
+    """Accept a run dir, summary.json path, or directory name under nested-sampling/."""
     raw = Path(run)
-    name = raw.parent.name if raw.name == "poc-summary.json" else raw.name
+    name = raw.parent.name if raw.name == "summary.json" else raw.name
     candidates = []
-    if raw.name == "poc-summary.json":
+    if raw.name == "summary.json":
         candidates.append(raw)
-    candidates.append(raw / "poc-summary.json")
-    candidates.append(Path(NESTED_SAMPLING_DIR) / name / "poc-summary.json")
+    candidates.append(raw / "summary.json")
+    candidates.append(Path(NESTED_SAMPLING_DIR) / name / "summary.json")
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     raise SystemExit(
-        f"No poc-summary.json for run {run!r} "
+        f"No summary.json for run {run!r} "
         f"(looked under {NESTED_SAMPLING_DIR}/{name}/)"
     )
 
 
 def nested_sampling_run_paths(limit=None, run=None):
-    """poc-summary.json paths, newest first, optionally filtered to one run or newest N."""
+    """summary.json paths, newest first, optionally filtered to one run or newest N."""
     if run:
         return [resolve_nested_sampling_summary(run)]
     paths = sorted(
-        glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "poc-summary.json")),
+        glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "summary.json")),
         key=nested_sampling_run_sort_key,
     )
     return paths[:limit] if limit is not None else paths
@@ -1072,10 +1072,10 @@ def run_log_evidence(run_dir, summary):
     return None
 
 
-def render_index_entry(poc_summary_path, status):
-    run_dir = os.path.dirname(poc_summary_path)
+def render_index_entry(summary_path, status):
+    run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
-    with open(poc_summary_path) as f:
+    with open(summary_path) as f:
         summary = json.load(f)
 
     polychord = summary.get("polychord", {})
@@ -1144,8 +1144,8 @@ def render_nested_sampling_index(status_for):
     paths = nested_sampling_run_paths()
     if not paths:
         return (
-            '<p class="empty">No nested-sampling PoC runs found under '
-            "results/nested-sampling-poc/*/poc-summary.json yet.</p>"
+            '<p class="empty">No nested-sampling runs found under '
+            "results/nested-sampling/*/summary.json yet.</p>"
         )
     return "".join(render_index_entry(p, status_for(p)) for p in paths)
 
@@ -1192,7 +1192,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--run",
         default=None,
-        help="One run directory or name under nested-sampling-poc/.",
+        help="One run directory or name under nested-sampling/.",
     )
     parser.add_argument(
         "--force",
@@ -1241,8 +1241,8 @@ def main(argv=None):
             page_path,
             title=f"nested-sampling run: {run_name}",
             subtitle=(
-                f"Generated from <code>results/nested-sampling-poc/{html.escape(run_name)}/"
-                "poc-summary.json</code>."
+                f"Generated from <code>results/nested-sampling/{html.escape(run_name)}/"
+                "summary.json</code>."
             ),
             body=index_nav_html() + render_nested_sampling_run(summary_path),
         )
@@ -1253,7 +1253,7 @@ def main(argv=None):
         os.path.join(out_dir, "index.html"),
         title="ri-reproducibility nested-sampling runs",
         subtitle=(
-            "One page per run under <code>results/nested-sampling-poc/</code> - "
+            "One page per run under <code>results/nested-sampling/</code> - "
             "regenerate with <code>./ri report</code> "
             "(up-to-date pages are skipped; <code>--upgrade</code> rebuilds "
             "the ones an older report version wrote, <code>--force</code> "

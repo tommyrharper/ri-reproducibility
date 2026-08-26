@@ -4,10 +4,10 @@
 Run on the host (needs a display), e.g.:
 
   uv run scripts/anesthetic-gui.py
-  uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-...
-  ./ri plot gui results/nested-sampling-poc/wsclean-vlaa-...
+  uv run scripts/anesthetic-gui.py results/nested-sampling/wsclean-vlaa-...
+  ./ri plot gui results/nested-sampling/wsclean-vlaa-...
 
-Also opens a merged run directory (poc-summary.json with merged_from),
+Also opens a merged run directory (summary.json with merged_from),
 re-merging the source runs' chains on the fly via anesthetic_io.
 """
 
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
+NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
 
@@ -53,16 +53,16 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         default=None,
         help="Run directory, chains/ directory, or PolyChord file root. "
-        "Default: most recent completed results/nested-sampling-poc/*/ ",
+        "Default: most recent completed results/nested-sampling/*/ ",
     )
     return parser.parse_args()
 
 
 def is_completed_run(run_dir: Path) -> bool:
-    """Completed: poc-summary.json + chains/, or a merged run (poc-summary.json only)."""
+    """Completed: summary.json + chains/, or a merged run (summary.json only)."""
     if not run_dir.is_dir():
         return False
-    summary_path = run_dir / "poc-summary.json"
+    summary_path = run_dir / "summary.json"
     if not summary_path.is_file():
         return False
     if (run_dir / "chains").is_dir():
@@ -92,7 +92,7 @@ def resolve_target(target: Path) -> Path:
 
 def merged_run_dir(target: Path) -> Path | None:
     """target itself if it's a merged run directory, else None."""
-    summary_path = target / "poc-summary.json"
+    summary_path = target / "summary.json"
     if not target.is_dir() or not summary_path.is_file():
         return None
     try:
@@ -107,7 +107,7 @@ def run_dir_for_chain_root(chain_root: Path) -> Path:
 
 
 def load_parameter_space(run_dir: Path) -> list[dict[str, Any]]:
-    summary = run_dir / "poc-summary.json"
+    summary = run_dir / "summary.json"
     if summary.is_file():
         data = json.loads(summary.read_text())
         space = data.get("parameter_space")
@@ -139,7 +139,7 @@ def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) ->
 def run_title(run_dir: Path, fallback_label: str) -> str:
     """Human-readable window title for the anesthetic GUI."""
     parts: list[str] = [run_dir.name]
-    summary_path = run_dir / "poc-summary.json"
+    summary_path = run_dir / "summary.json"
     if summary_path.is_file():
         data = json.loads(summary_path.read_text())
         algorithm = data.get("algorithm")

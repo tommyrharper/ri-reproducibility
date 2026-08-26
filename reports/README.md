@@ -4,7 +4,7 @@ Host-side output of the nested-sampling searches. Everything in here
 except this file and `manifests/.gitkeep` is generated and gitignored.
 
 - `nested-sampling-report/` - built by `./ri report` from
-  `results/nested-sampling-poc/*/poc-summary.json`. One page per run
+  `results/nested-sampling/*/summary.json`. One page per run
   (PolyChord log(Z), searched parameters and metrics per evaluation,
   reconstructions rendered next to the truth, likelihood plot, and a
   collapsible per-stage profiling table when the run recorded one), plus

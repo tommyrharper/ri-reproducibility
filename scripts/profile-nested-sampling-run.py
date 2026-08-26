@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Print a per-stage timing breakdown for a nested-sampling PoC run.
+"""Print a per-stage timing breakdown for a nested-sampling run.
 
-Post-processing only: reads the `profiling` block that `polychord_wsclean_poc.py`
-/ `polychord_r2d2_poc.py` write into `poc-summary.json` (summed from per-
-evaluation `timing.*` fields recorded around each pipeline stage) and renders
-it as a human-readable table, so you can see which stage actually dominates
-wall time without guessing.
+Post-processing only: reads the `profiling` block that `polychord_wsclean.py`
+/ `polychord_r2d2.py` write into `summary.json` (summed from per-evaluation
+`timing.*` fields recorded around each pipeline stage) and renders it as a
+human-readable table, so you can see which stage actually dominates wall time
+without guessing.
 
 Every share is a fraction of the run's worker-time budget (wall clock x
 mpi_procs), so the top-level stages plus the unaccounted remainder add up to
@@ -14,8 +14,8 @@ numbers - back the Profiling section of the HTML run report.
 
 Usage:
 
-  uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC>
-  uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC>/poc-summary.json
+  uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC>
+  uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC>/summary.json
   uv run scripts/profile-nested-sampling-run.py <run-dir> --json
 """
 
@@ -29,7 +29,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_sampling"))
 
-from poc_common import (  # noqa: E402
+from common import (  # noqa: E402
     PROFILING_VIEW_NOTE,
     format_duration,
     format_share,
@@ -41,9 +41,9 @@ COLUMN_WIDTH = 12
 
 
 def load_summary(target: Path) -> dict[str, Any]:
-    summary_path = target / "poc-summary.json" if target.is_dir() else target
+    summary_path = target / "summary.json" if target.is_dir() else target
     if not summary_path.is_file():
-        raise SystemExit(f"no poc-summary.json found at {summary_path}")
+        raise SystemExit(f"no summary.json found at {summary_path}")
     return json.loads(summary_path.read_text())
 
 
@@ -51,8 +51,8 @@ def print_report(summary: dict[str, Any]) -> None:
     profiling = summary.get("profiling")
     if not profiling:
         raise SystemExit(
-            "poc-summary.json has no `profiling` block - it was written by a run "
-            "predating profiler instrumentation; re-run the PoC to get one."
+            "summary.json has no `profiling` block - it was written by a run "
+            "predating profiler instrumentation; re-run it to get one."
         )
 
     breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
@@ -108,7 +108,7 @@ def print_report(summary: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("run", help="Run directory or poc-summary.json path")
+    parser.add_argument("run", help="Run directory or summary.json path")
     parser.add_argument("--json", action="store_true", help="Print the raw profiling dict as JSON instead of a table")
     args = parser.parse_args()
 

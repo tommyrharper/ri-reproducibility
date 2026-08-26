@@ -114,7 +114,7 @@ The detailed definitions are given in the linked sections of the search paramete
 \begin{table}[H]
 \centering
 \begin{tabular}{lll}
-Dimension & PoC range & Meaning \\
+Dimension & Range & Meaning \\
 \hline
 \hyperref[sec:param-dynamic-range]{\texttt{dynamic\_range}} & $10^3$--$5\times10^5$ & One-Jy source divided by thermal-noise sigma \\
 \hyperref[sec:param-observation-duration]{\texttt{observation\_minutes}} & $20$ sec--$20$ mins & Total requested observing time \\
@@ -122,7 +122,7 @@ Dimension & PoC range & Meaning \\
 \hyperref[sec:param-frequency-range]{\texttt{start\_frequency\_hz}} & ? & First channel frequency \\
 \hyperref[sec:param-frequency-range]{\texttt{channel\_width\_hz}} & ? & Uniform spacing between channels \\
 \end{tabular}
-\caption{Nested-sampling parameter dimensions used in the current PoC runs.}
+\caption{Nested-sampling parameter dimensions used in the current runs.}
 \label{tab:nested-sampling-parameters}
 \end{table}
 
@@ -357,14 +357,14 @@ The simulator supports the four standard VLA configurations:
     \item \texttt{vla.d}
 \end{itemize}
 These change the baseline distribution and therefore the Fourier coverage and dirty beam.
-For the first PoC runs, we plan to fix this parameter to \texttt{vla.a} before expanding the search over configuration.
+For the first runs, we plan to fix this parameter to \texttt{vla.a} before expanding the search over configuration.
 
 \subsubsection{Declination}
 \label{sec:param-declination}
 
 Suggested search range: $-15^\circ$--$75^\circ$.
 The NRAO VLA Observational Status Summary states that its quoted array resolutions are appropriate for sources in this declination range \cite{nrao-vla-resolution}.
-For the first PoC runs, declination can be fixed near the VLA latitude, $\delta \simeq 34^\circ$, before expanding the search.
+For the first runs, declination can be fixed near the VLA latitude, $\delta \simeq 34^\circ$, before expanding the search.
 
 \subsubsection{Observation Duration}
 \label{sec:param-observation-duration}

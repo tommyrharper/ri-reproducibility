@@ -1,20 +1,20 @@
-# Nested Sampling PoC: profiling
+# Nested sampling: profiling
 
 This is the profiling companion to [nested-sampling.md](nested-sampling.md):
 what each stage of a likelihood evaluation costs, how the per-stage
 instrumentation works, and every optimisation that has been measured against
-the PoC - the ones that stayed, and the ones that were rejected. Read
-`nested-sampling.md` first for what the PoC does and how to run it; read this
+the search - the ones that stayed, and the ones that were rejected. Read
+`nested-sampling.md` first for what the search does and how to run it; read this
 one when you want to know where the wall time goes or why the run scripts and
 images are shaped the way they are.
 
 ## What is instrumented
 
-Both `polychord_wsclean_poc.py` and `polychord_r2d2_poc.py` time every stage of
+Both `polychord_wsclean.py` and `polychord_r2d2.py` time every stage of
 each likelihood evaluation with plain `time.perf_counter()` calls around the
 existing subprocess/docker invocations already in `evaluate()` - no separate
 profiling framework, no changes to the container images' entrypoints. Each
-evaluation's `metrics.json` (and the aggregated `poc-summary.json`) gets a
+evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 `timing` block:
 
 | Field | Meaning |
@@ -30,7 +30,7 @@ only available for WSClean, because only its image installs GNU `time`; R2D2
 and MeqTrees containers report only the round-trip `docker run` time as one
 blob.
 
-`poc-summary.json` also gets a run-level `profiling` block: each field above
+`summary.json` also gets a run-level `profiling` block: each field above
 summed across every evaluation, plus:
 
 - `accounted_worker_seconds` - sum of every stage total across all evaluated
@@ -46,17 +46,17 @@ summed across every evaluation, plus:
 
 ## Running the profiler
 
-The instrumentation runs automatically as part of every PoC run - there's no
+The instrumentation runs automatically as part of every run - there's no
 separate flag. To read the breakdown of a completed run:
 
 ```bash
-./ri profile results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp>
 # or directly:
-uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
-uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp> --json
+uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC timestamp>
+uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC timestamp> --json
 ```
 
-`scripts/profile-nested-sampling-run.py` only reads `poc-summary.json` and
+`scripts/profile-nested-sampling-run.py` only reads `summary.json` and
 prints a table (or the raw `profiling` dict with `--json`); it does not launch
 anything itself. Runs written before this instrumentation existed have no
 `profiling` block and must be re-run to get one.
@@ -64,7 +64,7 @@ anything itself. Runs written before this instrumentation existed have no
 ### How the printed shares are computed
 
 The JSON fields above are raw sums. Turning them into something readable is
-`profiling_breakdown()` in `scripts/lib/nested_sampling/poc_common.py`, shared
+`profiling_breakdown()` in `scripts/lib/nested_sampling/common.py`, shared
 by the CLI and by the HTML report's "Profiling (where the run's time went)"
 section so the two cannot drift apart. It adds three things the raw block does
 not carry:
@@ -100,7 +100,7 @@ evaluations, not committed) profiles as:
 | PolyChord overhead (unaccounted) | 0.26s | 2.5% |
 
 Total wall time 10.2s (~0.16s/eval; ~1.8s on the default 8 ranks). That is
-`poc-summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
+`summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
 inside the PolyChord container - the end-to-end `time` of the run script is
 ~1.1s more on one rank and ~1.2s more on eight, for starting and removing the
 containers (8-rank end to end is ~2.95s). No fixed overhead of any
@@ -249,7 +249,7 @@ so the meqtrees image builds all of them at `docker build` time -
 and `skeleton_dir()` prefers that directory when it exists. It is an ordinary
 writable container path, so a shape the image was not built with is still built
 and published there at runtime: the baked set is a head start, not a fixed set.
-`poc_common.py` is `--mount=type=bind`ed for that one build step rather than
+`common.py` is `--mount=type=bind`ed for that one build step rather than
 copied, so the shapes come from the single authoritative `PARAMETER_SPACE` and
 the runtime image still carries only the three simulate-side scripts.
 
@@ -293,7 +293,7 @@ every evaluation directory.
 
 `docker exec` costs ~0.033s on this host, a third of the `wsclean` binary's own
 ~0.107s, and every evaluation paid it again. `sidecar_shell()` in
-`poc_common.py` therefore `docker exec -i`s a single `sh` into the rank's
+`common.py` therefore `docker exec -i`s a single `sh` into the rank's
 sidecar on first use, and `sidecar_run()` sends each later evaluation one
 command line - `cd <eval_dir> && <cmd> >stdout.log 2>stderr.log; echo $?` - and
 reads the exit code back. Arguments are `shlex.quote`d, the command's own output
@@ -321,7 +321,7 @@ stdin line - `{"argv": [...], "stdout": path, "stderr": path}` - and replies
 with `{"returncode": int}` on its original stdout, with fds 1 and 2 pointed at
 the request's log files for the duration so `makems` and the meqserver still log
 per-evaluation exactly as they did when each was its own process.
-`simulate_worker()` in `poc_common.py` starts one such process per rank on first
+`simulate_worker()` in `common.py` starts one such process per rank on first
 use and writes to its stdin from then on; a worker that dies without replying is
 dropped from the cache so the next evaluation starts a fresh one instead of
 inheriting the corpse.
@@ -371,12 +371,12 @@ is ~0.17s against ~0.03s for its second, even against a warm skeleton cache).
 No amount of eager work *inside* the worker can hide that, because the rank
 that launched it asks for its first evaluation ~0.2s later.
 
-So the ranks no longer launch them. `run-nested-sampling-poc.sh` creates one
+So the ranks no longer launch them. `run-nested-sampling.sh` creates one
 `<rank>.in`/`<rank>.out` FIFO pair per rank under
 `<output-dir>/.simulate-workers`, and the meqtrees sidecar's *container
 command* - `sidecar_launch ... -- sh -c ...`, in place of the default `sleep
 infinity` - spawns one `simulate_point_source_ms.py --serve --fifo <base>` per
-pair. `poc_common._connect_shell_started_worker()` opens that pair instead of
+pair. `common._connect_shell_started_worker()` opens that pair instead of
 spawning anything, and `FifoWorker` presents the same
 `.stdin`/`.stdout`/`.terminate()` surface as the `subprocess.Popen` it replaces,
 so nothing downstream changed. The FIFOs reach across containers because the
@@ -411,7 +411,7 @@ is the guard, verified to fail (rather than hang) when `serve()`'s two opens are
 swapped. And the rank's side opens with `O_NONBLOCK`, which is how a FIFO
 write-open reports "no reader yet" (`ENXIO`) instead of blocking forever: it
 retries for 10s and then falls back to starting its own worker, so a missing or
-broken pool costs latency, not the run. That fallback is also what the R2D2 PoC
+broken pool costs latency, not the run. That fallback is also what the R2D2 run
 uses - it does not set `NS_SIMULATE_FIFO_DIR` at all.
 
 One sharp edge: Timba registers `stop_default_mqs()` with `atexit`, but CPython
@@ -466,7 +466,7 @@ evaluation one. It was four independent startups run one after the other inside
 | `docker inspect` of each image's `ENTRYPOINT`, twice | ~0.05s |
 | the WSClean sidecar's `sh` (`docker exec`) | ~0.03s |
 
-`poc_common.prewarm()` starts all of them in threads, so a rank pays the slowest
+`common.prewarm()` starts all of them in threads, so a rank pays the slowest
 instead of the sum. `main()` calls it before `import pypolychord` and joins it
 immediately before `run_polychord()`, so the remainder also overlaps the
 sampler's own import and setup. Nothing may touch a sidecar between the call and
@@ -475,7 +475,7 @@ plain dicts with no lock, and a lazy start racing the prewarm thread would leave
 a second, orphaned worker.
 
 **What is still left in evaluation one.** Per-evaluation `simulate_seconds`
-from `poc-summary.json` used to show the eight `eval_id == 1` records (one per
+from `summary.json` used to show the eight `eval_id == 1` records (one per
 rank, all issued at the same moment) at 0.18-0.41s against a ~0.05s median for
 the rest of the run - the `--serve` worker's startup, finishing inside the first
 request because the rank that started it had nothing else to do meanwhile. The
@@ -500,7 +500,7 @@ prewarm threads is what showed it - the other two only `Popen`, so they return
 in milliseconds and the join was pure astropy.
 
 All it was doing is reading a single-HDU, uncompressed, `BITPIX = -32` image and
-two header cards (`CRPIX1`/`CRPIX2`). `poc_common.load_fits_2d()` now does that
+two header cards (`CRPIX1`/`CRPIX2`). `common.load_fits_2d()` now does that
 directly: 2880-byte header blocks of 80-column cards, then big-endian samples in
 C order. Anything outside that shape - an integer or `BSCALE`/`BZERO`-scaled
 image, a short data block - raises instead of being guessed at. astropy is still
@@ -509,14 +509,14 @@ installed in the image and still used by the self-check.
 The trap is card parsing, not the data block: a quoted value may contain the `/`
 that otherwise starts the comment (`BUNIT = 'JY/BEAM '`), so `_fits_card_value()`
 closes the quote before cutting the comment. `self_check_fits_reader()` (run by
-`POLYCHORD_WSCLEAN_POC_SELF_CHECK=1`) writes exactly that card with astropy and
+`POLYCHORD_WSCLEAN_SELF_CHECK=1`) writes exactly that card with astropy and
 asserts the reader agrees; it fails if the quote handling is removed.
 
 Verified against astropy on all 16833 FITS files this repo's results tree
 contains - identical pixels and identical values for every non-comment header
 card. Eight interleaved A/B pairs (rebuild between arms) gave 3.91s -> 3.61s end
 to end on the default 8 ranks, -7.8%, 8/8 pairs, with a bit-identical
-`chains/wsclean_vlaa_poc.stats` and bit-identical metrics for all 41
+`chains/wsclean_vlaa.stats` and bit-identical metrics for all 41
 evaluations.
 
 ### Sidecar teardown does not block the run
@@ -563,22 +563,22 @@ end-to-end script wall time went 6.82s -> 5.29s (-22%); single-rank went 13.1s
 -> 12.2s (-7%). All eight runs produced identical `log(Z)` and byte-identical
 objectives for all 41 evaluations.
 
-Note which clock that is. `poc-summary.json`'s `total_wall_seconds` - the
+Note which clock that is. `summary.json`'s `total_wall_seconds` - the
 number the profile table above totals - is measured around
 `run_polychord()` *inside* the container, so it does not see container startup
 or teardown at all: it is 3.65s before and after this change. Only
-`time scripts/run-nested-sampling-poc.sh` shows it. Anything that moves fixed
+`time scripts/run-nested-sampling.sh` shows it. Anything that moves fixed
 setup cost has to be measured end to end.
 
 Only the WSClean run script does this. The R2D2 one still uses
 `start_sidecars`, which is now a wrapper over `sidecar_launch` + `sidecar_wait`
-and behaves exactly as before; ~0.7s is not worth re-validating a PoC whose
+and behaves exactly as before; ~0.7s is not worth re-validating a run whose
 runs take 20 minutes.
 
 ### The images ship byte-compiled, so no container needs a warm-up
 
 `sidecar_launch` used to run a throwaway `python3 -c "import numpy,
-pypolychord, poc_common, argparse; argparse.ArgumentParser()"` in the fresh
+pypolychord, common, argparse; argparse.ArgumentParser()"` in the fresh
 PolyChord container before `sidecar_wait` returned, because the *first* Python
 process in a container cost far more than the next one: the real 8-rank
 `mpirun python3` exec measured 0.99s cold against 0.22s warm.
@@ -651,7 +651,7 @@ worth 0.17s, none of them PolyChord's. It is not the transport itself:
 already excludes `ucx` - to 0.046s, so the 0.19s is Open MPI opening the `cm`
 PML, which opens the MTL framework, which has libfabric probe every provider it
 can find. This job never leaves one container, and `ob1` over shared memory is
-what the search settles on anyway, so both PoC run scripts name it:
+what the search settles on anyway, so both run scripts name it:
 
 ```
 docker exec ... -e OMPI_MCA_pml=ob1 ...
@@ -774,7 +774,7 @@ infinity` container that lives for the whole run - through the long-lived `sh`
 above for WSClean, through the `--serve` worker for simulate. Both run scripts
 source `scripts/lib/start-sidecars.sh` and start those containers before the
 PolyChord container, handing the names to every rank in `NS_SIDECARS`;
-`sidecar_container()` in `poc_common.py` still starts one itself for any image
+`sidecar_container()` in `common.py` still starts one itself for any image
 that is not in there.
 
 That container mounts `REPO_ROOT` at its own host path (the same trick the
@@ -808,7 +808,7 @@ image has no GNU `time`.
 
 Together these took the profiled run from 43.5s to 27.5s (-37%) with identical
 per-evaluation metrics, identical `log(Z)`, and the same set of files in every
-evaluation directory. The R2D2 PoC picks up the simulate half of this through
+evaluation directory. The R2D2 run picks up the simulate half of this through
 the shared `simulate_measurement_set()`; its own convert and imaging containers
 are still one `docker run` each - the imaging one needs the extra
 `checkpoints/` mount and per-run thread env vars, and is dominated by R2D2's own

@@ -1,4 +1,4 @@
-# Nested Sampling PoC
+# Nested sampling
 
 This repo uses PolyChord as a targeted search tool, not as a Bayesian posterior
 fit. PolyChord maximizes a configurable objective metric (default
@@ -27,9 +27,9 @@ predicted by an actual MeqTrees/Meow point-source RIME run
 `meqtree-pipeliner.py`), not a hand-rolled formula; thermal noise is added on
 top of that clean MeqTrees prediction.
 
-## Run the PoC
+## Run it
 
-Both PoCs share the same `NS_*` and `OUTPUT_DIR` overrides (see "Environment
+Both algorithms share the same `NS_*` and `OUTPUT_DIR` overrides (see "Environment
 overrides" below). Each target builds its required images first and starts one
 long-lived sidecar container per image; the PolyChord container mounts the
 Docker socket and drives those sidecars. The WSClean target starts the
@@ -47,7 +47,7 @@ per image" in
 Outputs:
 
 ```text
-results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>/
+results/nested-sampling/wsclean-vlaa-<UTC timestamp>/
 ```
 
 Useful overrides:
@@ -59,7 +59,7 @@ Useful overrides:
 ./ri search wsclean --metric snr
 ./ri search r2d2 --metric off_source_rms_jy
 ./ri search r2d2 --metric sigma_res
-./ri search wsclean --output-dir results/nested-sampling-poc/manual
+./ri search wsclean --output-dir results/nested-sampling/manual
 ```
 
 PolyChord likelihood evaluations run in parallel across MPI ranks inside the
@@ -80,7 +80,7 @@ step in this rank's already-running sidecar containers.
 Outputs:
 
 ```text
-results/nested-sampling-poc/r2d2-vlaa-<UTC timestamp>/
+results/nested-sampling/r2d2-vlaa-<UTC timestamp>/
 ```
 
 The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
@@ -96,7 +96,7 @@ Before a full end-to-end run, validate the MS-to-`.mat` bridge:
 ./ri smoke ms-to-mat                 # or: scripts/check-ms-to-r2d2-mat.sh
 ```
 
-`run-nested-sampling-r2d2-poc.sh` runs `NS_MPI_PROCS` PolyChord ranks
+`run-nested-sampling-r2d2.sh` runs `NS_MPI_PROCS` PolyChord ranks
 concurrently, each launching its own R2D2 container. Each R2D2 imaging
 container is launched with OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`,
 `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) set from the host's available CPU
@@ -111,7 +111,7 @@ per-rank default.
 ### Environment overrides
 
 Both run scripts read the same `NS_*` variables and forward them to
-`polychord_wsclean_poc.py` / `polychord_r2d2_poc.py` as command-line flags.
+`polychord_wsclean.py` / `polychord_r2d2.py` as command-line flags.
 The defaults live in `defaults.toml` at the repository root, loaded by
 `scripts/lib/defaults.sh`, which both scripts source.
 
@@ -129,18 +129,18 @@ yourself still works and still wins over `defaults.toml`; a flag wins over both.
 | `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
 | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `docker info` |
 | `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh`. Unset means `{}`: each rank starts its own container per image |
-| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by the WSClean run script only. No default: unset (as in the R2D2 PoC) means each rank starts its own simulate worker |
+| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by the WSClean run script only. No default: unset (as in the R2D2 run script) means each rank starts its own simulate worker |
 
 `NS_SIDECARS` and `NS_SIMULATE_FIFO_DIR` are wiring the run scripts export for
 the containers they start, not knobs to set by hand.
 
 ## Parameter space
 
-VLA configuration is an outer-loop dimension. This PoC only runs `VLA.A`.
+VLA configuration is an outer-loop dimension. The runs here only use `VLA.A`.
 
-PolyChord dimensions for both algorithm PoCs:
+PolyChord dimensions for both algorithms:
 
-| Dimension | PoC range | Meaning |
+| Dimension | Range | Meaning |
 |---|---:|---|
 | `dynamic_range` | `1e2` to `1e3` | One-Jy source divided by thermal-noise sigma |
 | `observation_minutes` | `4` to `10` | Total requested observing time |
@@ -155,18 +155,18 @@ frequency sets are a follow-up ceiling.
 Fixed hyperparameters (not searched) on every evaluation:
 
 **WSClean:** `-niter 100` and `-auto-threshold 3.0`, recorded in
-`poc-summary.json` under `wsclean_fixed_hyperparameters`.
+`summary.json` under `wsclean_fixed_hyperparameters`.
 
-**R2D2:** `128x128` image size (matching the WSClean PoC's `-size 128 128
+**R2D2:** `128x128` image size (matching the WSClean run's `-size 128 128
 -scale 1asec` footprint), `num_iter 25`, `architecture unet`, `num_chans 64`,
 `ckpt_path /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in
-`poc-summary.json` under `r2d2_fixed_hyperparameters`.
+`summary.json` under `r2d2_fixed_hyperparameters`.
 
 ## MS to R2D2 `.mat` bridge
 
 R2D2-RI reads visibilities from a MATLAB `.mat` file via `load_data_to_tensor()`
 in the upstream `src/utils.py`. The nested-sampling simulator produces a CASA
-Measurement Set (`sim.ms`) that WSClean consumes directly. The R2D2 PoC adds
+Measurement Set (`sim.ms`) that WSClean consumes directly. The R2D2 run adds
 `scripts/lib/nested_sampling/ms_to_r2d2_mat.py`, which runs inside the MeqTrees
 image (python3-casacore plus scipy) and writes the minimal field set R2D2 loads
 without flag metadata:
@@ -214,7 +214,7 @@ max(0, 3 - log_snr)
 
 ### Choosing the objective (`--metric` / `NS_METRIC`)
 
-Both `polychord_wsclean_poc.py` and `polychord_r2d2_poc.py` accept
+Both `polychord_wsclean.py` and `polychord_r2d2.py` accept
 `--metric <value>` (default `total_rms_jy`). The shell wrappers forward
 `NS_METRIC`, whose default lives in `defaults.toml`, with the same value.
 Resolution order:
@@ -242,31 +242,31 @@ best corner with `--metric "-total_rms_jy"`, `--metric "-off_source_rms_jy"`
 or `--metric "-sigma_res"`. Failed simulations or imaging runs still receive
 objective `100.0`.
 
-Each evaluation record and `poc-summary.json` store the chosen value in an
-`objective` field. `poc-summary.json` also records the `--metric` string and a
+Each evaluation record and `summary.json` store the chosen value in an
+`objective` field. `summary.json` also records the `--metric` string and a
 `likelihood_framing` sentence describing what was optimized.
 
 ## Profiling
 
-Every PoC run times each stage of every likelihood evaluation automatically -
+Every run times each stage of every likelihood evaluation automatically -
 there is no separate flag. To read the breakdown of a completed run:
 
 ```bash
-./ri profile results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp>
 # or directly:
-uv run scripts/profile-nested-sampling-run.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp> [--json]
+uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC timestamp> [--json]
 ```
 
 The numbers come from the `timing` block in each evaluation's `metrics.json`
-and the run-level `profiling` block in that run's `poc-summary.json`.
+and the run-level `profiling` block in that run's `summary.json`.
 
 The same breakdown is available without the CLI: a run's HTML report page has a
 collapsible "Profiling (where the run's time went)" section, shown whenever that
-run's `poc-summary.json` carries a `profiling` block (runs predating the profiler
+run's `summary.json` carries a `profiling` block (runs predating the profiler
 instrumentation simply omit the section). It leads with a stacked bar of where
 the worker-time went and then the same rows as the CLI table, so the report page
 and `profile-nested-sampling-run.py` always agree - both call
-`profiling_breakdown()` in `scripts/lib/nested_sampling/poc_common.py`.
+`profiling_breakdown()` in `scripts/lib/nested_sampling/common.py`.
 
 Both views show, per stage: the total, the mean per evaluation, the share of the
 run's worker-time budget, and the evaluation count. Durations are rendered in
@@ -311,7 +311,7 @@ evaluations/eval-*/metrics.json
 Run-level summary:
 
 ```text
-poc-summary.json
+summary.json
 ```
 
 View completed runs (settings, evidence, per-evaluation metrics and
@@ -322,7 +322,7 @@ reconstructions) in the nested-sampling HTML report:
 # open reports/nested-sampling-report/index.html
 
 ./ri report --last 1
-./ri report --run results/nested-sampling-poc/r2d2-vlaa-merged-20260818T125604Z
+./ri report --run results/nested-sampling/r2d2-vlaa-merged-20260818T125604Z
 ./ri report --upgrade
 ./ri report --force
 ```
@@ -349,7 +349,7 @@ rebuilds its page. `UPGRADE=1` rebuilds the pages an older report version
 wrote. `FORCE=1` rebuilds every page in scope, up to date or not. `LAST=` and
 `RUN=` cannot be combined. Make cannot take `--last`; use `LAST=1`.
 
-The report globs `results/nested-sampling-poc/*/poc-summary.json` directly
+The report globs `results/nested-sampling/*/summary.json` directly
 (no manifest join), so a merged run directory (see **Merge runs** below) shows
 up as its own card automatically. Evidence prefers a `log_z` /
 `log_z_err` pair already in the summary (written for merged runs); otherwise
@@ -372,15 +372,15 @@ display; not inside Docker/Colima):
 
 ```bash
 ./ri plot gui
-./ri plot gui results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
-uv run scripts/anesthetic-gui.py results/nested-sampling-poc/wsclean-vlaa-<UTC timestamp>
+./ri plot gui results/nested-sampling/wsclean-vlaa-<UTC timestamp>
+uv run scripts/anesthetic-gui.py results/nested-sampling/wsclean-vlaa-<UTC timestamp>
 ```
 
-With no `RUN=`, the latest *completed* run under `results/nested-sampling-poc/*/`
-is used - either a plain run (`poc-summary.json` and `chains/`) or a merged
-run (`poc-summary.json` with `merged_from`, no local `chains/`). For a plain
+With no `RUN=`, the latest *completed* run under `results/nested-sampling/*/`
+is used - either a plain run (`summary.json` and `chains/`) or a merged
+run (`summary.json` with `merged_from`, no local `chains/`). For a plain
 run the script writes/refreshes `chains/<root>.paramnames` from that run's
-`poc-summary.json` / `parameter-space.json`; either way it passes only the
+`summary.json` / `parameter-space.json`; either way it passes only the
 searched Fourier parameter names into `samples.gui(params=...)` (not `logL` /
 `logL_birth` / `nlive`). Close the GUI window to return to the shell.
 Requires the host `uv` project dependency `anesthetic`
@@ -411,11 +411,11 @@ Sampler effort may differ between sources; the search itself must not:
 
 WSClean and R2D2 runs never merge with each other, nor do runs with a
 different `--metric` / `NS_METRIC` or a different prior box (the prior box is
-`PARAMETER_SPACE` in `scripts/lib/nested_sampling/poc_common.py`, copied into
-every `poc-summary.json` as `parameter_space`).
+`PARAMETER_SPACE` in `scripts/lib/nested_sampling/common.py`, copied into
+every `summary.json` as `parameter_space`).
 
 With no directories, every completed source run under
-`results/nested-sampling-poc/` is grouped by the must-match fields above
+`results/nested-sampling/` is grouped by the must-match fields above
 and one merged directory is written per group of 2+. Incomplete dirs,
 previous merges (`merged_from`), and singleton groups are skipped.
 Zero groups of 2+ exits non-zero. `--out` is only valid with an explicit
@@ -426,16 +426,16 @@ uv run scripts/merge-nested-sampling-runs.py
 ./ri merge
 
 uv run scripts/merge-nested-sampling-runs.py \
-  results/nested-sampling-poc/r2d2-vlaa-AAA \
-  results/nested-sampling-poc/r2d2-vlaa-BBB
+  results/nested-sampling/r2d2-vlaa-AAA \
+  results/nested-sampling/r2d2-vlaa-BBB
 
-./ri merge results/nested-sampling-poc/r2d2-vlaa-AAA results/nested-sampling-poc/r2d2-vlaa-BBB
+./ri merge results/nested-sampling/r2d2-vlaa-AAA results/nested-sampling/r2d2-vlaa-BBB
 ```
 
-Writes `results/nested-sampling-poc/<algorithm>-vlaa-merged-<UTC>/poc-summary.json`
+Writes `results/nested-sampling/<algorithm>-vlaa-merged-<UTC>/summary.json`
 (pass `--out DIR` on the explicit form to pick a different output directory).
 The explicit form refuses with a non-zero exit on fewer than two runs, a run
-missing `poc-summary.json` or `chains/`, or any must-match field above differing.
+missing `summary.json` or `chains/`, or any must-match field above differing.
 `polychord.nlive` in the merged summary is the sum of source nlives;
 `num_repeats` / `max_ndead` / `seed` stay a single value when all sources
 agree, else become a list. Pooled `evaluations` keep source argument order,

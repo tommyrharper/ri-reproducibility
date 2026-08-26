@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Algorithm-agnostic nested-sampling PoC helpers."""
+"""Algorithm-agnostic nested-sampling helpers."""
 
 from __future__ import annotations
 
@@ -807,10 +807,10 @@ def _connect_shell_started_worker() -> FifoWorker | None:
     meqserver, the first TDL compile and the first predict - and PolyChord asks
     every rank for a live point at once, so all of it used to land on the wall
     clock in front of evaluation one (~0.33s against a ~0.05s steady state).
-    run-nested-sampling-poc.sh makes one warm worker per rank the meqtrees
+    run-nested-sampling.sh makes one warm worker per rank the meqtrees
     container's own startup command instead, and this connects to it. Falling
     back to a rank-started worker is what happens when there is no pool - the
-    R2D2 PoC, or an OUTPUT_DIR outside the bind mount.
+    R2D2 run script, or an OUTPUT_DIR outside the bind mount.
     """
     fifo_dir = os.environ.get("NS_SIMULATE_FIFO_DIR")
     if not fifo_dir:

@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from poc_common import r2d2_docker_thread_env_flags
+from common import r2d2_docker_thread_env_flags
 
 
 def parse_args() -> argparse.Namespace:

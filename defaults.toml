@@ -7,7 +7,7 @@
 # stays overridable from the environment: a value here is only applied when
 # the variable is unset or empty, so
 #
-#     NS_SEED=7 make nested-sampling-poc
+#     NS_SEED=7 make nested-sampling
 #
 # still runs with seed 7. `{REPO_ROOT}` expands to the repository root.
 #
@@ -27,7 +27,7 @@ POLYCHORD_IMAGE = "ri-reproducibility/polychord:lite"
 CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
-# PolyChord sampler settings for the nested sampling proof of concept.
+# PolyChord sampler settings for the nested-sampling runs.
 # See docs/nested-sampling.md for what each one does.
 NS_NLIVE = 8
 NS_NUM_REPEATS = 2

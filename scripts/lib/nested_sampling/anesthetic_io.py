@@ -2,7 +2,7 @@
 """Shared anesthetic chain loading for the nested-sampling GUI and report.
 
 Understands both a plain PolyChord run directory and a merged run directory
-(``poc-summary.json`` with a ``merged_from`` list) written by
+(``summary.json`` with a ``merged_from`` list) written by
 ``scripts/merge-nested-sampling-runs.py``.
 """
 
@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling-poc"
+NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 
 # GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic). Mirrors
-# poc_common.PARAMETER_TEX_LABELS; duplicated (not imported) because this
-# module is also used host-side, where poc_common's astropy import isn't
+# PARAMETER_TEX_LABELS in common.py; duplicated (not imported) because this
+# module is also used host-side, where that module's astropy import isn't
 # installed.
 PARAMETER_TEX_LABELS = {
     "log10_dynamic_range": r"\mathrm{log}_{10}(\rho_{DR})",
@@ -46,7 +46,7 @@ def _similar_run_dirs(name: str) -> list[str]:
         if common >= 8 or name.rstrip("0123456789") == run or run.startswith(name[:16]):
             scored.append((common, run))
     scored.sort(key=lambda item: (-item[0], item[1]))
-    return [f"results/nested-sampling-poc/{run}" for _, run in scored[:5]]
+    return [f"results/nested-sampling/{run}" for _, run in scored[:5]]
 
 
 def find_chain_root(target: Path) -> Path:
@@ -119,7 +119,7 @@ def hide_empty_phys_live_birth(chain_root: Path) -> Iterator[None]:
 
 
 def _repo_root_from_run_dir(run_dir: Path) -> Path:
-    """run_dir is <repo_root>/results/nested-sampling-poc/<id>."""
+    """run_dir is <repo_root>/results/nested-sampling/<id>."""
     return run_dir.parents[2]
 
 
@@ -223,7 +223,7 @@ def weight_by_likelihood(samples):
 def load_nested_samples(run_dir: Path):
     """Load NestedSamples for a run directory, merging sources when needed."""
     run_dir = Path(run_dir).resolve()
-    summary_path = run_dir / "poc-summary.json"
+    summary_path = run_dir / "summary.json"
     merged_from = None
     param_names: list[str] = []
     if summary_path.is_file():
