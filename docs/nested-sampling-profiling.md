@@ -1035,7 +1035,9 @@ It now creates `<output-dir>/.simulate-workers` and `<output-dir>/.r2d2-workers`
 with one `<rank>.in`/`<rank>.out` pair each, and gives both sidecars a container
 command that spawns one worker per pair - the same
 `simulate_point_source_ms.py --serve --fifo <base>` line the WSClean script
-uses, and a new `r2d2_serve.py --fifo <base>`. The head start is everything the
+uses, and a new `r2d2_serve.py` (`--fifo <base>` at the time these numbers were
+taken; the subsection below replaced that with one `--fifo-dir` process that
+forks the pool). The head start is everything the
 run still has to do afterwards: the manifest, the PolyChord `docker run`,
 `mpirun`, `import pypolychord` and PolyChord's own setup. Measured
 (`NS_MPI_PROCS=8`, 38 evaluations, identical evaluation set and log(Z) to the
@@ -1064,6 +1066,40 @@ per-request work needs the request's parameters.
 `_connect_shell_started_worker()` now takes the name of the environment variable
 holding its pool directory, so `simulate_worker()` and `r2d2_worker()` share it;
 both keep the "spawn my own if there is no pool" fallback unchanged.
+
+#### The R2D2 pool forks from one warm-up instead of importing eight times
+
+Starting one `r2d2_serve.py --fifo <base>` interpreter per rank means eight
+`import torch` at the same moment, and they contend: measured inside the R2D2
+sidecar, `import optimiser, utils` is 0.885-0.899s on its own but 1.05-1.61s
+across eight concurrent interpreters. The sampler waits for the slowest, so the
+run paid the 1.61s, not the 0.89s.
+
+`r2d2_serve.py --fifo-dir <dir>` replaces the shell loop: it imports once, then
+forks one child per `<rank>.in`/`<rank>.out` pair in the directory and each child
+serves its pair exactly as `--fifo` did. Interleaved A/B, alternating the two
+run scripts (`NS_MPI_PROCS=8`, 38 evaluations, identical evaluation set in every
+run):
+
+| | End to end |
+|---|---:|
+| one interpreter per rank | 5.37s, 5.12s, 5.53s, 5.44s, 5.18s |
+| forked from one warm-up | 4.22s, 4.83s, 4.72s, 4.61s, 4.42s |
+
+Median pairwise saving ~0.8s, ~15% of the run. The children also share the
+~300MB of imports copy-on-write rather than holding a copy each, which is what
+makes the rank count cheap to raise.
+
+One thing the fork breaks and has to put back: a child starts a fresh
+`ru_maxrss` counter even though it starts holding all of the parent's resident
+pages, so the same imaging request reported 196MB from a pool worker against
+303MB from a worker that had imported for itself. `serve_pool()` records the
+warm-up's high-water mark before forking and `peak_memory_bytes()` returns the
+larger of that and the worker's own, which brings it back to 302MB - the metric
+`poc-summary.json` records is unchanged in meaning. `--self-check`'s
+`self_check_serve_pool()` guards both halves: it asserts the warm-up ran exactly
+once for two workers, and that a 64MB allocation made only during that warm-up
+still shows up in a child's reply.
 
 ### Sidecar containers run with `--network none`
 

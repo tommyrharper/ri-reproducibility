@@ -55,10 +55,11 @@ done
 # not a host path.
 #
 # Both containers run one worker per rank as their own command instead of the
-# default `sleep infinity`. Neither worker can answer for a while after it
-# starts - ~0.5s of Timba, meqserver, the first TDL compile and the first
-# predict for simulate, ~1.3s of `import torch` and the R2D2 modules for
-# imaging - and PolyChord asks every rank for its first live point at the same
+# default `sleep infinity` - the meqtrees one as a worker per FIFO pair, the
+# R2D2 one as a single process that imports torch once and forks the pool.
+# Neither worker can answer for a while after it starts - ~0.5s of Timba,
+# meqserver, the first TDL compile and the first predict for simulate, ~0.9s of
+# `import torch` and the R2D2 modules for imaging - and PolyChord asks every rank for its first live point at the same
 # moment, so all of it used to land on the wall clock inside evaluation one
 # (measured ~2.3s of imaging on evaluation one against a ~0.25s steady state).
 # Started as the containers' commands it runs while the PolyChord container, the
@@ -67,7 +68,7 @@ done
 # run` has returned, ~0.1s after the container's command has already started,
 # and head start is the entire point here.
 #
-# The single quotes are deliberate: $1, $2 and ${fifo} are for the container's
+# The single quotes are deliberate: $1, $2 and ${fifo} are for the containers'
 # own sh, which gets its arguments below, not for this one.
 # shellcheck disable=SC2016
 sidecar_launch "${PLATFORM}" "${MEQTREES_IMAGE}" -- sh -c '
@@ -88,10 +89,7 @@ sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
   -e MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -- sh -c '
-  for fifo in "$1"/*.in; do
-    [ -e "${fifo}" ] || continue
-    python3 "$2" --fifo "${fifo%.in}" &
-  done
+  python3 "$2" --fifo-dir "$1" &
   exec sleep infinity
 ' sh "${R2D2_FIFO_DIR}" "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py"
 # The PolyChord container joins the sidecars: `docker run` of it costs ~0.7s

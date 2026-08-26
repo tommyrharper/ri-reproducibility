@@ -100,7 +100,8 @@ Before a full end-to-end run, validate the MS-to-`.mat` bridge:
 concurrently, each with its own `r2d2_serve.py` imaging worker inside the
 shared R2D2 sidecar and its own simulate worker inside the MeqTrees one. Both
 pools are started by their container's own command, over one FIFO pair per rank,
-before the PolyChord container exists (see "R2D2 imaging runs in a long-lived
+before the PolyChord container exists - the imaging pool as one `--fifo-dir`
+process that imports torch once and forks a worker per pair (see "R2D2 imaging runs in a long-lived
 worker" and "The workers are started by the container, not by the ranks" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)). The workers get
 OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
