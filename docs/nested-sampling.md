@@ -422,6 +422,19 @@ to `savefig`. Corner plot 0.57s -> 0.53s, five-run cold build 1.55s -> 1.51s
 in-container and 4% less CPU (7% at twenty runs), with byte-identical PNGs.
 Best-effort like the rest.
 
+Saving the finished figure repeated a pass too. `savefig(bbox_inches="tight")`
+cannot trust the artist positions it is handed - a layout engine may still be
+pending - so it walks the whole figure once in a draw-disabled pass before
+measuring the box. After `fig.tight_layout()` both reasons are already spent:
+the layout has run, and all it leaves behind is a do-nothing placeholder engine.
+`tight_bbox()` in `scripts/lib/generate_report.py` clears the engine, measures
+the box itself and hands `savefig` a `Bbox` instead of the string, which drops
+that pass. Save 0.108s -> 0.083s, corner plot 0.572s -> 0.545s, five-run cold
+build 1.51s -> 1.47s in-container and 3% less CPU, with byte-identical PNGs.
+Unlike the caches above this only ever asks matplotlib to do less, so there is
+nothing to degrade gracefully; `_self_check_tight_bbox` asserts the two save
+paths still produce the same bytes.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the

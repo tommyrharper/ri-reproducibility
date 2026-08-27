@@ -124,6 +124,21 @@ IMAGE_SUBDIR = "images"
 image_dir = None  # set by main(); the self-checks point it at a temp dir
 
 
+def tight_bbox(fig):
+    """The box `savefig(bbox_inches="tight")` would measure, without its extra pass.
+
+    savefig can't trust the artist positions it is handed - a layout engine may
+    still be pending - so before measuring a "tight" box it walks the whole
+    figure once in a draw-disabled pass. After `fig.tight_layout()` that is
+    wasted work: the layout has run and all it left behind is a do-nothing
+    placeholder engine. Clear the engine and hand savefig the measured box, and
+    the pass goes away for a byte-identical PNG (~20% of the corner plot's save).
+    """
+    fig.set_layout_engine(None)
+    pad = plt.rcParams["savefig.pad_inches"]
+    return fig.get_tightbbox().padded(pad, pad)
+
+
 def figure_to_png_bytes(fig, **savefig_kw):
     buf = io.BytesIO()
     # compress_level=1: zlib's default (6) costs roughly double the CPU on these
@@ -578,7 +593,7 @@ def _render_likelihood_png(run_dir, param_names):
             grid = samples.plot_2d(plot_params, kind=kind, **extra)
             fig = grid.iloc[0, 0].figure
             fig.tight_layout()
-            return figure_to_png_bytes(fig, bbox_inches="tight")
+            return figure_to_png_bytes(fig, bbox_inches=tight_bbox(fig))
         except Exception:
             pass
     return None
@@ -1915,6 +1930,23 @@ def _self_check_tick_memo():
     plt.close(fig)
 
 
+def _self_check_tight_bbox():
+    """tight_bbox must reproduce what savefig(bbox_inches="tight") measures."""
+    load_plot_libs()
+
+    def draw():
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [0, 1000])
+        ax.set_xlabel("x label")
+        fig.tight_layout()
+        return fig
+
+    fig = draw()
+    assert figure_to_png_bytes(fig, bbox_inches=tight_bbox(fig)) == figure_to_png_bytes(
+        draw(), bbox_inches="tight"
+    ), "tight_bbox does not match bbox_inches='tight'"
+
+
 def _self_check_labels_map_memo():
     """The labels-map memo must hit while the frame's columns are unchanged and
     miss once a new column swaps the Index out, so a stale mapping can't stick."""
@@ -1978,6 +2010,7 @@ if __name__ == "__main__":
         _self_check_page_status()
         _self_check_tick_housekeeping()
         _self_check_tick_memo()
+        _self_check_tight_bbox()
         _self_check_labels_map_memo()
         _self_check_drop_labels_memo()
         print("generate_report self-check passed")
