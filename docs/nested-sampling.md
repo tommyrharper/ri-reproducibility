@@ -347,14 +347,23 @@ What each line is reading, and why it is worth a line:
   stuck at once.
 - **activity** - the overall rate, and the rate over the last 50 evaluations
   when the two have diverged. A run can collapse to a fraction of its own
-  throughput without ever going quiet for long enough to look stalled, and
-  that state passes every other check here: measured on a live 16-rank R2D2
-  search, 25/min fell to 5/min for several minutes with 15 of 16 ranks burning
-  a core behind the one still working, while evaluations kept landing every
-  20-30s. Warned on when the recent median gap is more than 4x the run's own.
-  A falling rate does **not** imply the evaluations got harder - on that run
-  per-evaluation cost was falling at the same time, because the search was
-  converging on cheaper parameters.
+  throughput without ever going quiet long enough to look stalled, and that
+  state passes every other check here: on a live 16-rank R2D2 search, 25/min
+  fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
+  Both numbers are shown and **neither is warned on**, because the same run
+  then recovered to 37/min with nothing done to it - five minute bins of 104,
+  23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
+  grounds for telling anyone to act.
+
+  Two things not to conclude from a falling rate. It does not mean the
+  evaluations got harder: on that run per-evaluation cost was *falling* at the
+  same time, because the search was converging on cheaper parameters. And
+  whether it means stragglers is answered by the spread of
+  `metrics.json` `timing.image_container_seconds`, not by the rate - a fat
+  tail is one slow evaluation gating a batch, while a tight distribution (that
+  run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means the missing wall
+  clock is going somewhere other than the likelihood, into sampler overhead,
+  contention or synchronisation. The two want different responses.
 - **ranks** - found by the `--output-dir` they were launched with, so no ranks
   means no run. `busy-waiting` counts the ranks that spent a whole one-second
   sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective
@@ -363,10 +372,14 @@ What each line is reading, and why it is worth a line:
   rank got stuck. (Cumulative CPU over the process's whole life does not: a run
   that works for an hour and then wedges still reads under any threshold for
   most of another hour, because the real work already done outweighs the
-  spinning.) On its own this is not a fault - measured on a healthy 16-rank
-  R2D2 run, 7 ranks sit at 1.0 at any moment, waiting for whichever peers are
-  still imaging. It is reported as a deadlock only when all but one are burning
-  CPU **and** nothing has completed for a minute.
+  spinning.) On its own the count means nothing, and not just because some
+  spinning is normal: on one healthy 16-rank R2D2 run it measured 7, then 15,
+  then 1 over the course of an hour, each reading stable across repeated
+  samples, as the sampler alternated between imaging in parallel and
+  synchronising. A single sample lands wherever the phase happens to be. So it
+  is reported as a deadlock only when all but one are burning CPU **and**
+  nothing has completed for a minute - and it is that second clause that does
+  the work.
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real

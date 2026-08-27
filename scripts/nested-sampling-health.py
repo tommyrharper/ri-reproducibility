@@ -79,15 +79,12 @@ DEFAULT_STALE_SECONDS = 600.0
 # something well inside a minute.
 SPIN_IDLE_SECONDS = 60.0
 
-# Evaluations in the "how is it going now" window, and how much slower than the
-# run's own median that window may get before it is worth saying so. A run can
-# collapse to a fraction of its own throughput without ever going quiet for
-# long enough to look stalled - measured on a live 16-rank R2D2 search, 25/min
-# fell to 5/min for seven minutes with 15 of 16 ranks burning a core behind one
-# that was working, while evaluations kept landing every 20-30s. Every other
-# check here passed it. Four times is a collapse, not a drift.
+# Evaluations in the "how is it going now" window, and how far it has to
+# diverge from the run's own median before both numbers are worth printing
+# rather than one. Half again is enough: the two agreeing is the normal case
+# and says nothing, so any real divergence is the interesting reading.
 RATE_WINDOW = 50
-RATE_COLLAPSE_FACTOR = 4.0
+RATE_DIVERGENCE_FACTOR = 1.5
 
 # A gap between consecutive evaluations counts as a stall when it is this many
 # times the run's own median gap. Relative because the two imagers are two
@@ -445,12 +442,14 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     if status == "stopped":
         warnings.append(f"stopped before finishing; continue it with ./ri resume {run_dir.name}")
     # All but one, because rank 0 is PolyChord's administrator and does nothing
-    # else - and only once evaluations have stopped landing. Busy-waiting on
-    # its own is not a fault: measured on a healthy 16-rank R2D2 run, 7 ranks
-    # sit at exactly 1.0 at any moment, waiting in the collective for whichever
-    # ranks are still imaging, and the moment before the last one finishes
-    # every rank but that one is doing it. What is not normal is all of them
-    # doing it while nothing completes.
+    # else - and only once evaluations have stopped landing, which is the
+    # clause doing the real work here. The spin count on its own says nothing:
+    # on one healthy 16-rank R2D2 run it was measured at 7, then 15, then 1
+    # over the course of an hour, each reading stable across repeated samples,
+    # as the sampler alternated between imaging in parallel and synchronising.
+    # A single sample can land anywhere in that range, so all-but-one spinning
+    # is a coin flip on timing rather than a fault. What no phase of a working
+    # run produces is a minute with nothing completed.
     if ranks and spinning >= max(1, len(ranks) - 1) and idle is not None \
             and idle > SPIN_IDLE_SECONDS:
         warnings.append(
@@ -458,22 +457,17 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"completed in {idle:.0f}s - the signature of every rank spinning in "
             "one MPI collective"
         )
-    # A run can collapse to a fraction of its own throughput without ever going
-    # quiet long enough to look stalled, so this is deliberately not ANDed with
-    # the spin count above: ranks all spinning behind one that works and a host
-    # too loaded to give the run its cores are both worth saying, and they have
-    # opposite spin signatures. Only for a live run - a finished run's slow tail
-    # is history, not something to act on.
-    slowdown = scan["slowdown_factor"]
-    if ranks and slowdown is not None and float(slowdown) > RATE_COLLAPSE_FACTOR:
-        detail = (f", with {spinning} of {len(ranks)} ranks burning CPU"
-                  if spinning >= max(1, len(ranks) - 1) else "")
-        warnings.append(
-            f"throughput has fallen to {1 / float(slowdown):.0%} of this run's own "
-            f"median - {scan['recent_evals_per_minute']:.1f}/min over the last "
-            f"{RATE_WINDOW} evaluations against {scan['evals_per_minute']:.1f}/min "
-            f"overall{detail}"
-        )
+    # Throughput is measured and shown but deliberately not warned on. A run
+    # can collapse to a fraction of its own rate without ever going quiet long
+    # enough to look stalled - a live 16-rank R2D2 search fell from ~25/min to
+    # ~5/min for ten minutes, passing every check here - so silence would hide
+    # it. But the same run then recovered to ~37/min with nothing done to it:
+    # five minute bins of 104, 23, 26, 93 against a 104-165 baseline. One
+    # observed dip, one observed recovery, and no established trigger, is not
+    # enough to tell a human that something needs doing. Showing the number and
+    # letting them judge is what the evidence supports; warning on a phase that
+    # heals itself would teach them to ignore the warnings that do not.
+    #
     # A tenth of the run, not a twentieth: a few percent is the ordinary spread
     # of evaluation cost across the parameter space, and the deadlock this
     # number exists to catch cost 23-27% before the watchdogs absorbed it.
@@ -554,11 +548,13 @@ def render(run: dict[str, object]) -> None:
                      f"last evaluation {format_hms(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_hms(float(run['span_seconds']))}"
                         if rate else "")
-                     # Only when the run has changed pace materially: the two
-                     # numbers agreeing is the normal case and says nothing.
+                     # Only when the run has changed pace materially, in either
+                     # direction: the two numbers agreeing says nothing.
                      + (f" ({run['recent_evals_per_minute']:.1f}/min over the last "
                         f"{RATE_WINDOW})"
-                        if slowdown is not None and float(slowdown) > 2.0 else "")),
+                        if slowdown is not None and (
+                            float(slowdown) > RATE_DIVERGENCE_FACTOR
+                            or float(slowdown) < 1 / RATE_DIVERGENCE_FACTOR) else "")),
         ("ranks", ranks),
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE, "
                      f"{run['meqserver_wedges']} meqserver wedges recovered"),
@@ -661,7 +657,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def self_check() -> None:
+    import contextlib
+    import io
     import tempfile
+
+    def io_capture(report: dict[str, object]) -> str:
+        """What render() prints for a run, so the report lines can be asserted on."""
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            render(report)
+        return sink.getvalue()
 
     global NESTED_SAMPLING_DIR
     saved = NESTED_SAMPLING_DIR
@@ -798,18 +803,21 @@ def self_check() -> None:
                                                                    str(collapsed.resolve())))
                                for r in ranks]
             report = describe(collapsed, collapsed_ranks, DEFAULT_STALE_SECONDS, spinning)
-            # Not stalled: something landed 12s ago, well inside every timeout.
+            # Not stalled: something landed seconds ago, well inside every
+            # timeout - which is exactly why the rate had to be measured.
             assert report["status"] == "healthy", report
             assert float(report["last_activity_seconds"]) < SPIN_IDLE_SECONDS, report
             assert abs(float(report["slowdown_factor"]) - 12) < 1, report
-            assert any("throughput has fallen" in w for w in report["warnings"]), report
-            # The same collapse with no ranks left is history, not something to
-            # act on, and must not be warned about.
-            assert not any("throughput" in w for w in
-                           describe(collapsed, [], DEFAULT_STALE_SECONDS)["warnings"])
-            # A run holding its pace says nothing about throughput at all.
-            assert not any("throughput" in w for w in
-                           describe(live, ranks, DEFAULT_STALE_SECONDS, working)["warnings"])
+            assert abs(float(report["recent_evals_per_minute"]) - 5) < 0.5, report
+            # Measured and shown, never warned on: a run that halves its pace
+            # and recovers is a phase, and warning on it would teach the reader
+            # to ignore the warnings that mean something.
+            assert not any("throughput" in w for w in report["warnings"]), report
+            rendered = io_capture(report)
+            assert "5.0/min over the last 50" in rendered, rendered
+            # A run holding its pace prints one rate, not two.
+            steady = describe(live, ranks, DEFAULT_STALE_SECONDS, working)
+            assert "over the last" not in io_capture(steady), io_capture(steady)
             # Too few evaluations to compare a window against a history: no
             # ratio at all rather than one drawn from a handful of gaps.
             assert describe(live, ranks, DEFAULT_STALE_SECONDS)["slowdown_factor"] is None
