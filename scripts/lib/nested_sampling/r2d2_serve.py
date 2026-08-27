@@ -155,9 +155,10 @@ def patch_nufft_plans() -> None:
 
     `finufft`'s simple interface - the one pytorch_finufft calls - creates a
     plan, sets the sampling points on it and destroys it again on every single
-    transform. An evaluation applies the same trajectory tens of times (29
-    Lanczos matvecs, 61 transforms, before the UNet passes even start), so all
-    of that setup is repetition: 0.018s of the 0.063s an operator norm costs.
+    transform. An evaluation applies the same trajectory tens of times (~21
+    Lanczos matvecs, ~45 transforms, before the UNet passes even start), so all
+    of that setup is repetition: measured at 0.018s of the 0.063s an operator
+    norm cost when this landed, at the 29 matvecs `tol=1e-5` then took.
     Keeping one plan per (operator, transform type) measured a forward/adjoint
     pair at 0.99ms against 1.89ms.
 
@@ -233,9 +234,16 @@ def lanczos_largest_eigenvalue(matvec, size: int, dtype, max_restarts: int = 100
 
     `matvec` maps a flat vector to `A x`. ARPACK's Lanczos builds a Krylov
     subspace, so it converges on a clustered spectrum where a power iteration
-    crawls: measured on this parameter space it is 25-40 operator applications
-    against the 39-305 the power iteration takes, and lands within 1e-10 of the
-    true value against the power iteration's 1e-4.
+    crawls: measured on this parameter space it is 17-25 operator applications
+    against the 39-305 the power iteration takes, and lands within ~3e-6 of the
+    true value against the power iteration's ~1e-4.
+
+    `tol` is 1e-3, not the 1e-5 this started at: the answer only scales the
+    operator, so upstream's own ~1e-4 is the accuracy that has to be beaten, and
+    over 24 real operators from this parameter space 1e-5 cost 28.7 applications
+    on average (max 33) for a 9e-11 median error where 1e-3 costs 21.2 (max 25)
+    for 2.9e-6. Going further is where it stops being free - 1e-2 is 16.8
+    applications but a 4.9e-4 median error, i.e. worse than the power iteration.
 
     The start vector is `ones`, not a random draw: with no seeding the upstream
     power iteration gives a different answer, and takes a different number of
@@ -253,7 +261,7 @@ def lanczos_largest_eigenvalue(matvec, size: int, dtype, max_restarts: int = 100
         k=1,
         which="LA",
         ncv=8,
-        tol=1e-5,
+        tol=1e-3,
         maxiter=max_restarts,
         v0=np.ones(size, dtype=dtype),
         return_eigenvectors=False,
@@ -536,7 +544,6 @@ def self_check_lanczos_largest_eigenvalue() -> None:
     basis = np.linalg.qr(rng.standard_normal((size, size)))[0]
     matrix = (basis * spectrum) @ basis.T
     largest = lanczos_largest_eigenvalue(lambda v: matrix @ v, size, np.float64)
-    assert abs(largest - 1.0) < 1e-7, largest
 
     # The same 1e-5 relative-change test upstream uses, for the comparison the
     # patch exists to make.
@@ -550,6 +557,11 @@ def self_check_lanczos_largest_eigenvalue() -> None:
             break
         previous, vector = value, vector / value
     assert abs(value - 1.0) > 1e-4, f"the power iteration was accurate in {applications}; pick a harder spectrum"
+    # Against the power iteration rather than against an absolute number: this
+    # spectrum is the worst case the patch is aimed at, and `tol` is a knob that
+    # trades applications for accuracy, so what has to hold is the comparison
+    # the patch exists to win, not whichever digit today's `tol` happens to hit.
+    assert abs(largest - 1.0) < abs(value - 1.0) / 10, (largest, value)
     print("r2d2 op-norm self-check passed")
 
 
