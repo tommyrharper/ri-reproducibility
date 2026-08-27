@@ -651,6 +651,38 @@ metrics table. Corner plots are weighted by the raw log-likelihood (the
 failure score), not by nested-sampling posterior mass. Runs are ordered newest-first by the UTC timestamp in the
 run directory name.
 
+### Read the report from another machine
+
+Searches normally run on a headless remote host, where there is no browser to
+open `index.html` with. `./ri serve` puts the report behind an HTTP server:
+
+```bash
+./ri serve                  # loopback:8000
+./ri serve --port 9000      # [REPORT_PORT]
+./ri serve --bind 0.0.0.0   # [REPORT_BIND]
+```
+
+It binds to `127.0.0.1` and prints the tunnel command to run on your own
+machine:
+
+```bash
+ssh -N -L 8000:127.0.0.1:8000 <user>@<host>
+# then open http://localhost:8000/
+```
+
+Nothing on the remote host is exposed by this and no port is opened - the
+loopback bind means the server is only reachable through an SSH session that
+host already accepts, and the tunnel runs at your end. `--bind 0.0.0.0` opts
+out and serves the report, unauthenticated, to anything that can reach the
+host. The `ssh -L` line guesses the host address from `hostname -I`, which is
+right on a cloud box and wrong behind NAT; `REPORT_SSH_HOST` overrides it.
+
+The server is `python3 -m http.server` from the host's standard library -
+no Docker, no dependencies - and runs in the foreground until Ctrl-C. It is
+also why copying a single page off the host does not work: the pages link to
+sibling PNGs under `images/`, which is most of the report's bytes, so the whole
+directory has to travel together (`rsync -a`) or be served in place.
+
 ### Replay a run in anesthetic's GUI
 
 For an interactive nested-sampling replay (live points vs \(\ln X\), \(\beta\)

@@ -106,6 +106,12 @@ def do_report(args):
     return env, [["scripts/generate-report.sh"]]
 
 
+def do_serve(args):
+    return env_from(args, (("port", "REPORT_PORT"), ("bind", "REPORT_BIND"))), [
+        ["scripts/serve-report.sh"]
+    ]
+
+
 def do_profile(args):
     return {}, [uv("scripts/profile-nested-sampling-run.py", args.run,
                    *(["--json"] if args.json else []))]
@@ -282,6 +288,23 @@ def build_parser():
     report.add_argument("--upgrade", action="store_true",
                         help="rebuild pages written by an older report version "
                              "[UPGRADE=1]")
+
+    serve = add(
+        "serve", do_serve, "read the HTML report from another machine",
+        description=(
+            "Serve reports/nested-sampling-report/ over HTTP. Meant for the usual\n"
+            "case where the search runs on a headless remote host and the browser\n"
+            "is somewhere else.\n"
+            "\n"
+            "The server binds to loopback and prints the `ssh -L` line that\n"
+            "tunnels it to your own machine, so nothing here is exposed and no\n"
+            "port is opened. Runs in the foreground; Ctrl-C stops it."
+        ),
+    )
+    serve.add_argument("--port", type=int, help="port to listen on [REPORT_PORT]")
+    serve.add_argument("--bind", metavar="ADDRESS",
+                       help="address to bind; 0.0.0.0 skips the tunnel and serves the "
+                            "report unauthenticated to the network [REPORT_BIND]")
 
     profile = add("profile", do_profile, "per-stage timing for one run",
                   description="Break a finished run down by stage. Field meanings: "

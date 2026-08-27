@@ -91,6 +91,20 @@ check(
     plan("report")[0],
 )
 
+# `serve` defaults live in the script, not here, so an unset flag must stay out
+# of the environment rather than pin the port or the bind address.
+check(
+    "serve overrides only what was asked for",
+    ({"REPORT_PORT": "9000"}, [["scripts/serve-report.sh"]]),
+    plan("serve", "--port", "9000"),
+)
+
+check(
+    "serve with no flags leaves the environment alone",
+    {},
+    plan("serve")[0],
+)
+
 check(
     "smoke with no target runs both imagers",
     [["scripts/smoke-test-wsclean.sh"], ["scripts/smoke-test-r2d2.sh"]],

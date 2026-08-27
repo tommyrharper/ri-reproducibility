@@ -90,6 +90,7 @@ finished run down per stage:
 ```bash
 ./ri report             # all runs
 ./ri report --last 1    # newest run only
+./ri serve              # read the report from a browser on another machine
 ./ri plot gui           # interactive corner plots (needs a display)
 ./ri plot likelihood    # R2D2 vs WSClean overlay
 ```
@@ -112,6 +113,13 @@ is built as two concurrent processes - its corner plot and the rest of its
 page - so a full redraw scales with the cores you have. The report runs inside the r2d2 image (its astropy + matplotlib +
 anesthetic), so no host Python environment is needed. Details in
 `docs/nested-sampling.md` ("Run summary and reports").
+
+Searches usually run on a headless remote host, so there is often no
+browser there to open the index with. `./ri serve` serves the report
+directory over HTTP on loopback and prints the `ssh -L` line that tunnels
+it to your own machine - nothing on the host is exposed and no port is
+opened. Details in `docs/nested-sampling.md` ("Read the report from
+another machine").
 
 `./ri plot likelihood` (`scripts/plot-merged-likelihood-compare.py`) writes
 the merged-failure-score figures into `reports/`, which is where

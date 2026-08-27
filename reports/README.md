@@ -18,7 +18,9 @@ except this file and `manifests/.gitkeep` is generated and gitignored.
   r2d2 image (its astropy + matplotlib + anesthetic) via
   `scripts/generate-report.sh`, same approach as `scripts/plot-fits.sh`,
   so no host Python environment is needed. Open the index in a browser.
-  See `docs/nested-sampling.md` for the full description.
+  See `docs/nested-sampling.md` for the full description. `./ri serve`
+  serves this directory over HTTP for reading it from a browser on
+  another machine.
 
 - `merged-r2d2-wsclean-*.png` - the merged and side-by-side failure-score
   figures written by `scripts/plot-merged-likelihood-compare.py`, which is
