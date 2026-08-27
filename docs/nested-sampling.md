@@ -43,10 +43,24 @@ Once the containers are up, a status line tracks the search against its
 count, which is always higher since PolyChord's slice sampler makes several
 evaluations per accepted dead point), a percent, and an ETA extrapolated from
 the rate so far (`scripts/lib/progress-bar.sh`). With `--max-ndead <= 0` (run
-until the evidence tolerance is met, no fixed cap) there is no total to be a
-percent of, so it shows a bouncing bar and the dead-point rate instead. On a
-real terminal the line is pinned to the bottom via a scroll region, so
-PolyChord's own feedback scrolling past above it doesn't bury it; only drawn
+until the evidence tolerance is met, no fixed cap) there is no dead-point
+total to measure a percent against, but the evidence tolerance itself is a
+real number: PolyChord stops once the evidence still held by the live points
+drops below `precision_criterion` (0.001, PolyChord's own default - not
+currently exposed as a flag here) of the accumulated evidence
+([`nested_sampling.F90`](https://github.com/PolyChord/PolyChordLite/blob/master/src/polychord/nested_sampling.F90)'s
+`live_logZ(...) < log(precision_criterion) + RTI%logZ`). `_ns_evidence_pct`
+approximates that from `chains/*.stats` (accumulated `log(Z)`) and
+`chains/*_phys_live.txt` (the live points' current log-likelihoods),
+using a single-cluster estimate of the remaining prior volume
+(`-ndead/nlive`) in place of PolyChord's own per-cluster tracking - close
+enough to watch climb toward 100 without being a substitute for the run's
+own numbers, and it can reach the 100% clamp a little ahead of the run
+actually stopping, more so at small `--nlive`. Before the first dead point
+(no `.stats` or `phys_live.txt` yet) it falls back to a bouncing bar and the
+raw dead-point rate. On a real terminal the line is pinned to the bottom via
+a scroll region, so PolyChord's own feedback scrolling past above it doesn't
+bury it; only drawn
 on a TTY, so piped or logged runs are unaffected.
 
 ### WSClean

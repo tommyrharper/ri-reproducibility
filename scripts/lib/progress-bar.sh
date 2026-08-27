@@ -15,10 +15,10 @@
 # bury the line - the fix for a WSClean search producing dead points faster
 # than a human can read a scrolling counter.
 
-# Usage: run_with_progress <output_dir> <max_ndead> -- cmd args...
+# Usage: run_with_progress <output_dir> <max_ndead> <nlive> -- cmd args...
 run_with_progress() {
-  local output_dir="$1" max_ndead="$2"
-  shift 2
+  local output_dir="$1" max_ndead="$2" nlive="$3"
+  shift 3
   [ "${1:-}" = "--" ] && shift
 
   "$@" &
@@ -31,19 +31,19 @@ run_with_progress() {
     _ns_add_trap '_ns_pin_teardown' INT
     _ns_add_trap '_ns_pin_teardown' TERM
     while kill -0 "${pid}" 2>/dev/null; do
-      _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
+      _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
       sleep 1
     done
-    _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
+    _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
     _ns_pin_teardown
   elif [ -t 1 ]; then
     # No usable terminal control (e.g. tput/TERM missing): fall back to a
     # plain redrawn line instead of a pinned one.
     while kill -0 "${pid}" 2>/dev/null; do
-      printf '\r%s' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")")"
+      printf '\r%s' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
       sleep 1
     done
-    printf '\r%s\n' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")")"
+    printf '\r%s\n' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
   fi
 
   wait "${pid}"
@@ -145,8 +145,14 @@ _ns_format_hms() {
   printf '%d:%02d:%02d' $((s / 3600)) $(((s % 3600) / 60)) $((s % 60))
 }
 
+_ns_render_bar() {
+  local pct="$1" width="${2:-30}" filled
+  filled=$((pct * width / 100))
+  printf '%s%s' "$(printf '%*s' "${filled}" '' | tr ' ' '#')" "$(printf '%*s' $((width - filled)) '')"
+}
+
 _ns_status_line() {
-  local output_dir="$1" max_ndead="$2" start="$3"
+  local output_dir="$1" max_ndead="$2" nlive="$3" start="$4"
   local now elapsed dead_file dead_count eval_count
 
   now="$(date +%s)"
@@ -157,13 +163,20 @@ _ns_status_line() {
   eval_count="$(_ns_count_glob "${output_dir}/evaluations" 'eval-*')"
 
   # PolyChord treats max_ndead <= 0 as "no bound, stop on evidence tolerance
-  # instead" - there's no budget to measure a percent or ETA against.
+  # instead" - there's no dead-point budget to measure a percent or ETA
+  # against, but the tolerance itself is a real number we can approximate
+  # progress against instead (see _ns_evidence_pct).
   if [ "${max_ndead}" -le 0 ]; then
-    _ns_unbounded_line "${dead_count}" "${eval_count}" "${elapsed}"
+    local evidence_pct
+    if evidence_pct="$(_ns_evidence_pct "${output_dir}/chains" "${dead_count}" "${nlive}")"; then
+      _ns_evidence_line "${evidence_pct}" "${dead_count}" "${eval_count}" "${elapsed}"
+    else
+      _ns_unbounded_line "${dead_count}" "${eval_count}" "${elapsed}"
+    fi
     return
   fi
 
-  local pct eta bar_width filled bar
+  local pct eta bar
   pct=$((dead_count * 100 / max_ndead))
   [ "${pct}" -gt 100 ] && pct=100
 
@@ -174,9 +187,7 @@ _ns_status_line() {
     eta="0:00:00"
   fi
 
-  bar_width=30
-  filled=$((pct * bar_width / 100))
-  bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')$(printf '%*s' $((bar_width - filled)) '')"
+  bar="$(_ns_render_bar "${pct}" 30)"
 
   printf '[%s] %3d%%  %d/%d dead points (%d evaluations)  elapsed %s  eta %s' \
     "${bar}" "${pct}" "${dead_count}" "${max_ndead}" "${eval_count}" "$(_ns_format_hms "${elapsed}")" "${eta}"
@@ -184,7 +195,10 @@ _ns_status_line() {
 
 # A block bouncing back and forth across the bar, one step per elapsed
 # second, so a no-budget run still visibly ticks over instead of sitting
-# frozen. Position, not percent: there is nothing to be a percent of.
+# frozen. Position, not percent: there is nothing to be a percent of. Used
+# only until _ns_evidence_pct has enough data to give a real number (before
+# the first dead point, chains/*.stats and chains/*_phys_live.txt don't
+# exist yet).
 _ns_unbounded_line() {
   local dead_count="$1" eval_count="$2" elapsed="$3"
   local bar_width=30 period pos i
@@ -202,6 +216,75 @@ _ns_unbounded_line() {
 
   printf '[%s] %d dead points (%d evaluations)  rate %s  elapsed %s  (no --max-ndead cap, stopping on evidence tolerance)' \
     "${bar}" "${dead_count}" "${eval_count}" "${rate}" "$(_ns_format_hms "${elapsed}")"
+}
+
+_ns_evidence_line() {
+  local pct="$1" dead_count="$2" eval_count="$3" elapsed="$4"
+  local bar
+  bar="$(_ns_render_bar "${pct}" 30)"
+  printf '[%s] %3d%%  %d dead points (%d evaluations)  elapsed %s  (evidence tolerance, no --max-ndead cap)' \
+    "${bar}" "${pct}" "${dead_count}" "${eval_count}" "$(_ns_format_hms "${elapsed}")"
+}
+
+# PolyChord's stopping test (source: PolyChordLite's nested_sampling.F90 -
+# `live_logZ(...) < log(precision_criterion) + RTI%logZ`) is not currently
+# exposed as a --flag by this repo: neither polychord_wsclean.py nor
+# polychord_r2d2.py override it, so pypolychord's own default applies.
+# Update this if that ever changes.
+_NS_PRECISION_CRITERION=0.001
+
+_ns_stats_file() {
+  local chains_dir="$1" f
+  for f in "${chains_dir}"/*.stats; do
+    [ -e "${f}" ] && { echo "${f}"; return; }
+  done
+}
+
+_ns_phys_live_file() {
+  local chains_dir="$1" f
+  for f in "${chains_dir}"/*_phys_live.txt; do
+    [ -e "${f}" ] && { echo "${f}"; return; }
+  done
+}
+
+# Approximates how close an uncapped run (--max-ndead <= 0) is to PolyChord's
+# real stopping test, from the same output files ./ri report and
+# scripts/lib/nested_sampling/anesthetic_io.py already read: chains/*.stats
+# for the accumulated log(Z) and chains/*_phys_live.txt for the live points'
+# current log-likelihoods (last column of each row). PolyChord's own
+# live_logZ is logsumexp(live loglikes) - log(nlive) + logXp, where logXp
+# (the remaining prior volume) is tracked per-cluster internally; this
+# approximates it as a single global -ndead/nlive, the textbook single-
+# cluster expectation. Good enough to watch a number climb toward 100 - a
+# run whose live points split across several clusters (chains/*.stats'
+# `ncluster` line) will see this diverge further from PolyChord's own exact
+# per-cluster figure than a single-cluster run does.
+_ns_evidence_pct() {
+  local chains_dir="$1" dead_count="$2" nlive="$3"
+  local stats_file live_file logz
+  [ "${dead_count}" -gt 0 ] && [ "${nlive}" -gt 0 ] || return 1
+  stats_file="$(_ns_stats_file "${chains_dir}")"
+  live_file="$(_ns_phys_live_file "${chains_dir}")"
+  [ -n "${stats_file}" ] && [ -n "${live_file}" ] || return 1
+  logz="$(grep -m1 '^log(Z)' "${stats_file}" 2>/dev/null | awk '{print $3}')"
+  [ -n "${logz}" ] || return 1
+  awk -v logz="${logz}" -v ndead="${dead_count}" -v nlive="${nlive}" -v pc="${_NS_PRECISION_CRITERION}" '
+    { n++; ll[n] = $NF }
+    END {
+      if (n == 0) exit 1
+      max = ll[1]
+      for (i = 2; i <= n; i++) if (ll[i] > max) max = ll[i]
+      s = 0
+      for (i = 1; i <= n; i++) s += exp(ll[i] - max)
+      live_logz = (max + log(s)) - log(n) + (-ndead / nlive)
+      ratio = exp(live_logz - logz)
+      if (ratio <= 0) exit 1
+      pct = 100 * pc / ratio
+      if (pct > 100) pct = 100
+      if (pct < 0) pct = 0
+      printf "%d", pct
+    }
+  ' "${live_file}"
 }
 
 self_check() {
@@ -246,15 +329,17 @@ self_check() {
   # evaluations - that mismatch (dead points lag evaluations) is exactly the
   # R2D2 run that showed "29/12 dead points" before this used dead-birth.txt.
   local line
-  line="$(_ns_status_line "${tmp}" 12 "$(($(date +%s) - 60))")"
+  line="$(_ns_status_line "${tmp}" 12 8 "$(($(date +%s) - 60))")"
   case "${line}" in
     *"3/12 dead points (4 evaluations)"*) ;;
     *) echo "FAIL: status line dead/eval split: ${line}"; exit 1 ;;
   esac
 
   # max_ndead <= 0 has no budget to divide by - must not claim an ETA or a
-  # percent, but should still show a rate.
-  line="$(_ns_status_line "${tmp}" -1 "$(($(date +%s) - 90))")"
+  # percent, but should still show a rate, before chains/*.stats and
+  # chains/*_phys_live.txt exist (see the evidence-pct test below for once
+  # they do).
+  line="$(_ns_status_line "${tmp}" -1 8 "$(($(date +%s) - 90))")"
   case "${line}" in
     *eta*) echo "FAIL: unbounded max_ndead printed an eta: ${line}"; exit 1 ;;
   esac
@@ -281,6 +366,28 @@ self_check() {
   [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 29)")" = "29" ] || { echo "FAIL: bounce at t=29 (far end)"; exit 1; }
   [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 30)")" = "28" ] || { echo "FAIL: bounce at t=30 (reversed)"; exit 1; }
   [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 58)")" = "0" ] || { echo "FAIL: bounce at t=58 (full period)"; exit 1; }
+
+  # Once chains/*.stats and chains/*_phys_live.txt exist, an uncapped run
+  # (--max-ndead <= 0) should switch from the ambiguous bounce to a real
+  # percent, approximating PolyChord's own stopping test (nlive=2,
+  # ndead=10, both live points at loglike 0, log(Z)=0.0 -> 14%, checked by
+  # hand against the same formula this function implements).
+  printf 'log(Z)       =   0.0 +/-   0.1\n' >"${tmp}/chains/wsclean_vlaa.stats"
+  printf '0.1 0.2 0.0\n0.3 0.4 0.0\n' >"${tmp}/chains/wsclean_vlaa_phys_live.txt"
+  [ "$(_ns_evidence_pct "${tmp}/chains" 10 2)" = "14" ] || {
+    echo "FAIL: evidence pct: $(_ns_evidence_pct "${tmp}/chains" 10 2)"; exit 1
+  }
+  # _ns_status_line reads ndead from chains/*_dead-birth.txt itself, so match
+  # the 10 dead points the hand-computed 14% above assumes.
+  seq 1 10 >"${tmp}/chains/wsclean_vlaa_dead-birth.txt"
+  line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
+  case "${line}" in
+    *"14%"*"evidence tolerance"*) ;;
+    *) echo "FAIL: status line did not switch to evidence pct: ${line}"; exit 1 ;;
+  esac
+  # No dead points yet means no ndead/nlive to divide by - must fall back to
+  # the bounce rather than divide by zero or report a bogus percent.
+  _ns_evidence_pct "${tmp}/chains" 0 2 >/dev/null && { echo "FAIL: evidence pct with 0 dead points should fail"; exit 1; }
 
   # _ns_add_trap must append to an existing trap, not replace it - a naive
   # `trap ... EXIT` here would silently disable start-sidecars.sh's Docker
