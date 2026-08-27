@@ -1333,6 +1333,64 @@ operators and all failed:
   gap is so small that a power iteration started anywhere crawls. A tight
   reference run needs >2000 applications to reach 1e-9.
 
+### Each measurement operator keeps its FINUFFT plans
+
+With the operator norm down to ~29 Lanczos matvecs, what is left of an imaging
+request is 61 NUFFT transforms - and `finufft`'s *simple* interface, which
+`pytorch_finufft` calls, builds a plan, sets the sampling points on it and
+destroys it again on every one of them. The trajectory does not change between
+transforms, so all of that is repetition. `cProfile` of one warm request:
+
+| | calls | tottime |
+|---|---:|---:|
+| `finufft` `Plan.__init__` (`makeplan`) | 61 | 0.014s |
+| `finufft` `Plan.setpts` | 61 | 0.004s |
+| `finufft` `Plan.execute` (the actual transform) | 61 | 0.033s |
+
+`r2d2_serve.py`'s `patch_nufft_plans()` replaces `MeasOpPytorchFinufft._GA` and
+`._AtGt` with versions that build one plan per (operator, transform type) on
+first use and call `execute` on it thereafter, with the same
+`eps`/`isign`/`upsampfac`/`modeord` `pytorch_finufft` would have passed. It also
+drops the `torch.autograd.Function.apply` dispatch and the input checks around
+each transform, which eager inference has no use for. A non-CPU device or a
+batch of more than one image is not what the cached plan was built for and falls
+back to upstream. Like `patch_op_norm()` it is applied in `warm_imports()`, so
+every request on every pool worker gets it with no image rebuild.
+
+| | forward+adjoint pair | warm imaging request |
+|---|---:|---:|
+| plan per transform (upstream) | 1.81ms | 0.069s |
+| plan per operator | 1.25ms | 0.045s |
+
+Interleaved A/B of `scripts/run-nested-sampling-r2d2-poc.sh` end to end,
+`NS_MPI_PROCS=8`, alternating the two `r2d2_serve.py`, 10 pairs:
+
+| | median | min | `image_container_seconds` (380 evaluations) |
+|---|---:|---:|---|
+| plan per transform | 3.352s | 3.162s | sum 53.5s, median 0.135s, max 0.359s |
+| plan per operator | 3.063s | 2.983s | sum 37.7s, median 0.094s, max 0.324s |
+
+9 of 10 pairs to the cached plans, median pair difference 0.324s (-8.6% end to
+end, -29% of the imaging worker-seconds). All 20 runs report the same
+`log(Z) = 99.92878 +/- 0.06674`.
+
+The win is larger than the 0.018s of `makeplan`/`setpts` on its own because the
+imaging pool is CPU-bound with 8 workers on a 20-CPU host, so work removed from
+a worker is worth more than its solo cost.
+
+#### The transforms are the same bits, but FINUFFT's type 1 is not always
+
+Compared against upstream on a real evaluation's operator - 5616 sampling points
+on 128x128 - the patched forward and adjoint are bitwise equal and `get_op_norm`
+returns the identical double. That is not a property of the patch alone:
+FINUFFT's type 1 spreads onto the grid, and its thread partitioning makes the
+summation order vary between two *identical* calls once the points are sparse
+enough. Ten identical `nufft2d1` calls at 200 points on 16x16 spread 4e-16
+relative; at the PoC's own size they are exactly equal, ten times out of ten.
+Type 2 interpolates one output per point and is bitwise reproducible either way.
+So `--self-check`, whose operator is deliberately tiny, compares the forward
+exactly and the adjoint at `rtol=1e-12`.
+
 ### The imaging workers' OpenMP threads sleep between requests, they do not spin
 
 With the operator norm down to ~30 NUFFT pairs, an imaging request that takes

@@ -14,8 +14,9 @@ conversation happens over the FIFO pair `<base>.in` / `<base>.out` instead, and
 is what lets the run script start these workers as the R2D2 container's own
 command, before the ranks that will use them exist.
 
-The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve; see
-`patch_op_norm` below.
+The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve and gives each
+measurement operator one FINUFFT plan per transform type; see `patch_op_norm`
+and `patch_nufft_plans` below.
 
 Upstream's `src/imager.py` has no importable entry point (its whole body sits
 under `if __name__ == "__main__"`), so each request re-runs that body with
@@ -135,6 +136,7 @@ def warm_imports() -> None:
         try:
             runpy.run_path(str(IMAGER), run_name="__warmup__")
             patch_op_norm()
+            patch_nufft_plans()
             # `create_meas_op` imports its NUFFT backend inside the function,
             # so imager.py's import block does not reach it and every worker
             # paid it on request one instead: 0.165s against a 0.072s steady
@@ -146,6 +148,84 @@ def warm_imports() -> None:
             )
         except Exception:
             traceback.print_exc()
+
+
+def patch_nufft_plans() -> None:
+    """Build each operator's FINUFFT plans once instead of once per transform.
+
+    `finufft`'s simple interface - the one pytorch_finufft calls - creates a
+    plan, sets the sampling points on it and destroys it again on every single
+    transform. An evaluation applies the same trajectory tens of times (29
+    Lanczos matvecs, 61 transforms, before the UNet passes even start), so all
+    of that setup is repetition: 0.018s of the 0.063s an operator norm costs.
+    Keeping one plan per (operator, transform type) measured a forward/adjoint
+    pair at 0.99ms against 1.89ms.
+
+    Same library, same eps/isign/upsampfac/modeord, so this only removes
+    `makeplan`/`setpts`/`destroy` plus the autograd `Function.apply` dispatch
+    that eager inference has no use for; the transforms come back bit-identical
+    at this problem size. Anything the cached plans do not cover - a non-CPU
+    device, a batch of more than one image - falls back to upstream. Both are
+    under `no_grad`: the plan path detaches through numpy anyway, and this
+    worker only ever runs `imager.py`, which is inference.
+    """
+    import finufft
+    import numpy as np
+    import torch
+    from ri_measurement_operator.pysrc.measOperator.meas_op_nufft_pytorch_finufft import (
+        MeasOpPytorchFinufft,
+    )
+
+    forward, adjoint = MeasOpPytorchFinufft._GA, MeasOpPytorchFinufft._AtGt
+
+    def plan(self, nufft_type: int):
+        """This operator's plan for `nufft_type`, or None if upstream must run."""
+        if str(self._device or "cpu") != "cpu":
+            return None
+        plans = getattr(self, "_ri_nufft_plans", None)
+        if plans is None:
+            plans = {}
+            setattr(self, "_ri_nufft_plans", plans)
+        if nufft_type not in plans:
+            points = np.ascontiguousarray(self._traj.detach().numpy())
+            made = finufft.Plan(
+                nufft_type,
+                tuple(int(size) for size in self._img_size),
+                1,
+                # pytorch_finufft's defaults for both transform types, plus the
+                # two the operator passes itself. isign is -1 for type 1 too:
+                # pytorch_finufft overrides FINUFFT's +1 there.
+                eps=1e-6,
+                isign=-1,
+                dtype=torch.empty(0, dtype=self._dtype_meas).numpy().dtype,
+                upsampfac=2.0,
+                modeord=0,
+            )
+            made.setpts(points[0], points[1])
+            plans[nufft_type] = made
+        return plans[nufft_type]
+
+    @torch.no_grad()
+    def _GA(self, x: torch.Tensor) -> torch.Tensor:
+        image = x.view(x.shape[0], *x.shape[-2:]).squeeze(0)
+        cached = plan(self, 2) if image.ndim == 2 else None
+        if cached is None:
+            return forward(self, x)
+        values = cached.execute(np.ascontiguousarray(image.to(self._dtype_meas).numpy()))
+        return torch.from_numpy(values) * self._data_weight
+
+    @torch.no_grad()
+    def _AtGt(self, y: torch.Tensor) -> torch.Tensor:
+        values = y.conj() * self._data_weight
+        flat = values.reshape(-1, values.shape[-1])
+        cached = plan(self, 1) if flat.shape[0] == 1 else None
+        if cached is None:
+            return adjoint(self, y)
+        image = cached.execute(np.ascontiguousarray(flat[0].numpy()))
+        return torch.from_numpy(image).reshape(*values.shape[:-1], *self._img_size)
+
+    MeasOpPytorchFinufft._GA = _GA
+    MeasOpPytorchFinufft._AtGt = _AtGt
 
 
 def lanczos_largest_eigenvalue(matvec, size: int, dtype, max_restarts: int = 100) -> float:
@@ -473,6 +553,53 @@ def self_check_lanczos_largest_eigenvalue() -> None:
     print("r2d2 op-norm self-check passed")
 
 
+def self_check_nufft_plan_reuse() -> None:
+    """A cached plan must give bit-identical transforms to a per-call one.
+
+    Only runs inside the R2D2 image, where the measurement operator lives -
+    same command as the op-norm check above.
+    """
+    sys.path.insert(0, str(IMAGER.parent))
+    try:
+        import torch
+        from ri_measurement_operator.pysrc.measOperator.meas_op_nufft_pytorch_finufft import (
+            MeasOpPytorchFinufft,
+        )
+    except ImportError:
+        print("r2d2 nufft plan self-check skipped: no R2D2 measurement operator")
+        return
+
+    def operator():
+        torch.manual_seed(0)
+        points = (torch.rand(1, 1, 200, dtype=torch.float64) - 0.5) * 6.0
+        return MeasOpPytorchFinufft(u=points, v=points.flip(-1), img_size=(16, 16), dtype=torch.float64)
+
+    torch.manual_seed(1)
+    image = torch.randn(1, 1, 16, 16, dtype=torch.float64)
+    upstream = operator()
+    visibilities = upstream.forward_op(image)
+    adjoint = upstream.adjoint_op(visibilities)
+
+    patch_nufft_plans()
+    patched = operator()
+    # The forward transform interpolates off the grid, one output per sampling
+    # point, and is bitwise reproducible. The adjoint spreads onto the grid,
+    # where FINUFFT's own thread partitioning makes the summation order - and so
+    # the last bit or two - vary between two identical calls once the points are
+    # this sparse: 4e-16 relative over ten calls of upstream against itself at
+    # 200 points on 16x16, and exactly zero at the 5616-points-on-128x128 the
+    # PoC actually runs. Hence the tolerance on this one and not the other.
+    assert torch.equal(patched.forward_op(image), visibilities), "the cached plan changed the forward transform"
+    assert torch.allclose(patched.adjoint_op(visibilities), adjoint, rtol=1e-12, atol=0.0), (
+        "the cached plan changed the adjoint transform"
+    )
+    # A batch of more than one is not what the cached plan was built for, so it
+    # has to come back from upstream rather than silently image the first row.
+    batch = torch.cat((visibilities, -visibilities), dim=0)
+    assert torch.allclose(patched.adjoint_op(batch), upstream.adjoint_op(batch), rtol=1e-12, atol=0.0)
+    print("r2d2 nufft plan self-check passed")
+
+
 def self_check_lazy_utils() -> None:
     """A name must resolve to the same value, and no later submodule than needed."""
     import tempfile
@@ -513,6 +640,7 @@ def self_check_lazy_utils() -> None:
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_lanczos_largest_eigenvalue()
+        self_check_nufft_plan_reuse()
         self_check_lazy_utils()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
