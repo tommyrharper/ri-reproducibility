@@ -38,7 +38,13 @@ Four things it checks, each one a way a run has actually gone wrong here:
   process carrying the run directory, because a rank is ~10MB and the imager
   worker behind it is ~3.3GB.
 
-Plus the host: memory, and sidecar containers whose run is gone. A killed run
+* **Cost, again, on disk.** The one resource nothing here reserves, checks or
+  frees, and the only one that only ever grows: an evaluation directory keeps
+  its measurement set and the imager's output, ~1.7MB, and nothing deletes it.
+  A live R2D2 run writes ~2.6GB/hour, so the run's own rate against the free
+  space is the only warning available before it ends on ENOSPC.
+
+Plus the host: memory, free disk, and sidecar containers whose run is gone. A killed run
 leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank. The next
 run frees those itself before it sizes itself, so this is here to explain where
 the host's memory went, not as a chore.
@@ -148,6 +154,21 @@ MIN_STALL_GAP_SECONDS = 2.0
 # rank-budget.sh's NS_RANK_BUDGET_HEADROOM_MB. Reported, not enforced: it is
 # the line under which the next run will refuse to size itself.
 HEADROOM_MB = 4096
+
+# Disk is the one resource nothing here reserves, checks or frees, and the only
+# one that only ever grows: an evaluation directory keeps its measurement set,
+# its .mat and the imager's output, ~1.7MB on this host, and nothing deletes
+# it. A live R2D2 run writes ~2.6GB/hour and a WSClean run 18GB over a few, so
+# a multi-day search on a 233GB filesystem is a plausible ENOSPC and there is
+# no other place that would say so first.
+#
+# Measured from a sample rather than a walk: `du -s` on one live run directory
+# cost 3-5s of I/O against the disk the run is using, which is not what a
+# read-only health check should do to it. Twenty of the newest evaluations,
+# which cost milliseconds, since what varies between them is imager output size
+# and not the shape of the directory.
+DISK_SAMPLE = 20
+DISK_WARN_HOURS = 12.0
 
 
 # --- host state: one `ps`, one `docker ps` ----------------------------------
@@ -326,6 +347,39 @@ def history(times: list[float]) -> dict[str, object] | None:
     }
 
 
+def _dir_bytes(path: Path) -> int:
+    """A directory tree's disk usage, counted as `du` counts it.
+
+    Allocated blocks rather than st_size: an evaluation holds a measurement
+    set, which is a directory of many small files, so apparent size understates
+    what the filesystem actually gave it.
+    """
+    total = 0
+    stack = [path]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue  # swept, or being written as this walks
+        for entry in entries:
+            try:
+                total += entry.stat(follow_symlinks=False).st_blocks * 512
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+            except OSError:
+                continue
+    return total
+
+
+def free_bytes(path: Path) -> tuple[int, int] | None:
+    """(free, total) on the filesystem holding `path`, or None if it cannot say."""
+    try:
+        fs = os.statvfs(path)
+    except (OSError, AttributeError):
+        return None
+    return fs.f_bavail * fs.f_frsize, fs.f_blocks * fs.f_frsize
+
+
 def evaluation_scan(run_dir: Path) -> dict[str, object]:
     """Counts, timings and failures, in one pass over evaluations/.
 
@@ -335,9 +389,10 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     """
     evaluations = run_dir / "evaluations"
     directories = 0
-    # (when it landed, whether it failed), kept paired so that "how the run is
-    # going now" can be asked of failures as well as of pace.
-    records: list[tuple[float, bool]] = []
+    # (when it landed, whether it failed, where it is), kept together so that
+    # "how the run is going now" can be asked of failures as well as of pace,
+    # and so the newest few can be measured for size without a second glob.
+    records: list[tuple[float, bool, Path]] = []
     wedged_lines = 0
     for entry in evaluations.glob("eval-*"):
         if not entry.is_dir():
@@ -346,7 +401,8 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         metrics = entry / "metrics.json"
         try:
             records.append((metrics.stat().st_mtime,
-                            FAILURE_OBJECTIVE_MARKER in metrics.read_text()))
+                            FAILURE_OBJECTIVE_MARKER in metrics.read_text(),
+                            entry))
         except OSError:
             pass  # in flight, or a leftover the next run will sweep
         try:
@@ -354,9 +410,9 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         except OSError:
             pass
     records.sort()
-    times = [when for when, _ in records]
-    failed = sum(1 for _, bad in records if bad)
-    recent_failed = (sum(1 for _, bad in records[-RATE_WINDOW:] if bad)
+    times = [when for when, _, _ in records]
+    failed = sum(1 for _, bad, _ in records if bad)
+    recent_failed = (sum(1 for _, bad, _ in records[-RATE_WINDOW:] if bad)
                      if len(records) >= RATE_WINDOW else None)
     gaps = [b - a for a, b in zip(times, times[1:])]
     threshold = MIN_STALL_GAP_SECONDS
@@ -392,6 +448,19 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         recent_rate = 60 / recent if recent > 0 else None
         slowdown = recent / overall if overall > 0 else None
 
+    # Spread over the run's life rather than taken from its tail. An
+    # evaluation's size follows its parameters, and a nested-sampling run
+    # concentrates on a shrinking region, so the newest evaluations drift away
+    # from the run's own average: newest-20 read 1.45MB against a true 1.68MB
+    # on the live R2D2 run here, while an even stride of 20 read 1.70MB.
+    # Strided rather than random so the number does not move between two
+    # readings of an unchanged run.
+    stride = max(1, len(records) // DISK_SAMPLE)
+    sample = [where for _, _, where in records[::stride]]
+    per_evaluation = (statistics.mean(_dir_bytes(where) for where in sample)
+                      if sample else None)
+    rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
+
     return {
         "completed": len(times),
         "in_flight": directories - len(times),
@@ -399,9 +468,12 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "last_activity_seconds": time.time() - times[-1] if times else None,
         "span_seconds": span,
         "recent_failed": recent_failed,
-        "evals_per_minute": (len(times) * 60 / span
-                             if span >= MIN_RATE_SPAN_SECONDS else None),
+        "evals_per_minute": rate,
         "recent_evals_per_minute": recent_rate,
+        "bytes_per_evaluation": per_evaluation,
+        "disk_bytes": per_evaluation * len(times) if per_evaluation else None,
+        "disk_bytes_per_hour": (per_evaluation * rate * 60
+                                if per_evaluation and rate else None),
         "history": history(times),
         "slowdown_factor": slowdown,
         "stall_threshold_seconds": threshold,
@@ -684,6 +756,21 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"{scan['stall_fraction']:.0%} of wall clock lost to gaps over "
             f"{scan['stall_threshold_seconds']:.0f}s"
         )
+    # Nothing reserves disk, nothing frees it, and no evaluation directory is
+    # ever deleted, so the only warning available is the run's own write rate
+    # against what the filesystem has left. Asked only of a run that is still
+    # writing: a finished run's GB are already spent and its rate is history.
+    space = free_bytes(run_dir)
+    per_hour = scan["disk_bytes_per_hour"]
+    disk_hours = None
+    if space is not None and per_hour and status in ("healthy", "starting", "stalled"):
+        disk_hours = space[0] / float(per_hour)
+        if disk_hours < DISK_WARN_HOURS:
+            warnings.append(
+                f"{space[0] / 1024 ** 3:.0f}GB free is ~{disk_hours:.0f}h at this run's "
+                f"{float(per_hour) / 1024 ** 3:.1f}GB/hour - nothing here prunes "
+                "evaluations, so the run ends on ENOSPC unless space is made"
+            )
 
     return {
         "name": run_dir.name,
@@ -698,6 +785,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "resident_mb": resident_mb,
         "cores_busy": round(cores_busy, 1),
         "host_cores": os.cpu_count(),
+        "disk_free_bytes": space[0] if space is not None else None,
+        "disk_hours_remaining": disk_hours,
         "dead_points": dead,
         "checkpoint_age_seconds": checkpoint_age,
         "log_tail": tail,
@@ -727,9 +816,12 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
             f"{memory}MB available is below the {HEADROOM_MB}MB headroom rank-budget.sh "
             "keeps free; a new run will refuse to size itself"
         )
+    space = free_bytes(NESTED_SAMPLING_DIR if NESTED_SAMPLING_DIR.exists() else Path("."))
     return {
         "available_mb": memory,
         "total_mb": meminfo_mb("MemTotal"),
+        "disk_free_bytes": space[0] if space is not None else None,
+        "disk_total_bytes": space[1] if space is not None else None,
         "cores": os.cpu_count(),
         "sidecars": containers,
         "leaked_sidecars": leaked,
@@ -738,6 +830,12 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
 
 
 # --- rendering ---------------------------------------------------------------
+
+
+def format_gb(value: float) -> str:
+    """GB at one decimal, MB below that, so a young run does not read as 0.0GB."""
+    return (f"{value / 1024 ** 3:.1f}GB" if value >= 0.1 * 1024 ** 3
+            else f"{value / 1024 ** 2:.0f}MB")
 
 
 def format_hms(seconds: float) -> str:
@@ -813,6 +911,17 @@ def render(run: dict[str, object]) -> None:
                       + (f", {run['cores_busy']:.1f}"
                          + (f" of {cores}" if cores else "")
                          + " cores busy" if run["cores_busy"] else "")))
+    # Memory and cores are held and given back; disk is only ever taken, and
+    # by the time it runs out the run is over. So the run's own share is shown
+    # as a rate and, while it is still writing, as the time that rate has left.
+    if run["disk_bytes"]:
+        per_hour = run["disk_bytes_per_hour"]
+        remaining = run["disk_hours_remaining"]
+        lines.append(("disk",
+                      f"{format_gb(float(run['disk_bytes']))} written"
+                      + (f", +{format_gb(float(per_hour))}/hour" if per_hour else "")
+                      + (f", {float(remaining):.0f}h of space left at that rate"
+                         if remaining is not None else "")))
     lines += [
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE"
                      + (f" ({run['recent_failed']} of the last {RATE_WINDOW})"
@@ -835,6 +944,10 @@ def render_host(host: dict[str, object]) -> None:
                                  else f"{int(memory) / 1024:.1f}GB available"
                                       + (f" of {int(total) / 1024:.1f}GB" if total else "")
                                       + f", {HEADROOM_MB / 1024:.0f}GB reserved as headroom"))
+    space = host["disk_free_bytes"]
+    print(f"  {'disk':<9} " + ("unknown" if space is None
+                               else f"{float(space) / 1024 ** 3:.0f}GB free of "
+                                    f"{float(host['disk_total_bytes']) / 1024 ** 3:.0f}GB"))
     sidecars = host["sidecars"]
     if sidecars is None:
         print(f"  {'sidecars':<9} unknown (docker did not answer)")
@@ -1029,6 +1142,62 @@ def self_check() -> None:
             with_cpu = io_capture(describe(live, not_ranks + ranks,
                                            DEFAULT_STALE_SECONDS, {92: 0.9}))
             assert "0.9 of " in with_cpu and "cores busy" in with_cpu, with_cpu
+
+            # Disk: the one resource nothing here reserves, frees or prunes,
+            # and the only one whose exhaustion ends a run outright.
+            bulky = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T000200Z"
+            (bulky / "evaluations").mkdir(parents=True)
+            (bulky / "run.env").write_text("NS_ALGORITHM=r2d2\n")
+            # Sizes that shrink over the run, the way a nested-sampling run's
+            # do as it concentrates: sampling the tail would read 8KB where the
+            # run averages 68KB, which is why the sample is strided.
+            for i in range(40):
+                eval_dir = bulky / "evaluations" / f"eval-{i:04d}-abc"
+                # A measurement set is a directory, so a walk that does not
+                # recurse reports an evaluation as costing a few hundred bytes.
+                (eval_dir / "point.ms").mkdir(parents=True)
+                (eval_dir / "point.ms" / "table.dat").write_bytes(
+                    b"\0" * ((128 if i < 20 else 8) * 1024))
+                metrics = eval_dir / "metrics.json"
+                metrics.write_text(json.dumps({"eval_id": i, "objective": 0.008}))
+                landed = now - 3600 + i * 60
+                os.utime(metrics, (landed, landed))
+            bulky_ranks = [{"pid": 200, "alive": True, "elapsed_seconds": 100.0,
+                            "cpu_seconds": 20.0, "rss_mb": 10,
+                            "args": f"python3 polychord_r2d2.py "
+                                    f"--output-dir {bulky.resolve()}"}]
+            report = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
+            truth = _dir_bytes(bulky / "evaluations")
+            assert truth > 2 * 1024 ** 2, truth  # the payload, or the walk missed it
+            estimate = float(report["disk_bytes"])
+            assert abs(estimate - truth) < 0.1 * truth, (estimate, truth)
+
+            # Free space is real and enormous on this host, so the projection
+            # is exercised against a stub: the arithmetic is what is under
+            # test, not statvfs. Four hours left, which is under the warning.
+            per_hour = float(report["disk_bytes_per_hour"])
+            real_free = globals()["free_bytes"]
+            try:
+                globals()["free_bytes"] = lambda _p: (int(per_hour * 4), 400 * 1024 ** 3)
+                short = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
+                globals()["free_bytes"] = lambda _p: (500 * 1024 ** 3, 900 * 1024 ** 3)
+                roomy = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
+                # No ranks and a stale mtime: a stopped run's rate is history,
+                # so it reports what it wrote and projects nothing.
+                globals()["free_bytes"] = lambda _p: (int(per_hour * 4), 400 * 1024 ** 3)
+                done = describe(bulky, [], DEFAULT_STALE_SECONDS)
+            finally:
+                globals()["free_bytes"] = real_free
+            assert 3.9 < float(short["disk_hours_remaining"]) < 4.1, short
+            assert any("ENOSPC" in w for w in short["warnings"]), short["warnings"]
+            assert "of space left at that rate" in io_capture(short)
+            assert not any("ENOSPC" in w for w in roomy["warnings"]), roomy["warnings"]
+            assert done["status"] == "stopped" and done["disk_hours_remaining"] is None, done
+            ended = io_capture(done)
+            assert "of space left" not in ended, ended
+            # Megabytes, not "0.0GB": the fixture is 2.7MB, and so is a run ten
+            # minutes old.
+            assert "MB written" in ended, ended
 
             # A stopped run says why, when the run script captured a log for it
             # - which is the whole reason run.log exists.

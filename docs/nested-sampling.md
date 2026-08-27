@@ -308,11 +308,13 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
   ranks     16 ranks of 16, 7 busy-waiting
   resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
+  disk      7.5GB written, +2.6GB/hour, 93h of space left at that rate
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
   stalls    8 gaps over 13s, 154s = 5.5% of wall clock
 
 host
   memory    8.9GB available of 62.6GB, 4GB reserved as headroom
+  disk      233GB free of 436GB
   sidecars  3 running, 0 leaked
 ```
 
@@ -435,6 +437,22 @@ What each line is reading, and why it is worth a line:
   number read to answer "will another run fit". Cores busy is the same one
   second CPU sample as the spin check, summed over those processes, so it
   measures the imaging rather than the ranks waiting on it.
+- **disk** - the resource nothing here reserves, checks or frees, and the only
+  one that only ever grows. An evaluation directory keeps its measurement set,
+  its `.mat` and the imager's output - ~1.7MB on this host - and nothing
+  deletes it (`./ri clean` deliberately leaves `results/` alone), so a live
+  R2D2 run writes ~2.6GB/hour and one WSClean run left 18GB behind. The
+  projection is that rate against what the filesystem has left, and it warns
+  under 12 hours: there is no other place that would say so before the run
+  ends on ENOSPC, hours of imaging from its last checkpoint.
+
+  Estimated from a **strided sample of 20 evaluations**, not a walk. `du -s`
+  on one live run cost 3-5s of I/O against the disk that run is using, which
+  is not what a read-only check should do to it; 20 stats cost milliseconds
+  and landed within 1% (7.5GB against a true 7.57GB). Strided over the run's
+  life rather than taken from its tail because evaluation size follows the
+  parameters and a nested-sampling run concentrates: the newest 20 read
+  1.45MB where the same run averaged 1.68MB.
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real
@@ -458,7 +476,9 @@ What each line is reading, and why it is worth a line:
   Before the watchdogs above, the MeqTrees deadlock cost 23-27% of wall clock
   here; after them, 0.
 - **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
-  keeps, and `ri-ns-sidecar-*` containers whose launching process is gone. A
+  keeps, free disk on the filesystem holding `results/` (nothing reserves it,
+  so this is the denominator the per-run projection above divides), and
+  `ri-ns-sidecar-*` containers whose launching process is gone. A
   killed run leaves those holding ~3.4GB per R2D2 rank, which would count
   against every later run's memory budget. Reported here because it is
   something to know about the host; not something to act on, because the next
