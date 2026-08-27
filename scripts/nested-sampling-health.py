@@ -20,10 +20,18 @@ Four things it checks, each one a way a run has actually gone wrong here:
   PolyChord maximizes, while a real `total_rms_jy` is ~0.008. A run whose
   imager is broken - a missing checkpoint mount, an OOM-killed worker - is
   therefore a run happily concentrating its live points on its own failures. It
-  looks perfectly healthy by every other measure and is worth nothing.
+  looks perfectly healthy by every other measure and is worth nothing. Asked of
+  the last `RATE_WINDOW` evaluations as well as of the whole run, because an
+  imager that breaks part-way through a long one stays under any whole-run
+  ratio for hours.
 * **Cost.** Gaps between evaluations, and `meqserver-wedged.log`, put a number
   on the MeqTrees deadlock the watchdogs in `simulate_point_source_ms.py`
   absorb (docs/nested-sampling.md, "When MeqTrees stops answering").
+
+* **Shape.** Every number above is one moment. `history` is the run's
+  throughput binned over its own life, which is what separates a dip that
+  recovered from a step down that did not - the two the medians report
+  identically on the way past each other.
 
 * **Cost, again, in memory and cores.** Memory is what caps a run here, so
   what the run holds is reported next to what the host has left - over every
@@ -98,6 +106,23 @@ SPIN_IDLE_SECONDS = 60.0
 # where the ordinary swing stops and the one real event starts.
 RATE_WINDOW = 50
 RATE_DIVERGENCE_FACTOR = 2.0
+
+# The same window, read for failures rather than pace, and half of it is the
+# bar. The overall ratio below cannot see an imager that broke part-way
+# through: a run three hours healthy and twenty minutes broken is still ~2%
+# failures overall and silent, while every point it is now adding is a
+# FAILURE_OBJECTIVE that PolyChord will happily maximize. Half is not a tuned
+# number - across 37,000 evaluations of the six real runs on this host the
+# failure count is zero, so any sustained burst is a fault and the threshold
+# only has to sit above the noise, which is nothing.
+RECENT_FAILURE_FRACTION = 0.5
+
+# The run's life as one line of text. Twenty slices so the whole thing fits
+# beside a label at any terminal width, and a zero slice gets its own mark so a
+# gap where nothing landed is visible rather than rounding to "slow".
+HISTORY_BUCKETS = 20
+HISTORY_LEVELS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+HISTORY_EMPTY = "\u00b7"
 
 # A gap between consecutive evaluations counts as a stall when it is this many
 # times the run's own median gap. Relative because the two imagers are two
@@ -245,6 +270,49 @@ def stage(run_dir: Path) -> str:
     return "starting up"
 
 
+def history(times: list[float]) -> dict[str, object] | None:
+    """The shape of the run's throughput over its own life, as one line of text.
+
+    The two medians already reported say how fast the run is going now against
+    how fast it has gone; neither can show the shape, and the shape is the
+    thing a reader actually wants. A dip that recovered, a step down that did
+    not, and a steady run all produce the same pair of numbers on the way past
+    each other - the observed collapse-and-recovery here (104, 23, 26, 93
+    against a 104-165 baseline) reads as an ordinary slowdown from the medians
+    alone and as an obvious V from twenty slices.
+
+    Binned over [first evaluation, last evaluation] rather than up to now, so
+    every slice is a full one. A slice ending at the present moment is partial
+    by definition and reads low by exactly the fraction of it that has not
+    happened yet, which is indistinguishable from a real collapse - the same
+    trap the gap-based rate above exists to avoid. How long ago the last
+    evaluation landed is the activity line's job, not this one's.
+
+    None below two evaluations a slice, where the counts are too small to be a
+    shape rather than noise.
+    """
+    if len(times) < 2 * HISTORY_BUCKETS:
+        return None
+    span = times[-1] - times[0]
+    if span <= 0:
+        return None
+    width = span / HISTORY_BUCKETS
+    counts = [0] * HISTORY_BUCKETS
+    for when in times:
+        counts[min(HISTORY_BUCKETS - 1, int((when - times[0]) / width))] += 1
+    peak = max(counts)
+    return {
+        # Scaled to the run's own peak: this answers "what changed", and an
+        # absolute scale shared with nothing else would only flatten it.
+        "bar": "".join(HISTORY_EMPTY if c == 0
+                       else HISTORY_LEVELS[(c * len(HISTORY_LEVELS) - 1) // peak]
+                       for c in counts),
+        "low_per_minute": min(counts) * 60 / width,
+        "high_per_minute": peak * 60 / width,
+        "bucket_seconds": width,
+    }
+
+
 def evaluation_scan(run_dir: Path) -> dict[str, object]:
     """Counts, timings and failures, in one pass over evaluations/.
 
@@ -254,8 +322,9 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     """
     evaluations = run_dir / "evaluations"
     directories = 0
-    times: list[float] = []
-    failed = 0
+    # (when it landed, whether it failed), kept paired so that "how the run is
+    # going now" can be asked of failures as well as of pace.
+    records: list[tuple[float, bool]] = []
     wedged_lines = 0
     for entry in evaluations.glob("eval-*"):
         if not entry.is_dir():
@@ -263,16 +332,19 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         directories += 1
         metrics = entry / "metrics.json"
         try:
-            times.append(metrics.stat().st_mtime)
-            if FAILURE_OBJECTIVE_MARKER in metrics.read_text():
-                failed += 1
+            records.append((metrics.stat().st_mtime,
+                            FAILURE_OBJECTIVE_MARKER in metrics.read_text()))
         except OSError:
             pass  # in flight, or a leftover the next run will sweep
         try:
             wedged_lines += len((entry / "meqserver-wedged.log").read_text().splitlines())
         except OSError:
             pass
-    times.sort()
+    records.sort()
+    times = [when for when, _ in records]
+    failed = sum(1 for _, bad in records if bad)
+    recent_failed = (sum(1 for _, bad in records[-RATE_WINDOW:] if bad)
+                     if len(records) >= RATE_WINDOW else None)
     gaps = [b - a for a, b in zip(times, times[1:])]
     threshold = MIN_STALL_GAP_SECONDS
     if gaps:
@@ -313,8 +385,10 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "failed": failed,
         "last_activity_seconds": time.time() - times[-1] if times else None,
         "span_seconds": span,
+        "recent_failed": recent_failed,
         "evals_per_minute": len(times) * 60 / span if span > 0 else None,
         "recent_evals_per_minute": recent_rate,
+        "history": history(times),
         "slowdown_factor": slowdown,
         "stall_threshold_seconds": threshold,
         "stall_count": len(stalls),
@@ -534,6 +608,16 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"{failed} of {completed} evaluations scored FAILURE_OBJECTIVE, which "
             "PolyChord maximizes - the run is chasing its own failures"
         )
+    # Only reached when the overall ratio is fine, which is the whole point: an
+    # imager that breaks part-way through a long run stays under that ratio for
+    # hours while every point it adds from now on is a failure.
+    elif scan["recent_failed"] is not None \
+            and int(scan["recent_failed"]) >= RECENT_FAILURE_FRACTION * RATE_WINDOW:
+        warnings.append(
+            f"{scan['recent_failed']} of the last {RATE_WINDOW} evaluations scored "
+            f"FAILURE_OBJECTIVE against {failed} of {completed} over the whole run "
+            "- the imager broke part-way through, and the search is now feeding on it"
+        )
     if status == "stalled":
         warnings.append(
             f"no evaluation has landed in {idle:.0f}s while {len(ranks)} ranks are still running"
@@ -684,8 +768,18 @@ def render(run: dict[str, object]) -> None:
                         if slowdown is not None and (
                             float(slowdown) > RATE_DIVERGENCE_FACTOR
                             or float(slowdown) < 1 / RATE_DIVERGENCE_FACTOR) else "")),
-        ("ranks", ranks),
     ]
+    # ...and the same throughput as a shape rather than as two numbers, which
+    # is the only line here that shows a dip that recovered as different from
+    # a step down that did not.
+    past = run["history"]
+    if past:
+        assert isinstance(past, dict)
+        lines.append(("history",
+                      f"{past['bar']}  {past['low_per_minute']:.0f}-"
+                      f"{past['high_per_minute']:.0f}/min per "
+                      f"{format_hms(float(past['bucket_seconds']))} slice"))
+    lines.append(("ranks", ranks))
     # Only for a run that still holds something. "0.0GB over 0 processes" is
     # what every finished run on disk would print, and none of them is the
     # question this line answers: memory, not CPU, is what caps a run, and what
@@ -699,8 +793,10 @@ def render(run: dict[str, object]) -> None:
                          + (f" of {cores}" if cores else "")
                          + " cores busy" if run["cores_busy"] else "")))
     lines += [
-        ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE, "
-                     f"{run['meqserver_wedges']} meqserver wedges recovered"),
+        ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE"
+                     + (f" ({run['recent_failed']} of the last {RATE_WINDOW})"
+                        if run["recent_failed"] else "")
+                     + f", {run['meqserver_wedges']} meqserver wedges recovered"),
         ("stalls", f"{run['stall_count']} gaps over {run['stall_threshold_seconds']:.0f}s, "
                    f"{run['stall_seconds']:.0f}s = {run['stall_fraction']:.1%} of wall clock"),
     ]
@@ -1043,6 +1139,49 @@ def self_check() -> None:
             assert not any("throughput" in w for w in report["warnings"]), report
             rendered = io_capture(report)
             assert "5.0/min over the last 50" in rendered, rendered
+            # The same collapse as a shape: the healthy phase fills the early
+            # slices to the peak and the collapse empties the late ones, which
+            # is the difference the two medians cannot show.
+            past = report["history"]
+            assert past is not None, report
+            assert past["bar"][0] == HISTORY_LEVELS[-1], past
+            assert past["bar"][-1] in HISTORY_LEVELS[:2] + HISTORY_EMPTY, past
+            assert len(past["bar"]) == HISTORY_BUCKETS, past
+            assert past["high_per_minute"] > 10 * past["low_per_minute"], past
+            assert "/min per" in rendered, rendered
+            # A steady run draws a flat line rather than a false trend: equal
+            # counts must all land on the same level, whatever the peak is.
+            flat = history([now + i for i in range(4 * HISTORY_BUCKETS)])
+            assert set(flat["bar"]) == {HISTORY_LEVELS[-1]}, flat
+            # A slice where nothing landed is marked, not rounded down to
+            # "slow" - a hole in the run is exactly what a reader is scanning
+            # this line for.
+            holed = history([now + i * 0.1 for i in range(3 * HISTORY_BUCKETS)]
+                            + [now + 1000])
+            assert HISTORY_EMPTY in holed["bar"], holed
+            # Too few evaluations to be a shape rather than noise.
+            assert history([now + i for i in range(HISTORY_BUCKETS)]) is None
+            assert history([now] * 100) is None  # no span, no bins
+
+            # An imager that broke part-way through a long healthy run: 400
+            # good evaluations then 50 failures is 11% overall, well under the
+            # whole-run bar, while every point it is adding now is a failure.
+            broke = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T030000Z"
+            (broke / "chains").mkdir(parents=True)
+            for i in range(400):
+                write_eval(broke, i + 1, now - 500 + i)
+            for i in range(RATE_WINDOW):
+                write_eval(broke, 401 + i, now - 100 + i, objective=100.0)
+            report = describe(broke, [], DEFAULT_STALE_SECONDS)
+            assert report["failed"] == 50 and report["completed"] == 450, report
+            assert report["recent_failed"] == RATE_WINDOW, report
+            assert any("broke part-way through" in w for w in report["warnings"]), report
+            assert "(50 of the last 50)" in io_capture(report), io_capture(report)
+            # ...and the run before it broke says nothing, so the warning is
+            # the break rather than the presence of any failure at all.
+            healthy_window = describe(collapsed, [], DEFAULT_STALE_SECONDS)
+            assert healthy_window["recent_failed"] == 0, healthy_window
+            assert not any("broke part-way" in w for w in healthy_window["warnings"])
             # A run holding its pace prints one rate, not two.
             steady = describe(live, ranks, DEFAULT_STALE_SECONDS, working)
             assert "over the last" not in io_capture(steady), io_capture(steady)
@@ -1059,6 +1198,9 @@ def self_check() -> None:
             report = describe(poisoned, [], DEFAULT_STALE_SECONDS)
             assert report["failed"] == 3, report
             assert any("broken imager" in w for w in report["warnings"]), report
+            # Three evaluations is not a window: no recent ratio at all, rather
+            # than one drawn from a handful.
+            assert report["recent_failed"] is None, report
             # It died before PolyChord's main loop, which no count shows.
             assert report["stage"] == "starting up", report
 

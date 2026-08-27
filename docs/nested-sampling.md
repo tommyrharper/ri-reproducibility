@@ -305,6 +305,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   stage     sampling, 113 dead points as of 0:08:18 ago, next at ~163
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
+  history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
   ranks     16 ranks of 16, 7 busy-waiting
   resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
@@ -392,6 +393,16 @@ What each line is reading, and why it is worth a line:
   run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means the missing wall
   clock is going somewhere other than the likelihood, into sampler overhead,
   contention or synchronisation. The two want different responses.
+- **history** - the same throughput binned into twenty equal slices of the
+  run's own life, scaled to its own peak. The two rates above are the only
+  numbers here that change over time, and as numbers they cannot show the
+  *shape*: a dip that recovered and a step down that did not read identically
+  on the way past each other. The collapse-and-recovery described above -
+  bins of 104, 23, 26, 93 against a 104-165 baseline - is an obvious V here
+  and an ordinary-looking slowdown from the medians alone. A slice where
+  nothing landed is marked `·` rather than drawn as merely slow. Binned over
+  first-to-last evaluation, never up to now, for the partial-window reason
+  above; how long ago the last one landed is **activity**'s job.
 - **ranks** - found by the `--output-dir` they were launched with, so no ranks
   means no run. `busy-waiting` counts the ranks that spent a whole one-second
   sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective
@@ -426,6 +437,15 @@ What each line is reading, and why it is worth a line:
   a missing checkpoint mount or an OOM-killed worker reports "the imager fails
   catastrophically here", which is exactly the conclusion this repo exists to
   draw.
+
+  Asked of **the last 50 evaluations as well as of the whole run**, because a
+  whole-run ratio cannot see an imager that broke part-way through: three
+  hours healthy and twenty minutes broken is ~2% failures overall and silent,
+  while every point the search adds from that moment on is a failure. Half the
+  window is the bar, which is not a tuned number - across the 37,000
+  evaluations of the six real runs on this host the failure count is zero, so
+  any sustained burst is a fault and the threshold only has to clear noise
+  there is none of.
 - **stalls** - gaps between evaluations more than 10x the run's own median,
   and never less than 2s. Relative because WSClean lands 30-50 evaluations a
   second and R2D2 roughly one every two, so no fixed threshold suits both.
