@@ -65,7 +65,6 @@ COPY scripts/lib/nested_sampling /opt/ri-nested-sampling
 RUN python3 -m compileall -q /opt/ri-nested-sampling
 
 WORKDIR /workspace
-VOLUME ["/data", "/results"]
 
 ENTRYPOINT ["python3", "/opt/ri-nested-sampling/polychord_wsclean.py"]
 CMD ["--help"]

@@ -135,7 +135,6 @@ RUN mkdir -p "${MPLCONFIGDIR}" \
     && chmod -R a+rwX "${MPLCONFIGDIR}"
 
 WORKDIR /opt/r2d2/R2D2-RI
-VOLUME ["/data", "/checkpoints", "/results"]
 
 ENTRYPOINT ["python3"]
 CMD ["--version"]
