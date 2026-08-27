@@ -349,7 +349,7 @@ indistinguishable at the size the pages display them. What is left of a full
 redraw's cost is the anesthetic corner plot. A rebuild that redraws nothing does not even
 import astropy or matplotlib - they are loaded on the first missing PNG - which
 is most of what is left of a page-only rebuild. numpy goes the same way:
-`poc_common.py` binds `np` to a shim that imports numpy on first attribute
+`common.py` binds `np` to a shim that imports numpy on first attribute
 access, because the report reaches into that module only for its formatting
 helpers and a page-only rebuild never touches an array (0.19s -> 0.16s on a five-run page-only rebuild, and
 `self_check_lazy_numpy()` there fails if a module-level `np.` use creeps back

@@ -23,7 +23,7 @@
 # Rebuilding a page reuses the PNGs under images/, which is most of the cost -
 # delete the whole report directory to force those to be drawn again. A rebuild
 # that draws nothing skips the astropy/matplotlib import as well, and numpy
-# with them (poc_common binds `np` lazily, since the report wants only its
+# with them (common binds `np` lazily, since the report wants only its
 # formatting helpers). Pages that
 # do need building are built in parallel: each run is two concurrent tasks, its
 # corner plot and the rest of its page, in two pools forked either side of the
