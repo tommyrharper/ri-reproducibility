@@ -47,6 +47,7 @@ from common import (
     self_check_resume_adoption,
     self_check_source_offset,
     self_check_spectral_window,
+    self_check_worker_timeout,
     sidecar_command,
     sidecar_run,
     sidecar_shell,
@@ -442,6 +443,7 @@ if __name__ == "__main__":
         self_check_profiling()
         self_check_failure_record_persistence()
         self_check_resume_adoption()
+        self_check_worker_timeout()
         print("metric resolution self-check passed")
     else:
         main()
