@@ -392,6 +392,8 @@ def likelihood_section(uri):
 # changes. Touching viewLim keeps exactly that and drops the rest.
 # Best-effort: if pandas moves the private helper, the plot is just slower.
 _tick_housekeeping_deduped = False
+# Axes the in-progress handle_shared_axes scan has selected, innermost last.
+_shared_axes_recording = []
 
 
 def dedupe_pandas_tick_housekeeping():
@@ -407,6 +409,8 @@ def dedupe_pandas_tick_housekeeping():
         return False
 
     def once(axis):
+        if _shared_axes_recording:
+            _shared_axes_recording[-1].append(axis)
         if getattr(axis, "_report_labels_removed", False):
             axis.axes.viewLim  # noqa: B018 - un-stales the shared view limits
             return
@@ -414,6 +418,53 @@ def dedupe_pandas_tick_housekeeping():
         remove_labels(axis)
 
     tools._remove_labels_from_axis = once
+
+    # With the labels themselves deduplicated, what is left of a repeat call is
+    # the scan that decides which axes to hand to `once`: for every axis, and
+    # for both of its axes, walk the whole shared-axis group comparing
+    # positions. That answer is fixed for as long as the figure's axes, their
+    # visibility and the grid shape are, so record the axes the first scan
+    # selects and replay just their viewLim touch afterwards.
+    shared = getattr(tools, "handle_shared_axes", None)
+    if shared is None:
+        return True
+
+    def deduped(axarr, nplots, naxes, nrows, ncols, sharex, sharey):
+        axarr = list(axarr)
+        if not axarr:
+            return shared(axarr, nplots, naxes, nrows, ncols, sharex, sharey)
+        fig = axarr[0].get_figure()
+        key = (
+            tuple(id(ax) for ax in axarr),
+            tuple(ax.get_visible() for ax in axarr),
+            nplots,
+            naxes,
+            nrows,
+            ncols,
+            sharex,
+            sharey,
+        )
+        cached = getattr(fig, "_report_shared_axes_memo", None)
+        if cached is not None and cached[0] == key:
+            for axis in cached[1]:
+                axis.axes.viewLim  # noqa: B018 - the same un-stale as above
+            return None
+        selected = []
+        _shared_axes_recording.append(selected)
+        try:
+            shared(axarr, nplots, naxes, nrows, ncols, sharex, sharey)
+        finally:
+            _shared_axes_recording.pop()
+        # The entry keeps axarr alive, so no id() in the key can be recycled
+        # onto a different axes while the memo is live.
+        fig._report_shared_axes_memo = (key, selected, axarr)
+        return None
+
+    # pandas' plotting core does `from .tools import handle_shared_axes`, so the
+    # name has to be rebound wherever it was bound, not just on tools.
+    for module in list(sys.modules.values()):
+        if getattr(module, "handle_shared_axes", None) is shared:
+            module.handle_shared_axes = deduped
     return True
 
 
@@ -1913,6 +1964,46 @@ def _self_check_tick_housekeeping():
     plt.close(fig)
 
 
+def _self_check_shared_axes_dedupe():
+    """A repeated handle_shared_axes call must skip the scan but still un-stale
+    the view limits of every axis the first scan selected."""
+    load_plot_libs()
+    if not dedupe_pandas_tick_housekeeping():
+        return
+    from pandas.plotting._matplotlib import core as pandas_plot_core
+    from pandas.plotting._matplotlib import tools
+
+    fig, axarr = plt.subplots(2, 2, sharex=True, sharey=True)
+    flat = list(axarr.flat)
+    scanned = []
+    real_scan = tools._has_externally_shared_axis
+    tools._has_externally_shared_axis = lambda ax, which: (
+        scanned.append(ax) or real_scan(ax, which)
+    )
+    try:
+        # sharex/sharey False with axes that do share is the anesthetic case:
+        # it is what sends pandas into the per-axis _has_externally_shared_axis
+        # scan this dedupe removes.
+        args = dict(
+            axarr=flat, nplots=4, naxes=4, nrows=2, ncols=2, sharex=False, sharey=False
+        )
+        pandas_plot_core.handle_shared_axes(**args)
+        selected = fig._report_shared_axes_memo[1]
+        assert selected, "first scan selected no axes to strip"
+        for ax in flat:
+            ax._stale_viewlims["x"] = ax._stale_viewlims["y"] = True
+        before = len(scanned)
+        pandas_plot_core.handle_shared_axes(**args)
+        assert len(scanned) == before, "repeat call re-ran the shared-axis scan"
+        assert not any(
+            axis.axes._stale_viewlims["x"] or axis.axes._stale_viewlims["y"]
+            for axis in selected
+        ), "repeat call lost the viewLim un-stale"
+    finally:
+        tools._has_externally_shared_axis = real_scan
+        plt.close(fig)
+
+
 def _self_check_tick_memo():
     """The tick memo must hit while the axis is unchanged, miss once its view
     limits move, and keep un-staling the shared view limits either way."""
@@ -2009,6 +2100,7 @@ if __name__ == "__main__":
         _self_check_profiling()
         _self_check_page_status()
         _self_check_tick_housekeeping()
+        _self_check_shared_axes_dedupe()
         _self_check_tick_memo()
         _self_check_tight_bbox()
         _self_check_labels_map_memo()
