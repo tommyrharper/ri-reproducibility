@@ -166,7 +166,6 @@ ENV LD_LIBRARY_PATH=/opt/casacore/lib:/opt/wsclean/lib \
 RUN printf 'measures.directory: /opt/casacore-data\n' > /opt/casacore-data/measures.d
 
 WORKDIR /workspace
-VOLUME ["/data", "/results"]
 
 ENTRYPOINT ["wsclean"]
 CMD ["--version"]

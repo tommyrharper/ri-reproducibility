@@ -75,7 +75,6 @@ RUN --mount=type=bind,source=scripts/lib/nested_sampling/common.py,target=/opt/r
 RUN python3 -m compileall -q /opt/ri-nested-sampling /usr/lib/python3/dist-packages/Timba/Apps || true
 
 WORKDIR /workspace
-VOLUME ["/data", "/results"]
 
 ENTRYPOINT ["python3", "/opt/ri-nested-sampling/simulate_point_source_ms.py"]
 CMD ["--help"]
