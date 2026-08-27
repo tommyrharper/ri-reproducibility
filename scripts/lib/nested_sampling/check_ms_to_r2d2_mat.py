@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from common import r2d2_docker_thread_env_flags
+from common import DEFAULT_SUPER_RESOLUTION, r2d2_docker_thread_env_flags
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,7 +109,7 @@ def main() -> None:
         (
             "import sys; sys.path.insert(0, 'src'); "
             "from utils import load_data_to_tensor; "
-            "data = load_data_to_tensor(uv_file_path='/work/r2d2_data.mat', super_resolution=1.52, verbose=False); "
+            f"data = load_data_to_tensor(uv_file_path='/work/r2d2_data.mat', super_resolution={DEFAULT_SUPER_RESOLUTION}, verbose=False); "
             "print('visibility_count', data['y'].numel()); "
             "print('u_count', data['u'].numel()); "
             "print('nW_count', data['nW'].numel())"

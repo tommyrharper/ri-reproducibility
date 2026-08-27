@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 
 from common import (
+    DEFAULT_IMAGE_DIM,
+    DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_NITER,
     FAILURE_OBJECTIVE,
@@ -25,6 +27,7 @@ from common import (
     cube_to_params,
     gathered_window_fit_stats,
     compute_image_metrics,
+    image_pixel_size_arcsec,
     load_evaluations_from_dir,
     load_parameter_space,
     mpi_rank,
@@ -35,6 +38,7 @@ from common import (
     read_gnu_time_wall_seconds,
     resolve_metric,
     self_check_fits_reader,
+    self_check_image_pixel_size,
     self_check_lazy_numpy,
     self_check_metric_resolution,
     self_check_parameter_space,
@@ -94,6 +98,17 @@ def evaluate(
             "timing": {"simulate_seconds": simulate_seconds},
         })
 
+    # R2D2 sizes its pixels from the data; WSClean has to be told. Reading the
+    # figure the simulator recorded keeps the two imaging the same sky - see
+    # image_pixel_size_arcsec() in common.py.
+    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    if "max_proj_baseline_lambda" not in simulation["observation"]:
+        raise SystemExit(
+            "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
+            "rebuild the meqtrees image (scripts/build.sh meqtrees), it bakes in a stale simulator"
+        )
+    scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
+
     wsclean_dir = eval_dir / "wsclean"
     wsclean_dir.mkdir()
     wsclean_stdout = eval_dir / "wsclean.stdout.log"
@@ -106,10 +121,10 @@ def evaluate(
         "-temp-dir",
         str(wsclean_dir),
         "-size",
-        "128",
-        "128",
+        str(DEFAULT_IMAGE_DIM),
+        str(DEFAULT_IMAGE_DIM),
         "-scale",
-        "1asec",
+        f"{scale_arcsec:.6g}asec",
         "-niter",
         str(DEFAULT_WSCLEAN_NITER),
         "-mgain",
@@ -183,6 +198,7 @@ def evaluate(
     record = {
         "eval_id": eval_id,
         "params": params,
+        "image_pixel_size_arcsec": scale_arcsec,
         "metrics": metrics,
         "objective": objective,
         "paths": {
@@ -245,6 +261,11 @@ def self_check_failure_record_persistence() -> None:
             platform: str,
         ) -> tuple[Path, list[str], None]:
             eval_dir.mkdir(parents=True, exist_ok=False)
+            # A real simulate always leaves this behind, and evaluate() reads it
+            # for the WSClean cell size.
+            (eval_dir / "simulation.json").write_text(
+                json.dumps({"observation": {"max_proj_baseline_lambda": 1.0e5}})
+            )
             return eval_dir / "sim.ms", ["simulate"], None
 
         def successful_wsclean(
@@ -386,6 +407,10 @@ def main() -> None:
             "wsclean_fixed_hyperparameters": {
                 "niter": DEFAULT_WSCLEAN_NITER,
                 "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
+                "image_dim": DEFAULT_IMAGE_DIM,
+                # `-scale` is derived per evaluation from this and the sampled
+                # sky, not fixed; each record carries its own image_pixel_size_arcsec.
+                "super_resolution": DEFAULT_SUPER_RESOLUTION,
             },
             "parameter_space": load_parameter_space(),
             "evaluations": all_evaluations,
@@ -407,6 +432,7 @@ if __name__ == "__main__":
         self_check_spectral_window()
         self_check_lazy_numpy()
         self_check_fits_reader()
+        self_check_image_pixel_size()
         self_check_profiling()
         self_check_failure_record_persistence()
         self_check_resume_adoption()

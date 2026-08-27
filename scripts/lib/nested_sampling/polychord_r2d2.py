@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 
 from common import (
+    DEFAULT_IMAGE_DIM,
+    DEFAULT_SUPER_RESOLUTION,
     FAILURE_OBJECTIVE,
     WORKER_DIED,
     WorkerDied,
@@ -51,11 +53,9 @@ from common import (
     write_polychord_paramnames,
 )
 
-DEFAULT_R2D2_IM_DIM = 128
 DEFAULT_R2D2_NUM_ITER = 25
 DEFAULT_R2D2_NUM_CHANS = 64
 DEFAULT_R2D2_ARCHITECTURE = "unet"
-DEFAULT_R2D2_SUPER_RESOLUTION = 1.52
 DEFAULT_R2D2_CKPT_REALISATIONS = 1
 
 
@@ -81,10 +81,11 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         f"output_path: {output_path}",
         "save_all_outputs: False",
         "nufft_pkg: finufft",
+        f"super_resolution: {DEFAULT_SUPER_RESOLUTION}",
         "meas_op_on_gpu: False",
         "meas_dtype: double",
-        f"im_dim_x: {DEFAULT_R2D2_IM_DIM}",
-        f"im_dim_y: {DEFAULT_R2D2_IM_DIM}",
+        f"im_dim_x: {DEFAULT_IMAGE_DIM}",
+        f"im_dim_y: {DEFAULT_IMAGE_DIM}",
         "data_weighting: True",
         "natural_weight: True",
         "weight_type: briggs",
@@ -526,12 +527,12 @@ def main() -> None:
                 "mpi_procs": mpi_procs,
             },
             "r2d2_fixed_hyperparameters": {
-                "im_dim_x": DEFAULT_R2D2_IM_DIM,
-                "im_dim_y": DEFAULT_R2D2_IM_DIM,
+                "im_dim_x": DEFAULT_IMAGE_DIM,
+                "im_dim_y": DEFAULT_IMAGE_DIM,
                 "num_iter": DEFAULT_R2D2_NUM_ITER,
                 "num_chans": DEFAULT_R2D2_NUM_CHANS,
                 "architecture": DEFAULT_R2D2_ARCHITECTURE,
-                "super_resolution": DEFAULT_R2D2_SUPER_RESOLUTION,
+                "super_resolution": DEFAULT_SUPER_RESOLUTION,
                 "ckpt_path": "/checkpoints/R2D2_A1",
                 "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
             },

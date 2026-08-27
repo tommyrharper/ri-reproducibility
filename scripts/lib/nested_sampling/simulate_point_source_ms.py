@@ -34,6 +34,7 @@ TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
 # The MS time grid step. Shared with prebuild_skeletons(), which has to
 # enumerate the same NTimes values a run's evaluations will ask for.
 DEFAULT_INTEGRATION_SECONDS = 120.0
+SPEED_OF_LIGHT = 299792458.0
 
 # makems and casacore fsync on nearly every table write. On the bind-mounted
 # repo that is ~0.5s of ext4 journal wait per run (makems alone: 0.54s on the
@@ -423,6 +424,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
         data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
+        uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
         n_rows, n_chan, data_n_corr = data.shape
         if n_chan != len(freqs_hz):
             raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
@@ -452,6 +454,13 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
                 % (1.0 / (noise_sigma_jy * noise_sigma_jy), noise_sigma_jy)
             )
 
+    # The longest projected baseline in wavelengths, which is what both imagers
+    # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
+    # image_pixel_size_arcsec() in common.py), and the WSClean runner reads this
+    # to pass the matching `-scale`. u/v scale linearly with frequency, so the
+    # maximum over (row, channel) is the longest baseline at the top channel.
+    max_proj_baseline_lambda = float(np.max(np.hypot(uvw[:, 0], uvw[:, 1]))) * float(freqs_hz.max()) / SPEED_OF_LIGHT
+
     return {
         "measurement_set": str(output_ms),
         "vla_config": args.vla_config,
@@ -463,6 +472,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
             "m_arcsec": args.source_m_arcsec,
         },
         "observation": {
+            "max_proj_baseline_lambda": max_proj_baseline_lambda,
             "requested_minutes": args.observation_minutes,
             "integration_seconds": args.integration_seconds,
             "time_samples": max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds))),

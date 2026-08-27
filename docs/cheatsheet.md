@@ -335,6 +335,7 @@ uv run --no-project scripts/test_cli.py
 | `reports/manifests/` | One JSON manifest per recorded run |
 | `docs/nested-sampling.md` | Nested-sampling design, metrics, output files |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
+| `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 
 ## Gotchas
