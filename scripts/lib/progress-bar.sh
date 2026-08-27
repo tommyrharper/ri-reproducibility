@@ -40,10 +40,10 @@ run_with_progress() {
     # No usable terminal control (e.g. tput/TERM missing): fall back to a
     # plain redrawn line instead of a pinned one.
     while kill -0 "${pid}" 2>/dev/null; do
-      printf '\r%s   ' "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
+      printf '\r%s' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")")"
       sleep 1
     done
-    printf '\r%s   \n' "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
+    printf '\r%s\n' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")")"
   fi
 
   wait "${pid}"
@@ -100,7 +100,22 @@ _ns_pin_teardown() {
 _ns_pin_draw() {
   local rows
   rows="$(tput lines 2>/dev/null)" || return 0
-  printf '\e7\e[%d;1H\e[2K%s\e8' "${rows}" "$1"
+  printf '\e7\e[%d;1H\e[2K%s\e8' "${rows}" "$(_ns_truncate_pad "$1")"
+}
+
+# A status line wider than the terminal wraps onto the row above once
+# printed - which sits inside the scroll region, not on the reserved line,
+# and disappears the moment normal output scrolls past it. Confirmed by
+# replaying a captured real run through a terminal emulator: the line was
+# there in the byte stream but wrapped and then vanished on screen within a
+# couple of seconds. Every draw is clamped to the terminal's actual width so
+# it can never wrap, and padded so a shorter redraw doesn't leave the
+# previous line's tail on screen.
+_ns_truncate_pad() {
+  local text="$1" cols width
+  cols="$(tput cols 2>/dev/null)" || cols=80
+  width=$((cols > 1 ? cols - 1 : cols))
+  printf '%-*.*s' "${width}" "${width}" "${text}"
 }
 
 _ns_count_glob() {
@@ -209,6 +224,23 @@ self_check() {
 
   [ "$(_ns_format_hms 3661)" = "1:01:01" ] || { echo "FAIL: format_hms"; exit 1; }
   [ "$(_ns_format_hms 59)" = "0:00:59" ] || { echo "FAIL: format_hms short"; exit 1; }
+
+  # A pinned draw is written to a fixed row and never re-checked, so a line
+  # even one column wider than the terminal wraps onto the row above (inside
+  # the scroll region) and gets scrolled away within seconds - confirmed by
+  # replaying a real run through a terminal emulator: the bar was in the byte
+  # stream but invisible on screen. `tput cols` fails outside a real
+  # terminal, so this exercises the 80-column fallback.
+  local long_line padded
+  long_line="$(printf 'x%.0s' $(seq 1 200))"
+  padded="$(_ns_truncate_pad "${long_line}")"
+  [ "${#padded}" = "79" ] || { echo "FAIL: long line not clamped to 79 cols: ${#padded}"; exit 1; }
+  padded="$(_ns_truncate_pad "short")"
+  [ "${#padded}" = "79" ] || { echo "FAIL: short line not padded to 79 cols: ${#padded}"; exit 1; }
+  case "${padded}" in
+    "short"*) ;;
+    *) echo "FAIL: padding altered the content: ${padded}"; exit 1 ;;
+  esac
 
   # 3 dead points against a cap of 12 must drive the percent/ETA, not the 4
   # evaluations - that mismatch (dead points lag evaluations) is exactly the

@@ -653,12 +653,10 @@ run page links back to the index. Rendering a run means reading its FITS
 output, so **run pages that are already up to date are skipped** - a re-run
 only builds pages for new runs.
 
-Building more than a couple of pages prints a progress line - page count,
-elapsed time, ETA - since that's most of the report's wall clock (see below).
-`generate-report.sh` decides this from its own `-t 1`, not the Python
-process's: `docker run` has no `-t`, so the container's stdout is a pipe,
-never a pty, and `sys.stdout.isatty()` inside it is always `False` regardless
-of the host terminal.
+Each page built prints its own `wrote <path>` line, immediately followed by
+elapsed time and an ETA - reading FITS output and drawing plots is most of
+the report's wall clock (see below), so a rebuild with several outdated or
+missing runs has something to show for the wait.
 
 The index has a toolbar above the run cards: filter by algorithm (R2D2 /
 WSClean) or by merged/unmerged, and sort newest/oldest or by eval count. It is
