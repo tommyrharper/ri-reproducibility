@@ -1837,6 +1837,10 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .nav a { color: inherit; opacity: 0.7; text-decoration: none; }
 .nav a:hover { opacity: 1; text-decoration: underline; }
 .index-entry { display: block; color: inherit; text-decoration: none; }
+/* [hidden] alone loses to the rule above: both are one-class/one-attribute
+   specificity, and this author sheet already beat the UA sheet's own
+   `[hidden] { display: none }` for the same reason. Pin it back down. */
+.index-entry[hidden] { display: none; }
 a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transparent); }
 .index-entry h2 { font-size: 1.05rem; }
 .index-entry-missing { opacity: 0.6; }
