@@ -676,6 +676,100 @@ def memoize_anesthetic_drop_labels():
     return True
 
 
+# Every read of an axis' viewLim asks matplotlib whether any axis sharing a
+# limit with it still needs autoscaling, and that question is answered by
+# walking the whole share group - twice, once per axis name - through a WeakSet.
+# One corner plot asks it ~3200 times over 20 shared axes, and the answer is
+# almost always "nothing is stale". Staleness is only ever *created* in one
+# place, _request_autoscale_view, so count calls to it: an axis whose group was
+# found settled at epoch N is still settled while the epoch reads N, and the
+# scan can be skipped outright. The epoch is re-read after the wrapped call so
+# an autoscale that re-stales the group on its way out is not recorded as
+# settled. Nothing else in matplotlib or mpl_toolkits writes _stale_viewlims to
+# True, so the counter sees every transition.
+# Best-effort: if matplotlib renames either private method, the plot is slower.
+_viewlim_scan_skipped = False
+
+
+def skip_settled_matplotlib_viewlims():
+    global _viewlim_scan_skipped
+    if _viewlim_scan_skipped:
+        return True
+    _viewlim_scan_skipped = True
+    try:
+        from matplotlib.axes._base import _AxesBase
+
+        request_autoscale = _AxesBase._request_autoscale_view
+        unstale = _AxesBase._unstale_viewLim
+    except (ImportError, AttributeError):
+        return False
+
+    epoch = [0]
+
+    def counted(self, *args, **kwargs):
+        epoch[0] += 1
+        return request_autoscale(self, *args, **kwargs)
+
+    def skipped(self):
+        started = epoch[0]
+        if getattr(self, "_report_viewlim_epoch", None) == started:
+            return
+        unstale(self)
+        if epoch[0] == started:
+            self._report_viewlim_epoch = started
+
+    _AxesBase._request_autoscale_view = counted
+    _AxesBase._unstale_viewLim = skipped
+    return True
+
+
+# anesthetic gives each panel its own limit-linking behaviour by defining a
+# fresh Axes subclass *inside* the per-axis helper and rebinding __class__ to
+# it, so a 5x5 corner plot builds 15 one-instance classes. Each one costs
+# matplotlib's Artist.__init_subclass__, which regenerates set()'s signature and
+# docstring by parsing the docstring of all ~265 setters - and leaves every
+# panel with a class of its own, so no type-level cache in matplotlib or CPython
+# is ever shared between them. The class bodies close over nothing but their
+# base, so one class per (helper, base type) is enough: let the first panel
+# build it as usual and rebind the rest onto the same class.
+# Best-effort: if anesthetic moves the helpers, the plot is just slower.
+_axes_subclasses_shared = False
+
+
+def share_anesthetic_axes_subclasses():
+    global _axes_subclasses_shared
+    if _axes_subclasses_shared:
+        return True
+    _axes_subclasses_shared = True
+    try:
+        from anesthetic.plot import AxesDataFrame
+
+        helpers = {
+            name: AxesDataFrame.__dict__[name].__func__
+            for name in ("_make_diagonal", "_make_offdiagonal")
+        }
+    except (ImportError, AttributeError, KeyError):
+        return False
+
+    cache = {}
+
+    def share(name, make):
+        def shared(ax):
+            key = (name, type(ax))
+            subclass = cache.get(key)
+            if subclass is None:
+                make(ax)
+                cache[key] = type(ax)
+            else:
+                ax.__class__ = subclass
+
+        return shared
+
+    for name, make in helpers.items():
+        setattr(AxesDataFrame, name, staticmethod(share(name, make)))
+    return True
+
+
 def _render_likelihood_png(run_dir, param_names):
     load_plot_libs()
     try:
@@ -688,6 +782,8 @@ def _render_likelihood_png(run_dir, param_names):
     memoize_matplotlib_text_layout()
     memoize_anesthetic_labels_map()
     memoize_anesthetic_drop_labels()
+    skip_settled_matplotlib_viewlims()
+    share_anesthetic_axes_subclasses()
 
     try:
         samples = weight_by_likelihood(load_nested_samples(run_dir))
@@ -2167,6 +2263,66 @@ def _self_check_drop_labels_memo():
     assert list(third.columns) == ["a", "b", "c"]
 
 
+def _self_check_viewlim_skip():
+    """The settled-viewLim skip must not run the scan twice for one settled
+    epoch, must still autoscale once something asks for it, and must not record
+    an epoch when the autoscale it ran re-staled the group."""
+    load_plot_libs()
+    if not skip_settled_matplotlib_viewlims():
+        return
+    from matplotlib.axes._base import _AxesBase
+
+    fig, ax = plt.subplots()
+    ax.plot([0, 1], [0, 5])
+    scans = []
+    settled = _AxesBase._unstale_viewLim
+
+    def counting(self):
+        scans.append(self)
+        return settled(self)
+
+    _AxesBase._unstale_viewLim = counting
+    try:
+        ax.viewLim
+        first = len(scans)
+        ax.viewLim
+        assert len(scans) == first + 1, "the skip stopped being called at all"
+        assert not ax._stale_viewlims["y"], "a settled axis was left stale"
+        ax.plot([0, 1], [0, 50])
+        ax.viewLim
+        assert ax.get_ylim()[1] > 5, "a re-staled axis was never autoscaled"
+    finally:
+        _AxesBase._unstale_viewLim = settled
+        plt.close(fig)
+
+
+def _self_check_axes_subclass_sharing():
+    """Two panels made by the same anesthetic helper must land on one shared
+    subclass, and the two helpers must not share a subclass with each other."""
+    load_plot_libs()
+    if not share_anesthetic_axes_subclasses():
+        return
+    try:
+        from anesthetic.plot import AxesDataFrame
+    except ImportError:
+        return
+    fig, axs = plt.subplots(1, 3)
+    try:
+        base = type(axs[0])
+        AxesDataFrame._make_diagonal(axs[0])
+        AxesDataFrame._make_diagonal(axs[1])
+        AxesDataFrame._make_offdiagonal(axs[2])
+        assert type(axs[0]) is not base, "the panel was never given a subclass"
+        assert type(axs[0]) is type(axs[1]), "two diagonals built two classes"
+        assert type(axs[2]) is not type(axs[0]), "both helpers shared a class"
+        assert issubclass(type(axs[2]), base), "the subclass lost its base"
+        # The shared class must still do the linking the fresh one did.
+        axs[1].set_xlim(2, 7)
+        assert axs[1].get_ylim() == (2, 7), "the shared class stopped linking"
+    finally:
+        plt.close(fig)
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -2188,6 +2344,8 @@ if __name__ == "__main__":
         _self_check_tight_bbox()
         _self_check_labels_map_memo()
         _self_check_drop_labels_memo()
+        _self_check_viewlim_skip()
+        _self_check_axes_subclass_sharing()
         print("generate_report self-check passed")
     else:
         main()

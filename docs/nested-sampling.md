@@ -462,6 +462,33 @@ Unlike the caches above this only ever asks matplotlib to do less, so there is
 nothing to degrade gracefully; `_self_check_tight_bbox` asserts the two save
 paths still produce the same bytes.
 
+Two more repeats are structural rather than per-pass. Every read of an axis'
+`viewLim` asks matplotlib whether anything sharing a limit with it still needs
+autoscaling, and that question walks the whole shared-axis group through a
+`WeakSet`, once per axis name - ~3200 times over 20 axes for one corner plot,
+almost always to answer "nothing". Staleness is only ever created in one place,
+`_request_autoscale_view`, so `skip_settled_matplotlib_viewlims()` counts calls
+to it: an axis whose group was found settled at epoch *N* is still settled while
+the counter reads *N*, and the scan is skipped outright. The epoch is re-read
+after the wrapped call, so an autoscale that re-stales the group on its way out
+is not recorded as settled. Nothing else in matplotlib or `mpl_toolkits` writes
+`_stale_viewlims` to `True`, so the counter sees every transition.
+
+And anesthetic gives each panel its limit-linking behaviour by defining a fresh
+`Axes` subclass *inside* the per-axis helper and rebinding `__class__` to it, so
+a 5x5 corner plot builds 15 one-instance classes. Each one pays matplotlib's
+`Artist.__init_subclass__`, which regenerates `set()`'s signature and docstring
+by parsing the docstring of all ~265 setters, and each leaves its panel with a
+class no other panel shares, so no type-level cache is reused either. The class
+bodies close over nothing but their base, so
+`share_anesthetic_axes_subclasses()` lets the first panel build the class as
+usual and rebinds the rest onto it, one class per (helper, base type).
+
+Together: corner plot 0.499s -> 0.456s (-8.5%), five-run cold build 1.207s ->
+1.171s in-container and 3.6% less CPU, with byte-identical PNGs. Best-effort
+like the rest - if matplotlib or anesthetic renames either private hook, the
+plot is just slower.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the
