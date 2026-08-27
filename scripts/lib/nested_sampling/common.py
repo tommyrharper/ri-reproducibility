@@ -886,10 +886,13 @@ def source_pixel(
     same formula on both axes reproduces Meow's `LMDirection` convention (the
     one `point_source_forest.py` places the source with) without a manual sign
     flip. Checked against an actual WSClean image with a non-zero offset, not
-    derived from the FITS standard alone - see self_check_source_offset(). At
-    `l == m == 0.0` this is exactly `(cx, cy)` and never reads
-    `CDELT1`/`CDELT2`, so it needs nothing an image without a source offset
-    does not already have.
+    derived from the FITS standard alone - see self_check_source_offset().
+
+    `header` must carry both CDELT keys; `compute_image_metrics()` supplies
+    them for R2D2, which writes none. It used to be true that an unoffset
+    source never reached this read, which is why a header-less image only
+    failed once `source_offset_fraction` was searched - do not lean on that
+    again.
     """
     if source_l_arcsec == 0.0 and source_m_arcsec == 0.0:
         return cx, cy
@@ -909,12 +912,35 @@ def compute_image_metrics(
     residual_dirty_path: Path | None = None,
     source_l_arcsec: float = 0.0,
     source_m_arcsec: float = 0.0,
+    pixel_size_arcsec: float | None = None,
 ) -> dict[str, float]:
     image, header = load_fits_2d(image_path)
 
     y_size, x_size = image.shape
-    cx = int(round(float(header.get("CRPIX1", x_size / 2.0)) - 1.0))
-    cy = int(round(float(header.get("CRPIX2", y_size / 2.0)) - 1.0))
+    # WSClean writes a full WCS; R2D2 writes a bare header - SIMPLE, BITPIX,
+    # NAXIS and nothing else - so for R2D2 both the reference pixel and the
+    # cell size have to be supplied. Its grid is the centred one the FFT
+    # implies, and its cell size is what `image_pixel_size_arcsec()` derives
+    # from the same recorded baseline R2D2 sized its own pixels from (the
+    # figure WSClean is passed as `-scale`). Missing CDELT with no
+    # `pixel_size_arcsec` is a caller bug, not something to guess a scale for:
+    # silently centring the source scores a good image as a catastrophic one.
+    if "CDELT1" not in header or "CDELT2" not in header:
+        if pixel_size_arcsec is None:
+            raise ValueError(
+                f"{image_path}: image has no CDELT1/CDELT2 and no pixel_size_arcsec was given"
+            )
+        header = {
+            **header,
+            "CDELT1": -pixel_size_arcsec / 3600.0,
+            "CDELT2": pixel_size_arcsec / 3600.0,
+        }
+    # FITS CRPIX is 1-based, so the centre of an even axis is `size / 2 + 1`:
+    # 65 for the 128-pixel images here, which is what WSClean writes and what
+    # R2D2's own grid uses. Defaulting to `size / 2` put a header-less image's
+    # centre one pixel low on both axes.
+    cx = int(round(float(header.get("CRPIX1", x_size / 2.0 + 1.0)) - 1.0))
+    cy = int(round(float(header.get("CRPIX2", y_size / 2.0 + 1.0)) - 1.0))
     cx = max(0, min(x_size - 1, cx))
     cy = max(0, min(y_size - 1, cy))
     sx, sy = source_pixel(header, cx, cy, source_l_arcsec, source_m_arcsec, x_size, y_size)
@@ -1767,6 +1793,51 @@ def self_check_source_offset() -> None:
     }
     sx, sy = source_pixel(real_header, 64, 64, 6.87503877002526, 11.907916453689596, 128, 128)
     assert (sx, sy) == (59, 73), (sx, sy)
+
+    # R2D2 writes no WCS at all, so compute_image_metrics() has to supply one.
+    # Both cases below are real R2D2 reconstructions from a search with
+    # `source_offset_fraction` enabled: the (l, m) and max projected baseline
+    # the simulator recorded, against the pixel the brightest pixel of the
+    # reconstruction was actually measured at. This is the check that would
+    # have caught the missing header, and the one that pins the l-axis sign
+    # and the centre pixel for R2D2 the way `real_header` above pins WSClean.
+    import tempfile
+
+    from astropy.io import fits
+
+    for l_as, m_as, max_proj_baseline_lambda, expected in (
+        (20.529971838368628, 35.5589543020127, 32152.12622557544, (54, 81)),
+        (12.833132485007466, 22.22763748429558, 57746.84392542726, (53, 83)),
+    ):
+        scale = image_pixel_size_arcsec(max_proj_baseline_lambda)
+        image = np.zeros((DEFAULT_IMAGE_DIM, DEFAULT_IMAGE_DIM))
+        image[expected[1], expected[0]] = 1.0
+        with tempfile.TemporaryDirectory() as tmp:
+            # PrimaryHDU alone writes what R2D2 writes: SIMPLE/BITPIX/NAXIS
+            # and nothing else. No CRPIX either, so this also pins the centre.
+            path = Path(tmp) / "r2d2_model_image.fits"
+            fits.PrimaryHDU(image).writeto(path)
+            metrics = compute_image_metrics(
+                path, 1.0, 0.0, 0,
+                source_l_arcsec=l_as,
+                source_m_arcsec=m_as,
+                pixel_size_arcsec=scale,
+            )
+            # The 1 Jy spike sits exactly where the source was, so a metric
+            # that located it sees a perfect image; one pixel out and the
+            # residual carries the whole 1 Jy twice over.
+            assert metrics["peak_flux_abs_error_jy"] == 0.0, (l_as, m_as, metrics["peak_flux_abs_error_jy"])
+            assert metrics["total_rms_jy"] == 0.0, (l_as, m_as, metrics["total_rms_jy"])
+
+            # A header with no WCS and no scale to stand in for it must say so
+            # rather than quietly centring the source and scoring a good image
+            # as a catastrophic one, which is what makes such a bug invisible.
+            try:
+                compute_image_metrics(path, 1.0, 0.0, 0, source_l_arcsec=l_as, source_m_arcsec=m_as)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a header-less image with no pixel_size_arcsec must raise")
 
     # A cube with everything at 0.5 fixes the offset fraction at its box's
     # midpoint; band_start's own resolution can move start_frequency_hz, so

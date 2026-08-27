@@ -26,6 +26,7 @@ from common import (
     cube_to_params,
     gathered_window_fit_stats,
     compute_image_metrics,
+    image_pixel_size_arcsec,
     convert_ms_to_mat,
     load_evaluations_from_dir,
     load_parameter_space,
@@ -196,6 +197,18 @@ def evaluate(
             },
         })
 
+    # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
+    # have to be told the cell size it used. Same figure WSClean is handed as
+    # `-scale`, from the same recorded baseline, so the two score the same sky
+    # - see image_pixel_size_arcsec() in common.py.
+    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    if "max_proj_baseline_lambda" not in simulation["observation"]:
+        raise SystemExit(
+            "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
+            "rebuild the meqtrees image (scripts/build.sh meqtrees), it bakes in a stale simulator"
+        )
+    scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
+
     image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
     dirty_path = r2d2_dir / "r2d2_data" / "dirty_normalised.fits"
     residual_dirty_path = r2d2_dir / "r2d2_data" / "R2D2_residual_dirty_image.fits"
@@ -210,6 +223,7 @@ def evaluate(
             residual_dirty_path=residual_dirty_path,
             source_l_arcsec=params["source_l_arcsec"],
             source_m_arcsec=params["source_m_arcsec"],
+            pixel_size_arcsec=scale_arcsec,
         )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
@@ -237,6 +251,7 @@ def evaluate(
     record = {
         "eval_id": eval_id,
         "params": params,
+        "image_pixel_size_arcsec": scale_arcsec,
         "metrics": metrics,
         "objective": objective,
         "paths": {
@@ -392,6 +407,11 @@ def self_check_failure_record_persistence() -> None:
             platform: str,
         ) -> tuple[Path, list[str], None]:
             eval_dir.mkdir(parents=True, exist_ok=False)
+            # A real simulate always leaves this behind, and evaluate() reads it
+            # for the cell size R2D2's images carry no header for.
+            (eval_dir / "simulation.json").write_text(
+                json.dumps({"observation": {"max_proj_baseline_lambda": 1.0e5}})
+            )
             return eval_dir / "sim.ms", ["simulate"], None
 
         def successful_convert(*args: Any, **kwargs: Any) -> int:
