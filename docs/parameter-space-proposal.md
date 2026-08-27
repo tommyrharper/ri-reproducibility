@@ -7,45 +7,17 @@ Everything else that shapes an evaluation is pinned in `cube_to_params()` or in
 the runners.
 
 This document proposes what to add next, ranked by failure-mode value per unit
-of plumbing. Section 0 is the confound that had to be fixed before any of it
-was worth measuring, and is fixed by the same PR that adds this file.
+of plumbing. WSClean's cell size following the sampled frequency instead of a
+hard-coded `-scale` - the confound that had to be fixed before any of this was
+worth measuring - is implemented; see "Cell size" in `docs/nested-sampling.md`.
 
-Nothing here is implemented beyond section 0 and section 1; it is a plan, not
-a changelog - section 1's own writeup below is kept as the design rationale,
-not updated into a changelog entry. Every dimension `[[parameter_space]]`
-takes `enabled` (default true) for pinning it back out without deleting it -
-see "Toggling dimensions on and off" in docs/nested-sampling.md - which is
-what makes landing one dimension at a time here safe: the next section's
-addition does not have to also be the next section's permanent commitment.
-
-## 0. Fixed in this PR: WSClean's cell size now follows the sampled frequency
-
-`polychord_wsclean.py` used to hard-code `-size 128 128 -scale 1asec`, while
-`polychord_r2d2.py` lets R2D2 derive its cell size from the sampling pattern,
-so R2D2's pixels tracked frequency and WSClean's did not. The search sweeps
-`start_frequency_hz` over 54 MHz to 50 GHz - three orders of magnitude -
-against VLA-A's ~36 km maximum baseline:
-
-| Band | Synthesized beam | Pixels per beam at 1 arcsec | Field (128 px) |
-|---|---:|---:|---:|
-| 4 (54 MHz) | 31.5 arcsec | 31.5 | 4 beams across |
-| L (1.4 GHz) | 1.21 arcsec | 1.2 | 105 beams across |
-| Q (45 GHz) | 0.038 arcsec | 0.04 | 3400 beams across |
-
-At the top of the range the PSF was ~1/26 of a pixel: grossly undersampled, and
-the "source" a gridding artefact. At the bottom the cell oversampled the beam
-by ~10x against the usual ~3 pixels per beam, and the whole 128-pixel field was
-only four beams wide. Only around L band did the fixed 1 arcsec cell resemble a
-sane choice. So `start_frequency_hz` was measuring how badly WSClean's fixed
-grid was mismatched to the sampled frequency, not a property of either
-algorithm - and the two were not being compared like for like, because only one
-of them rescaled.
-
-The fix derives `-scale` from R2D2's own formula
-(`image_pixel_size_arcsec()` in `common.py`) applied to the longest projected
-baseline the simulator records, so `pixels_per_beam` is now a knob that could
-be searched deliberately (see 9) rather than a silent confound. See "Cell size"
-in `docs/nested-sampling.md`.
+Nothing here is implemented beyond section 1; it is a plan, not a changelog -
+section 1's own writeup below is kept as the design rationale, not updated
+into a changelog entry. Every dimension `[[parameter_space]]` takes `enabled`
+(default true) for pinning it back out without deleting it - see "Toggling
+dimensions on and off" in docs/nested-sampling.md - which is what makes
+landing one dimension at a time here safe: the next section's addition does
+not have to also be the next section's permanent commitment.
 
 ## 1. Source offset from the phase centre - cheapest, highest value
 
@@ -216,6 +188,6 @@ inserting into `[[parameter_space]]` also invalidates existing chains, and
 `merge-nested-sampling-runs.py` refuses to merge runs whose `parameter_space`
 differs, so batch additions rather than dripping them in.
 
-Suggested first batch, +3 dimensions, all cheap and all unlocking physics the
-existing dimensions already pay for: **source offset (1)**, **integration time
-(2)**, **gain error (3)** - after fixing the cell-size confound (0).
+Suggested first batch, all cheap and all unlocking physics the existing
+dimensions already pay for: **source offset (1)** - implemented - then
+**integration time (2)** and **gain error (3)**.
