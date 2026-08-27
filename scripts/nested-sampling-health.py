@@ -29,8 +29,9 @@ Plus the host: memory, and sidecar containers whose run is gone. A killed run
 leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank, which
 then counts against every later run's memory budget until someone notices.
 
-Filesystem reads, one `ps` and one `docker ps`; nothing started, nothing
-imaged, so it costs a busy host nothing to ask.
+Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
+when a run has live ranks; nothing started, nothing imaged, so it costs a busy
+host nothing to ask.
 
 Usage:
 
@@ -70,6 +71,13 @@ FAILURE_OBJECTIVE_MARKER = '"objective": 100.0'
 # simulate reply, 3600s for an imaging one) bound anything the run itself would
 # wait on. Overridable because a search over a slower parameter space moves it.
 DEFAULT_STALE_SECONDS = 600.0
+
+# How long nothing may complete before every rank burning CPU is read as a
+# deadlock rather than as ranks waiting on whichever peer is still imaging.
+# Much shorter than the stale threshold above because the two signals together
+# are unambiguous where either alone is not: a healthy run at any pace lands
+# something well inside a minute.
+SPIN_IDLE_SECONDS = 60.0
 
 # A gap between consecutive evaluations counts as a stall when it is this many
 # times the run's own median gap. Relative because the two imagers are two
@@ -289,30 +297,96 @@ def rank_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[di
     ]
 
 
-def spinning_ranks(ranks: list[dict[str, object]]) -> int:
-    """Ranks that have spent nearly their whole life on CPU.
+def _cpu_seconds(pid: int) -> float | None:
+    """CPU time for one process, in ticks rather than whole seconds.
+
+    `ps` rounds its `time` column to the second, which is too coarse to
+    difference over a short interval; /proc counts in clock ticks, so a one
+    second sample resolves to a percent. Linux only, and cpu_busy_fractions
+    falls back to `ps` and a longer interval where it is not there.
+    """
+    try:
+        # The comm field can itself contain spaces and brackets, so everything
+        # before the last ") " is skipped rather than parsed. What is left
+        # starts at `state`, which makes utime and stime fields 11 and 12.
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _cpu_seconds_from_ps(pids: list[int]) -> dict[int, float]:
+    """The same, from `ps`, for hosts without /proc."""
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=,time=", "-p", ",".join(str(p) for p in pids)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    sampled = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit():
+            seconds = _clock_seconds(fields[1])
+            if seconds is not None:
+                sampled[int(fields[0])] = seconds
+    return sampled
+
+
+def cpu_busy_fractions(pids: list[int]) -> dict[int, float]:
+    """What share of a short interval each process spent on CPU, right now.
 
     Open MPI's ob1 busy-waits, so a rank blocked in a collective burns a core
     and is indistinguishable from a working one on instantaneous CPU percent.
-    Cumulative CPU time against elapsed time does distinguish them: a working
-    rank waits on its imager for most of its life, a deadlocked one never has.
+    What separates them is how much of the interval went to CPU: a working rank
+    spends most of it waiting on its imager, a spinning one spends all of it.
+
+    Sampled twice rather than taken as cumulative CPU time over the process's
+    whole life. The lifetime ratio only reveals a rank that wedged early - a
+    run that works for an hour at 40% and then deadlocks still reads ~0.45 five
+    minutes later, and goes on reading under the threshold for as long as it
+    takes the spinning to outweigh the real work already done. Which is most of
+    an hour, on the runs this is for.
+    """
+    if not pids:
+        return {}
+    fine = {pid: _cpu_seconds(pid) for pid in pids}
+    if all(v is not None for v in fine.values()):
+        # /proc resolves to a percent, so a second is a long enough sample.
+        before, interval = fine, 1.0
+    else:
+        # `ps` counts whole seconds, so the interval has to be long enough that
+        # the rounding does not swamp the difference.
+        before, interval = _cpu_seconds_from_ps(pids), 5.0
+    time.sleep(interval)
+    after = ({pid: _cpu_seconds(pid) for pid in pids} if interval == 1.0
+             else _cpu_seconds_from_ps(pids))
+    fractions = {}
+    for pid in pids:
+        start, end = before.get(pid), after.get(pid)
+        if start is not None and end is not None:
+            fractions[pid] = (end - start) / interval
+    return fractions
+
+
+def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> int:
+    """Ranks that spent the whole sample on CPU.
+
     Rank 0 is PolyChord's administrator and legitimately spins, so one is
     normal and all of them is the signal.
     """
-    count = 0
-    for rank in ranks:
-        elapsed, cpu = rank["elapsed_seconds"], rank["cpu_seconds"]
-        if elapsed and cpu is not None and elapsed > 0 and cpu / elapsed > 0.95:
-            count += 1
-    return count
+    return sum(1 for rank in ranks if busy.get(int(rank["pid"]), 0.0) > 0.95)
 
 
 def describe(run_dir: Path, processes: list[dict[str, object]],
-             stale_seconds: float) -> dict[str, object]:
+             stale_seconds: float, busy: dict[int, float] | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     scan = evaluation_scan(run_dir)
     ranks = rank_processes(run_dir, processes)
-    spinning = spinning_ranks(ranks)
+    spinning = spinning_ranks(ranks, busy or {})
     idle = scan["last_activity_seconds"]
     complete = (run_dir / "summary.json").exists()
 
@@ -347,12 +421,19 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         )
     if status == "stopped":
         warnings.append(f"stopped before finishing; continue it with ./ri resume {run_dir.name}")
-    # All but one, because rank 0 legitimately spins: it is PolyChord's
-    # administrator and does nothing else.
-    if ranks and spinning >= max(1, len(ranks) - 1):
+    # All but one, because rank 0 is PolyChord's administrator and does nothing
+    # else - and only once evaluations have stopped landing. Busy-waiting on
+    # its own is not a fault: measured on a healthy 16-rank R2D2 run, 7 ranks
+    # sit at exactly 1.0 at any moment, waiting in the collective for whichever
+    # ranks are still imaging, and the moment before the last one finishes
+    # every rank but that one is doing it. What is not normal is all of them
+    # doing it while nothing completes.
+    if ranks and spinning >= max(1, len(ranks) - 1) and idle is not None \
+            and idle > SPIN_IDLE_SECONDS:
         warnings.append(
-            f"{spinning} of {len(ranks)} ranks have spent their whole life on "
-            "CPU - the signature of every rank spinning in one MPI collective"
+            f"{spinning} of {len(ranks)} ranks are burning CPU and nothing has "
+            f"completed in {idle:.0f}s - the signature of every rank spinning in "
+            "one MPI collective"
         )
     # A tenth of the run, not a twentieth: a few percent is the ordinary spread
     # of evaluation cost across the parameter space, and the deadlock this
@@ -422,7 +503,7 @@ def render(run: dict[str, object]) -> None:
     if settings.get("NS_MPI_PROCS"):
         ranks += f" of {settings['NS_MPI_PROCS']}"
     if run["ranks_spinning"]:
-        ranks += f", {run['ranks_spinning']} spinning"
+        ranks += f", {run['ranks_spinning']} busy-waiting"
 
     idle = run["last_activity_seconds"]
     rate = run["evals_per_minute"]
@@ -514,7 +595,12 @@ def main(argv: list[str] | None = None) -> int:
 
     processes = process_table()
     directories = run_directories() if args.all else [resolve(args.run)]
-    runs = [describe(d, processes, args.stale_seconds) for d in directories]
+    # One sample interval for every run being reported, not one each: only a
+    # run with live ranks is sampled at all, and there is rarely more than one.
+    # A report over finished runs costs nothing.
+    busy = cpu_busy_fractions(
+        [int(p["pid"]) for d in directories for p in rank_processes(d, processes)])
+    runs = [describe(d, processes, args.stale_seconds, busy) for d in directories]
     host = host_report(processes)
 
     if args.json:
@@ -599,11 +685,53 @@ def self_check() -> None:
             assert describe(live, [], 5.0)["warnings"] == []
             (live / "summary.json").unlink()
 
-            # Ranks that never leave the CPU are the deadlock signature; ranks
-            # that do are the healthy one, even at the same rank count.
-            spun = [dict(r, cpu_seconds=99.0) for r in ranks]
-            assert spinning_ranks(spun) == 4 and spinning_ranks(ranks) == 0
-            assert any("spinning" in w for w in describe(live, spun, DEFAULT_STALE_SECONDS)["warnings"])
+            # Ranks that spend a whole sample on CPU are the deadlock
+            # signature; ranks that wait on their imager are the healthy one,
+            # at the same rank count and with the same lifetimes.
+            working = {int(r["pid"]): 0.4 for r in ranks}
+            spinning = {int(r["pid"]): 0.999 for r in ranks}
+            assert spinning_ranks(ranks, spinning) == 4
+            assert spinning_ranks(ranks, working) == 0
+            # Unsampled is not spinning: a rank that exited between the two
+            # samples must not read as wedged.
+            assert spinning_ranks(ranks, {}) == 0
+            # ...but busy-waiting alone is not a fault. Every rank spinning is
+            # only a deadlock once nothing is completing either: on a healthy
+            # run most ranks sit at 1.0 waiting for whichever peer is still
+            # imaging. These evaluations landed seconds ago, so no warning.
+            assert describe(live, ranks, DEFAULT_STALE_SECONDS, spinning)["warnings"] == []
+            assert describe(live, ranks, DEFAULT_STALE_SECONDS, working)["warnings"] == []
+            # The same ranks against a run that has gone quiet: a deadlock, and
+            # said so well before the much longer stale threshold is reached.
+            quiet = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T010000Z"
+            (quiet / "chains").mkdir(parents=True)
+            for i in range(4):
+                write_eval(quiet, i + 1, now - 300 + i * 0.5)
+            quiet_ranks = [dict(r, args=str(r["args"]).replace(str(live.resolve()),
+                                                               str(quiet.resolve())))
+                           for r in ranks]
+            report = describe(quiet, quiet_ranks, DEFAULT_STALE_SECONDS, spinning)
+            assert report["status"] == "healthy", report  # not yet stale...
+            assert any("burning CPU" in w for w in report["warnings"]), report
+            # One rank still working is PolyChord's usual shape, not a deadlock.
+            all_but_one = {**working, int(ranks[0]["pid"]): 0.999}
+            assert describe(quiet, quiet_ranks, DEFAULT_STALE_SECONDS,
+                            all_but_one)["warnings"] == []
+
+            # The sampler itself, against a process that really is spinning and
+            # one that really is not - both in the same interval, because a
+            # discriminator that always returned zero would pass a check made
+            # only of idle processes. The bar is 0.5 rather than 0.95 so a
+            # loaded host cannot fail it; the two are an order apart.
+            assert cpu_busy_fractions([]) == {}
+            spinner = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+            try:
+                sampled = cpu_busy_fractions([spinner.pid, os.getpid()])
+            finally:
+                spinner.kill()
+                spinner.wait()
+            assert sampled.get(spinner.pid, 0) > 0.5, sampled
+            assert sampled.get(os.getpid(), 1) < 0.5, sampled
 
             # A run whose imager is broken: every count healthy, every point
             # worthless. This is the one the other checks cannot see.

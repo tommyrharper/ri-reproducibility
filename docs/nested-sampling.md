@@ -305,7 +305,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   stage     sampling, 57 dead points
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
-  ranks     16 ranks of 16, 1 spinning
+  ranks     16 ranks of 16, 7 busy-waiting
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
   stalls    8 gaps over 13s, 154s = 5.5% of wall clock
 
@@ -316,9 +316,10 @@ host
 
 With no argument it reports on the newest run; `--all` covers every run on
 disk and `--json` is the machine-readable form. It reads files and runs one
-`ps` and one `docker ps` - nothing is started and nothing is imaged, so a run
-in progress does not notice it. Exit status is 1 when something needs
-attention, so it can gate a script.
+`ps` and one `docker ps`, plus a one second CPU sample when a run has live
+ranks - nothing is started and nothing is imaged, so a run in progress does not
+notice it. Exit status is 1 when something needs attention, so it can gate a
+script.
 
 **The status is decided in this order, and the order is the point.** A run
 that finished and a run that died both stop writing, so a stale mtime alone
@@ -345,12 +346,17 @@ What each line is reading, and why it is worth a line:
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
   stuck at once.
 - **ranks** - found by the `--output-dir` they were launched with, so no ranks
-  means no run. `spinning` counts ranks whose cumulative CPU time is within 5%
-  of their elapsed time: Open MPI's `ob1` busy-waits, so a rank blocked in a
-  collective burns a core and looks identical to a working one on `%CPU`, but
-  a working rank spends most of its life waiting on its imager and a
-  deadlocked one never has. Rank 0 is PolyChord's administrator and
-  legitimately spins, so one is normal - all of them is a deadlock.
+  means no run. `busy-waiting` counts the ranks that spent a whole one-second
+  sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective
+  burns a core and looks identical to a working one on `%CPU`; sampling twice
+  and taking the increment is what separates them, and it does so whenever the
+  rank got stuck. (Cumulative CPU over the process's whole life does not: a run
+  that works for an hour and then wedges still reads under any threshold for
+  most of another hour, because the real work already done outweighs the
+  spinning.) On its own this is not a fault - measured on a healthy 16-rank
+  R2D2 run, 7 ranks sit at 1.0 at any moment, waiting for whichever peers are
+  still imaging. It is reported as a deadlock only when all but one are burning
+  CPU **and** nothing has completed for a minute.
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real

@@ -377,7 +377,8 @@ def build_parser():
             "looks like a spectacular discovery - and any sidecar container left\n"
             "holding memory by a run that is gone.\n"
             "\n"
-            "Reads files and runs one ps and one docker ps, so it costs a busy\n"
+            "Reads files, runs one ps and one docker ps, and samples rank CPU\n"
+            "for a second when a run is live, so it costs a busy\n"
             "host nothing. Exits 1 when something needs attention."
         ),
     )
