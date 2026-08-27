@@ -151,6 +151,18 @@ check(
 )
 
 check(
+    "self-check with no target runs every set",
+    [["scripts/self-check.sh", "all"]],
+    plan("self-check")[1],
+)
+
+check(
+    "self-check takes one set at a time",
+    [["scripts/self-check.sh", "simulate"]],
+    plan("self-check", "simulate")[1],
+)
+
+check(
     "smoke with no target runs both imagers",
     [["scripts/smoke-test-wsclean.sh"], ["scripts/smoke-test-r2d2.sh"]],
     plan("smoke")[1],

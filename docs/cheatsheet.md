@@ -57,6 +57,21 @@ After editing `scripts/lib/nested_sampling/*`, rebuild **both** `polychord` and
 ./ri smoke ms-to-mat       # the MS -> R2D2 .mat bridge, before an R2D2 search
 ```
 
+## Self-checks
+
+CI runs everything that needs no Docker. These are the rest - a live meqserver,
+a real TDL compile, numpy, casacore - so they only run when asked. The working
+tree is what runs, inside the image, so no rebuild is needed to check a change;
+a run executes the baked copy, so rebuild before starting one. They start no
+search and write nothing into `results/`, so they are safe alongside a run.
+
+```bash
+./ri self-check            # host-side checks, then all three images
+./ri self-check simulate   # MeqTrees: skeleton cache, forest reuse, deadlock recovery
+./ri self-check wsclean    # the WSClean sampler's checks
+./ri self-check r2d2       # the R2D2 sampler's checks
+```
+
 ## Shells into an image
 
 ```bash

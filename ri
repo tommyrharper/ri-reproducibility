@@ -84,6 +84,10 @@ def do_smoke(args):
     return {}, [[f"scripts/smoke-test-{t}.sh"] for t in targets]
 
 
+def do_self_check(args):
+    return {}, [["scripts/self-check.sh", args.target]]
+
+
 def do_shell(args):
     return {}, [["scripts/shell.sh", args.image]]
 
@@ -245,6 +249,18 @@ def build_parser():
                        help="WSClean tuned for this exact CPU (tags :native, "
                             "WSCLEAN_PORTABLE=OFF); faster but not portable, and "
                             "not comparable with a portable build")
+
+    self_check = add("self-check", do_self_check, "run the checks that need the images",
+        description="Runs the host-side checks, then each module's own "
+                    "--self-check inside the image it runs in - the ones that "
+                    "need a live meqserver, a TDL compile, numpy or casacore, "
+                    "and so cannot run in CI. The working tree is what runs, so "
+                    "no rebuild is needed to check a change - but a run executes "
+                    "the copy baked into the image, so rebuild before starting "
+                    "one. Starts no search and writes nothing into results/.")
+    self_check.add_argument("target", nargs="?", default="all",
+        choices=("all", "simulate", "wsclean", "r2d2"),
+        help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",
                 description="Cheap end-to-end checks to run after a rebuild, before "
