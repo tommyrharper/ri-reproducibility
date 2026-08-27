@@ -318,12 +318,30 @@ The committed list is the VLA's:
 | C | 4-8 GHz | Q | 40-50 GHz |
 
 Nothing in the code is VLA-specific: another telescope is a matter of
-replacing the list (any number of bands, in any order, gaps allowed). A window
-wider than every band is narrowed until it fits rather than placed outside
-one. `self_check_spectral_window()` in
-`scripts/lib/nested_sampling/common.py` is the guard - it samples the cube,
-asserts every window lands inside a band, and asserts the theta -> cube -> params
-round trip PolyChord relies on still comes back to the same parameters.
+replacing the list (any number of bands, in any order, gaps allowed).
+`self_check_spectral_window()` in `scripts/lib/nested_sampling/common.py` is
+the guard - it samples the cube, asserts every window lands inside a band, and
+asserts the theta -> cube -> params round trip PolyChord relies on still comes
+back to the same parameters.
+
+`channel_count` and `channel_width_hz` stay ordinary boxes you can widen, and
+widening them cannot put a window outside a band, because the placement is
+computed per draw from the width that draw asked for:
+
+- The set of candidate bands is whichever ones can hold *that* window, so a
+  wide window simply never starts in a band too narrow for it, while a narrow
+  window drawn a moment later still can. No band is lost from the prior for
+  being narrow.
+- A window wider than every band - only reachable if `channel_count` x
+  `channel_width_hz` exceeds the widest band, 13.5 GHz for the VLA - has its
+  channels narrowed until it fits rather than being placed outside a band.
+  That caps the top of the `channel_width_hz` range, so
+  `warn_if_window_exceeds_bands()` prints what the effective ceiling is when
+  the configured box reaches past it.
+
+The band guarantee is the sampler's. `simulate_point_source_ms.py` takes
+`--start-frequency-hz` and `--channel-width-hz` as given, so a hand-run
+simulate (or a smoke test) can still ask for whatever it likes.
 
 Fixed hyperparameters (not searched) on every evaluation:
 

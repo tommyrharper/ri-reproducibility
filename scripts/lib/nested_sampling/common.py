@@ -187,7 +187,32 @@ def load_parameter_space() -> list[dict[str, Any]]:
             bands = load_receiver_bands()
             spec.setdefault("min", min(float(band["min"]) for band in bands))
             spec.setdefault("max", max(float(band["max"]) for band in bands))
+            warn_if_window_exceeds_bands(specs)
     return specs
+
+
+def warn_if_window_exceeds_bands(specs: list[dict[str, Any]]) -> None:
+    """Say so when the channel ranges ask for more bandwidth than any band has.
+
+    place_spectral_window() narrows the channels rather than placing a window
+    outside a band, so a too-wide box is not an error - but it does mean the
+    top of the configured channel_width_hz range is never actually searched,
+    and a silently capped search reads as one that covered its whole box.
+    """
+    by_name = {str(spec["name"]): spec for spec in specs}
+    count, width = by_name.get("channel_count"), by_name.get("channel_width_hz")
+    if not count or not width:
+        return
+    widest = max(float(band["max"]) - float(band["min"]) for band in load_receiver_bands())
+    window = float(count["max"]) * float(width["max"])
+    if window > widest:
+        print(
+            f"defaults.toml: {count['max']} channels of {float(width['max']) / 1e6:g} MHz span "
+            f"{window / 1e6:g} MHz, wider than the widest receiver band ({widest / 1e6:g} MHz). "
+            f"Channels are narrowed to fit, so at {count['max']} channels nothing above "
+            f"{widest / float(count['max']) / 1e6:g} MHz is ever searched.",
+            file=sys.stderr,
+        )
 
 
 def placeable_start_ranges(window_hz: float) -> list[tuple[float, float]]:
