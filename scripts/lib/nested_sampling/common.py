@@ -880,18 +880,22 @@ def source_pixel(
 ) -> tuple[int, int]:
     """The pixel a source at (`source_l_arcsec`, `source_m_arcsec`) lands on.
 
-    Standard flat-sky FITS/AIPS convention, matching Meow's `LMDirection` (the
-    one `point_source_forest.py` places the source with): `l` runs opposite
-    the RA axis's pixel direction (`CDELT1` is negative), `m` runs the same
-    way as the Dec axis's (`CDELT2` positive). At `l == m == 0.0` this is
-    exactly `(cx, cy)` and never reads `CDELT1`/`CDELT2`, so it needs nothing
-    an image without a source offset does not already have.
+    Plain WCS: `pixel = CRPIX - 1 + world_offset / CDELT`, applied on each axis
+    with that axis's own signed `CDELT` (arcsec/pixel) - `CDELT1` is negative
+    (RA increases the opposite way pixel x does), `CDELT2` positive, so the
+    same formula on both axes reproduces Meow's `LMDirection` convention (the
+    one `point_source_forest.py` places the source with) without a manual sign
+    flip. Checked against an actual WSClean image with a non-zero offset, not
+    derived from the FITS standard alone - see self_check_source_offset(). At
+    `l == m == 0.0` this is exactly `(cx, cy)` and never reads
+    `CDELT1`/`CDELT2`, so it needs nothing an image without a source offset
+    does not already have.
     """
     if source_l_arcsec == 0.0 and source_m_arcsec == 0.0:
         return cx, cy
     cdelt1_arcsec = float(header["CDELT1"]) * 3600.0
     cdelt2_arcsec = float(header["CDELT2"]) * 3600.0
-    sx = cx + int(round(-source_l_arcsec / cdelt1_arcsec))
+    sx = cx + int(round(source_l_arcsec / cdelt1_arcsec))
     sy = cy + int(round(source_m_arcsec / cdelt2_arcsec))
     return max(0, min(x_size - 1, sx)), max(0, min(y_size - 1, sy))
 
@@ -1750,7 +1754,19 @@ def self_check_source_offset() -> None:
     cx, cy = 64, 64
     assert source_pixel(header, cx, cy, 0.0, 0.0, 128, 128) == (cx, cy)
     sx, sy = source_pixel(header, cx, cy, 3.0, 5.0, 128, 128)
-    assert (sx, sy) == (cx + 3, cy + 5), (sx, sy)
+    assert (sx, sy) == (cx - 3, cy + 5), (sx, sy)
+
+    # Pinned against an actual WSClean image (a real header, a real 1 Jy
+    # point source at this exact offset), not just the FITS/WCS formula: the
+    # `l` sign was wrong here once - source_pixel() agreed with itself but not
+    # with where WSClean actually put the source - and only running a real
+    # search caught it, not this self-check. See the PR that added this line.
+    real_header = {
+        "CRPIX1": 65.0, "CRPIX2": 65.0,
+        "CDELT1": -0.000376683333333333, "CDELT2": 0.000376683333333333,
+    }
+    sx, sy = source_pixel(real_header, 64, 64, 6.87503877002526, 11.907916453689596, 128, 128)
+    assert (sx, sy) == (59, 73), (sx, sy)
 
     # A cube with everything at 0.5 fixes the offset fraction at its box's
     # midpoint; band_start's own resolution can move start_frequency_hz, so
