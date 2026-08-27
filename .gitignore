@@ -58,3 +58,6 @@ latex/*.log
 latex/*.bbl
 latex/*.blg
 latex/*.toc
+
+# agents
+.claude
