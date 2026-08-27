@@ -57,7 +57,78 @@ METRIC_NAMES = (
     "peak_memory_bytes",
 )
 
+# An evaluation the algorithm failed. PolyChord maximizes the objective and a
+# real total_rms_jy is ~0.008, so this makes a failure the most interesting
+# point in the search - which is the point, because failure modes are what
+# this repo looks for. It is only correct for failures of the *algorithm*:
+# see WORKER_DIED.
 FAILURE_OBJECTIVE = 100.0
+
+# A worker died mid-request instead of a tool running and failing. Real exit
+# statuses are 0-255, so this cannot be mistaken for one.
+#
+# The distinction matters more than it looks. A host that runs out of memory
+# has its OOM killer take a worker, and without this the rank could not tell
+# that from R2D2 exiting non-zero on the parameters it was given - so it
+# recorded FAILURE_OBJECTIVE, and the search treated running out of memory as
+# the most interesting result it had ever found. The infrastructure dying says
+# nothing about the algorithm, so it must never reach the sampler as a
+# likelihood: it is retried, and if it persists the run stops.
+WORKER_DIED = -1
+
+# How long to keep putting a request to a worker before its death is called
+# permanent, as the pause before each attempt. A worker is dropped from the
+# cache when it dies, so every attempt gets a freshly started one.
+#
+# The retries are patient rather than immediate because of what kills a worker
+# here: the host running out of memory, usually because another run on the
+# same machine is holding it. That clears on its own - the memory this
+# attempt died for is freed by its own death, and the other run eventually
+# finishes - so waiting is what turns a dead run into a slow one. ~51s of
+# patience, then the evaluation is treated as impossible.
+WORKER_RETRY_DELAYS = (0.0, 1.0, 5.0, 15.0, 30.0)
+
+
+def worker_attempts() -> Any:
+    """Attempt numbers for a worker request, pausing longer before each retry."""
+    for attempt, delay in enumerate(WORKER_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        yield attempt
+
+
+class WorkerDied(RuntimeError):
+    """A worker died and did not come back, so the host failed, not the algorithm.
+
+    Raised out of an evaluation rather than scored, because there is no honest
+    value to return. Scoring it high makes the sampler chase the OOM killer;
+    scoring it low carves a hole out of exactly the expensive corner of the
+    parameter space where the real failure modes live. Both are a lie about
+    the algorithm, so the run stops instead.
+    """
+
+
+def abort_run(message: str) -> None:
+    """Stop every rank now, without returning a likelihood.
+
+    Raising out of the likelihood would only unwind this rank - it is called
+    from PolyChord's Fortran - and leave the others waiting on a collective
+    that never comes, so the job is torn down explicitly. Exiting with the
+    results so far on disk and a reason on stderr is the honest outcome: the
+    evaluations that did finish are still valid, and the chain is not
+    contaminated by a value nobody measured.
+    """
+    print(f"FATAL: {message}", file=sys.stderr, flush=True)
+    try:
+        from mpi4py import MPI
+
+        MPI.COMM_WORLD.Abort(1)
+    except Exception:
+        # No MPI, or it is already too broken to abort through: fall through
+        # to the hard exit, which the launcher turns into a failed run anyway.
+        pass
+    os._exit(1)
+
 
 DEFAULT_WSCLEAN_NITER = 100
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
@@ -335,23 +406,29 @@ def sidecar_run(
     The command's own output goes to the log files, so only the exit code `echo`
     comes back down the shell's stdout and nothing a sidecar prints can be
     mistaken for a reply. A shell that dies without answering is dropped from
-    the cache so the next evaluation starts a fresh one.
+    the cache, so the retry below starts a fresh one; a death that survives
+    that is reported as WORKER_DIED rather than as an exit status the command
+    never returned.
     """
-    shell = sidecar_shell(image, platform)
     request = (
         f"cd {shlex.quote(str(workdir))} && {shlex.join(cmd)}"
         f" >{shlex.quote(str(stdout_path))} 2>{shlex.quote(str(stderr_path))}; echo $?\n"
     )
     started = time.perf_counter()
-    shell.stdin.write(request)
-    shell.stdin.flush()
-    reply = shell.stdout.readline()
-    wall_seconds = time.perf_counter() - started
-    if not reply:
+    for attempt in worker_attempts():
+        shell = sidecar_shell(image, platform)
+        shell.stdin.write(request)
+        shell.stdin.flush()
+        reply = shell.stdout.readline()
+        if reply:
+            wall_seconds = time.perf_counter() - started
+            return DockerRunResult(returncode=int(reply), wall_seconds=wall_seconds, peak_memory_bytes=0)
         _SIDECAR_SHELLS.pop(image, None)
-        stderr_path.write_text(f"FATAL: {image} sidecar shell exited without a reply\n")
-        return DockerRunResult(returncode=1, wall_seconds=wall_seconds, peak_memory_bytes=0)
-    return DockerRunResult(returncode=int(reply), wall_seconds=wall_seconds, peak_memory_bytes=0)
+    wall_seconds = time.perf_counter() - started
+    stderr_path.write_text(
+        f"FATAL: {image} sidecar shell exited without a reply, {len(WORKER_RETRY_DELAYS)} times\n"
+    )
+    return DockerRunResult(returncode=WORKER_DIED, wall_seconds=wall_seconds, peak_memory_bytes=0)
 
 
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
@@ -789,6 +866,52 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
+def adopt_completed_evaluations(
+    evaluations_dir: Path,
+    evaluations: list[dict[str, Any]],
+    cache: dict[str, dict[str, Any]],
+) -> int:
+    """Take an interrupted run's finished evaluations into this run's state.
+
+    Without this a resumed run restarts its eval ids at 1 and rebuilds
+    directories the first attempt already wrote, which fails on the first
+    repeated point. With it the ids carry on and a point evaluated before is
+    served from the cache instead of being paid for twice - which is the whole
+    reason to resume rather than start again.
+    """
+    for record in load_evaluations_from_dir(evaluations_dir):
+        evaluations.append(record)
+        cache[params_key(record["params"])] = record
+    return len(evaluations)
+
+
+def self_check_resume_adoption() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        evaluations_dir = Path(tmp)
+        params = {"channel_count": 2, "noise_seed": 7}
+        eval_dir = evaluations_dir / "eval-0001-abc"
+        eval_dir.mkdir()
+        write_evaluation_record(eval_dir, {"eval_id": 1, "params": params, "objective": 0.5})
+
+        evaluations: list[dict[str, Any]] = []
+        cache: dict[str, dict[str, Any]] = {}
+        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        # Keyed the way the likelihood keys it, or the resumed run would
+        # recompute the point and collide with its own directory.
+        assert params_key(params) in cache
+        assert cache[params_key(params)]["objective"] == 0.5
+        # The next eval id continues rather than restarting at 1.
+        assert len(evaluations) + 1 == 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # A fresh run adopts nothing and starts at id 1.
+        evaluations = []
+        cache = {}
+        assert adopt_completed_evaluations(Path(tmp), evaluations, cache) == 0
+
+
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
     (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
     return record
@@ -941,25 +1064,37 @@ def run_r2d2_imaging(
     stdout_path: Path,
     stderr_path: Path,
 ) -> DockerRunResult:
-    """Run one `imager.py` in this rank's R2D2 worker, same shape as sidecar_run()."""
-    worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
+    """Run one `imager.py` in this rank's R2D2 worker, same shape as sidecar_run().
+
+    This is the request the host's OOM killer interrupts when memory runs
+    short, so a death here is retried against a fresh worker and, if it
+    happens again, reported as WORKER_DIED - never as an `imager.py` exit
+    status, which is what the sampler would otherwise score as a failure mode.
+    """
     request = {"argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}
     started = time.perf_counter()
-    worker.stdin.write(json.dumps(request) + "\n")
-    worker.stdin.flush()
-    reply = worker.stdout.readline()
-    wall_seconds = time.perf_counter() - started
-    if not reply:
-        # The worker died mid-request; drop it so the next evaluation gets a
-        # fresh one instead of every later evaluation inheriting the corpse.
+    for attempt in worker_attempts():
+        worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
+        worker.stdin.write(json.dumps(request) + "\n")
+        worker.stdin.flush()
+        reply = worker.stdout.readline()
+        if reply:
+            answer = json.loads(reply)
+            return DockerRunResult(
+                returncode=answer["returncode"],
+                wall_seconds=time.perf_counter() - started,
+                peak_memory_bytes=answer["peak_memory_bytes"],
+            )
+        # The worker died mid-request; drop it so the next attempt starts a
+        # fresh one instead of inheriting the corpse.
         _R2D2_WORKERS.pop(r2d2_image, None)
-        stderr_path.write_text("FATAL: r2d2 worker exited without a reply\n")
-        return DockerRunResult(returncode=1, wall_seconds=wall_seconds, peak_memory_bytes=0)
-    answer = json.loads(reply)
+    stderr_path.write_text(
+        f"FATAL: r2d2 worker exited without a reply, {len(WORKER_RETRY_DELAYS)} times\n"
+    )
     return DockerRunResult(
-        returncode=answer["returncode"],
-        wall_seconds=wall_seconds,
-        peak_memory_bytes=answer["peak_memory_bytes"],
+        returncode=WORKER_DIED,
+        wall_seconds=time.perf_counter() - started,
+        peak_memory_bytes=0,
     )
 
 
@@ -996,19 +1131,23 @@ def simulate_worker_request(
 ) -> int:
     """Send one request to this rank's simulate worker and report its exit code.
 
-    A worker that dies without answering is dropped from the cache so the next
-    evaluation gets a fresh one instead of every later evaluation inheriting the
-    corpse, and reports exit 1 with the reason in the caller's stderr log.
+    A worker that dies without answering is dropped from the cache so the retry
+    gets a fresh one instead of inheriting the corpse. A death that survives
+    the retry reports WORKER_DIED, not an exit status the simulate never
+    returned, with the reason in the caller's stderr log.
     """
-    worker = simulate_worker(meqtrees_image, platform)
-    worker.stdin.write(json.dumps(request) + "\n")
-    worker.stdin.flush()
-    reply = worker.stdout.readline()
-    if not reply:
+    for attempt in worker_attempts():
+        worker = simulate_worker(meqtrees_image, platform)
+        worker.stdin.write(json.dumps(request) + "\n")
+        worker.stdin.flush()
+        reply = worker.stdout.readline()
+        if reply:
+            return int(json.loads(reply)["returncode"])
         _SIMULATE_WORKERS.pop(meqtrees_image, None)
-        stderr_path.write_text("FATAL: simulate worker exited without a reply\n")
-        return 1
-    return json.loads(reply)["returncode"]
+    stderr_path.write_text(
+        f"FATAL: simulate worker exited without a reply, {len(WORKER_RETRY_DELAYS)} times\n"
+    )
+    return WORKER_DIED
 
 
 def simulate_measurement_set(
