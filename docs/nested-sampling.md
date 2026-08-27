@@ -294,6 +294,156 @@ R=$(ls -1dt results/nested-sampling/wsclean-* | head -1)
 cat "$R"/evaluations/*/meqserver-wedged.log 2>/dev/null | wc -l
 ```
 
+### Is the run healthy?
+
+`./ri runs` answers "did it finish?". `./ri health` answers the question you
+have while one is still going:
+
+```console
+$ ./ri health
+r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
+  stage     sampling, 113 dead points as of 0:08:18 ago, next at ~163
+  progress  1287 evaluations, 15 in flight
+  activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
+  ranks     16 ranks of 16, 7 busy-waiting
+  failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
+  stalls    8 gaps over 13s, 154s = 5.5% of wall clock
+
+host
+  memory    8.9GB available, 4GB reserved as headroom
+  sidecars  3 running, 0 leaked
+```
+
+With no argument it reports on the newest run; `--all` covers every run on
+disk and `--json` is the machine-readable form. It reads files and runs one
+`ps` and one `docker ps`, plus a one second CPU sample when a run has live
+ranks - nothing is started and nothing is imaged, so a run in progress does not
+notice it. Exit status is 1 when something needs attention, so it can gate a
+script.
+
+**The status is decided in this order, and the order is the point.** A run
+that finished and a run that died both stop writing, so a stale mtime alone
+says nothing:
+
+| | |
+|---|---|
+| `FINISHED` | `summary.json` is there. |
+| `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
+| `STARTING` | No ranks yet, but something was written recently. |
+| `STOPPED` | No ranks and nothing recent. `./ri resume <run>` continues it. |
+| `HEALTHY` | Ranks running and evaluations landing. |
+
+What each line is reading, and why it is worth a line:
+
+- **stage** - how far into PolyChord the run got, from `chains/`: `*.resume`
+  means it reached the main loop, `*_phys_live.txt` alone means it is still
+  drawing the initial live points. A run that dies before the main loop dies
+  with no dead points, which otherwise looks the same as one that has barely
+  started.
+
+  The dead-point count never appears without **how old it is**, because
+  PolyChord writes its checkpoint only every ~`nlive` points and the count
+  cannot move between writes. One reading of 57 that had not changed in fifty
+  minutes was taken here as evidence that progress had stopped, and cost an
+  hour of investigation; the next write landed at 113. It survived being
+  checked against the terminal, too - PolyChord's feedback box and these files
+  come from the *same* update event, so agreement between them is one signal
+  displayed twice, not two witnesses. Nothing in this report decides anything
+  from the count, and printing its age plus where it will next land is what
+  stops a reader doing so either. An age of an hour or more is ordinary rather
+  than alarming, and it grows as a run goes on: one 16-rank R2D2 search took
+  31 minutes to its first checkpoint and 72 more to its second, because each
+  batch of `nlive` dead points costs more likelihood evaluations than the last
+  (its `<nlike>` went 14.10 to 32.50 over the same two). So a later reading
+  longer than an earlier one is the expected shape, not a slowdown.
+- **progress** - `evaluations/eval-*/metrics.json` is written only when an
+  evaluation succeeds, so its count is the progress and the directories
+  without one are the evaluations in flight. That number should sit near
+  `NS_MPI_PROCS`; pinned there while the count does not move is every rank
+  stuck at once.
+- **activity** - the overall rate, and the rate over the last 50 evaluations
+  when the two have diverged. A run can collapse to a fraction of its own
+  throughput without ever going quiet long enough to look stalled, and that
+  state passes every other check here: on a live 16-rank R2D2 search, 25/min
+  fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
+  Both numbers are shown and **neither is warned on**, because the same run
+  then recovered to 37/min with nothing done to it - five minute bins of 104,
+  23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
+  grounds for telling anyone to act.
+
+  Both rates are medians of the gaps between evaluations, not counts in a
+  window, and that is deliberate: the most recent window is always partial, so
+  it reads low by whatever fraction of it has not elapsed. On this run,
+  mid-window, the partial bucket said 23.8/min against a 91-165 per five
+  minutes baseline - a collapse, apparently - while the gaps said 52.5/min and
+  the bucket finished at 164, the highest of the run. A gap cannot be measured
+  until both of its ends exist, so there is no partial window to misread. The
+  one thing gaps cannot see is a stall that began *after* the last completed
+  evaluation, which is what the idle thresholds cover; the two look redundant
+  and are complementary.
+
+  Two things not to conclude from a falling rate. It does not mean the
+  evaluations got harder: on that run per-evaluation cost was *falling* at the
+  same time, because the search was converging on cheaper parameters. And
+  whether it means stragglers is answered by the spread of
+  `metrics.json` `timing.image_container_seconds`, not by the rate - a fat
+  tail is one slow evaluation gating a batch, while a tight distribution (that
+  run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means the missing wall
+  clock is going somewhere other than the likelihood, into sampler overhead,
+  contention or synchronisation. The two want different responses.
+- **ranks** - found by the `--output-dir` they were launched with, so no ranks
+  means no run. `busy-waiting` counts the ranks that spent a whole one-second
+  sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective
+  burns a core and looks identical to a working one on `%CPU`; sampling twice
+  and taking the increment is what separates them, and it does so whenever the
+  rank got stuck. (Cumulative CPU over the process's whole life does not: a run
+  that works for an hour and then wedges still reads under any threshold for
+  most of another hour, because the real work already done outweighs the
+  spinning.) On its own the count means nothing, and not just because some
+  spinning is normal: four independent measurements of one healthy 16-rank
+  R2D2 run, across an hour, gave 1, 2, 7 and 15, as the sampler alternated
+  between imaging in parallel and synchronising. Each was reproducible for as
+  long as its phase lasted - **a count sampled for a minute lands there just as
+  confidently as one sampled once**, which is what made every one of those
+  readings persuasive to whoever took it. So it is reported as a deadlock only
+  when all but one are burning CPU **and** nothing has completed for a minute,
+  and it is that second clause that does the work.
+- **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
+  `meqserver-wedged.log` lines. **This is the one that a run can pass every
+  other check and still fail.** PolyChord maximizes, and a real
+  `total_rms_jy` is ~0.008, so failed evaluations are the best points the
+  search has ever seen and it concentrates its live points on them. A run with
+  a missing checkpoint mount or an OOM-killed worker reports "the imager fails
+  catastrophically here", which is exactly the conclusion this repo exists to
+  draw.
+- **stalls** - gaps between evaluations more than 10x the run's own median,
+  and never less than 2s. Relative because WSClean lands 30-50 evaluations a
+  second and R2D2 roughly one every two, so no fixed threshold suits both.
+  Before the watchdogs above, the MeqTrees deadlock cost 23-27% of wall clock
+  here; after them, 0.
+- **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
+  keeps, and `ri-ns-sidecar-*` containers whose launching process is gone. A
+  killed run leaves those holding ~3.4GB per R2D2 rank, counted against every
+  later run's memory budget until someone removes them.
+
+- **why it stopped** - a stopped run's warning quotes its `run.log`, which is
+  where the run's own output is kept. Everything else on disk says *that* a
+  run broke; only this says why. It quotes the last line naming an error
+  rather than the last line outright, **and how many ranks said it**:
+
+  ```
+  run.log ends "TypeError: _connect_shell_started_worker() ..." (x15 ranks)
+  ```
+
+  The count is the diagnosis. An MPI crash leaves one traceback per rank, so
+  the real failure here was the same stack fifteen times over and a plain tail
+  of the file lands on it only by luck. Every rank reporting the same error is
+  a code bug that every rank hits deterministically - that was the `run.log`
+  captured from PR #66. One rank alone is a flaky worker, an OOM kill, or bad
+  luck on one evaluation, and those want opposite responses. For a run that
+  stopped without a traceback it falls back to the last non-empty line, which
+  is PolyChord's own last word on where it got to.
+
 ### Finding and resuming a run that stopped
 
 A run writes `summary.json` only once PolyChord returns, so a run directory
@@ -693,11 +843,22 @@ evaluations/eval-*/metrics.json
 
 ### Run summary and reports
 
-Run-level summary:
+Run-level summary, written only once PolyChord returns:
 
 ```text
 summary.json
 ```
+
+Everything the run printed, written as it goes and appended to by `./ri
+resume`, so it survives a run that never reaches `summary.json`:
+
+```text
+run.log
+```
+
+This is the only artifact that records *why* a run stopped - a traceback out
+of the PolyChord container reaches nowhere else. `./ri health` quotes its last
+line for a stopped run.
 
 View completed runs (settings, evidence, per-evaluation metrics and
 reconstructions) in the nested-sampling HTML report:

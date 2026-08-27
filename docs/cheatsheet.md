@@ -218,6 +218,20 @@ and the report, which globs for `summary.json`, will not show it at all.
 
 `resume` takes no settings: the run recorded its own in `run.env`.
 
+## Is the run that is going still worth going?
+
+```bash
+./ri health                # the newest run, plus host memory and leaked sidecars
+./ri health <run>
+./ri health --all
+```
+
+`HEALTHY` / `STALLED` / `STOPPED` / `FINISHED`, with the rate, the share of
+wall clock lost to stalls, and how many evaluations scored
+`FAILURE_OBJECTIVE` - which PolyChord maximizes, so a run whose imager is
+broken looks like a run finding spectacular failures. Exits 1 when something
+needs attention. Details: docs/nested-sampling.md.
+
 ## Reports
 
 ```bash

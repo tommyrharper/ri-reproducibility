@@ -21,7 +21,31 @@ run_with_progress() {
   shift 3
   [ "${1:-}" = "--" ] && shift
 
-  "$@" &
+  # Keep the run's own output. Everything a stopped run leaves on disk says
+  # *that* it broke - empty imager directories, chains stuck at the initial
+  # live points - and nothing says *why*: the traceback existed only in the
+  # terminal it was started from, and diagnosing one meant starting the search
+  # again under a redirect and waiting for it to happen twice.
+  #
+  # Teed rather than redirected, because the status line below needs this
+  # shell's own stdout to still be a terminal: `> run.log 2>&1` around the
+  # whole script makes `[ -t 1 ]` false and silently takes the progress bar
+  # away. Only the command's output is diverted, and nothing downstream
+  # notices - the `docker exec` this wraps is issued without `-t`, so the
+  # container's stdout was already a pipe and its buffering does not change.
+  #
+  # Through a named pipe rather than `> >(tee ...)` so that tee has a pid that
+  # can be waited for. The last thing a dying run writes is the whole point of
+  # having the file, and a process substitution offers no way to know it was
+  # flushed before the script moves on.
+  local log="${output_dir}/run.log" pipe="${output_dir}/.run.log.fifo"
+  rm -f "${pipe}"
+  mkfifo "${pipe}"
+  # Appended, not truncated: `./ri resume` re-runs this against a directory
+  # that already has a log, and the first failure is usually the one to read.
+  tee -a "${log}" <"${pipe}" &
+  local tee_pid=$!
+  "$@" >"${pipe}" 2>&1 &
   local pid=$!
   local start
   start="$(date +%s)"
@@ -46,7 +70,17 @@ run_with_progress() {
     printf '\r%s\n' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
   fi
 
-  wait "${pid}"
+  local status=0
+  wait "${pid}" || status=$?
+  # The command's last writer is now closed, so tee sees EOF. Waited for so
+  # the function leaves no child behind and the file is known to be complete
+  # before the caller reads it. In practice tee always drains first and the
+  # self-check below cannot force it not to, so this is a guard against a race
+  # rather than a fix for an observed one - kept because the lines at risk are
+  # exactly the ones the file exists for.
+  wait "${tee_pid}" 2>/dev/null || true
+  rm -f "${pipe}"
+  return "${status}"
 }
 
 # Appends a command to whatever trap is already registered for a signal
@@ -400,6 +434,36 @@ self_check() {
   [ "$(cat "${tmp}/trap.log")" = "$(printf 'new\nexisting')" ] || {
     echo "FAIL: trap chaining order/content: $(cat "${tmp}/trap.log")"; exit 1
   }
+
+  # run_with_progress must keep the run's output rather than only showing it,
+  # and must still hand back the command's exit status - the run scripts are
+  # `set -e` and a swallowed failure would let one report OK after failing.
+  local run_dir="${tmp}/run"
+  mkdir -p "${run_dir}"
+  local status=0
+  run_with_progress "${run_dir}" -1 2 -- \
+    sh -c 'echo to-stdout; echo to-stderr >&2; exit 7' >"${tmp}/terminal" 2>&1 || status=$?
+  [ "${status}" = "7" ] || { echo "FAIL: exit status ${status}, want 7"; exit 1; }
+  # Both streams, in the file and on the way through to the terminal.
+  grep -q '^to-stdout$' "${run_dir}/run.log" || { echo "FAIL: stdout not logged"; exit 1; }
+  grep -q '^to-stderr$' "${run_dir}/run.log" || { echo "FAIL: stderr not logged"; exit 1; }
+  grep -q '^to-stdout$' "${tmp}/terminal" || { echo "FAIL: stdout not passed through"; exit 1; }
+  # Appended across runs, because ./ri resume runs again into the same
+  # directory and the first failure is usually the one worth reading.
+  run_with_progress "${run_dir}" -1 2 -- sh -c 'echo second-run' >/dev/null 2>&1
+  grep -q '^to-stdout$' "${run_dir}/run.log" || { echo "FAIL: log truncated on resume"; exit 1; }
+  grep -q '^second-run$' "${run_dir}/run.log" || { echo "FAIL: second run not logged"; exit 1; }
+  # The whole of a noisy run's output, not just the start of it: the last line
+  # before a crash is the one worth having. Sized past the pipe buffer so this
+  # is a real completeness check rather than one satisfied by a single write.
+  run_with_progress "${run_dir}" -1 2 -- \
+    sh -c 'i=0; while [ $i -lt 20000 ]; do echo "line-$i"; i=$((i + 1)); done; exit 3' \
+    >/dev/null 2>&1
+  [ "$(tail -n 1 "${run_dir}/run.log")" = "line-19999" ] || {
+    echo "FAIL: last line lost: $(tail -n 1 "${run_dir}/run.log")"; exit 1
+  }
+  # And the pipe it went through is not left behind in the run directory.
+  [ ! -e "${run_dir}/.run.log.fifo" ] || { echo "FAIL: fifo left behind"; exit 1; }
 
   rm -rf "${tmp}"
   echo "progress-bar self-check passed"
