@@ -97,6 +97,16 @@ def do_search(args):
     return env, commands
 
 
+def do_runs(args):
+    flags = ["--incomplete"] if args.incomplete else []
+    flags += ["--json"] if args.json else []
+    return {}, [uv("scripts/nested-sampling-runs.py", *flags)]
+
+
+def do_resume(args):
+    return {}, [["scripts/resume-nested-sampling-run.sh", args.run]]
+
+
 def do_report(args):
     env = env_from(args, (("last", "LAST"), ("run", "RUN")))
     if args.force:
@@ -273,6 +283,35 @@ def build_parser():
     search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")
     search.add_argument("--no-build", action="store_true",
                         help="skip the image builds this search would do first")
+
+    runs = add(
+        "runs", do_runs, "list runs and which ones stopped early",
+        description=(
+            "One line per run under results/nested-sampling/, with whether it\n"
+            "finished. A run writes summary.json only once PolyChord returns, so\n"
+            "a run without one stopped early - and the HTML report, which globs\n"
+            "for summary.json, does not show it at all.\n"
+            "\n"
+            "Anything unfinished is listed again at the end with the ./ri resume\n"
+            "line that continues it."
+        ),
+    )
+    runs.add_argument("--incomplete", action="store_true",
+                      help="only the runs that stopped before finishing")
+    runs.add_argument("--json", action="store_true", help="raw JSON instead of a table")
+
+    resume = add(
+        "resume", do_resume, "continue a run that stopped early",
+        description=(
+            "Continue an interrupted run in place, keeping every evaluation it\n"
+            "already finished. The run directory records the settings it was\n"
+            "started with, so no flags are needed and none can be misremembered.\n"
+            "\n"
+            "./ri runs lists what there is to resume."
+        ),
+    )
+    resume.add_argument("run", metavar="RUN",
+                        help="run directory, or its name under results/nested-sampling/")
 
     # Results
     report = add("report", do_report, "build the HTML run report",
