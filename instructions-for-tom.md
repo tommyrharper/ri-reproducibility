@@ -56,6 +56,6 @@ Then for the ranges:
 - `log10_dynamic_range`: `2-6`
 - `observation_minutes`: `0.3-20`
 - `channel_count`: `1-16` (this may be too large)
-- `start_frequency_hz`
-- `channel_width_hz`
+- `start_frequency_hz`: `band_start`
+- `channel_width_hz`: `100khz-2Mhz`
 
