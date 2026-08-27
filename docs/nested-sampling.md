@@ -351,9 +351,11 @@ What each line is reading, and why it is worth a line:
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
   stops a reader doing so either. An age of an hour or more is ordinary rather
-  than alarming - the interval between the first two checkpoints of one
-  16-rank R2D2 run was 72 minutes, during which the search completed some two
-  thousand evaluations.
+  than alarming, and it grows as a run goes on: one 16-rank R2D2 search took
+  31 minutes to its first checkpoint and 72 more to its second, because each
+  batch of `nlive` dead points costs more likelihood evaluations than the last
+  (its `<nlike>` went 14.10 to 32.50 over the same two). So a later reading
+  longer than an earlier one is the expected shape, not a slowdown.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
