@@ -459,8 +459,14 @@ What each line is reading, and why it is worth a line:
   here; after them, 0.
 - **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
   keeps, and `ri-ns-sidecar-*` containers whose launching process is gone. A
-  killed run leaves those holding ~3.4GB per R2D2 rank, counted against every
-  later run's memory budget until someone removes them.
+  killed run leaves those holding ~3.4GB per R2D2 rank, which would count
+  against every later run's memory budget. Reported here because it is
+  something to know about the host; not something to act on, because the next
+  run removes them itself - `ns_reap_leaked_sidecars` in
+  `scripts/lib/rank-budget.sh` runs before the run reads free memory, so the
+  memory a dead run is sitting on is freed rather than sized around. The
+  launcher's pid is in the container name, and pid reuse can only make it skip
+  a container, never take a live one.
 
 - **why it stopped** - a stopped run's warning quotes its `run.log`, which is
   where the run's own output is kept. Everything else on disk says *that* a

@@ -151,11 +151,54 @@ _ns_unlock() {
   fi
 }
 
+# A run killed with SIGKILL leaves its `ri-ns-sidecar-*` containers running,
+# each holding ~3.4GB of warm imaging worker that nothing will ever free. That
+# is the same shape of debris as a stale reservation above, and the fix is the
+# same rule: the launcher's pid is in the container name, so a name whose pid
+# is gone is memory nobody owns. Until now `./ri health` only named them and
+# the FATAL below only suggested looking, which meant the next run was sized
+# against - or refused for - memory a dead run was sitting on.
+#
+# Split from the docker call so the pid rule can be checked without a daemon.
+# Names are `ri-ns-sidecar-<launcher pid>-<n>` (start-sidecars.sh) and
+# `ri-ns-sidecar-<rank pid>-<uuid8>` (common.py's fallback); the pid is in the
+# same position in both. Pid reuse only ever makes this skip a container, never
+# take a live one, which is the direction to be wrong in.
+_ns_dead_sidecar_names() {
+  local name pid
+  while read -r name; do
+    pid="${name#ri-ns-sidecar-}"
+    pid="${pid%%-*}"
+    case "${pid}" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    kill -0 "${pid}" 2>/dev/null || printf '%s\n' "${name}"
+  done
+}
+
+ns_reap_leaked_sidecars() {
+  local dead
+  command -v docker >/dev/null 2>&1 || return 0
+  dead="$(docker ps --filter name=ri-ns-sidecar --format '{{.Names}}' 2>/dev/null \
+    | _ns_dead_sidecar_names)"
+  [ -n "${dead}" ] || return 0
+  # Said out loud: this is another run's wreckage being removed, and a silent
+  # `docker rm --force` is not something to do on someone else's host.
+  echo "NOTE: removing sidecar container(s) left behind by a run that is gone," \
+    "which were holding memory against this run:" ${dead} >&2
+  # shellcheck disable=SC2086  # container names cannot contain whitespace
+  docker rm --force ${dead} >/dev/null 2>&1 || true
+}
+
 # Echoes the rank count to use. Never more than requested, never less than 1.
 ns_budget_ranks() {
   local requested="$1" mb_per_rank="$2" label="$3"
   local dir="${NS_RANK_BUDGET_DIR:-${TMPDIR:-/tmp}/ri-ns-rank-budget-$(id -u)}"
   local available reserved=0 budget affordable now entry pid expiry mb
+
+  # Before the read, so the memory a dead run is still holding is counted as
+  # free rather than clamping this run down to fit around it.
+  ns_reap_leaked_sidecars
 
   # No memory reading (neither /proc/meminfo nor vm_stat, i.e. a platform
   # this hasn't been taught) means no clamp: the guard is a safety net on
@@ -203,9 +246,9 @@ ns_budget_ranks() {
       echo "FATAL: not enough free memory for a single ${label} rank:" \
         "${available}MB available, ${reserved}MB reserved by other runs," \
         "${NS_RANK_BUDGET_HEADROOM_MB}MB headroom, ${mb_per_rank}MB needed per rank." \
-        "Wait for the other runs to finish, or free memory. If nothing is" \
-        "running, check for sidecars a killed run left behind:" \
-        "docker ps --filter name=ri-ns-sidecar" >&2
+        "Sidecars left by a dead run were already removed, so this is memory" \
+        "something live is holding: wait for the other runs to finish," \
+        "or see ./ri health." >&2
       _ns_unlock "${dir}"
       return 1
     fi
@@ -229,6 +272,7 @@ ns_budget_ranks() {
 ns_budget_warn_if_over() {
   local requested="$1" mb_per_rank="$2" label="$3"
   local available
+  ns_reap_leaked_sidecars
   _ns_available_mb >/dev/null 2>&1 || return 0
   available="$(_ns_available_mb)"
   if [ "$((requested * mb_per_rank))" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
@@ -270,6 +314,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   # call leaves a reservation of its own behind.
   clear_reservations() { rm -f "${NS_RANK_BUDGET_DIR}"/[0-9]*; }
 
+  # The budget functions reap leaked sidecars, which is a `docker rm --force`
+  # against whatever is on this host - not something a check may do. The rule
+  # it reaps by is checked directly below instead.
+  ns_reap_leaked_sidecars() { :; }
+
   # Asking for less than the budget affords is left alone.
   [ "$(ns_budget_ranks 8 3400 r2d2)" = 8 ]
   # ...and reserves what it is about to take, for whoever reads next.
@@ -306,6 +355,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "$(ns_budget_ranks 8 3400 r2d2)" = 8 ]
   [ ! -f "${NS_RANK_BUDGET_DIR}/${PPID}" ]
   clear_reservations
+
+  # The leaked-sidecar rule, without a daemon: a container whose launcher pid
+  # is gone is named for removal, one whose pid is this shell is left alone.
+  # Both name shapes are covered, because common.py's fallback path uses a
+  # uuid rather than an index after the pid.
+  [ "$(printf 'ri-ns-sidecar-999999-0\nri-ns-sidecar-%s-1\n' "$$" | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-0" ]
+  [ "$(printf 'ri-ns-sidecar-999999-a1b2c3d4\n' | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-a1b2c3d4" ]
+  # Anything that is not that name shape is left alone rather than guessed at.
+  [ -z "$(printf 'ri-ns-sidecar-notapid-0\nsomething-else\n' | _ns_dead_sidecar_names)" ]
+  [ -z "$(printf '' | _ns_dead_sidecar_names)" ]
 
   # An explicit rank count is obeyed, and warned about when it will not fit.
   ns_budget_warn_if_over 8 3400 r2d2 2>/dev/null

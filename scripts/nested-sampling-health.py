@@ -39,8 +39,9 @@ Four things it checks, each one a way a run has actually gone wrong here:
   worker behind it is ~3.3GB.
 
 Plus the host: memory, and sidecar containers whose run is gone. A killed run
-leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank, which
-then counts against every later run's memory budget until someone notices.
+leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank. The next
+run frees those itself before it sizes itself, so this is here to explain where
+the host's memory went, not as a chore.
 
 Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
 when a run has live processes; nothing started, nothing imaged, so it costs a
@@ -716,7 +717,8 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
     if leaked:
         warnings.append(
             f"{len(leaked)} sidecar container(s) outlived the run that started them, "
-            "holding ~3.4GB per R2D2 rank against every later run's memory budget: "
+            "holding ~3.4GB per R2D2 rank. The next run frees them before it sizes "
+            "itself (scripts/lib/rank-budget.sh); to have the memory now: "
             "docker rm -f " + " ".join(str(c["name"]) for c in leaked)
         )
     memory = meminfo_mb("MemAvailable")
