@@ -306,6 +306,8 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
+  sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
+  forecast  ~38% done, ~454 dead points total, ~4h54m left
   ranks     16 ranks of 16, 7 busy-waiting
   resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
   disk      7.5GB written, +2.6GB/hour, 93h of space left at that rate
@@ -411,6 +413,42 @@ What each line is reading, and why it is worth a line:
   nothing landed is marked `·` rather than drawn as merely slow. Binned over
   first-to-last evaluation, never up to now, for the partial-window reason
   above; how long ago the last one landed is **activity**'s job.
+- **sampler** - PolyChord's own running total, out of `chains/*.stats`, which
+  it rewrites at every checkpoint. Every other line here is operational; this
+  is the number the search exists to produce, and `logZ` moving is the only
+  direct evidence that the sampler is integrating rather than merely running.
+  The likelihood calls per dead point beside it is the sampler's efficiency -
+  what the evaluation rate in **activity** is being *spent* on. A run whose
+  rate holds while this climbs is working just as hard for less, which no
+  other line here can show.
+- **forecast** - how far through the search is, and how long is left. With
+  `--max-ndead -1`, the default for a real search, there is otherwise no
+  denominator anywhere: a run could be reported healthy and fast for three
+  days without this report ever saying whether it was a tenth done or nearly
+  finished. Nested sampling supplies one. Each dead point shrinks the prior
+  volume by the same factor, so `exp(-ndead/nlive)` is what is left of it; the
+  evidence still to come is that volume times the mean likelihood of the live
+  points now in it (`chains/*_phys_live.txt`), and PolyChord stops when that
+  falls to a fixed fraction of the evidence already banked. The volume shrinks
+  one e-fold per `nlive` dead points, which turns "how much further that ratio
+  has to fall" into a count of dead points, and the run's own dead-point rate
+  turns that into hours.
+
+  The stopping fraction is measured rather than taken from the documentation.
+  `precision_criterion` defaults to 1e-3, but the two searches on this host
+  that ran to natural termination (wsclean, nlive=50, seeds 123 and 372)
+  stopped at 446 and 463 dead points where 1e-3 predicts 350 for both; the
+  ratio they actually reached was 1.3e-4 and 9.6e-5. Calibrated to their mean
+  (`TERMINATION_EVIDENCE_RATIO`), replaying those two runs through the shipped
+  code forecasts 452-459 from `ndead=100` onward - within 3% of both, and
+  stable across the whole run rather than drifting. Recalibrate there if a
+  PolyChord upgrade or a non-default `precision_criterion` moves it.
+
+  Withheld inside the first e-fold, where the live set is still the prior and
+  the estimate would be reporting its own constant rather than this run, and
+  withheld from a run that is not going: a stopped run's remaining dead points
+  are not remaining, they are lost. An explicit `--max-ndead` is a hard stop
+  the sampler hits first, so it is used directly and printed without the `~`.
 - **ranks** - found by the `--output-dir` they were launched with, so no ranks
   means no run. `busy-waiting` counts the ranks that spent a whole one-second
   sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective

@@ -44,6 +44,12 @@ Four things it checks, each one a way a run has actually gone wrong here:
   A live R2D2 run writes ~2.6GB/hour, so the run's own rate against the free
   space is the only warning available before it ends on ENOSPC.
 
+* **How far through.** `chains/*.stats` carries the evidence the search has
+  actually accumulated and what each dead point cost in likelihood calls, and
+  with the live points beside it that gives the one thing a `--max-ndead -1`
+  run has nowhere else: a denominator. `forecast` turns the prior volume still
+  to be compressed into dead points left and hours left.
+
 Plus the host: memory, free disk, and sidecar containers whose run is gone. A killed run
 leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank. The next
 run frees those itself before it sizes itself, so this is here to explain where
@@ -68,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import statistics
@@ -169,6 +176,17 @@ HEADROOM_MB = 4096
 # and not the shape of the directory.
 DISK_SAMPLE = 20
 DISK_WARN_HOURS = 12.0
+
+# Where PolyChord stops, as a fraction of the evidence already collected still
+# sitting in the live points. This is the one number the forecast rests on, and
+# it is measured rather than taken from the documentation: `precision_criterion`
+# defaults to 1e-3, but the two searches on this host that ran to natural
+# termination (wsclean, nlive=50, seeds 123 and 372) stopped at 446 and 463
+# dead points where 1e-3 predicts 350 for both. The ratio they actually reached
+# was 1.3e-4 and 9.6e-5; their mean forecasts 451, which is 1% and 3% out
+# instead of 25% short twice. Recalibrate here if a PolyChord upgrade or a
+# non-default precision_criterion moves it.
+TERMINATION_EVIDENCE_RATIO = 1.2e-4
 
 
 # --- host state: one `ps`, one `docker ps` ----------------------------------
@@ -541,6 +559,111 @@ def dead_points(run_dir: Path) -> tuple[int, float | None]:
     return 0, None
 
 
+def _setting(run_env: dict[str, str], key: str) -> int | None:
+    """A numeric setting out of run.env, or None if it is absent or not one."""
+    raw = run_env.get(key, "")
+    return int(raw) if raw.lstrip("-").isdigit() else None
+
+
+def sampler_stats(run_dir: Path) -> dict[str, object] | None:
+    """What PolyChord itself says it has found, out of `chains/*.stats`.
+
+    Rewritten at every checkpoint, and the only artifact that carries the
+    number the search exists to produce. Nothing here read it before, so a run
+    could be reported healthy on every operational line while saying nothing
+    about its own result - and `nlike` per dead point, the sampler's own
+    efficiency, is the one cost that a rate in evaluations per minute cannot
+    show, because it is what that rate is being spent on.
+
+    A checkpoint rewrite can be read half-written; every field is therefore
+    optional and a torn read simply reports less.
+    """
+    for path in (run_dir / "chains").glob("*.stats"):
+        try:
+            text = path.read_text()
+        except OSError:
+            return None
+        found: dict[str, object] = {}
+        # The global evidence, which is the first `log(Z)` in the file - the
+        # per-cluster ones below it are `log(Z_1)` and so on.
+        match = re.search(r"^log\(Z\)\s*=\s*(\S+)\s*\+/-\s*(\S+)", text, re.MULTILINE)
+        if match:
+            try:
+                found["log_z"] = float(match.group(1))
+                found["log_z_error"] = float(match.group(2))
+            except ValueError:
+                pass
+        for key in ("ndead", "nlive", "nlike"):
+            hit = re.search(rf"^\s*{key}:\s*(\d+)", text, re.MULTILINE)
+            if hit:
+                found[key] = int(hit.group(1))
+        return found or None
+    return None
+
+
+def live_loglikelihoods(run_dir: Path) -> list[float]:
+    """The likelihood of every point still alive, from `chains/*_phys_live.txt`.
+
+    Last column, the same file PolyChord rewrites with the stats. Empty for a
+    finished run, which is how a finished run gets no forecast.
+    """
+    for path in (run_dir / "chains").glob("*_phys_live.txt"):
+        try:
+            return [float(line.split()[-1]) for line in path.read_text().splitlines()
+                    if line.strip()]
+        except (OSError, ValueError, IndexError):
+            return []
+    return []
+
+
+def evidence_forecast(run_dir: Path, stats: dict[str, object] | None,
+                      nlive: int | None, max_ndead: int | None) -> dict[str, object] | None:
+    """How far through the search is, and how many dead points are left.
+
+    The gap this closes is that with `--max-ndead -1`, the default, a run has
+    no denominator anywhere: `./ri health` could say a search was healthy and
+    fast for three days without ever saying whether it was a tenth of the way
+    through or nearly done.
+
+    Nested sampling supplies one. Each dead point shrinks the prior volume by
+    the same factor, so what is left of it is exp(-ndead/nlive); the evidence
+    still to come is that volume times the mean likelihood of the points now
+    sitting in it, and the run ends when that falls to
+    TERMINATION_EVIDENCE_RATIO of the evidence already banked. The volume
+    shrinks one e-fold per `nlive` dead points, which turns "how much further
+    that ratio has to fall" into a count.
+
+    An explicit `--max-ndead` is a hard stop the sampler will hit first, so it
+    is used directly and the answer is not an estimate at all.
+    """
+    if not stats or "ndead" not in stats or not nlive:
+        return None
+    ndead = int(stats["ndead"])
+    if max_ndead is not None and max_ndead > 0:
+        total, estimated = max_ndead, False
+    else:
+        live = live_loglikelihoods(run_dir)
+        # Before the first e-fold the live set is still the prior and the
+        # ratio is ~1, so the forecast would be reporting the constant
+        # nlive*ln(1/ratio) and nothing about this run.
+        if "log_z" not in stats or not live or ndead < nlive:
+            return None
+        # Shifted by the largest live likelihood before exponentiating, so a
+        # metric with real dynamic range cannot overflow the mean. The metrics
+        # used here span ~0.006 nats and would be safe either way.
+        peak = max(live)
+        log_z_live = (-ndead / nlive + peak
+                      + math.log(sum(math.exp(x - peak) for x in live) / len(live)))
+        remaining = nlive * (log_z_live - float(stats["log_z"])
+                             - math.log(TERMINATION_EVIDENCE_RATIO))
+        total, estimated = ndead + max(0, round(remaining)), True
+    return {
+        "total_dead_points": total,
+        "fraction": min(1.0, ndead / total) if total > 0 else None,
+        "estimated": estimated,
+    }
+
+
 def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
     """Everything alive that carries this run's directory in its arguments.
 
@@ -681,6 +804,22 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     else:
         status = "stopped"
 
+    # Only for a run that is still going: a stopped run's remaining dead
+    # points are not remaining, they are lost, and its hours-left would be
+    # counted off a rate that stopped.
+    stats = sampler_stats(run_dir)
+    forecast = None
+    if status in ("healthy", "stalled", "starting"):
+        forecast = evidence_forecast(run_dir, stats, _setting(run_env, "NS_NLIVE"),
+                                     _setting(run_env, "NS_MAX_NDEAD"))
+    if forecast and stats and float(scan["span_seconds"] or 0) >= MIN_RATE_SPAN_SECONDS:
+        # Dead points per second over the run's own life. Not the evaluation
+        # rate: the two are related by the sampler efficiency this line exists
+        # to make visible, and that efficiency changes as the search moves.
+        left = int(forecast["total_dead_points"]) - int(stats["ndead"])
+        rate = int(stats["ndead"]) / float(scan["span_seconds"])
+        forecast["hours_remaining"] = left / rate / 3600 if rate > 0 else None
+
     warnings: list[str] = []
     completed = int(scan["completed"])
     failed = int(scan["failed"])
@@ -789,6 +928,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "disk_hours_remaining": disk_hours,
         "dead_points": dead,
         "checkpoint_age_seconds": checkpoint_age,
+        "sampler": stats,
+        "forecast": forecast,
         "log_tail": tail,
         "warnings": warnings,
         **scan,
@@ -843,6 +984,13 @@ def format_hms(seconds: float) -> str:
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+def format_hours(hours: float) -> str:
+    """`4h40m` under a day, `2d 6h` over one - a wait, not a duration to add up."""
+    if hours >= 24:
+        return f"{int(hours // 24)}d {int(hours % 24)}h"
+    return f"{int(hours)}h{int(hours % 1 * 60):02d}m"
+
+
 def render(run: dict[str, object]) -> None:
     print(f"{run['name']}  {run['algorithm']}  {str(run['status']).upper()}")
     settings = run["settings"]
@@ -895,9 +1043,37 @@ def render(run: dict[str, object]) -> None:
     if past:
         assert isinstance(past, dict)
         lines.append(("history",
-                      f"{past['bar']}  {past['low_per_minute']:.0f}-"
-                      f"{past['high_per_minute']:.0f}/min per "
-                      f"{format_hms(float(past['bucket_seconds']))} slice"))
+                      (f"{past['bar']}  {past['low_per_minute']:.0f}-"
+                       f"{past['high_per_minute']:.0f}/min per "
+                       f"{format_hms(float(past['bucket_seconds']))} slice")))
+    # What the search has actually found, and what each dead point cost it.
+    # Every other line here is operational; this one is the result, and the
+    # calls-per-dead-point is the sampler's own efficiency - the thing an
+    # evaluation rate is being spent on, and the only place a search that is
+    # working hard for nothing shows up as such.
+    stats = run["sampler"]
+    if stats and "log_z" in stats:
+        per_dead = ""
+        if stats.get("ndead") and stats.get("nlike"):
+            calls = round(int(stats["nlike"]) / int(stats["ndead"]))
+            per_dead = (f", {calls} likelihood call{'' if calls == 1 else 's'} "
+                        "per dead point")
+        lines.append((
+            "sampler",
+            (f"logZ = {float(stats['log_z']):.3f} "
+             f"+/- {float(stats['log_z_error']):.3f}{per_dead}")))
+    # The denominator a `--max-ndead -1` search otherwise has nowhere: without
+    # it, "healthy and fast" is all this report can say about a run that might
+    # be a tenth done or nearly finished.
+    ahead = run["forecast"]
+    if ahead:
+        assert isinstance(ahead, dict)
+        about = "~" if ahead["estimated"] else ""
+        left = ahead.get("hours_remaining")
+        lines.append(("forecast",
+                      f"{about}{float(ahead['fraction']):.0%} done, "
+                      f"{about}{ahead['total_dead_points']} dead points total"
+                      + (f", {about}{format_hours(float(left))} left" if left else "")))
     lines.append(("ranks", ranks))
     # Only for a run that still holds something. "0.0GB over 0 processes" is
     # what every finished run on disk would print, and none of them is the
@@ -927,8 +1103,9 @@ def render(run: dict[str, object]) -> None:
                      + (f" ({run['recent_failed']} of the last {RATE_WINDOW})"
                         if run["recent_failed"] else "")
                      + f", {run['meqserver_wedges']} meqserver wedges recovered"),
-        ("stalls", f"{run['stall_count']} gaps over {run['stall_threshold_seconds']:.0f}s, "
-                   f"{run['stall_seconds']:.0f}s = {run['stall_fraction']:.1%} of wall clock"),
+        ("stalls", (f"{run['stall_count']} gaps over "
+                    f"{run['stall_threshold_seconds']:.0f}s, {run['stall_seconds']:.0f}s = "
+                    f"{run['stall_fraction']:.1%} of wall clock")),
     ]
     for label, value in lines:
         print(f"  {label:<9} {value}")
@@ -1142,6 +1319,77 @@ def self_check() -> None:
             with_cpu = io_capture(describe(live, not_ranks + ranks,
                                            DEFAULT_STALE_SECONDS, {92: 0.9}))
             assert "0.9 of " in with_cpu and "cores busy" in with_cpu, with_cpu
+
+            # The sampler's own view: what PolyChord has found, and how much
+            # of the search is left. nlive 50 and 200 dead points is four
+            # e-folds of prior volume gone, so a sixteen-thousandth of it is
+            # left; a flat likelihood puts the same fraction of the evidence
+            # in the live points, and the run stops when that reaches
+            # TERMINATION_EVIDENCE_RATIO. ln(1/1.2e-4) = 9.03 e-folds in all,
+            # so 451 dead points and 200 of them done. Replayed against the
+            # two searches that ran to natural termination here, the same
+            # arithmetic forecast 452-459 from ndead=100 onward against
+            # observed 446 and 463.
+            fc = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260101T000100Z"
+            (fc / "chains").mkdir(parents=True)
+            (fc / "chains" / "w.resume").write_text("")
+            (fc / "chains" / "w_dead-birth.txt").write_text("x\n" * 200)
+            (fc / "chains" / "w.stats").write_text(
+                "Global evidence:\n"
+                "log(Z)       =   0.000000000000000E+000 +/-   0.201075706705112E-002\n"
+                "log(Z_1)     =  -0.900000000000000E+001 +/-   0.1E-002 (Still Active)\n"
+                " ndead:           200\n nlive:            50\n nlike:          4800\n")
+            (fc / "chains" / "w_phys_live.txt").write_text(
+                "  0.1  0.000000000000000E+000\n" * 50)
+            (fc / "run.env").write_text(
+                "NS_ALGORITHM=wsclean\nNS_MPI_PROCS=4\nNS_NLIVE=50\nNS_MAX_NDEAD=-1\n")
+            for i in range(60):
+                write_eval(fc, i + 1, now - 12000 + i * (12000 / 59))
+            fc_ranks = [{"pid": 200 + i, "alive": True, "elapsed_seconds": 12000.0,
+                         "cpu_seconds": 20.0, "rss_mb": 10,
+                         "args": f"python3 polychord_wsclean.py --output-dir {fc.resolve()}"}
+                        for i in range(4)]
+            # The local `log(Z_1)` line sits below the global one and must not
+            # be read instead of it.
+            stats = sampler_stats(fc)
+            assert stats == {"log_z": 0.0, "log_z_error": 0.00201075706705112,
+                             "ndead": 200, "nlive": 50, "nlike": 4800}, stats
+            report = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
+            ahead = report["forecast"]
+            assert ahead["total_dead_points"] == 451, ahead
+            assert ahead["estimated"] is True, ahead
+            # 251 dead points left at the 200-per-12000s this run has managed.
+            assert 4.1 < float(ahead["hours_remaining"]) < 4.3, ahead
+            shown = io_capture(report)
+            # 4800 calls over 200 dead points.
+            assert "logZ = 0.000 +/- 0.002, 24 likelihood calls per dead point" in shown, shown
+            assert "~44% done, ~451 dead points total, ~4h11m left" in shown, shown
+
+            # An explicit --max-ndead is a hard stop, so the count is known
+            # rather than estimated and prints without the tildes.
+            (fc / "run.env").write_text(
+                "NS_ALGORITHM=wsclean\nNS_MPI_PROCS=4\nNS_NLIVE=50\nNS_MAX_NDEAD=300\n")
+            capped = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
+            assert capped["forecast"]["total_dead_points"] == 300, capped["forecast"]
+            assert capped["forecast"]["estimated"] is False, capped["forecast"]
+            assert "67% done, 300 dead points total, 1h40m left" in io_capture(capped)
+
+            # Inside the first e-fold the live set is still the prior, so the
+            # estimate would be reporting its own constant and not this run.
+            (fc / "chains" / "w.stats").write_text(
+                "log(Z)       =   0.000000000000000E+000 +/-   0.2E-002\n"
+                " ndead:            20\n nlive:            50\n nlike:           480\n")
+            (fc / "run.env").write_text(
+                "NS_ALGORITHM=wsclean\nNS_MPI_PROCS=4\nNS_NLIVE=50\nNS_MAX_NDEAD=-1\n")
+            early = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
+            assert early["forecast"] is None, early["forecast"]
+            # ...but the evidence it has is still worth showing.
+            assert "logZ = 0.000" in io_capture(early)
+
+            # A run with no chains at all says nothing rather than guessing.
+            assert sampler_stats(live) is None, sampler_stats(live)
+            assert live_loglikelihoods(live) == []
+            assert describe(live, ranks, DEFAULT_STALE_SECONDS)["forecast"] is None
 
             # Disk: the one resource nothing here reserves, frees or prunes,
             # and the only one whose exhaustion ends a run outright.
