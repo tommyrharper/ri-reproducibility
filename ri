@@ -90,11 +90,24 @@ def do_shell(args):
 
 def do_search(args):
     env = env_from(args, SEARCH_ENV)
+    if args.enable_param:
+        env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
+    if args.disable_param:
+        env["NS_DISABLE_PARAMS"] = ",".join(args.disable_param)
     commands = []
     if not args.no_build:
         commands += [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]]
     commands.append([SEARCH_SCRIPT[args.imager]])
     return env, commands
+
+
+def do_params(args):
+    env = {}
+    if args.enable_param:
+        env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
+    if args.disable_param:
+        env["NS_DISABLE_PARAMS"] = ",".join(args.disable_param)
+    return env, [uv("scripts/list-parameter-space.py")]
 
 
 def do_runs(args):
@@ -281,8 +294,33 @@ def build_parser():
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
     search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")
+    search.add_argument("--enable-param", action="append", metavar="NAME",
+                        help="search this parameter_space dimension even if defaults.toml "
+                             "has it disabled; repeatable [NS_ENABLE_PARAMS]")
+    search.add_argument("--disable-param", action="append", metavar="NAME",
+                        help="pin this parameter_space dimension at its default/min instead "
+                             "of searching it; repeatable, and --enable-param wins if a name "
+                             "is given to both [NS_DISABLE_PARAMS]. ./ri params lists names "
+                             "and current state")
     search.add_argument("--no-build", action="store_true",
                         help="skip the image builds this search would do first")
+
+    params = add(
+        "params", do_params, "list the parameter space and what is searched",
+        description=(
+            "One line per [[parameter_space]] entry in defaults.toml: its box,\n"
+            "whether it is currently searched, and what it is pinned at when it is\n"
+            "not.\n"
+            "\n"
+            "--enable-param / --disable-param preview a search's toggle state\n"
+            "without running anything - the same NS_ENABLE_PARAMS / NS_DISABLE_PARAMS\n"
+            "./ri search itself sets."
+        ),
+    )
+    params.add_argument("--enable-param", action="append", metavar="NAME",
+                        help="show this dimension as searched, regardless of defaults.toml")
+    params.add_argument("--disable-param", action="append", metavar="NAME",
+                        help="show this dimension as pinned, regardless of defaults.toml")
 
     runs = add(
         "runs", do_runs, "list runs and which ones stopped early",

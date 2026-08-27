@@ -42,8 +42,10 @@ from common import (
     self_check_lazy_numpy,
     self_check_metric_resolution,
     self_check_parameter_space,
+    self_check_parameter_toggle,
     self_check_profiling,
     self_check_resume_adoption,
+    self_check_source_offset,
     self_check_spectral_window,
     sidecar_command,
     sidecar_run,
@@ -176,6 +178,8 @@ def evaluate(
             peak_memory_bytes,
             dirty_path=dirty_path,
             residual_dirty_path=residual_dirty_path,
+            source_l_arcsec=params["source_l_arcsec"],
+            source_m_arcsec=params["source_m_arcsec"],
         )
         objective = objective_from_metrics(metrics)
     except Exception as exc:
@@ -429,10 +433,12 @@ if __name__ == "__main__":
     if os.environ.get("POLYCHORD_WSCLEAN_SELF_CHECK") == "1":
         self_check_metric_resolution()
         self_check_parameter_space()
+        self_check_parameter_toggle()
         self_check_spectral_window()
         self_check_lazy_numpy()
         self_check_fits_reader()
         self_check_image_pixel_size()
+        self_check_source_offset()
         self_check_profiling()
         self_check_failure_record_persistence()
         self_check_resume_adoption()

@@ -42,6 +42,16 @@ NS_METRIC = "total_rms_jy"
 # `kind = "band_start"` takes its range from the `[[receiver_band]]` list
 # below instead of from `min`/`max`.
 #
+# Every entry also takes `enabled` (default true). Set `enabled = false` to
+# pin a dimension out of the search instead of deleting it: `cube_to_params()`
+# fixes it at its `default` (falling back to `min` when no `default` is
+# given) rather than drawing it from the cube, so disabling a dimension does
+# not require every downstream reader to special-case a missing key. This is
+# the toggle `./ri search --enable-param` / `--disable-param` and `./ri
+# params` also work through - see "Toggling dimensions on and off" in
+# docs/nested-sampling.md. Toggling changes PolyChord's dimension count, so
+# it invalidates existing chains the same way reordering does.
+#
 # Arrays of tables rather than environment variables, so defaults.sh skips
 # them; they have to stay at the end of the file, because every key after a
 # `[[table]]` header belongs to that table.
@@ -70,6 +80,19 @@ kind = "band_start"
 name = "channel_width_hz"
 min = 0.1e6
 max = 2.0e6
+
+# Source offset from the phase centre, as a fraction of the image half-width,
+# at a fixed 30 degree position angle (see docs/parameter-space-proposal.md,
+# section 1). At exactly 0.0 (the old hard-coded behaviour) the source sits on
+# the phase centre and disables bandwidth smearing, time smearing, the w-term
+# and pixel-interpolation error outright, so `channel_width_hz`,
+# `channel_count` and `observation_minutes` only buy visibility count. 0.35
+# keeps the offset inside the small-field regime `ms_to_r2d2_mat.py`'s
+# w-dropping needs to stay valid for R2D2 (see the same doc section).
+[[parameter_space]]
+name = "source_offset_fraction"
+min = 0.0
+max = 0.35
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
 # These are the VLA's; nothing in the code is VLA-specific, so pointing this

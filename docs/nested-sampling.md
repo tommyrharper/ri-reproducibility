@@ -298,10 +298,40 @@ PolyChord dimensions for both algorithms:
 | `channel_count` | `2` to `6` | Number of frequency channels |
 | `start_frequency_hz` | a receiver band (see below) | First channel frequency |
 | `channel_width_hz` | `0.5e6` to `2.0e6` | Uniform spacing between channels |
+| `source_offset_fraction` | `0.0` to `0.35` | Source offset from the phase centre, as a fraction of the image half-width |
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
 frequency sets are a follow-up ceiling.
+
+The current box for every dimension is in `defaults.toml`, which is the one
+authoritative copy - this table names them, not their exact ranges.
+
+### Toggling dimensions on and off
+
+Every `[[parameter_space]]` entry in `defaults.toml` takes `enabled` (default
+true). Setting `enabled = false` pins that dimension out of the search
+instead of deleting it: `cube_to_params()` fixes it at its `default` (falling
+back to `min` when no `default` is given) rather than drawing it from the
+cube. `source_offset_fraction`, for example, disables back to the old
+hard-coded centred source, because its `min` already is `0.0`.
+
+Two ways to see and change this without editing the file:
+
+```
+./ri params                                     # what is searched, what is pinned
+./ri search wsclean --disable-param source_offset_fraction --enable-param channel_count
+```
+
+`--enable-param` / `--disable-param` are repeatable and set `NS_ENABLE_PARAMS`
+/ `NS_DISABLE_PARAMS` (comma-separated names), which override `enabled` in
+defaults.toml for that one invocation - an env-var edit, not a file edit, for
+a one-off search. `--enable-param` wins if a name is passed to both.
+
+Toggling a dimension changes PolyChord's dimension count, so - like
+reordering `[[parameter_space]]` - it invalidates existing chains, and
+`merge-nested-sampling-runs.py` refuses to merge runs whose `parameter_space`
+differs.
 
 ### Receiver bands
 
@@ -412,6 +442,30 @@ WSClean's, since R2D2 rescaled either way.
 `super_resolution` is 1.5, R2D2's own default, now written into the R2D2
 config explicitly rather than left implicit, because WSClean's `-scale` is
 derived from it.
+
+### Source offset
+
+`source_offset_fraction` moves the source off the phase centre, at a fixed 30
+degree position angle (non-axis-aligned, to avoid the symmetries a purely
+horizontal or vertical offset would have). At `0.0` it reproduces the old
+hard-coded behaviour exactly: no bandwidth smearing, no time smearing, no
+w-term, no pixel-interpolation error, and `point_source_forest.py` skips
+K-Jones outright.
+
+`source_offset_to_lm()` in `common.py` converts the fraction to an (l, m)
+offset in arcsec using a *nominal* image half-width - `image_pixel_size_arcsec()`
+against VLA-A's ~36 km maximum baseline and the sampled frequency, not the
+`max_proj_baseline_lambda` the simulator will actually record - because the
+source position has to reach `simulate_point_source_ms.py` before the MS (and
+its real baselines) exist. `compute_image_metrics()` places the truth pixel at
+that same offset (`source_pixel()`), so an off-centre evaluation is not scored
+against a source that is not there.
+
+Caveat: `ms_to_r2d2_mat.py` writes only `u` and `v` (see the bridge table
+below) - `w` is dropped, so R2D2 sees a coplanar 2-D array while WSClean does
+not. `source_offset_fraction`'s box tops out at 0.35 to stay inside the
+small-field regime that keeps this an acceptable approximation rather than
+comparing the two imagers on different physics.
 
 Fixed hyperparameters (not searched) on every evaluation:
 
