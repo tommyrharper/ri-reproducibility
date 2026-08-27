@@ -878,7 +878,22 @@ def adopt_completed_evaluations(
     repeated point. With it the ids carry on and a point evaluated before is
     served from the cache instead of being paid for twice - which is the whole
     reason to resume rather than start again.
+
+    The evaluations that were still in flight when the run stopped are thrown
+    away first. An evaluation directory with no metrics.json holds nothing
+    worth keeping - the run died between creating it and scoring it - and
+    simulate_measurement_set() creates each one with `exist_ok=False`, on
+    purpose, so that two ranks cannot land on the same directory. Left in
+    place, one of these would crash the resumed run the moment the sampler
+    proposed that point again: the very run this is supposed to rescue.
     """
+    import shutil
+
+    for leftover in sorted(evaluations_dir.glob("eval-*")):
+        if leftover.is_dir() and not (leftover / "metrics.json").exists():
+            # ignore_errors because every rank runs this, and they are all
+            # removing the same directories at the same moment.
+            shutil.rmtree(leftover, ignore_errors=True)
     for record in load_evaluations_from_dir(evaluations_dir):
         evaluations.append(record)
         cache[params_key(record["params"])] = record
@@ -904,6 +919,26 @@ def self_check_resume_adoption() -> None:
         assert cache[params_key(params)]["objective"] == 0.5
         # The next eval id continues rather than restarting at 1.
         assert len(evaluations) + 1 == 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # An evaluation that was in flight when the run stopped has a
+        # directory but no metrics.json. It has to go: it holds nothing, and
+        # simulate_measurement_set() creates directories with exist_ok=False,
+        # so leaving it would crash the resumed run when the sampler proposed
+        # that point again.
+        evaluations_dir = Path(tmp)
+        finished = evaluations_dir / "eval-0001-abc"
+        finished.mkdir()
+        write_evaluation_record(finished, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        in_flight = evaluations_dir / "eval-0002-def"
+        in_flight.mkdir()
+        (in_flight / "sim.ms").write_text("half a measurement set")
+
+        evaluations = []
+        cache = {}
+        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert finished.exists()
+        assert not in_flight.exists()
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
