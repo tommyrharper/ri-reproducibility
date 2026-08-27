@@ -1843,6 +1843,14 @@ a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transpare
 .index-run-name { font-size: 0.8rem; opacity: 0.6; margin: 0 0 0.5rem; word-break: break-all; }
 .index-evidence { font-size: 0.95rem; margin-top: 0.6rem; }
 .index-evidence .delta { font-size: 0.8rem; opacity: 0.7; margin-left: 0.35rem; }
+.ns-index-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 0.5rem 1.25rem; margin: 0 0 1.25rem;
+  font-size: 0.85rem;
+}
+.ns-index-toolbar label { display: flex; align-items: center; gap: 0.4rem; }
+.ns-index-toolbar select { font: inherit; }
+.ns-index-count { opacity: 0.65; margin-left: auto; }
 """
 
 
@@ -1901,7 +1909,14 @@ def run_log_evidence(run_dir, summary):
     return None
 
 
+# Display labels for known algorithm tokens; anything else falls back to the
+# raw summary value so a future algorithm still gets a working filter option.
+ALGORITHM_LABELS = {"r2d2": "R2D2", "wsclean": "WSClean"}
+
+
 def render_index_entry(summary_path, status):
+    """Returns (card_html, algorithm_token) - the token feeds the index toolbar's
+    algorithm filter options, "" when the run has none worth filtering on."""
     run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
     with open(summary_path) as f:
@@ -1911,6 +1926,16 @@ def render_index_entry(summary_path, status):
     evaluations = summary.get("evaluations", [])
     succeeded = [ev for ev in evaluations if "error" not in ev]
     failed_count = len(evaluations) - len(succeeded)
+
+    algorithm_token = str(summary.get("algorithm") or "").strip().lower()
+    if algorithm_token in ("", "?"):
+        algorithm_token = ""
+    is_merged = bool(summary.get("merged_from"))
+    card_attrs = (
+        f' data-algorithm="{html.escape(algorithm_token)}"'
+        f' data-merged="{"1" if is_merged else "0"}"'
+        f' data-evals="{len(succeeded)}"'
+    )
 
     title_bits = [html.escape(str(summary.get("algorithm", "?")))]
     ts_label = format_run_id_timestamp(run_name)
@@ -1923,7 +1948,7 @@ def render_index_entry(summary_path, status):
         duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>'
 
     badges = []
-    if summary.get("merged_from"):
+    if is_merged:
         badges.append('<span class="badge badge-ok">merged</span>')
     badges.append(f'<span class="badge">{html.escape(str(summary.get("vla_config", "?")))}</span>')
     badges.append(f'<span class="badge">nlive {html.escape(str(polychord.get("nlive", "?")))}</span>')
@@ -1954,9 +1979,9 @@ def render_index_entry(summary_path, status):
     """
     if status == "missing":
         return (
-            f'<div class="card index-entry index-entry-missing">{body}'
+            f'<div class="card index-entry index-entry-missing"{card_attrs}>{body}'
             '<p class="empty">Page not generated yet - run <code>./ri report</code>.</p></div>'
-        )
+        ), algorithm_token
     stale_html = ""
     if status == "outdated":
         stale_html = (
@@ -1964,9 +1989,93 @@ def render_index_entry(summary_path, status):
             "<code>./ri report --upgrade</code>.</p>"
         )
     return (
-        f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}">'
+        f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}"{card_attrs}>'
         f"{body}{stale_html}</a>"
+    ), algorithm_token
+
+
+# Wired up client-side in INDEX_SCRIPT: the toolbar only ever filters/reorders
+# cards already in the page, so it needs no server round-trip and works the
+# same off a plain `file://` open as it does served.
+def render_index_toolbar(algorithm_tokens):
+    algo_options = "".join(
+        f'<option value="{html.escape(token)}">{html.escape(ALGORITHM_LABELS.get(token, token.title()))}</option>'
+        for token in algorithm_tokens
     )
+    return f"""
+    <div class="ns-index-toolbar">
+      <label>Algorithm
+        <select id="ns-filter-algorithm"><option value="">All algorithms</option>{algo_options}</select>
+      </label>
+      <label>Merged
+        <select id="ns-filter-merged">
+          <option value="">All runs</option>
+          <option value="1">Merged only</option>
+          <option value="0">Unmerged only</option>
+        </select>
+      </label>
+      <label>Sort by
+        <select id="ns-sort">
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="evals-desc">Most evals</option>
+          <option value="evals-asc">Fewest evals</option>
+        </select>
+      </label>
+      <span class="ns-index-count" id="ns-index-count"></span>
+    </div>
+    """
+
+
+# Filters by hiding cards (native `hidden` attribute, no CSS of its own needed)
+# and sorts by re-appending them in the wanted order - appendChild on a node
+# already in the list moves it rather than duplicating it. Array#sort is
+# specified stable, so the two eval sorts keep the newest-first document order
+# as their tie-break for free.
+INDEX_SCRIPT = """
+<script>
+(function () {
+  var list = document.getElementById("ns-index-list");
+  var algoSel = document.getElementById("ns-filter-algorithm");
+  var mergedSel = document.getElementById("ns-filter-merged");
+  var sortSel = document.getElementById("ns-sort");
+  var countEl = document.getElementById("ns-index-count");
+  if (!list || !algoSel || !mergedSel || !sortSel) return;
+  var items = Array.prototype.slice.call(list.children);
+
+  function apply() {
+    var sorted = items.slice();
+    if (sortSel.value === "oldest") {
+      sorted.reverse();
+    } else if (sortSel.value === "evals-desc" || sortSel.value === "evals-asc") {
+      var dir = sortSel.value === "evals-desc" ? -1 : 1;
+      sorted.sort(function (a, b) {
+        return dir * (Number(a.dataset.evals || 0) - Number(b.dataset.evals || 0));
+      });
+    }
+    sorted.forEach(function (el) { list.appendChild(el); });
+
+    var algo = algoSel.value;
+    var merged = mergedSel.value;
+    var visible = 0;
+    items.forEach(function (el) {
+      var show = (!algo || el.dataset.algorithm === algo)
+        && (!merged || el.dataset.merged === merged);
+      el.hidden = !show;
+      if (show) visible += 1;
+    });
+    if (countEl) {
+      countEl.textContent = visible + " of " + items.length + " run" + (items.length === 1 ? "" : "s");
+    }
+  }
+
+  algoSel.addEventListener("change", apply);
+  mergedSel.addEventListener("change", apply);
+  sortSel.addEventListener("change", apply);
+  apply();
+})();
+</script>
+"""
 
 
 def render_nested_sampling_index(status_for):
@@ -1976,7 +2085,19 @@ def render_nested_sampling_index(status_for):
             '<p class="empty">No nested-sampling runs found under '
             "results/nested-sampling/*/summary.json yet.</p>"
         )
-    return "".join(render_index_entry(p, status_for(p)) for p in paths)
+    entries = []
+    algorithm_tokens = []
+    for p in paths:
+        entry_html, algorithm_token = render_index_entry(p, status_for(p))
+        entries.append(entry_html)
+        if algorithm_token and algorithm_token not in algorithm_tokens:
+            algorithm_tokens.append(algorithm_token)
+    algorithm_tokens.sort()
+    return (
+        render_index_toolbar(algorithm_tokens)
+        + f'<div id="ns-index-list">{"".join(entries)}</div>'
+        + INDEX_SCRIPT
+    )
 
 
 def index_nav_html():
@@ -2268,6 +2389,62 @@ def _self_check_page_status():
         f.write("<!doctype html><html><head><title>old</title></head></html>")
     assert page_status(tmp_dir, "run-b") == "outdated"
     shutil.rmtree(tmp_dir)
+
+
+def _self_check_index_toolbar():
+    """Index cards carry the algorithm/merged/evals data the toolbar filters
+    and sorts on, and the toolbar options match the algorithms actually seen."""
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    try:
+        r2d2_dir = os.path.join(tmp_dir, "r2d2-run")
+        os.makedirs(r2d2_dir)
+        r2d2_summary = os.path.join(r2d2_dir, "summary.json")
+        with open(r2d2_summary, "w") as f:
+            json.dump({
+                "algorithm": "r2d2",
+                "evaluations": [{"eval_id": 1, "objective": 1.0}, {"eval_id": 2, "error": "boom"}],
+            }, f)
+        card, token = render_index_entry(r2d2_summary, "current")
+        assert token == "r2d2", token
+        assert 'data-algorithm="r2d2"' in card, card
+        assert 'data-merged="0"' in card, card
+        assert 'data-evals="1"' in card, card  # one succeeded, one failed
+
+        wsclean_dir = os.path.join(tmp_dir, "wsclean-run")
+        os.makedirs(wsclean_dir)
+        wsclean_summary = os.path.join(wsclean_dir, "summary.json")
+        with open(wsclean_summary, "w") as f:
+            json.dump({
+                "algorithm": "wsclean",
+                "merged_from": [{"name": "some-source-run"}],
+                "evaluations": [],
+            }, f)
+        card, token = render_index_entry(wsclean_summary, "missing")
+        assert token == "wsclean", token
+        assert '<div class="card index-entry index-entry-missing" data-algorithm="wsclean"' in card, card
+        assert 'data-merged="1"' in card, card
+        assert 'data-evals="0"' in card, card
+
+        unknown_dir = os.path.join(tmp_dir, "mystery-run")
+        os.makedirs(unknown_dir)
+        unknown_summary = os.path.join(unknown_dir, "summary.json")
+        with open(unknown_summary, "w") as f:
+            json.dump({"evaluations": []}, f)
+        card, token = render_index_entry(unknown_summary, "current")
+        assert token == "", token
+        assert 'data-algorithm=""' in card, card
+
+        toolbar = render_index_toolbar(["r2d2", "wsclean", "sasir"])
+        assert '<option value="r2d2">R2D2</option>' in toolbar, toolbar
+        assert '<option value="wsclean">WSClean</option>' in toolbar, toolbar
+        assert '<option value="sasir">Sasir</option>' in toolbar, toolbar  # unknown token: title-cased fallback
+        assert '<select id="ns-filter-merged">' in toolbar, toolbar
+        assert '<select id="ns-sort">' in toolbar, toolbar
+    finally:
+        shutil.rmtree(tmp_dir)
 
 
 def _self_check_cached_png():
@@ -2691,6 +2868,7 @@ if __name__ == "__main__":
         _self_check_render_array_png()
         _self_check_profiling()
         _self_check_page_status()
+        _self_check_index_toolbar()
         _self_check_tick_housekeeping()
         _self_check_shared_axes_dedupe()
         _self_check_tick_memo()
