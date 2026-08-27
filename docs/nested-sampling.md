@@ -40,8 +40,10 @@ a sidecar too" and "Long-lived sidecar containers, one per image" in
 Once the containers are up, a progress bar tracks the search against its
 `--max-ndead` budget: elapsed time, dead points done, and an ETA extrapolated
 from the rate so far (`scripts/lib/progress-bar.sh`, counting
-`evaluations/eval-*` the same way `./ri runs` does). Only drawn on a TTY, so
-piped or logged runs are unaffected.
+`evaluations/eval-*` the same way `./ri runs` does). With `--max-ndead <= 0`
+(run until the evidence tolerance is met, no fixed cap) there is no total to
+be a percent of, so it shows a bouncing bar and the dead-point rate instead.
+Only drawn on a TTY, so piped or logged runs are unaffected.
 
 ### WSClean
 
