@@ -37,3 +37,9 @@
 ./ri plot likelihood # the R2D2 vs WSClean overlay image
 
 ```
+
+## current search approach:
+
+```zsh
+./ri search r2d2 --nlive 50 --num-repeats ? --max-ndead
+```

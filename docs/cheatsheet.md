@@ -101,6 +101,8 @@ Each search builds the images it needs first; `--no-build` skips that.
 Each flag sets its variable for that run, so the two forms below are the same
 run. A flag beats an exported variable, and both beat `defaults.toml`.
 
+#### Tweak these
+
 | Flag | Variable | Meaning | Default |
 |---|---|---|---|
 | `--nlive` | `NS_NLIVE` | PolyChord live points | `8` |
@@ -108,12 +110,25 @@ run. A flag beats an exported variable, and both beat `defaults.toml`.
 | `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget, terminates the run | `12` |
 | `--seed` | `NS_SEED` | PolyChord seed | `41` |
 | `--metric` | `NS_METRIC` | Objective, see below | `total_rms_jy` |
-| `--mpi-procs` | `NS_MPI_PROCS` | Rank count; `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)` |
+
+#### Leave these alone
+
+Flags exist; defaults are derived. Leave unset unless you want serial
+debugging (`--mpi-procs 1`) or a pinned run directory.
+
+| Flag | Variable | Meaning | Default |
+|---|---|---|---|
+| `--mpi-procs` | `NS_MPI_PROCS` | Rank count; `1` is serial | `min(NS_NLIVE, host CPUs)` |
 | `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1 |
 | `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
 
-`NS_SIDECARS`, `NS_SIMULATE_FIFO_DIR` and `NS_R2D2_FIFO_DIR` are wiring the run
-scripts export, not knobs to set by hand.
+No flags. The run scripts export these for the containers they start.
+
+| Variable | Meaning |
+|---|---|
+| `NS_SIDECARS` | Image → sidecar container name |
+| `NS_SIMULATE_FIFO_DIR` | Per-rank simulate worker FIFOs |
+| `NS_R2D2_FIFO_DIR` | Per-rank R2D2 imaging worker FIFOs |
 
 ```bash
 ./ri search wsclean --nlive 8 --num-repeats 2 --max-ndead 12

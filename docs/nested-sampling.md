@@ -133,30 +133,43 @@ torch - see "R2D2 sizes its own torch thread pool" in
 
 ### Environment overrides
 
-Both run scripts read the same `NS_*` variables and forward them to
+Both run scripts read the same variables and forward the sampler ones to
 `polychord_wsclean.py` / `polychord_r2d2.py` as command-line flags.
-The defaults live in `defaults.toml` at the repository root, loaded by
-`scripts/lib/defaults.sh`, which both scripts source.
+Sampler defaults live in `defaults.toml` at the repository root, loaded by
+`scripts/lib/defaults.sh`. Setting a variable yourself still wins over
+`defaults.toml`; a flag wins over both.
 
-`./ri search` exposes each of them as a flag (`--nlive`, `--num-repeats`,
-`--max-ndead`, `--seed`, `--metric`, `--mpi-procs`, `--omp-threads`,
-`--output-dir`) which sets the variable for that run. Setting the variable
-yourself still works and still wins over `defaults.toml`; a flag wins over both.
+#### Tweak these
 
-| Variable | Meaning | Default |
+| Flag | Variable | Meaning | Default |
+|---|---|---|---|
+| `--nlive` | `NS_NLIVE` | Number of PolyChord live points | `8` |
+| `--num-repeats` | `NS_NUM_REPEATS` | How much PolyChord explores inside the likelihood constraint before generating a replacement live point | `2` |
+| `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget that terminates the run | `12` |
+| `--seed` | `NS_SEED` | PolyChord random seed | `41` |
+| `--metric` | `NS_METRIC` | Objective: `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
+
+#### Leave these alone
+
+Flags exist, but the defaults are derived. Leave them unset unless you want
+serial debugging (`--mpi-procs 1`), a different rank/thread split, or a
+pinned run directory.
+
+| Flag | Variable | Meaning | Default |
+|---|---|---|---|
+| `--mpi-procs` | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` is serial | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` (`sysctl -n hw.ncpu` on macOS, which has no `nproc`) |
+| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1 |
+| `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
+
+The run scripts also export these for the containers they start. They have
+no `./ri` flags. Unset, the Python ranks fall back to starting their own
+workers, which is slower.
+
+| Variable | Meaning | Set by the run scripts to |
 |---|---|---|
-| `NS_NLIVE` | Number of PolyChord live points (`--nlive`) | `8` |
-| `NS_NUM_REPEATS` | How much PolyChord explores inside the likelihood constraint before generating a replacement live point (`--num-repeats`) | `2` |
-| `NS_MAX_NDEAD` | Dead-point budget that terminates the run (`--max-ndead`) | `12` |
-| `NS_SEED` | PolyChord random seed (`--seed`) | `41` |
-| `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
-| `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` (`sysctl -n hw.ncpu` on macOS, which has no `nproc`) |
-| `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh`. Unset means `{}`: each rank starts its own container per image |
-| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by both run scripts. No default: unset means each rank starts its own simulate worker |
-| `NS_R2D2_FIFO_DIR` | Same, for the pre-warmed `r2d2_serve.py` imaging workers | `${OUTPUT_DIR}/.r2d2-workers`, set by the R2D2 run script. No default: unset means each rank `docker exec`s its own imaging worker |
-
-`NS_SIDECARS`, `NS_SIMULATE_FIFO_DIR` and `NS_R2D2_FIFO_DIR` are wiring the run
-scripts export for the containers they start, not knobs to set by hand.
+| `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh` |
+| `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers` |
+| `NS_R2D2_FIFO_DIR` | Same, for the pre-warmed `r2d2_serve.py` imaging workers | `${OUTPUT_DIR}/.r2d2-workers` (R2D2 run only) |
 
 ## Parameter space
 
