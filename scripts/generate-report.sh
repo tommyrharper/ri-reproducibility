@@ -25,10 +25,10 @@
 # astropy import so only the parent pays for it. anesthetic is imported in the
 # parent too, so the corner-plot workers inherit it rather than each repeating
 # the import. The corner plot also de-duplicates pandas' per-plot-call tick
-# housekeeping, memoises matplotlib's per-axis tick updates, caches
-# anesthetic's per-index label mapping and label-stripped frame copies, and
-# hands savefig a pre-measured tight bbox so it skips its own extra layout
-# pass - see docs/nested-sampling.md.
+# housekeeping and the shared-axis scan that drives it, memoises matplotlib's
+# per-axis tick updates, caches anesthetic's per-index label mapping and
+# label-stripped frame copies, and hands savefig a pre-measured tight bbox so
+# it skips its own extra layout pass - see docs/nested-sampling.md.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

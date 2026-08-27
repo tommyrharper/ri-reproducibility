@@ -384,6 +384,18 @@ in-container and 15% less CPU, with byte-identical PNGs. The patch is
 best-effort: if pandas moves the private helper it is a no-op and the plot is
 just slower again.
 
+With the labels themselves de-duplicated, what was left of a repeat call was the
+scan that decides which axes to hand to the helper: for every axis, and for both
+of its axes, walk the whole shared-axis group comparing positions - 420 of those
+per corner plot. The same function records the axes the first scan selects and
+replays only their `viewLim` touch afterwards, keyed on the figure's axes, their
+visibility and the grid shape, so anything that changes the answer misses. That
+takes the scan to 28 calls; corner plot 0.552s -> 0.538s, five-run cold build
+1.449s -> 1.435s in-container and 1.5% less CPU, with byte-identical PNGs.
+Note that pandas' plotting core binds `handle_shared_axes` by `from ... import`,
+so the patch has to rebind the name in every module that holds it, not just in
+`pandas.plotting._matplotlib.tools`.
+
 Matplotlib repeats work of its own on the same figure. Every layout pass -
 `tight_layout()`, the tight-bbox draw, the render draw, and each spine and axis
 label placed in between - recomputes every axis' tick positions and label text
