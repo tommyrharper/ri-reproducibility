@@ -11,14 +11,16 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/r2d2-vlaa-${RUN_ID}}"
 
 # Needed before the launches, because the containers' commands below want one
-# FIFO pair per rank to already exist. `nproc` and not `docker info --format
-# '{{.NCPU}}'`: the two answer the same on any daemon these scripts can use -
-# every sidecar bind-mounts host paths, so the daemon is always this host - and
-# `docker info` is ~0.06s of CLI-plus-daemon round trip sitting in front of the
-# R2D2 sidecar's `docker run`, which is 1:1 on the run's wall clock. The
-# daemon-availability check it doubled as is below the launches instead, where
-# it overlaps the containers coming up and costs nothing.
-HOST_CPUS="$(nproc)"
+# FIFO pair per rank to already exist. `nproc`/`sysctl` (matches the fallback
+# in record-environment.sh and r2d2-docker-thread-env.sh, since `nproc` is
+# Linux-only and this repo also runs on macOS hosts) and not `docker info
+# --format '{{.NCPU}}'`: the two answer the same on any daemon these scripts
+# can use - every sidecar bind-mounts host paths, so the daemon is always this
+# host - and `docker info` is ~0.06s of CLI-plus-daemon round trip sitting in
+# front of the R2D2 sidecar's `docker run`, which is 1:1 on the run's wall
+# clock. The daemon-availability check it doubled as is below the launches
+# instead, where it overlaps the containers coming up and costs nothing.
+HOST_CPUS="$(command -v nproc >/dev/null 2>&1 && nproc || sysctl -n hw.ncpu)"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
