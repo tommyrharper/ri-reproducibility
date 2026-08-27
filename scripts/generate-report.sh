@@ -26,10 +26,12 @@
 # parent too, so the corner-plot workers inherit it rather than each repeating
 # the import. The corner plot also de-duplicates pandas' per-plot-call tick
 # housekeeping and the shared-axis scan that drives it, memoises matplotlib's
-# per-axis tick updates and its per-text layout measurements, caches
-# anesthetic's per-index label mapping and label-stripped frame copies, and
-# hands savefig a pre-measured tight bbox so it skips its own extra layout
-# pass - see docs/nested-sampling.md.
+# per-axis tick updates and its per-text layout measurements, skips its
+# shared-axis autoscale scan while nothing has gone stale, caches anesthetic's
+# per-index label mapping, its label-stripped frame copies and the per-panel
+# Axes subclasses it builds one at a time, and hands savefig a pre-measured
+# tight bbox so it skips its own extra layout pass - see
+# docs/nested-sampling.md.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
