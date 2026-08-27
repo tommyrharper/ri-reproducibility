@@ -17,6 +17,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -319,6 +320,54 @@ def meqserver_session():
     return _MQS
 
 
+# How long one predict may take before its meqserver is assumed wedged. Timba's
+# `wait=True` means wait forever, which is how a MeqTrees deadlock used to take a
+# whole run down: this process sat in Timba's 1s poll loop with no instruction to
+# ever give up, and the rank waiting on its reply held every other rank in
+# PolyChord's collective behind it. A number bounds that here, where the worker
+# can replace its own server and answer the rank normally, instead of out in the
+# rank where the only move is to kill this process. A predict is ~0.1s and the
+# slowest simulate on record is 0.6s, so 3s is ~30x the real thing.
+PREDICT_WAIT_SECONDS = 3.0
+
+
+class MeqserverWedged(RuntimeError):
+    """A predict went unanswered for PREDICT_WAIT_SECONDS.
+
+    Deliberately not a failed evaluation: the sampler must never score this,
+    because it says nothing about the parameters. It is the local, recoverable
+    form of what common.py calls WORKER_DIED - the server is replaced and the
+    predict retried, and only a second failure gives up.
+    """
+
+
+def restart_meqserver_session() -> None:
+    """Replace a meqserver that stopped answering, without asking it politely.
+
+    stop_meqserver_session() below sends halt() and waits for the reply, which
+    is exactly what a wedged server will not send, so it would hang here too.
+    The server is this process's own child, so SIGKILL and reap it instead.
+    Octopussy stays up and only the server is replaced; the forest lives in the
+    server, so it dies with it and the next predict recompiles. Measured at
+    0.18s, against ~3s for the rank-side watchdog to kill this whole worker and
+    a replacement to import Timba from scratch.
+    """
+    global _MQS
+    from Timba.Apps import meqserver
+
+    pid = getattr(_MQS, "serv_pid", None)
+    _MQS = None
+    _FOREST.clear()
+    # default_mqs() hands back its own module global whenever that is already a
+    # meqserver, so clearing it is what makes a restart possible at all.
+    meqserver.mqs = None
+    if pid:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            os.waitpid(pid, 0)
+
+
 def stop_meqserver_session() -> None:
     """Shut the meqserver down explicitly, the way meqtree-pipeliner.py does.
 
@@ -364,9 +413,6 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
             ]
         )
     )
-    mqs = meqserver_session()
-    from Timba.TDL import Compile, TDLOptions
-
     # Compiling the forest is ~0.034s of every evaluation and depends on every
     # tdlconf key except ms_sel.msname: the antenna layout and phase centre come
     # from the fixed antenna table and RightAscension/Declination that
@@ -375,8 +421,40 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
     # evaluations just point it at their own MS. self_check_forest_reuse()
     # is the guard on that claim.
     key = "\n".join(line for line in tdlconf.read_text().splitlines() if not line.startswith("ms_sel.msname"))
-    # Same sequence meqtree-pipeliner.py runs for
-    # `-c <tdlconf> point_source_forest.py[predict] =predict`.
+    # A wedged meqserver is replaced once and the predict retried against the
+    # fresh one, which costs ~0.2s and the caller never sees. Twice in a row is
+    # no longer a stuck server but something this worker cannot fix, so it goes
+    # back to the rank as a dead worker rather than a failed evaluation - see
+    # MeqserverWedged.
+    for attempt in range(2):
+        try:
+            errors = _compile_and_predict(tdlconf, key, output_ms)
+            break
+        except MeqserverWedged as exc:
+            # Its own file, not meqtree-pipeliner.log: the retry reopens that
+            # log and truncates it, so a wedge that was recovered from left no
+            # trace of ever having happened. This is the only record that an
+            # evaluation cost seconds instead of milliseconds.
+            with (output_ms.parent / "meqserver-wedged.log").open("a") as note:
+                note.write(f"attempt {attempt + 1}: {exc}\n")
+            if attempt:
+                raise
+            restart_meqserver_session()
+    if errors:
+        raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
+
+
+def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
+    """One compile-and-predict against this process's meqserver.
+
+    Same sequence meqtree-pipeliner.py runs for
+    `-c <tdlconf> point_source_forest.py[predict] =predict`, except that the
+    predict is bounded instead of waiting forever. Raises MeqserverWedged when
+    the server does not answer inside that bound.
+    """
+    mqs = meqserver_session()
+    from Timba.TDL import Compile, TDLOptions
+
     with redirect_fds(output_ms.parent / "meqtree-pipeliner.log"):
         module = _FOREST.get(key)
         if module is None:
@@ -391,7 +469,16 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
         else:
             point_to_measurement_set(module, output_ms)
             print("### reusing the compiled forest; only the Measurement Set changed")
-        TDLOptions.get_job_func("predict")(mqs, None, wait=True)
+        try:
+            TDLOptions.get_job_func("predict")(mqs, None, wait=PREDICT_WAIT_SECONDS)
+        except AttributeError as exc:
+            # Timba's meq() ends in `return msg.payload`, and msg is None when
+            # the wait expires, so a timeout arrives here as an AttributeError
+            # off that line rather than as a return value. Anything else of the
+            # same type is a real bug and is left to propagate.
+            if "NoneType" not in str(exc):
+                raise
+            raise MeqserverWedged(f"no reply to the predict in {PREDICT_WAIT_SECONDS}s") from exc
         # get_error_log() flushes, so each request only sees its own errors.
         errors = mqs.get_error_log()
         for index, (_event, error) in enumerate(errors):
@@ -399,8 +486,7 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
             # (`string.join`) and raises AttributeError, which would replace the
             # meqserver's error with a traceback from the reporting path itself.
             print(f"###   {index:03d}: {error!r}")
-    if errors:
-        raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
+    return errors
 
 
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -606,6 +692,23 @@ def serve(fifo_base: str | None = None) -> None:
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             try:
                 handle_request(request)
+            except MeqserverWedged:
+                # Past what this worker can fix - it has already replaced its
+                # meqserver once for this request. Die instead of answering, so
+                # the rank sees the worker death it already knows how to retry
+                # (common.py's WORKER_DIED) rather than an exit status, which it
+                # would score as a failure of these parameters. The parameters
+                # did nothing wrong, and a host fault the sampler chases is the
+                # one outcome FAILURE_OBJECTIVE must never be spent on.
+                #
+                # os._exit() because Timba's octopussy event thread is not a
+                # daemon, so a normal exit blocks joining it forever - the same
+                # trap stop_meqserver_session() exists to avoid, and it cannot
+                # help here because it needs a server that answers.
+                traceback.print_exc()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
             except Exception:
                 traceback.print_exc()
                 returncode = 1
@@ -704,6 +807,82 @@ def self_check_forest_reuse() -> None:
     print("forest reuse self-check passed")
 
 
+def self_check_meqserver_restart() -> None:
+    """A wedged meqserver is replaced once; a second wedge kills the worker.
+
+    The deadlock this covers is a real one: MeqTrees stopped answering a
+    predict, and because Timba's `wait=True` means wait forever, the worker sat
+    in its poll loop while the rank waiting on the reply held every other rank
+    in PolyChord's collective. Recovering here rather than out in the rank is
+    what keeps the stall to one restart instead of one killed worker.
+
+    The two outcomes have to stay apart. One wedge is a stuck server and the
+    caller must never know; two in a row is a worker that cannot be saved, and
+    it has to leave as a worker death, never as an exit status the sampler
+    would score against these parameters.
+    """
+    original_predict = globals()["_compile_and_predict"]
+    original_restart = globals()["restart_meqserver_session"]
+    calls: list[str] = []
+
+    def restart() -> None:
+        calls.append("restart")
+
+    def predict(wedges: int):
+        remaining = [wedges]
+
+        def run(*_args: object, **_kwargs: object) -> list:
+            calls.append("predict")
+            if remaining[0]:
+                remaining[0] -= 1
+                raise MeqserverWedged("no reply to the predict")
+            return []
+
+        return run
+
+    scratch = tempfile.TemporaryDirectory()
+    ms = Path(scratch.name) / "sim.ms"
+    try:
+        globals()["restart_meqserver_session"] = restart
+
+        # One wedge: restart, retry, and the caller sees an ordinary predict.
+        calls.clear()
+        globals()["_compile_and_predict"] = predict(wedges=1)
+        run_meqtrees_predict(ms, "2x2", 1.0, 0.0, 0.0)
+        assert calls == ["predict", "restart", "predict"], calls
+        # The only record that this evaluation cost seconds rather than
+        # milliseconds - meqtree-pipeliner.log cannot hold it, because the
+        # retry reopens that file and truncates whatever the wedge wrote.
+        note = ms.parent / "meqserver-wedged.log"
+        assert note.exists() and "attempt 1" in note.read_text(), note
+        note.unlink()
+
+        # No wedge: nothing is restarted and the predict runs once.
+        calls.clear()
+        globals()["_compile_and_predict"] = predict(wedges=0)
+        run_meqtrees_predict(ms, "2x2", 1.0, 0.0, 0.0)
+        assert calls == ["predict"], calls
+        assert not (ms.parent / "meqserver-wedged.log").exists()
+
+        # Two in a row: raised, not swallowed and not turned into an exit
+        # status, so serve() can kill the worker and let the rank retry it.
+        calls.clear()
+        globals()["_compile_and_predict"] = predict(wedges=2)
+        try:
+            run_meqtrees_predict(ms, "2x2", 1.0, 0.0, 0.0)
+        except MeqserverWedged:
+            pass
+        else:
+            raise AssertionError("a second wedge in a row must reach the caller")
+        assert calls == ["predict", "restart", "predict"], calls
+    finally:
+        scratch.cleanup()
+        globals()["_compile_and_predict"] = original_predict
+        globals()["restart_meqserver_session"] = original_restart
+
+    print("meqserver restart self-check passed")
+
+
 def self_check_serve_reply_stream() -> None:
     """A worker's stdout must carry replies only, never meqserver startup chatter."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
@@ -780,6 +959,7 @@ if __name__ == "__main__":
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
             self_check_forest_reuse()
+            self_check_meqserver_restart()
             self_check_serve_reply_stream()
             self_check_serve_fifo()
         else:
