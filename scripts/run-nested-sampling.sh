@@ -163,7 +163,7 @@ scripts/record-environment.sh \
 sidecar_wait
 
 mkdir -p "${OUTPUT_DIR}/evaluations"
-run_with_progress "${OUTPUT_DIR}/evaluations" "${NS_MAX_NDEAD}" -- "${RUN_COMMAND[@]}"
+run_with_progress "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" -- "${RUN_COMMAND[@]}"
 
 rm -rf "${SIMULATE_FIFO_DIR}"
 echo "OK: nested-sampling output in ${OUTPUT_DIR}"

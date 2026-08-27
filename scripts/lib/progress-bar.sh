@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# A single-line progress indicator for a nested-sampling search: elapsed
-# time, dead points done, and (when --max-ndead is a positive cap) a percent
-# and ETA extrapolated from the rate so far. --max-ndead <= 0 means PolyChord
-# runs until its evidence tolerance is met instead of a fixed dead-point
-# budget, so there is no total to be a percent of - that case gets a
-# bouncing bar and a rate instead, ambiguous but still visibly alive. Dead
-# points are counted via evaluations/eval-* instead of parsing PolyChord's
-# own feedback, which is the same signal `./ri runs` already uses to report
-# progress on a stopped run.
+# A pinned status line for a nested-sampling search: elapsed time, dead
+# points against the run's --max-ndead cap (when it has one) with a percent
+# and ETA extrapolated from the rate so far, plus the raw evaluation count.
+#
+# Dead points come from PolyChord's own chains/*_dead-birth.txt (one line per
+# dead point) - the same file scripts/lib/nested_sampling/anesthetic_io.py
+# already reads for finished runs. evaluations/eval-* is *not* the same
+# count: PolyChord's slice sampler makes several likelihood evaluations per
+# accepted dead point (roughly num_repeats per dimension), so it always runs
+# ahead - shown separately, not conflated with dead points.
+#
+# On a TTY the status is pinned to the terminal's last line via a scroll
+# region (DECSTBM), so PolyChord's own feedback scrolling by above it doesn't
+# bury the line - the fix for a WSClean search producing dead points faster
+# than a human can read a scrolling counter.
 
-# Usage: run_with_progress <evaluations_dir> <max_ndead> -- cmd args...
+# Usage: run_with_progress <output_dir> <max_ndead> -- cmd args...
 run_with_progress() {
-  local evaluations_dir="$1" max_ndead="$2"
+  local output_dir="$1" max_ndead="$2"
   shift 2
   [ "${1:-}" = "--" ] && shift
 
@@ -20,26 +26,103 @@ run_with_progress() {
   local start
   start="$(date +%s)"
 
-  # `\r`-redraws corrupt piped/logged output, so only draw one on a real TTY.
-  if [ -t 1 ]; then
+  if [ -t 1 ] && _ns_pin_setup; then
+    _ns_add_trap '_ns_pin_teardown' EXIT
+    _ns_add_trap '_ns_pin_teardown' INT
+    _ns_add_trap '_ns_pin_teardown' TERM
     while kill -0 "${pid}" 2>/dev/null; do
-      _ns_print_progress "${evaluations_dir}" "${max_ndead}" "${start}"
+      _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
       sleep 1
     done
-    _ns_print_progress "${evaluations_dir}" "${max_ndead}" "${start}"
-    echo
+    _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
+    _ns_pin_teardown
+  elif [ -t 1 ]; then
+    # No usable terminal control (e.g. tput/TERM missing): fall back to a
+    # plain redrawn line instead of a pinned one.
+    while kill -0 "${pid}" 2>/dev/null; do
+      printf '\r%s   ' "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
+      sleep 1
+    done
+    printf '\r%s   \n' "$(_ns_status_line "${output_dir}" "${max_ndead}" "${start}")"
   fi
 
   wait "${pid}"
 }
 
-_ns_count_evaluations() {
-  local dir="$1" n=0 f
-  for f in "${dir}"/eval-*; do
+# Appends a command to whatever trap is already registered for a signal
+# instead of replacing it - start-sidecars.sh's cleanup trap on EXIT/INT/TERM
+# must keep running (a leftover R2D2 sidecar holds ~33.7GB), so ours must not
+# clobber it. New command runs first: INT/TERM's existing handler ends in
+# `exit N`, which would skip anything appended after it.
+_ns_add_trap() {
+  local new="$1" sig="$2" line existing=""
+  line="$(trap -p "${sig}")"
+  if [ -n "${line}" ]; then
+    # `trap -p` prints valid shell source for re-registering the trap
+    # (`trap -- 'cmd' SIG`), quoted so embedded quotes in the existing
+    # command survive - letting bash's own parser split it back into words
+    # is what correctly reverses that quoting; substring-stripping the
+    # 'trap -- ' prefix textually breaks the moment the command itself
+    # contains a quote.
+    eval "set -- ${line}"
+    existing="$3"
+  fi
+  if [ -n "${existing}" ]; then
+    trap "${new}; ${existing}" "${sig}"
+  else
+    trap "${new}" "${sig}"
+  fi
+}
+
+_ns_pin_active=0
+
+# ponytail: scroll region is sized once at setup and not redone on SIGWINCH,
+# so resizing the terminal mid-run can leave the reserved line mis-positioned
+# until the next run. Fix by trapping WINCH if that ever bites someone.
+_ns_pin_setup() {
+  local rows
+  rows="$(tput lines 2>/dev/null)" || return 1
+  [ -n "${rows}" ] && [ "${rows}" -gt 1 ] || return 1
+  printf '\n'
+  printf '\e7\e[1;%dr\e8' "$((rows - 1))"
+  _ns_pin_active=1
+}
+
+_ns_pin_teardown() {
+  [ "${_ns_pin_active}" = "1" ] || return 0
+  _ns_pin_active=0
+  local rows
+  rows="$(tput lines 2>/dev/null)" || return 0
+  printf '\e[1;%dr' "${rows}"
+  printf '\e[%d;1H\e[2K' "${rows}"
+}
+
+_ns_pin_draw() {
+  local rows
+  rows="$(tput lines 2>/dev/null)" || return 0
+  printf '\e7\e[%d;1H\e[2K%s\e8' "${rows}" "$1"
+}
+
+_ns_count_glob() {
+  local dir="$1" pattern="$2" n=0 f
+  for f in "${dir}"/${pattern}; do
     [ -e "${f}" ] || continue
     n=$((n + 1))
   done
   echo "${n}"
+}
+
+_ns_dead_birth_file() {
+  local chains_dir="$1" f
+  for f in "${chains_dir}"/*_dead-birth.txt; do
+    [ -e "${f}" ] && { echo "${f}"; return; }
+  done
+}
+
+_ns_count_lines() {
+  local file="$1"
+  [ -f "${file}" ] || { echo 0; return; }
+  wc -l <"${file}" | tr -d ' '
 }
 
 _ns_format_hms() {
@@ -47,47 +130,48 @@ _ns_format_hms() {
   printf '%d:%02d:%02d' $((s / 3600)) $(((s % 3600) / 60)) $((s % 60))
 }
 
-_ns_print_progress() {
-  local evaluations_dir="$1" max_ndead="$2" start="$3"
-  local now elapsed done_count
+_ns_status_line() {
+  local output_dir="$1" max_ndead="$2" start="$3"
+  local now elapsed dead_file dead_count eval_count
 
   now="$(date +%s)"
   elapsed=$((now - start))
-  done_count="$(_ns_count_evaluations "${evaluations_dir}")"
+  dead_file="$(_ns_dead_birth_file "${output_dir}/chains")"
+  dead_count=0
+  [ -n "${dead_file}" ] && dead_count="$(_ns_count_lines "${dead_file}")"
+  eval_count="$(_ns_count_glob "${output_dir}/evaluations" 'eval-*')"
 
   # PolyChord treats max_ndead <= 0 as "no bound, stop on evidence tolerance
-  # instead" - there's no budget to measure a percent or ETA against, so draw
-  # a bouncing indicator (activity, not completion) plus the rate so far.
+  # instead" - there's no budget to measure a percent or ETA against.
   if [ "${max_ndead}" -le 0 ]; then
-    _ns_print_unbounded "${done_count}" "${elapsed}"
+    _ns_unbounded_line "${dead_count}" "${eval_count}" "${elapsed}"
     return
   fi
 
-  local pct eta bar_width filled
-  pct=$((done_count * 100 / max_ndead))
+  local pct eta bar_width filled bar
+  pct=$((dead_count * 100 / max_ndead))
   [ "${pct}" -gt 100 ] && pct=100
 
   eta="?"
-  if [ "${done_count}" -gt 0 ] && [ "$((max_ndead - done_count))" -gt 0 ]; then
-    eta="$(_ns_format_hms $(((max_ndead - done_count) * elapsed / done_count)))"
-  elif [ "${done_count}" -ge "${max_ndead}" ]; then
+  if [ "${dead_count}" -gt 0 ] && [ "$((max_ndead - dead_count))" -gt 0 ]; then
+    eta="$(_ns_format_hms $(((max_ndead - dead_count) * elapsed / dead_count)))"
+  elif [ "${dead_count}" -ge "${max_ndead}" ]; then
     eta="0:00:00"
   fi
 
   bar_width=30
   filled=$((pct * bar_width / 100))
-  local bar
   bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')$(printf '%*s' $((bar_width - filled)) '')"
 
-  printf '\r[%s] %3d%%  %d/%d dead points  elapsed %s  eta %s   ' \
-    "${bar}" "${pct}" "${done_count}" "${max_ndead}" "$(_ns_format_hms "${elapsed}")" "${eta}"
+  printf '[%s] %3d%%  %d/%d dead points (%d evaluations)  elapsed %s  eta %s' \
+    "${bar}" "${pct}" "${dead_count}" "${max_ndead}" "${eval_count}" "$(_ns_format_hms "${elapsed}")" "${eta}"
 }
 
 # A block bouncing back and forth across the bar, one step per elapsed
 # second, so a no-budget run still visibly ticks over instead of sitting
 # frozen. Position, not percent: there is nothing to be a percent of.
-_ns_print_unbounded() {
-  local done_count="$1" elapsed="$2"
+_ns_unbounded_line() {
+  local dead_count="$1" eval_count="$2" elapsed="$3"
   local bar_width=30 period pos i
   period=$((2 * (bar_width - 1)))
   pos=$((elapsed % period))
@@ -99,30 +183,46 @@ _ns_print_unbounded() {
   done
 
   local rate="-"
-  [ "${elapsed}" -gt 0 ] && rate="$((done_count * 60 / elapsed))/min"
+  [ "${elapsed}" -gt 0 ] && rate="$((dead_count * 60 / elapsed))/min"
 
-  printf '\r[%s] %d dead points  rate %s  elapsed %s  (no --max-ndead cap, stopping on evidence tolerance)   ' \
-    "${bar}" "${done_count}" "${rate}" "$(_ns_format_hms "${elapsed}")"
+  printf '[%s] %d dead points (%d evaluations)  rate %s  elapsed %s  (no --max-ndead cap, stopping on evidence tolerance)' \
+    "${bar}" "${dead_count}" "${eval_count}" "${rate}" "$(_ns_format_hms "${elapsed}")"
 }
 
 self_check() {
   local tmp
   tmp="$(mktemp -d)"
+  mkdir "${tmp}/chains" "${tmp}/evaluations"
 
-  [ "$(_ns_count_evaluations "${tmp}")" = "0" ] || { echo "FAIL: empty dir count"; exit 1; }
+  [ "$(_ns_dead_birth_file "${tmp}/chains")" = "" ] || { echo "FAIL: no dead-birth file yet"; exit 1; }
+  [ "$(_ns_count_lines "${tmp}/chains/missing")" = "0" ] || { echo "FAIL: missing file counts as 0"; exit 1; }
 
-  mkdir "${tmp}/eval-0001-a" "${tmp}/eval-0002-b"
-  [ "$(_ns_count_evaluations "${tmp}")" = "2" ] || { echo "FAIL: eval count"; exit 1; }
+  printf 'l1\nl2\nl3\n' >"${tmp}/chains/wsclean_vlaa_dead-birth.txt"
+  [ "$(_ns_dead_birth_file "${tmp}/chains")" = "${tmp}/chains/wsclean_vlaa_dead-birth.txt" ] || {
+    echo "FAIL: dead-birth file not found"; exit 1
+  }
+  [ "$(_ns_count_lines "${tmp}/chains/wsclean_vlaa_dead-birth.txt")" = "3" ] || { echo "FAIL: dead-birth line count"; exit 1; }
+
+  mkdir "${tmp}/evaluations/eval-0001-a" "${tmp}/evaluations/eval-0002-b" \
+    "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  [ "$(_ns_count_glob "${tmp}/evaluations" 'eval-*')" = "4" ] || { echo "FAIL: evaluations count"; exit 1; }
 
   [ "$(_ns_format_hms 3661)" = "1:01:01" ] || { echo "FAIL: format_hms"; exit 1; }
   [ "$(_ns_format_hms 59)" = "0:00:59" ] || { echo "FAIL: format_hms short"; exit 1; }
 
-  # max_ndead <= 0 (PolyChord's "run until evidence tolerance" setting, e.g.
-  # --max-ndead -1) has no budget to divide by - must not claim an ETA or a
-  # percent, which the naive done_count >= max_ndead check used to do, but
-  # should still show the rate.
+  # 3 dead points against a cap of 12 must drive the percent/ETA, not the 4
+  # evaluations - that mismatch (dead points lag evaluations) is exactly the
+  # R2D2 run that showed "29/12 dead points" before this used dead-birth.txt.
   local line
-  line="$(_ns_print_progress "${tmp}" -1 "$(($(date +%s) - 90))")"
+  line="$(_ns_status_line "${tmp}" 12 "$(($(date +%s) - 60))")"
+  case "${line}" in
+    *"3/12 dead points (4 evaluations)"*) ;;
+    *) echo "FAIL: status line dead/eval split: ${line}"; exit 1 ;;
+  esac
+
+  # max_ndead <= 0 has no budget to divide by - must not claim an ETA or a
+  # percent, but should still show a rate.
+  line="$(_ns_status_line "${tmp}" -1 "$(($(date +%s) - 90))")"
   case "${line}" in
     *eta*) echo "FAIL: unbounded max_ndead printed an eta: ${line}"; exit 1 ;;
   esac
@@ -130,7 +230,7 @@ self_check() {
     *%*) echo "FAIL: unbounded max_ndead printed a percent: ${line}"; exit 1 ;;
   esac
   case "${line}" in
-    *"1/min"*) ;;
+    *"2/min"*) ;;
     *) echo "FAIL: unbounded max_ndead did not show a rate: ${line}"; exit 1 ;;
   esac
 
@@ -145,10 +245,22 @@ self_check() {
     done
     echo "-1"
   }
-  [ "$(_ns_bar_pos "$(_ns_print_unbounded 0 0)")" = "0" ] || { echo "FAIL: bounce at t=0"; exit 1; }
-  [ "$(_ns_bar_pos "$(_ns_print_unbounded 0 29)")" = "29" ] || { echo "FAIL: bounce at t=29 (far end)"; exit 1; }
-  [ "$(_ns_bar_pos "$(_ns_print_unbounded 0 30)")" = "28" ] || { echo "FAIL: bounce at t=30 (reversed)"; exit 1; }
-  [ "$(_ns_bar_pos "$(_ns_print_unbounded 0 58)")" = "0" ] || { echo "FAIL: bounce at t=58 (full period)"; exit 1; }
+  [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 0)")" = "0" ] || { echo "FAIL: bounce at t=0"; exit 1; }
+  [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 29)")" = "29" ] || { echo "FAIL: bounce at t=29 (far end)"; exit 1; }
+  [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 30)")" = "28" ] || { echo "FAIL: bounce at t=30 (reversed)"; exit 1; }
+  [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 58)")" = "0" ] || { echo "FAIL: bounce at t=58 (full period)"; exit 1; }
+
+  # _ns_add_trap must append to an existing trap, not replace it - a naive
+  # `trap ... EXIT` here would silently disable start-sidecars.sh's Docker
+  # cleanup on exit/Ctrl-C.
+  (
+    log="${tmp}/trap.log"
+    trap "echo existing >>'${log}'" EXIT
+    _ns_add_trap "echo new >>'${log}'" EXIT
+  )
+  [ "$(cat "${tmp}/trap.log")" = "$(printf 'new\nexisting')" ] || {
+    echo "FAIL: trap chaining order/content: $(cat "${tmp}/trap.log")"; exit 1
+  }
 
   rm -rf "${tmp}"
   echo "progress-bar self-check passed"

@@ -37,13 +37,17 @@ others and the run is `docker exec`ed into it (see "The PolyChord container is
 a sidecar too" and "Long-lived sidecar containers, one per image" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)).
 
-Once the containers are up, a progress bar tracks the search against its
-`--max-ndead` budget: elapsed time, dead points done, and an ETA extrapolated
-from the rate so far (`scripts/lib/progress-bar.sh`, counting
-`evaluations/eval-*` the same way `./ri runs` does). With `--max-ndead <= 0`
-(run until the evidence tolerance is met, no fixed cap) there is no total to
-be a percent of, so it shows a bouncing bar and the dead-point rate instead.
-Only drawn on a TTY, so piped or logged runs are unaffected.
+Once the containers are up, a status line tracks the search against its
+`--max-ndead` budget: elapsed time, dead points done (from PolyChord's own
+`chains/*_dead-birth.txt`, one line per dead point - not the raw evaluation
+count, which is always higher since PolyChord's slice sampler makes several
+evaluations per accepted dead point), a percent, and an ETA extrapolated from
+the rate so far (`scripts/lib/progress-bar.sh`). With `--max-ndead <= 0` (run
+until the evidence tolerance is met, no fixed cap) there is no total to be a
+percent of, so it shows a bouncing bar and the dead-point rate instead. On a
+real terminal the line is pinned to the bottom via a scroll region, so
+PolyChord's own feedback scrolling past above it doesn't bury it; only drawn
+on a TTY, so piped or logged runs are unaffected.
 
 ### WSClean
 
