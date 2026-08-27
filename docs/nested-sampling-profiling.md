@@ -665,6 +665,60 @@ objective is `off_source_rms_jy` ~ 8e-6, so a 1e-7 pixel shift moves the
 likelihood and takes the whole sampler down a different path. This repository
 is about reproducibility; `-j 1` stays.
 
+#### The R2D2 image was left out, and it was the expensive one
+
+`compileall` landed in `docker/polychord/Dockerfile` and
+`docker/meqtrees/Dockerfile` when those were the images a run started fresh.
+`docker/r2d2/Dockerfile` never got it, and by the time the imaging pool became
+the thing evaluation one waits on it was the one place where it mattered most:
+`python:3.10-slim-bookworm` ships 1483 stdlib `.py` and **zero** `.pyc`, and
+the R2D2 checkout ships 48 `.py` and zero `.pyc`. Only the venv was compiled,
+because pip does that itself (16942 of 16943).
+
+So the first Python process in a fresh R2D2 container compiled every stdlib
+module `import torch` reaches - `asyncio`, `email`, `http`, `inspect` and the
+rest - and wrote it into the container layer:
+
+| | |
+|---|---:|
+| `import torch`, first process in a fresh container | 0.887s |
+| `import torch`, second process in the same container | 0.615s |
+| `docker diff` after one `import torch` | 222 entries |
+
+Same three negative controls as the section above, all on a fresh container:
+`cat` over every file under `torch/` (0.20s) leaves it at 0.886s, so it is not
+page cache; `python3 -c pass` first leaves it at 0.893s and a `ctypes.CDLL` of
+`libtorch_cpu.so` at 0.889s, so it is not the loader; allocating and freeing
+400MB leaves it at 0.888s, so it is not first-touch of anonymous memory. Only a
+previous full `import torch` in the same container helps, which is what `docker
+diff` explains.
+
+With `RUN python3 -m compileall -q "/usr/local/lib/python${PYTHON_VERSION}"
+/opt/r2d2/R2D2-RI/src || true` in the runtime stage, a fresh container imports
+torch in 0.64s and writes 3 diff entries. Ten interleaved pairs of the default
+8-rank run against the same image built without that line (`R2D2_IMAGE` picks
+the arm, so no rebuild between runs):
+
+| | with `compileall` | without | wins |
+|---|---:|---:|---:|
+| end to end | 2.627s | 2.905s | 10/10 |
+| `run_polychord` wall | 1.408s | 1.695s | 10/10 |
+| pool ready, from script start | 1.619s | 1.908s | 10/10 |
+| pool warm-up alone | 1.023s | 1.186s | 10/10 |
+
+The warm-up's own 0.163s is the stdlib torch reaches; the rest of the 0.289s is
+`r2d2_serve.py`'s own imports before it, which pay the same stdlib. log(Z) is
+identical (0.999287799533384E+002) and so are every evaluation's parameters,
+objective and error; only the timings and `peak_memory_bytes` move, and the
+latter *down* (283.0MB -> 280.6MB), because the worker no longer compiles
+bytecode in-process.
+
+`compileall` there is not insurance the way it is in the MeqTrees image, which
+gets Debian's own `.pyc` for its `/usr/lib/python3` stdlib (3242 of 3242).
+Check a new image with `docker run --rm --entrypoint sh <image> -c 'python3 -c
+"import sysconfig;print(sysconfig.get_paths()[\"stdlib\"])"'` and count `.pyc`
+under what it prints.
+
 ### `mpi_rank()` reads the launcher's environment first
 
 `from mpi4py import MPI` initialises MPI, and eight ranks doing that at once
@@ -1247,6 +1301,34 @@ run adds are the part that might actually want the threads. What the
 measurement does settle is that this is a shared-host contention question and
 not another thread-pool bug like the `ncpus` one: an imaging worker holds 5
 threads, and torch's inter-op pool is never created.
+
+**The same floor, re-measured after the changes below.** Two temporary probes
+make it directly observable: `date +%s.%N` as the first thing the R2D2
+sidecar's container command runs, and a `time.time()` pair around
+`warm_imports()` in `serve_pool` written to a file under the run's output
+directory. On a 2.63s end-to-end run:
+the R2D2 container's own command starts 0.52s after the script does, its FIFOs
+are open 0.09s later, and `warm_imports` returns at 1.62s; the ranks reach
+their first imaging request at ~0.95s and block on the difference, which is why
+`eval_id == 1` `image_container_seconds` is ~0.83s against a ~0.07s steady
+state. Everything else has ~0.8s of slack behind that, and three attempts to
+spend it came to nothing:
+
+- **Launching the R2D2 sidecar first** (8 pairs): container command start 0.60s
+  -> 0.56s, pool ready 2.02s -> 1.98s, end to end 3.85s -> 3.84s. Same result
+  as the 6-pair test above, one image later.
+- **Launching it first *and* waiting for its `docker run` before issuing the
+  other two** (10 pairs): `run_polychord` wall 1.630s -> 1.480s (10/10), pool
+  readiness unchanged (1.824s -> 1.827s), end to end unchanged (2.821s ->
+  2.829s, 4 wins/5 losses). It moves the rank's wait out of the sampler and
+  into the script's preamble and nothing else - a warning about reading the
+  sampler wall clock on its own.
+- **The transforms themselves.** At the eight-way concurrency a real run has,
+  `finufft` `nthreads=1` and `nthreads=2` are a tie (0.058-0.067s per request
+  either way over 3 trials of 15 requests x 8 workers), and `upsampfac=1.25` -
+  28% faster per transform solo, and not bit-identical, so out of bounds anyway
+  - is *slower* at eight (0.065s against 0.060s). A solo request is 0.031s of
+  which 0.023s is 37 `finufft` `execute` calls.
 
 ### The operator norm is solved with Lanczos, not a power iteration
 

@@ -88,6 +88,8 @@ RUN pip freeze > /opt/r2d2/requirements.lock.txt
 ##############################################################################
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 
+ARG PYTHON_VERSION
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # libfftw3-3 (double) + libfftw3-single3: runtime shared libraries for the
@@ -102,6 +104,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /opt/venv /opt/venv
 COPY --from=build /opt/r2d2 /opt/r2d2
+
+# The base image's Python ships no bytecode for its standard library (1483
+# `.py`, 0 `.pyc`) and the R2D2 checkout has none either, so the first Python
+# process in a fresh container compiled everything `import torch` and imager.py
+# reach and wrote it into the container layer: `import torch` cost 0.89s cold
+# against 0.62s once one process had paid it. The nested-sampling run starts
+# this image fresh every time and its imaging worker's warm-up is what
+# evaluation one waits on, so that 0.27s is straight off the run's wall clock.
+# pip already compiled the venv. `|| true` for the same reason the PolyChord
+# and MeqTrees images carry it: compileall returns non-zero on any file that is
+# not valid source for this interpreter, and which those are is a property of
+# whatever `PYTHON_VERSION` resolves to, not of this repository. Nothing under
+# either path fails today.
+RUN python3 -m compileall -q "/usr/local/lib/python${PYTHON_VERSION}" /opt/r2d2/R2D2-RI/src || true
 
 ENV PATH=/opt/venv/bin:${PATH} \
     R2D2_HOME=/opt/r2d2/R2D2-RI \
