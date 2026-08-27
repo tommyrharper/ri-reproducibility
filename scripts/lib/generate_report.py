@@ -14,12 +14,9 @@ import hashlib
 import html
 import io
 import json
-import multiprocessing
 import os
 import re
-import shutil
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -72,10 +69,31 @@ def load_plot_libs():
     global plt
     if "plt" in globals():
         return
+    import warnings
+
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    # matplotlib.projections imports mpl_toolkits.mplot3d solely to register the
+    # '3d' projection, and already wraps that import in a try/except that
+    # degrades to "3d unavailable" when it fails. Nothing here draws in 3d - a
+    # corner plot is a grid of 2d axes - so short-circuit it: a None in
+    # sys.modules makes the import raise ImportError, which is exactly the case
+    # matplotlib handles, and skips 17ms (6.7%) of the 258ms `import
+    # matplotlib.pyplot` that sits on the build's serial prologue. The poison is
+    # removed again immediately, so a later `import mpl_toolkits.mplot3d` still
+    # works; only the registry entry stays gone, which turns an accidental
+    # projection='3d' into a loud ValueError rather than a silent wrong plot.
+    poisoned = "mpl_toolkits.mplot3d" not in sys.modules
+    if poisoned:
+        sys.modules["mpl_toolkits.mplot3d"] = None
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Unable to import Axes3D")
+            import matplotlib.pyplot as plt
+    finally:
+        if poisoned:
+            sys.modules.pop("mpl_toolkits.mplot3d", None)
 
 
 def load_chain_libs():
@@ -2116,6 +2134,10 @@ def main(argv=None):
     # the same PNG is harmless.
     written = len(todo)
     if todo:
+        # Only a build with something to draw forks anything, and the import is
+        # 3.4ms of a rebuild that has nothing to do.
+        import multiprocessing
+
         workers = min(len(todo), os.cpu_count() or 1)
         if drawing:
             load_chain_libs()
@@ -2228,6 +2250,9 @@ def _self_check_profiling():
 
 
 def _self_check_page_status():
+    import shutil
+    import tempfile
+
     tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
     assert page_status(tmp_dir, "run-a") == "missing"
     path = os.path.join(tmp_dir, run_page_name("run-a"))
@@ -2247,6 +2272,9 @@ def _self_check_page_status():
 
 def _self_check_cached_png():
     """A second request for the same key reuses the file instead of re-rendering."""
+    import shutil
+    import tempfile
+
     global image_dir
     tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
     image_dir = os.path.join(tmp_dir, IMAGE_SUBDIR)
@@ -2634,6 +2662,20 @@ def _self_check_axes_subclass_sharing():
         plt.close(fig)
 
 
+def _self_check_mplot3d_skip():
+    """The skipped 3d projection costs the registry nothing else, and unpoisons."""
+    load_plot_libs()
+    import mpl_toolkits.mplot3d  # noqa: F401  - the None must be gone again
+
+    names = plt.matplotlib.projections.get_projection_names()
+    assert "3d" not in names, names
+    assert names == ["aitoff", "hammer", "lambert", "mollweide", "polar", "rectilinear"], names
+    # The 2d axes the report actually draws on are unaffected.
+    fig = plt.figure()
+    assert type(fig.add_subplot()) is plt.matplotlib.axes.Axes
+    plt.close(fig)
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -2644,6 +2686,7 @@ if __name__ == "__main__":
     if os.environ.get("GENERATE_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
+        _self_check_mplot3d_skip()
         _self_check_cached_png()
         _self_check_render_array_png()
         _self_check_profiling()
