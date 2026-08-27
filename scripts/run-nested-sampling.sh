@@ -111,6 +111,8 @@ RUN_COMMAND=(
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
   -e NS_SIDECARS="${NS_SIDECARS}"
   -e NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
+  -e NS_ENABLE_PARAMS="${NS_ENABLE_PARAMS:-}"
+  -e NS_DISABLE_PARAMS="${NS_DISABLE_PARAMS:-}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
   # host CPU, in every rank. Nothing here has a BLAS call big enough to want
   # them (the largest is a norm over a 128x128 image), so on a 20-CPU host the

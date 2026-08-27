@@ -10,7 +10,13 @@ This document proposes what to add next, ranked by failure-mode value per unit
 of plumbing. Section 0 is the confound that had to be fixed before any of it
 was worth measuring, and is fixed by the same PR that adds this file.
 
-Nothing here is implemented beyond section 0; it is a plan, not a changelog.
+Nothing here is implemented beyond section 0 and section 1; it is a plan, not
+a changelog - section 1's own writeup below is kept as the design rationale,
+not updated into a changelog entry. Every dimension `[[parameter_space]]`
+takes `enabled` (default true) for pinning it back out without deleting it -
+see "Toggling dimensions on and off" in docs/nested-sampling.md - which is
+what makes landing one dimension at a time here safe: the next section's
+addition does not have to also be the next section's permanent commitment.
 
 ## 0. Fixed in this PR: WSClean's cell size now follows the sampled frequency
 

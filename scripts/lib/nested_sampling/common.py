@@ -150,6 +150,19 @@ DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 DEFAULT_IMAGE_DIM = 128
 DEFAULT_SUPER_RESOLUTION = 1.5
 
+# `source_offset_fraction` geometry (docs/parameter-space-proposal.md, section 1).
+# VLA-A's longest baseline, used to pick the offset before the MS exists (the
+# simulator needs an absolute source position; the real cell size is only known
+# from the simulated observation, after the source has already been placed).
+# Declination barely changes VLA-A's maximum baseline near 65 degrees, so this
+# is accurate enough for a controlled, small offset - see
+# docs/nested-sampling.md, "Toggling dimensions on and off".
+VLA_A_MAX_BASELINE_M = 36_000.0
+SPEED_OF_LIGHT_M_S = 299_792_458.0
+# Fixed, not axis-aligned: avoids the symmetries a purely horizontal or
+# vertical offset would have.
+SOURCE_OFFSET_POSITION_ANGLE_DEG = 30.0
+
 
 def image_pixel_size_arcsec(
     max_proj_baseline_lambda: float,
@@ -168,6 +181,23 @@ def image_pixel_size_arcsec(
     if not max_proj_baseline_lambda > 0.0:
         raise SystemExit(f"FATAL: non-positive max projected baseline: {max_proj_baseline_lambda!r}")
     return (180.0 / math.pi) * 3600.0 / (super_resolution * 2.0 * max_proj_baseline_lambda)
+
+
+def source_offset_to_lm(fraction: float, start_frequency_hz: float) -> tuple[float, float]:
+    """`source_offset_fraction` (0.0-0.35) to an (l, m) sky offset in arcsec.
+
+    The offset is `fraction` of the image half-width, at a fixed
+    `SOURCE_OFFSET_POSITION_ANGLE_DEG`. The half-width uses
+    `image_pixel_size_arcsec()` against `VLA_A_MAX_BASELINE_M` and the sampled
+    frequency - a nominal max projected baseline, not the one the simulator
+    will actually record for this evaluation, because the source position has
+    to be chosen before the MS (and its real baselines) exist.
+    """
+    max_proj_baseline_lambda = VLA_A_MAX_BASELINE_M * start_frequency_hz / SPEED_OF_LIGHT_M_S
+    half_width_arcsec = image_pixel_size_arcsec(max_proj_baseline_lambda) * (DEFAULT_IMAGE_DIM / 2.0)
+    radius_arcsec = fraction * half_width_arcsec
+    angle_rad = math.radians(SOURCE_OFFSET_POSITION_ANGLE_DEG)
+    return radius_arcsec * math.sin(angle_rad), radius_arcsec * math.cos(angle_rad)
 
 
 @cache
@@ -210,14 +240,43 @@ def load_receiver_bands() -> list[dict[str, Any]]:
 
 
 @cache
+def load_all_parameter_specs() -> list[dict[str, Any]]:
+    """Every `[[parameter_space]]` entry in defaults.toml, enabled or not.
+
+    `load_parameter_space()` is the ones the sampler actually searches; this
+    is every one that has ever been added, disabled entries included, so
+    `cube_to_params()` can still fix a disabled dimension at its pinned value
+    and `./ri params` can show the full list.
+    """
+    return load_defaults()["parameter_space"]
+
+
+def _param_name_set(env_var: str) -> set[str]:
+    return {name.strip() for name in os.environ.get(env_var, "").split(",") if name.strip()}
+
+
+@cache
 def load_parameter_space() -> list[dict[str, Any]]:
     """The parameter space the sampler searches - `[[parameter_space]]` in defaults.toml.
+
+    An entry is included unless `enabled = false` in defaults.toml, further
+    overridden by the `NS_DISABLE_PARAMS` / `NS_ENABLE_PARAMS` comma-separated
+    name lists (what `./ri search --disable-param` / `--enable-param` set), so
+    a one-off search does not need a defaults.toml edit. See "Toggling
+    dimensions on and off" in docs/nested-sampling.md.
 
     A `kind = "band_start"` dimension carries no `min`/`max` of its own: its
     box is the span of the receiver bands, filled in here so that everything
     reading a spec (paramnames, plots, summary.json) sees a plain box.
     """
-    specs = load_defaults()["parameter_space"]
+    force_off = _param_name_set("NS_DISABLE_PARAMS")
+    force_on = _param_name_set("NS_ENABLE_PARAMS")
+    specs = [
+        spec
+        for spec in load_all_parameter_specs()
+        if str(spec["name"]) in force_on
+        or (spec.get("enabled", True) and str(spec["name"]) not in force_off)
+    ]
     for spec in specs:
         if spec.get("kind") == "band_start":
             bands = load_receiver_bands()
@@ -433,6 +492,7 @@ PARAMETER_TEX_LABELS = {
     "channel_count": r"n_{\mathrm{freq}}",
     "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
     "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
+    "source_offset_fraction": r"f_{\mathrm{offset}}",
     "wsclean_niter": r"N_{\mathrm{iter}}",
     "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
 }
@@ -494,6 +554,30 @@ def scale(cube_value: float, lower: float, upper: float) -> float:
     return lower + cube_value * (upper - lower)
 
 
+def fill_disabled_parameters(raw: dict[str, Any]) -> None:
+    """Pin every dimension `load_parameter_space()` left out at a fixed value.
+
+    A disabled dimension is still a key every downstream reader (the
+    simulator CLI, `compute_image_metrics()`, `simulate_measurement_set()`)
+    expects in `params`, so it is fixed here instead of drawn from the cube:
+    at its `default` if defaults.toml gives one, otherwise at its `min` (which
+    is why disabling `source_offset_fraction` alone reproduces the old
+    hard-coded centred source - its `min` already is 0.0).
+    """
+    enabled_names = {spec["name"] for spec in load_parameter_space()}
+    for spec in load_all_parameter_specs():
+        name = spec["name"]
+        if name in enabled_names or name in raw:
+            continue
+        if "default" not in spec and spec.get("kind") == "band_start":
+            raise SystemExit(
+                f"defaults.toml: parameter_space '{name}' is disabled but has no "
+                "`default` - a band_start dimension has no min/max to fall back "
+                "on, so pin it explicitly, e.g. default = 1.4e9"
+            )
+        raw[name] = spec.get("default", spec.get("min", 0.0))
+
+
 def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw: dict[str, Any] = {}
     specs = load_parameter_space()
@@ -502,6 +586,7 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
         if spec.get("kind") == "integer":
             value = int(round(value))
         raw[spec["name"]] = value
+    fill_disabled_parameters(raw)
     # The band-start dimension is resolved last: it fits the window to the band
     # it lands in, which can narrow the channels or drop some of them.
     for i, spec in enumerate(specs):
@@ -512,8 +597,14 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw["dynamic_range"] = 10.0 ** raw.pop("log10_dynamic_range")
     raw["vla_config"] = "VLA.A"
     raw["source_flux_jy"] = 1.0
-    raw["source_l_arcsec"] = 0.0
-    raw["source_m_arcsec"] = 0.0
+    # Kept under its own name, not popped like log10_dynamic_range above:
+    # prior_vector() only has a reverse formula for that one special case, so
+    # every other cube dimension has to survive into `raw` under its own name
+    # for the theta -> cube -> params round trip self_check_spectral_window()
+    # checks.
+    raw["source_l_arcsec"], raw["source_m_arcsec"] = source_offset_to_lm(
+        raw["source_offset_fraction"], raw["start_frequency_hz"]
+    )
     return raw
 
 
@@ -778,6 +869,33 @@ def sigma_res(residual: np.ndarray, dirty: np.ndarray) -> float:
     return float(np.linalg.norm(residual) / max(np.linalg.norm(dirty), 1e-12))
 
 
+def source_pixel(
+    header: dict[str, Any],
+    cx: int,
+    cy: int,
+    source_l_arcsec: float,
+    source_m_arcsec: float,
+    x_size: int,
+    y_size: int,
+) -> tuple[int, int]:
+    """The pixel a source at (`source_l_arcsec`, `source_m_arcsec`) lands on.
+
+    Standard flat-sky FITS/AIPS convention, matching Meow's `LMDirection` (the
+    one `point_source_forest.py` places the source with): `l` runs opposite
+    the RA axis's pixel direction (`CDELT1` is negative), `m` runs the same
+    way as the Dec axis's (`CDELT2` positive). At `l == m == 0.0` this is
+    exactly `(cx, cy)` and never reads `CDELT1`/`CDELT2`, so it needs nothing
+    an image without a source offset does not already have.
+    """
+    if source_l_arcsec == 0.0 and source_m_arcsec == 0.0:
+        return cx, cy
+    cdelt1_arcsec = float(header["CDELT1"]) * 3600.0
+    cdelt2_arcsec = float(header["CDELT2"]) * 3600.0
+    sx = cx + int(round(-source_l_arcsec / cdelt1_arcsec))
+    sy = cy + int(round(source_m_arcsec / cdelt2_arcsec))
+    return max(0, min(x_size - 1, sx)), max(0, min(y_size - 1, sy))
+
+
 def compute_image_metrics(
     image_path: Path,
     source_flux_jy: float,
@@ -785,6 +903,8 @@ def compute_image_metrics(
     peak_memory_bytes: int,
     dirty_path: Path | None = None,
     residual_dirty_path: Path | None = None,
+    source_l_arcsec: float = 0.0,
+    source_m_arcsec: float = 0.0,
 ) -> dict[str, float]:
     image, header = load_fits_2d(image_path)
 
@@ -793,20 +913,21 @@ def compute_image_metrics(
     cy = int(round(float(header.get("CRPIX2", y_size / 2.0)) - 1.0))
     cx = max(0, min(x_size - 1, cx))
     cy = max(0, min(y_size - 1, cy))
+    sx, sy = source_pixel(header, cx, cy, source_l_arcsec, source_m_arcsec, x_size, y_size)
 
     truth = np.zeros_like(image)
-    truth[cy, cx] = source_flux_jy
+    truth[sy, sx] = source_flux_jy
     residual = image - truth
 
     yy, xx = np.ogrid[:y_size, :x_size]
-    off_source = (yy - cy) ** 2 + (xx - cx) ** 2 > 25
+    off_source = (yy - sy) ** 2 + (xx - sx) ** 2 > 25
     off_rms = rms(image[off_source])
     total_rms = rms(residual)
     peak = float(np.nanmax(np.abs(image)))
     snr = peak / off_rms if off_rms > 0 else float("inf")
     log_snr = math.log10(snr) if math.isfinite(snr) and snr > 0 else 99.0
     relative_l2_error = float(np.linalg.norm(residual) / max(np.linalg.norm(truth), 1e-12))
-    peak_flux_error = abs(float(image[cy, cx]) - source_flux_jy)
+    peak_flux_error = abs(float(image[sy, sx]) - source_flux_jy)
 
     metrics = {
         "snr": float(snr),
@@ -1555,9 +1676,15 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
 
 
 def self_check_parameter_space() -> None:
-    """The parameter space survived the trip through defaults.toml."""
+    """The parameter space survived the trip through defaults.toml.
+
+    6, not 5: the default-enabled count in the committed defaults.toml. Meant
+    to be retuned by toggling `enabled`, same as the ranges below - bump this
+    when the default-enabled set changes, so a stray toggle in a commit still
+    trips a canary.
+    """
     specs = load_parameter_space()
-    assert len(specs) == 5, specs
+    assert len(specs) == 6, specs
     for spec in specs:
         assert spec["name"] in PARAMETER_TEX_LABELS, spec
         assert float(spec["min"]) < float(spec["max"]), spec
@@ -1569,6 +1696,69 @@ def self_check_parameter_space() -> None:
     assert isinstance(channel_count["min"], int) and isinstance(channel_count["max"], int), channel_count
     assert channel_count["min"] >= 1, channel_count
     print("parameter space self-check passed")
+
+
+def self_check_parameter_toggle() -> None:
+    """`enabled = false` and `NS_ENABLE_PARAMS`/`NS_DISABLE_PARAMS` actually toggle a dimension."""
+    saved_off = os.environ.get("NS_DISABLE_PARAMS")
+    saved_on = os.environ.get("NS_ENABLE_PARAMS")
+    try:
+        os.environ["NS_DISABLE_PARAMS"] = "source_offset_fraction"
+        os.environ.pop("NS_ENABLE_PARAMS", None)
+        load_parameter_space.cache_clear()
+        specs = load_parameter_space()
+        assert "source_offset_fraction" not in {spec["name"] for spec in specs}, specs
+        assert len(specs) == len(load_all_parameter_specs()) - 1, specs
+
+        # A disabled dimension is still one fewer cube dimension for
+        # cube_to_params() to draw, and still a params key: pinned at its
+        # `default`/`min`, here 0.0, so it round-trips to a centred source.
+        raw: dict[str, Any] = {spec["name"]: float(spec.get("min", 0.0)) for spec in specs}
+        fill_disabled_parameters(raw)
+        assert raw["source_offset_fraction"] == 0.0, raw
+
+        os.environ["NS_DISABLE_PARAMS"] = "channel_count"
+        os.environ["NS_ENABLE_PARAMS"] = "channel_count"
+        load_parameter_space.cache_clear()
+        assert "channel_count" in {spec["name"] for spec in load_parameter_space()}, "enable wins over disable"
+    finally:
+        for var, saved in (("NS_DISABLE_PARAMS", saved_off), ("NS_ENABLE_PARAMS", saved_on)):
+            if saved is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = saved
+        load_parameter_space.cache_clear()
+    print("parameter toggle self-check passed")
+
+
+def self_check_source_offset() -> None:
+    """`source_offset_fraction` reaches `cube_to_params()` as an (l, m) offset that `source_pixel()` can invert."""
+    l_arcsec, m_arcsec = source_offset_to_lm(0.0, 1.4e9)
+    assert l_arcsec == 0.0 and m_arcsec == 0.0, (l_arcsec, m_arcsec)
+
+    l_arcsec, m_arcsec = source_offset_to_lm(0.35, 1.4e9)
+    assert l_arcsec > 0.0 and m_arcsec > 0.0, (l_arcsec, m_arcsec)
+    l_double_freq, _ = source_offset_to_lm(0.35, 2.8e9)
+    # Doubling frequency doubles the baseline in wavelengths, which halves the
+    # cell size and so the offset it corresponds to in arcsec.
+    assert math.isclose(l_double_freq, l_arcsec / 2.0, rel_tol=1e-9), (l_double_freq, l_arcsec)
+    l_half_fraction, _ = source_offset_to_lm(0.175, 1.4e9)
+    assert math.isclose(l_half_fraction, l_arcsec / 2.0, rel_tol=1e-9), (l_half_fraction, l_arcsec)
+
+    # A pixel scale big enough that a 1-pixel round trip is exact.
+    header = {"CRPIX1": 65.0, "CRPIX2": 65.0, "CDELT1": -1.0 / 3600.0, "CDELT2": 1.0 / 3600.0}
+    cx, cy = 64, 64
+    assert source_pixel(header, cx, cy, 0.0, 0.0, 128, 128) == (cx, cy)
+    sx, sy = source_pixel(header, cx, cy, 3.0, 5.0, 128, 128)
+    assert (sx, sy) == (cx + 3, cy + 5), (sx, sy)
+
+    # A cube with everything at 0.5 fixes the offset fraction at its box's
+    # midpoint; band_start's own resolution can move start_frequency_hz, so
+    # only the sign and non-zero-ness of the offset are pinned here.
+    n = len(load_parameter_space())
+    params = cube_to_params(np.full(n, 0.5))
+    assert params["source_l_arcsec"] != 0.0 or params["source_m_arcsec"] != 0.0, params
+    print("source offset self-check passed")
 
 
 def self_check_spectral_window() -> None:

@@ -79,6 +79,29 @@ check(
     plan("search", "wsclean", "--no-build")[1],
 )
 
+# --enable-param / --disable-param are repeatable and join into the same
+# comma-separated names load_parameter_space() reads from the environment.
+check(
+    "search --enable-param/--disable-param join into NS_*_PARAMS",
+    {"NS_ENABLE_PARAMS": "source_offset_fraction", "NS_DISABLE_PARAMS": "channel_count,observation_minutes"},
+    plan(
+        "search", "wsclean", "--enable-param", "source_offset_fraction",
+        "--disable-param", "channel_count", "--disable-param", "observation_minutes",
+    )[0],
+)
+
+check(
+    "params lists the parameter space",
+    ({}, [["uv", "run", "scripts/list-parameter-space.py"]]),
+    plan("params"),
+)
+
+check(
+    "params --enable-param/--disable-param preview the same override",
+    {"NS_DISABLE_PARAMS": "source_offset_fraction"},
+    plan("params", "--disable-param", "source_offset_fraction")[0],
+)
+
 # `runs` and `resume` are how an interrupted run is found and continued, so
 # the flags have to reach the scripts that do the finding and the continuing.
 check(
