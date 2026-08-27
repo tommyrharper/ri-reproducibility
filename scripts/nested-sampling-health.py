@@ -25,13 +25,18 @@ Four things it checks, each one a way a run has actually gone wrong here:
   on the MeqTrees deadlock the watchdogs in `simulate_point_source_ms.py`
   absorb (docs/nested-sampling.md, "When MeqTrees stops answering").
 
+* **Cost, again, in memory and cores.** Memory is what caps a run here, so
+  what the run holds is reported next to what the host has left - over every
+  process carrying the run directory, because a rank is ~10MB and the imager
+  worker behind it is ~3.3GB.
+
 Plus the host: memory, and sidecar containers whose run is gone. A killed run
 leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank, which
 then counts against every later run's memory budget until someone notices.
 
 Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
-when a run has live ranks; nothing started, nothing imaged, so it costs a busy
-host nothing to ask.
+when a run has live processes; nothing started, nothing imaged, so it costs a
+busy host nothing to ask.
 
 Usage:
 
@@ -130,25 +135,25 @@ def _clock_seconds(field: str) -> float | None:
 
 
 def process_table() -> list[dict[str, object]]:
-    """Every process, as (pid, state, elapsed, cpu, args).
+    """Every process, as (pid, state, elapsed, cpu, rss, args).
 
     One call, because everything here needs it: the ranks of a run, whether a
-    sidecar's launcher is still alive, and how much of its life a rank has
-    spent on CPU.
+    sidecar's launcher is still alive, how much of its life a rank has spent on
+    CPU, and how much memory the run is holding.
     """
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid=,state=,etime=,time=,args="],
+            ["ps", "-eo", "pid=,state=,etime=,time=,rss=,args="],
             capture_output=True, text=True, check=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return []
     rows: list[dict[str, object]] = []
     for line in out.splitlines():
-        fields = line.split(None, 4)
-        if len(fields) < 5 or not fields[0].isdigit():
+        fields = line.split(None, 5)
+        if len(fields) < 6 or not fields[0].isdigit():
             continue
-        pid, state, etime, cpu, args = fields
+        pid, state, etime, cpu, rss, args = fields
         rows.append({
             "pid": int(pid),
             # A process killed while its parent is not wait()ing stays as a
@@ -157,6 +162,8 @@ def process_table() -> list[dict[str, object]]:
             "alive": state[:1] != "Z",
             "elapsed_seconds": _clock_seconds(etime),
             "cpu_seconds": _clock_seconds(cpu),
+            # KB on both BSD and GNU ps.
+            "rss_mb": int(rss) // 1024 if rss.isdigit() else 0,
             "args": args,
         })
     return rows
@@ -188,15 +195,16 @@ def sidecar_containers() -> list[dict[str, object]] | None:
     return containers
 
 
-def available_mb() -> int | None:
-    """Free memory as rank-budget.sh's guard reads it, or None off Linux.
+def meminfo_mb(key: str) -> int | None:
+    """One /proc/meminfo field in MB, or None off Linux.
 
-    scripts/lib/rank-budget.sh is the authority on what a run may take; this
-    only reports the number its decision will be made from.
+    scripts/lib/rank-budget.sh is the authority on what a run may take;
+    `MemAvailable` here only reports the number its decision will be made from.
+    `MemTotal` is what turns a run's footprint into a share of the host.
     """
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
+            if line.startswith(f"{key}:"):
                 return int(line.split()[1]) // 1024
     except (OSError, ValueError, IndexError):
         return None
@@ -373,6 +381,18 @@ def dead_points(run_dir: Path) -> tuple[int, float | None]:
     return 0, None
 
 
+def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Everything alive that carries this run's directory in its arguments.
+
+    Wider than the ranks on purpose: the memory a run actually holds is almost
+    all in its imager workers, which name the run by their --fifo-dir and are
+    visible on the host even though they live inside the sidecar containers. A
+    rank itself is ~10MB against an R2D2 worker's ~3.3GB.
+    """
+    marker = str(run_dir.resolve())
+    return [p for p in processes if p["alive"] and marker in str(p["args"])]
+
+
 def rank_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
     """This run's MPI ranks, found by the --output-dir they were launched with.
 
@@ -382,11 +402,8 @@ def rank_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[di
     exec` both carry the whole rank command line in their own arguments, and
     counting those as ranks puts the count two over `NS_MPI_PROCS`.
     """
-    marker = str(run_dir.resolve())
-    return [
-        p for p in processes
-        if marker in str(p["args"]) and p["alive"] and RANK_COMMAND.match(str(p["args"]))
-    ]
+    return [p for p in run_processes(run_dir, processes)
+            if RANK_COMMAND.match(str(p["args"]))]
 
 
 def _cpu_seconds(pid: int) -> float | None:
@@ -477,8 +494,16 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
              stale_seconds: float, busy: dict[int, float] | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     scan = evaluation_scan(run_dir)
-    ranks = rank_processes(run_dir, processes)
+    owned = run_processes(run_dir, processes)
+    ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
     spinning = spinning_ranks(ranks, busy or {})
+    # RSS, so shared pages are counted once per process holding them. The
+    # imager workers are separate containers with separate model copies, so on
+    # the run this exists for the sum lands within a percent of what the host
+    # reports as used - and overcounting is the safe direction for a number
+    # read to answer "can another run fit".
+    resident_mb = sum(int(p["rss_mb"]) for p in owned)
+    cores_busy = sum((busy or {}).get(int(p["pid"]), 0.0) for p in owned)
     dead, checkpoint_age = dead_points(run_dir)
     tail = log_tail(run_dir)
     idle = scan["last_activity_seconds"]
@@ -571,6 +596,10 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "settings": run_env,
         "ranks": len(ranks),
         "ranks_spinning": spinning,
+        "processes": len(owned),
+        "resident_mb": resident_mb,
+        "cores_busy": round(cores_busy, 1),
+        "host_cores": os.cpu_count(),
         "dead_points": dead,
         "checkpoint_age_seconds": checkpoint_age,
         "log_tail": tail,
@@ -593,7 +622,7 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
             "holding ~3.4GB per R2D2 rank against every later run's memory budget: "
             "docker rm -f " + " ".join(str(c["name"]) for c in leaked)
         )
-    memory = available_mb()
+    memory = meminfo_mb("MemAvailable")
     if memory is not None and memory < HEADROOM_MB:
         warnings.append(
             f"{memory}MB available is below the {HEADROOM_MB}MB headroom rank-budget.sh "
@@ -601,6 +630,8 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
         )
     return {
         "available_mb": memory,
+        "total_mb": meminfo_mb("MemTotal"),
+        "cores": os.cpu_count(),
         "sidecars": containers,
         "leaked_sidecars": leaked,
         "warnings": warnings,
@@ -654,6 +685,20 @@ def render(run: dict[str, object]) -> None:
                             float(slowdown) > RATE_DIVERGENCE_FACTOR
                             or float(slowdown) < 1 / RATE_DIVERGENCE_FACTOR) else "")),
         ("ranks", ranks),
+    ]
+    # Only for a run that still holds something. "0.0GB over 0 processes" is
+    # what every finished run on disk would print, and none of them is the
+    # question this line answers: memory, not CPU, is what caps a run, and what
+    # a live one is holding is what the next one has to fit around.
+    if run["processes"]:
+        cores = run["host_cores"]
+        lines.append(("resources",
+                      f"{int(run['resident_mb']) / 1024:.1f}GB resident over "
+                      f"{run['processes']} processes"
+                      + (f", {run['cores_busy']:.1f}"
+                         + (f" of {cores}" if cores else "")
+                         + " cores busy" if run["cores_busy"] else "")))
+    lines += [
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE, "
                      f"{run['meqserver_wedges']} meqserver wedges recovered"),
         ("stalls", f"{run['stall_count']} gaps over {run['stall_threshold_seconds']:.0f}s, "
@@ -668,9 +713,11 @@ def render(run: dict[str, object]) -> None:
 def render_host(host: dict[str, object]) -> None:
     print("host")
     memory = host["available_mb"]
+    total = host["total_mb"]
     print(f"  {'memory':<9} " + ("unknown (not Linux)" if memory is None
-                                 else f"{int(memory) / 1024:.1f}GB available, "
-                                      f"{HEADROOM_MB / 1024:.0f}GB reserved as headroom"))
+                                 else f"{int(memory) / 1024:.1f}GB available"
+                                      + (f" of {int(total) / 1024:.1f}GB" if total else "")
+                                      + f", {HEADROOM_MB / 1024:.0f}GB reserved as headroom"))
     sidecars = host["sidecars"]
     if sidecars is None:
         print(f"  {'sidecars':<9} unknown (docker did not answer)")
@@ -735,10 +782,12 @@ def main(argv: list[str] | None = None) -> int:
     processes = process_table()
     directories = run_directories() if args.all else [resolve(args.run)]
     # One sample interval for every run being reported, not one each: only a
-    # run with live ranks is sampled at all, and there is rarely more than one.
-    # A report over finished runs costs nothing.
+    # run with live processes is sampled at all, and there is rarely more than
+    # one. A report over finished runs costs nothing. Everything the run owns
+    # rather than only its ranks, because the ranks wait while the imager
+    # workers do the work - sampling only the ranks measures the waiting.
     busy = cpu_busy_fractions(
-        [int(p["pid"]) for d in directories for p in rank_processes(d, processes)])
+        [int(p["pid"]) for d in directories for p in run_processes(d, processes)])
     runs = [describe(d, processes, args.stale_seconds, busy) for d in directories]
     host = host_report(processes)
 
@@ -786,6 +835,16 @@ def self_check() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             NESTED_SAMPLING_DIR = Path(tmp)
 
+            # The real `ps`, because its output format is what this parses
+            # and BSD and GNU differ. This interpreter is in its own table,
+            # alive, and holding more than a megabyte - so a column that moved
+            # or stopped being a number fails here rather than silently
+            # reporting a run as holding nothing.
+            table = process_table()
+            mine = [p for p in table if p["pid"] == os.getpid()]
+            assert len(mine) == 1, f"{len(mine)} rows for pid {os.getpid()}"
+            assert mine[0]["alive"] and int(mine[0]["rss_mb"]) > 0, mine
+
             # `[[dd-]hh:]mm:ss` in every form ps prints it.
             assert _clock_seconds("00:12") == 12
             assert _clock_seconds("01:02:03") == 3723
@@ -803,7 +862,7 @@ def self_check() -> None:
                 write_eval(live, i + 1, now - 40 + i * 0.5)
             (live / "evaluations" / "eval-0005-inflight").mkdir()
             ranks = [{"pid": 100 + i, "alive": True, "elapsed_seconds": 100.0,
-                      "cpu_seconds": 20.0,
+                      "cpu_seconds": 20.0, "rss_mb": 10,
                       "args": f"python3 polychord_r2d2.py --output-dir {live.resolve()}"}
                      for i in range(4)]
 
@@ -811,10 +870,19 @@ def self_check() -> None:
             # command line in their own arguments; neither is a rank.
             not_ranks = [
                 {"pid": 90, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 1.0,
+                 "rss_mb": 5,
                  "args": f"mpirun -np 4 python3 polychord_r2d2.py --output-dir {live.resolve()}"},
                 {"pid": 91, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 1.0,
+                 "rss_mb": 5,
                  "args": f"/usr/bin/docker exec c mpirun python3 polychord_r2d2.py "
                          f"--output-dir {live.resolve()}"},
+                # The sidecar's imager worker: not a rank, and where all of the
+                # run's memory is. Named by --fifo-dir rather than
+                # --output-dir, which is why the footprint is taken over
+                # everything carrying the run directory rather than the ranks.
+                {"pid": 92, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 90.0,
+                 "rss_mb": 3300,
+                 "args": f"python3 r2d2_serve.py --fifo-dir {live.resolve()}/.r2d2-workers"},
             ]
             # PolyChord writes the dead-point count every ~nlive points, so it
             # is stale by design between writes. Aged here at ten minutes while
@@ -834,6 +902,16 @@ def self_check() -> None:
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report
             assert report["warnings"] == [], report
+            # The imager worker is 3.3GB of the run and none of its ranks:
+            # 4 ranks at 10MB, mpirun and docker exec at 5MB each, worker 3300.
+            assert report["processes"] == 7, report
+            assert report["resident_mb"] == 3350, report
+            assert "3.3GB resident over 7 processes" in aged, aged
+            # CPU is sampled over the same processes, so a busy worker shows as
+            # a busy core even while every rank sits in a collective.
+            with_cpu = io_capture(describe(live, not_ranks + ranks,
+                                           DEFAULT_STALE_SECONDS, {92: 0.9}))
+            assert "0.9 of " in with_cpu and "cores busy" in with_cpu, with_cpu
 
             # A stopped run says why, when the run script captured a log for it
             # - which is the whole reason run.log exists.
@@ -1013,7 +1091,7 @@ def self_check() -> None:
 
             # A sidecar whose launcher is gone is memory nobody will free.
             processes = [{"pid": 4242, "alive": True, "elapsed_seconds": 1.0,
-                          "cpu_seconds": 0.0, "args": "sh"}]
+                          "cpu_seconds": 0.0, "rss_mb": 0, "args": "sh"}]
             live_container = {"name": "ri-ns-sidecar-4242-0", "image": "i", "owner_pid": 4242}
             leaked = {"name": "ri-ns-sidecar-9999-0", "image": "i", "owner_pid": 9999}
             global sidecar_containers
@@ -1051,17 +1129,17 @@ def self_check() -> None:
             import contextlib
             import io
 
-            global available_mb
-            original_memory = available_mb
+            global meminfo_mb
+            original_memory = meminfo_mb
             try:
                 sidecar_containers = lambda: []  # noqa: E731
-                available_mb = lambda: HEADROOM_MB * 2  # noqa: E731
+                meminfo_mb = lambda key: HEADROOM_MB * 2  # noqa: E731
                 with contextlib.redirect_stdout(io.StringIO()):
                     assert main(["--all", "--json"]) == 1
                     assert main([live.name]) == 0
             finally:
                 sidecar_containers = original
-                available_mb = original_memory
+                meminfo_mb = original_memory
     finally:
         NESTED_SAMPLING_DIR = saved
     print("nested-sampling-health self-check passed")

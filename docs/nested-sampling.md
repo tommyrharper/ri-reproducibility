@@ -306,11 +306,12 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   ranks     16 ranks of 16, 7 busy-waiting
+  resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
   stalls    8 gaps over 13s, 154s = 5.5% of wall clock
 
 host
-  memory    8.9GB available, 4GB reserved as headroom
+  memory    8.9GB available of 62.6GB, 4GB reserved as headroom
   sidecars  3 running, 0 leaked
 ```
 
@@ -408,6 +409,15 @@ What each line is reading, and why it is worth a line:
   readings persuasive to whoever took it. So it is reported as a deadlock only
   when all but one are burning CPU **and** nothing has completed for a minute,
   and it is that second clause that does the work.
+- **resources** - what the run is actually holding, so the host's free memory
+  below has an owner. Taken over every live process carrying the run
+  directory, not just its ranks: a rank is ~10MB and the imager worker it
+  talks to is ~3.3GB, and the workers name the run by their `--fifo-dir`
+  rather than by `--output-dir`. RSS, so a page shared between processes is
+  counted once per holder - overcounting, which is the safe direction for a
+  number read to answer "will another run fit". Cores busy is the same one
+  second CPU sample as the spin check, summed over those processes, so it
+  measures the imaging rather than the ranks waiting on it.
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real
