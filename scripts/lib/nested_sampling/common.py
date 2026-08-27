@@ -1435,6 +1435,22 @@ _SIMULATE_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
 _FIFO_POOL_ABANDONED = False
 
 
+def fifo_worker_pgrep_pattern(base: Path) -> str:
+    """pgrep -f regex matching exactly the pooled worker serving `base`.
+
+    The `$` does the real work, and check_fifo_kill_pattern() in
+    scripts/test_watchdogs.py is the guard on it: without the anchor this
+    matches every rank whose number starts with this one's, so killing rank 1
+    would take ranks 10 to 19 with it. The anchor also stops the `sh -c`
+    carrying this pattern from matching itself, because that command line
+    continues past the pattern and ends with the `$` as a literal character.
+    The bracket is belt and braces for the same self-match - it is a character
+    class here and a literal `[` in any command line quoting this string - and
+    a mutation of it changes no behaviour while the anchor stands.
+    """
+    return f"serve --fif[o] {base}$"
+
+
 class FifoWorker:
     """A `--serve --fifo` worker the run script already started.
 
@@ -1469,7 +1485,7 @@ class FifoWorker:
         """
         global _FIFO_POOL_ABANDONED
         _FIFO_POOL_ABANDONED = True
-        pattern = f"serve --fif[o] {self.base}$"
+        pattern = fifo_worker_pgrep_pattern(self.base)
         subprocess.run(
             [
                 "docker", "exec", self.container, "sh", "-c",

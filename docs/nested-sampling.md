@@ -232,6 +232,7 @@ arrived as `returncode=1`. They are now separate:
 |---|---|
 | The tool ran and exited non-zero | `FAILURE_OBJECTIVE` - a failure mode, scored |
 | A worker died mid-request | Retried, then the run stops - never scored |
+| A worker stopped answering | Its meqserver is replaced, or it is killed - never scored |
 
 A dead worker is retried against a freshly started one, waiting longer each
 time (`WORKER_RETRY_DELAYS` in `common.py`, ~51s in total). That is usually
@@ -242,6 +243,56 @@ If it still cannot run, the run stops rather than inventing a likelihood.
 There is no honest value to return: scoring it high makes the sampler chase
 the OOM killer, and scoring it low carves a hole out of exactly the expensive
 corner where the real failure modes live.
+
+### When MeqTrees stops answering
+
+MeqTrees deadlocks with its `meqserver` roughly once every 2,000 to 5,000
+evaluations. The worker stays alive, the predict never completes, and no reply
+is ever written - so this is not a worker that died, and nothing that watches
+for a death sees it.
+
+It used to stop the whole run. Timba's `wait=True` means wait *indefinitely*,
+so the rank that asked for that simulate blocked forever, and because PolyChord
+keeps every rank in the same collective, the other 19 burned a core each behind
+it. A 20-rank run left overnight came back stopped rather than finished.
+
+Three bounds now stand in the way, each one shorter than the one outside it:
+
+| Bound | Where | What it does when it expires |
+|---|---|---|
+| `PREDICT_WAIT_SECONDS` (3s) | `simulate_point_source_ms.py` | The worker kills its own meqserver, starts a fresh one (~0.2s) and retries the predict. The rank never learns anything happened. |
+| `SIMULATE_REPLY_TIMEOUT` (10s) | `common.py` | The rank kills the worker, drops its pooled FIFO slot and retries against a rank-started one. |
+| `WORKER_RETRY_DELAYS` (5 attempts) | `common.py` | `WORKER_DIED`: the run stops rather than scoring a host fault. |
+
+The ordering is the design, not a coincidence. If the worker's own bound ever
+exceeds the rank's, the rank kills the worker before it can fix itself and
+every deadlock silently costs a killed worker again - so
+`scripts/test_watchdogs.py` asserts the ladder holds, and CI runs it.
+
+In practice the first layer absorbs nearly all of it. Two full 20-rank runs
+after it was added recovered 8 deadlocks between them without a single one
+reaching the rank, and neither run had a gap above 2s anywhere. The same run
+shape before it lost 23-27% of its wall clock to the layer below.
+
+An evaluation that hit one leaves a `meqserver-wedged.log` next to its other
+logs, and nothing else marks it:
+
+```
+$ cat results/nested-sampling/<run>/evaluations/*/meqserver-wedged.log
+attempt 1: no reply to the predict in 3.0s
+```
+
+One line means the worker fixed itself. Two, for the same evaluation, means it
+could not, and the worker exited rather than replying - deliberately, because
+an exit status would come back as a failed evaluation and the search would
+start chasing a wedged meqserver instead of the algorithm.
+
+Counting those files is the honest way to ask how much a run is paying:
+
+```bash
+R=$(ls -1dt results/nested-sampling/wsclean-* | head -1)
+cat "$R"/evaluations/*/meqserver-wedged.log 2>/dev/null | wc -l
+```
 
 ### Finding and resuming a run that stopped
 

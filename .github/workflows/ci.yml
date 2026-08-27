@@ -41,6 +41,9 @@ jobs:
           bash scripts/lib/run-config.sh --self-check
           NESTED_SAMPLING_RUNS_SELF_CHECK=1 python3 scripts/nested-sampling-runs.py
 
+      - name: Check the deadlock watchdogs
+        run: python3 scripts/test_watchdogs.py
+
       - name: Check shared defaults
         run: scripts/test-defaults.sh
 

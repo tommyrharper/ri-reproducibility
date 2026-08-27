@@ -883,6 +883,101 @@ def self_check_meqserver_restart() -> None:
     print("meqserver restart self-check passed")
 
 
+def self_check_predict_timeout_recovery() -> None:
+    """The real Timba path: a bounded predict expires, and the worker recovers.
+
+    self_check_meqserver_restart() above pins the control flow against a
+    stand-in. This one pins the two library facts the whole design rests on,
+    which no amount of monkeypatching can vouch for: that Timba honours a
+    numeric `wait` at all (`wait=True` means wait forever, and a version that
+    ignored a number would put the deadlock straight back), and that a
+    meqserver killed underneath a live octopussy can be replaced in the same
+    process. A Timba or base-image upgrade is exactly what would break either.
+    """
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        ms = Path(scratch) / "sim.ms"
+        args = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", "4.0",
+            "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+            "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(args, ms), ms, args)
+        corr_sel, _ = determine_corr_selection(ms)
+
+        with redirect_fds(Path(os.devnull)):
+            meqserver_session()
+        first_pid = _MQS.serv_pid
+
+        # A bound nothing can meet, so both attempts expire: the caller has to
+        # get control back rather than block, and it has to arrive as
+        # MeqserverWedged so serve() can tell it apart from a failed evaluation.
+        original_bound = PREDICT_WAIT_SECONDS
+        globals()["PREDICT_WAIT_SECONDS"] = 0.001
+        started = time.monotonic()
+        try:
+            run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
+        except MeqserverWedged:
+            pass
+        else:
+            raise AssertionError("a predict that never answers must raise MeqserverWedged")
+        finally:
+            globals()["PREDICT_WAIT_SECONDS"] = original_bound
+        bounded = time.monotonic() - started
+        assert bounded < 60.0, f"a numeric wait did not bound the predict: {bounded:.1f}s"
+        assert (ms.parent / "meqserver-wedged.log").exists(), "a wedge left no record"
+
+        # The server was replaced along the way, and the session it left behind
+        # still produces real visibilities rather than a half-dead forest.
+        assert _MQS is None or _MQS.serv_pid != first_pid, "the wedged meqserver was not replaced"
+        with redirect_fds(Path(os.devnull)):
+            run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
+        data = table(str(ms), ack=False).getcol("DATA")
+        assert abs(data[0, 0, 0] - 1.0) < 1e-6, f"XX after recovery is {data[0, 0, 0]}"
+        assert abs(data[0, 0, -1] - 1.0) < 1e-6, f"YY after recovery is {data[0, 0, -1]}"
+    print("predict timeout recovery self-check passed")
+
+
+def self_check_wedge_kills_worker() -> None:
+    """A worker that cannot fix itself must die, never answer with a status.
+
+    This is the invariant the whole WORKER_DIED split exists for: an exit
+    status comes back as a failed evaluation and PolyChord maximizes
+    FAILURE_OBJECTIVE, so a meqserver nobody can revive would become the
+    search's best point and the run would chase a host fault instead of the
+    algorithm. Reordering serve()'s except clauses is all it would take, and
+    nothing else here would notice.
+    """
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        ms = Path(scratch) / "sim.ms"
+        # A worker whose predicts can never succeed, without a knob in the
+        # production path: the bound is set in the child before serve() runs.
+        bootstrap = (
+            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
+            "import simulate_point_source_ms as s; s.PREDICT_WAIT_SECONDS = 0.001; s.serve()"
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", bootstrap],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        request = {
+            "argv": [
+                "--output-ms", str(ms), "--observation-minutes", "4.0",
+                "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+                "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+            ],
+            "stdout": str(Path(scratch) / "out.log"),
+            "stderr": str(Path(scratch) / "err.log"),
+        }
+        worker.stdin.write(json.dumps(request) + "\n")
+        worker.stdin.flush()
+        reply = worker.stdout.readline()
+        assert reply == "", f"a wedged worker answered instead of dying: {reply!r}"
+        assert worker.wait(timeout=300) != 0, "a wedged worker must not exit successfully"
+    print("wedge kills worker self-check passed")
+
+
 def self_check_serve_reply_stream() -> None:
     """A worker's stdout must carry replies only, never meqserver startup chatter."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
@@ -960,6 +1055,8 @@ if __name__ == "__main__":
             self_check_skeleton_prebuild()
             self_check_forest_reuse()
             self_check_meqserver_restart()
+            self_check_predict_timeout_recovery()
+            self_check_wedge_kills_worker()
             self_check_serve_reply_stream()
             self_check_serve_fifo()
         else:
