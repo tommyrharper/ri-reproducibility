@@ -71,24 +71,52 @@ _ns_available_mb() {
     awk '/^MemAvailable:/ { print int($2 / 1024); found = 1 } END { exit !found }' /proc/meminfo
     return
   fi
-  # macOS has no MemAvailable. Free + inactive + speculative pages is the
-  # same "reclaimable without swapping" idea vm_stat can give us; page size
-  # comes from vm_stat's own header so this isn't hardcoding 4096/16384.
-  if command -v vm_stat >/dev/null 2>&1; then
-    vm_stat | awk -v pagesize="$(vm_stat | sed -n 's/.*page size of \([0-9]*\) bytes.*/\1/p')" '
-      /^Pages free:/ { free = $3 }
-      /^Pages inactive:/ { inactive = $3 }
-      /^Pages speculative:/ { spec = $3 }
-      END {
-        if (pagesize == "") { exit 1 }
-        gsub(/\./, "", free); gsub(/\./, "", inactive); gsub(/\./, "", spec)
-        print int((free + inactive + spec) * pagesize / 1024 / 1024)
-      }'
+  # macOS has no MemAvailable, and the containers a rank starts don't run on
+  # macOS anyway - the daemon is a Linux VM (Docker Desktop / Colima) with its
+  # own fixed memory allocation, separate from the host's. vm_stat used to
+  # measure the host's memory here, which is the wrong pool: a Mac with 64GB
+  # and a 48GB VM only ever has ~16GB left for the host, shared with every
+  # desktop app, so Chrome and an IDE sitting open reads as this run being
+  # short on memory while the VM - where the rank would actually live - sits
+  # nearly empty. Ask the daemon what its own VM has instead: total memory
+  # from `docker info`, minus what every currently-running container is
+  # already using.
+  if command -v docker >/dev/null 2>&1; then
+    _ns_docker_available_mb
     return
   fi
   # Neither read is available: returning nothing here is what turns the
   # clamp off.
   return 1
+}
+
+# `docker stats --format '{{.MemUsage}}'` gives a human string per container
+# ("3.6GiB / 46.95GiB"), not raw bytes, so summing usage across containers
+# means converting each one - pulled out so the self-check can exercise the
+# unit conversion without a live daemon.
+_ns_mem_string_to_mb() {
+  awk '
+    function to_mb(v,   n) {
+      n = v + 0
+      if (v ~ /TiB$/) return n * 1024 * 1024
+      if (v ~ /GiB$/) return n * 1024
+      if (v ~ /MiB$/) return n
+      if (v ~ /KiB$/) return n / 1024
+      return n / 1024 / 1024  # bare bytes
+    }
+    { sum += to_mb($1) }
+    END { printf "%d\n", sum }
+  '
+}
+
+_ns_docker_available_mb() {
+  local total_bytes used_mb
+  total_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null)"
+  [ -n "${total_bytes}" ] && [ "${total_bytes}" -gt 0 ] 2>/dev/null || return 1
+  used_mb="$(docker stats --no-stream --format '{{.MemUsage}}' 2>/dev/null \
+    | awk -F' / ' '{ print $1 }' | _ns_mem_string_to_mb)"
+  [ -n "${used_mb}" ] || used_mb=0
+  printf '%d\n' "$(( total_bytes / 1024 / 1024 - used_mb ))"
 }
 
 # The whole read-decide-reserve in ns_budget_ranks has to be atomic against
@@ -221,8 +249,15 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_RANK_BUDGET_HEADROOM_MB=4096
 
   # The real reader works on whatever platform runs this check - /proc/meminfo
-  # on Linux, `vm_stat` on macOS - not just the NS_AVAILABLE_MB override below.
+  # on Linux, the Docker VM's own memory on macOS - not just the
+  # NS_AVAILABLE_MB override below.
   [ "$(_ns_available_mb)" -gt 0 ]
+
+  # Unit conversion is the part a live daemon can't exercise in CI: GiB/MiB/
+  # KiB/bare-bytes strings as `docker stats --format '{{.MemUsage}}'` prints
+  # them, summed across containers.
+  [ "$(printf '3.5GiB\n512MiB\n' | _ns_mem_string_to_mb)" = 4096 ]
+  [ "$(printf '1024KiB\n' | _ns_mem_string_to_mb)" = 1 ]
 
   export NS_AVAILABLE_MB=40960
   # 40960 available - 4096 headroom = 36864, over 3400 per rank, is 10 ranks.
