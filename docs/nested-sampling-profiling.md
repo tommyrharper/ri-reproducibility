@@ -1592,6 +1592,117 @@ The win is larger than the 0.018s of `makeplan`/`setpts` on its own because the
 imaging pool is CPU-bound with 8 workers on a 20-CPU host, so work removed from
 a worker is worth more than its solo cost.
 
+#### The operator norm runs on a coarser upsampling grid
+
+Once the plans are cached and the checkpoints are absent, an imaging request is
+*almost entirely* `get_op_norm`. `cProfile` of one warm request, 0.038s solo:
+53 `finufft` `execute` calls at 0.047s of `tottime` under the profiler, ARPACK's
+`iterate` at 0.063s cumulative of the 0.085s the whole request takes. Everything
+else - the YAML parse, the `.mat` read, `gen_imaging_weights`, building the
+operator - is single-digit milliseconds.
+
+FINUFFT's `upsampfac` sets how far the nonuniform points are spread before the
+FFT: 2.0 puts a 128x128 image on a 256x256 grid, 1.25 on a 160x160 one, 2.56x
+fewer FFT points for a wider spreading kernel. With ~3000 visibilities against
+128x128 modes this transform is FFT-bound, so that trade is one-sided. Measured
+on a real operator, one forward/adjoint pair:
+
+| `dtype` | `eps` | `upsampfac` | per pair | max relative error |
+|---|---:|---:|---:|---:|
+| double | 1e-6 | 2.0 | 0.893ms | - |
+| double | 1e-4 | 2.0 | 0.870ms | 9.2e-05 |
+| double | 1e-3 | 2.0 | 0.829ms | 7.8e-04 |
+| single | 1e-5 | 2.0 | 0.822ms | 7.8e-06 |
+| double | 1e-6 | 1.25 | 0.598ms | 5.1e-06 |
+| single | 1e-5 | 1.25 | 0.306ms | 1.2e-04 |
+
+Loosening `eps` buys almost nothing, which is the same statement: `eps` sets the
+spreading width, and the spreading is not where the time is.
+
+`r2d2_serve.py`'s `OP_NORM_UPSAMPFAC` is 1.25 and applies to the operator-norm
+matvecs only - `get_op_norm` sets `self._ri_upsampfac` around the Lanczos solve
+and restores 2.0 in a `finally`, and the plan cache is keyed on
+`(transform type, upsampfac)` so the imaging transforms keep their own 2.0
+plans. Single precision is *not* used: it is the bigger win of the two but its
+1.2e-04 is close enough to the solve's own `tol=1e-3` to be worth avoiding for
+0.3ms.
+
+Over 12 real operators from this parameter space, solving each three ways:
+
+| `upsampfac` | applications | solve | eigenvalue vs 2.0 (median / max) |
+|---|---:|---:|---|
+| 2.0 | 19.7 (max 25) | 25.99ms | - |
+| 1.5 | 19.7 (max 25) | 21.35ms | 1.1e-07 / 1.2e-07 |
+| 1.25 | 19.7 (max 25) | 18.06ms | 5.2e-08 / 7.3e-08 |
+
+The eigenvalue moves 100x less than a single transform does, because the answer
+is an average over a 128x128 eigenvector, and the application count does not
+move at all - so this is 30% off `get_op_norm` for nothing. It is also two
+orders of magnitude inside the `tol=1e-3` the solve already stops at, and four
+inside the ~1e-4 the upstream power iteration it replaced delivered.
+
+Under load it is worth more than solo, because the FFT it removes is what
+saturates memory bandwidth. Eight forked workers each imaging 8 real
+evaluations, alternating the two settings:
+
+| `upsampfac` | median request | mean |
+|---|---:|---:|
+| 2.0 | 68.6ms, 69.9ms | 68.5ms, 69.4ms |
+| 1.25 | 51.2ms, 52.7ms | 51.2ms, 52.9ms |
+
+Interleaved A/B of `scripts/run-nested-sampling-r2d2-poc.sh` end to end,
+`NS_MPI_PROCS=8`, alternating the two `r2d2_serve.py`, 24 pairs:
+
+| | end to end | sampler wall | `image_container_seconds` (912 evaluations) |
+|---|---:|---:|---:|
+| `upsampfac` 2.0 | 2.671s | 1.560s | sum 6.497s |
+| `upsampfac` 1.25 | 2.578s | 1.456s | sum 5.783s |
+
+-0.094s end to end (t = -5.7, 20 of 24 pairs), -0.104s of sampler wall, -0.713s
+of imaging worker-seconds. Every run reports the same objectives.
+
+An earlier block of 10 pairs, run while another agent session was loading the
+host (per-pair spread ~0.25s against the usual ~0.10s), read the same change as
+-0.007s +/- 0.072 - noise - while still showing the full -0.518s of imaging
+worker-seconds. Pooled over all 34 pairs it is -0.068s +/- 0.024 (t = -2.8).
+Check `uptime` before believing an end-to-end A/B on this host; the worker-second
+proxy survives load that the wall clock does not.
+
+#### What a second of imaging worker time is worth end to end
+
+Iteration-scale changes to a *stage* are worth measuring against a calibration
+rather than a guess. `time.sleep(0.020)` in front of the reply in `answer()` -
+a file swap, no rebuild, and no CPU consumed - costs the run
+
+| | end to end | sampler wall |
+|---|---:|---:|
+| unchanged | 2.668s | 1.565s |
+| +0.020s per imaging request | 2.916s | 1.749s |
+
+over 6 pairs: +0.248s end to end for +0.76 worker-seconds, a ratio of 0.33. The
+`upsampfac` change above removed 0.713 worker-seconds for 0.104s of sampler
+wall, a ratio of 0.15 - the difference being that the sleep also lands on
+evaluation one, where a rank is already blocked on the pool and a delay is 1:1.
+Either way the imaging stage *is* on the critical path: with 7 of the 8 ranks
+evaluating, ~5-6 rounds each, a second of imaging worker time is worth 0.15-0.33
+seconds of run.
+
+The rounds are visible directly. Logging each request's arrival and reply time
+in `answer()` for one run gives 38 requests over a 0.800s span, one rank taking
+1 (the PolyChord administrator) and the rest 5 or 6:
+
+```
+rank 1: 6 reqs busy=0.424 first=0.000 last=0.800
+rank 2: 5 reqs busy=0.331 first=0.001 last=0.712
+...
+```
+
+Requests arrive in waves 0.13-0.15s apart, each wave 7 requests wide, and a
+rank's own gap between one reply and its next request is 0.043-0.083s - the
+simulate and convert stages of the next evaluation. So a rank's round is roughly
+half imaging and half simulate, the ranks are not barriered against each other,
+and the run ends when the rank that drew 6 evaluations finishes its sixth.
+
 #### The transforms are the same bits, but FINUFFT's type 1 is not always
 
 Compared against upstream on a real evaluation's operator - 5616 sampling points

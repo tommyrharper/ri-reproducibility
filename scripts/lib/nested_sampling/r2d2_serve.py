@@ -16,9 +16,10 @@ command, before the ranks that will use them exist. `--fifo-dir` also opens
 every pair before it warms up, so a rank attaches at ~0.3s rather than ~1.2s and
 spends the difference on its own startup instead of on this one's.
 
-The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve and gives each
-measurement operator one FINUFFT plan per transform type; see `patch_op_norm`
-and `patch_nufft_plans` below.
+The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve, runs that
+solve on a coarser FINUFFT upsampling grid than the imaging transforms use, and
+gives each measurement operator one plan per (transform type, upsampling
+factor); see `patch_op_norm`, `OP_NORM_UPSAMPFAC` and `patch_nufft_plans`.
 
 Upstream's `src/imager.py` has no importable entry point (its whole body sits
 under `if __name__ == "__main__"`), so each request re-runs that body with
@@ -152,6 +153,26 @@ def warm_imports() -> None:
             traceback.print_exc()
 
 
+# FINUFFT's upsampling factor for the operator-norm matvecs only; the imaging
+# transforms keep upstream's 2.0. `get_op_norm` produces one number, the
+# `1/sqrt(2L)` target-dynamic-range heuristic, and the Lanczos solve that
+# produces it already stops at a 1e-3 relative tolerance - against which 1.25
+# costs nothing measurable: over 12 real operators from this parameter space the
+# eigenvalue moves 7.3e-8 at worst and the application count is unchanged at
+# 19.7 (the per-transform error is 5.1e-6, and averaging over a 128x128
+# eigenvector is what turns it into 1e-8).
+#
+# What it buys is the FFT: 1.25 makes the padded grid 160x160 instead of
+# 256x256, measured at 0.598ms per forward/adjoint pair against 0.893ms solo and
+# - because that FFT is what saturates memory bandwidth - a whole imaging
+# request at 51ms against 69ms with eight of them running at once. Over those 12
+# operators the whole solve is 18.1ms at 1.25, 21.4ms at 1.5 and 26.0ms at 2.0.
+# Loosening `eps` instead is nearly free here (0.829ms per pair at 1e-3 against
+# 0.893ms at 1e-6): with ~3000 visibilities against 128x128 modes this transform
+# is FFT-bound, not spreading-bound.
+OP_NORM_UPSAMPFAC = 1.25
+
+
 def patch_nufft_plans() -> None:
     """Build each operator's FINUFFT plans once instead of once per transform.
 
@@ -161,13 +182,15 @@ def patch_nufft_plans() -> None:
     Lanczos matvecs, ~45 transforms, before the UNet passes even start), so all
     of that setup is repetition: measured at 0.018s of the 0.063s an operator
     norm cost when this landed, at the 29 matvecs `tol=1e-5` then took.
-    Keeping one plan per (operator, transform type) measured a forward/adjoint
-    pair at 0.99ms against 1.89ms.
+    Keeping one plan per (operator, transform type, upsampling factor) measured
+    a forward/adjoint pair at 0.99ms against 1.89ms.
 
-    Same library, same eps/isign/upsampfac/modeord, so this only removes
+    Same library, same eps/isign/modeord, so for the imaging transforms - which
+    keep upstream's `upsampfac` of 2.0 - this only removes
     `makeplan`/`setpts`/`destroy` plus the autograd `Function.apply` dispatch
-    that eager inference has no use for; the transforms come back bit-identical
-    at this problem size. Anything the cached plans do not cover - a non-CPU
+    that eager inference has no use for, and they come back bit-identical at
+    this problem size. `upsampfac` is in the key because `get_op_norm` asks for
+    a coarser grid; see OP_NORM_UPSAMPFAC. Anything the cached plans do not cover - a non-CPU
     device, a batch of more than one image - falls back to upstream. Both are
     under `no_grad`: the plan path detaches through numpy anyway, and this
     worker only ever runs `imager.py`, which is inference.
@@ -189,7 +212,9 @@ def patch_nufft_plans() -> None:
         if plans is None:
             plans = {}
             setattr(self, "_ri_nufft_plans", plans)
-        if nufft_type not in plans:
+        upsampfac = getattr(self, "_ri_upsampfac", 2.0)
+        key = (nufft_type, upsampfac)
+        if key not in plans:
             points = np.ascontiguousarray(self._traj.detach().numpy())
             made = finufft.Plan(
                 nufft_type,
@@ -201,12 +226,12 @@ def patch_nufft_plans() -> None:
                 eps=1e-6,
                 isign=-1,
                 dtype=torch.empty(0, dtype=self._dtype_meas).numpy().dtype,
-                upsampfac=2.0,
+                upsampfac=upsampfac,
                 modeord=0,
             )
             made.setpts(points[0], points[1])
-            plans[nufft_type] = made
-        return plans[nufft_type]
+            plans[key] = made
+        return plans[key]
 
     @torch.no_grad()
     def _GA(self, x: torch.Tensor) -> torch.Tensor:
@@ -304,11 +329,16 @@ def patch_op_norm() -> None:
             image = image.to(self._device).view(1, 1, *size)
             return self.adjoint_op(self.forward_op(image)).reshape(-1).cpu().numpy()
 
+        # The Lanczos matvecs run on a coarser FINUFFT upsampling grid than the
+        # imaging transforms do; see OP_NORM_UPSAMPFAC.
+        self._ri_upsampfac = OP_NORM_UPSAMPFAC
         try:
             self._op_norm = lanczos_largest_eigenvalue(matvec, int(np.prod(size)), dtype)
         except ArpackNoConvergence:
             self._op_norm = None
             return power_iteration(self, True, rel_tol, max_iter, verbose)
+        finally:
+            self._ri_upsampfac = 2.0
         return self._op_norm
 
     MeasOp.get_op_norm = get_op_norm
@@ -653,6 +683,14 @@ def self_check_nufft_plan_reuse() -> None:
     # has to come back from upstream rather than silently image the first row.
     batch = torch.cat((visibilities, -visibilities), dim=0)
     assert torch.allclose(patched.adjoint_op(batch), upstream.adjoint_op(batch), rtol=1e-12, atol=0.0)
+
+    # `get_op_norm` runs its matvecs on OP_NORM_UPSAMPFAC plans; the imaging
+    # transforms must still come off the 2.0 ones afterwards. Cheap to get
+    # wrong - one missed restore and every later transform silently changes.
+    patch_op_norm()
+    assert patched.get_op_norm(True) > 0.0
+    assert torch.equal(patched.forward_op(image), visibilities), "the op-norm plan leaked into imaging"
+    assert set(patched._ri_nufft_plans) == {(1, OP_NORM_UPSAMPFAC), (1, 2.0), (2, OP_NORM_UPSAMPFAC), (2, 2.0)}
     print("r2d2 nufft plan self-check passed")
 
 
