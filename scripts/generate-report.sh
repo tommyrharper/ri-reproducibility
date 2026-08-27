@@ -14,6 +14,9 @@
 #   reports/nested-sampling-report/<run>.html   (one page per run)
 #   reports/nested-sampling-report/images/      (PNGs the pages reference)
 #
+# The container is removed asynchronously after the run rather than by
+# `docker run --rm`, which blocks until the rootfs is torn down.
+#
 # Each page records the report version that wrote it. Up-to-date pages are
 # skipped; UPGRADE=1 rebuilds the ones an older report version wrote, and
 # FORCE=1 (or a RUN= selection) rebuilds them all. The index is always rebuilt.
@@ -78,9 +81,16 @@ R2D2_OMP_THREADS="${R2D2_OMP_THREADS:-1}"
 # shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 
+# The report writes to the bind mount, so once python3 has exited nothing about
+# the container matters - but `docker run --rm` keeps the CLI blocked for ~0.13s
+# of every invocation while it tears the rootfs down. Name it and remove it from
+# an EXIT trap instead, so the teardown runs after the script has reported.
+CONTAINER="nested-sampling-report-$$-${RANDOM}"
+trap 'docker rm -f "${CONTAINER}" >/dev/null 2>&1 &' EXIT
+
 # --network none: the report only reads the repo and writes reports/, and
 # skipping the container network setup is ~0.3s of every invocation.
-docker run --rm --network none --platform "${PLATFORM}" \
+docker run --network none --platform "${PLATFORM}" --name "${CONTAINER}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   -v "${REPO_ROOT}/reports:/workspace/out:rw" \
