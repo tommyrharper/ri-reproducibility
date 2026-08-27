@@ -40,6 +40,14 @@
 
 ## current search approach:
 
+Currently we have 5 dimesions, so `d=5`
+- `nlive` should be `25d` for a serious run
+- `--num-repeats` can start around `2d`, up to `5d`
+- `--max-ndead` set to `-1` to make unlimited so we have a precision stopping criteria (you have to use `--max-ndead=-1` with the `=` sign to catch the negative symbol.
+- `--seed` choose something random
+- `--metric` currently going for `total_rms_jy`
+
+Current command:
 ```zsh
-./ri search r2d2 --nlive 50 --num-repeats ? --max-ndead
+./ri search r2d2 --nlive=50 --num-repeats=10 --max-ndead=-1 --seed=123 --metric=total_rms_jy
 ```
