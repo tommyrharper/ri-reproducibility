@@ -513,6 +513,65 @@ def memoize_matplotlib_tick_updates():
     return True
 
 
+# Laying a Text out - splitting it into lines, measuring each against the font,
+# rotating the box - is a pure function of the string and its font/alignment
+# properties, and matplotlib re-does it from scratch on every call. One corner
+# plot asks for it 441 times for 70 distinct texts, because the three passes
+# over the figure (tight_layout, the tight-bbox measurement, the render) each
+# re-measure every tick label and axis title. The result is position-free -
+# get_window_extent translates it afterwards - so one global cache serves every
+# Text with the same properties. Texts with wrapping on are left alone: their
+# layout also depends on the figure width, which is not in the key.
+# Best-effort: if matplotlib renames the private method, the plot is just slower.
+_text_layout_memoized = False
+
+
+def memoize_matplotlib_text_layout():
+    global _text_layout_memoized
+    if _text_layout_memoized:
+        return True
+    _text_layout_memoized = True
+    try:
+        from matplotlib.text import Text
+
+        get_layout = Text._get_layout
+    except (ImportError, AttributeError):
+        return False
+
+    cache = {}
+
+    def memoized(self, renderer):
+        if self._wrap:
+            return get_layout(self, renderer)
+        key = (
+            self._text,
+            # Any two renderers of the same class at the same dpi measure
+            # text identically, so the class is all a backend swap needs.
+            type(renderer),
+            self.get_figure(root=True).dpi,
+            # FontProperties compares by hash, so this is its own equality.
+            hash(self._fontproperties),
+            self._usetex,
+            self._parse_math,
+            self._linespacing,
+            # Reads the transform when transform_rotates_text is on.
+            self.get_rotation(),
+            self.get_rotation_mode(),
+            self._horizontalalignment,
+            self._verticalalignment,
+            self._multialignment,
+        )
+        layout = cache.get(key)
+        if layout is None:
+            if len(cache) > 512:
+                cache.clear()
+            layout = cache[key] = get_layout(self, renderer)
+        return layout
+
+    Text._get_layout = memoized
+    return True
+
+
 # anesthetic's labelled frames resolve every `df[key]` by trying the lookup
 # against each of four label-stripped views and keeping the best answer, and
 # each attempt rebuilds the axis' paramname -> label mapping from scratch. Over
@@ -626,6 +685,7 @@ def _render_likelihood_png(run_dir, param_names):
 
     dedupe_pandas_tick_housekeeping()
     memoize_matplotlib_tick_updates()
+    memoize_matplotlib_text_layout()
     memoize_anesthetic_labels_map()
     memoize_anesthetic_drop_labels()
 
@@ -2021,6 +2081,28 @@ def _self_check_tick_memo():
     plt.close(fig)
 
 
+def _self_check_text_layout_memo():
+    """The text-layout memo must share one layout between two texts with the
+    same properties, and miss once any of those properties differs."""
+    load_plot_libs()
+    if not memoize_matplotlib_text_layout():
+        return
+    fig, ax = plt.subplots()
+    renderer = fig._get_renderer()
+    first, same, longer, rotated = (
+        ax.text(0.1 * i, 0.5, text)
+        for i, text in enumerate(("abc", "abc", "abcdef", "abc"))
+    )
+    rotated.set_rotation(90)
+    layout = first._get_layout(renderer)
+    assert same._get_layout(renderer) is layout, "memo missed on an identical text"
+    assert longer._get_layout(renderer) is not layout, "memo hit on a different string"
+    assert rotated._get_layout(renderer) is not layout, "memo hit on a rotated text"
+    same.set_fontsize(plt.rcParams["font.size"] * 2)
+    assert same._get_layout(renderer) is not layout, "memo hit after a font change"
+    plt.close(fig)
+
+
 def _self_check_tight_bbox():
     """tight_bbox must reproduce what savefig(bbox_inches="tight") measures."""
     load_plot_libs()
@@ -2102,6 +2184,7 @@ if __name__ == "__main__":
         _self_check_tick_housekeeping()
         _self_check_shared_axes_dedupe()
         _self_check_tick_memo()
+        _self_check_text_layout_memo()
         _self_check_tight_bbox()
         _self_check_labels_map_memo()
         _self_check_drop_labels_memo()
