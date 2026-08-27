@@ -294,6 +294,85 @@ R=$(ls -1dt results/nested-sampling/wsclean-* | head -1)
 cat "$R"/evaluations/*/meqserver-wedged.log 2>/dev/null | wc -l
 ```
 
+### Is the run healthy?
+
+`./ri runs` answers "did it finish?". `./ri health` answers the question you
+have while one is still going:
+
+```console
+$ ./ri health
+r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
+  stage     sampling, 57 dead points
+  progress  1287 evaluations, 15 in flight
+  activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
+  ranks     16 ranks of 16, 1 spinning
+  failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
+  stalls    8 gaps over 13s, 154s = 5.5% of wall clock
+
+host
+  memory    8.9GB available, 4GB reserved as headroom
+  sidecars  3 running, 0 leaked
+```
+
+With no argument it reports on the newest run; `--all` covers every run on
+disk and `--json` is the machine-readable form. It reads files and runs one
+`ps` and one `docker ps` - nothing is started and nothing is imaged, so a run
+in progress does not notice it. Exit status is 1 when something needs
+attention, so it can gate a script.
+
+**The status is decided in this order, and the order is the point.** A run
+that finished and a run that died both stop writing, so a stale mtime alone
+says nothing:
+
+| | |
+|---|---|
+| `FINISHED` | `summary.json` is there. |
+| `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
+| `STARTING` | No ranks yet, but something was written recently. |
+| `STOPPED` | No ranks and nothing recent. `./ri resume <run>` continues it. |
+| `HEALTHY` | Ranks running and evaluations landing. |
+
+What each line is reading, and why it is worth a line:
+
+- **stage** - how far into PolyChord the run got, from `chains/`: `*.resume`
+  means it reached the main loop, `*_phys_live.txt` alone means it is still
+  drawing the initial live points. A run that dies before the main loop dies
+  with no dead points, which otherwise looks the same as one that has barely
+  started.
+- **progress** - `evaluations/eval-*/metrics.json` is written only when an
+  evaluation succeeds, so its count is the progress and the directories
+  without one are the evaluations in flight. That number should sit near
+  `NS_MPI_PROCS`; pinned there while the count does not move is every rank
+  stuck at once.
+- **ranks** - found by the `--output-dir` they were launched with, so no ranks
+  means no run. `spinning` counts ranks whose cumulative CPU time is within 5%
+  of their elapsed time: Open MPI's `ob1` busy-waits, so a rank blocked in a
+  collective burns a core and looks identical to a working one on `%CPU`, but
+  a working rank spends most of its life waiting on its imager and a
+  deadlocked one never has. Rank 0 is PolyChord's administrator and
+  legitimately spins, so one is normal - all of them is a deadlock.
+- **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
+  `meqserver-wedged.log` lines. **This is the one that a run can pass every
+  other check and still fail.** PolyChord maximizes, and a real
+  `total_rms_jy` is ~0.008, so failed evaluations are the best points the
+  search has ever seen and it concentrates its live points on them. A run with
+  a missing checkpoint mount or an OOM-killed worker reports "the imager fails
+  catastrophically here", which is exactly the conclusion this repo exists to
+  draw.
+- **stalls** - gaps between evaluations more than 10x the run's own median,
+  and never less than 2s. Relative because WSClean lands 30-50 evaluations a
+  second and R2D2 roughly one every two, so no fixed threshold suits both.
+  Before the watchdogs above, the MeqTrees deadlock cost 23-27% of wall clock
+  here; after them, 0.
+- **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
+  keeps, and `ri-ns-sidecar-*` containers whose launching process is gone. A
+  killed run leaves those holding ~3.4GB per R2D2 rank, counted against every
+  later run's memory budget until someone removes them.
+
+Not covered: a run's own stdout is not captured to disk, so a traceback that
+stops a run exists only in the terminal it was started from. The health report
+can say a run stopped and where it stopped, never why.
+
 ### Finding and resuming a run that stopped
 
 A run writes `summary.json` only once PolyChord returns, so a run directory

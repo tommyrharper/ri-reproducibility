@@ -116,6 +116,36 @@ check(
     plan("runs"),
 )
 
+# `health` takes either a run or --all, never both, and the run is a bare
+# positional rather than a flag - so it is the one place a mistranslation would
+# silently report on the wrong run.
+check(
+    "health with no arguments asks about the newest run",
+    ({}, [["uv", "run", "scripts/nested-sampling-health.py"]]),
+    plan("health"),
+)
+
+check(
+    "health passes a run name and its thresholds through",
+    ({}, [["uv", "run", "scripts/nested-sampling-health.py",
+           "r2d2-vlaa-20260827T101500Z", "--stale-seconds", "30.0", "--json"]]),
+    plan("health", "r2d2-vlaa-20260827T101500Z", "--stale-seconds", "30", "--json"),
+)
+
+check(
+    "health --all asks about every run",
+    ({}, [["uv", "run", "scripts/nested-sampling-health.py", "--all"]]),
+    plan("health", "--all"),
+)
+
+# Both at once is a mistake, and it has to reach the script to be rejected -
+# dropping one here would report on the wrong thing without saying so.
+check(
+    "health sends a run and --all together rather than picking one",
+    ({}, [["uv", "run", "scripts/nested-sampling-health.py", "somerun", "--all"]]),
+    plan("health", "somerun", "--all"),
+)
+
 # No flags: resuming reads the settings back out of the run directory, so the
 # run name is the only thing that has to travel.
 check(

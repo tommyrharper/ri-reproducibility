@@ -61,6 +61,13 @@ jobs:
         env:
           NESTED_SAMPLING_RUNS_SELF_CHECK: "1"
 
+      # Its own step because it shells out to `ps`, whose output format is one
+      # of the things it parses - and that differs between the two runners.
+      - name: Check the run health report
+        run: uv run --no-project python3 scripts/nested-sampling-health.py
+        env:
+          NESTED_SAMPLING_HEALTH_SELF_CHECK: "1"
+
       - name: Check the deadlock watchdogs
         run: uv run --no-project python3 scripts/test_watchdogs.py
 
