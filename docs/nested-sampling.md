@@ -408,6 +408,21 @@ above relies on. Corner plot 0.86s -> 0.69s, five-run cold build 1.65s -> 1.43s
 in-container and 18% less CPU, with byte-identical PNGs. Best-effort in the same
 way: a matplotlib that renames the private method just draws slower.
 
+Laying out a `Text` - splitting it into lines, measuring each against the font,
+rotating the box - is repeated the same way. Those three passes ask for it 441
+times per corner plot, for 70 distinct texts: the tick labels and axis titles
+are re-measured in full on every pass, and the diagonal panels share their
+labels with the panels below them. The result is position-free, so
+`memoize_matplotlib_text_layout()` caches `Text._get_layout` in one process-wide
+dict keyed on the string, the renderer class and figure dpi, the font
+properties, the usetex/parse-math flags, the line spacing, the rotation and
+rotation mode, and the three alignments - every input the layout reads. Texts
+with wrapping enabled bypass the cache entirely, because their line breaks also
+depend on the figure width. Corner plot 0.523s -> 0.496s (5% of every plot, so
+5% of the CPU once there are more runs than cores), five-run cold build 1.443s
+-> 1.423s in-container and 1.6% less CPU, with byte-identical PNGs. Best-effort
+like the rest.
+
 anesthetic repeats work of its own. Its labelled frames resolve every `df[key]`
 by attempting the lookup against each of four label-stripped views of the frame
 and keeping the best answer, and each attempt rebuilds that axis' paramname ->
