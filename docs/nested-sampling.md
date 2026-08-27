@@ -217,20 +217,42 @@ There is no honest value to return: scoring it high makes the sampler chase
 the OOM killer, and scoring it low carves a hole out of exactly the expensive
 corner where the real failure modes live.
 
-### Interrupted runs resume
+### Finding and resuming a run that stopped
 
-PolyChord's own checkpointing is on, so stopping is not the same as starting
-over. `--output-dir` pointing at an interrupted run finds its `.resume` file
-and continues from there, adopting the evaluations already on disk so their
-ids carry on and no point is paid for twice:
+A run writes `summary.json` only once PolyChord returns, so a run directory
+without one stopped early. `./ri runs` is the list:
 
-```bash
-./ri search r2d2 --output-dir results/nested-sampling/r2d2-vlaa-20260827T101500Z
+```console
+$ ./ri runs
+RUN                        ALGORITHM  STATUS      EVALS
+r2d2-vlaa-20260827T1015Z   r2d2       resumable   659
+wsclean-vlaa-20260827T09Z  wsclean    complete    1706
+
+1 run stopped before finishing.
+Continue where it left off, keeping every evaluation already done:
+  ./ri resume r2d2-vlaa-20260827T1015Z
 ```
 
-A fresh run has no resume file and starts clean, so this costs nothing to
-leave on. It covers every way a long run stops - the memory guard giving up,
-a Ctrl-C, a reboot - not just the one this section is about.
+`./ri resume <run>` continues it in place. No flags: each run records what it
+was started with (`run.env`, written at startup, holding the values actually
+used - including a rank count the memory guard clamped), so a resume cannot
+silently become a different search. PolyChord's own checkpointing supplies the
+live points and the evaluations already on disk are adopted, so their ids
+carry on and no point is paid for twice.
+
+`STATUS` is `complete` when `summary.json` is there, `resumable` when it is
+not but a PolyChord `.resume` file is, and `incomplete` when a run stopped
+before it checkpointed anything. `./ri runs --incomplete` lists only the ones
+needing attention, and `--json` is the machine-readable form.
+
+The HTML report lists unfinished runs at the top of its index for the same
+reason, because they have no page of their own: a run that stops does not
+appear as failed there, it simply is not there, which is the easiest kind of
+problem to miss.
+
+This covers every way a long run stops - the memory guard giving up, a Ctrl-C,
+a reboot - not only the one the previous section is about. A fresh run has no
+resume file and starts clean, so leaving checkpointing on costs nothing.
 
 ### Running WSClean and R2D2 at the same time
 

@@ -79,6 +79,28 @@ check(
     plan("search", "wsclean", "--no-build")[1],
 )
 
+# `runs` and `resume` are how an interrupted run is found and continued, so
+# the flags have to reach the scripts that do the finding and the continuing.
+check(
+    "runs passes its selectors through",
+    ({}, [["uv", "run", "scripts/nested-sampling-runs.py", "--incomplete", "--json"]]),
+    plan("runs", "--incomplete", "--json"),
+)
+
+check(
+    "runs with no selectors lists everything",
+    ({}, [["uv", "run", "scripts/nested-sampling-runs.py"]]),
+    plan("runs"),
+)
+
+# No flags: resuming reads the settings back out of the run directory, so the
+# run name is the only thing that has to travel.
+check(
+    "resume passes the run through and nothing else",
+    ({}, [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
+    plan("resume", "r2d2-vlaa-20260827T101500Z"),
+)
+
 check(
     "report selectors become the script's variables",
     {"LAST": "1", "FORCE": "1"},
