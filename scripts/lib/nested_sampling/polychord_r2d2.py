@@ -47,6 +47,7 @@ from common import (
     self_check_r2d2_thread_env,
     self_check_source_offset,
     self_check_spectral_window,
+    self_check_worker_pool_connect,
     self_check_worker_timeout,
     simulate_measurement_set,
     simulate_worker,
@@ -589,6 +590,7 @@ if __name__ == "__main__":
         self_check_worker_death_is_not_scored()
         self_check_resume_adoption()
         self_check_worker_timeout()
+        self_check_worker_pool_connect()
         print("metric resolution self-check passed")
     else:
         main()
