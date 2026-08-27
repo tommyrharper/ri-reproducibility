@@ -182,7 +182,11 @@ into every `summary.json`.
 file (the VLA's ten bands) so that the whole `channel_count` x
 `channel_width_hz` window stays inside one band; each band gets an equal share
 of the prior. Swap the list for another telescope's bands - no code change.
-See docs/nested-sampling.md.
+
+Widening `channel_count` or `channel_width_hz` cannot break that: each draw is
+placed only in the bands wide enough to hold it, and a window wider than every
+band (>13.5 GHz on the VLA) has its channels narrowed to fit, with a warning
+saying what the effective width ceiling is. See docs/nested-sampling.md.
 
 ## Runs that stopped early
 
