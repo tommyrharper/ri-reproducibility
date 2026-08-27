@@ -107,7 +107,10 @@ worker" and "The workers are started by the container, not by the ranks" in
 patches R2D2's `MeasOp.get_op_norm` to solve the operator norm with Lanczos
 rather than upstream's power iteration - the same quantity, ~2.5x fewer NUFFT
 pairs and ~1e-10 relative accuracy instead of ~1e-4, and no longer a different
-answer on every run (see "The operator norm is solved with Lanczos" there). Its
+answer on every run (see "The operator norm is solved with Lanczos" there) - and
+it gives each measurement operator one FINUFFT plan per transform type instead
+of the one-plan-per-transform `pytorch_finufft` builds, worth ~30% of a warm
+imaging request (see "Each measurement operator keeps its FINUFFT plans"). Its
 warm-up runs `imager.py`'s own import block - the file under a run name that is
 not `__main__` - plus the NUFFT backend `create_meas_op` imports lazily, and
 makes `utils` resolve its submodules on demand so the imaging path never pays
