@@ -20,7 +20,8 @@ The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve; see
 Upstream's `src/imager.py` has no importable entry point (its whole body sits
 under `if __name__ == "__main__"`), so each request re-runs that body with
 runpy. Its imports are then served from `sys.modules`, which is where the saving
-comes from.
+comes from - and the same guard is what lets the warm-up run the file under a
+different name to pay for those imports up front.
 
 This script runs from the repository bind mount, not from a copy baked into the
 R2D2 image, so editing it needs no image rebuild.
@@ -34,6 +35,7 @@ import resource
 import runpy
 import sys
 import traceback
+import types
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -81,6 +83,39 @@ def peak_memory_bytes() -> int:
     return max(_PEAK_FLOOR, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
 
 
+# `utils/__init__.py` re-exports one name from each of these, so importing any
+# part of `utils` imports all of them. The two at the end are the ones nothing
+# on the imaging path uses - `util_training` pulls lightning and `noise` pulls
+# scipy.optimize, 0.13s of the imaging worker's readiness between them - so the
+# search below reaches them only for a name the rest do not define.
+_UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
+
+
+def install_lazy_utils() -> None:
+    """Make `utils` import its submodules on demand rather than all at once.
+
+    A module `__getattr__` (PEP 562) that resolves a name by walking the
+    submodules in order, so `from utils import vprint` costs the submodules up
+    to the one that defines it and no more. Same names, same values - only the
+    ones nothing asks for go unimported.
+    """
+    import importlib
+
+    package = types.ModuleType("utils")
+    package.__path__ = [str(IMAGER.parent / "utils")]
+
+    def __getattr__(name: str):
+        for submodule in _UTILS_SUBMODULES:
+            value = getattr(importlib.import_module(f"utils.{submodule}"), name, None)
+            if value is not None:
+                setattr(package, name, value)
+                return value
+        raise AttributeError(f"module 'utils' has no attribute {name!r}")
+
+    package.__getattr__ = __getattr__
+    sys.modules["utils"] = package
+
+
 def warm_imports() -> None:
     """Pay `import torch` and the R2D2 modules before request one.
 
@@ -90,16 +125,25 @@ def warm_imports() -> None:
     """
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
-    # imager.py's own import block, minus the parts it re-imports for free.
-    # Anything it imports that is missing here is simply paid on request one.
+    install_lazy_utils()
+    # Run imager.py's own body under a name that is not "__main__": its imaging
+    # work is all behind an `if __name__ == "__main__"` guard, so what executes
+    # is exactly its import block - no hand-maintained copy of it to drift.
     # Under redirect_fds because a stray import-time print would otherwise land
     # in the reply stream and be read as a reply.
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
-            import optimiser  # noqa: F401
-            import utils  # noqa: F401
-
+            runpy.run_path(str(IMAGER), run_name="__warmup__")
             patch_op_norm()
+            # `create_meas_op` imports its NUFFT backend inside the function,
+            # so imager.py's import block does not reach it and every worker
+            # paid it on request one instead: 0.165s against a 0.072s steady
+            # state. This is the backend `write_r2d2_config` asks for, and it
+            # goes after patch_op_norm so that picking another one costs a slow
+            # request one rather than an unpatched operator norm.
+            from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
+                meas_op_nufft_pytorch_finufft,
+            )
         except Exception:
             traceback.print_exc()
 
@@ -248,6 +292,12 @@ def answer(fifo_base: str | None) -> None:
         replies.flush()
 
 
+# What the stub imagers below do: `sys.exit(argv[1])`, behind the same
+# `if __name__ == "__main__"` guard the real imager.py puts its body behind - so
+# the warm-up's runpy pass over it runs its imports and nothing else.
+_GUARDED_EXIT_IMAGER = "import sys\nif __name__ == '__main__':\n    sys.exit(int(sys.argv[1]))\n"
+
+
 def self_check_serve_reply_stream() -> None:
     """Replies must carry JSON only, and a failed request must not end the worker."""
     import subprocess
@@ -258,9 +308,10 @@ def self_check_serve_reply_stream() -> None:
         imager = root / "imager.py"
         imager.write_text(
             "import sys\n"
-            "print('chatter on stdout')\n"
-            "print('chatter on stderr', file=sys.stderr)\n"
-            "sys.exit(int(sys.argv[1]))\n"
+            "if __name__ == '__main__':\n"
+            "    print('chatter on stdout')\n"
+            "    print('chatter on stderr', file=sys.stderr)\n"
+            "    sys.exit(int(sys.argv[1]))\n"
         )
         worker = subprocess.Popen(
             [sys.executable, __file__],
@@ -292,7 +343,7 @@ def self_check_serve_fifo() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         imager = root / "imager.py"
-        imager.write_text("import sys\nsys.exit(int(sys.argv[1]))\n")
+        imager.write_text(_GUARDED_EXIT_IMAGER)
         base = root / "0"
         os.mkfifo(f"{base}.in")
         os.mkfifo(f"{base}.out")
@@ -327,16 +378,20 @@ def self_check_serve_pool() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        (root / "imager.py").write_text("import sys\nsys.exit(int(sys.argv[1]))\n")
-        (root / "optimiser.py").write_text("")
+        (root / "imager.py").write_text("from utils import vprint\n" + _GUARDED_EXIT_IMAGER)
         # Stands in for `import torch`: one line per interpreter that imports it.
         marker = root / "imports.log"
         # The 64MB is dropped again before the fork, so it only shows up in a
         # reply if the warm-up's high-water mark crossed the fork with it.
-        (root / "utils.py").write_text(
+        package = root / "utils"
+        package.mkdir()
+        for submodule in _UTILS_SUBMODULES:
+            (package / f"{submodule}.py").write_text("")
+        (package / "misc.py").write_text(
             f"open({str(marker)!r}, 'a').write('x\\n')\n"
             "_ = bytearray(64 * 1024 * 1024)\n"
             "del _\n"
+            "vprint = print\n"
         )
         pool = root / "pool"
         pool.mkdir()
@@ -418,9 +473,47 @@ def self_check_lanczos_largest_eigenvalue() -> None:
     print("r2d2 op-norm self-check passed")
 
 
+def self_check_lazy_utils() -> None:
+    """A name must resolve to the same value, and no later submodule than needed."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        package = Path(tmp) / "src" / "utils"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("from .misc import vprint\nfrom .noise import compute_tau\n")
+        for submodule in _UTILS_SUBMODULES:
+            (package / f"{submodule}.py").write_text("")
+        (package / "misc.py").write_text("vprint = 'from misc'\n")
+        (package / "noise.py").write_text("compute_tau = 'from noise'\n")
+
+        global IMAGER
+        saved_path, saved_imager = list(sys.path), IMAGER
+        try:
+            IMAGER = package.parent / "imager.py"
+            sys.path.insert(0, str(package.parent))
+            for name in [key for key in sys.modules if key == "utils" or key.startswith("utils.")]:
+                del sys.modules[name]
+            install_lazy_utils()
+            import utils
+
+            assert utils.vprint == "from misc", utils.vprint
+            # `misc` comes before `noise`, so asking for a name it defines must
+            # not have pulled the expensive tail of the list in behind it.
+            assert "utils.noise" not in sys.modules, "the lazy shim imported past the name it found"
+            assert utils.compute_tau == "from noise", utils.compute_tau
+            assert "utils.noise" in sys.modules
+        finally:
+            for name in [key for key in sys.modules if key == "utils" or key.startswith("utils.")]:
+                del sys.modules[name]
+            sys.path[:] = saved_path
+            IMAGER = saved_imager
+    print("r2d2 lazy utils self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_lanczos_largest_eigenvalue()
+        self_check_lazy_utils()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
