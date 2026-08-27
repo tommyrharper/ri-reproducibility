@@ -25,16 +25,34 @@ if command -v nproc >/dev/null 2>&1; then
 else
   HOST_CPUS="$(sysctl -n hw.ncpu)"
 fi
+# Rank count is what costs memory - 3.4GB of warm imaging worker each - and
+# `min(NS_NLIVE, host CPUs)` knows nothing about how much the host has left,
+# so on its own it will happily ask for more than the box holds and let the
+# OOM killer score the difference as the search's best points. See
+# scripts/lib/rank-budget.sh.
+# shellcheck source=scripts/lib/rank-budget.sh
+. "${REPO_ROOT}/scripts/lib/rank-budget.sh"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
   else
     NS_MPI_PROCS="${HOST_CPUS}"
   fi
+  # Kept for the thread split below: this is the run's fair share of the
+  # host, and it should not grow just because memory forced the rank count
+  # down. It is memory pressure that clamps the ranks, and memory pressure
+  # means another run is already using the cores this one would take.
+  NS_MPI_PROCS_UNCLAMPED="${NS_MPI_PROCS}"
+  NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2)"
+else
+  # Explicitly asked for, so it is honoured - but said out loud if it will
+  # not fit, because the way this run fails is silent.
+  ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2
+  NS_MPI_PROCS_UNCLAMPED="${NS_MPI_PROCS}"
 fi
 
 if [ -z "${R2D2_OMP_THREADS:-}" ]; then
-  R2D2_OMP_THREADS="$(( HOST_CPUS / NS_MPI_PROCS ))"
+  R2D2_OMP_THREADS="$(( HOST_CPUS / NS_MPI_PROCS_UNCLAMPED ))"
   if [ "${R2D2_OMP_THREADS}" -lt 1 ]; then
     R2D2_OMP_THREADS=1
   fi

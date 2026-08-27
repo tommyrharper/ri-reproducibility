@@ -26,12 +26,21 @@ if command -v nproc >/dev/null 2>&1; then
 else
   HOST_CPUS="$(sysctl -n hw.ncpu)"
 fi
+# A WSClean rank is cheap next to an R2D2 one (~0.2GB against ~3.4GB), but it
+# is not free, and this host runs both at once from several agent sessions.
+# Same guard, same reservation, so the two size themselves around each other
+# rather than both assuming an empty box. See scripts/lib/rank-budget.sh.
+# shellcheck source=scripts/lib/rank-budget.sh
+. "${REPO_ROOT}/scripts/lib/rank-budget.sh"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
   else
     NS_MPI_PROCS="${HOST_CPUS}"
   fi
+  NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_WSCLEAN_MB_PER_RANK}" wsclean)"
+else
+  ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_WSCLEAN_MB_PER_RANK}" wsclean
 fi
 
 mkdir -p "${OUTPUT_DIR}"
