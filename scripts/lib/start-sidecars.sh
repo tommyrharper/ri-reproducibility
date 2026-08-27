@@ -43,6 +43,15 @@ SIDECAR_NAMES=()
 _SIDECAR_PIDS=()
 _SIDECAR_JSON=""
 
+# Backgrounded: `docker rm --force` of the three containers costs ~0.4s, and
+# waiting for it is 8% of the run's wall clock spent after every result is
+# already on disk. The orphaned `docker rm` outlives this shell and finishes.
+_sidecar_remove() {
+  if [ "${#SIDECAR_NAMES[@]}" -gt 0 ]; then
+    docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 &
+  fi
+}
+
 sidecar_launch() {
   local platform="$1" image="$2" name
   local -a args=() command=(sleep infinity)
@@ -72,10 +81,15 @@ sidecar_launch() {
   # is issued, so a caller can build the command that consumes it while the
   # containers are still coming up.
   export NS_SIDECARS="{${_SIDECAR_JSON}}"
-  # Backgrounded: `docker rm --force` of the three containers costs ~0.4s, and
-  # waiting for it is 8% of the run's wall clock spent after every result is
-  # already on disk. The orphaned `docker rm` outlives this shell and finishes.
-  trap 'docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 &' EXIT
+  # INT and TERM as well as EXIT: bash does not run an EXIT trap when it dies
+  # on an uncaught signal, so a Ctrl-C or a `timeout` left the sidecars
+  # running with no parent. An abandoned R2D2 sidecar holds its whole warm
+  # worker pool - measured at 33.7GB - which then counts against every later
+  # run's memory budget (see scripts/lib/rank-budget.sh) until someone
+  # notices. Cleaning up twice is harmless; the second `docker rm` just fails.
+  trap '_sidecar_remove' EXIT
+  trap '_sidecar_remove; exit 130' INT
+  trap '_sidecar_remove; exit 143' TERM
 }
 
 sidecar_wait() {

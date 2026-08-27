@@ -10,6 +10,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - `scripts/build.sh` hashes each image's build inputs into an `ri.build-inputs` label and skips `docker build` when nothing changed (~0.08s), so rebuilding freely is cheap; the input list lives in `build.sh` and must be updated whenever a Dockerfile starts copying something new.
 - Host `__pycache__` is excluded from both the context (root `.dockerignore`) and the build-input hash, so a `--self-check` does not force a rebuild.
 - Image tags are shared across worktrees. Capture `docker images -q <tag>` per timing run and rebuild all images before trusting a result if another session could have rebuilt one.
+- Memory, not CPU, caps a run: ~3.4GB per R2D2 rank (~0.2GB per WSClean rank), linear in `NS_MPI_PROCS` and independent of `NS_NLIVE`. `scripts/lib/rank-budget.sh` clamps and reserves against it because running out is silent - an OOM-killed evaluation is recorded as `FAILURE_OBJECTIVE`, which PolyChord scores as the best point it has found. Sessions share this host, so check `docker ps --filter name=ri-ns-sidecar` for sidecars a killed run left holding memory, and expect another session's run to shrink yours.
 - Every image must byte-compile its interpreter's stdlib at build time. Check a new base image by counting its stdlib `.pyc` files.
 - Benchmark direct stage timings before end-to-end A/B confirmation. Effects below 0.1s need at least 30 interleaved pairs; check host load and use `timeout` because MeqTrees can hang.
 

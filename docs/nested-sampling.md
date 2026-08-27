@@ -157,9 +157,60 @@ pinned run directory.
 
 | Flag | Variable | Meaning | Default |
 |---|---|---|---|
-| `--mpi-procs` | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` is serial | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` (`sysctl -n hw.ncpu` on macOS, which has no `nproc`) |
-| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1 |
+| `--mpi-procs` | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` is serial | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` (`sysctl -n hw.ncpu` on macOS, which has no `nproc`), then clamped to what free memory holds - see "Rank count is the memory budget" |
+| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1, from the rank count before the memory clamp |
 | `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
+
+### Rank count is the memory budget
+
+Rank count, not `NS_NLIVE`, is what costs memory: each rank keeps one warm
+worker holding its own copy of the imaging stack. Measured on a 20-CPU, 62GB
+host with `NS_NLIVE` held at 12 and only the rank count varied:
+
+| Ranks | R2D2 peak memory |
+|---:|---:|
+| 4 | 13.5GB |
+| 8 | 27.0GB |
+| 12 | 40.6GB |
+
+That is 3.4GB per R2D2 rank, linear, against ~0.2GB per WSClean rank. Two
+consequences:
+
+- **`NS_NLIVE` is free.** It sets search quality, not memory. `--nlive 40
+  --mpi-procs 12` evaluates 40 live points 12 at a time and costs 12 ranks of
+  memory. Raise `--nlive` for a better search without paying for it in RAM.
+- **`--mpi-procs` is what has to fit.** On a 62GB host R2D2 tops out around 16
+  ranks; the CPU would allow 20.
+
+Both run scripts clamp an auto-derived rank count to what free memory can
+hold, and reserve it so that runs started at the same moment size themselves
+around each other rather than both assuming an empty host
+(`scripts/lib/rank-budget.sh`). A clamp prints a `NOTE:`; a host with no room
+for even one rank fails before starting any container. An explicit
+`--mpi-procs` is honoured, with a `WARNING:` if it will not fit.
+
+The guard exists because running out of memory here is silent rather than
+loud. The host OOM killer takes an imaging worker, the rank reads EOF from
+its reply FIFO, and the evaluation is recorded with `FAILURE_OBJECTIVE`
+(`100.0`). PolyChord maximizes the objective and a real `total_rms_jy` is
+~0.008, so an out-of-memory evaluation scores as the best point the search
+has ever seen and the sampler concentrates live points there. The run
+completes and reports a parameter region as a catastrophic failure mode when
+what actually failed was the host. Failed evaluations carry an `error` field,
+so they can be filtered afterwards - but the sampling budget is already spent.
+
+### Running WSClean and R2D2 at the same time
+
+Fine, and barely worth it. A default WSClean search is ~3s and ~1.3GB against
+R2D2's ~100s and ~27GB, so running WSClean first and R2D2 afterwards costs
+about three seconds against perfect overlap. Measured over three interleaved
+pairs, a concurrent WSClean run changed R2D2's wall clock by under 1%.
+
+What does need care is two *R2D2* runs, or any run started while another is
+warming up. Give both an explicit `--mpi-procs` whose R2D2 total stays under
+16 ranks, and prefer giving cores to R2D2: it is ~100x more expensive per
+evaluation (~14s against ~0.15s), so a core spent on WSClean buys far less
+progress.
 
 The run scripts also export these for the containers they start. They have
 no `./ri` flags. Unset, the Python ranks fall back to starting their own

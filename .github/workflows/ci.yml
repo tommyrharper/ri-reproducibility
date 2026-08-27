@@ -34,6 +34,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Check the run-script libraries
+        run: |
+          bash scripts/lib/rank-budget.sh --self-check
+          bash scripts/lib/start-sidecars.sh --self-check
+
       - name: Check shared defaults
         run: scripts/test-defaults.sh
 
