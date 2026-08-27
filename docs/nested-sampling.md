@@ -408,6 +408,20 @@ mutates in place, is deliberately never cached. Corner plot 0.66s -> 0.62s,
 five-run cold build 1.43s -> 1.37s in-container and 5% less CPU, with
 byte-identical PNGs. Best-effort like the two above.
 
+Each of those four attempts also deep-copies the whole frame first, so one
+corner plot makes ~380 copies of the same handful of frames.
+`memoize_anesthetic_drop_labels()` caches `_LabelledObject.drop_labels` against
+the frame's identity, both of its pandas `Index` objects, and which
+`(axis, level)` pairs actually get dropped - so the specs that drop the same
+levels share one copy and the rest stay apart. Pinning the indexes is what makes
+it safe: an `Index` is immutable, so adding, dropping or relabelling a column
+swaps in a new one and misses the cache instead of handing back a stale copy of
+the frame. Rewriting an existing column's values in place would still slip past
+that, but nothing on the plotting path does - the frame is read-only from load
+to `savefig`. Corner plot 0.57s -> 0.53s, five-run cold build 1.55s -> 1.51s
+in-container and 4% less CPU (7% at twenty runs), with byte-identical PNGs.
+Best-effort like the rest.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the

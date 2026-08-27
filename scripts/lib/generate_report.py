@@ -493,6 +493,64 @@ def memoize_anesthetic_labels_map():
     return True
 
 
+# The other half of that same `df[key]` detour: each of the four attempts first
+# builds a *deep copy* of the whole frame with the labels dropped, so one corner
+# plot makes ~380 copies of the same handful of frames. The result is a pure
+# function of the frame's data and of which (axis, level) pairs actually get
+# dropped, so cache it on exactly that.
+# The key pins the frame's identity *and* both of its pandas Index objects: an
+# Index is immutable, so anything that adds, drops or relabels a column swaps in
+# a new one and misses the cache. That is the guard iteration 13 found was
+# missing from a plain id(self) cache, which went stale the moment anesthetic
+# added its weight columns. Rewriting an existing column's values in place would
+# still slip past it, but nothing on the plotting path does that - the frame is
+# read-only from load to savefig. The entry holds the frame and its indexes
+# alive so their id()s cannot be recycled underneath the key.
+# Best-effort: if anesthetic moves the private class, the plot is just slower.
+_drop_labels_memoized = False
+
+
+def memoize_anesthetic_drop_labels():
+    global _drop_labels_memoized
+    if _drop_labels_memoized:
+        return True
+    _drop_labels_memoized = True
+    try:
+        import numpy as np
+
+        from anesthetic.labelled_pandas import _LabelledObject
+
+        drop_labels = _LabelledObject.drop_labels
+    except (ImportError, AttributeError):
+        return False
+
+    cache = {}
+
+    def memoized(self, axis=0):
+        try:
+            axes = self.axes
+            # Mirrors drop_labels' own loop: same order, same (axis, level)
+            # pairs, so two specs share an entry only when they drop the same
+            # levels off the same axes in the same order.
+            dropped = tuple(
+                (a, self.islabelled(a))
+                for a in np.atleast_1d(axis)
+                if a is not None and self.islabelled(a)
+            )
+            key = (id(self), tuple(id(ax) for ax in axes), dropped)
+        except Exception:
+            return drop_labels(self, axis)
+        hit = cache.get(key)
+        if hit is None:
+            if len(cache) > 64:
+                cache.clear()
+            hit = cache[key] = (self, axes, drop_labels(self, axis))
+        return hit[2]
+
+    _LabelledObject.drop_labels = memoized
+    return True
+
+
 def _render_likelihood_png(run_dir, param_names):
     load_plot_libs()
     try:
@@ -503,6 +561,7 @@ def _render_likelihood_png(run_dir, param_names):
     dedupe_pandas_tick_housekeeping()
     memoize_matplotlib_tick_updates()
     memoize_anesthetic_labels_map()
+    memoize_anesthetic_drop_labels()
 
     try:
         samples = weight_by_likelihood(load_nested_samples(run_dir))
@@ -1877,6 +1936,32 @@ def _self_check_labels_map_memo():
     assert list(second) == ["$a$", "$b$", "$c$"]
 
 
+def _self_check_drop_labels_memo():
+    """The drop-labels memo must reuse one copy for every spec that drops the
+    same levels, keep specs that drop different ones apart, and miss as soon as
+    a new column swaps the columns Index out - that last one is the guard that
+    stops a stale copy of the frame reaching the plot."""
+    if not memoize_anesthetic_drop_labels():
+        return
+    from anesthetic.labelled_pandas import LabelledDataFrame
+    from pandas import MultiIndex
+
+    columns = MultiIndex.from_tuples(
+        [("a", "$a$"), ("b", "$b$")], names=["params", "labels"]
+    )
+    df = LabelledDataFrame([[0.0, 1.0]], columns=columns)
+    stripped = df.drop_labels(1)
+    assert list(stripped.columns) == ["a", "b"]
+    assert df.drop_labels(1) is stripped, "memo missed on an unchanged frame"
+    assert df.drop_labels([0, 1]) is stripped, "same dropped levels, same copy"
+    # Nothing is labelled on the index, so this one only copies.
+    assert df.drop_labels(0) is not stripped, "different levels shared a copy"
+    df[("c", "$c$")] = 2.0
+    third = df.drop_labels(1)
+    assert third is not stripped, "memo hit after a column was added"
+    assert list(third.columns) == ["a", "b", "c"]
+
+
 def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
@@ -1894,6 +1979,7 @@ if __name__ == "__main__":
         _self_check_tick_housekeeping()
         _self_check_tick_memo()
         _self_check_labels_map_memo()
+        _self_check_drop_labels_memo()
         print("generate_report self-check passed")
     else:
         main()
