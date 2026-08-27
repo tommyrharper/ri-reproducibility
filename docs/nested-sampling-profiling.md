@@ -1192,7 +1192,8 @@ Both halves are accounted for and neither has slack left:
   and rejected: `OMP_WAIT_POLICY=PASSIVE` on the R2D2 sidecar (2 wins, 3 losses
   over 5 pairs) and launching the R2D2 sidecar before the other two (worker
   ready 2.03s either way over 6 pairs, because `sidecar_launch` already
-  backgrounds each `docker run`).
+  backgrounds each `docker run`). The 1.24s of R2D2 imports is now 1.10s - see
+  "The imaging worker warms what `imager.py` imports, and no more" below.
 - **Sampler, ~1.7s, which is one rank's evaluations.** The `eval_id` histogram
   of a run is seven ranks with 5 evaluations and one with 7, and 7 x ~0.3s is
   the whole sampler wall - PolyChord's own overhead is in the noise. Of that
@@ -1363,6 +1364,70 @@ larger than the ~0.3s the policy is worth. A per-worker microbenchmark of the
 imaging request would have shown it either way; end-to-end wall clock at this
 size will not resolve a change this small until the noise source above it is
 gone.
+
+### The imaging worker warms what `imager.py` imports, and no more
+
+With the no-op builds gone and the sampler down to ~1.3s, the binding wait in
+`make nested-sampling-r2d2-poc` is the R2D2 worker pool's readiness. It is
+directly observable from the host without instrumenting anything: a pool worker
+opens its `<rank>.in` FIFO for reading before it answers, so polling
+`os.open(fifo, O_WRONLY | O_NONBLOCK)` until it stops raising `ENXIO` dates the
+moment the rank stops waiting. On a ~3.5s run that lands at ~2.0s, and
+`run_polychord` starts within ~0.05s of it - every rank is sitting in `warm()`
+until then.
+
+`warm_imports()` used to pay for that window with a hand-copied `import
+optimiser, utils`, which was both more and less than `imager.py` needs.
+
+- **Less**: `create_meas_op` imports its NUFFT backend *inside the function*, so
+  `finufft`, `pytorch_finufft` and
+  `ri_measurement_operator...meas_op_nufft_pytorch_finufft` were not warmed at
+  all and every worker imported them on its own request one - 0.165s against a
+  0.072s steady state. Pre-importing the backend in the warm-up removes that.
+- **More**: `utils/__init__.py` re-exports one name from each of its nine
+  submodules, so importing any part of `utils` imports all of them. The imaging
+  path uses seven. The other two are the expensive ones: `utils.util_training`
+  pulls `lightning` and `utils.noise` pulls `scipy.optimize`.
+
+| after `import torch`, in the R2D2 image | |
+|---|---:|
+| `import utils` (the package `__init__`) | 0.335s |
+| the seven submodules the imaging path uses, `__init__` bypassed | 0.209s |
+| the two it does not (`noise`, `util_training`) | 0.127s |
+
+`install_lazy_utils()` puts a module with a PEP 562 `__getattr__` in
+`sys.modules["utils"]`: a name is resolved by walking the submodules in order
+until one defines it, and `noise` and `util_training` are last in that order, so
+nothing on the imaging path reaches them. Same names, same values - only the
+unused imports go unpaid. The warm-up then runs `imager.py` itself through
+`runpy.run_path(..., run_name="__warmup__")` rather than naming its imports by
+hand: upstream puts its whole body behind `if __name__ == "__main__"`, so what
+executes under any other name is exactly its import block, and there is no copy
+of that block here to drift.
+
+Interleaved A/B, 8 pairs, alternating the two `r2d2_serve.py` versions in place
+(it runs off the bind mount, so no rebuild):
+
+| | worker pool ready | end to end |
+|---|---:|---:|
+| before | 1.95 1.99 1.96 1.99 2.14 2.05 2.08 2.09 | 3.35 3.38 3.34 3.51 3.64 3.58 3.61 3.65 |
+| after | 1.88 1.81 1.87 1.84 1.93 1.86 1.95 1.89 | 3.26 3.19 3.47 3.42 3.47 3.49 3.61 3.43 |
+
+Readiness is 8 of 8, median -0.145s. End to end is 6 wins, 1 tie, 1 loss, median
+-0.10s (~3%) - the wait is what shrank, and only some of it shows up outside.
+`log(Z)` is 99.92878 +/- 0.06674 in every run of both arms, and both arms
+produce the same 38 evaluations.
+
+Two things worth recording about how this was measured. Pre-importing the NUFFT
+backend on its own is worth nothing end to end on a warm host (5 interleaved
+pairs, flat to +/-0.01s): the first profiled run that motivated it showed eight
+evaluations at 0.73-0.87s against a 0.13s steady state, one per rank, but that
+was the page cache being cold on `libtorch` and the finufft shared objects, not
+eight workers importing at once - the same run repeated warm has no such spike.
+And the R2D2 image reports `torch` at 0.85-0.92s by `-X importtime`, of which
+`torch._C` (0.19s), `_meta_registrations` (0.17s), `torch.functional`/`torch.nn`
+(0.16s), `torch.export` (0.08s) and `torch.nested` (0.06s) are stock and not
+disableable - that part of the readiness window is a hard floor.
 
 ### Sidecar containers run with `--network none`
 
