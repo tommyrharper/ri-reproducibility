@@ -676,6 +676,71 @@ def memoize_anesthetic_drop_labels():
     return True
 
 
+# Even with both halves cached, `df[key]` on a labelled frame still *runs* all
+# four label-stripped lookups and throws three of them away: anesthetic's `ac`
+# evaluates every candidate, sorts them by dimensionality (fewest first, then
+# most index levels, ties going to the earliest candidate) and returns the
+# first. For the case the corner plot hits ~65 times per plot - a plain string
+# column name on a frame whose *columns* carry the labels level - the winner is
+# decided in advance, so run only that one.
+#
+# The winner is candidate `1` (drop the labels off the columns) because, with
+# labelled columns, `df["x"]` on the two candidates that keep them (`0` and
+# `None`) indexes a >=2-level MultiIndex and so yields a 2-D frame, which loses
+# to any 1-D result outright; and of the two that strip them (`1` and `[0, 1]`)
+# candidate `1` leaves the *index* untouched, so it never has fewer index
+# levels than candidate `[0, 1]` and it comes first on a tie. A DataFrame lookup
+# cannot return a 0-D result, so nothing can undercut a 1-D one. Any candidate
+# that raises is dropped by `ac` and cannot win either.
+#
+# Each guard is a premise of that argument rather than a safety net: a string
+# key is what forces candidates `0` and `None` to be 2-D, labelled columns are
+# what make the labels a level to strip in the first place, and a Series is a
+# two-candidate search over scalar results - a different comparison entirely.
+# Anything outside the guards, any candidate that raises, and any result that
+# turns out not to be 1-D all fall back to anesthetic's own search, so a shape
+# the argument does not cover is slow rather than wrong.
+# Best-effort: if anesthetic moves the private class, the plot is just slower.
+_labelled_column_shortcut = False
+
+
+def shortcut_anesthetic_labelled_column():
+    global _labelled_column_shortcut
+    if _labelled_column_shortcut:
+        return True
+    _labelled_column_shortcut = True
+    try:
+        from pandas import Series
+        from pandas.errors import IndexingError
+
+        from anesthetic.labelled_pandas import LabelledDataFrame, _LabelledObject
+
+        getitem = _LabelledObject.__getitem__
+    except (ImportError, AttributeError):
+        return False
+
+    def shortcut(self, key):
+        if (
+            type(key) is str
+            and isinstance(self, LabelledDataFrame)
+            and self.islabelled(1)
+        ):
+            try:
+                column = super(_LabelledObject, self.drop_labels(1)).__getitem__(key)
+            except (KeyError, ValueError, TypeError, IndexingError):
+                return getitem(self, key)
+            if getattr(column, "ndim", None) == 1:
+                # The rename `ac` applies to whichever candidate it returns.
+                labels = self.get_labels_map(1)
+                if isinstance(labels, Series) and column.name in labels.index:
+                    column.name = labels.loc[column.name]
+                return column
+        return getitem(self, key)
+
+    _LabelledObject.__getitem__ = shortcut
+    return True
+
+
 # matplotlib looks up an Axes' axis objects through the _axis_map property,
 # which rebuilds a dict - two f-strings and two getattrs - on every read. One
 # corner plot reads it ~4500 times and the answer only ever changes where
@@ -887,6 +952,7 @@ def _render_likelihood_png(run_dir, param_names):
     memoize_matplotlib_text_layout()
     memoize_anesthetic_labels_map()
     memoize_anesthetic_drop_labels()
+    shortcut_anesthetic_labelled_column()
     skip_settled_matplotlib_viewlims()
     cache_matplotlib_axis_map()
     memoize_matplotlib_alias_maps()
@@ -2370,6 +2436,88 @@ def _self_check_drop_labels_memo():
     assert list(third.columns) == ["a", "b", "c"]
 
 
+def _self_check_labelled_column_shortcut():
+    """The labelled-column shortcut must return exactly what anesthetic's own
+    four-way search returns - same type, same index, same values, same
+    relabelled name - on every shape the corner plot can hand it, and raise
+    where it raises. Each case is built twice: pandas caches a frame's column
+    Series, so resolving both ways on one frame would compare an object with
+    itself and prove nothing."""
+    if not shortcut_anesthetic_labelled_column():
+        return
+    from anesthetic.labelled_pandas import (
+        LabelledDataFrame,
+        LabelledSeries,
+        _LabelledObject,
+        ac,
+    )
+    from pandas import MultiIndex
+
+    def searched(frame, key):
+        """anesthetic's own resolution, spelled out so the patch can't shadow it."""
+        return ac(
+            [
+                (
+                    super(_LabelledObject, frame.drop_labels(i)).__getitem__,
+                    frame.get_labels_map(i),
+                )
+                for i in frame._all_axes()
+            ],
+            key,
+        )
+
+    def same(build, key):
+        got, want = build()[key], searched(build(), key)
+        assert got is not want, "the two frames shared pandas' column cache"
+        assert type(got) is type(want), (key, type(got), type(want))
+        assert getattr(got, "name", None) == getattr(want, "name", None), (
+            key,
+            getattr(got, "name", None),
+            getattr(want, "name", None),
+        )
+        assert [list(a) for a in got.axes] == [list(a) for a in want.axes], (
+            key,
+            got.axes,
+            want.axes,
+        )
+        assert list(got.to_numpy().ravel()) == list(want.to_numpy().ravel()), key
+
+    labelled = MultiIndex.from_tuples(
+        [("a", "$a$"), ("b", "$b$")], names=["params", "labels"]
+    )
+    # The corner plot's own shape: labelled columns, plain index, string key.
+    same(lambda: LabelledDataFrame([[0.0, 1.0], [2.0, 3.0]], columns=labelled), "a")
+    # A key that names the whole (param, label) pair instead of the param.
+    same(lambda: LabelledDataFrame([[0.0, 1.0]], columns=labelled), ("b", "$b$"))
+    # Labels on the index as well - the shortcut still has to pick the
+    # candidate that leaves the index alone.
+    same(
+        lambda: LabelledDataFrame(
+            [[0.0, 1.0], [2.0, 3.0]], index=labelled, columns=labelled
+        ),
+        "b",
+    )
+    # A key that leaves a column level behind: every candidate is 2-D, so the
+    # search falls through to its level count and keeps a *different* one.
+    nested = MultiIndex.from_tuples(
+        [("g", "a", "$a$"), ("g", "b", "$b$")], names=["group", "params", "labels"]
+    )
+    same(lambda: LabelledDataFrame([[0.0, 1.0]], columns=nested), "g")
+    # Nothing labelled at all, and a Series rather than a frame: both outside
+    # the shortcut's guards.
+    same(lambda: LabelledDataFrame([[0.0, 1.0]], columns=["a", "b"]), "a")
+    assert LabelledSeries([0.0, 1.0], index=labelled)["a"] == searched(
+        LabelledSeries([0.0, 1.0], index=labelled), "a"
+    )
+    # A column that is not there still raises rather than resolving.
+    try:
+        LabelledDataFrame([[0.0]], columns=labelled[:1])["missing"]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("a missing column silently resolved")
+
+
 def _self_check_viewlim_skip():
     """The settled-viewLim skip must not run the scan twice for one settled
     epoch, must still autoscale once something asks for it, and must not record
@@ -2495,6 +2643,7 @@ if __name__ == "__main__":
         _self_check_tight_bbox()
         _self_check_labels_map_memo()
         _self_check_drop_labels_memo()
+        _self_check_labelled_column_shortcut()
         _self_check_viewlim_skip()
         _self_check_axis_map_cache()
         _self_check_alias_map_memo()
