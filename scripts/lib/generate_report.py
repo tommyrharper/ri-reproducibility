@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2575,11 +2576,24 @@ def main(argv=None):
                 load_render_libs()
             with multiprocessing.Pool(workers) as body_pool:
                 bodies = [body_pool.apply_async(run_body_task, (item,)) for item in todo]
-                for item, plot, body in zip(todo, plots, bodies):
+                # write_run_page already prints "wrote <path>" per page, on
+                # its own newline-terminated line - a \r-redrawn line here
+                # collided with it instead of overwriting it (no newline of
+                # its own to end on, so the next page's "wrote ..." print
+                # kept appending to the end of this one instead of starting
+                # fresh), which is what made this look like nothing was
+                # printed at all rather than a run-on mess. Printing our own
+                # plain line, always newline-terminated, avoids that outright
+                # instead of trying to redraw in place.
+                start = time.monotonic()
+                for i, (item, plot, body) in enumerate(zip(todo, plots, bodies), start=1):
                     write_run_page(
                         item,
                         body.get().replace(LIKELIHOOD_SLOT, likelihood_section(plot.get())),
                     )
+                    elapsed = time.monotonic() - start
+                    eta = format_duration(elapsed / i * (len(todo) - i)) if i < len(todo) else "0s"
+                    print(f"[{i}/{len(todo)}] elapsed {format_duration(elapsed)}  eta {eta}")
 
     # The index is cheap and must reflect every run on disk, so always rebuild it.
     write_html_doc(
