@@ -1582,10 +1582,10 @@ def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> "subpro
     the same value, so there is nothing per-rank to lose.
     """
     if r2d2_image not in _R2D2_WORKERS:
-        worker = _connect_shell_started_worker("NS_R2D2_FIFO_DIR")
+        container = sidecar_container(r2d2_image, platform, r2d2_checkpoint_mount(checkpoints_dir))
+        worker = _connect_shell_started_worker("NS_R2D2_FIFO_DIR", container)
         if worker is None:
             repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
-            container = sidecar_container(r2d2_image, platform, r2d2_checkpoint_mount(checkpoints_dir))
             worker = subprocess.Popen(
                 [
                     "docker", "exec", "--interactive",
@@ -1875,6 +1875,51 @@ def self_check_worker_timeout() -> None:
         globals().update(original)
 
     print("worker timeout self-check passed")
+
+
+def self_check_worker_pool_connect() -> None:
+    """Both workers must reach their pre-warmed FIFO pool, not just simulate.
+
+    `_connect_shell_started_worker` has two call sites, and a signature change
+    that updated only the simulate one left `r2d2_worker` raising TypeError on
+    the first evaluation of every pooled R2D2 run - invisible to a WSClean run,
+    which never takes this path. Calling both here is what makes the two call
+    sites drift loudly instead of silently.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / str(mpi_rank())
+        os.mkfifo(f"{base}.in")
+        os.mkfifo(f"{base}.out")
+        # O_RDWR is the one open mode a FIFO never blocks on, and it puts the
+        # reader on .in and the writer on .out that a live worker would.
+        ends = [os.open(f"{base}.in", os.O_RDWR), os.open(f"{base}.out", os.O_RDWR)]
+        original = dict(os.environ)
+        try:
+            os.environ["NS_SIMULATE_FIFO_DIR"] = tmp
+            os.environ["NS_R2D2_FIFO_DIR"] = tmp
+            # The run script already started these; naming them here keeps the
+            # check off docker entirely.
+            _SIDECAR_CONTAINERS["meqtrees-self-check"] = "self-check"
+            _SIDECAR_CONTAINERS["r2d2-self-check"] = "self-check"
+            for worker in (
+                simulate_worker("meqtrees-self-check", "linux/amd64"),
+                r2d2_worker("r2d2-self-check", "linux/amd64", "/checkpoints"),
+            ):
+                assert isinstance(worker, FifoWorker), type(worker)
+                atexit.unregister(worker.terminate)
+        finally:
+            for image in ("meqtrees-self-check", "r2d2-self-check"):
+                _SIDECAR_CONTAINERS.pop(image, None)
+            _SIMULATE_WORKERS.pop("meqtrees-self-check", None)
+            _R2D2_WORKERS.pop("r2d2-self-check", None)
+            os.environ.clear()
+            os.environ.update(original)
+            for fd in ends:
+                os.close(fd)
+
+    print("worker pool connect self-check passed")
 
 
 def self_check_parameter_space() -> None:
