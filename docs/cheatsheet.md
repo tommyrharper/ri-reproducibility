@@ -171,12 +171,18 @@ Failed simulate/imaging evaluations score `100.0`.
 | `dynamic_range` | `1e2` - `1e3` |
 | `observation_minutes` | `4` - `10` |
 | `channel_count` | `2` - `6` |
-| `start_frequency_hz` | `1.0e9` - `1.1e9` |
+| `start_frequency_hz` | inside one receiver band |
 | `channel_width_hz` | `0.5e6` - `2.0e6` |
 
 Defined as `[[parameter_space]]` in `defaults.toml`, read by
 `load_parameter_space()` in `scripts/lib/nested_sampling/common.py` and copied
 into every `summary.json`.
+
+`start_frequency_hz` is drawn from the `[[receiver_band]]` list in the same
+file (the VLA's ten bands) so that the whole `channel_count` x
+`channel_width_hz` window stays inside one band; each band gets an equal share
+of the prior. Swap the list for another telescope's bands - no code change.
+See docs/nested-sampling.md.
 
 ## Runs that stopped early
 

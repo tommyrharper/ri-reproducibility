@@ -135,8 +135,8 @@ DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
 
 @cache
-def load_parameter_space() -> list[dict[str, Any]]:
-    """The parameter space the sampler searches - `[[parameter_space]]` in defaults.toml.
+def load_defaults() -> dict[str, Any]:
+    """defaults.toml, the one file both the host and the containers read.
 
     REPO_ROOT is what the containers get: the repo is bind-mounted at the same
     path inside them, and this module is baked in at /opt/ri-nested-sampling,
@@ -156,8 +156,81 @@ def load_parameter_space() -> list[dict[str, Any]]:
         path = Path(root) / "defaults.toml"
         if path.is_file():
             with path.open("rb") as handle:
-                return tomllib.load(handle)["parameter_space"]
+                return tomllib.load(handle)
     raise SystemExit("no defaults.toml found - set REPO_ROOT to the repository root")
+
+
+@cache
+def load_receiver_bands() -> list[dict[str, Any]]:
+    """The receiver bands a spectral window has to fit inside - `[[receiver_band]]`.
+
+    Sorted by frequency so the unit-cube mapping does not depend on the order
+    they happen to be written in.
+    """
+    bands = load_defaults()["receiver_band"]
+    if not bands:
+        raise SystemExit("defaults.toml: [[receiver_band]] is empty")
+    return sorted(bands, key=lambda band: float(band["min"]))
+
+
+@cache
+def load_parameter_space() -> list[dict[str, Any]]:
+    """The parameter space the sampler searches - `[[parameter_space]]` in defaults.toml.
+
+    A `kind = "band_start"` dimension carries no `min`/`max` of its own: its
+    box is the span of the receiver bands, filled in here so that everything
+    reading a spec (paramnames, plots, summary.json) sees a plain box.
+    """
+    specs = load_defaults()["parameter_space"]
+    for spec in specs:
+        if spec.get("kind") == "band_start":
+            bands = load_receiver_bands()
+            spec.setdefault("min", min(float(band["min"]) for band in bands))
+            spec.setdefault("max", max(float(band["max"]) for band in bands))
+    return specs
+
+
+def placeable_start_ranges(window_hz: float) -> list[tuple[float, float]]:
+    """Per band, the start frequencies a `window_hz`-wide window fits inside.
+
+    Bands too narrow to hold the window drop out, so a window wider than every
+    band would leave nothing - place_spectral_window() narrows the channels
+    instead of letting that happen.
+    """
+    return [
+        (float(band["min"]), float(band["max"]) - window_hz)
+        for band in load_receiver_bands()
+        if float(band["max"]) - float(band["min"]) >= window_hz
+    ]
+
+
+def place_spectral_window(cube_value: float, channel_count: int, channel_width_hz: float) -> tuple[float, float]:
+    """Map a unit-cube value onto a start frequency, with the window inside one band.
+
+    Each band that can hold `channel_count` channels of `channel_width_hz` gets
+    an equal share of the dimension; within a share the start frequency is
+    uniform over that band's placeable range. Returns the channel width too
+    because a window wider than the widest band is narrowed to fit rather than
+    placed outside one.
+    """
+    widest = max(float(band["max"]) - float(band["min"]) for band in load_receiver_bands())
+    width = min(float(channel_width_hz), widest / channel_count)
+    ranges = placeable_start_ranges(channel_count * width)
+    position = min(1.0, max(0.0, cube_value)) * len(ranges)
+    index = min(int(position), len(ranges) - 1)
+    lower, upper = ranges[index]
+    return lower + (position - index) * (upper - lower), width
+
+
+def spectral_window_cube_value(start_frequency_hz: float, channel_count: int, channel_width_hz: float) -> float:
+    """The inverse of place_spectral_window(), for the theta -> cube round trip."""
+    ranges = placeable_start_ranges(channel_count * channel_width_hz)
+    for index, (lower, upper) in enumerate(ranges):
+        if start_frequency_hz <= upper or index == len(ranges) - 1:
+            span = upper - lower
+            within = 0.0 if span <= 0.0 else (start_frequency_hz - lower) / span
+            return (index + min(1.0, max(0.0, within))) / len(ranges)
+    return 1.0
 
 
 # GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
@@ -230,11 +303,19 @@ def scale(cube_value: float, lower: float, upper: float) -> float:
 
 def cube_to_params(cube: np.ndarray) -> dict[str, Any]:
     raw: dict[str, Any] = {}
-    for i, spec in enumerate(load_parameter_space()):
+    specs = load_parameter_space()
+    for i, spec in enumerate(specs):
         value = scale(float(cube[i]), float(spec["min"]), float(spec["max"]))
         if spec.get("kind") == "integer":
             value = int(round(value))
         raw[spec["name"]] = value
+    # The band-start dimension is placed last: where the window can start, and
+    # whether its channels have to be narrowed, both depend on how wide it is.
+    for i, spec in enumerate(specs):
+        if spec.get("kind") == "band_start":
+            raw[spec["name"]], raw["channel_width_hz"] = place_spectral_window(
+                float(cube[i]), raw["channel_count"], raw["channel_width_hz"]
+            )
     raw["dynamic_range"] = 10.0 ** raw.pop("log10_dynamic_range")
     raw["vla_config"] = "VLA.A"
     raw["source_flux_jy"] = 1.0
@@ -1260,8 +1341,16 @@ def convert_ms_to_mat(
 
 def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:
     specs = load_parameter_space()
+    values = {str(spec["name"]): float(theta[i]) for i, spec in enumerate(specs)}
     cube_like = np.zeros(len(specs), dtype=np.float64)
     for i, spec in enumerate(specs):
+        if spec.get("kind") == "band_start":
+            cube_like[i] = spectral_window_cube_value(
+                values[str(spec["name"])],
+                int(round(values["channel_count"])),
+                values["channel_width_hz"],
+            )
+            continue
         lower = float(spec["min"])
         upper = float(spec["max"])
         cube_like[i] = (float(theta[i]) - lower) / (upper - lower)
@@ -1285,6 +1374,53 @@ def self_check_parameter_space() -> None:
         assert float(spec["min"]) < float(spec["max"]), spec
     # TOML keeps int and float apart, and cube_to_params rounds this one.
     assert {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"} in specs
+
+
+def self_check_spectral_window() -> None:
+    """Every sampled window sits inside one receiver band, and inverts back."""
+    bands = load_receiver_bands()
+    assert bands and all(float(b["min"]) < float(b["max"]) for b in bands), bands
+
+    specs = load_parameter_space()
+    index = next(i for i, spec in enumerate(specs) if spec.get("kind") == "band_start")
+    rng = np.random.default_rng(0)
+    seen = set()
+    for _ in range(2000):
+        cube = rng.random(len(specs))
+        params = cube_to_params(cube)
+        start = params["start_frequency_hz"]
+        stop = start + params["channel_count"] * params["channel_width_hz"]
+        band = next(
+            (b for b in bands if float(b["min"]) <= start and stop <= float(b["max"])),
+            None,
+        )
+        assert band is not None, params
+        seen.add(band["name"])
+        # theta -> cube -> params is the sampler's own round trip; it has to
+        # land back on the same parameters (to floating-point), or the
+        # likelihood would see different ones from those PolyChord stored.
+        theta = prior_vector(cube, params)
+        again = cube_to_params(cube_like_from_theta(theta))
+        assert again.keys() == params.keys()
+        for name, value in params.items():
+            other = again[name]
+            assert isinstance(value, float) and math.isclose(value, other, rel_tol=1e-9) or value == other, (name, value, other)
+    assert len(seen) == len(bands), sorted(seen)
+
+    # The unit cube's ends land on the ends of the lowest and highest band.
+    edges = np.zeros(len(specs))
+    assert cube_to_params(edges)["start_frequency_hz"] == float(bands[0]["min"])
+    edges[index] = 1.0
+    top = cube_to_params(edges)
+    assert top["start_frequency_hz"] + top["channel_count"] * top["channel_width_hz"] == float(bands[-1]["max"])
+
+    # A window wider than every band is narrowed to fit rather than placed
+    # outside one - what stops a widened channel_width_hz from sampling
+    # frequencies the telescope cannot observe.
+    narrowest = min(float(b["max"]) - float(b["min"]) for b in bands)
+    start, width = place_spectral_window(0.0, 4, narrowest)
+    assert 4 * width <= max(float(b["max"]) - float(b["min"]) for b in bands), width
+    assert any(float(b["min"]) <= start and start + 4 * width <= float(b["max"]) for b in bands)
 
 
 def self_check_r2d2_thread_env() -> None:

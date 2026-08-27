@@ -39,6 +39,7 @@ from common import (
     self_check_parameter_space,
     self_check_profiling,
     self_check_resume_adoption,
+    self_check_spectral_window,
     sidecar_command,
     sidecar_run,
     sidecar_shell,
@@ -397,6 +398,7 @@ if __name__ == "__main__":
     if os.environ.get("POLYCHORD_WSCLEAN_SELF_CHECK") == "1":
         self_check_metric_resolution()
         self_check_parameter_space()
+        self_check_spectral_window()
         self_check_lazy_numpy()
         self_check_fits_reader()
         self_check_profiling()
