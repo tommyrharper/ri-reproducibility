@@ -29,7 +29,9 @@
 # corner plot and the rest of its page, in two pools forked either side of the
 # astropy import so only the parent pays for it. anesthetic is imported in the
 # parent too, so the corner-plot workers inherit it rather than each repeating
-# the import. The corner plot also de-duplicates pandas' per-plot-call tick
+# the import. matplotlib's 3d projection is skipped on the way in - nothing here
+# draws in 3d and matplotlib already copes with an unimportable Axes3D - which
+# is 6.7% of the `import matplotlib.pyplot` on that same serial prologue. The corner plot also de-duplicates pandas' per-plot-call tick
 # housekeeping and the shared-axis scan that drives it, memoises matplotlib's
 # per-axis tick updates and its per-text layout measurements, skips its
 # shared-axis autoscale scan while nothing has gone stale, caches anesthetic's

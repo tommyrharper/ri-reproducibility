@@ -561,6 +561,34 @@ importing the module - the self-checks, host-side use - leaves the caller's gc
 alone; the pool workers inherit the setting across fork. This is the one lever
 that helps the serial import prologue as well as the plots.
 
+`load_plot_libs()` skips matplotlib's 3d projection. `matplotlib.projections`
+imports `mpl_toolkits.mplot3d` solely to register the `'3d'` projection, inside
+a `try`/`except` that already degrades to "3d unavailable" when the import
+fails. Nothing here draws in 3d - a corner plot is a grid of 2d axes - so a
+`None` is parked in `sys.modules` for the duration of the `import
+matplotlib.pyplot`, which makes that import raise `ImportError` and take the
+branch matplotlib already handles. The entry is removed again immediately, so a
+later `import mpl_toolkits.mplot3d` still works; only the registry entry stays
+gone, which turns an accidental `projection='3d'` into a loud `ValueError`
+rather than a silently wrong plot. Worth 17ms of the 258ms `import
+matplotlib.pyplot` (-6.7%), median of 15 interleaved runs with the two
+distributions not overlapping at all.
+
+Alongside it, `multiprocessing` (3.4ms) is imported only once `main()` has runs
+to fan out, and `tempfile`/`shutil` (2.0ms) only inside the self-checks that
+use them, so a rebuild with nothing to do stops paying for either: its CPU
+drops from 0.093s to 0.081s (-13%). Together with the 3d skip the parent's
+serial import prologue - `import generate_report` plus matplotlib plus
+anesthetic, which is over half a cold build's critical path - goes from 600.6ms
+to 577.0ms (-3.9%), on every build that draws anything.
+
+Two neighbouring import trims are measured dead and should not be retried:
+`pyparsing` (29ms) cannot be dropped with the `_fontconfig_pattern` it first
+appears under, because `matplotlib._mathtext` imports it anyway for the math
+labels; and `importlib.metadata` (23ms) cannot be stubbed for anesthetic's
+`__version__`, because pandas' plotting-backend loader needs its real
+`entry_points()` on the same path.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the
