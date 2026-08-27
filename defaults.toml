@@ -48,18 +48,18 @@ NS_METRIC = "total_rms_jy"
 
 [[parameter_space]]
 name = "log10_dynamic_range"
-min = 2.0
-max = 3.0
+min = 1.0
+max = 6.0
 
 [[parameter_space]]
 name = "observation_minutes"
-min = 4.0
-max = 10.0
+min = 0.3
+max = 20.0
 
 [[parameter_space]]
 name = "channel_count"
-min = 2
-max = 6
+min = 1
+max = 8
 kind = "integer"
 
 [[parameter_space]]
@@ -68,7 +68,7 @@ kind = "band_start"
 
 [[parameter_space]]
 name = "channel_width_hz"
-min = 0.5e6
+min = 0.1e6
 max = 2.0e6
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
