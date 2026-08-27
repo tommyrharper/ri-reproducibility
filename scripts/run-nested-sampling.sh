@@ -129,6 +129,11 @@ RUN_COMMAND=(
   "${POLYCHORD_CONTAINER}"
   mpirun
   --allow-run-as-root
+  # The rank count comes from `nproc`, which counts hardware threads, but Open
+  # MPI's default slot count is physical cores. On any SMT host the two
+  # disagree and mpirun refuses to launch ("not enough slots"). This makes Open
+  # MPI count the same units the rank count was derived from.
+  --use-hwthread-cpus
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_wsclean.py
   --output-dir "${OUTPUT_DIR}"
