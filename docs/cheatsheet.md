@@ -178,6 +178,19 @@ Defined as `[[parameter_space]]` in `defaults.toml`, read by
 `load_parameter_space()` in `scripts/lib/nested_sampling/common.py` and copied
 into every `summary.json`.
 
+## Runs that stopped early
+
+A run writes `summary.json` only when it finishes, so one without it stopped -
+and the report, which globs for `summary.json`, will not show it at all.
+
+```bash
+./ri runs                  # every run, with whether it finished
+./ri runs --incomplete     # only the ones that stopped
+./ri resume <run>          # continue one, keeping the evaluations it has
+```
+
+`resume` takes no settings: the run recorded its own in `run.env`.
+
 ## Reports
 
 ```bash

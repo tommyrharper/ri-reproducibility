@@ -1668,6 +1668,11 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .gallery figcaption { font-size: 0.75rem; opacity: 0.7; text-align: center; margin-top: 0.25rem; word-break: break-all; }
 .manifest-name { font-size: 0.75rem; opacity: 0.5; margin-top: 0.75rem; margin-bottom: 0; }
 .empty { opacity: 0.6; }
+.unfinished { border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); border-radius: 8px; padding: 0.75rem 1rem; margin: 0 0 1rem; }
+.unfinished h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+.unfinished ul { margin: 0.5rem 0 0; padding-left: 1.25rem; }
+.unfinished li { margin: 0.25rem 0; }
+.unfinished code { font-size: 0.85rem; }
 .eval-table-wrap { overflow-x: auto; margin: 0.5rem 0; }
 .eval-table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
 .eval-table th, .eval-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); text-align: left; vertical-align: top; }
@@ -2082,10 +2087,47 @@ INDEX_SCRIPT = """
 """
 
 
+def unfinished_run_names():
+    """Runs that stopped before finishing, newest first.
+
+    summary.json is written only once PolyChord returns, so a run directory
+    without one stopped early. That matters here more than anywhere: the index
+    below is built by globbing for summary.json, so an interrupted run is not
+    listed as failed, it is simply missing - and a run that silently vanishes
+    from the report is the one nobody goes back to.
+    """
+    names = []
+    for path in sorted(glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*")), reverse=True):
+        if os.path.isdir(path) and not os.path.exists(os.path.join(path, "summary.json")):
+            names.append(os.path.basename(path))
+    return names
+
+
+def render_unfinished_runs():
+    names = unfinished_run_names()
+    if not names:
+        return ""
+    count = len(names)
+    items = "".join(
+        f"<li><code>{html.escape(name)}</code> &mdash; "
+        f"<code>./ri resume {html.escape(name)}</code></li>"
+        for name in names
+    )
+    return (
+        '<section class="unfinished">'
+        f"<h2>{count} run{'' if count == 1 else 's'} stopped before finishing</h2>"
+        "<p>These have no <code>summary.json</code>, so they have no page below. "
+        "Each can be continued where it left off, keeping every evaluation it "
+        "already finished:</p>"
+        f"<ul>{items}</ul>"
+        "</section>"
+    )
+
+
 def render_nested_sampling_index(status_for):
     paths = nested_sampling_run_paths()
     if not paths:
-        return (
+        return render_unfinished_runs() + (
             '<p class="empty">No nested-sampling runs found under '
             "results/nested-sampling/*/summary.json yet.</p>"
         )
@@ -2098,7 +2140,8 @@ def render_nested_sampling_index(status_for):
             algorithm_tokens.append(algorithm_token)
     algorithm_tokens.sort()
     return (
-        render_index_toolbar(algorithm_tokens)
+        render_unfinished_runs()
+        + render_index_toolbar(algorithm_tokens)
         + f'<div id="ns-index-list">{"".join(entries)}</div>'
         + INDEX_SCRIPT
     )
