@@ -29,6 +29,7 @@ from common import (
     resolve_metric,
     run_checked,
     run_docker_monitored,
+    self_check_lazy_numpy,
     self_check_metric_resolution,
     self_check_profiling,
     self_check_r2d2_thread_env,
@@ -439,6 +440,7 @@ def main() -> None:
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_R2D2_SELF_CHECK") == "1":
         self_check_metric_resolution()
+        self_check_lazy_numpy()
         self_check_r2d2_thread_env()
         self_check_profiling()
         self_check_failure_record_persistence()

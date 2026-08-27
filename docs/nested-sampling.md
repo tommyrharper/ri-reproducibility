@@ -348,7 +348,12 @@ matplotlib figure - roughly 16x cheaper per image and 5x smaller on disk, and
 indistinguishable at the size the pages display them. What is left of a full
 redraw's cost is the anesthetic corner plot. A rebuild that redraws nothing does not even
 import astropy or matplotlib - they are loaded on the first missing PNG - which
-is most of what is left of a page-only rebuild. The two halves load separately:
+is most of what is left of a page-only rebuild. numpy goes the same way:
+`poc_common.py` binds `np` to a shim that imports numpy on first attribute
+access, because the report reaches into that module only for its formatting
+helpers and a page-only rebuild never touches an array (0.19s -> 0.16s on a five-run page-only rebuild, and
+`self_check_lazy_numpy()` there fails if a module-level `np.` use creeps back
+in). The two halves load separately:
 the corner plot needs only matplotlib, the eval rasters astropy and PIL on top,
 so a cold build keeps astropy out of the parent's serial prologue and off the
 corner plot's critical path (the longest task in the build). The index is always rebuilt, so

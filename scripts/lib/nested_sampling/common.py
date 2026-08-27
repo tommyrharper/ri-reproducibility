@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -18,7 +19,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+
+class _LazyNumpy:
+    """numpy, imported on first attribute access instead of at import time.
+
+    numpy is 0.134s of this module's 0.144s import (0.03s of it once the
+    report's own stdlib imports have primed the shared machinery), and the
+    report only wants the formatting helpers below - a rebuild that writes
+    pages from the image store never touches an array, so it should not pay
+    for numpy at all. Every `np.x` here is inside a function body (annotations
+    are strings under
+    ``from __future__ import annotations``), so the first such access rebinds
+    the module global to the real numpy and this shim drops out of the picture
+    for the rest of the process, including the sampler's likelihood loop.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        global np
+        import numpy as np
+
+        return getattr(np, name)
+
+
+np: Any = _LazyNumpy()
 
 
 METRIC_NAMES = (
@@ -1020,6 +1043,26 @@ def self_check_fits_reader() -> None:
     assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
     assert header["SIMPLE"] is True
     assert int(header["NAXIS"]) == int(expected_header["NAXIS"])
+
+
+def self_check_lazy_numpy() -> None:
+    """Importing this module must not import numpy, and `np` must still work.
+
+    Needs a fresh interpreter: any caller that has already touched an array has
+    numpy in sys.modules. The regression this catches is a new module-level
+    `np.` use, which would re-import numpy eagerly and silently give the
+    report's page-only rebuild its 0.03s back.
+    """
+    probe = (
+        "import sys, poc_common;"
+        "assert 'numpy' not in sys.modules, 'poc_common imported numpy eagerly';"
+        "assert poc_common.np.array([1.0, 2.0]).sum() == 3.0;"
+        "assert 'numpy' in sys.modules;"
+        "assert poc_common.np is sys.modules['numpy'], 'np was not rebound'"
+    )
+    subprocess.run(
+        [sys.executable, "-c", probe], cwd=str(Path(__file__).parent), check=True
+    )
 
 
 def self_check_metric_resolution() -> None:
