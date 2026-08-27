@@ -150,7 +150,7 @@ yourself still works and still wins over `defaults.toml`; a flag wins over both.
 | `NS_MAX_NDEAD` | Dead-point budget that terminates the run (`--max-ndead`) | `12` |
 | `NS_SEED` | PolyChord random seed (`--seed`) | `41` |
 | `NS_METRIC` | Objective (`--metric`): `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
-| `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `docker info` |
+| `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` disables parallel evaluations | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` |
 | `NS_SIDECARS` | JSON map from image name to that image's long-lived sidecar container | Exported by `scripts/lib/start-sidecars.sh`. Unset means `{}`: each rank starts its own container per image |
 | `NS_SIMULATE_FIFO_DIR` | Directory holding the per-rank `<rank>.in` / `<rank>.out` FIFOs of the pre-warmed simulate workers | `${OUTPUT_DIR}/.simulate-workers`, set by both run scripts. No default: unset means each rank starts its own simulate worker |
 | `NS_R2D2_FIFO_DIR` | Same, for the pre-warmed `r2d2_serve.py` imaging workers | `${OUTPUT_DIR}/.r2d2-workers`, set by the R2D2 run script. No default: unset means each rank `docker exec`s its own imaging worker |

@@ -11,6 +11,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Host `__pycache__` is excluded from both the context (root `.dockerignore`) and the build-input hash, so a `--self-check` does not force a rebuild.
 - Image tags are shared across worktrees. Capture `docker images -q <tag>` per timing run and rebuild all images before trusting a result if another session could have rebuilt one.
 - Every image must byte-compile its interpreter's stdlib at build time. Check a new base image by counting its stdlib `.pyc` files.
+- Benchmark direct stage timings before end-to-end A/B confirmation. Effects below 0.1s need at least 30 interleaved pairs; use `timeout` because MeqTrees can hang.
 
 ## Maintaining this file
 

@@ -10,12 +10,15 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/r2d2-vlaa-${RUN_ID}}"
 
-# Also the daemon-availability check - a dead daemon fails the sidecar launches
-# too, but this is where the run says so.
-if ! HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null)"; then
-  echo "FATAL: Docker daemon is not available" >&2
-  exit 1
-fi
+# Needed before the launches, because the containers' commands below want one
+# FIFO pair per rank to already exist. `nproc` and not `docker info --format
+# '{{.NCPU}}'`: the two answer the same on any daemon these scripts can use -
+# every sidecar bind-mounts host paths, so the daemon is always this host - and
+# `docker info` is ~0.06s of CLI-plus-daemon round trip sitting in front of the
+# R2D2 sidecar's `docker run`, which is 1:1 on the run's wall clock. The
+# daemon-availability check it doubled as is below the launches instead, where
+# it overlaps the containers coming up and costs nothing.
+HOST_CPUS="$(nproc)"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -110,6 +113,14 @@ sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
 sidecar_launch "${PLATFORM}" "${POLYCHORD_IMAGE}" \
   -v "${DOCKER_SOCKET}:/var/run/docker.sock"
 POLYCHORD_CONTAINER="${SIDECAR_NAME}"
+
+# A dead daemon fails the launches above too, but they are backgrounded, so this
+# is where the run says so. Here rather than in front of them because at this
+# point the ~0.06s overlaps the containers starting.
+if ! docker info --format '{{.NCPU}}' >/dev/null 2>&1; then
+  echo "FATAL: Docker daemon is not available" >&2
+  exit 1
+fi
 
 RUN_COMMAND=(
   docker exec
