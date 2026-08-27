@@ -105,8 +105,8 @@ process that imports torch once and forks a worker per pair (see "R2D2 imaging r
 worker" and "The workers are started by the container, not by the ranks" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)). That process also
 patches R2D2's `MeasOp.get_op_norm` to solve the operator norm with Lanczos
-rather than upstream's power iteration - the same quantity, ~2.5x fewer NUFFT
-pairs and ~1e-10 relative accuracy instead of ~1e-4, and no longer a different
+rather than upstream's power iteration - the same quantity, ~3.5x fewer NUFFT
+pairs and ~3e-6 relative accuracy instead of ~1e-4, and no longer a different
 answer on every run (see "The operator norm is solved with Lanczos" there) - and
 it gives each measurement operator one FINUFFT plan per transform type instead
 of the one-plan-per-transform `pytorch_finufft` builds, worth ~30% of a warm

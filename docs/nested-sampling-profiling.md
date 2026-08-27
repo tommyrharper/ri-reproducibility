@@ -1267,7 +1267,7 @@ That tail is exactly what the sampler pays for. A PolyChord round costs the
 the straggler was ~40% of the sampler wall clock.
 
 `r2d2_serve.py`'s `patch_op_norm()` replaces the method with an ARPACK Lanczos
-solve (`scipy.sparse.linalg.eigsh`, `k=1`, `ncv=8`, `tol=1e-5`) over the same
+solve (`scipy.sparse.linalg.eigsh`, `k=1`, `ncv=8`, `tol=1e-3`) over the same
 `adjoint_op(forward_op(.))`, started from a deterministic `ones` vector. It
 computes the same quantity under the same caching contract - `_op_norm`,
 `compute_flag`, and therefore `get_op_norm_prime` too - and falls back to the
@@ -1284,7 +1284,8 @@ Measured over 12 evaluations of this parameter space, per operator:
 | Lanczos, `ncv=8`, `tol=1e-5` | 25-40 | 0.044-0.069s | ~1e-10 |
 
 An `ncv` sweep (6, 8, 10, 12, 20 at `tol` 1e-5 and 1e-4) is flat to within
-noise; 8 has the lowest maximum, which is the number that matters here.
+noise; 8 has the lowest maximum, which is the number that matters here. `tol`
+is not flat, and 1e-5 was not the right end of it - see below.
 
 Across a whole 8-rank, 38-evaluation run, `image_container_seconds`:
 
@@ -1308,13 +1309,64 @@ which is the power iteration's own error being removed, and it is now the same
 number on every run.
 
 `python3 scripts/lib/nested_sampling/r2d2_serve.py --self-check` guards it on a
-synthetic 400x400 spectrum with the same 0.999 eigenvalue ratio: Lanczos must
-land within 1e-7 while the 1e-5 relative-change test the power iteration uses
-stops more than 1e-4 out. It needs scipy, so run it in the R2D2 image
+synthetic 400x400 spectrum with the same 0.999 eigenvalue ratio: the 1e-5
+relative-change test the power iteration uses must stop more than 1e-4 out, and
+Lanczos must land at least 10x closer than it did. The assertion is against the
+power iteration rather than against an absolute number because `tol` is a knob
+that trades applications for accuracy, and what has to hold across a change to
+it is the comparison the patch exists to win. It needs scipy, so run it in the R2D2 image
 (`docker run --rm -v "$PWD:$PWD" --entrypoint python3 ri-reproducibility/r2d2:cpu
 "$PWD/scripts/lib/nested_sampling/r2d2_serve.py" --self-check`); on a host
 without scipy that one check prints that it was skipped and the other three
 still run.
+
+#### `tol` is 1e-3, not the 1e-5 this started at
+
+ARPACK's `tol` is a straight trade of operator applications against accuracy,
+and the accuracy that has to be met is not machine precision - the norm only
+scales the operator, and upstream's power iteration delivers ~1e-4. The first
+version of the patch asked for 1e-5 out of caution and got ~1e-10, i.e. it was
+paying six orders of magnitude it had no use for.
+
+Measured over 24 real operators from a PoC run (each solved again at `ncv=40`,
+`tol=0` for the reference):
+
+| `ncv`, `tol` | Applications (mean) | Applications (max) | Median relative error |
+|---|---:|---:|---:|
+| 8, 1e-5 | 28.7 | 33 | 9.1e-11 |
+| 8, 1e-4 | 24.5 | 29 | 2.6e-08 |
+| **8, 1e-3** | **21.2** | **25** | **2.9e-06** |
+| 8, 1e-2 | 16.8 | 21 | 4.9e-04 |
+| 6, 1e-2 | 16.8 | 22 | 3.0e-04 |
+| 12, 1e-3 | 22.0 | 25 | 1.5e-06 |
+
+1e-3 is the last step that is free: it is 26% fewer applications than 1e-5 and
+still ~30x more accurate than the power iteration. 1e-2 is another 21% cheaper
+but its median error, 4.9e-4, is *worse* than the power iteration this patch
+replaced, so it is the wrong side of the trade. Widening `ncv` instead of
+loosening `tol` buys nothing - the mean moves by under one application.
+
+Interleaved A/B of `scripts/run-nested-sampling-r2d2-poc.sh` end to end,
+`NS_MPI_PROCS=8`, alternating the two `r2d2_serve.py` (no `docker build` in
+either arm, and no foreign container on the host for any of the 24 runs):
+
+| | Median | 12 pairs |
+|---|---:|---|
+| `tol=1e-5` | 3.125s | - |
+| `tol=1e-3` | 2.952s | 12 wins, 0 losses |
+
+-0.173s, -5.6% end to end. Inside the run, medians over the 13 runs of each arm:
+
+| | sampler wall | imaging worker-seconds | per-evaluation median | per-evaluation max |
+|---|---:|---:|---:|---:|
+| `tol=1e-5` | 1.125s | 3.67s | 0.095s | 0.132s |
+| `tol=1e-3` | 0.950s | 2.87s | 0.075s | 0.112s |
+
+-22% of the imaging stage for -16% of the sampler, and the simulate stage does
+not move (2.03s -> 1.97s). The evaluation set is identical across both arms;
+the only imaging number the checkpoint-less path prints, the estimated target
+dynamic range, moves by a median 2.2e-7 and at most 4.6e-6 over the 38
+evaluations - two orders of magnitude inside the power iteration's own error.
 
 #### Warm and deterministic start vectors, measured and rejected
 
