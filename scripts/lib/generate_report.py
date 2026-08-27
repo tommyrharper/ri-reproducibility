@@ -1251,6 +1251,47 @@ def format_searched_params(params, parameter_space):
     return " · ".join(parts)
 
 
+def format_param_range(spec):
+    """"min-max" for a `parameter_space` entry, or "" if it has no range (fixed)."""
+    lo, hi = spec.get("min"), spec.get("max")
+    if lo is None or hi is None:
+        return ""
+    return f"{fmt_value(lo)}-{fmt_value(hi)}"
+
+
+def render_parameter_space_section(parameter_space):
+    """The searched parameters and the range each was drawn from, for the report
+    page - the per-run record of what was actually varied, distinct from any
+    fixed hyperparameters shown elsewhere."""
+    if not parameter_space:
+        return ""
+    rows = []
+    for spec in parameter_space:
+        name = spec.get("name")
+        if not name:
+            continue
+        range_label = format_param_range(spec) or "-"
+        kind = spec.get("kind", "")
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(name))}</td>"
+            f"<td>{html.escape(range_label)}</td>"
+            f"<td>{html.escape(str(kind))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return ""
+    return f"""
+    <section>
+      <h3>Parameter space</h3>
+      <table class="kv param-space-table">
+        <thead><tr><th>parameter</th><th>range</th><th>kind</th></tr></thead>
+        <tbody>{"".join(rows)}</tbody>
+      </table>
+    </section>
+    """
+
+
 def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
     if not image_path:
         return '<span class="empty">—</span>'
@@ -1592,6 +1633,7 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
       {evidence_html}
       {evaluations_html}
       {render_profiling(summary)}
+      {render_parameter_space_section(parameter_space)}
       {fixed_html}
       <p class="manifest-name">{html.escape(rel_summary)}</p>
     </article>
@@ -1860,6 +1902,26 @@ a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transpare
 .ns-index-toolbar label { display: flex; align-items: center; gap: 0.4rem; }
 .ns-index-toolbar select { font: inherit; }
 .ns-index-count { opacity: 0.65; margin-left: auto; }
+.compare-select {
+  display: flex; align-items: center; gap: 0.3rem;
+  font-size: 0.8rem; opacity: 0.75; white-space: nowrap;
+  flex-shrink: 0; cursor: pointer;
+}
+.compare-select:hover { opacity: 1; }
+.ns-compare-panel {
+  border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+  border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.5rem;
+}
+.ns-compare-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.ns-compare-header h3 { margin: 0; font-size: 1rem; }
+.ns-compare-table-wrap { overflow-x: auto; margin-top: 0.75rem; }
+table.ns-compare-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+table.ns-compare-table th, table.ns-compare-table td {
+  padding: 0.3rem 0.6rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent);
+  text-align: left; white-space: nowrap;
+}
+table.ns-compare-table thead th { opacity: 0.7; font-weight: 600; }
+table.ns-compare-table tbody th { opacity: 0.65; font-weight: normal; }
 """
 
 
@@ -1924,8 +1986,10 @@ ALGORITHM_LABELS = {"r2d2": "R2D2", "wsclean": "WSClean"}
 
 
 def render_index_entry(summary_path, status):
-    """Returns (card_html, algorithm_token) - the token feeds the index toolbar's
-    algorithm filter options, "" when the run has none worth filtering on."""
+    """Returns (card_html, algorithm_token, parameter_space) - the token feeds the
+    index toolbar's algorithm filter options ("" when the run has none worth
+    filtering on), and parameter_space feeds its parameter/range filter and the
+    run-comparison panel."""
     run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
     with open(summary_path) as f:
@@ -1935,16 +1999,18 @@ def render_index_entry(summary_path, status):
     evaluations = summary.get("evaluations", [])
     succeeded = [ev for ev in evaluations if "error" not in ev]
     failed_count = len(evaluations) - len(succeeded)
+    parameter_space = summary.get("parameter_space", [])
 
     algorithm_token = str(summary.get("algorithm") or "").strip().lower()
     if algorithm_token in ("", "?"):
         algorithm_token = ""
     is_merged = bool(summary.get("merged_from"))
-    card_attrs = (
-        f' data-algorithm="{html.escape(algorithm_token)}"'
-        f' data-merged="{"1" if is_merged else "0"}"'
-        f' data-evals="{len(succeeded)}"'
-    )
+    param_names = [spec["name"] for spec in parameter_space if spec.get("name")]
+    param_ranges = {
+        spec["name"]: format_param_range(spec)
+        for spec in parameter_space
+        if spec.get("name") and format_param_range(spec)
+    }
 
     title_bits = [html.escape(str(summary.get("algorithm", "?")))]
     ts_label = format_run_id_timestamp(run_name)
@@ -1974,12 +2040,34 @@ def render_index_entry(summary_path, status):
         log_z, log_z_err = evidence
         err_html = f'<span class="delta">± {log_z_err:.4g}</span>' if log_z_err is not None else ""
         evidence_html = f'<div class="index-evidence">log(Z) = <strong>{log_z:.4g}</strong>{err_html}</div>'
+        logz_attr_value = f"{log_z:.4g}"
     else:
         evidence_html = '<div class="index-evidence empty">log(Z) unavailable</div>'
+        logz_attr_value = ""
+
+    card_attrs = (
+        f' data-algorithm="{html.escape(algorithm_token)}"'
+        f' data-merged="{"1" if is_merged else "0"}"'
+        f' data-evals="{len(succeeded)}"'
+        f' data-run-name="{html.escape(run_name)}"'
+        f' data-vla-config="{html.escape(str(summary.get("vla_config", "")))}"'
+        f' data-nlive="{html.escape(str(polychord.get("nlive", "")))}"'
+        f' data-metric="{html.escape(str(summary.get("metric", "")))}"'
+        f' data-logz="{logz_attr_value}"'
+        f' data-param-names="{html.escape(",".join(param_names))}"'
+        f' data-param-ranges="{html.escape(json.dumps(param_ranges))}"'
+    )
+
+    compare_checkbox_html = (
+        '<label class="compare-select" title="Select to compare runs">'
+        '<input type="checkbox" class="compare-checkbox">'
+        "Compare</label>"
+    )
 
     body = f"""
       <div class="card-header-top">
         <h2>{" ".join(title_bits)}</h2>
+        {compare_checkbox_html}
         {duration_html}
       </div>
       <p class="index-run-name">{html.escape(run_name)}</p>
@@ -1990,7 +2078,7 @@ def render_index_entry(summary_path, status):
         return (
             f'<div class="card index-entry index-entry-missing"{card_attrs}>{body}'
             '<p class="empty">Page not generated yet - run <code>./ri report</code>.</p></div>'
-        ), algorithm_token
+        ), algorithm_token, parameter_space
     stale_html = ""
     if status == "outdated":
         stale_html = (
@@ -2000,17 +2088,29 @@ def render_index_entry(summary_path, status):
     return (
         f'<a class="card index-entry" href="{html.escape(run_page_name(run_name))}"{card_attrs}>'
         f"{body}{stale_html}</a>"
-    ), algorithm_token
+    ), algorithm_token, parameter_space
 
 
 # Wired up client-side in INDEX_SCRIPT: the toolbar only ever filters/reorders
 # cards already in the page, so it needs no server round-trip and works the
 # same off a plain `file://` open as it does served.
-def render_index_toolbar(algorithm_tokens):
+def render_index_toolbar(algorithm_tokens, param_ranges_by_name):
     algo_options = "".join(
         f'<option value="{html.escape(token)}">{html.escape(ALGORITHM_LABELS.get(token, token.title()))}</option>'
         for token in algorithm_tokens
     )
+    param_options = "".join(
+        f'<option value="{html.escape(name)}">{html.escape(name)}</option>'
+        for name in param_ranges_by_name
+    )
+    # Range options depend on the chosen parameter, so only the map goes to the
+    # page - INDEX_SCRIPT fills #ns-filter-param-range's options on change.
+    # `<script>` content is HTML's "raw text" - entities are never decoded in
+    # it, so html.escape would hand JSON.parse a literal "&quot;". Neutralise
+    # "<" instead (the only character that can prematurely end the element via
+    # a "</script" sequence); < is a legal JSON escape, so this still
+    # parses to the exact same object.
+    param_ranges_json = json.dumps(param_ranges_by_name).replace("<", "\\u003c")
     return f"""
     <div class="ns-index-toolbar">
       <label>Algorithm
@@ -2023,6 +2123,12 @@ def render_index_toolbar(algorithm_tokens):
           <option value="0">Unmerged only</option>
         </select>
       </label>
+      <label>Parameter
+        <select id="ns-filter-param"><option value="">Any parameter</option>{param_options}</select>
+      </label>
+      <label>Range
+        <select id="ns-filter-param-range" disabled><option value="">Any range</option></select>
+      </label>
       <label>Sort by
         <select id="ns-sort">
           <option value="newest">Newest first</option>
@@ -2033,6 +2139,8 @@ def render_index_toolbar(algorithm_tokens):
       </label>
       <span class="ns-index-count" id="ns-index-count"></span>
     </div>
+    <script type="application/json" id="ns-param-ranges">{param_ranges_json}</script>
+    <div class="ns-compare-panel" id="ns-compare-panel" hidden></div>
     """
 
 
@@ -2047,10 +2155,28 @@ INDEX_SCRIPT = """
   var list = document.getElementById("ns-index-list");
   var algoSel = document.getElementById("ns-filter-algorithm");
   var mergedSel = document.getElementById("ns-filter-merged");
+  var paramSel = document.getElementById("ns-filter-param");
+  var rangeSel = document.getElementById("ns-filter-param-range");
   var sortSel = document.getElementById("ns-sort");
   var countEl = document.getElementById("ns-index-count");
-  if (!list || !algoSel || !mergedSel || !sortSel) return;
+  var rangesDataEl = document.getElementById("ns-param-ranges");
+  var comparePanel = document.getElementById("ns-compare-panel");
+  if (!list || !algoSel || !mergedSel || !paramSel || !rangeSel || !sortSel) return;
   var items = Array.prototype.slice.call(list.children);
+  var paramRanges = {};
+  try {
+    paramRanges = JSON.parse((rangesDataEl && rangesDataEl.textContent) || "{}");
+  } catch (e) { paramRanges = {}; }
+
+  function refreshRangeOptions() {
+    var name = paramSel.value;
+    var ranges = paramRanges[name] || [];
+    rangeSel.disabled = !name;
+    rangeSel.innerHTML = '<option value="">Any range</option>' + ranges.map(function (r) {
+      return '<option value="' + r + '">' + r + "</option>";
+    }).join("");
+    rangeSel.value = "";
+  }
 
   function apply() {
     var sorted = items.slice();
@@ -2066,10 +2192,15 @@ INDEX_SCRIPT = """
 
     var algo = algoSel.value;
     var merged = mergedSel.value;
+    var param = paramSel.value;
+    var range = rangeSel.value;
     var visible = 0;
     items.forEach(function (el) {
+      var names = (el.dataset.paramNames || "").split(",");
       var show = (!algo || el.dataset.algorithm === algo)
-        && (!merged || el.dataset.merged === merged);
+        && (!merged || el.dataset.merged === merged)
+        && (!param || names.indexOf(param) !== -1)
+        && (!range || (paramRangesFor(el)[param] === range));
       el.hidden = !show;
       if (show) visible += 1;
     });
@@ -2078,9 +2209,100 @@ INDEX_SCRIPT = """
     }
   }
 
+  function paramRangesFor(el) {
+    try {
+      return JSON.parse(el.dataset.paramRanges || "{}");
+    } catch (e) { return {}; }
+  }
+
+  // Compare: checkboxes live inside each `.index-entry` <a>, so a click has to
+  // stop there or it navigates to the run page instead of toggling the box.
+  function selectedCards() {
+    return items.filter(function (el) {
+      var box = el.querySelector(".compare-checkbox");
+      return box && box.checked;
+    });
+  }
+
+  function renderCompare() {
+    var selected = selectedCards();
+    if (!comparePanel) return;
+    if (selected.length === 0) {
+      comparePanel.hidden = true;
+      comparePanel.innerHTML = "";
+      return;
+    }
+    var paramNames = [];
+    selected.forEach(function (el) {
+      (el.dataset.paramNames || "").split(",").forEach(function (n) {
+        if (n && paramNames.indexOf(n) === -1) paramNames.push(n);
+      });
+    });
+    paramNames.sort();
+
+    var headerCells = selected.map(function (el) {
+      return "<th>" + (el.dataset.runName || "?") + "</th>";
+    }).join("");
+
+    function row(label, fn) {
+      return "<tr><th>" + label + "</th>" + selected.map(function (el) {
+        return "<td>" + fn(el) + "</td>";
+      }).join("") + "</tr>";
+    }
+
+    var rows = [
+      row("algorithm", function (el) { return el.dataset.algorithm || "-"; }),
+      row("vla_config", function (el) { return el.dataset.vlaConfig || "-"; }),
+      row("nlive", function (el) { return el.dataset.nlive || "-"; }),
+      row("metric", function (el) { return el.dataset.metric || "-"; }),
+      row("log(Z)", function (el) { return el.dataset.logz || "-"; }),
+      row("evals", function (el) { return el.dataset.evals || "-"; })
+    ];
+    paramNames.forEach(function (name) {
+      rows.push(row(name, function (el) {
+        return paramRangesFor(el)[name] || "-";
+      }));
+    });
+
+    comparePanel.hidden = false;
+    comparePanel.innerHTML = '<div class="ns-compare-header"><h3>Comparing ' + selected.length
+      + " run" + (selected.length === 1 ? "" : "s") + '</h3>'
+      + '<button type="button" id="ns-compare-clear">Clear</button></div>'
+      + '<div class="ns-compare-table-wrap"><table class="ns-compare-table"><thead><tr><th></th>'
+      + headerCells + "</tr></thead><tbody>" + rows.join("") + "</tbody></table></div>";
+
+    var clearBtn = document.getElementById("ns-compare-clear");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", function () {
+        selected.forEach(function (el) {
+          var box = el.querySelector(".compare-checkbox");
+          if (box) box.checked = false;
+        });
+        renderCompare();
+      });
+    }
+  }
+
+  // stopPropagation only - not preventDefault. The checkbox's own toggle is
+  // itself a cancelable default action of this same click event: calling
+  // preventDefault here would stop the card link from navigating but would
+  // just as much revert the checkbox back to unchecked. Stopping propagation
+  // before the event would reach the wrapping <a> keeps the checkbox's native
+  // behaviour intact while the anchor never sees the click at all.
+  items.forEach(function (el) {
+    var label = el.querySelector(".compare-select");
+    if (label) label.addEventListener("click", function (e) { e.stopPropagation(); });
+  });
+  list.addEventListener("change", function (e) {
+    if (e.target.classList.contains("compare-checkbox")) renderCompare();
+  });
+
   algoSel.addEventListener("change", apply);
   mergedSel.addEventListener("change", apply);
+  paramSel.addEventListener("change", function () { refreshRangeOptions(); apply(); });
+  rangeSel.addEventListener("change", apply);
   sortSel.addEventListener("change", apply);
+  refreshRangeOptions();
   apply();
 })();
 </script>
@@ -2133,15 +2355,25 @@ def render_nested_sampling_index(status_for):
         )
     entries = []
     algorithm_tokens = []
+    param_ranges_by_name = {}
     for p in paths:
-        entry_html, algorithm_token = render_index_entry(p, status_for(p))
+        entry_html, algorithm_token, parameter_space = render_index_entry(p, status_for(p))
         entries.append(entry_html)
         if algorithm_token and algorithm_token not in algorithm_tokens:
             algorithm_tokens.append(algorithm_token)
+        for spec in parameter_space:
+            name = spec.get("name")
+            range_label = format_param_range(spec)
+            if not name or not range_label:
+                continue
+            param_ranges_by_name.setdefault(name, set()).add(range_label)
     algorithm_tokens.sort()
+    param_ranges_by_name = {
+        name: sorted(ranges) for name, ranges in sorted(param_ranges_by_name.items())
+    }
     return (
         render_unfinished_runs()
-        + render_index_toolbar(algorithm_tokens)
+        + render_index_toolbar(algorithm_tokens, param_ranges_by_name)
         + f'<div id="ns-index-list">{"".join(entries)}</div>'
         + INDEX_SCRIPT
     )
@@ -2439,8 +2671,9 @@ def _self_check_page_status():
 
 
 def _self_check_index_toolbar():
-    """Index cards carry the algorithm/merged/evals data the toolbar filters
-    and sorts on, and the toolbar options match the algorithms actually seen."""
+    """Index cards carry the algorithm/merged/evals/parameter-space data the
+    toolbar filters, sorts, and compares on, and the toolbar options match what
+    was actually seen across runs."""
     import shutil
     import tempfile
 
@@ -2453,12 +2686,20 @@ def _self_check_index_toolbar():
             json.dump({
                 "algorithm": "r2d2",
                 "evaluations": [{"eval_id": 1, "objective": 1.0}, {"eval_id": 2, "error": "boom"}],
+                "parameter_space": [
+                    {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
+                    {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"},
+                ],
             }, f)
-        card, token = render_index_entry(r2d2_summary, "current")
+        card, token, parameter_space = render_index_entry(r2d2_summary, "current")
         assert token == "r2d2", token
         assert 'data-algorithm="r2d2"' in card, card
         assert 'data-merged="0"' in card, card
         assert 'data-evals="1"' in card, card  # one succeeded, one failed
+        assert 'data-param-names="log10_dynamic_range,channel_count"' in card, card
+        assert '&quot;log10_dynamic_range&quot;: &quot;2-3&quot;' in card, card
+        assert 'class="compare-checkbox"' in card, card
+        assert len(parameter_space) == 2, parameter_space
 
         wsclean_dir = os.path.join(tmp_dir, "wsclean-run")
         os.makedirs(wsclean_dir)
@@ -2469,29 +2710,59 @@ def _self_check_index_toolbar():
                 "merged_from": [{"name": "some-source-run"}],
                 "evaluations": [],
             }, f)
-        card, token = render_index_entry(wsclean_summary, "missing")
+        card, token, parameter_space = render_index_entry(wsclean_summary, "missing")
         assert token == "wsclean", token
         assert '<div class="card index-entry index-entry-missing" data-algorithm="wsclean"' in card, card
         assert 'data-merged="1"' in card, card
         assert 'data-evals="0"' in card, card
+        assert 'data-param-names=""' in card, card
+        assert parameter_space == [], parameter_space
 
         unknown_dir = os.path.join(tmp_dir, "mystery-run")
         os.makedirs(unknown_dir)
         unknown_summary = os.path.join(unknown_dir, "summary.json")
         with open(unknown_summary, "w") as f:
             json.dump({"evaluations": []}, f)
-        card, token = render_index_entry(unknown_summary, "current")
+        card, token, _ = render_index_entry(unknown_summary, "current")
         assert token == "", token
         assert 'data-algorithm=""' in card, card
 
-        toolbar = render_index_toolbar(["r2d2", "wsclean", "sasir"])
+        toolbar = render_index_toolbar(
+            ["r2d2", "wsclean", "sasir"],
+            {"log10_dynamic_range": ["2-3"], "channel_count": ["2-6"]},
+        )
         assert '<option value="r2d2">R2D2</option>' in toolbar, toolbar
         assert '<option value="wsclean">WSClean</option>' in toolbar, toolbar
         assert '<option value="sasir">Sasir</option>' in toolbar, toolbar  # unknown token: title-cased fallback
         assert '<select id="ns-filter-merged">' in toolbar, toolbar
+        assert '<select id="ns-filter-param">' in toolbar, toolbar
+        assert '<option value="log10_dynamic_range">log10_dynamic_range</option>' in toolbar, toolbar
+        assert '<select id="ns-filter-param-range" disabled>' in toolbar, toolbar
         assert '<select id="ns-sort">' in toolbar, toolbar
+        assert 'id="ns-compare-panel" hidden' in toolbar, toolbar
+        # The ranges map sits inside a <script> element, whose content HTML
+        # never entity-decodes - it must stay raw JSON, not html.escape'd.
+        assert '"channel_count": ["2-6"]' in toolbar, toolbar
+        assert "&quot;" not in toolbar, toolbar
+        assert json.loads(toolbar.split('id="ns-param-ranges">')[1].split("</script>")[0]) == {
+            "log10_dynamic_range": ["2-3"],
+            "channel_count": ["2-6"],
+        }, toolbar
     finally:
         shutil.rmtree(tmp_dir)
+
+
+def _self_check_parameter_space_section():
+    """The report page's parameter-space table shows each searched parameter's
+    range and kind, and is empty when a run has none."""
+    html_out = render_parameter_space_section([
+        {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
+        {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"},
+    ])
+    assert "<h3>Parameter space</h3>" in html_out, html_out
+    assert "<td>log10_dynamic_range</td><td>2-3</td><td></td>" in html_out, html_out
+    assert "<td>channel_count</td><td>2-6</td><td>integer</td>" in html_out, html_out
+    assert render_parameter_space_section([]) == ""
 
 
 def _self_check_cached_png():
@@ -2916,6 +3187,7 @@ if __name__ == "__main__":
         _self_check_profiling()
         _self_check_page_status()
         _self_check_index_toolbar()
+        _self_check_parameter_space_section()
         _self_check_tick_housekeeping()
         _self_check_shared_axes_dedupe()
         _self_check_tick_memo()
