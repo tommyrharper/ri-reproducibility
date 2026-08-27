@@ -358,6 +358,12 @@ run page links back to the index. Rendering a run means reading its FITS
 output, so **run pages that are already up to date are skipped** - a re-run
 only builds pages for new runs.
 
+The index has a toolbar above the run cards: filter by algorithm (R2D2 /
+WSClean) or by merged/unmerged, and sort newest/oldest or by eval count. It is
+plain client-side JavaScript over the cards already on the page - no rebuild
+or server needed, and it works the same off a `file://` open as it does
+through `./ri serve`.
+
 The plots themselves are PNG files under
 `reports/nested-sampling-report/images/`, named after a hash of what they
 were drawn from, and the pages link to them rather than inlining them. That
