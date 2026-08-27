@@ -454,6 +454,29 @@ to `savefig`. Corner plot 0.57s -> 0.53s, five-run cold build 1.55s -> 1.51s
 in-container and 4% less CPU (7% at twenty runs), with byte-identical PNGs.
 Best-effort like the rest.
 
+Caching both halves still leaves anesthetic *running* all four attempts and
+throwing three away, which is the expensive part: `ac` evaluates every
+candidate, sorts them by dimensionality (fewest first, then most index levels,
+ties going to the earliest candidate) and returns the first. For the case the
+corner plot hits ~65 times per plot - a plain string column name on a frame
+whose columns carry the labels level - the winner is decided in advance, so
+`shortcut_anesthetic_labelled_column()` runs only that one. It is the candidate
+that strips the labels off the columns: the two that keep them index a
+two-or-more-level `MultiIndex` and so return a 2-D frame, which loses to any 1-D
+result outright, and of the two that strip them this one leaves the *index*
+alone, so it never has fewer index levels than the other and it wins the tie by
+position. A `DataFrame` lookup cannot return a 0-D result, so nothing can
+undercut a 1-D one. The guards are premises of that argument rather than safety
+nets - a string key is what forces the label-keeping candidates to be 2-D - but
+anything outside them, any candidate that raises, and any result that turns out
+not to be 1-D all fall back to anesthetic's own search, so an uncovered shape is
+slow rather than wrong. Corner plot 0.449s -> 0.413s (-8.2% CPU), five-run cold
+build 1.168s -> 1.120s wall in-container and 4.2% less CPU, with byte-identical
+PNGs. Best-effort like the rest. `_self_check_labelled_column_shortcut` builds
+each frame twice before comparing the two resolutions, because pandas caches a
+frame's column `Series` and resolving both ways on one frame would compare an
+object with itself.
+
 Saving the finished figure repeated a pass too. `savefig(bbox_inches="tight")`
 cannot trust the artist positions it is handed - a layout engine may still be
 pending - so it walks the whole figure once in a draw-disabled pass before
