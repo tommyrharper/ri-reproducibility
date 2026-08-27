@@ -93,7 +93,6 @@ max = 2.0e6
 name = "source_offset_fraction"
 min = 0.0
 max = 0.35
-enabled = false
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
 # These are the VLA's; nothing in the code is VLA-specific, so pointing this
