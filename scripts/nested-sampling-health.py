@@ -291,6 +291,27 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     }
 
 
+def log_tail(run_dir: Path) -> str | None:
+    """The last thing the run said, or None if it said nothing.
+
+    `run.log` is the only place a traceback survives - every other artifact a
+    stopped run leaves says that it broke, never why. Read from the end,
+    because a search that ran for hours can leave a large one.
+    """
+    path = run_dir / "run.log"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 8192))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.strip():
+            return line.strip()
+    return None
+
+
 def dead_points(run_dir: Path) -> int:
     """PolyChord's own progress: one line per dead point, as the progress bar counts it."""
     for path in (run_dir / "chains").glob("*_dead-birth.txt"):
@@ -440,7 +461,13 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"no evaluation has landed in {idle:.0f}s while {len(ranks)} ranks are still running"
         )
     if status == "stopped":
-        warnings.append(f"stopped before finishing; continue it with ./ri resume {run_dir.name}")
+        # The log's last line if there is one, because "why" is the question a
+        # stopped run raises and this is the only artifact that answers it.
+        # Runs from before run.log was captured have none, hence the fallback.
+        ending = f'; run.log ends "{tail}"' if (tail := log_tail(run_dir)) else ""
+        warnings.append(
+            f"stopped before finishing{ending}; continue it with ./ri resume {run_dir.name}"
+        )
     # All but one, because rank 0 is PolyChord's administrator and does nothing
     # else - and only once evaluations have stopped landing, which is the
     # clause doing the real work here. The spin count on its own says nothing:
@@ -488,6 +515,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "ranks": len(ranks),
         "ranks_spinning": spinning,
         "dead_points": dead_points(run_dir),
+        "log_tail": log_tail(run_dir),
         "warnings": warnings,
         **scan,
     }
@@ -725,6 +753,25 @@ def self_check() -> None:
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report
             assert report["warnings"] == [], report
+
+            # A stopped run says why, when the run script captured a log for it
+            # - which is the whole reason run.log exists.
+            assert log_tail(live) is None
+            (live / "run.log").write_text(
+                "ndead: 40\n"
+                # Padded past the 8KB read window, so the tail is genuinely
+                # sought to rather than found by reading the file.
+                + "chatter\n" * 2000
+                + "TypeError: unsupported operand type(s)\n\n"
+            )
+            assert log_tail(live) == "TypeError: unsupported operand type(s)"
+            stopped_report = describe(live, [], 5.0)
+            assert stopped_report["status"] == "stopped"
+            assert any("TypeError" in w and "./ri resume" in w
+                       for w in stopped_report["warnings"]), stopped_report
+            # A run from before run.log existed still gets the resume line.
+            (live / "run.log").unlink()
+            assert any("./ri resume" in w for w in describe(live, [], 5.0)["warnings"])
 
             # Same run, same files, no ranks: a stale mtime is only a stall
             # while something is still running.

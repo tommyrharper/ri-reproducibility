@@ -399,9 +399,9 @@ What each line is reading, and why it is worth a line:
   killed run leaves those holding ~3.4GB per R2D2 rank, counted against every
   later run's memory budget until someone removes them.
 
-Not covered: a run's own stdout is not captured to disk, so a traceback that
-stops a run exists only in the terminal it was started from. The health report
-can say a run stopped and where it stopped, never why.
+- **why it stopped** - a stopped run's warning quotes the last line of its
+  `run.log`, which is where the run's own output is kept. Everything else on
+  disk says *that* a run broke; only this says why.
 
 ### Finding and resuming a run that stopped
 
@@ -802,11 +802,22 @@ evaluations/eval-*/metrics.json
 
 ### Run summary and reports
 
-Run-level summary:
+Run-level summary, written only once PolyChord returns:
 
 ```text
 summary.json
 ```
+
+Everything the run printed, written as it goes and appended to by `./ri
+resume`, so it survives a run that never reaches `summary.json`:
+
+```text
+run.log
+```
+
+This is the only artifact that records *why* a run stopped - a traceback out
+of the PolyChord container reaches nowhere else. `./ri health` quotes its last
+line for a stopped run.
 
 View completed runs (settings, evidence, per-evaluation metrics and
 reconstructions) in the nested-sampling HTML report:
