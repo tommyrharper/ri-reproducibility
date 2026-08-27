@@ -38,11 +38,21 @@ nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 
 echo "=== host-side checks ==="
 python3 "${REPO_ROOT}/scripts/test_watchdogs.py"
+python3 "${REPO_ROOT}/scripts/test_self_checks.py"
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "simulate" ]]; then
   echo
   echo "=== simulate (${MEQTREES_IMAGE}) ==="
   docker_run --entrypoint python3 "${MEQTREES_IMAGE}" -u "$(nested_sampling simulate_point_source_ms.py)" --self-check
+fi
+
+if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2-serve" ]]; then
+  echo
+  echo "=== r2d2 imaging worker (${R2D2_IMAGE}) ==="
+  # The R2D2 sidecar runs this file off the bind mount, so what runs here is
+  # what a run would run. Its numpy and measurement-operator checks skip
+  # themselves outside this image, which is what they do in CI.
+  docker_run --entrypoint python3 "${R2D2_IMAGE}" -u "$(nested_sampling r2d2_serve.py)" --self-check
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "wsclean" ]]; then

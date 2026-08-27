@@ -10,8 +10,10 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Shell and Python checks
+  # Linting reads the source and does not care what it is running on, so it
+  # stays on one runner rather than doubling with the matrix below.
+  lint:
+    name: Lint and syntax
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -31,6 +33,22 @@ jobs:
       - name: Check Python syntax
         run: python3 -m compileall -q scripts config
 
+  # These execute code, and the code branches on the platform - rank-budget.sh
+  # reads /proc/meminfo on Linux and vm_stat on macOS, and defaults.sh picks an
+  # image architecture from `uname -m`. Both hosts run real searches, so both
+  # get checked. Everything here is seconds of work and needs no Docker, which
+  # is what keeps a second runner cheap.
+  checks:
+    name: Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
@@ -39,10 +57,15 @@ jobs:
           bash scripts/lib/rank-budget.sh --self-check
           bash scripts/lib/start-sidecars.sh --self-check
           bash scripts/lib/run-config.sh --self-check
-          NESTED_SAMPLING_RUNS_SELF_CHECK=1 python3 scripts/nested-sampling-runs.py
+          uv run --no-project python3 scripts/nested-sampling-runs.py
+        env:
+          NESTED_SAMPLING_RUNS_SELF_CHECK: "1"
 
       - name: Check the deadlock watchdogs
-        run: python3 scripts/test_watchdogs.py
+        run: uv run --no-project python3 scripts/test_watchdogs.py
+
+      - name: Check the image-free self-checks
+        run: uv run --no-project python3 scripts/test_self_checks.py
 
       - name: Check shared defaults
         run: scripts/test-defaults.sh

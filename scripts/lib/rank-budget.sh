@@ -250,8 +250,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
 
   # The real reader works on whatever platform runs this check - /proc/meminfo
   # on Linux, the Docker VM's own memory on macOS - not just the
-  # NS_AVAILABLE_MB override below.
-  [ "$(_ns_available_mb)" -gt 0 ]
+  # NS_AVAILABLE_MB override below. A host with neither (a macOS CI runner has
+  # no Docker daemon) is the documented clamp-off path, and the reader has to
+  # take it by failing rather than by printing something that is not a number.
+  if _ns_self_check_mb="$(_ns_available_mb)"; then
+    [ "${_ns_self_check_mb}" -gt 0 ]
+  fi
 
   # Unit conversion is the part a live daemon can't exercise in CI: GiB/MiB/
   # KiB/bare-bytes strings as `docker stats --format '{{.MemUsage}}'` prints

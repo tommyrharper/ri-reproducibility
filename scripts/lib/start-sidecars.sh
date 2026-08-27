@@ -67,13 +67,22 @@ sidecar_launch() {
   done
   name="ri-ns-sidecar-$$-${#SIDECAR_NAMES[@]}"
   SIDECAR_NAME="${name}"
+  # macOS ships bash 3.2, where expanding an empty array under `set -u` is an
+  # "unbound variable" error rather than nothing - so a sidecar with no extra
+  # docker arguments, which is most of them, could not start there at all. The
+  # `${a[@]+"${a[@]}"}` form expands to nothing when empty on both. The slice
+  # needs its own array because the guard cannot wrap a slice.
+  local -a entrypoint_args=()
+  if [ "${#command[@]}" -gt 1 ]; then
+    entrypoint_args=("${command[@]:1}")
+  fi
   docker run --detach --rm --name "${name}" \
     --network none \
     --shm-size 512m \
     --platform "${platform}" \
     -v "${REPO_ROOT}:${REPO_ROOT}" \
-    "${args[@]}" \
-    --entrypoint "${command[0]}" "${image}" "${command[@]:1}" >/dev/null &
+    ${args[@]+"${args[@]}"} \
+    --entrypoint "${command[0]}" "${image}" ${entrypoint_args[@]+"${entrypoint_args[@]}"} >/dev/null &
   _SIDECAR_PIDS+=("$!")
   SIDECAR_NAMES+=("${SIDECAR_NAME}")
   _SIDECAR_JSON="${_SIDECAR_JSON}${_SIDECAR_JSON:+,}\"${image}\":\"${SIDECAR_NAME}\""
@@ -94,7 +103,7 @@ sidecar_launch() {
 
 sidecar_wait() {
   local pid
-  for pid in "${_SIDECAR_PIDS[@]}"; do
+  for pid in ${_SIDECAR_PIDS[@]+"${_SIDECAR_PIDS[@]}"}; do
     wait "${pid}"
   done
   _SIDECAR_PIDS=()

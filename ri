@@ -259,7 +259,7 @@ def build_parser():
                     "the copy baked into the image, so rebuild before starting "
                     "one. Starts no search and writes nothing into results/.")
     self_check.add_argument("target", nargs="?", default="all",
-        choices=("all", "simulate", "wsclean", "r2d2"),
+        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2"),
         help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",
