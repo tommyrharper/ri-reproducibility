@@ -41,7 +41,6 @@ os.environ.setdefault("REPO_ROOT", str(REPO_ROOT))
 # are listed because they cost nothing and become real coverage in the image.
 HOST_RUNNABLE = {
     "common": (
-        "self_check_lazy_numpy",
         "self_check_parameter_space",
         "self_check_parameter_toggle",
         "self_check_profiling",
@@ -67,6 +66,11 @@ IMAGE_ONLY = {
     "common": (
         "self_check_fits_reader",
         "self_check_image_pixel_size",
+        # Proves numpy is imported lazily and then rebound, which it can only
+        # do somewhere numpy is installed. It re-runs itself in a subprocess to
+        # get a clean sys.modules, so it also escapes any in-process attempt to
+        # hide numpy from it - CI caught this listed as host-runnable.
+        "self_check_lazy_numpy",
         "self_check_metric_resolution",
         "self_check_source_offset",
         "self_check_spectral_window",
