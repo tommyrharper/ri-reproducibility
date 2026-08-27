@@ -133,6 +133,42 @@ def abort_run(message: str) -> None:
 DEFAULT_WSCLEAN_NITER = 100
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
+# Image geometry, shared by both imagers so that they reconstruct the same sky.
+# R2D2 derives its cell size from the data it is given rather than taking one
+# (src/utils/io.py in the pinned upstream commit), so WSClean has to apply the
+# same formula instead of a fixed `-scale`: the search sweeps start_frequency_hz
+# over three orders of magnitude, and a fixed cell is either far finer or far
+# coarser than the synthesized beam at almost every frequency in that range.
+#
+# 1.5 is R2D2's own `CommonArgs` default (src/utils/args.py). It is stated here
+# and written into the R2D2 config explicitly rather than left to that default,
+# because WSClean's `-scale` is derived from it: an unpinned value on one side
+# is the same mismatch in a quieter form. (The 1.52 this repo used to record as
+# R2D2's super-resolution factor is a property of upstream's bundled
+# `data_3c353.mat` example, not of these runs, and was never written into the
+# config - so R2D2 has always run at 1.5.)
+DEFAULT_IMAGE_DIM = 128
+DEFAULT_SUPER_RESOLUTION = 1.5
+
+
+def image_pixel_size_arcsec(
+    max_proj_baseline_lambda: float,
+    super_resolution: float = DEFAULT_SUPER_RESOLUTION,
+) -> float:
+    """The cell size R2D2 would pick for this sampling pattern, in arcsec.
+
+    Upstream `src/utils/io.py`, verbatim:
+
+        spatial_bandwidth = 2 * max_proj_baseline
+        image_pixel_size = (180.0 / np.pi) * 3600.0 / (super_resolution * spatial_bandwidth)
+
+    `max_proj_baseline` is the longest projected baseline in wavelengths, which
+    the simulator records as `observation.max_proj_baseline_lambda`.
+    """
+    if not max_proj_baseline_lambda > 0.0:
+        raise SystemExit(f"FATAL: non-positive max projected baseline: {max_proj_baseline_lambda!r}")
+    return (180.0 / math.pi) * 3600.0 / (super_resolution * 2.0 * max_proj_baseline_lambda)
+
 
 @cache
 def load_defaults() -> dict[str, Any]:
@@ -1525,8 +1561,14 @@ def self_check_parameter_space() -> None:
     for spec in specs:
         assert spec["name"] in PARAMETER_TEX_LABELS, spec
         assert float(spec["min"]) < float(spec["max"]), spec
-    # TOML keeps int and float apart, and cube_to_params rounds this one.
-    assert {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"} in specs
+    # TOML keeps int and float apart, and cube_to_params rounds this one. Asserted
+    # by shape rather than by value: the ranges in defaults.toml are meant to be
+    # retuned, and pinning them here only means editing two files instead of one.
+    channel_count = next(spec for spec in specs if spec["name"] == "channel_count")
+    assert channel_count["kind"] == "integer", channel_count
+    assert isinstance(channel_count["min"], int) and isinstance(channel_count["max"], int), channel_count
+    assert channel_count["min"] >= 1, channel_count
+    print("parameter space self-check passed")
 
 
 def self_check_spectral_window() -> None:
@@ -1727,6 +1769,42 @@ def self_check_metric_resolution() -> None:
             pass
         else:
             raise AssertionError(f"expected SystemExit for invalid metric {invalid!r}")
+
+
+def self_check_image_pixel_size() -> None:
+    """The derived cell has to be the one R2D2 picks for the same sampling pattern.
+
+    Reproduces upstream's expression (src/utils/io.py) from raw u/v the way
+    ms_to_r2d2_mat.py writes them, rather than restating this module's own
+    formula, so a drift on either side shows up here.
+    """
+    speed_of_light = 299792458.0
+    baseline_m = np.array([120.0, 36400.0, 4800.0])
+    freqs_hz = np.array([1.0e9, 1.4e9])
+
+    u = np.concatenate([baseline_m / (speed_of_light / f) for f in freqs_hz])
+    v = np.zeros_like(u)
+    max_proj_baseline = float(np.max(np.sqrt(u**2 + v**2)))
+    upstream = (180.0 / math.pi) * 3600.0 / (DEFAULT_SUPER_RESOLUTION * 2 * max_proj_baseline)
+
+    # What the simulator records: the longest baseline scaled to the top channel.
+    recorded = float(np.max(baseline_m)) * float(freqs_hz.max()) / speed_of_light
+    assert abs(image_pixel_size_arcsec(recorded) - upstream) < 1e-12, (
+        f"{image_pixel_size_arcsec(recorded)} != {upstream}"
+    )
+
+    # A finer cell for a longer baseline, and inversely proportional to it.
+    assert image_pixel_size_arcsec(2.0 * recorded) < image_pixel_size_arcsec(recorded)
+    assert abs(image_pixel_size_arcsec(2.0 * recorded) * 2.0 - image_pixel_size_arcsec(recorded)) < 1e-12
+
+    for bad in (0.0, -1.0):
+        try:
+            image_pixel_size_arcsec(bad)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"expected SystemExit for max projected baseline {bad!r}")
+    print("image pixel size self-check passed")
 
 
 def self_check_profiling() -> None:

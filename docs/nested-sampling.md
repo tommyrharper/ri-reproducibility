@@ -380,15 +380,40 @@ The band guarantee is the sampler's. `simulate_point_source_ms.py` takes
 `--start-frequency-hz` and `--channel-width-hz` as given, so a hand-run
 simulate (or a smoke test) can still ask for whatever it likes.
 
+### Cell size
+
+The cell size is derived per evaluation, not fixed. R2D2 sizes its own pixels
+from the sampling pattern it is handed - upstream `src/utils/io.py` takes the
+longest projected baseline in wavelengths and sets
+
+    image_pixel_size = 206265 arcsec / (super_resolution * 2 * max_proj_baseline)
+
+so the WSClean runner applies the same formula (`image_pixel_size_arcsec()` in
+`common.py`) to the `observation.max_proj_baseline_lambda` the simulator
+records, and passes the result as `-scale`. Both imagers then reconstruct the
+same sky at the same resolution, and each WSClean evaluation records the value
+it used as `image_pixel_size_arcsec`.
+
+A fixed `-scale` cannot work here, because `start_frequency_hz` spans 54 MHz to
+50 GHz while the VLA-A maximum baseline does not move: against the 1 arcsec
+cell this used to pass, the synthesized beam is ~31 arcsec at the bottom of
+that range and ~0.04 arcsec at the top. The search would have been measuring
+how badly WSClean's grid was mismatched to the sampled frequency - and only
+WSClean's, since R2D2 rescaled either way.
+
+`super_resolution` is 1.5, R2D2's own default, now written into the R2D2
+config explicitly rather than left implicit, because WSClean's `-scale` is
+derived from it.
+
 Fixed hyperparameters (not searched) on every evaluation:
 
-**WSClean:** `-niter 100` and `-auto-threshold 3.0`, recorded in
-`summary.json` under `wsclean_fixed_hyperparameters`.
+**WSClean:** `-niter 100`, `-auto-threshold 3.0`, and a `128x128` image,
+recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
 
-**R2D2:** `128x128` image size (matching the WSClean run's `-size 128 128
--scale 1asec` footprint), `num_iter 25`, `architecture unet`, `num_chans 64`,
-`ckpt_path /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in
-`summary.json` under `r2d2_fixed_hyperparameters`.
+**R2D2:** `128x128` image size (the same footprint as the WSClean run),
+`num_iter 25`, `architecture unet`, `num_chans 64`, `ckpt_path
+/checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in `summary.json`
+under `r2d2_fixed_hyperparameters`.
 
 ## MS to R2D2 `.mat` bridge
 
@@ -980,6 +1005,9 @@ are renumbered `eval_id` `1..N` (originals kept as `source_eval_id` /
 treat the merged directory as a completed run - see the sections above.
 
 ## Deferred
+
+What to search next, ranked, with the plumbing each one needs:
+[`docs/parameter-space-proposal.md`](parameter-space-proposal.md).
 
 Deferred deliberately:
 
