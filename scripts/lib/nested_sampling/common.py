@@ -1054,11 +1054,11 @@ def self_check_lazy_numpy() -> None:
     report's page-only rebuild its 0.03s back.
     """
     probe = (
-        "import sys, poc_common;"
-        "assert 'numpy' not in sys.modules, 'poc_common imported numpy eagerly';"
-        "assert poc_common.np.array([1.0, 2.0]).sum() == 3.0;"
+        "import sys, common;"
+        "assert 'numpy' not in sys.modules, 'common imported numpy eagerly';"
+        "assert common.np.array([1.0, 2.0]).sum() == 3.0;"
         "assert 'numpy' in sys.modules;"
-        "assert poc_common.np is sys.modules['numpy'], 'np was not rebound'"
+        "assert common.np is sys.modules['numpy'], 'np was not rebound'"
     )
     subprocess.run(
         [sys.executable, "-c", probe], cwd=str(Path(__file__).parent), check=True
