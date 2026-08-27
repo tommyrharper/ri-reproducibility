@@ -1259,6 +1259,26 @@ def format_param_range(spec):
     return f"{fmt_value(lo)}-{fmt_value(hi)}"
 
 
+def render_param_space_badges(parameter_space):
+    """One small pill per searched parameter's range, for the index card - the
+    same "row of tabs" treatment as the algorithm/nlive/evals badges above it,
+    so the parameter space is visible without opening the run page."""
+    badges = []
+    for spec in parameter_space:
+        name = spec.get("name")
+        if not name:
+            continue
+        range_label = format_param_range(spec)
+        if not range_label:
+            continue
+        badges.append(
+            f'<span class="badge badge-param">{html.escape(str(name))} {html.escape(range_label)}</span>'
+        )
+    if not badges:
+        return ""
+    return f'<div class="badges param-badges">{"".join(badges)}</div>'
+
+
 def render_parameter_space_section(parameter_space):
     """The searched parameters and the range each was drawn from, for the report
     page - the per-run record of what was actually varied, distinct from any
@@ -1282,13 +1302,13 @@ def render_parameter_space_section(parameter_space):
     if not rows:
         return ""
     return f"""
-    <section>
-      <h3>Parameter space</h3>
+    <details>
+      <summary>Parameter space</summary>
       <table class="kv param-space-table">
         <thead><tr><th>parameter</th><th>range</th><th>kind</th></tr></thead>
         <tbody>{"".join(rows)}</tbody>
       </table>
-    </section>
+    </details>
     """
 
 
@@ -1696,6 +1716,13 @@ h1 { font-size: 1.4rem; }
 }
 .badge-ok { background: color-mix(in srgb, #2e9e5b 25%, transparent); }
 .badge-warn { background: color-mix(in srgb, #d97706 25%, transparent); }
+.param-badges { margin-top: 0.3rem; }
+.badge-param {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, CanvasText 30%, transparent);
+  font-family: ui-monospace, monospace;
+  opacity: 0.85;
+}
 .purpose { opacity: 0.8; font-size: 0.9rem; }
 .headline { font-size: 1.1rem; margin: 0.5rem 0; }
 .headline .delta { font-size: 0.85rem; opacity: 0.7; }
@@ -2072,6 +2099,7 @@ def render_index_entry(summary_path, status):
       </div>
       <p class="index-run-name">{html.escape(run_name)}</p>
       <div class="badges">{"".join(badges)}</div>
+      {render_param_space_badges(parameter_space)}
       {evidence_html}
     """
     if status == "missing":
@@ -2699,6 +2727,9 @@ def _self_check_index_toolbar():
         assert 'data-param-names="log10_dynamic_range,channel_count"' in card, card
         assert '&quot;log10_dynamic_range&quot;: &quot;2-3&quot;' in card, card
         assert 'class="compare-checkbox"' in card, card
+        assert '<div class="badges param-badges">' in card, card
+        assert '<span class="badge badge-param">log10_dynamic_range 2-3</span>' in card, card
+        assert '<span class="badge badge-param">channel_count 2-6</span>' in card, card
         assert len(parameter_space) == 2, parameter_space
 
         wsclean_dir = os.path.join(tmp_dir, "wsclean-run")
@@ -2759,7 +2790,7 @@ def _self_check_parameter_space_section():
         {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
         {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"},
     ])
-    assert "<h3>Parameter space</h3>" in html_out, html_out
+    assert "<summary>Parameter space</summary>" in html_out, html_out
     assert "<td>log10_dynamic_range</td><td>2-3</td><td></td>" in html_out, html_out
     assert "<td>channel_count</td><td>2-6</td><td>integer</td>" in html_out, html_out
     assert render_parameter_space_section([]) == ""
