@@ -117,9 +117,8 @@ anesthetic), so no host Python environment is needed. Details in
 Searches usually run on a headless remote host, so there is often no
 browser there to open the index with. `./ri serve` serves the report
 directory over HTTP on loopback and prints the `ssh -L` line that tunnels
-it to your own machine - nothing on the host is exposed and no port is
-opened. Details in `docs/nested-sampling.md` ("Read the report from
-another machine").
+it to your own machine, so nothing goes out to the network. Details in
+`docs/nested-sampling.md` ("Read the report from another machine").
 
 `./ri plot likelihood` (`scripts/plot-merged-likelihood-compare.py`) writes
 the merged-failure-score figures into `reports/`, which is where

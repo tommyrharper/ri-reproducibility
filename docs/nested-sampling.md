@@ -670,12 +670,17 @@ ssh -N -L 8000:127.0.0.1:8000 <user>@<host>
 # then open http://localhost:8000/
 ```
 
-Nothing on the remote host is exposed by this and no port is opened - the
-loopback bind means the server is only reachable through an SSH session that
-host already accepts, and the tunnel runs at your end. `--bind 0.0.0.0` opts
-out and serves the report, unauthenticated, to anything that can reach the
-host. The `ssh -L` line guesses the host address from `hostname -I`, which is
-right on a cloud box and wrong behind NAT; `REPORT_SSH_HOST` overrides it.
+Nothing goes out to the network: the loopback bind means the only route in
+from another machine is an SSH session the host already accepts, and the tunnel
+runs at your end. It is not an access control, though - the report is
+unauthenticated, so anyone with an account on that host, and any container
+sharing its network namespace, can read it over loopback without SSH. On a
+shared login node that is worth knowing before starting one. `--bind 0.0.0.0`
+drops even that and serves the report to anything that can reach the host.
+
+The `ssh -L` line forwards to whatever `--bind` actually bound, and guesses the
+host address from `hostname -I` - right on a cloud box and wrong behind NAT, so
+`REPORT_SSH_HOST` overrides it.
 
 The server is `python3 -m http.server` from the host's standard library -
 no Docker, no dependencies - and runs in the foreground until Ctrl-C. It is

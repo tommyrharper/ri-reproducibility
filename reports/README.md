@@ -19,8 +19,8 @@ except this file and `manifests/.gitkeep` is generated and gitignored.
   `scripts/generate-report.sh`, same approach as `scripts/plot-fits.sh`,
   so no host Python environment is needed. Open the index in a browser.
   See `docs/nested-sampling.md` for the full description. `./ri serve`
-  serves this directory over HTTP for reading it from a browser on
-  another machine.
+  serves this directory over HTTP on loopback, for reading it from a
+  browser on another machine over an `ssh -L` tunnel.
 
 - `merged-r2d2-wsclean-*.png` - the merged and side-by-side failure-score
   figures written by `scripts/plot-merged-likelihood-compare.py`, which is

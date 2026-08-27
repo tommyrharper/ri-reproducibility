@@ -189,9 +189,11 @@ Reading the report from a browser on another machine:
 ./ri serve --bind 0.0.0.0        # no tunnel; unauthenticated to the network
 ```
 
-The server binds to loopback, so nothing is exposed and no port is opened on
-this host - the `ssh -L` tunnel it prints runs on your own machine. Foreground;
-Ctrl-C stops it.
+The server binds to loopback, so nothing is served to the network - the
+`ssh -L` tunnel it prints runs on your own machine. The report is
+unauthenticated, so a loopback bind still leaves it readable by anyone with an
+account on this host; `--bind 0.0.0.0` drops even that. Foreground; Ctrl-C
+stops it.
 
 ## Profiling
 
