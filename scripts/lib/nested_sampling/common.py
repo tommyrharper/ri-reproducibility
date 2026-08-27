@@ -100,14 +100,25 @@ def worker_attempts() -> Any:
 
 # A worker that goes silent is not a worker that died, and until these bounds
 # existed only the second one was survivable. MeqTrees deadlocks with its
-# meqserver during startup roughly once in 5,000 evaluations - the worker stays
-# alive, its request never completes and no reply is ever written - which left
-# the rank waiting on it blocked in readline() forever and the other ranks
-# burning a core each in the MPI collective behind it. Every run left unattended
-# came back stopped rather than finished. Each bound is far above the slowest
-# reply its path has ever produced: 0.53s for the slowest of 6,113 wsclean
-# evaluations, 477s for the slowest R2D2 imaging.
-SIMULATE_REPLY_TIMEOUT = 30.0
+# meqserver roughly once in 2,000 evaluations - the worker stays alive, its
+# request never completes and no reply is ever written - which left the rank
+# waiting on it blocked in readline() forever and the other ranks burning a core
+# each in the MPI collective behind it. Every run left unattended came back
+# stopped rather than finished.
+#
+# The bound is also the stall: PolyChord has every rank in the same collective,
+# so one silent worker holds all of them until its timeout expires. At 30s a
+# 20-rank wsclean run spent 92s of 408s - 23% of its wall clock - waiting out
+# four of these. So each bound wants to be as small as it can be without ever
+# firing on a stage that was only slow.
+#
+# Both requests this one covers are far below it, measured over 17,644
+# evaluations: simulate peaks at 0.34s on wsclean and 0.60s on R2D2, and the
+# R2D2-only MS-to-.mat convert - the slower of the two, and the reason this is
+# not smaller still - peaks at 1.42s, with nothing over 2s. 10s leaves 7x on
+# the worst of them. R2D2's actually slow stage is its imaging, which is
+# IMAGING_REPLY_TIMEOUT below and nothing to do with this.
+SIMULATE_REPLY_TIMEOUT = 10.0
 SHELL_REPLY_TIMEOUT = 300.0
 IMAGING_REPLY_TIMEOUT = 3600.0
 
