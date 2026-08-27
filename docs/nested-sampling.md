@@ -37,6 +37,12 @@ others and the run is `docker exec`ed into it (see "The PolyChord container is
 a sidecar too" and "Long-lived sidecar containers, one per image" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)).
 
+Once the containers are up, a progress bar tracks the search against its
+`--max-ndead` budget: elapsed time, dead points done, and an ETA extrapolated
+from the rate so far (`scripts/lib/progress-bar.sh`, counting
+`evaluations/eval-*` the same way `./ri runs` does). Only drawn on a TTY, so
+piped or logged runs are unaffected.
+
 ### WSClean
 
 ```bash

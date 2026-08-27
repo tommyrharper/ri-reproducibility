@@ -7,6 +7,8 @@ cd "${REPO_ROOT}"
 
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
+# shellcheck source=scripts/lib/progress-bar.sh
+source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/wsclean-vlaa-${RUN_ID}}"
 
@@ -158,7 +160,8 @@ scripts/record-environment.sh \
 # `git` that overlaps with the containers coming up.
 sidecar_wait
 
-"${RUN_COMMAND[@]}"
+mkdir -p "${OUTPUT_DIR}/evaluations"
+run_with_progress "${OUTPUT_DIR}/evaluations" "${NS_MAX_NDEAD}" -- "${RUN_COMMAND[@]}"
 
 rm -rf "${SIMULATE_FIFO_DIR}"
 echo "OK: nested-sampling output in ${OUTPUT_DIR}"
