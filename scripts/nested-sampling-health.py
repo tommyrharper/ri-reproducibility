@@ -275,6 +275,23 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     # How the run is going now against how it has gone, as a ratio of median
     # gaps. Medians, so one long gap cannot manufacture a collapse and a run
     # that is genuinely half its old speed cannot hide behind a fast tail.
+    #
+    # Gaps rather than "evaluations in the last N minutes", which is the
+    # obvious simplification and is wrong: the most recent window is always
+    # partial, so it reads low by exactly the fraction of it that has not
+    # elapsed yet, and at the moment of sampling that is indistinguishable from
+    # a real slowdown. Measured on a live run mid-window - 23.8/min from the
+    # partial bucket against a 91-165 per five minutes baseline, which looks
+    # like a collapse starting, where the gaps said 52.5/min and the bucket
+    # went on to finish at 164, the highest of the run. An inter-arrival gap
+    # cannot be measured until both ends exist, so there is no partial window
+    # to misread.
+    #
+    # The one thing gaps cannot see is a stall that began after the last
+    # completed evaluation, because that open-ended interval has no far end
+    # yet. last_activity_seconds is exactly that interval, and the idle clauses
+    # in describe() are what cover the hole. The two look redundant and are
+    # complementary; do not drop either.
     recent_rate, slowdown = None, None
     if len(gaps) >= 2 * RATE_WINDOW:
         recent = statistics.median(gaps[-RATE_WINDOW:])

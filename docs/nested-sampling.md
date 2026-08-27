@@ -350,7 +350,10 @@ What each line is reading, and why it is worth a line:
   come from the *same* update event, so agreement between them is one signal
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
-  stops a reader doing so either.
+  stops a reader doing so either. An age of an hour or more is ordinary rather
+  than alarming - the interval between the first two checkpoints of one
+  16-rank R2D2 run was 72 minutes, during which the search completed some two
+  thousand evaluations.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
@@ -365,6 +368,17 @@ What each line is reading, and why it is worth a line:
   then recovered to 37/min with nothing done to it - five minute bins of 104,
   23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
   grounds for telling anyone to act.
+
+  Both rates are medians of the gaps between evaluations, not counts in a
+  window, and that is deliberate: the most recent window is always partial, so
+  it reads low by whatever fraction of it has not elapsed. On this run,
+  mid-window, the partial bucket said 23.8/min against a 91-165 per five
+  minutes baseline - a collapse, apparently - while the gaps said 52.5/min and
+  the bucket finished at 164, the highest of the run. A gap cannot be measured
+  until both of its ends exist, so there is no partial window to misread. The
+  one thing gaps cannot see is a stall that began *after* the last completed
+  evaluation, which is what the idle thresholds cover; the two look redundant
+  and are complementary.
 
   Two things not to conclude from a falling rate. It does not mean the
   evaluations got harder: on that run per-evaluation cost was *falling* at the
