@@ -181,6 +181,18 @@ Up-to-date pages are skipped; the index is always rebuilt. `--last` and `--run`
 cannot be combined. Both reports are generated and gitignored - `git add -f` a
 copy if you want one version-controlled.
 
+Reading the report from a browser on another machine:
+
+```bash
+./ri serve                       # loopback:8000, prints the ssh -L line to run locally
+./ri serve --port 9000
+./ri serve --bind 0.0.0.0        # no tunnel; unauthenticated to the network
+```
+
+The server binds to loopback, so nothing is exposed and no port is opened on
+this host - the `ssh -L` tunnel it prints runs on your own machine. Foreground;
+Ctrl-C stops it.
+
 ## Profiling
 
 ```bash
