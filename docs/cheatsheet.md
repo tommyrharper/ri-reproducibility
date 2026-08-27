@@ -174,8 +174,9 @@ Failed simulate/imaging evaluations score `100.0`.
 | `start_frequency_hz` | `1.0e9` - `1.1e9` |
 | `channel_width_hz` | `0.5e6` - `2.0e6` |
 
-Defined as `PARAMETER_SPACE` in `scripts/lib/nested_sampling/common.py`,
-copied into every `summary.json`.
+Defined as `[[parameter_space]]` in `defaults.toml`, read by
+`load_parameter_space()` in `scripts/lib/nested_sampling/common.py` and copied
+into every `summary.json`.
 
 ## Reports
 

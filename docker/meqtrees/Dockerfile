@@ -59,10 +59,13 @@ COPY scripts/lib/nested_sampling/ms_to_r2d2_mat.py /opt/ri-nested-sampling/ms_to
 # here so that no run ever calls makems: a fresh makems is ~0.11s against
 # ~0.004s for a cache hit, and a default 8-rank run used to take ~7 of those
 # misses inside the sampler plus one per worker in warm_forest(). ~1.2s of build
-# time and ~18MB of image for -0.17s end to end. common.py is bind-mounted
-# rather than copied so the shapes come from the one authoritative
-# PARAMETER_SPACE without the runtime image growing a fourth script.
+# time and ~18MB of image for -0.17s end to end. common.py and the
+# defaults.toml it reads the parameter space from are bind-mounted rather than
+# copied so the shapes come from the one authoritative [[parameter_space]]
+# without the runtime image growing a fourth script.
 RUN --mount=type=bind,source=scripts/lib/nested_sampling/common.py,target=/opt/ri-nested-sampling/common.py \
+    --mount=type=bind,source=defaults.toml,target=/opt/ri-build-root/defaults.toml \
+    REPO_ROOT=/opt/ri-build-root \
     python3 /opt/ri-nested-sampling/simulate_point_source_ms.py --prebuild-skeletons
 
 # Same reason as the polychord image: anything without a valid .pyc is

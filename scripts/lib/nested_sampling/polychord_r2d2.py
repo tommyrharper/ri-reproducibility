@@ -16,12 +16,12 @@ import numpy as np
 
 from common import (
     FAILURE_OBJECTIVE,
-    PARAMETER_SPACE,
     cube_like_from_theta,
     cube_to_params,
     compute_image_metrics,
     convert_ms_to_mat,
     load_evaluations_from_dir,
+    load_parameter_space,
     mpi_rank,
     params_key,
     prewarm,
@@ -32,6 +32,7 @@ from common import (
     run_r2d2_imaging,
     self_check_lazy_numpy,
     self_check_metric_resolution,
+    self_check_parameter_space,
     self_check_profiling,
     self_check_r2d2_thread_env,
     simulate_measurement_set,
@@ -352,7 +353,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     evaluations_dir = output_dir / "evaluations"
     evaluations_dir.mkdir(exist_ok=True)
-    (output_dir / "parameter-space.json").write_text(json.dumps(PARAMETER_SPACE, indent=2) + "\n")
+    (output_dir / "parameter-space.json").write_text(json.dumps(load_parameter_space(), indent=2) + "\n")
 
     cache: dict[str, dict[str, Any]] = {}
     evaluations: list[dict[str, Any]] = []
@@ -375,7 +376,7 @@ def main() -> None:
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
         return float(cache[key]["objective"]), []
 
-    settings = PolyChordSettings(len(PARAMETER_SPACE), 0)
+    settings = PolyChordSettings(len(load_parameter_space()), 0)
     settings.base_dir = str(output_dir / "chains")
     settings.file_root = "r2d2_vlaa"
     settings.nlive = args.nlive
@@ -389,7 +390,7 @@ def main() -> None:
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
     run_start = time.monotonic()
-    pypolychord.run_polychord(likelihood, len(PARAMETER_SPACE), 0, settings, prior)
+    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start
 
     if mpi_rank() == 0:
@@ -419,7 +420,7 @@ def main() -> None:
                 "ckpt_path": "/checkpoints/R2D2_A1",
                 "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
             },
-            "parameter_space": PARAMETER_SPACE,
+            "parameter_space": load_parameter_space(),
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
@@ -433,6 +434,7 @@ def main() -> None:
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_R2D2_SELF_CHECK") == "1":
         self_check_metric_resolution()
+        self_check_parameter_space()
         self_check_lazy_numpy()
         self_check_r2d2_thread_env()
         self_check_r2d2_config_thread_cap()

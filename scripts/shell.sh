@@ -40,6 +40,7 @@ case "${1:-}" in
     # the other containers, so paths it passes on must resolve on the host too.
     docker run --rm -it \
       -v "${REPO_ROOT}:${REPO_ROOT}" -w "${REPO_ROOT}" \
+      -e REPO_ROOT="${REPO_ROOT}" \
       -v /var/run/docker.sock:/var/run/docker.sock \
       --entrypoint bash "${POLYCHORD_IMAGE}"
     ;;

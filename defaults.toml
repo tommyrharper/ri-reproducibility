@@ -34,3 +34,38 @@ NS_NUM_REPEATS = 2
 NS_MAX_NDEAD = 12
 NS_SEED = 41
 NS_METRIC = "total_rms_jy"
+
+# The parameter space the sampler searches, read by `load_parameter_space()`
+# in scripts/lib/nested_sampling/common.py. The order is the order of
+# PolyChord's unit cube, so reordering it invalidates existing chains, and
+# `kind = "integer"` rounds the scaled value to the nearest integer.
+#
+# An array of tables rather than an environment variable, so defaults.sh skips
+# it; it has to stay at the end of the file, because every key after a
+# `[[table]]` header belongs to that table.
+
+[[parameter_space]]
+name = "log10_dynamic_range"
+min = 2.0
+max = 3.0
+
+[[parameter_space]]
+name = "observation_minutes"
+min = 4.0
+max = 10.0
+
+[[parameter_space]]
+name = "channel_count"
+min = 2
+max = 6
+kind = "integer"
+
+[[parameter_space]]
+name = "start_frequency_hz"
+min = 1.0e9
+max = 1.1e9
+
+[[parameter_space]]
+name = "channel_width_hz"
+min = 0.5e6
+max = 2.0e6
