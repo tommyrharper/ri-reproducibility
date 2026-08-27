@@ -179,16 +179,16 @@ Defined as `[[parameter_space]]` in `defaults.toml`, read by
 into every `summary.json`.
 
 `start_frequency_hz` is drawn from the `[[receiver_band]]` list in the same
-file (the VLA's ten bands) so that the whole `channel_count` x
-`channel_width_hz` window stays inside one band; each band gets an equal share
-of the prior. Swap the list for another telescope's bands - no code change.
+file (the VLA's ten bands), each band getting an equal share of the prior.
+Swap the list for another telescope's bands - no code change.
 
-Widening `channel_count` or `channel_width_hz` cannot break that: each draw is
-placed only in the bands wide enough to hold it. Both ends of
-`channel_width_hz` are hard - no draw is bent to fit a band - so a box whose
-widest window fits no band at all (>13.5 GHz on the VLA) is a configuration
-error, fatal at load with the count and width that would fit. See
-docs/nested-sampling.md.
+The window is then fitted to the room left in that band: keep it if it fits,
+else narrow the channels, else hold the width at its min and drop channels,
+else throw the start frequency away and draw another. So the mins are hard
+floors, the maxes are never exceeded, and a run can measure narrower channels
+than it drew. How often that happens, and what it costs, is in each run's
+`summary.json` under `spectral_window_fitting` and printed when the run ends.
+See docs/nested-sampling.md.
 
 ## Runs that stopped early
 

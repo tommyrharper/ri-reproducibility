@@ -299,13 +299,10 @@ frequency sets are a follow-up ceiling.
 
 A telescope only receives inside its bands, so `start_frequency_hz` is not
 scaled onto a plain box: the `[[receiver_band]]` list in `defaults.toml` names
-the bands, and each band wide enough to hold the sampled `channel_count` x
-`channel_width_hz` window gets an equal share of that unit-cube dimension, with
-the start frequency uniform inside the band's placeable range. The whole
-window - `start_frequency_hz` to `start_frequency_hz + channel_count *
-channel_width_hz` - therefore always sits inside one band, and every band is
-searched about equally often (uniform across the union of the bands instead
-would draw the 32 MHz-wide 4-band about once in 1500 evaluations).
+the bands, each gets an equal share of that unit-cube dimension, and the start
+frequency is uniform inside the band its share picks. Equal share per band
+rather than uniform across the union of them, or the 32 MHz-wide 4-band would
+come up about once in 1500 draws and never actually be searched.
 
 The committed list is the VLA's:
 
@@ -319,26 +316,65 @@ The committed list is the VLA's:
 
 Nothing in the code is VLA-specific: another telescope is a matter of
 replacing the list (any number of bands, in any order, gaps allowed).
-`self_check_spectral_window()` in `scripts/lib/nested_sampling/common.py` is
-the guard - it samples the cube, asserts every window lands inside a band, and
-asserts the theta -> cube -> params round trip PolyChord relies on still comes
+
+### Fitting the window into the band
+
+`channel_count` and `channel_width_hz` are drawn from their own boxes, knowing
+nothing about frequency, so a window can easily be wider than the room left
+above the start frequency that came up. `fit_spectral_window()` in
+`common.py` fits it to that room, giving up as little as possible at each
+step:
+
+1. the window fits - keep the draw;
+2. it does not - narrow the channels until it does, if that stays at or above
+   `channel_width_hz`'s min;
+3. it would go below that - hold the width at the min and drop channels
+   instead, if that stays at or above `channel_count`'s min;
+4. even the smallest window does not fit, so the start frequency is too close
+   to the top of its band to hold anything - draw another start frequency and
+   start over.
+
+The redraw steps a fixed distance (the golden ratio conjugate) around the unit
+interval rather than drawing from an RNG, which spreads successive tries
+across every band and keeps the prior transform a pure function of the cube -
+what PolyChord requires, and what makes the `theta -> cube -> params` round
+trip a fixed point: a fitted window is one that already fits, so re-deriving it
+changes nothing.
+
+Two consequences worth knowing. The fitting only ever gives ground, so the
+mins are hard floors and the maxes are never exceeded - but a run does measure
+narrower channels than it drew, and the prior on `channel_width_hz` is no
+longer flat: it is deformed towards the narrow end near the top of each band.
+And a box whose *smallest* window - `channel_count`'s min at
+`channel_width_hz`'s min - fits no band at all cannot be fitted from any start
+frequency, so `check_channel_box_against_bands()` refuses it at load.
+
+### What the fitting costs
+
+Every draw that is fitted rather than kept is a draw whose parameters are not
+the ones the sampler asked for, and every redraw is work thrown away, so both
+are counted. `WINDOW_FIT_STATS` tallies them and each run's `summary.json`
+carries the result under `spectral_window_fitting`:
+
+```json
+"spectral_window_fitting": {
+  "draws": 2000, "as_sampled": 1972, "width_reduced": 25, "count_reduced": 3,
+  "redrawn_draws": 5, "redraws": 5, "seconds": 0.0017,
+  "seconds_per_draw": 8.6e-07
+}
+```
+
+The run also prints that line when it finishes. With the committed box the
+fitting is cheap and rare - the window tops out at 12 MHz against a 32 MHz
+narrowest band, so it only bites near the top of a band - and the cost is
+microseconds a draw against seconds an evaluation. Widen `channel_count` or
+`channel_width_hz` and the reduced counts climb, which is the number to watch:
+it is how much of the box the run is not really searching.
+
+`self_check_spectral_window()` is the guard - it samples the cube, asserts
+every fitted window lands inside a band and inside the configured channel
+boxes, forces each rung of the ladder above, and asserts the round trip comes
 back to the same parameters.
-
-`channel_count` and `channel_width_hz` stay ordinary boxes you can widen, and
-both ends of `channel_width_hz` are hard: every draw is sampled from exactly
-the range you configured, and no draw is ever bent to make it fit a band.
-Widening them still cannot put a window outside a band:
-
-- The set of candidate bands is recomputed per draw, from the window that draw
-  asked for, so a wide window simply never starts in a band too narrow for it,
-  while a narrow window drawn a moment later still can. No band is lost from
-  the prior for being narrow.
-- The two rules only contradict each other for a box whose *widest* window -
-  `channel_count`'s max at `channel_width_hz`'s max - fits no band at all
-  (>13.5 GHz for the VLA). There is no honest answer for that draw, so
-  `check_channel_box_against_bands()` refuses it at load, naming the channel
-  count and the channel width that would fit. A run either searches the box
-  you configured or does not start.
 
 The band guarantee is the sampler's. `simulate_point_source_ms.py` takes
 `--start-frequency-hz` and `--channel-width-hz` as given, so a hand-run
