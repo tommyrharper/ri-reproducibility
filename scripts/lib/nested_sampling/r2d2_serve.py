@@ -12,7 +12,9 @@ redirection did - and the reply is one JSON line on stdout,
 conversation happens over the FIFO pair `<base>.in` / `<base>.out` instead, and
 `--fifo-dir <dir>` serves one such pair per rank from a single warm-up. Either
 is what lets the run script start these workers as the R2D2 container's own
-command, before the ranks that will use them exist.
+command, before the ranks that will use them exist. `--fifo-dir` also opens
+every pair before it warms up, so a rank attaches at ~0.3s rather than ~1.2s and
+spends the difference on its own startup instead of on this one's.
 
 The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve and gives each
 measurement operator one FINUFFT plan per transform type; see `patch_op_norm`
@@ -320,21 +322,46 @@ def serve_pool(fifo_dir: str) -> None:
     across 8 of them on a 20-CPU host, and the sampler waits for the slowest.
     Importing once and forking pays it at the solo price, and the children then
     share the ~300MB of it copy-on-write instead of holding a copy each.
+
+    This process holds both ends of every pair open from before the warm-up
+    until the pair's child exits, so a rank can attach while the warm-up is
+    still running and get on with its own startup.
     """
     global _PEAK_FLOOR
     bases = sorted(str(path)[: -len(".in")] for path in Path(fifo_dir).glob("*.in"))
+    # A rank attaches by write-opening `<rank>.in` - ENXIO until someone is
+    # reading it - and then read-opening `<rank>.out`, which blocks until
+    # someone is writing it. Opened only by the children, that is not until the
+    # warm-up below has finished, and the rank spends ~1.2s idle in a window
+    # where it has its own sampler to load and evaluation one's simulate and
+    # convert to run. Held here instead, both opens succeed immediately.
+    #
+    # `.out` is O_RDWR because a plain write-open would block until the rank
+    # read-opens, which is the wait this is removing; on a FIFO O_RDWR never
+    # blocks. Holding a writer on it is also what keeps the rank's reply read
+    # from hitting a spurious EOF in the moment between the fork and the child
+    # opening its own end.
+    keeper = {base: (os.open(f"{base}.in", os.O_RDONLY | os.O_NONBLOCK), os.open(f"{base}.out", os.O_RDWR))
+              for base in bases}
     warm_imports()
     # Set before the fork, so every child reports at least what the warm-up it
     # inherited already cost.
     _PEAK_FLOOR = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-    children = []
+    children = {}
     for base in bases:
         pid = os.fork()
         if pid:
-            children.append(pid)
+            children[pid] = base
             continue
         status = 0
         try:
+            # The child re-opens its own pair inside answer() and wants none of
+            # the inherited ends, its own included: holding the request pipe's
+            # read end open in two processes would keep a request alive after
+            # the one that should answer it has gone.
+            for fds in keeper.values():
+                for fd in fds:
+                    os.close(fd)
             answer(base)
         except Exception:
             traceback.print_exc()
@@ -342,8 +369,15 @@ def serve_pool(fifo_dir: str) -> None:
         # _exit, not sys.exit: this child inherited the parent's atexit hooks and
         # stdio buffers and must run neither.
         os._exit(status)
-    for pid in children:
-        os.waitpid(pid, 0)
+    while children:
+        pid, _status = os.wait()
+        base = children.pop(pid, None)
+        # Dropped as its worker goes, not at the end: while this process holds
+        # them a rank whose worker died would write into a pipe nobody reads
+        # and then wait forever for a reply. Closing here gives it the same
+        # broken pipe and empty reply it gets when there is no pool at all.
+        for fd in keeper.pop(base, ()):
+            os.close(fd)
 
 
 def serve(fifo_base: str | None = None) -> None:
@@ -476,6 +510,10 @@ def self_check_serve_pool() -> None:
         for submodule in _UTILS_SUBMODULES:
             (package / f"{submodule}.py").write_text("")
         (package / "misc.py").write_text(
+            # The sleep is what makes the pre-opened FIFO ends observable: a
+            # rank must be able to attach while this is still running.
+            "import time\n"
+            "time.sleep(0.5)\n"
             f"open({str(marker)!r}, 'a').write('x\\n')\n"
             "_ = bytearray(64 * 1024 * 1024)\n"
             "del _\n"
@@ -501,7 +539,13 @@ def self_check_serve_pool() -> None:
                     assert time.monotonic() < deadline, f"rank {rank} never got a worker"
                     time.sleep(0.01)
             os.set_blocking(write_fd, True)
+            # What the pre-opened ends buy: rank 0 attaches - both FIFOs, not
+            # just the request one - while the warm-up is still running.
+            if rank == 0:
+                assert not marker.exists(), "rank 0's request pipe waited for the warm-up"
             with os.fdopen(write_fd, "w") as requests, open(f"{base}.out") as replies:
+                if rank == 0:
+                    assert not marker.exists(), "rank 0's reply pipe waited for the warm-up"
                 request = {"argv": [str(code)], "stdout": str(root / "o.log"), "stderr": str(root / "e.log")}
                 requests.write(json.dumps(request) + "\n")
                 requests.flush()

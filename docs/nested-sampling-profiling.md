@@ -1571,6 +1571,87 @@ And the R2D2 image reports `torch` at 0.85-0.92s by `-X importtime`, of which
 (0.16s), `torch.export` (0.08s) and `torch.nested` (0.06s) are stock and not
 disableable - that part of the readiness window is a hard floor.
 
+#### The ranks attach to the pool before the warm-up, not after
+
+The readiness wait above is the pool's, not the ranks'. A rank attaches to its
+worker by write-opening `<rank>.in` - `ENXIO` until someone is reading it - and
+then read-opening `<rank>.out`, which blocks until someone is writing it. Both
+ends were opened by the forked children, and the children do not exist until
+`warm_imports()` has finished, so the rank could not attach until the whole
+~1.2s of `import torch` and the R2D2 modules was paid.
+
+`serve_pool()` now opens both ends of every pair itself, before the warm-up, and
+holds them until that pair's child exits. `.out` is `O_RDWR` because a plain
+write-open would block waiting for the rank, which is the wait being removed; on
+a FIFO `O_RDWR` never blocks. Measured from the host with a stand-in for the
+ranks - eight attaches against a pool started exactly as the run script starts
+it, `docker run` issued at t=0:
+
+| | rank 7 attached at |
+|---|---:|
+| children open the FIFOs | 1.206 1.226 1.216 1.195 |
+| the pool opens them before warming | 0.298 0.296 0.284 0.286 |
+
+-0.92s, 4 of 4. What the rank does with that window is the rest of PolyChord's
+startup and evaluation one's simulate and convert, and then it blocks on the
+imaging reply anyway - so only the ~0.05s it would otherwise have spent on those
+after the wait can come off the run. Interleaved A/B, 12 pairs alternating the
+two `r2d2_serve.py` versions in place (one pair dropped: its
+second arm hit the meqserver hang described below and was killed by the
+harness' 60s timeout):
+
+| | End to end |
+|---|---:|
+| children open the FIFOs | 2.647 2.744 2.641 2.826 2.785 2.945 2.742 2.759 2.783 2.808 2.848 |
+| the pool opens them first | 2.588 2.643 2.764 2.759 2.749 2.784 2.792 2.711 2.781 2.807 2.725 |
+
+9 wins, 2 losses, median -0.048s (-1.7%), mean -0.039s. `log(Z)` is 99.92878 +/-
+0.06674 in all 23 completed runs and both arms produce the same 38 evaluations.
+This is the same shape of result as the simulate worker's version of this change
+(above), which was rejected at 0.35s off the join and 0.00s end to end; the
+difference is that a rank has simulate and convert to run before it needs an
+imaging reply, where on the simulate side it had nothing.
+
+It does move where the wait is *counted*. The rank starts timing an imaging
+request when it writes it, so a rank that reaches evaluation one while the pool
+is still importing measures the rest of the import as imaging: in a profiled
+pair, `eval_id == 1` `image_container_seconds` goes from 0.102s to 0.587s and
+summed imaging worker-seconds from 2.73s to 6.14s, while the steady-state median
+is 0.068s against 0.073s and the run is faster. Read those two numbers as the
+readiness wait, not as an imaging regression - the same trap `OMPI_MCA_pml=ob1`
+set for `simulate_seconds`.
+
+Three FIFO details this depends on, each of which deadlocks or corrupts the run
+if it is got wrong:
+
+- The children close every inherited end, their own included, before `answer()`
+  re-opens the pair. Two processes holding a request pipe's read end means a
+  request can be delivered to the one that will not answer it.
+- The parent keeps holding both ends until the pair's child exits, rather than
+  dropping them after the fork. Dropping the `.out` write end leaves a window
+  with no writer at all, and a rank sitting in `readline()` reads that as EOF -
+  an empty reply, which the run reports as a dead worker. Measured: it happens
+  on the first request every time.
+- The parent drops a pair's ends *as* its child exits, not at the end of the
+  run. While it holds them, a rank whose worker died would write into a pipe
+  nobody reads and then wait forever for a reply; closing them gives it the same
+  broken pipe and empty reply it gets when there is no pool at all.
+
+`self_check_serve_pool()` guards the property: its stand-in for `import torch`
+sleeps 0.5s, and rank 0 must have opened *both* of its FIFOs before that sleep
+has finished.
+
+#### An evaluation's MeqTrees predict can hang forever
+
+Seen twice in ~25 runs on a host shared with other work, in both arms of the A/B
+above and therefore not caused by it: a rank stops in `pipe_read` waiting for its
+simulate worker's reply, and that worker is in `futex_wait_queue_me` inside
+`meqserver`'s `await_()` - a `threading.Event.wait()` with no timeout - for a
+predict that never completes. All eight imaging workers are idle. Nothing in the
+path has a timeout (`simulate_worker_request()` blocks in `readline()`), so the
+run hangs until it is killed. Worth knowing when timing anything here: an A/B
+harness needs `timeout` around each run or one hang eats the whole measurement.
+
 ### Sidecar containers run with `--network none`
 
 Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`
