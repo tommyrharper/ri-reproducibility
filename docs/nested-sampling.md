@@ -288,12 +288,42 @@ PolyChord dimensions for both algorithms:
 | `dynamic_range` | `1e2` to `1e3` | One-Jy source divided by thermal-noise sigma |
 | `observation_minutes` | `4` to `10` | Total requested observing time |
 | `channel_count` | `2` to `6` | Number of frequency channels |
-| `start_frequency_hz` | `1.0e9` to `1.1e9` | First channel frequency |
+| `start_frequency_hz` | a receiver band (see below) | First channel frequency |
 | `channel_width_hz` | `0.5e6` to `2.0e6` | Uniform spacing between channels |
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
 frequency sets are a follow-up ceiling.
+
+### Receiver bands
+
+A telescope only receives inside its bands, so `start_frequency_hz` is not
+scaled onto a plain box: the `[[receiver_band]]` list in `defaults.toml` names
+the bands, and each band wide enough to hold the sampled `channel_count` x
+`channel_width_hz` window gets an equal share of that unit-cube dimension, with
+the start frequency uniform inside the band's placeable range. The whole
+window - `start_frequency_hz` to `start_frequency_hz + channel_count *
+channel_width_hz` - therefore always sits inside one band, and every band is
+searched about equally often (uniform across the union of the bands instead
+would draw the 32 MHz-wide 4-band about once in 1500 evaluations).
+
+The committed list is the VLA's:
+
+| Band | Range | Band | Range |
+|---|---:|---|---:|
+| 4 | 54-86 MHz | X | 8-12 GHz |
+| P | 224-480 MHz | Ku | 12-18 GHz |
+| L | 1-2 GHz | K | 18-26.5 GHz |
+| S | 2-4 GHz | Ka | 26.5-40 GHz |
+| C | 4-8 GHz | Q | 40-50 GHz |
+
+Nothing in the code is VLA-specific: another telescope is a matter of
+replacing the list (any number of bands, in any order, gaps allowed). A window
+wider than every band is narrowed until it fits rather than placed outside
+one. `self_check_spectral_window()` in
+`scripts/lib/nested_sampling/common.py` is the guard - it samples the cube,
+asserts every window lands inside a band, and asserts the theta -> cube -> params
+round trip PolyChord relies on still comes back to the same parameters.
 
 Fixed hyperparameters (not searched) on every evaluation:
 
