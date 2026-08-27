@@ -7,6 +7,7 @@ import atexit
 import json
 import math
 import os
+import select
 import shlex
 import subprocess
 import sys
@@ -95,6 +96,35 @@ def worker_attempts() -> Any:
         if delay:
             time.sleep(delay)
         yield attempt
+
+
+# A worker that goes silent is not a worker that died, and until these bounds
+# existed only the second one was survivable. MeqTrees deadlocks with its
+# meqserver during startup roughly once in 5,000 evaluations - the worker stays
+# alive, its request never completes and no reply is ever written - which left
+# the rank waiting on it blocked in readline() forever and the other ranks
+# burning a core each in the MPI collective behind it. Every run left unattended
+# came back stopped rather than finished. Each bound is far above the slowest
+# reply its path has ever produced: 0.53s for the slowest of 6,113 wsclean
+# evaluations, 477s for the slowest R2D2 imaging.
+SIMULATE_REPLY_TIMEOUT = 30.0
+SHELL_REPLY_TIMEOUT = 300.0
+IMAGING_REPLY_TIMEOUT = 3600.0
+
+
+def worker_reply(stream: Any, timeout: float) -> str | None:
+    """One reply line: `""` if the worker died, None if it stopped answering.
+
+    select() reads the file descriptor underneath the buffer, which is only
+    safe because the protocol is strictly one flushed reply line per request
+    and a request only goes out once the previous reply has been read - so
+    there is never a second line already sitting in the buffer for select() to
+    miss. A reply is short enough to be an atomic pipe write, so a readable
+    stream always holds the whole line.
+    """
+    if not select.select([stream], [], [], timeout)[0]:
+        return None
+    return stream.readline()
 
 
 class WorkerDied(RuntimeError):
@@ -784,14 +814,21 @@ def sidecar_run(
         shell = sidecar_shell(image, platform)
         shell.stdin.write(request)
         shell.stdin.flush()
-        reply = shell.stdout.readline()
+        reply = worker_reply(shell.stdout, SHELL_REPLY_TIMEOUT)
         if reply:
             wall_seconds = time.perf_counter() - started
             return DockerRunResult(returncode=int(reply), wall_seconds=wall_seconds, peak_memory_bytes=0)
+        if reply is None:
+            # ponytail: kills the `docker exec` client, leaving the `sh` it was
+            # talking to wedged in the sidecar - the ranks' shells are
+            # indistinguishable in there, so there is nothing to pgrep for. One
+            # leaks per timeout; give the shell an `echo $$` handshake at
+            # startup if that ever costs more than the retry does.
+            shell.kill()
         _SIDECAR_SHELLS.pop(image, None)
     wall_seconds = time.perf_counter() - started
     stderr_path.write_text(
-        f"FATAL: {image} sidecar shell exited without a reply, {len(WORKER_RETRY_DELAYS)} times\n"
+        f"FATAL: {image} sidecar shell gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
     return DockerRunResult(returncode=WORKER_DIED, wall_seconds=wall_seconds, peak_memory_bytes=0)
 
@@ -1380,25 +1417,66 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
 _SIMULATE_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
 
 
+# Set when a pooled worker had to be killed. Its FIFO pair died with it, so
+# reconnecting can only find a corpse, and the ENXIO wait below would be pure
+# delay in front of a retry that has to fall back to a rank-started worker
+# anyway. Per rank, because each rank is its own process.
+_FIFO_POOL_ABANDONED = False
+
+
 class FifoWorker:
     """A `--serve --fifo` worker the run script already started.
 
-    Same `.stdin`/`.stdout`/`.terminate()` surface as the `subprocess.Popen`
-    below, over the FIFO pair the worker is serving on. Closing stdin is what
-    ends it: the worker's request loop sees EOF and exits.
+    Same `.stdin`/`.stdout`/`.kill()`/`.terminate()` surface as the
+    `subprocess.Popen` below, over the FIFO pair the worker is serving on.
+    Closing stdin is what ends it: the worker's request loop sees EOF and
+    exits.
     """
 
-    def __init__(self, write_fd: int, reply_path: Path) -> None:
+    def __init__(self, write_fd: int, reply_path: Path, container: str, base: Path) -> None:
         self.stdin = os.fdopen(write_fd, "w")
         # Opening a FIFO blocks until the other end is open, so this must be the
         # same order serve() uses - request pipe first, reply pipe second.
         self.stdout = reply_path.open("r")
+        self.container = container
+        self.base = base
 
     def terminate(self) -> None:
         self.stdin.close()
 
+    def kill(self) -> None:
+        """SIGKILL this worker inside the sidecar, wedged meqserver and all.
 
-def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
+        A worker that stopped answering is still holding its end of the FIFO
+        pair open, so leaving it alive means the next attempt reconnects to the
+        same wedged process rather than a fresh one - and its meqserver is
+        ~0.4GB that nothing else will ever reclaim. `--fifo <base>` is unique to
+        this rank's worker, so pgrep finds it with no pid file to keep in sync.
+        The bracket in the pattern is what stops the `sh -c` running it from
+        matching its own command line; the image has pgrep but no pkill, hence
+        killing the meqserver child by pid.
+        """
+        global _FIFO_POOL_ABANDONED
+        _FIFO_POOL_ABANDONED = True
+        pattern = f"serve --fif[o] {self.base}$"
+        subprocess.run(
+            [
+                "docker", "exec", self.container, "sh", "-c",
+                f"p=$(pgrep -f {shlex.quote(pattern)}) || exit 0;"
+                " kill -9 $(pgrep -P $p) $p 2>/dev/null || true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        for stream in (self.stdin, self.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWorker | None:
     """Attach to this rank's pre-warmed worker, or None if there is not one.
 
     A rank-started worker is not ready to answer for a while - interpreter,
@@ -1412,7 +1490,7 @@ def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
     containers.
     """
     fifo_dir = os.environ.get(fifo_dir_var)
-    if not fifo_dir:
+    if not fifo_dir or _FIFO_POOL_ABANDONED:
         return None
     base = Path(fifo_dir) / str(mpi_rank())
     # O_NONBLOCK is how a FIFO write-open says "no reader yet" (ENXIO) instead of
@@ -1429,7 +1507,7 @@ def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
             time.sleep(0.002)
             continue
         os.set_blocking(write_fd, True)
-        return FifoWorker(write_fd, Path(f"{base}.out"))
+        return FifoWorker(write_fd, Path(f"{base}.out"), container, base)
 
 
 def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | FifoWorker:
@@ -1442,7 +1520,9 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | Fi
     compile, RIME predict and noise fill.
     """
     if meqtrees_image not in _SIMULATE_WORKERS:
-        worker = _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR")
+        worker = _connect_shell_started_worker(
+            "NS_SIMULATE_FIFO_DIR", sidecar_container(meqtrees_image, platform)
+        )
         if worker is None:
             repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
             worker = subprocess.Popen(
@@ -1537,7 +1617,7 @@ def run_r2d2_imaging(
         worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
         worker.stdin.write(json.dumps(request) + "\n")
         worker.stdin.flush()
-        reply = worker.stdout.readline()
+        reply = worker_reply(worker.stdout, IMAGING_REPLY_TIMEOUT)
         if reply:
             answer = json.loads(reply)
             return DockerRunResult(
@@ -1545,11 +1625,15 @@ def run_r2d2_imaging(
                 wall_seconds=time.perf_counter() - started,
                 peak_memory_bytes=answer["peak_memory_bytes"],
             )
-        # The worker died mid-request; drop it so the next attempt starts a
-        # fresh one instead of inheriting the corpse.
+        if reply is None:
+            # ponytail: as in sidecar_run(), this kills the `docker exec`
+            # client and leaves the worker wedged in the sidecar.
+            worker.kill()
+        # The worker died or went silent mid-request; drop it so the next
+        # attempt starts a fresh one instead of inheriting the corpse.
         _R2D2_WORKERS.pop(r2d2_image, None)
     stderr_path.write_text(
-        f"FATAL: r2d2 worker exited without a reply, {len(WORKER_RETRY_DELAYS)} times\n"
+        f"FATAL: r2d2 worker gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
     return DockerRunResult(
         returncode=WORKER_DIED,
@@ -1592,20 +1676,24 @@ def simulate_worker_request(
     """Send one request to this rank's simulate worker and report its exit code.
 
     A worker that dies without answering is dropped from the cache so the retry
-    gets a fresh one instead of inheriting the corpse. A death that survives
-    the retry reports WORKER_DIED, not an exit status the simulate never
-    returned, with the reason in the caller's stderr log.
+    gets a fresh one instead of inheriting the corpse. One that stops answering
+    without dying - the MeqTrees/meqserver deadlock SIMULATE_REPLY_TIMEOUT
+    exists for - is killed first, so that it leaves the same way. Either one
+    surviving the retries reports WORKER_DIED, not an exit status the simulate
+    never returned, with the reason in the caller's stderr log.
     """
     for attempt in worker_attempts():
         worker = simulate_worker(meqtrees_image, platform)
         worker.stdin.write(json.dumps(request) + "\n")
         worker.stdin.flush()
-        reply = worker.stdout.readline()
+        reply = worker_reply(worker.stdout, SIMULATE_REPLY_TIMEOUT)
         if reply:
             return int(json.loads(reply)["returncode"])
+        if reply is None:
+            worker.kill()
         _SIMULATE_WORKERS.pop(meqtrees_image, None)
     stderr_path.write_text(
-        f"FATAL: simulate worker exited without a reply, {len(WORKER_RETRY_DELAYS)} times\n"
+        f"FATAL: simulate worker gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
     return WORKER_DIED
 
@@ -1705,16 +1793,90 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
     )
 
 
+def self_check_worker_timeout() -> None:
+    """A worker that goes silent must be retried, then reported as WORKER_DIED.
+
+    The run this guards against is a real one: MeqTrees deadlocked with its
+    meqserver, the worker stayed alive and answered nothing, and the rank
+    waiting on it sat in readline() for 82 of the run's 84 minutes with the
+    other 19 ranks spinning in the collective behind it. Silence has to leave
+    by the same door a death does - killed, dropped, retried against a fresh
+    worker - and a silence that outlasts the retries has to reach the sampler
+    as WORKER_DIED rather than as an exit status the simulate never returned.
+    """
+    import tempfile
+
+    class Worker:
+        """A worker whose reply never arrives, or arrives, on a real fd."""
+
+        def __init__(self, reply: str | None) -> None:
+            read_fd, self._write_fd = os.pipe()
+            self.stdout = os.fdopen(read_fd, "r")
+            self.stdin = open(os.devnull, "w")
+            self.killed = False
+            if reply is not None:
+                os.write(self._write_fd, reply.encode())
+
+        def kill(self) -> None:
+            self.killed = True
+
+    # An empty read means the worker died; no read at all means it went silent.
+    died = Worker("")
+    os.close(died._write_fd)
+    assert worker_reply(died.stdout, 5.0) == ""
+    answered = Worker('{"returncode": 3}\n')
+    assert worker_reply(answered.stdout, 5.0) == '{"returncode": 3}\n'
+    assert worker_reply(Worker(None).stdout, 0.05) is None
+
+    original = {name: globals()[name] for name in ("simulate_worker", "WORKER_RETRY_DELAYS", "SIMULATE_REPLY_TIMEOUT")}
+    workers: list[Worker] = []
+
+    def spawn(reply: str | None) -> Any:
+        def worker(*_args: Any, **_kwargs: Any) -> Worker:
+            workers.append(Worker(reply))
+            return workers[-1]
+
+        return worker
+
+    try:
+        globals()["WORKER_RETRY_DELAYS"] = (0.0, 0.0)
+        globals()["SIMULATE_REPLY_TIMEOUT"] = 0.05
+
+        globals()["simulate_worker"] = spawn(None)
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr_path = Path(tmp) / "simulate.stderr.log"
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == WORKER_DIED
+            assert "gave no reply" in stderr_path.read_text()
+        # Every silent worker is killed rather than left holding its meqserver,
+        # and each attempt gets a fresh one instead of the corpse.
+        assert len(workers) == 2, len(workers)
+        assert all(worker.killed for worker in workers)
+
+        # The bound must not cost a worker that does answer its reply.
+        workers.clear()
+        globals()["simulate_worker"] = spawn('{"returncode": 7}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr_path = Path(tmp) / "simulate.stderr.log"
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
+            assert not stderr_path.exists()
+        assert len(workers) == 1 and not workers[0].killed
+    finally:
+        globals().update(original)
+
+    print("worker timeout self-check passed")
+
+
 def self_check_parameter_space() -> None:
     """The parameter space survived the trip through defaults.toml.
 
-    6, not 5: the default-enabled count in the committed defaults.toml. Meant
-    to be retuned by toggling `enabled`, same as the ranges below - bump this
-    when the default-enabled set changes, so a stray toggle in a commit still
-    trips a canary.
+    5, not 6: the default-enabled count in the committed defaults.toml, which
+    is what `source_offset_fraction` being `enabled = false` leaves. Meant to
+    be retuned by toggling `enabled`, same as the ranges below - bump this when
+    the default-enabled set changes, so a stray toggle in a commit still trips
+    a canary.
     """
     specs = load_parameter_space()
-    assert len(specs) == 6, specs
+    assert len(specs) == 5, specs
     for spec in specs:
         assert spec["name"] in PARAMETER_TEX_LABELS, spec
         assert float(spec["min"]) < float(spec["max"]), spec
@@ -1841,10 +2003,23 @@ def self_check_source_offset() -> None:
 
     # A cube with everything at 0.5 fixes the offset fraction at its box's
     # midpoint; band_start's own resolution can move start_frequency_hz, so
-    # only the sign and non-zero-ness of the offset are pinned here.
-    n = len(load_parameter_space())
-    params = cube_to_params(np.full(n, 0.5))
-    assert params["source_l_arcsec"] != 0.0 or params["source_m_arcsec"] != 0.0, params
+    # only the sign and non-zero-ness of the offset are pinned here. Forced on
+    # rather than read from defaults.toml: this dimension is toggled off and on
+    # between runs, and the arithmetic above it still has to be right on the
+    # runs that enable it.
+    saved_on = os.environ.get("NS_ENABLE_PARAMS")
+    try:
+        os.environ["NS_ENABLE_PARAMS"] = "source_offset_fraction"
+        load_parameter_space.cache_clear()
+        n = len(load_parameter_space())
+        params = cube_to_params(np.full(n, 0.5))
+        assert params["source_l_arcsec"] != 0.0 or params["source_m_arcsec"] != 0.0, params
+    finally:
+        if saved_on is None:
+            os.environ.pop("NS_ENABLE_PARAMS", None)
+        else:
+            os.environ["NS_ENABLE_PARAMS"] = saved_on
+        load_parameter_space.cache_clear()
     print("source offset self-check passed")
 
 
