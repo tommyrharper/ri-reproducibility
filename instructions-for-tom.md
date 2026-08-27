@@ -51,3 +51,11 @@ Current command:
 ```zsh
 ./ri search r2d2 --nlive=50 --num-repeats=10 --max-ndead=-1 --seed=123 --metric=total_rms_jy
 ```
+
+Then for the ranges:
+- `log10_dynamic_range`: `2-6`
+- `observation_minutes`: `0.3-20`
+- `channel_count`: `1-16` (this may be too large)
+- `start_frequency_hz`
+- `channel_width_hz`
+
