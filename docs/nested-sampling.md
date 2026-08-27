@@ -302,7 +302,7 @@ have while one is still going:
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 57 dead points
+  stage     sampling, 113 dead points as of 0:08:18 ago, next at ~163
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   ranks     16 ranks of 16, 7 busy-waiting
@@ -340,6 +340,17 @@ What each line is reading, and why it is worth a line:
   drawing the initial live points. A run that dies before the main loop dies
   with no dead points, which otherwise looks the same as one that has barely
   started.
+
+  The dead-point count never appears without **how old it is**, because
+  PolyChord writes its checkpoint only every ~`nlive` points and the count
+  cannot move between writes. One reading of 57 that had not changed in fifty
+  minutes was taken here as evidence that progress had stopped, and cost an
+  hour of investigation; the next write landed at 113. It survived being
+  checked against the terminal, too - PolyChord's feedback box and these files
+  come from the *same* update event, so agreement between them is one signal
+  displayed twice, not two witnesses. Nothing in this report decides anything
+  from the count, and printing its age plus where it will next land is what
+  stops a reader doing so either.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
@@ -399,9 +410,23 @@ What each line is reading, and why it is worth a line:
   killed run leaves those holding ~3.4GB per R2D2 rank, counted against every
   later run's memory budget until someone removes them.
 
-- **why it stopped** - a stopped run's warning quotes the last line of its
-  `run.log`, which is where the run's own output is kept. Everything else on
-  disk says *that* a run broke; only this says why.
+- **why it stopped** - a stopped run's warning quotes its `run.log`, which is
+  where the run's own output is kept. Everything else on disk says *that* a
+  run broke; only this says why. It quotes the last line naming an error
+  rather than the last line outright, **and how many ranks said it**:
+
+  ```
+  run.log ends "TypeError: _connect_shell_started_worker() ..." (x15 ranks)
+  ```
+
+  The count is the diagnosis. An MPI crash leaves one traceback per rank, so
+  the real failure here was the same stack fifteen times over and a plain tail
+  of the file lands on it only by luck. Every rank reporting the same error is
+  a code bug that every rank hits deterministically - that was the `run.log`
+  captured from PR #66. One rank alone is a flaky worker, an OOM kill, or bad
+  luck on one evaluation, and those want opposite responses. For a run that
+  stopped without a traceback it falls back to the last non-empty line, which
+  is PolyChord's own last word on where it got to.
 
 ### Finding and resuming a run that stopped
 

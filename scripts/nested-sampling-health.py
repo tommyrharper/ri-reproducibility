@@ -61,6 +61,11 @@ NESTED_SAMPLING_DIR = Path("results/nested-sampling")
 # A run's own MPI ranks, as `ps` shows them.
 RANK_COMMAND = re.compile(r"\S*python[\d.]*\s+\S*polychord_\w+\.py\b")
 
+# What counts as the line worth quoting out of run.log. Deliberately broad: the
+# useful line is whichever one names the failure, and this only has to beat
+# "whatever happened to be printed last".
+ERROR_LINE = re.compile(r"Traceback|Error|Exception|FATAL", re.IGNORECASE)
+
 # common.py's FAILURE_OBJECTIVE, as write_evaluation_record's json.dumps writes
 # it. Matched as text because the alternative is parsing thousands of files to
 # read one number out of each.
@@ -81,10 +86,13 @@ SPIN_IDLE_SECONDS = 60.0
 
 # Evaluations in the "how is it going now" window, and how far it has to
 # diverge from the run's own median before both numbers are worth printing
-# rather than one. Half again is enough: the two agreeing is the normal case
-# and says nothing, so any real divergence is the interesting reading.
+# rather than one. Doubled rather than half again, because a healthy run's own
+# pace is noisier than it looks: five minute bins over 107 minutes of one
+# ranged 91-165 with no fault present. Walking that run's history, this fires
+# at 269 sampled moments in 15% of them at 1.5x and 5% at 2.0x, and the knee is
+# where the ordinary swing stops and the one real event starts.
 RATE_WINDOW = 50
-RATE_DIVERGENCE_FACTOR = 1.5
+RATE_DIVERGENCE_FACTOR = 2.0
 
 # A gap between consecutive evaluations counts as a stall when it is this many
 # times the run's own median gap. Relative because the two imagers are two
@@ -291,35 +299,61 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     }
 
 
-def log_tail(run_dir: Path) -> str | None:
-    """The last thing the run said, or None if it said nothing.
+def log_tail(run_dir: Path) -> dict[str, object] | None:
+    """What the run last said, and how many ranks said it.
 
     `run.log` is the only place a traceback survives - every other artifact a
-    stopped run leaves says that it broke, never why. Read from the end,
-    because a search that ran for hours can leave a large one.
+    stopped run leaves says that it broke, never why.
+
+    The count is the diagnosis, not decoration. An MPI crash produces one
+    traceback per rank, so a real failure here is the same stack fifteen or
+    twenty times over and the plain last line of the file is the right answer
+    only by luck of where the output stopped. All ranks reporting the same
+    error is a code bug every rank hits deterministically; one rank alone is a
+    flaky worker, an OOM kill, or bad luck on one evaluation. Those want
+    opposite responses, and the multiplicity is the only thing in the file that
+    tells them apart.
+
+    Falls back to the last non-empty line, which for a run that stopped without
+    a traceback is PolyChord's own last word on where it got to.
     """
     path = run_dir / "run.log"
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - 8192))
-            lines = handle.read().decode("utf-8", "replace").splitlines()
+            # Enough to hold every rank's copy: the one real crash captured
+            # here was 15 tracebacks in 18KB.
+            handle.seek(max(0, handle.tell() - 65536))
+            lines = [line.strip() for line in
+                     handle.read().decode("utf-8", "replace").splitlines() if line.strip()]
     except OSError:
         return None
-    for line in reversed(lines):
-        if line.strip():
-            return line.strip()
-    return None
+    if not lines:
+        return None
+    errors = [line for line in lines if ERROR_LINE.search(line)]
+    line = errors[-1] if errors else lines[-1]
+    return {"line": line, "occurrences": lines.count(line), "is_error": bool(errors)}
 
 
-def dead_points(run_dir: Path) -> int:
-    """PolyChord's own progress: one line per dead point, as the progress bar counts it."""
+def dead_points(run_dir: Path) -> tuple[int, float | None]:
+    """PolyChord's progress and how old that number is.
+
+    The age is not decoration. PolyChord writes its checkpoint roughly every
+    `nlive` dead points, so between writes the count cannot move by
+    construction - and a count that has not moved for fifty minutes looks
+    exactly like a run that has stopped making progress. That misreading has
+    already cost an hour of investigation here, and it survived being checked
+    against the terminal, because PolyChord's own feedback box and these files
+    are written by the same event: two displays of one signal, not two
+    witnesses. Nothing here decides anything from this count; it is reported
+    with its age so that nobody else does either.
+    """
     for path in (run_dir / "chains").glob("*_dead-birth.txt"):
         try:
-            return sum(1 for _ in path.open())
+            return sum(1 for _ in path.open()), time.time() - path.stat().st_mtime
         except OSError:
-            return 0
-    return 0
+            return 0, None
+    return 0, None
 
 
 def rank_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -428,6 +462,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     scan = evaluation_scan(run_dir)
     ranks = rank_processes(run_dir, processes)
     spinning = spinning_ranks(ranks, busy or {})
+    dead, checkpoint_age = dead_points(run_dir)
+    tail = log_tail(run_dir)
     idle = scan["last_activity_seconds"]
     complete = (run_dir / "summary.json").exists()
 
@@ -461,10 +497,14 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"no evaluation has landed in {idle:.0f}s while {len(ranks)} ranks are still running"
         )
     if status == "stopped":
-        # The log's last line if there is one, because "why" is the question a
-        # stopped run raises and this is the only artifact that answers it.
-        # Runs from before run.log was captured have none, hence the fallback.
-        ending = f'; run.log ends "{tail}"' if (tail := log_tail(run_dir)) else ""
+        # What the log said, because "why" is the question a stopped run raises
+        # and this is the only artifact that answers it. Runs from before
+        # run.log was captured have none, hence the plain form.
+        ending = ""
+        if tail:
+            copies = int(tail["occurrences"])
+            ending = (f'; run.log ends "{tail["line"]}"'
+                      + (f" (x{copies} ranks)" if copies > 1 else ""))
         warnings.append(
             f"stopped before finishing{ending}; continue it with ./ri resume {run_dir.name}"
         )
@@ -514,8 +554,9 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "settings": run_env,
         "ranks": len(ranks),
         "ranks_spinning": spinning,
-        "dead_points": dead_points(run_dir),
-        "log_tail": log_tail(run_dir),
+        "dead_points": dead,
+        "checkpoint_age_seconds": checkpoint_age,
+        "log_tail": tail,
         "warnings": warnings,
         **scan,
     }
@@ -570,8 +611,19 @@ def render(run: dict[str, object]) -> None:
     idle = run["last_activity_seconds"]
     rate = run["evals_per_minute"]
     slowdown = run["slowdown_factor"]
+    # Where the count will next move to, so a reader who comes back has
+    # something to compare against rather than a number that looks stuck.
+    next_update = ""
+    if settings.get("NS_NLIVE", "").isdigit() and run["checkpoint_age_seconds"] is not None:
+        next_update = f", next at ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
     lines = [
-        ("stage", f"{run['stage']}, {run['dead_points']} dead points"),
+        # The dead-point count never appears without how old it is. PolyChord
+        # writes it every ~nlive points, so it is stale by design between
+        # writes and a frozen-looking count means nothing on its own.
+        ("stage", f"{run['stage']}, {run['dead_points']} dead points"
+                  + (f" as of {format_hms(float(run['checkpoint_age_seconds']))} ago"
+                     f"{next_update}"
+                     if run["checkpoint_age_seconds"] is not None else "")),
         ("progress", f"{run['completed']} evaluations, {run['in_flight']} in flight"),
         ("activity", "nothing yet" if idle is None else
                      f"last evaluation {format_hms(float(idle))} ago"
@@ -729,7 +781,7 @@ def self_check() -> None:
             (live / "chains").mkdir(parents=True)
             (live / "chains" / "r2d2_vlaa.resume").write_text("")
             (live / "chains" / "r2d2_vlaa_dead-birth.txt").write_text("a\nb\nc\n")
-            (live / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\n")
+            (live / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\nNS_NLIVE=4\n")
             for i in range(4):
                 write_eval(live, i + 1, now - 40 + i * 0.5)
             (live / "evaluations" / "eval-0005-inflight").mkdir()
@@ -747,8 +799,20 @@ def self_check() -> None:
                  "args": f"/usr/bin/docker exec c mpirun python3 polychord_r2d2.py "
                          f"--output-dir {live.resolve()}"},
             ]
+            # PolyChord writes the dead-point count every ~nlive points, so it
+            # is stale by design between writes. Aged here at ten minutes while
+            # evaluations land every second: a run in exactly the state that
+            # has already been misread as "progress has stopped", so the count
+            # must never be shown without how old it is.
+            os.utime(live / "chains" / "r2d2_vlaa_dead-birth.txt", (now - 600, now - 600))
             report = describe(live, not_ranks + ranks, DEFAULT_STALE_SECONDS)
             assert report["status"] == "healthy", report
+            assert 590 < float(report["checkpoint_age_seconds"]) < 620, report
+            aged = io_capture(report)
+            assert "3 dead points as of 0:10:0" in aged, aged
+            # ...and where it will next move to, so a reader coming back has
+            # something to compare against. nlive is 4 in this fixture.
+            assert "next at ~7" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report
@@ -757,18 +821,39 @@ def self_check() -> None:
             # A stopped run says why, when the run script captured a log for it
             # - which is the whole reason run.log exists.
             assert log_tail(live) is None
+            # The shape a real MPI crash leaves: every rank raises the same
+            # thing, so the last line is the right answer only by luck of where
+            # the output happened to stop, and the count is the diagnosis.
+            crash = "TypeError: _connect_shell_started_worker() missing 1 required argument"
             (live / "run.log").write_text(
                 "ndead: 40\n"
-                # Padded past the 8KB read window, so the tail is genuinely
-                # sought to rather than found by reading the file.
-                + "chatter\n" * 2000
-                + "TypeError: unsupported operand type(s)\n\n"
+                # Past the read window, so the tail is genuinely sought to.
+                + "chatter\n" * 9000
+                + "".join(f"Traceback (most recent call last):\n  frame\n{crash}\n"
+                          for _ in range(15))
+                + "mpirun detected that one process exited\n"
             )
-            assert log_tail(live) == "TypeError: unsupported operand type(s)"
+            found = log_tail(live)
+            assert found["line"] == crash, found
+            assert found["occurrences"] == 15, found
             stopped_report = describe(live, [], 5.0)
             assert stopped_report["status"] == "stopped"
-            assert any("TypeError" in w and "./ri resume" in w
+            assert any("TypeError" in w and "(x15 ranks)" in w and "./ri resume" in w
                        for w in stopped_report["warnings"]), stopped_report
+
+            # One rank alone is a different fault and must not be reported as
+            # if every rank hit it.
+            (live / "run.log").write_text(f"chatter\n{crash}\nmpirun: exiting\n")
+            assert log_tail(live)["occurrences"] == 1
+            assert not any("ranks)" in w for w in describe(live, [], 5.0)["warnings"])
+
+            # A run that stopped without a traceback still reports where it got
+            # to, rather than nothing.
+            (live / "run.log").write_text("ndead: 113  logZ = -1.2\n\n")
+            quiet_exit = log_tail(live)
+            assert quiet_exit["line"] == "ndead: 113  logZ = -1.2", quiet_exit
+            assert quiet_exit["is_error"] is False, quiet_exit
+
             # A run from before run.log existed still gets the resume line.
             (live / "run.log").unlink()
             assert any("./ri resume" in w for w in describe(live, [], 5.0)["warnings"])
