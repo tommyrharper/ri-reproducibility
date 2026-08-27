@@ -408,9 +408,11 @@ compiles the forest and runs one throwaway predict before it opens its request
 pipe (`warm_forest()`); on the stdin path it deliberately does not, because
 there the rank that started it is already waiting.
 
-The price is that `docker info` moves back in front of the sidecar launches
-(~0.06s of serial delay, undone from an earlier iteration) because the FIFOs
-have to exist before the container's command globs for them.
+The price is that `HOST_CPUS` - which sets how many FIFO pairs to make - moves
+back in front of the sidecar launches, because the FIFOs have to exist before
+the container's command globs for them. It is read from `nproc` rather than
+`docker info --format '{{.NCPU}}'` for exactly that reason; see "`HOST_CPUS`
+comes from `nproc`, not from the daemon" below.
 
 Measured on the default 8-rank run: the eight `eval_id == 1` `simulate_seconds`
 records go from 0.18-0.41s (median ~0.33s) to 0.05-0.11s against a ~0.05s
@@ -569,10 +571,12 @@ are issued.
 The `docker info` that resolves `HOST_CPUS` (and doubles as the
 daemon-availability check) moved *after* the launches for the same reason -
 nothing between the launches and `sidecar_wait` touches a sidecar - which put
-`launches-issued` at ~0.005s after script start instead of ~0.075s. The WSClean
-script has since moved it back in front of them, because the FIFO pairs the
-meqtrees container's command globs for have to exist first (see "The workers are
-started by the container, not by the ranks" above).
+`launches-issued` at ~0.005s after script start instead of ~0.075s. Both
+scripts then had to move `HOST_CPUS` back in front of the launches, because the
+FIFO pairs the containers' commands glob for have to exist first (see "The
+workers are started by the container, not by the ranks" above); only the
+daemon check is still below them, and `HOST_CPUS` no longer costs a daemon
+round trip (see "`HOST_CPUS` comes from `nproc`, not from the daemon" below).
 
 Measured with four interleaved A/B runs of the default 8-rank configuration,
 end-to-end script wall time went 6.82s -> 5.29s (-22%); single-rank went 13.1s
@@ -1272,7 +1276,8 @@ Both halves are accounted for and neither has slack left:
   and a further 1.24s of `import optimiser, utils`, of which `python3 -X
   importtime` attributes 0.877s to `torch` alone and 0.309s to `utils`. The
   ~0.15s left is the run script's own preamble (`defaults.sh` 0.02s, the
-  daemon-check `docker info` 0.08s). Everything else the script does before the
+  daemon-check `docker info` 0.08s - since replaced by `nproc`, see below).
+  Everything else the script does before the
   first evaluation - the manifest write, the other two containers, `mpirun`,
   `import pypolychord` - already fits inside that window. Two things measured
   and rejected: `OMP_WAIT_POLICY=PASSIVE` on the R2D2 sidecar (2 wins, 3 losses
@@ -1329,6 +1334,81 @@ spend it came to nothing:
   28% faster per transform solo, and not bit-identical, so out of bounds anyway
   - is *slower* at eight (0.065s against 0.060s). A solo request is 0.031s of
   which 0.023s is 37 `finufft` `execute` calls.
+
+#### Pool readiness is 1:1 on the run's wall clock
+
+"Judge a startup-side change on pool readiness" (above) is now calibrated.
+Inject a `time.sleep(0.25)` in front of `warm_imports()` in `serve_pool` -
+`r2d2_serve.py` runs off the repo bind mount, so this is a file swap and no
+rebuild - and interleave it against the stock file: end to end goes 2.54s ->
+2.80s, **+0.26s from +0.25s of delay, 6 pairs out of 6**. The exchange rate is
+1:1, so a second taken off the R2D2 pool's readiness is a second off the run,
+and a second taken off anything else is worth whatever slack that branch has -
+which, for the ranks, is the ~0.4s they already spend blocked.
+
+The timeline behind that, measured by wrapping `prewarm`'s two targets in
+`polychord_r2d2_poc.py` with `time.time()` probes (a temporary patch; the
+polychord image has to be rebuilt for it) on a 2.35s run:
+
+| | |
+|---|---:|
+| script starts | 0.00s |
+| R2D2 sidecar's `docker run` issued | 0.17s |
+| `sidecar_wait` returns, `docker exec` issued | 0.55s |
+| ranks reach `main()` | 0.71-0.74s |
+| ranks attached to the imaging pool | +0.001-0.009s |
+| ranks attached to the simulate pool, `warm()` returns | 0.89-1.03s |
+| R2D2 pool answers | ~1.55s |
+| script exits | 2.35s |
+
+The imaging attach is free because of the pre-opened FIFO pairs; the simulate
+attach is not, because that worker still opens its pair after `meqserver` and
+`warm_forest()`. Neither is the binding branch: both are done by ~1.0s and the
+pool does not answer until ~1.55s.
+
+Two more numbers for scale. The sampler is linear in evaluations - 38
+evaluations in 1.35s, 55 in 1.80s, i.e. ~0.32s + ~0.027s per evaluation - and
+`NS_MAX_NDEAD=120` still only produces 55, because the precision criterion
+stops an `NS_NLIVE=8` run first. Steady-state per evaluation is simulate
+0.054s, imaging 0.069s, convert 0.014s. And `make nested-sampling-r2d2-poc` is
+now only ~0.06s more than calling the run script directly, so the build checks
+are no longer worth measuring separately.
+
+#### `HOST_CPUS` comes from `nproc`, not from the daemon
+
+`HOST_CPUS` has to be resolved before the sidecar launches, because it sets how
+many FIFO pairs to create and the containers' commands glob for them. Reading
+it with `docker info --format '{{.NCPU}}'` is 0.038-0.064s of CLI-plus-daemon
+round trip (`nproc` is 0.001-0.004s) sitting in front of the R2D2 sidecar's
+`docker run`, which the exchange rate above prices at 1:1. The two answers
+cannot differ for any daemon these scripts can use: every sidecar bind-mounts
+host paths, so the daemon is always this host. Only the daemon-availability
+check the `docker info` doubled as still needs the daemon, and it sits below
+the launches now, where it overlaps the containers coming up.
+
+Measured with `PS4='+ $(date +%s.%N) ' bash -x` on the run script, 4 runs per
+arm, the R2D2 sidecar's `docker run` is issued at 0.129-0.212s (median 0.164s)
+before and 0.096-0.113s (median 0.099s) after - **0.065s earlier, with the two
+ranges not overlapping**. `docker exec` is issued at the same time either way,
+because that is gated by the manifest write and the container starts, not by
+the preamble.
+
+End to end, over 37 valid interleaved pairs of
+`scripts/run-nested-sampling-r2d2-poc.sh` (one 38th pair dropped: arm A hit the
+MeqTrees predict hang below and its `timeout 300` fired):
+
+| | before | after |
+|---|---:|---:|
+| mean | 2.640s | 2.575s |
+| median | 2.633s | 2.589s |
+
+**-0.066s +-0.022s (t=2.98), 28 wins of 37.** The observed saving is the 0.065s
+of earlier launch, as the 1:1 exchange rate predicts. Note how much data that
+took: the first 14 pairs read +0.009s +-0.027s, which on its own is
+indistinguishable from zero. Per-pair spread here is ~0.10s, so anything under
+~0.1s needs 30+ pairs before the sign of the result means anything - and a
+directly measured proxy for what the change actually moves (here, when the
+`docker run` is issued) is worth having before the A/B is started, not after.
 
 ### The operator norm is solved with Lanczos, not a power iteration
 
