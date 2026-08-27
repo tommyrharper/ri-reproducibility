@@ -494,6 +494,31 @@ Together: corner plot 0.499s -> 0.456s (-8.5%), five-run cold build 1.207s ->
 like the rest - if matplotlib or anesthetic renames either private hook, the
 plot is just slower.
 
+Two of matplotlib's own lookup helpers rebuild the same answer on every call,
+which only shows up at this call volume. `_axis_map` - how an `Axes` finds its
+`XAxis`/`YAxis`, read ~4500 times per corner plot - is a property that builds a
+fresh dict from two f-strings and two `getattr`s each time;
+`cache_matplotlib_axis_map()` keeps the dict on the instance and validates it by
+identity against `self.xaxis`/`self.yaxis`, so the one place matplotlib swaps
+those objects (`_init_axis`) misses the cache instead of getting a stale map.
+Projections whose `_axis_names` is not `("x", "y")` fall through to the original
+property. And `cbook.normalize_kwargs`, which every artist constructor and every
+`.set()` call routes its kwargs through (~3400 times per corner plot), flattens
+the artist class' alias map (`{'linewidth': ['lw'], ...}`) into an
+alias -> canonical dict from scratch on each call; that flattening is a pure
+function of the class, so `memoize_matplotlib_alias_maps()` memoises it per
+class and keeps matplotlib's duplicate-alias `TypeError`. Callers that pass a
+plain dict keep the original path. Like the shared-axis scan in iteration 16,
+the patch has to rebind `normalize_kwargs` in every module that did
+`from ... import normalize_kwargs`, because the hot call sites are not in the
+defining module.
+
+Together: corner plot 2.330s -> 2.262s CPU over the five runs (-2.6%), five-run
+cold build 1.167s -> 1.157s wall and 1.0% less worker CPU in-container, with
+byte-identical PNGs. The build's wall clock moves less than its CPU because
+half of it is the parent's serial import prologue, which no plot-side change
+touches.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the

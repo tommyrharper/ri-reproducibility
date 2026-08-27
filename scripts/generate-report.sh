@@ -31,7 +31,8 @@
 # per-axis tick updates and its per-text layout measurements, skips its
 # shared-axis autoscale scan while nothing has gone stale, caches anesthetic's
 # per-index label mapping, its label-stripped frame copies and the per-panel
-# Axes subclasses it builds one at a time, and hands savefig a pre-measured
+# Axes subclasses it builds one at a time, caches matplotlib's per-Axes axis
+# map and its per-class kwarg alias maps, and hands savefig a pre-measured
 # tight bbox so it skips its own extra layout pass - see
 # docs/nested-sampling.md.
 set -euo pipefail

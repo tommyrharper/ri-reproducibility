@@ -676,6 +676,111 @@ def memoize_anesthetic_drop_labels():
     return True
 
 
+# matplotlib looks up an Axes' axis objects through the _axis_map property,
+# which rebuilds a dict - two f-strings and two getattrs - on every read. One
+# corner plot reads it ~4500 times and the answer only ever changes where
+# _init_axis() installs fresh XAxis/YAxis objects, so keep the dict on the
+# instance and validate it by identity against the two attributes it maps: a
+# rebuilt axis misses and the map is built again. Only the ordinary 2D case is
+# cached; a projection with a different _axis_names falls through to the
+# original property.
+# Best-effort: if matplotlib drops the property, the plot is just slower.
+_axis_map_cached = False
+
+
+def cache_matplotlib_axis_map():
+    global _axis_map_cached
+    if _axis_map_cached:
+        return True
+    _axis_map_cached = True
+    try:
+        from matplotlib.axes._base import _AxesBase
+
+        axis_map = _AxesBase._axis_map.fget
+    except (ImportError, AttributeError):
+        return False
+
+    def cached(self):
+        if self._axis_names == ("x", "y"):
+            x_axis = self.xaxis
+            y_axis = self.yaxis
+            hit = self.__dict__.get("_report_axis_map")
+            if hit is not None and hit[0] is x_axis and hit[1] is y_axis:
+                return hit[2]
+            built = {"x": x_axis, "y": y_axis}
+            self.__dict__["_report_axis_map"] = (x_axis, y_axis, built)
+            return built
+        return axis_map(self)
+
+    _AxesBase._axis_map = property(cached)
+    return True
+
+
+# Every matplotlib artist constructor and every .set() call routes its kwargs
+# through cbook.normalize_kwargs, which flattens the artist class' alias map
+# ({'linewidth': ['lw'], ...}) into an alias -> canonical dict from scratch each
+# time. The alias map is a class attribute, so that flattening is the same
+# answer for the life of the process: memoise it per class. One corner plot
+# makes ~3400 of these calls. Callers that pass a plain dict (or None) keep the
+# original path.
+# Best-effort: if matplotlib changes the helper's shape, the plot is slower.
+_alias_maps_memoized = False
+
+
+def memoize_matplotlib_alias_maps():
+    global _alias_maps_memoized
+    if _alias_maps_memoized:
+        return True
+    _alias_maps_memoized = True
+    try:
+        from matplotlib import cbook
+        from matplotlib.artist import Artist
+
+        normalize = cbook.normalize_kwargs
+    except (ImportError, AttributeError):
+        return False
+
+    cache = {}
+
+    def memoized(kw, alias_mapping=None):
+        if kw is None:
+            return {}
+        if isinstance(alias_mapping, type) and issubclass(alias_mapping, Artist):
+            cls = alias_mapping
+        elif isinstance(alias_mapping, Artist):
+            cls = type(alias_mapping)
+        else:
+            return normalize(kw, alias_mapping)
+        to_canonical = cache.get(cls)
+        if to_canonical is None:
+            to_canonical = cache[cls] = {
+                alias: canonical
+                for canonical, aliases in getattr(cls, "_alias_map", {}).items()
+                for alias in aliases
+            }
+        if not to_canonical:
+            return dict(kw)
+        seen = {}
+        ret = {}
+        for key, value in kw.items():
+            canonical = to_canonical.get(key, key)
+            if canonical in seen:
+                raise TypeError(
+                    f"Got both {seen[canonical]!r} and {key!r}, which are "
+                    "aliases of one another"
+                )
+            seen[canonical] = key
+            ret[canonical] = value
+        return ret
+
+    # matplotlib and pandas both do `from ... import normalize_kwargs`, so the
+    # defining module is not where the hot call sites look it up.
+    for module in list(sys.modules.values()):
+        if getattr(module, "normalize_kwargs", None) is normalize:
+            module.normalize_kwargs = memoized
+    return True
+
+
 # Every read of an axis' viewLim asks matplotlib whether any axis sharing a
 # limit with it still needs autoscaling, and that question is answered by
 # walking the whole share group - twice, once per axis name - through a WeakSet.
@@ -783,6 +888,8 @@ def _render_likelihood_png(run_dir, param_names):
     memoize_anesthetic_labels_map()
     memoize_anesthetic_drop_labels()
     skip_settled_matplotlib_viewlims()
+    cache_matplotlib_axis_map()
+    memoize_matplotlib_alias_maps()
     share_anesthetic_axes_subclasses()
 
     try:
@@ -2296,6 +2403,50 @@ def _self_check_viewlim_skip():
         plt.close(fig)
 
 
+def _self_check_axis_map_cache():
+    """The cached _axis_map must answer with the axes' own axis objects and
+    must notice when fresh ones are swapped in."""
+    load_plot_libs()
+    if not cache_matplotlib_axis_map():
+        return
+    fig, ax = plt.subplots()
+    try:
+        first = ax._axis_map
+        assert first == {"x": ax.xaxis, "y": ax.yaxis}, first
+        assert ax._axis_map is first, "the map was rebuilt for an unchanged axes"
+        ax._init_axis()  # the one place matplotlib swaps the axis objects
+        assert ax._axis_map == {"x": ax.xaxis, "y": ax.yaxis}, (
+            "the cache survived a swap of the axes' axis objects"
+        )
+    finally:
+        plt.close(fig)
+
+
+def _self_check_alias_map_memo():
+    """The memoised normalize_kwargs must canonicalise aliases exactly as
+    matplotlib does, keep the two artist classes' maps apart, and still reject
+    a canonical name given twice under different aliases."""
+    load_plot_libs()
+    if not memoize_matplotlib_alias_maps():
+        return
+    from matplotlib.lines import Line2D
+    from matplotlib.text import Text
+    import matplotlib.cbook as cbook
+
+    normalize = cbook.normalize_kwargs
+    assert normalize({"lw": 2, "c": "r"}, Line2D) == {"linewidth": 2, "color": "r"}
+    assert normalize({"lw": 2}, Line2D([], [])) == {"linewidth": 2}
+    # 'lw' is not an alias for Text, so it must survive untranslated.
+    assert normalize({"lw": 2}, Text) == {"lw": 2}
+    assert normalize({"lw": 2}, {"width": ["lw"]}) == {"width": 2}
+    try:
+        normalize({"lw": 1, "linewidth": 2}, Line2D)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("two aliases of one property were accepted")
+
+
 def _self_check_axes_subclass_sharing():
     """Two panels made by the same anesthetic helper must land on one shared
     subclass, and the two helpers must not share a subclass with each other."""
@@ -2345,6 +2496,8 @@ if __name__ == "__main__":
         _self_check_labels_map_memo()
         _self_check_drop_labels_memo()
         _self_check_viewlim_skip()
+        _self_check_axis_map_cache()
+        _self_check_alias_map_memo()
         _self_check_axes_subclass_sharing()
         print("generate_report self-check passed")
     else:
