@@ -362,7 +362,8 @@ What each line is reading, and why it is worth a line:
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
-  stuck at once.
+  stuck at once. On a run with no ranks left they are counted as *abandoned*
+  instead - what the ranks were holding when it died, not work still going.
 - **activity** - the overall rate, and the rate over the last 50 evaluations
   when the two have diverged. A run can collapse to a fraction of its own
   throughput without ever going quiet long enough to look stalled, and that
@@ -372,6 +373,11 @@ What each line is reading, and why it is worth a line:
   then recovered to 37/min with nothing done to it - five minute bins of 104,
   23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
   grounds for telling anyone to act.
+  Neither rate is shown at all when the run's first and last evaluation are
+  under a second apart: parallel ranks land their opening batch together, so a
+  run killed inside it has a span that measures mtime granularity rather than
+  throughput, and dividing by it printed things like `6176.5/min over
+  0:00:00`. The same floor silences **history**, twenty times over.
 
   Both rates are medians of the gaps between evaluations, not counts in a
   window, and that is deliberate: the most recent window is always partial, so

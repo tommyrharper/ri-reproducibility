@@ -107,6 +107,17 @@ SPIN_IDLE_SECONDS = 60.0
 RATE_WINDOW = 50
 RATE_DIVERGENCE_FACTOR = 2.0
 
+# Below this much elapsed time, dividing a count by it measures mtime
+# granularity rather than throughput. Parallel ranks land their first batch
+# together - so the opening evaluations of any run share a timestamp to within
+# milliseconds - and a run killed during that batch is left holding nothing
+# else. Real runs on this host printed "6176.5/min over 0:00:00" from 14
+# evaluations 0.14s apart and "8700112/min" from 42 of them 0.3ms apart, both
+# of which are the arithmetic working exactly as written on an input that
+# means nothing. One second, because that is the resolution the span is
+# displayed at: under it there is no honest way to print the denominator.
+MIN_RATE_SPAN_SECONDS = 1.0
+
 # The same window, read for failures rather than pace, and half of it is the
 # bar. The overall ratio below cannot see an imager that broke part-way
 # through: a run three hours healthy and twenty minutes broken is still ~2%
@@ -289,12 +300,13 @@ def history(times: list[float]) -> dict[str, object] | None:
     evaluation landed is the activity line's job, not this one's.
 
     None below two evaluations a slice, where the counts are too small to be a
-    shape rather than noise.
+    shape rather than noise, and below a second a slice, where the slice rates
+    are mtime granularity rather than throughput (MIN_RATE_SPAN_SECONDS).
     """
     if len(times) < 2 * HISTORY_BUCKETS:
         return None
     span = times[-1] - times[0]
-    if span <= 0:
+    if span < HISTORY_BUCKETS * MIN_RATE_SPAN_SECONDS:
         return None
     width = span / HISTORY_BUCKETS
     counts = [0] * HISTORY_BUCKETS
@@ -386,7 +398,8 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "last_activity_seconds": time.time() - times[-1] if times else None,
         "span_seconds": span,
         "recent_failed": recent_failed,
-        "evals_per_minute": len(times) * 60 / span if span > 0 else None,
+        "evals_per_minute": (len(times) * 60 / span
+                             if span >= MIN_RATE_SPAN_SECONDS else None),
         "recent_evals_per_minute": recent_rate,
         "history": history(times),
         "slowdown_factor": slowdown,
@@ -756,7 +769,13 @@ def render(run: dict[str, object]) -> None:
                   + (f" as of {format_hms(float(run['checkpoint_age_seconds']))} ago"
                      f"{next_update}"
                      if run["checkpoint_age_seconds"] is not None else "")),
-        ("progress", f"{run['completed']} evaluations, {run['in_flight']} in flight"),
+        # Directories without a metrics.json are evaluations in flight only
+        # while something is still flying them. On a run with no ranks left
+        # they are what the ranks were holding when it died, and calling those
+        # "in flight" reads as work still happening on a run that ended hours
+        # ago.
+        ("progress", f"{run['completed']} evaluations, {run['in_flight']} "
+                     + ("in flight" if run["ranks"] else "abandoned")),
         ("activity", "nothing yet" if idle is None else
                      f"last evaluation {format_hms(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_hms(float(run['span_seconds']))}"
@@ -1162,6 +1181,35 @@ def self_check() -> None:
             # Too few evaluations to be a shape rather than noise.
             assert history([now + i for i in range(HISTORY_BUCKETS)]) is None
             assert history([now] * 100) is None  # no span, no bins
+
+            # A run killed inside its opening batch: the ranks all landed
+            # together, so the span is mtime granularity and every rate derived
+            # from it is arithmetic on noise. Real runs here printed
+            # "6176.5/min over 0:00:00" and a "0-8700112/min" sparkline off
+            # exactly this shape, which discredits the honest numbers beside
+            # them. Neither line is printed rather than printed wrong.
+            batch = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260101T040000Z"
+            (batch / "chains").mkdir(parents=True)
+            for i in range(4 * HISTORY_BUCKETS):
+                write_eval(batch, i + 1, now - 3600 + i * 0.005)
+            burst = describe(batch, [], DEFAULT_STALE_SECONDS)
+            assert burst["completed"] == 4 * HISTORY_BUCKETS, burst
+            assert burst["evals_per_minute"] is None, burst
+            assert burst["history"] is None, burst
+            assert "/min" not in io_capture(burst), io_capture(burst)
+            # ...and one second later the same run does report both, so the
+            # floor is a floor and not a way to lose a fast run's numbers.
+            for i in range(4 * HISTORY_BUCKETS):
+                write_eval(batch, 1000 + i, now - 3600 + i * 1.0)
+            fast = describe(batch, [], DEFAULT_STALE_SECONDS)
+            assert fast["evals_per_minute"] is not None, fast
+            assert fast["history"] is not None, fast
+
+            # Directories with no metrics.json are "in flight" only while
+            # something is still flying them; on a dead run they are what its
+            # ranks were holding when it died.
+            assert "0 abandoned" in io_capture(burst), io_capture(burst)
+            assert "in flight" in io_capture(describe(live, ranks, 5.0))
 
             # An imager that broke part-way through a long healthy run: 400
             # good evaluations then 50 failures is 11% overall, well under the
