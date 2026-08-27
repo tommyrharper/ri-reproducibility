@@ -59,6 +59,11 @@ if [ -z "${R2D2_OMP_THREADS:-}" ]; then
 fi
 
 mkdir -p "${OUTPUT_DIR}"
+# Written before anything can go wrong, so that a run which stops - out of
+# memory, Ctrl-C, reboot - still says how to start it again exactly.
+# shellcheck source=scripts/lib/run-config.sh
+. "${REPO_ROOT}/scripts/lib/run-config.sh"
+write_run_config "${OUTPUT_DIR}" r2d2
 # The workers are reached over FIFOs, so these have to sit on the bind mount the
 # rank's container and the sidecars both see - REPO_ROOT, which OUTPUT_DIR is
 # under by default. Point OUTPUT_DIR outside the repo and the ranks simply fall
