@@ -336,8 +336,14 @@ computed per draw from the width that draw asked for:
   `channel_width_hz` exceeds the widest band, 13.5 GHz for the VLA - has its
   channels narrowed until it fits rather than being placed outside a band.
   That caps the top of the `channel_width_hz` range, so
-  `warn_if_window_exceeds_bands()` prints what the effective ceiling is when
-  the configured box reaches past it.
+  `check_channel_box_against_bands()` prints what the effective ceiling is
+  when the configured box reaches past it.
+- The narrowing stops at `channel_width_hz`'s configured `min`, which is a
+  hard floor: no draw is ever thinner than the width you asked for. That
+  leaves one box that cannot be satisfied - `channel_count`'s max at the
+  minimum width still wider than every band - and it is a configuration error,
+  fatal at load with the count that would fit, not something the sampler
+  quietly works around mid-run.
 
 The band guarantee is the sampler's. `simulate_point_source_ms.py` takes
 `--start-frequency-hz` and `--channel-width-hz` as given, so a hand-run
