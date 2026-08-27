@@ -101,8 +101,10 @@ concurrently, each with its own `r2d2_serve.py` imaging worker inside the
 shared R2D2 sidecar and its own simulate worker inside the MeqTrees one. Both
 pools are started by their container's own command, over one FIFO pair per rank,
 before the PolyChord container exists - the imaging pool as one `--fifo-dir`
-process that imports torch once and forks a worker per pair (see "R2D2 imaging runs in a long-lived
-worker" and "The workers are started by the container, not by the ranks" in
+process that imports torch once, forks a worker per pair, and opens every pair
+before it starts importing so the ranks do not wait for it (see "R2D2 imaging runs in a long-lived
+worker", "The workers are started by the container, not by the ranks" and "The
+ranks attach to the pool before the warm-up" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md)). That process also
 patches R2D2's `MeasOp.get_op_norm` to solve the operator norm with Lanczos
 rather than upstream's power iteration - the same quantity, ~3.5x fewer NUFFT
