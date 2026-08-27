@@ -21,7 +21,11 @@ OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/wsclean-vlaa-${RU
 # price at 1:1 on the run's wall clock. The daemon-availability check it
 # doubled as is below the launches instead, where it overlaps the containers
 # coming up and costs nothing.
-HOST_CPUS="$(command -v nproc >/dev/null 2>&1 && nproc || sysctl -n hw.ncpu)"
+if command -v nproc >/dev/null 2>&1; then
+  HOST_CPUS="$(nproc)"
+else
+  HOST_CPUS="$(sysctl -n hw.ncpu)"
+fi
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
