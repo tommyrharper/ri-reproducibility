@@ -79,6 +79,16 @@ DEFAULT_STALE_SECONDS = 600.0
 # something well inside a minute.
 SPIN_IDLE_SECONDS = 60.0
 
+# Evaluations in the "how is it going now" window, and how much slower than the
+# run's own median that window may get before it is worth saying so. A run can
+# collapse to a fraction of its own throughput without ever going quiet for
+# long enough to look stalled - measured on a live 16-rank R2D2 search, 25/min
+# fell to 5/min for seven minutes with 15 of 16 ranks burning a core behind one
+# that was working, while evaluations kept landing every 20-30s. Every other
+# check here passed it. Four times is a collapse, not a drift.
+RATE_WINDOW = 50
+RATE_COLLAPSE_FACTOR = 4.0
+
 # A gap between consecutive evaluations counts as a stall when it is this many
 # times the run's own median gap. Relative because the two imagers are two
 # orders of magnitude apart - WSClean lands 30-50 evaluations a second, R2D2
@@ -256,6 +266,17 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         threshold = max(threshold, STALL_GAP_FACTOR * statistics.median(gaps))
     stalls = [g for g in gaps if g > threshold]
     span = times[-1] - times[0] if len(times) > 1 else 0.0
+
+    # How the run is going now against how it has gone, as a ratio of median
+    # gaps. Medians, so one long gap cannot manufacture a collapse and a run
+    # that is genuinely half its old speed cannot hide behind a fast tail.
+    recent_rate, slowdown = None, None
+    if len(gaps) >= 2 * RATE_WINDOW:
+        recent = statistics.median(gaps[-RATE_WINDOW:])
+        overall = statistics.median(gaps)
+        recent_rate = 60 / recent if recent > 0 else None
+        slowdown = recent / overall if overall > 0 else None
+
     return {
         "completed": len(times),
         "in_flight": directories - len(times),
@@ -263,6 +284,8 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "last_activity_seconds": time.time() - times[-1] if times else None,
         "span_seconds": span,
         "evals_per_minute": len(times) * 60 / span if span > 0 else None,
+        "recent_evals_per_minute": recent_rate,
+        "slowdown_factor": slowdown,
         "stall_threshold_seconds": threshold,
         "stall_count": len(stalls),
         "stall_seconds": sum(stalls),
@@ -435,6 +458,22 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"completed in {idle:.0f}s - the signature of every rank spinning in "
             "one MPI collective"
         )
+    # A run can collapse to a fraction of its own throughput without ever going
+    # quiet long enough to look stalled, so this is deliberately not ANDed with
+    # the spin count above: ranks all spinning behind one that works and a host
+    # too loaded to give the run its cores are both worth saying, and they have
+    # opposite spin signatures. Only for a live run - a finished run's slow tail
+    # is history, not something to act on.
+    slowdown = scan["slowdown_factor"]
+    if ranks and slowdown is not None and float(slowdown) > RATE_COLLAPSE_FACTOR:
+        detail = (f", with {spinning} of {len(ranks)} ranks burning CPU"
+                  if spinning >= max(1, len(ranks) - 1) else "")
+        warnings.append(
+            f"throughput has fallen to {1 / float(slowdown):.0%} of this run's own "
+            f"median - {scan['recent_evals_per_minute']:.1f}/min over the last "
+            f"{RATE_WINDOW} evaluations against {scan['evals_per_minute']:.1f}/min "
+            f"overall{detail}"
+        )
     # A tenth of the run, not a twentieth: a few percent is the ordinary spread
     # of evaluation cost across the parameter space, and the deadlock this
     # number exists to catch cost 23-27% before the watchdogs absorbed it.
@@ -507,13 +546,19 @@ def render(run: dict[str, object]) -> None:
 
     idle = run["last_activity_seconds"]
     rate = run["evals_per_minute"]
+    slowdown = run["slowdown_factor"]
     lines = [
         ("stage", f"{run['stage']}, {run['dead_points']} dead points"),
         ("progress", f"{run['completed']} evaluations, {run['in_flight']} in flight"),
         ("activity", "nothing yet" if idle is None else
                      f"last evaluation {format_hms(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_hms(float(run['span_seconds']))}"
-                        if rate else "")),
+                        if rate else "")
+                     # Only when the run has changed pace materially: the two
+                     # numbers agreeing is the normal case and says nothing.
+                     + (f" ({run['recent_evals_per_minute']:.1f}/min over the last "
+                        f"{RATE_WINDOW})"
+                        if slowdown is not None and float(slowdown) > 2.0 else "")),
         ("ranks", ranks),
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE, "
                      f"{run['meqserver_wedges']} meqserver wedges recovered"),
@@ -732,6 +777,42 @@ def self_check() -> None:
                 spinner.wait()
             assert sampled.get(spinner.pid, 0) > 0.5, sampled
             assert sampled.get(os.getpid(), 1) < 0.5, sampled
+
+            # A run that has gone serial: still landing evaluations, so never
+            # idle long enough to look stalled, but at a fraction of its own
+            # throughput. Every other check here passes it.
+            collapsed = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T020000Z"
+            (collapsed / "chains").mkdir(parents=True)
+            (collapsed / "chains" / "r2d2_vlaa.resume").write_text("")
+            # 200s of healthy phase plus 720s of collapse, landed so that the
+            # last evaluation is a few seconds old: still well inside every
+            # timeout the run itself has, which is the point.
+            stamp = now - (200 + 60 * 12) - 5
+            for i in range(200):          # the healthy phase, one a second
+                stamp += 1
+                write_eval(collapsed, i + 1, stamp)
+            for i in range(60):           # ...and the collapse, one per 12s
+                stamp += 12
+                write_eval(collapsed, 201 + i, stamp)
+            collapsed_ranks = [dict(r, args=str(r["args"]).replace(str(live.resolve()),
+                                                                   str(collapsed.resolve())))
+                               for r in ranks]
+            report = describe(collapsed, collapsed_ranks, DEFAULT_STALE_SECONDS, spinning)
+            # Not stalled: something landed 12s ago, well inside every timeout.
+            assert report["status"] == "healthy", report
+            assert float(report["last_activity_seconds"]) < SPIN_IDLE_SECONDS, report
+            assert abs(float(report["slowdown_factor"]) - 12) < 1, report
+            assert any("throughput has fallen" in w for w in report["warnings"]), report
+            # The same collapse with no ranks left is history, not something to
+            # act on, and must not be warned about.
+            assert not any("throughput" in w for w in
+                           describe(collapsed, [], DEFAULT_STALE_SECONDS)["warnings"])
+            # A run holding its pace says nothing about throughput at all.
+            assert not any("throughput" in w for w in
+                           describe(live, ranks, DEFAULT_STALE_SECONDS, working)["warnings"])
+            # Too few evaluations to compare a window against a history: no
+            # ratio at all rather than one drawn from a handful of gaps.
+            assert describe(live, ranks, DEFAULT_STALE_SECONDS)["slowdown_factor"] is None
 
             # A run whose imager is broken: every count healthy, every point
             # worthless. This is the one the other checks cannot see.

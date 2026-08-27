@@ -345,6 +345,16 @@ What each line is reading, and why it is worth a line:
   without one are the evaluations in flight. That number should sit near
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
   stuck at once.
+- **activity** - the overall rate, and the rate over the last 50 evaluations
+  when the two have diverged. A run can collapse to a fraction of its own
+  throughput without ever going quiet for long enough to look stalled, and
+  that state passes every other check here: measured on a live 16-rank R2D2
+  search, 25/min fell to 5/min for several minutes with 15 of 16 ranks burning
+  a core behind the one still working, while evaluations kept landing every
+  20-30s. Warned on when the recent median gap is more than 4x the run's own.
+  A falling rate does **not** imply the evaluations got harder - on that run
+  per-evaluation cost was falling at the same time, because the search was
+  converging on cheaper parameters.
 - **ranks** - found by the `--output-dir` they were launched with, so no ranks
   means no run. `busy-waiting` counts the ranks that spent a whole one-second
   sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective
