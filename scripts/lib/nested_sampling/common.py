@@ -194,73 +194,200 @@ def load_parameter_space() -> list[dict[str, Any]]:
 def check_channel_box_against_bands(specs: list[dict[str, Any]]) -> None:
     """The channel box against the bandwidth the bands actually have.
 
-    `channel_width_hz`'s min and max are both hard: every draw is sampled from
-    exactly that range and no draw is bent to fit a band. That only works if
-    the widest window the box can ask for fits somewhere, so a box that
-    overflows every band is a configuration error, and it is fatal here at
-    load rather than mid-run - a search cannot honour both the box and the
-    bands when they contradict each other, and quietly resolving that in
-    favour of either one hides which parameters were really searched.
+    A window that overflows the band its start frequency landed in is fitted
+    to it (see fit_spectral_window()), so a box asking for more than a band
+    holds is normal. The one box no fitting can rescue is one whose *smallest*
+    window - the minimum channel count at the minimum width - fits no band at
+    all: every draw would then fail, whatever start frequency came up. That is
+    a configuration error, fatal here at load rather than after the images are
+    warm.
     """
     by_name = {str(spec["name"]): spec for spec in specs}
     count, width = by_name.get("channel_count"), by_name.get("channel_width_hz")
     if not count or not width:
         return
     widest = max(float(band["max"]) - float(band["min"]) for band in load_receiver_bands())
-    window = float(count["max"]) * float(width["max"])
-    if window > widest:
+    smallest = float(count["min"]) * float(width["min"])
+    if smallest > widest:
         raise SystemExit(
-            f"defaults.toml: {count['max']} channels of {float(width['max']) / 1e6:g} MHz span "
-            f"{window / 1e6:g} MHz, wider than the widest receiver band ({widest / 1e6:g} MHz), "
-            f"so no start frequency can hold them. Lower channel_count's max (to "
-            f"{int(widest // float(width['max']))}) or channel_width_hz's max (to "
-            f"{widest / float(count['max']) / 1e6:g} MHz)."
+            f"defaults.toml: the smallest window the parameter space allows - {count['min']} "
+            f"channels of {float(width['min']) / 1e6:g} MHz, {smallest / 1e6:g} MHz - is wider "
+            f"than the widest receiver band ({widest / 1e6:g} MHz), so no start frequency can "
+            f"hold it. Lower channel_count's min or channel_width_hz's min."
         )
 
 
-def placeable_start_ranges(window_hz: float) -> list[tuple[float, float]]:
-    """Per band, the start frequencies a `window_hz`-wide window fits inside.
+# A start frequency with too little room above it for even the smallest window
+# is replaced by stepping this far around the unit interval and drawing again.
+# The golden ratio conjugate spreads successive tries across every band rather
+# than nudging along the one that just failed, and stepping (rather than
+# drawing from an RNG) keeps the prior transform a pure function of the cube,
+# which is what PolyChord requires.
+START_REDRAW_STEP = 0.6180339887498949
+MAX_START_REDRAWS = 64
 
-    Bands too narrow to hold the window drop out. At least one always survives:
-    check_channel_box_against_bands() has refused to load a parameter space
-    whose widest window overflows every band.
+
+@dataclass
+class WindowFitStats:
+    """What fitting sampled windows into receiver bands costs.
+
+    `draws` counts prior transforms, not evaluations: a draw whose window is
+    reduced still becomes one evaluation, it just measures narrower channels
+    (or fewer of them) than the one that was drawn.
     """
-    return [
-        (float(band["min"]), float(band["max"]) - window_hz)
-        for band in load_receiver_bands()
-        if float(band["max"]) - float(band["min"]) >= window_hz
-    ]
+
+    draws: int = 0
+    as_sampled: int = 0
+    width_reduced: int = 0
+    count_reduced: int = 0
+    redrawn_draws: int = 0
+    redraws: int = 0
+    seconds: float = 0.0
+
+    def record(self, outcome: str, redraws: int, seconds: float) -> None:
+        self.draws += 1
+        setattr(self, outcome, getattr(self, outcome) + 1)
+        self.redrawn_draws += 1 if redraws else 0
+        self.redraws += redraws
+        self.seconds += seconds
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "draws": self.draws,
+            "as_sampled": self.as_sampled,
+            "width_reduced": self.width_reduced,
+            "count_reduced": self.count_reduced,
+            "redrawn_draws": self.redrawn_draws,
+            "redraws": self.redraws,
+            "seconds": self.seconds,
+            "seconds_per_draw": self.seconds / self.draws if self.draws else 0.0,
+        }
 
 
-def place_spectral_window(cube_value: float, channel_count: int, channel_width_hz: float) -> float:
-    """Map a unit-cube value onto a start frequency, with the window inside one band.
+WINDOW_FIT_STATS = WindowFitStats()
 
-    Each band that can hold `channel_count` channels of `channel_width_hz` gets
-    an equal share of the dimension; within a share the start frequency is
-    uniform over that band's placeable range. The window itself is taken as
-    given - the channel box is validated against the bands at load, so nothing
-    here has to bend a sampled width to make it fit.
+
+def gathered_window_fit_stats() -> dict[str, Any]:
+    """Every rank's fitting tally, summed.
+
+    PolyChord's rank 0 coordinates and barely runs the prior transform at all -
+    the workers do the drawing - so this has to be collected across the run or
+    the numbers in `summary.json` describe nobody's work. Collective: call it
+    from every rank once PolyChord has returned, before rank 0 branches off to
+    write the summary.
     """
-    ranges = placeable_start_ranges(channel_count * channel_width_hz)
-    if not ranges:
-        raise SystemExit(
-            f"{channel_count} channels of {channel_width_hz / 1e6:g} MHz fit no receiver band"
-        )
-    position = min(1.0, max(0.0, cube_value)) * len(ranges)
-    index = min(int(position), len(ranges) - 1)
-    lower, upper = ranges[index]
-    return lower + (position - index) * (upper - lower)
+    counters = ("draws", "as_sampled", "width_reduced", "count_reduced", "redrawn_draws", "redraws", "seconds")
+    mine = WINDOW_FIT_STATS.as_dict()
+    try:
+        from mpi4py import MPI
+
+        parts = MPI.COMM_WORLD.gather(mine, root=0) or [mine]
+    except Exception:
+        # No MPI (a host run, or the self-checks): this process is the run.
+        parts = [mine]
+    total: dict[str, Any] = {key: sum(part[key] for part in parts) for key in counters}
+    total["ranks"] = len(parts)
+    total["seconds_per_draw"] = total["seconds"] / total["draws"] if total["draws"] else 0.0
+    return total
 
 
-def spectral_window_cube_value(start_frequency_hz: float, channel_count: int, channel_width_hz: float) -> float:
-    """The inverse of place_spectral_window(), for the theta -> cube round trip."""
-    ranges = placeable_start_ranges(channel_count * channel_width_hz)
-    for index, (lower, upper) in enumerate(ranges):
-        if start_frequency_hz <= upper or index == len(ranges) - 1:
-            span = upper - lower
-            within = 0.0 if span <= 0.0 else (start_frequency_hz - lower) / span
-            return (index + min(1.0, max(0.0, within))) / len(ranges)
+def window_fit_summary_line(stats: dict[str, Any]) -> str:
+    return (
+        f"spectral window fitting: {stats['draws']} draws over {stats['ranks']} rank(s), "
+        f"{stats['as_sampled']} as sampled, {stats['width_reduced']} narrowed, "
+        f"{stats['count_reduced']} with channels dropped, {stats['redrawn_draws']} restarted "
+        f"({stats['redraws']} start frequencies discarded), {stats['seconds'] * 1e3:.1f} ms total"
+    )
+
+
+def start_frequency_from_cube(cube_value: float) -> tuple[dict[str, Any], float]:
+    """The band a unit-cube value picks, and where in it the window starts.
+
+    Every band gets an equal share of the dimension and the start frequency is
+    uniform inside the band - equal share rather than uniform across the union
+    of the bands, or the 32 MHz-wide 4-band would come up about once in every
+    1500 draws and never actually be searched.
+    """
+    bands = load_receiver_bands()
+    position = min(1.0, max(0.0, cube_value)) * len(bands)
+    index = min(int(position), len(bands) - 1)
+    band = bands[index]
+    lower, upper = float(band["min"]), float(band["max"])
+    return band, lower + (position - index) * (upper - lower)
+
+
+def start_frequency_cube_value(start_frequency_hz: float) -> float:
+    """The inverse of start_frequency_from_cube(), for the theta -> cube round trip."""
+    bands = load_receiver_bands()
+    for index, band in enumerate(bands):
+        lower, upper = float(band["min"]), float(band["max"])
+        if start_frequency_hz <= upper or index == len(bands) - 1:
+            within = (start_frequency_hz - lower) / (upper - lower)
+            return (index + min(1.0, max(0.0, within))) / len(bands)
     return 1.0
+
+
+@cache
+def channel_floors() -> tuple[int, float]:
+    """The smallest channel count and channel width the parameter space allows."""
+    by_name = {str(spec["name"]): spec for spec in load_parameter_space()}
+    return int(by_name["channel_count"]["min"]), float(by_name["channel_width_hz"]["min"])
+
+
+def fit_spectral_window(
+    cube_value: float, channel_count: int, channel_width_hz: float, track: bool = False
+) -> tuple[float, int, float]:
+    """Fit a sampled window into the band its start frequency landed in.
+
+    The start frequency is drawn first and the window is fitted to the room
+    left above it, giving up as little as possible at each step:
+
+    1. the window fits - keep the draw;
+    2. it does not - narrow the channels until it does, if that stays at or
+       above the minimum width;
+    3. it would go below that - hold the width at the minimum and drop
+       channels instead, if that stays at or above the minimum count;
+    4. even the smallest window does not fit, so the start frequency is too
+       close to the top of its band to hold anything - draw another one and
+       start over.
+
+    `track` is set by the prior transform, the one caller whose draws are real
+    sampler work; the likelihood re-derives parameters it has already been
+    given, which always fit and would otherwise pad the tally.
+
+    Returns (start_frequency_hz, channel_count, channel_width_hz).
+    """
+    started = time.perf_counter() if track else 0.0
+    count_min, width_min = channel_floors()
+    cube_value = min(1.0, max(0.0, cube_value))
+
+    def finish(start: float, count: int, width: float, outcome: str, redraws: int) -> tuple[float, int, float]:
+        if track:
+            WINDOW_FIT_STATS.record(outcome, redraws, time.perf_counter() - started)
+        return start, count, width
+
+    for redraws in range(MAX_START_REDRAWS + 1):
+        band, start = start_frequency_from_cube(cube_value)
+        room = float(band["max"]) - start
+        count, width = int(channel_count), float(channel_width_hz)
+        if count * width <= room:
+            return finish(start, count, width, "as_sampled", redraws)
+        width = room / count
+        if width >= width_min:
+            return finish(start, count, width, "width_reduced", redraws)
+        count = int(room // width_min)
+        if count >= count_min:
+            return finish(start, count, width_min, "count_reduced", redraws)
+        cube_value = (cube_value + START_REDRAW_STEP) % 1.0
+
+    # Unreachable for any parameter space check_channel_box_against_bands()
+    # lets through unless the bands are so tightly packed that most of every
+    # one of them is unusable, in which case the box, not the draw, is wrong.
+    abort_run(
+        f"no start frequency in {MAX_START_REDRAWS} tries left room for {count_min} channels of "
+        f"{width_min / 1e6:g} MHz - lower channel_count's min or channel_width_hz's min"
+    )
+    raise AssertionError("abort_run does not return")
 
 
 # GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
@@ -331,7 +458,7 @@ def scale(cube_value: float, lower: float, upper: float) -> float:
     return lower + cube_value * (upper - lower)
 
 
-def cube_to_params(cube: np.ndarray) -> dict[str, Any]:
+def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw: dict[str, Any] = {}
     specs = load_parameter_space()
     for i, spec in enumerate(specs):
@@ -339,12 +466,12 @@ def cube_to_params(cube: np.ndarray) -> dict[str, Any]:
         if spec.get("kind") == "integer":
             value = int(round(value))
         raw[spec["name"]] = value
-    # The band-start dimension is placed last: where the window can start
-    # depends on how wide it is.
+    # The band-start dimension is resolved last: it fits the window to the band
+    # it lands in, which can narrow the channels or drop some of them.
     for i, spec in enumerate(specs):
         if spec.get("kind") == "band_start":
-            raw[spec["name"]] = place_spectral_window(
-                float(cube[i]), raw["channel_count"], raw["channel_width_hz"]
+            raw[spec["name"]], raw["channel_count"], raw["channel_width_hz"] = fit_spectral_window(
+                float(cube[i]), raw["channel_count"], raw["channel_width_hz"], track=track
             )
     raw["dynamic_range"] = 10.0 ** raw.pop("log10_dynamic_range")
     raw["vla_config"] = "VLA.A"
@@ -1375,11 +1502,7 @@ def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:
     cube_like = np.zeros(len(specs), dtype=np.float64)
     for i, spec in enumerate(specs):
         if spec.get("kind") == "band_start":
-            cube_like[i] = spectral_window_cube_value(
-                values[str(spec["name"])],
-                int(round(values["channel_count"])),
-                values["channel_width_hz"],
-            )
+            cube_like[i] = start_frequency_cube_value(values[str(spec["name"])])
             continue
         lower = float(spec["min"])
         upper = float(spec["max"])
@@ -1407,29 +1530,37 @@ def self_check_parameter_space() -> None:
 
 
 def self_check_spectral_window() -> None:
-    """Every sampled window sits inside one receiver band, and inverts back."""
+    """Every fitted window sits inside one receiver band, and inverts back."""
     bands = load_receiver_bands()
     assert bands and all(float(b["min"]) < float(b["max"]) for b in bands), bands
 
     specs = load_parameter_space()
     index = next(i for i, spec in enumerate(specs) if spec.get("kind") == "band_start")
+    count_spec = next(spec for spec in specs if spec["name"] == "channel_count")
+    width_spec = next(spec for spec in specs if spec["name"] == "channel_width_hz")
+    count_min, width_min = channel_floors()
+
+    before = WINDOW_FIT_STATS.as_dict()
     rng = np.random.default_rng(0)
-    seen, widths = set(), []
+    seen = set()
     for _ in range(2000):
         cube = rng.random(len(specs))
-        params = cube_to_params(cube)
+        params = cube_to_params(cube, track=True)
         start = params["start_frequency_hz"]
-        stop = start + params["channel_count"] * params["channel_width_hz"]
+        count, width = params["channel_count"], params["channel_width_hz"]
         band = next(
-            (b for b in bands if float(b["min"]) <= start and stop <= float(b["max"])),
+            (b for b in bands if float(b["min"]) <= start and start + count * width <= float(b["max"])),
             None,
         )
         assert band is not None, params
         seen.add(band["name"])
-        widths.append(params["channel_width_hz"])
-        # theta -> cube -> params is the sampler's own round trip; it has to
-        # land back on the same parameters (to floating-point), or the
-        # likelihood would see different ones from those PolyChord stored.
+        # Fitting only ever gives ground: it narrows channels or drops them,
+        # and never past the floors the parameter space set.
+        assert width_min <= width <= float(width_spec["max"]), params
+        assert count_min <= count <= int(count_spec["max"]), params
+        # theta -> cube -> params is the sampler's own round trip; a fitted
+        # window has to be a fixed point of the fitting, or the likelihood
+        # would see different parameters from the ones PolyChord stored.
         theta = prior_vector(cube, params)
         again = cube_to_params(cube_like_from_theta(theta))
         assert again.keys() == params.keys()
@@ -1438,28 +1569,56 @@ def self_check_spectral_window() -> None:
             assert isinstance(value, float) and math.isclose(value, other, rel_tol=1e-9) or value == other, (name, value, other)
     assert len(seen) == len(bands), sorted(seen)
 
-    # The unit cube's ends land on the ends of the lowest and highest band.
+    # The tally adds up, and only the tracked draws above were counted.
+    after = WINDOW_FIT_STATS.as_dict()
+    counted = {key: after[key] - before[key] for key in after}
+    assert counted["draws"] == 2000, counted
+    assert counted["as_sampled"] + counted["width_reduced"] + counted["count_reduced"] == 2000, counted
+    assert counted["redraws"] >= counted["redrawn_draws"], counted
+    assert counted["seconds"] > 0.0, counted
+
+    # The bottom of the cube is the bottom of the lowest band, where a window
+    # always fits as sampled; the top is the very top of the highest band,
+    # where nothing does, so it is redrawn into a band that has room.
     edges = np.zeros(len(specs))
     assert cube_to_params(edges)["start_frequency_hz"] == float(bands[0]["min"])
     edges[index] = 1.0
     top = cube_to_params(edges)
-    assert top["start_frequency_hz"] + top["channel_count"] * top["channel_width_hz"] == float(bands[-1]["max"])
+    top_stop = top["start_frequency_hz"] + top["channel_count"] * top["channel_width_hz"]
+    assert any(float(b["min"]) <= top["start_frequency_hz"] and top_stop <= float(b["max"]) for b in bands)
 
-    # channel_width_hz's min and max are both hard: no draw is bent to fit a
-    # band, so every width lands in the configured range exactly.
-    width_spec = next(spec for spec in specs if spec["name"] == "channel_width_hz")
-    assert min(widths) >= float(width_spec["min"]) and max(widths) <= float(width_spec["max"])
+    # Each rung of the ladder, forced directly: a start frequency with room for
+    # the window, for a narrowed one, for the minimum width with fewer
+    # channels, and for nothing at all.
+    band = bands[-1]
+    top_of_band = float(band["max"])
+    for room, count, width, expect in (
+        (1e9, 4, 2.0e6, (4, 2.0e6)),
+        (4 * width_min, 4, 2.0e6, (4, width_min)),
+        (count_min * width_min, 4, 2.0e6, (count_min, width_min)),
+    ):
+        cube_value = start_frequency_cube_value(top_of_band - room)
+        start, got_count, got_width = fit_spectral_window(cube_value, count, width)
+        assert (got_count, got_width) == expect or math.isclose(got_width, expect[1], rel_tol=1e-9), (
+            room, got_count, got_width, expect
+        )
+        assert start + got_count * got_width <= top_of_band + 1e-3, (start, got_count, got_width)
 
-    # A box whose widest window fits no band is a configuration error rather
-    # than something to bend, and it is fatal at load, not mid-run.
+    # No room at all: the start frequency is thrown away and another drawn.
+    start, count, width = fit_spectral_window(start_frequency_cube_value(top_of_band), 4, 2.0e6)
+    assert any(float(b["min"]) <= start and start + count * width <= float(b["max"]) for b in bands)
+    assert count >= count_min and width >= width_min
+
+    # A box whose smallest window fits no band cannot be fitted at all, and is
+    # fatal at load rather than mid-run.
     try:
         check_channel_box_against_bands(
-            [{"name": "channel_count", "min": 2, "max": 64}, {"name": "channel_width_hz", "min": 0.5e6, "max": 1.0e9}]
+            [{"name": "channel_count", "min": 32, "max": 64}, {"name": "channel_width_hz", "min": 1.0e9, "max": 2.0e9}]
         )
     except SystemExit as error:
-        assert "no start frequency can hold them" in str(error), error
+        assert "no start frequency can hold it" in str(error), error
     else:
-        raise AssertionError("a box whose widest window fits no band should not load")
+        raise AssertionError("a box whose smallest window fits no band should not load")
 
 
 def self_check_r2d2_thread_env() -> None:

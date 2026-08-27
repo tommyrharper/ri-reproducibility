@@ -23,6 +23,7 @@ from common import (
     adopt_completed_evaluations,
     cube_like_from_theta,
     cube_to_params,
+    gathered_window_fit_stats,
     compute_image_metrics,
     load_evaluations_from_dir,
     load_parameter_space,
@@ -47,6 +48,7 @@ from common import (
     simulate_worker,
     stable_seed,
     summarize_profiling,
+    window_fit_summary_line,
     write_evaluation_record,
     write_polychord_paramnames,
 )
@@ -306,7 +308,7 @@ def main() -> None:
     evaluations: list[dict[str, Any]] = []
 
     def prior(cube: np.ndarray) -> np.ndarray:
-        params = cube_to_params(cube)
+        params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
@@ -361,6 +363,8 @@ def main() -> None:
     run_start = time.monotonic()
     pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start
+    # Collective, so every rank calls it before rank 0 goes on alone.
+    window_fit_stats = gathered_window_fit_stats()
 
     if mpi_rank() == 0:
         all_evaluations = load_evaluations_from_dir(evaluations_dir)
@@ -388,9 +392,11 @@ def main() -> None:
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs),
+            "spectral_window_fitting": window_fit_stats,
         }
         summary_path = output_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+        print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")
 
 
