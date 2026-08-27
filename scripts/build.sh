@@ -81,7 +81,8 @@ build_meqtrees() {
       scripts/lib/nested_sampling/simulate_point_source_ms.py \
       scripts/lib/nested_sampling/point_source_forest.py \
       scripts/lib/nested_sampling/ms_to_r2d2_mat.py \
-      scripts/lib/nested_sampling/common.py)" \
+      scripts/lib/nested_sampling/common.py \
+      defaults.toml)" \
     -f docker/meqtrees/Dockerfile
 }
 

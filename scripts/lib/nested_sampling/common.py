@@ -15,6 +15,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -61,13 +62,32 @@ FAILURE_OBJECTIVE = 100.0
 DEFAULT_WSCLEAN_NITER = 100
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
-PARAMETER_SPACE = [
-    {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
-    {"name": "observation_minutes", "min": 4.0, "max": 10.0},
-    {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"},
-    {"name": "start_frequency_hz", "min": 1.0e9, "max": 1.1e9},
-    {"name": "channel_width_hz", "min": 0.5e6, "max": 2.0e6},
-]
+
+@cache
+def load_parameter_space() -> list[dict[str, Any]]:
+    """The parameter space the sampler searches - `[[parameter_space]]` in defaults.toml.
+
+    REPO_ROOT is what the containers get: the repo is bind-mounted at the same
+    path inside them, and this module is baked in at /opt/ri-nested-sampling,
+    where the __file__-relative repo root a host run walks up to does not exist.
+
+    Read on first use rather than at import, for the same reason numpy is: the
+    report imports this module inside the R2D2 image, whose Python 3.10 has no
+    tomllib, and it wants the formatting helpers - never the prior box, which
+    it reads back out of each run's summary.json.
+    """
+    import tomllib
+
+    here = Path(__file__).resolve()
+    for root in (os.environ.get("REPO_ROOT"), here.parent.parent.parent.parent):
+        if not root:
+            continue
+        path = Path(root) / "defaults.toml"
+        if path.is_file():
+            with path.open("rb") as handle:
+                return tomllib.load(handle)["parameter_space"]
+    raise SystemExit("no defaults.toml found - set REPO_ROOT to the repository root")
+
 
 # GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
 PARAMETER_TEX_LABELS = {
@@ -89,7 +109,7 @@ def write_polychord_paramnames(
     """Write PolyChord's <file_root>.paramnames beside future chain output."""
     base_dir.mkdir(parents=True, exist_ok=True)
     path = base_dir / f"{file_root}.paramnames"
-    specs = parameter_space if parameter_space is not None else PARAMETER_SPACE
+    specs = parameter_space if parameter_space is not None else load_parameter_space()
     with path.open("w") as handle:
         for spec in specs:
             name = str(spec["name"])
@@ -139,7 +159,7 @@ def scale(cube_value: float, lower: float, upper: float) -> float:
 
 def cube_to_params(cube: np.ndarray) -> dict[str, Any]:
     raw: dict[str, Any] = {}
-    for i, spec in enumerate(PARAMETER_SPACE):
+    for i, spec in enumerate(load_parameter_space()):
         value = scale(float(cube[i]), float(spec["min"]), float(spec["max"]))
         if spec.get("kind") == "integer":
             value = int(round(value))
@@ -1065,8 +1085,9 @@ def convert_ms_to_mat(
 
 
 def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:
-    cube_like = np.zeros(len(PARAMETER_SPACE), dtype=np.float64)
-    for i, spec in enumerate(PARAMETER_SPACE):
+    specs = load_parameter_space()
+    cube_like = np.zeros(len(specs), dtype=np.float64)
+    for i, spec in enumerate(specs):
         lower = float(spec["min"])
         upper = float(spec["max"])
         cube_like[i] = (float(theta[i]) - lower) / (upper - lower)
@@ -1076,9 +1097,20 @@ def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:
 
 def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
     return np.asarray(
-        [params[spec["name"]] if spec["name"] in params else math.log10(params["dynamic_range"]) for spec in PARAMETER_SPACE],
+        [params[spec["name"]] if spec["name"] in params else math.log10(params["dynamic_range"]) for spec in load_parameter_space()],
         dtype=np.float64,
     )
+
+
+def self_check_parameter_space() -> None:
+    """The parameter space survived the trip through defaults.toml."""
+    specs = load_parameter_space()
+    assert len(specs) == 5, specs
+    for spec in specs:
+        assert spec["name"] in PARAMETER_TEX_LABELS, spec
+        assert float(spec["min"]) < float(spec["max"]), spec
+    # TOML keeps int and float apart, and cube_to_params rounds this one.
+    assert {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"} in specs
 
 
 def self_check_r2d2_thread_env() -> None:

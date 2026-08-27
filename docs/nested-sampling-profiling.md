@@ -264,9 +264,10 @@ so the meqtrees image builds all of them at `docker build` time -
 and `skeleton_dir()` prefers that directory when it exists. It is an ordinary
 writable container path, so a shape the image was not built with is still built
 and published there at runtime: the baked set is a head start, not a fixed set.
-`common.py` is `--mount=type=bind`ed for that one build step rather than
-copied, so the shapes come from the single authoritative `PARAMETER_SPACE` and
-the runtime image still carries only the three simulate-side scripts.
+`common.py` and `defaults.toml` are `--mount=type=bind`ed for that one build
+step rather than copied, so the shapes come from the single authoritative
+`[[parameter_space]]` in `defaults.toml` and the runtime image still carries
+only the three simulate-side scripts.
 
 The MS name is part of the cache key, so a prebuilt entry is only useful if it
 is built under the name a real evaluation uses (`sim.ms`).

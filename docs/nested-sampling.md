@@ -754,7 +754,7 @@ Sampler effort may differ between sources; the search itself must not:
 
 WSClean and R2D2 runs never merge with each other, nor do runs with a
 different `--metric` / `NS_METRIC` or a different prior box (the prior box is
-`PARAMETER_SPACE` in `scripts/lib/nested_sampling/common.py`, copied into
+`[[parameter_space]]` in `defaults.toml`, copied into
 every `summary.json` as `parameter_space`).
 
 With no directories, every completed source run under

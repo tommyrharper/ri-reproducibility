@@ -758,10 +758,10 @@ if __name__ == "__main__":
             # Build time only: fills BAKED_SKELETON_DIR from the one authoritative
             # copy of the parameter space, bind-mounted in for this step so the
             # runtime image still carries nothing but the three simulate scripts.
-            from common import PARAMETER_SPACE
+            from common import load_parameter_space
 
             BAKED_SKELETON_DIR.mkdir(parents=True, exist_ok=True)
-            prebuild_skeletons({spec["name"]: [spec["min"], spec["max"]] for spec in PARAMETER_SPACE})
+            prebuild_skeletons({spec["name"]: [spec["min"], spec["max"]] for spec in load_parameter_space()})
         elif sys.argv[1:2] == ["--serve"]:
             # `--serve` / `--serve --fifo <base>`; neither takes the simulate
             # argument set, so they are dispatched before argparse.

@@ -1,8 +1,9 @@
 # Loads the shared runtime defaults from defaults.toml at the repository root.
 #
-# defaults.toml is the file to edit; this one only reads it. Every key there
-# names an environment variable and is applied only when that variable is
-# unset or empty, so overrides from the environment always win.
+# defaults.toml is the file to edit; this one only reads it. Every scalar key
+# there names an environment variable and is applied only when that variable
+# is unset or empty, so overrides from the environment always win. The arrays
+# of tables in it (parameter_space) are for the Python side and skipped here.
 #
 # Source this after REPO_ROOT is set - it is needed both to find the file and
 # to expand the `{REPO_ROOT}` placeholder in it.
@@ -35,6 +36,10 @@ with open(path, "rb") as handle:
     defaults = tomllib.load(handle)
 
 for key, value in defaults.items():
+    # Arrays and tables (parameter_space) are read directly by the Python side
+    # from defaults.toml; only scalars name an environment variable.
+    if isinstance(value, (list, dict)):
+        continue
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         sys.exit(f"{path}: {key} must be a string or number, got {type(value).__name__}")
     # Environment wins: only fill in variables that are unset or empty.
