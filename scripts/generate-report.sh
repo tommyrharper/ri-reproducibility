@@ -93,10 +93,19 @@ source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 CONTAINER="nested-sampling-report-$$-${RANDOM}"
 trap 'docker rm -f "${CONTAINER}" >/dev/null 2>&1 &' EXIT
 
+# docker run has no -t, so the container's stdout is a pipe docker forwards
+# rather than a pty: generate_report.py can't tell a live terminal from a log
+# file by asking its own isatty(). The host can, so it's passed down instead.
+PROGRESS_FLAG=()
+if [ -t 1 ]; then
+  PROGRESS_FLAG=(-e REPORT_PROGRESS_TTY=1)
+fi
+
 # --network none: the report only reads the repo and writes reports/, and
 # skipping the container network setup is ~0.3s of every invocation.
 docker run --network none --platform "${PLATFORM}" --name "${CONTAINER}" \
   "${R2D2_DOCKER_ENV_FLAGS[@]}" \
+  "${PROGRESS_FLAG[@]}" \
   -v "${REPO_ROOT}:/workspace/repo:ro" \
   -v "${REPO_ROOT}/reports:/workspace/out:rw" \
   --entrypoint python3 \
