@@ -1430,7 +1430,9 @@ the straggler was ~40% of the sampler wall clock.
 
 `r2d2_serve.py`'s `patch_op_norm()` replaces the method with an ARPACK Lanczos
 solve (`scipy.sparse.linalg.eigsh`, `k=1`, `ncv=8`, `tol=1e-3`) over the same
-`adjoint_op(forward_op(.))`, started from a deterministic `ones` vector. It
+`adjoint_op(forward_op(.))`, started from a deterministic vector - `ones` for
+the worker's first operator and that operator's converged eigenvector for every
+later one, see below. It
 computes the same quantity under the same caching contract - `_op_norm`,
 `compute_flag`, and therefore `get_op_norm_prime` too - and falls back to the
 original power iteration if ARPACK ever fails to converge within 100 restarts.
@@ -1530,6 +1532,57 @@ the only imaging number the checkpoint-less path prints, the estimated target
 dynamic range, moves by a median 2.2e-7 and at most 4.6e-6 over the 38
 evaluations - two orders of magnitude inside the power iteration's own error.
 
+#### The start vector is the last eigenvector this worker converged on
+
+`ones` is a bad guess for a matrix whose top eigenvector is a smooth,
+strongly peaked image. A *converged* eigenvector from a neighbouring operator
+is a very good one: one imaging worker sees a whole sequence of operators drawn
+from the same parameter space, and although their individual top eigenvectors
+are nearly orthogonal (cos ~0.01) their dominant subspaces coincide. So
+`get_op_norm` keeps the first eigenvector it converges on and feeds it back as
+ARPACK's `v0` for every later operator in that worker's life.
+
+Measured over 24 real operators from a PoC run, at the shipped `ncv=8`,
+`tol=1e-3` and `OP_NORM_UPSAMPFAC=1.25`:
+
+| start vector | Applications (mean) | Applications (max) | Solve (median) | 24-operator total |
+|---|---:|---:|---:|---:|
+| `ones` | 21.2 | 25 | 19.6ms | 491ms |
+| **first converged eigenvector** | **14.3** | **17** | **14.0ms** | **298ms** |
+| rolling (previous operator's) | 14.3 | 25 | - | 291ms |
+
+Frozen and rolling tie on the mean, so the frozen one wins on its worst case:
+17 applications against 25. A rolling vector chases each operator's own
+eigenvector and occasionally lands somewhere the next operator's Lanczos has to
+climb out of.
+
+The price is that the answer now depends on which operator the worker saw
+first, and that dependence is far below the tolerance the answer is already
+specified to. Against a solve from `ones` the eigenvalue moves 6.3e-07 median /
+3.4e-06 worst, and the spread across five *different* frozen start vectors is
+the same size (6.2e-07 median, 3.9e-06 worst) - against ARPACK's own 1e-3
+`tol`, and upstream's ~1e-4 power iteration. Run-to-run reproducibility is
+untouched: which rank runs which evaluation is PolyChord's seeded, rank-indexed
+business, and worker N always serves rank N.
+
+Interleaved A/B of `scripts/run-nested-sampling-r2d2-poc.sh` end to end,
+`NS_MPI_PROCS=8`, alternating the two `r2d2_serve.py` with no `docker build` in
+either arm. 60 pairs run, 57 valid - two dropped for the MeqTrees predict hang
+and one for straddling a foreign session's image rebuild, which the harness
+catches by recording `docker images -q` per run:
+
+| | `ones` | reused | delta | wins |
+|---|---:|---:|---:|---|
+| end-to-end wall | 2.652s | 2.608s | **-0.044s (-1.7%)**, t=-2.6 | 39/57 |
+| steady-state imaging worker-seconds | 1.759s | 1.378s | **-0.380s (-21.6%)**, t=-13.2 | 55/57 |
+| steady-state simulate worker-seconds | 1.673s | 1.662s | -0.011s, t=-0.5 | 32/57 |
+
+The simulate column is the control: it is not supposed to move, and it does
+not. Every one of the 114 runs produced 38 evaluations with an identical
+objective hash. -0.380 imaging worker-seconds for -0.044s of wall clock is the
+low end of the 0.15-0.33 exchange rate below, which is what a host running
+another agent's containers for most of the first block should give.
+
 #### Warm and deterministic start vectors, measured and rejected
 
 Before the Lanczos solve, three cheaper ideas were measured on the same
@@ -1537,12 +1590,17 @@ operators and all failed:
 
 - **Warm start from the previous evaluation's eigenvector.** ~1.9x fewer
   iterations on average (472 to 252 over 8 evaluations) but wildly unreliable -
-  2 iterations on one operator, 90 on the next - and it makes the answer depend
-  on which rank ran which evaluation in what order, which is worse than the
-  seed noise it would replace.
+  2 iterations on one operator, 90 on the next. Note that this is a verdict on
+  the *power iteration*: once the solve is Lanczos the same idea is reliable
+  and is what ships, see above. The instability was the power iteration's, not
+  the warm start's.
 - **Deterministic seeds:** `ones`, the PSF, and a cosine at the argmax of
   `fft2(psf)` (the circulant approximation's top eigenvector). None beat
-  `randn` consistently, and the cosine seed was off by 5e-2 on two operators.
+  `randn` consistently, and the cosine seed was off by 5e-2 on two operators. Under Lanczos the same family fails again for a different
+  reason - none of them is a converged eigenvector: over 24 operators a seeded
+  `randn` costs 21.3 applications, a low-passed one 20.7-25.5, Gaussians
+  18.7-22.2 and one or two power iterations from `ones` 21.2-21.3, against
+  `ones`' own 21.2 and a reused eigenvector's 14.3.
 - The reason all of them disappoint is the same one Lanczos fixes: the spectral
   gap is so small that a power iteration started anywhere crawls. A tight
   reference run needs >2000 applications to reach 1e-9.

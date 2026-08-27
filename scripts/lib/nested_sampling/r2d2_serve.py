@@ -256,7 +256,7 @@ def patch_nufft_plans() -> None:
     MeasOpPytorchFinufft._AtGt = _AtGt
 
 
-def lanczos_largest_eigenvalue(matvec, size: int, dtype, max_restarts: int = 100) -> float:
+def lanczos_largest_eigenvalue(matvec, size: int, dtype, v0=None, max_restarts: int = 100):
     """Largest eigenvalue of a Hermitian positive semi-definite operator.
 
     `matvec` maps a flat vector to `A x`. ARPACK's Lanczos builds a Krylov
@@ -272,9 +272,14 @@ def lanczos_largest_eigenvalue(matvec, size: int, dtype, max_restarts: int = 100
     for 2.9e-6. Going further is where it stops being free - 1e-2 is 16.8
     applications but a 4.9e-4 median error, i.e. worse than the power iteration.
 
-    The start vector is `ones`, not a random draw: with no seeding the upstream
-    power iteration gives a different answer, and takes a different number of
-    iterations, on every run of the same evaluation.
+    Returns `(eigenvalue, eigenvector)`; asking for the eigenvector costs
+    `eigsh` no extra applications.
+
+    The start vector defaults to `ones`, and is never a random draw: with no
+    seeding the upstream power iteration gives a different answer, and takes a
+    different number of iterations, on every run of the same evaluation. `v0`
+    is how `get_op_norm` feeds back a converged eigenvector; see
+    `_reused_start_vector`.
 
     ponytail: `max_restarts` bounds the worst case at ~600 applications; the
     caller falls back to the power iteration if it is ever hit.
@@ -283,17 +288,40 @@ def lanczos_largest_eigenvalue(matvec, size: int, dtype, max_restarts: int = 100
     from scipy.sparse.linalg import LinearOperator, eigsh
 
     operator = LinearOperator((size, size), matvec=matvec, dtype=dtype)
-    eigenvalues = eigsh(
+    if v0 is None:
+        v0 = np.ones(size, dtype=dtype)
+    eigenvalues, eigenvectors = eigsh(
         operator,
         k=1,
         which="LA",
         ncv=8,
         tol=1e-3,
         maxiter=max_restarts,
-        v0=np.ones(size, dtype=dtype),
-        return_eigenvectors=False,
+        v0=v0,
+        return_eigenvectors=True,
     )
-    return float(eigenvalues[0])
+    return float(eigenvalues[0]), np.ascontiguousarray(eigenvectors[:, 0], dtype=dtype)
+
+
+# The last eigenvector `get_op_norm` converged on in this worker, reused as the
+# next operator's ARPACK start vector. One worker sees a whole sequence of
+# operators from the same parameter space, and their top eigenvalues sit in a
+# shared dominant subspace even though the individual eigenvectors are nearly
+# orthogonal (cos ~0.01), so a converged one is a far better guess than `ones`:
+# over 24 real operators it costs 14.3 applications (max 17) against 21.2 (max
+# 25) and cuts the solve from 19.6ms to 14.0ms.
+#
+# It is deliberately the FIRST one, held for the rest of the worker's life,
+# rather than a rolling one - rolling ties on the mean but has a 25-application
+# worst case where freezing has 17. The price is that the answer depends on
+# which operator the worker saw first, which is bounded well below the
+# tolerance it is already specified to: over those operators the eigenvalue
+# moves 6.3e-07 median / 3.4e-06 worst against a solve from `ones`, and the
+# spread across five different frozen start vectors is the same size - against
+# ARPACK's own 1e-3 `tol` and upstream's ~1e-4 power iteration. Nothing generic
+# reproduces it: seeded randn, low-passed randn, Gaussians and one or two power
+# iterations from `ones` all measure 18.7-25.5 applications.
+_reused_start_vector = None
 
 
 def patch_op_norm() -> None:
@@ -329,16 +357,24 @@ def patch_op_norm() -> None:
             image = image.to(self._device).view(1, 1, *size)
             return self.adjoint_op(self.forward_op(image)).reshape(-1).cpu().numpy()
 
+        global _reused_start_vector
+        length = int(np.prod(size))
+        v0 = _reused_start_vector
+        if v0 is not None and (v0.size != length or v0.dtype != dtype):
+            v0 = None
+
         # The Lanczos matvecs run on a coarser FINUFFT upsampling grid than the
         # imaging transforms do; see OP_NORM_UPSAMPFAC.
         self._ri_upsampfac = OP_NORM_UPSAMPFAC
         try:
-            self._op_norm = lanczos_largest_eigenvalue(matvec, int(np.prod(size)), dtype)
+            self._op_norm, eigenvector = lanczos_largest_eigenvalue(matvec, length, dtype, v0)
         except ArpackNoConvergence:
             self._op_norm = None
             return power_iteration(self, True, rel_tol, max_iter, verbose)
         finally:
             self._ri_upsampfac = 2.0
+        if _reused_start_vector is None:
+            _reused_start_vector = eigenvector
         return self._op_norm
 
     MeasOp.get_op_norm = get_op_norm
@@ -617,7 +653,23 @@ def self_check_lanczos_largest_eigenvalue() -> None:
     rng = np.random.default_rng(0)
     basis = np.linalg.qr(rng.standard_normal((size, size)))[0]
     matrix = (basis * spectrum) @ basis.T
-    largest = lanczos_largest_eigenvalue(lambda v: matrix @ v, size, np.float64)
+    largest, eigenvector = lanczos_largest_eigenvalue(lambda v: matrix @ v, size, np.float64)
+
+    # A neighbouring operator, the way one evaluation's is a neighbour of the
+    # last one's: `matrix`'s converged eigenvector must start it in fewer
+    # applications than `ones` does, which is the whole point of reusing it.
+    nudged = matrix + 1e-3 * (basis * np.roll(spectrum, 1)) @ basis.T
+    counts = {}
+    for label, start in (("ones", None), ("reused", eigenvector)):
+        applied = [0]
+
+        def count(v, applied=applied):
+            applied[0] += 1
+            return nudged @ v
+
+        counts[label] = (lanczos_largest_eigenvalue(count, size, np.float64, start)[0], applied[0])
+    assert counts["reused"][1] < counts["ones"][1], counts
+    assert abs(counts["reused"][0] - counts["ones"][0]) / counts["ones"][0] < 1e-3, counts
 
     # The same 1e-5 relative-change test upstream uses, for the comparison the
     # patch exists to make.
