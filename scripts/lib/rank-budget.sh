@@ -67,10 +67,60 @@ _ns_available_mb() {
     printf '%s\n' "${NS_AVAILABLE_MB}"
     return 0
   fi
-  # Linux only. macOS has no MemAvailable equivalent that means the same
-  # thing, and returning nothing here is what turns the clamp off.
-  [ -r /proc/meminfo ] || return 1
-  awk '/^MemAvailable:/ { print int($2 / 1024); found = 1 } END { exit !found }' /proc/meminfo
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemAvailable:/ { print int($2 / 1024); found = 1 } END { exit !found }' /proc/meminfo
+    return
+  fi
+  # macOS has no MemAvailable. Free + inactive + speculative pages is the
+  # same "reclaimable without swapping" idea vm_stat can give us; page size
+  # comes from vm_stat's own header so this isn't hardcoding 4096/16384.
+  if command -v vm_stat >/dev/null 2>&1; then
+    vm_stat | awk -v pagesize="$(vm_stat | sed -n 's/.*page size of \([0-9]*\) bytes.*/\1/p')" '
+      /^Pages free:/ { free = $3 }
+      /^Pages inactive:/ { inactive = $3 }
+      /^Pages speculative:/ { spec = $3 }
+      END {
+        if (pagesize == "") { exit 1 }
+        gsub(/\./, "", free); gsub(/\./, "", inactive); gsub(/\./, "", spec)
+        print int((free + inactive + spec) * pagesize / 1024 / 1024)
+      }'
+    return
+  fi
+  # Neither read is available: returning nothing here is what turns the
+  # clamp off.
+  return 1
+}
+
+# The whole read-decide-reserve in ns_budget_ranks has to be atomic against
+# another run doing the same thing. flock(1) isn't stock on macOS, so fall
+# back to an mkdir spinlock - mkdir is atomic on any POSIX filesystem. A
+# stale lock (holder SIGKILLed) is pruned by checking the PID it recorded,
+# same as a stale reservation below.
+_ns_lock() {
+  local dir="$1" lockdir="${1}/.lock.d" holder
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"${dir}/.lock"
+    flock 9
+    return
+  fi
+  while ! mkdir "${lockdir}" 2>/dev/null; do
+    holder="$(cat "${lockdir}/pid" 2>/dev/null || true)"
+    if [ -n "${holder}" ] && ! kill -0 "${holder}" 2>/dev/null; then
+      rm -rf "${lockdir}"
+      continue
+    fi
+    sleep 0.05
+  done
+  echo "$$" >"${lockdir}/pid"
+}
+
+_ns_unlock() {
+  local dir="$1"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>&-
+  else
+    rm -rf "${dir}/.lock.d"
+  fi
 }
 
 # Echoes the rank count to use. Never more than requested, never less than 1.
@@ -79,18 +129,16 @@ ns_budget_ranks() {
   local dir="${NS_RANK_BUDGET_DIR:-${TMPDIR:-/tmp}/ri-ns-rank-budget-$(id -u)}"
   local available reserved=0 budget affordable now entry pid expiry mb
 
-  # No memory reading and no flock (macOS) means no clamp: the guard is a
-  # safety net on the hosts that can support it, not a hard dependency.
-  if ! available="$(_ns_available_mb)" || ! command -v flock >/dev/null 2>&1; then
+  # No memory reading (neither /proc/meminfo nor vm_stat, i.e. a platform
+  # this hasn't been taught) means no clamp: the guard is a safety net on
+  # the hosts that can support it, not a hard dependency.
+  if ! available="$(_ns_available_mb)"; then
     printf '%s\n' "${requested}"
     return 0
   fi
 
   mkdir -p "${dir}"
-  # The whole read-decide-reserve has to be atomic against another run doing
-  # the same thing, which is the case this exists for.
-  exec 9>"${dir}/.lock"
-  flock 9
+  _ns_lock "${dir}"
 
   now="$(date +%s)"
   for entry in "${dir}"/*; do
@@ -130,7 +178,7 @@ ns_budget_ranks() {
         "Wait for the other runs to finish, or free memory. If nothing is" \
         "running, check for sidecars a killed run left behind:" \
         "docker ps --filter name=ri-ns-sidecar" >&2
-      exec 9>&-
+      _ns_unlock "${dir}"
       return 1
     fi
     # Said out loud: a run that quietly used fewer cores than asked for would
@@ -143,7 +191,7 @@ ns_budget_ranks() {
 
   printf '%s %s\n' "$((now + NS_RANK_BUDGET_RESERVE_SECONDS))" \
     "$((requested * mb_per_rank))" >"${dir}/$$"
-  exec 9>&-
+  _ns_unlock "${dir}"
 
   printf '%s\n' "${requested}"
 }
@@ -171,6 +219,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_RANK_BUDGET_DIR="$(mktemp -d)"
   export NS_RANK_BUDGET_DIR
   NS_RANK_BUDGET_HEADROOM_MB=4096
+
+  # The real reader works on whatever platform runs this check - /proc/meminfo
+  # on Linux, `vm_stat` on macOS - not just the NS_AVAILABLE_MB override below.
+  [ "$(_ns_available_mb)" -gt 0 ]
+
   export NS_AVAILABLE_MB=40960
   # 40960 available - 4096 headroom = 36864, over 3400 per rank, is 10 ranks.
   # Each case starts from an empty directory: ns_budget_ranks runs in the

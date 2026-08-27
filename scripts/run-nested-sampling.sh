@@ -13,20 +13,16 @@ source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/wsclean-vlaa-${RUN_ID}}"
 
 # Needed before the launches, because the containers' commands below want one
-# FIFO pair per rank to already exist. `nproc`/`sysctl` (matches the fallback
-# in record-environment.sh and r2d2-docker-thread-env.sh, since `nproc` is
-# Linux-only and this repo also runs on macOS hosts) and not `docker info
-# --format '{{.NCPU}}'`: the two answer the same on any daemon these scripts
-# can use - every sidecar bind-mounts host paths, so the daemon is always this
-# host - and `docker info` is ~0.06s of CLI-plus-daemon round trip sitting in
-# front of the sidecars' `docker run`, which the R2D2 script's measurements
-# price at 1:1 on the run's wall clock. The daemon-availability check it
-# doubled as is below the launches instead, where it overlaps the containers
-# coming up and costs nothing.
+# FIFO pair per rank to already exist. On Linux `nproc` is what mpirun will
+# see too, since the daemon is the host kernel. On macOS the daemon runs
+# inside its own VM (Docker Desktop / Colima), which can be handed fewer
+# vCPUs than `sysctl` reports for the host - `-np` gets sized from a CPU
+# count mpirun's container never has, and it refuses to launch at all
+# ("not enough slots"). Ask the daemon what it actually has instead.
 if command -v nproc >/dev/null 2>&1; then
   HOST_CPUS="$(nproc)"
 else
-  HOST_CPUS="$(sysctl -n hw.ncpu)"
+  HOST_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null || sysctl -n hw.ncpu)"
 fi
 # A WSClean rank is cheap next to an R2D2 one (~0.2GB against ~3.4GB), but it
 # is not free, and this host runs both at once from several agent sessions.
