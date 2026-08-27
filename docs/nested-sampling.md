@@ -373,13 +373,14 @@ What each line is reading, and why it is worth a line:
   that works for an hour and then wedges still reads under any threshold for
   most of another hour, because the real work already done outweighs the
   spinning.) On its own the count means nothing, and not just because some
-  spinning is normal: on one healthy 16-rank R2D2 run it measured 7, then 15,
-  then 1 over the course of an hour, each reading stable across repeated
-  samples, as the sampler alternated between imaging in parallel and
-  synchronising. A single sample lands wherever the phase happens to be. So it
-  is reported as a deadlock only when all but one are burning CPU **and**
-  nothing has completed for a minute - and it is that second clause that does
-  the work.
+  spinning is normal: four independent measurements of one healthy 16-rank
+  R2D2 run, across an hour, gave 1, 2, 7 and 15, as the sampler alternated
+  between imaging in parallel and synchronising. Each was reproducible for as
+  long as its phase lasted - **a count sampled for a minute lands there just as
+  confidently as one sampled once**, which is what made every one of those
+  readings persuasive to whoever took it. So it is reported as a deadlock only
+  when all but one are burning CPU **and** nothing has completed for a minute,
+  and it is that second clause that does the work.
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real

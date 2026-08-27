@@ -444,12 +444,13 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # All but one, because rank 0 is PolyChord's administrator and does nothing
     # else - and only once evaluations have stopped landing, which is the
     # clause doing the real work here. The spin count on its own says nothing:
-    # on one healthy 16-rank R2D2 run it was measured at 7, then 15, then 1
-    # over the course of an hour, each reading stable across repeated samples,
-    # as the sampler alternated between imaging in parallel and synchronising.
-    # A single sample can land anywhere in that range, so all-but-one spinning
-    # is a coin flip on timing rather than a fault. What no phase of a working
-    # run produces is a minute with nothing completed.
+    # four independent measurements of one healthy 16-rank R2D2 run, across an
+    # hour, gave 1, 2, 7 and 15, as the sampler alternated between imaging in
+    # parallel and synchronising. Each was reproducible for as long as its
+    # phase lasted - a count sampled for a minute lands there just as
+    # confidently as one sampled once - so all-but-one spinning is a coin flip
+    # on timing rather than a fault. What no phase of a working run produces is
+    # a minute with nothing completed.
     if ranks and spinning >= max(1, len(ranks) - 1) and idle is not None \
             and idle > SPIN_IDLE_SECONDS:
         warnings.append(
