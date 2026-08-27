@@ -45,17 +45,23 @@ _ns_format_hms() {
 
 _ns_print_progress() {
   local evaluations_dir="$1" max_ndead="$2" start="$3"
-  local now elapsed done_count pct eta bar_width filled
+  local now elapsed done_count
 
   now="$(date +%s)"
   elapsed=$((now - start))
   done_count="$(_ns_count_evaluations "${evaluations_dir}")"
 
-  pct=0
-  if [ "${max_ndead}" -gt 0 ]; then
-    pct=$((done_count * 100 / max_ndead))
-    [ "${pct}" -gt 100 ] && pct=100
+  # PolyChord treats max_ndead <= 0 as "no bound, stop on evidence tolerance
+  # instead" - there's no budget to measure against, so just show the count.
+  if [ "${max_ndead}" -le 0 ]; then
+    printf '\r%d dead points  elapsed %s   ' \
+      "${done_count}" "$(_ns_format_hms "${elapsed}")"
+    return
   fi
+
+  local pct eta bar_width filled
+  pct=$((done_count * 100 / max_ndead))
+  [ "${pct}" -gt 100 ] && pct=100
 
   eta="?"
   if [ "${done_count}" -gt 0 ] && [ "$((max_ndead - done_count))" -gt 0 ]; then
@@ -84,6 +90,18 @@ self_check() {
 
   [ "$(_ns_format_hms 3661)" = "1:01:01" ] || { echo "FAIL: format_hms"; exit 1; }
   [ "$(_ns_format_hms 59)" = "0:00:59" ] || { echo "FAIL: format_hms short"; exit 1; }
+
+  # max_ndead <= 0 (PolyChord's "run until evidence tolerance" setting, e.g.
+  # --max-ndead -1) has no budget to divide by - must not claim an ETA or
+  # a percent, which the naive done_count >= max_ndead check used to do.
+  local line
+  line="$(_ns_print_progress "${tmp}" -1 "$(($(date +%s) - 90))")"
+  case "${line}" in
+    *eta*) echo "FAIL: unbounded max_ndead printed an eta: ${line}"; exit 1 ;;
+  esac
+  case "${line}" in
+    *%*) echo "FAIL: unbounded max_ndead printed a percent: ${line}"; exit 1 ;;
+  esac
 
   rm -rf "${tmp}"
   echo "progress-bar self-check passed"
