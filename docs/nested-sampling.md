@@ -189,15 +189,48 @@ around each other rather than both assuming an empty host
 for even one rank fails before starting any container. An explicit
 `--mpi-procs` is honoured, with a `WARNING:` if it will not fit.
 
-The guard exists because running out of memory here is silent rather than
-loud. The host OOM killer takes an imaging worker, the rank reads EOF from
-its reply FIFO, and the evaluation is recorded with `FAILURE_OBJECTIVE`
-(`100.0`). PolyChord maximizes the objective and a real `total_rms_jy` is
-~0.008, so an out-of-memory evaluation scores as the best point the search
-has ever seen and the sampler concentrates live points there. The run
-completes and reports a parameter region as a catastrophic failure mode when
-what actually failed was the host. Failed evaluations carry an `error` field,
-so they can be filtered afterwards - but the sampling budget is already spent.
+### Infrastructure failures are not failure modes
+
+A failed evaluation scores `FAILURE_OBJECTIVE` (`100.0`), which PolyChord
+maximizes against a real `total_rms_jy` of ~0.008 - so a failure becomes the
+most interesting point in the search. That is deliberate: failure modes are
+what these runs look for.
+
+It is only correct when the *algorithm* failed. A worker the host's OOM killer
+took says nothing about R2D2, and scoring it would report a parameter region
+as catastrophic when what actually failed was the machine. The two used to be
+indistinguishable, because a dead worker and a genuine non-zero exit both
+arrived as `returncode=1`. They are now separate:
+
+| What happened | What the run does |
+|---|---|
+| The tool ran and exited non-zero | `FAILURE_OBJECTIVE` - a failure mode, scored |
+| A worker died mid-request | Retried, then the run stops - never scored |
+
+A dead worker is retried against a freshly started one, waiting longer each
+time (`WORKER_RETRY_DELAYS` in `common.py`, ~51s in total). That is usually
+enough, because the memory the attempt died for is released by its own death
+and the run holding the rest eventually finishes.
+
+If it still cannot run, the run stops rather than inventing a likelihood.
+There is no honest value to return: scoring it high makes the sampler chase
+the OOM killer, and scoring it low carves a hole out of exactly the expensive
+corner where the real failure modes live.
+
+### Interrupted runs resume
+
+PolyChord's own checkpointing is on, so stopping is not the same as starting
+over. `--output-dir` pointing at an interrupted run finds its `.resume` file
+and continues from there, adopting the evaluations already on disk so their
+ids carry on and no point is paid for twice:
+
+```bash
+./ri search r2d2 --output-dir results/nested-sampling/r2d2-vlaa-20260827T101500Z
+```
+
+A fresh run has no resume file and starts clean, so this costs nothing to
+leave on. It covers every way a long run stops - the memory guard giving up,
+a Ctrl-C, a reboot - not just the one this section is about.
 
 ### Running WSClean and R2D2 at the same time
 

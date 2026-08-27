@@ -17,6 +17,10 @@ from common import (
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_NITER,
     FAILURE_OBJECTIVE,
+    WORKER_DIED,
+    WorkerDied,
+    abort_run,
+    adopt_completed_evaluations,
     cube_like_from_theta,
     cube_to_params,
     compute_image_metrics,
@@ -34,6 +38,7 @@ from common import (
     self_check_metric_resolution,
     self_check_parameter_space,
     self_check_profiling,
+    self_check_resume_adoption,
     sidecar_command,
     sidecar_run,
     sidecar_shell,
@@ -71,6 +76,10 @@ def evaluate(
     sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
     simulate_seconds = time.perf_counter() - sim_start
+    # A dead worker is the host failing, not the algorithm, so it is never
+    # scored - see WORKER_DIED in common.py.
+    if sim_error is not None and sim_error.returncode == WORKER_DIED:
+        raise WorkerDied(f"simulate worker died on evaluation {eval_id} ({eval_dir})")
     if sim_error is not None:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -119,6 +128,8 @@ def evaluate(
     run_result = sidecar_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = read_gnu_time_peak_memory(wsclean_time)
     image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
+    if run_result.returncode == WORKER_DIED:
+        raise WorkerDied(f"wsclean sidecar shell died on evaluation {eval_id} ({eval_dir})")
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -308,7 +319,12 @@ def main() -> None:
         if key not in cache:
             eval_id = len(evaluations) + 1
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
-            record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
+            try:
+                record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
+            except WorkerDied as exc:
+                # No honest likelihood exists for an evaluation the host never
+                # ran, and any value invented here would steer the sampler.
+                abort_run(str(exc))
             cache[key] = record
             evaluations.append(record)
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
@@ -321,8 +337,22 @@ def main() -> None:
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
-    settings.read_resume = False
-    settings.write_resume = False
+    # PolyChord's own checkpointing, on so that an interrupted run is not a
+    # wasted one. It was off, which was survivable when a run was 100s of toy
+    # evaluations and is not once a run is hours long: any interruption - the
+    # host running out of memory, a Ctrl-C, a reboot - threw away every
+    # evaluation. Resuming is `--output-dir <the interrupted run>`, which finds
+    # the resume file and continues; a fresh run has none and starts clean.
+    resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
+    settings.write_resume = True
+    settings.read_resume = resume_path.exists()
+    if settings.read_resume:
+        # Adopt what the interrupted attempt already evaluated, so eval ids
+        # carry on rather than restarting at 1 and colliding with its
+        # directories, and so a repeated point is served from the cache
+        # instead of being recomputed.
+        done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
+        print(f"resuming from {resume_path}, {done} evaluations already done", flush=True)
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
@@ -371,6 +401,7 @@ if __name__ == "__main__":
         self_check_fits_reader()
         self_check_profiling()
         self_check_failure_record_persistence()
+        self_check_resume_adoption()
         print("metric resolution self-check passed")
     else:
         main()

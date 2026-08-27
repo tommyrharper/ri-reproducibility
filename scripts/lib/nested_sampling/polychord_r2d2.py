@@ -16,6 +16,10 @@ import numpy as np
 
 from common import (
     FAILURE_OBJECTIVE,
+    WORKER_DIED,
+    WorkerDied,
+    abort_run,
+    adopt_completed_evaluations,
     cube_like_from_theta,
     cube_to_params,
     compute_image_metrics,
@@ -34,6 +38,7 @@ from common import (
     self_check_metric_resolution,
     self_check_parameter_space,
     self_check_profiling,
+    self_check_resume_adoption,
     self_check_r2d2_thread_env,
     simulate_measurement_set,
     simulate_worker,
@@ -109,6 +114,10 @@ def evaluate(
     sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
     simulate_seconds = time.perf_counter() - sim_start
+    # A dead worker is the host failing, not the algorithm, so it is never
+    # scored - see WORKER_DIED in common.py.
+    if sim_error is not None and sim_error.returncode == WORKER_DIED:
+        raise WorkerDied(f"simulate worker died on evaluation {eval_id} ({eval_dir})")
     if sim_error is not None:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -128,6 +137,8 @@ def evaluate(
     convert_start = time.perf_counter()
     convert_returncode = convert_ms_to_mat(convert_cmd, eval_dir, args.meqtrees_image, args.platform)
     convert_seconds = time.perf_counter() - convert_start
+    if convert_returncode == WORKER_DIED:
+        raise WorkerDied(f"simulate worker died converting evaluation {eval_id} ({eval_dir})")
     if convert_returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -159,6 +170,10 @@ def evaluate(
         args.r2d2_image, args.platform, args.checkpoints_dir, r2d2_cmd, r2d2_stdout, r2d2_stderr
     )
     peak_memory_bytes = run_result.peak_memory_bytes
+    # The OOM killer's usual victim: retried against a fresh worker already,
+    # so reaching here means the host cannot run this evaluation at all.
+    if run_result.returncode == WORKER_DIED:
+        raise WorkerDied(f"r2d2 imaging worker died on evaluation {eval_id} ({eval_dir})")
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -256,6 +271,82 @@ def self_check_r2d2_config_thread_cap() -> None:
             del os.environ["R2D2_OMP_THREADS"]
         else:
             os.environ["R2D2_OMP_THREADS"] = saved
+
+
+def self_check_worker_death_is_not_scored() -> None:
+    """A dead worker must stop the run, not become the search's best point.
+
+    The two cases have to stay apart: R2D2 exiting non-zero on its parameters
+    is a failure mode and is scored, while a worker the OOM killer took says
+    nothing about the algorithm and must never reach the sampler.
+    """
+    import tempfile
+
+    original_convert = globals()["convert_ms_to_mat"]
+    original_run_r2d2 = globals()["run_r2d2_imaging"]
+    original_simulate = globals()["simulate_measurement_set"]
+
+    def successful_simulate(
+        params: dict[str, Any],
+        eval_dir: Path,
+        meqtrees_image: str,
+        platform: str,
+    ) -> tuple[Path, list[str], None]:
+        eval_dir.mkdir(parents=True, exist_ok=False)
+        return eval_dir / "sim.ms", ["simulate"], None
+
+    def imaging(returncode: int) -> Callable[..., Any]:
+        def run(*args: Any, **kwargs: Any) -> argparse.Namespace:
+            return argparse.Namespace(returncode=returncode, wall_seconds=0.1, peak_memory_bytes=0)
+
+        return run
+
+    args = argparse.Namespace(
+        meqtrees_image="meqtrees",
+        r2d2_image="r2d2",
+        checkpoints_dir="/checkpoints",
+        platform="linux/arm64",
+    )
+    try:
+        globals()["simulate_measurement_set"] = successful_simulate
+        globals()["convert_ms_to_mat"] = lambda *a, **k: 0
+
+        globals()["run_r2d2_imaging"] = imaging(WORKER_DIED)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            try:
+                evaluate({}, args, root / "eval-0001-deadbeef", 1, lambda metrics: 0.0)
+            except WorkerDied:
+                pass
+            else:
+                raise AssertionError("a dead imaging worker was scored instead of stopping the run")
+            # And nothing was recorded, so no later merge or plot can pick up
+            # an objective for an evaluation the host never actually ran.
+            assert load_evaluations_from_dir(root) == []
+
+        # A real non-zero exit is still a failure mode, and still scored.
+        globals()["run_r2d2_imaging"] = imaging(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = evaluate({}, args, root / "eval-0001-deadbeef", 1, lambda metrics: 0.0)
+            assert record["objective"] == FAILURE_OBJECTIVE
+            assert "exit 3" in record["error"]
+
+        # The same split applies to a dead simulate worker.
+        globals()["run_r2d2_imaging"] = imaging(0)
+        globals()["convert_ms_to_mat"] = lambda *a, **k: WORKER_DIED
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            try:
+                evaluate({}, args, root / "eval-0001-deadbeef", 1, lambda metrics: 0.0)
+            except WorkerDied:
+                pass
+            else:
+                raise AssertionError("a dead simulate worker was scored instead of stopping the run")
+    finally:
+        globals()["simulate_measurement_set"] = original_simulate
+        globals()["convert_ms_to_mat"] = original_convert
+        globals()["run_r2d2_imaging"] = original_run_r2d2
 
 
 def self_check_failure_record_persistence() -> None:
@@ -370,7 +461,12 @@ def main() -> None:
         if key not in cache:
             eval_id = len(evaluations) + 1
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
-            record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
+            try:
+                record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
+            except WorkerDied as exc:
+                # No honest likelihood exists for an evaluation the host never
+                # ran, and any value invented here would steer the sampler.
+                abort_run(str(exc))
             cache[key] = record
             evaluations.append(record)
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
@@ -383,8 +479,22 @@ def main() -> None:
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
-    settings.read_resume = False
-    settings.write_resume = False
+    # PolyChord's own checkpointing, on so that an interrupted run is not a
+    # wasted one. It was off, which was survivable when a run was 100s of toy
+    # evaluations and is not once a run is hours long: any interruption - the
+    # host running out of memory, a Ctrl-C, a reboot - threw away every
+    # evaluation. Resuming is `--output-dir <the interrupted run>`, which finds
+    # the resume file and continues; a fresh run has none and starts clean.
+    resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
+    settings.write_resume = True
+    settings.read_resume = resume_path.exists()
+    if settings.read_resume:
+        # Adopt what the interrupted attempt already evaluated, so eval ids
+        # carry on rather than restarting at 1 and colliding with its
+        # directories, and so a repeated point is served from the cache
+        # instead of being recomputed.
+        done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
+        print(f"resuming from {resume_path}, {done} evaluations already done", flush=True)
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
@@ -440,6 +550,8 @@ if __name__ == "__main__":
         self_check_r2d2_config_thread_cap()
         self_check_profiling()
         self_check_failure_record_persistence()
+        self_check_worker_death_is_not_scored()
+        self_check_resume_adoption()
         print("metric resolution self-check passed")
     else:
         main()
