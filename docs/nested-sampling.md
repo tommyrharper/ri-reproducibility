@@ -325,25 +325,20 @@ asserts the theta -> cube -> params round trip PolyChord relies on still comes
 back to the same parameters.
 
 `channel_count` and `channel_width_hz` stay ordinary boxes you can widen, and
-widening them cannot put a window outside a band, because the placement is
-computed per draw from the width that draw asked for:
+both ends of `channel_width_hz` are hard: every draw is sampled from exactly
+the range you configured, and no draw is ever bent to make it fit a band.
+Widening them still cannot put a window outside a band:
 
-- The set of candidate bands is whichever ones can hold *that* window, so a
-  wide window simply never starts in a band too narrow for it, while a narrow
-  window drawn a moment later still can. No band is lost from the prior for
-  being narrow.
-- A window wider than every band - only reachable if `channel_count` x
-  `channel_width_hz` exceeds the widest band, 13.5 GHz for the VLA - has its
-  channels narrowed until it fits rather than being placed outside a band.
-  That caps the top of the `channel_width_hz` range, so
-  `check_channel_box_against_bands()` prints what the effective ceiling is
-  when the configured box reaches past it.
-- The narrowing stops at `channel_width_hz`'s configured `min`, which is a
-  hard floor: no draw is ever thinner than the width you asked for. That
-  leaves one box that cannot be satisfied - `channel_count`'s max at the
-  minimum width still wider than every band - and it is a configuration error,
-  fatal at load with the count that would fit, not something the sampler
-  quietly works around mid-run.
+- The set of candidate bands is recomputed per draw, from the window that draw
+  asked for, so a wide window simply never starts in a band too narrow for it,
+  while a narrow window drawn a moment later still can. No band is lost from
+  the prior for being narrow.
+- The two rules only contradict each other for a box whose *widest* window -
+  `channel_count`'s max at `channel_width_hz`'s max - fits no band at all
+  (>13.5 GHz for the VLA). There is no honest answer for that draw, so
+  `check_channel_box_against_bands()` refuses it at load, naming the channel
+  count and the channel width that would fit. A run either searches the box
+  you configured or does not start.
 
 The band guarantee is the sampler's. `simulate_point_source_ms.py` takes
 `--start-frequency-hz` and `--channel-width-hz` as given, so a hand-run

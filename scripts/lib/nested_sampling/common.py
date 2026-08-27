@@ -191,58 +191,39 @@ def load_parameter_space() -> list[dict[str, Any]]:
     return specs
 
 
-def channel_width_floor() -> float:
-    """The configured `channel_width_hz` minimum - a width no draw goes below."""
-    for spec in load_parameter_space():
-        if spec["name"] == "channel_width_hz":
-            return float(spec["min"])
-    return 0.0
-
-
 def check_channel_box_against_bands(specs: list[dict[str, Any]]) -> None:
     """The channel box against the bandwidth the bands actually have.
 
-    Fatal when even the narrowest configured channels do not fit: the minimum
-    width is a hard floor, so there is no window left to place and the run
-    would otherwise have to break either that floor or the band it sits in.
-    Widening `channel_count` or lowering `channel_width_hz`'s min is the fix.
-
-    A box whose *widest* window overflows is not fatal - those draws have their
-    channels narrowed towards the floor to fit - but it does mean the top of
-    the configured width range is never searched, and a silently capped search
-    reads as one that covered its whole box, so it says so.
+    `channel_width_hz`'s min and max are both hard: every draw is sampled from
+    exactly that range and no draw is bent to fit a band. That only works if
+    the widest window the box can ask for fits somewhere, so a box that
+    overflows every band is a configuration error, and it is fatal here at
+    load rather than mid-run - a search cannot honour both the box and the
+    bands when they contradict each other, and quietly resolving that in
+    favour of either one hides which parameters were really searched.
     """
     by_name = {str(spec["name"]): spec for spec in specs}
     count, width = by_name.get("channel_count"), by_name.get("channel_width_hz")
     if not count or not width:
         return
     widest = max(float(band["max"]) - float(band["min"]) for band in load_receiver_bands())
-    floor_span = float(count["max"]) * float(width["min"])
-    if floor_span > widest:
-        raise SystemExit(
-            f"defaults.toml: {count['max']} channels at the minimum width of "
-            f"{float(width['min']) / 1e6:g} MHz span {floor_span / 1e6:g} MHz, wider than the "
-            f"widest receiver band ({widest / 1e6:g} MHz), so no start frequency can hold them. "
-            f"Lower channel_count's max (to {int(widest // float(width['min']))}) or "
-            f"channel_width_hz's min."
-        )
     window = float(count["max"]) * float(width["max"])
     if window > widest:
-        print(
+        raise SystemExit(
             f"defaults.toml: {count['max']} channels of {float(width['max']) / 1e6:g} MHz span "
-            f"{window / 1e6:g} MHz, wider than the widest receiver band ({widest / 1e6:g} MHz). "
-            f"Channels are narrowed to fit, so at {count['max']} channels nothing above "
-            f"{widest / float(count['max']) / 1e6:g} MHz is ever searched.",
-            file=sys.stderr,
+            f"{window / 1e6:g} MHz, wider than the widest receiver band ({widest / 1e6:g} MHz), "
+            f"so no start frequency can hold them. Lower channel_count's max (to "
+            f"{int(widest // float(width['max']))}) or channel_width_hz's max (to "
+            f"{widest / float(count['max']) / 1e6:g} MHz)."
         )
 
 
 def placeable_start_ranges(window_hz: float) -> list[tuple[float, float]]:
     """Per band, the start frequencies a `window_hz`-wide window fits inside.
 
-    Bands too narrow to hold the window drop out, so a window wider than every
-    band would leave nothing - place_spectral_window() narrows the channels
-    instead of letting that happen.
+    Bands too narrow to hold the window drop out. At least one always survives:
+    check_channel_box_against_bands() has refused to load a parameter space
+    whose widest window overflows every band.
     """
     return [
         (float(band["min"]), float(band["max"]) - window_hz)
@@ -251,23 +232,24 @@ def placeable_start_ranges(window_hz: float) -> list[tuple[float, float]]:
     ]
 
 
-def place_spectral_window(cube_value: float, channel_count: int, channel_width_hz: float) -> tuple[float, float]:
+def place_spectral_window(cube_value: float, channel_count: int, channel_width_hz: float) -> float:
     """Map a unit-cube value onto a start frequency, with the window inside one band.
 
     Each band that can hold `channel_count` channels of `channel_width_hz` gets
     an equal share of the dimension; within a share the start frequency is
-    uniform over that band's placeable range. Returns the channel width too
-    because a window wider than the widest band is narrowed to fit rather than
-    placed outside one - down to the configured minimum width and no further,
-    which check_channel_box_against_bands() has already proved fits.
+    uniform over that band's placeable range. The window itself is taken as
+    given - the channel box is validated against the bands at load, so nothing
+    here has to bend a sampled width to make it fit.
     """
-    widest = max(float(band["max"]) - float(band["min"]) for band in load_receiver_bands())
-    width = max(channel_width_floor(), min(float(channel_width_hz), widest / channel_count))
-    ranges = placeable_start_ranges(channel_count * width)
+    ranges = placeable_start_ranges(channel_count * channel_width_hz)
+    if not ranges:
+        raise SystemExit(
+            f"{channel_count} channels of {channel_width_hz / 1e6:g} MHz fit no receiver band"
+        )
     position = min(1.0, max(0.0, cube_value)) * len(ranges)
     index = min(int(position), len(ranges) - 1)
     lower, upper = ranges[index]
-    return lower + (position - index) * (upper - lower), width
+    return lower + (position - index) * (upper - lower)
 
 
 def spectral_window_cube_value(start_frequency_hz: float, channel_count: int, channel_width_hz: float) -> float:
@@ -357,11 +339,11 @@ def cube_to_params(cube: np.ndarray) -> dict[str, Any]:
         if spec.get("kind") == "integer":
             value = int(round(value))
         raw[spec["name"]] = value
-    # The band-start dimension is placed last: where the window can start, and
-    # whether its channels have to be narrowed, both depend on how wide it is.
+    # The band-start dimension is placed last: where the window can start
+    # depends on how wide it is.
     for i, spec in enumerate(specs):
         if spec.get("kind") == "band_start":
-            raw[spec["name"]], raw["channel_width_hz"] = place_spectral_window(
+            raw[spec["name"]] = place_spectral_window(
                 float(cube[i]), raw["channel_count"], raw["channel_width_hz"]
             )
     raw["dynamic_range"] = 10.0 ** raw.pop("log10_dynamic_range")
@@ -1432,7 +1414,7 @@ def self_check_spectral_window() -> None:
     specs = load_parameter_space()
     index = next(i for i, spec in enumerate(specs) if spec.get("kind") == "band_start")
     rng = np.random.default_rng(0)
-    seen = set()
+    seen, widths = set(), []
     for _ in range(2000):
         cube = rng.random(len(specs))
         params = cube_to_params(cube)
@@ -1444,6 +1426,7 @@ def self_check_spectral_window() -> None:
         )
         assert band is not None, params
         seen.add(band["name"])
+        widths.append(params["channel_width_hz"])
         # theta -> cube -> params is the sampler's own round trip; it has to
         # land back on the same parameters (to floating-point), or the
         # likelihood would see different ones from those PolyChord stored.
@@ -1462,28 +1445,21 @@ def self_check_spectral_window() -> None:
     top = cube_to_params(edges)
     assert top["start_frequency_hz"] + top["channel_count"] * top["channel_width_hz"] == float(bands[-1]["max"])
 
-    # A window wider than every band is narrowed to fit rather than placed
-    # outside one - what stops a widened channel_width_hz from sampling
-    # frequencies the telescope cannot observe - but never below the
-    # configured minimum width, which is a hard floor.
-    widest = max(float(b["max"]) - float(b["min"]) for b in bands)
-    floor = channel_width_floor()
-    for count in (2, 4, 16):
-        start, width = place_spectral_window(0.0, count, widest * 2)
-        assert width >= floor, (count, width)
-        assert count * width <= widest, (count, width)
-        assert any(float(b["min"]) <= start and start + count * width <= float(b["max"]) for b in bands)
+    # channel_width_hz's min and max are both hard: no draw is bent to fit a
+    # band, so every width lands in the configured range exactly.
+    width_spec = next(spec for spec in specs if spec["name"] == "channel_width_hz")
+    assert min(widths) >= float(width_spec["min"]) and max(widths) <= float(width_spec["max"])
 
-    # A box whose narrowest channels cannot fit any band is a configuration
-    # error rather than a floor to break, and it is fatal at load, not mid-run.
+    # A box whose widest window fits no band is a configuration error rather
+    # than something to bend, and it is fatal at load, not mid-run.
     try:
         check_channel_box_against_bands(
-            [{"name": "channel_count", "min": 2, "max": 64}, {"name": "channel_width_hz", "min": 1.0e9, "max": 2.0e9}]
+            [{"name": "channel_count", "min": 2, "max": 64}, {"name": "channel_width_hz", "min": 0.5e6, "max": 1.0e9}]
         )
     except SystemExit as error:
         assert "no start frequency can hold them" in str(error), error
     else:
-        raise AssertionError("a box too wide even at its minimum width should not load")
+        raise AssertionError("a box whose widest window fits no band should not load")
 
 
 def self_check_r2d2_thread_env() -> None:
