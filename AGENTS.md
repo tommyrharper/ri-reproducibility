@@ -8,6 +8,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Nested-sampling infrastructure, run commands, and the per-stage profiler (`./ri profile <run>`) are documented in `docs/nested-sampling.md`; use those entrypoints instead of ad hoc container wiring.
 - The `polychord` and `meqtrees` images both bake in files from `scripts/lib/nested_sampling` at build time (no live mount); after editing those files, rebuild every image that copies them (`scripts/build.sh polychord`, `scripts/build.sh meqtrees`) before starting a nested-sampling run, or it silently runs the stale baked-in code. The exception is `r2d2_serve.py`, which the R2D2 sidecar runs off the repo bind mount, so it needs no rebuild. `polychord` copies the whole directory, `meqtrees` only the three simulate-side scripts (`simulate_point_source_ms.py`, `point_source_forest.py`, `ms_to_r2d2_mat.py`) - except that the `meqtrees` build also bind-mounts `common.py` to bake the MS skeleton cache, so a `PARAMETER_SPACE` change needs both images rebuilt.
 - `scripts/build.sh` hashes each image's build inputs into an `ri.build-inputs` label and skips `docker build` when nothing changed (~0.08s), so rebuilding freely is cheap; the input list lives in `build.sh` and must be updated whenever a Dockerfile starts copying something new.
+- Host `__pycache__` is excluded from both the context (root `.dockerignore`) and the build-input hash, so a `--self-check` does not force a rebuild.
 
 ## Maintaining this file
 

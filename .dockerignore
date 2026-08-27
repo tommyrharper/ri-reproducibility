@@ -1,0 +1,8 @@
+# Host-side bytecode caches. `python3 -m compileall -q scripts config` (the CI
+# check) and any local `import poc_common` write these under the directories
+# docker/polychord/Dockerfile COPYs, so without this every build context - and
+# every `ri.build-inputs` hash in scripts/build.sh - changes when they appear or
+# go away. The images compile their own .pyc with their own interpreter anyway
+# (see docker/polychord/Dockerfile).
+**/__pycache__
+**/*.pyc

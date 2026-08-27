@@ -1167,6 +1167,38 @@ does not cover either - `apt-get`/`pip` output drifting under a pinned base
 image, or a moved upstream git ref - so those still need `FORCE_BUILD=1` or a
 `docker rmi`, exactly as they previously needed `--no-cache`.
 
+##### Host `__pycache__` is not a build input
+
+The hash's one false positive was bytecode. `docker/polychord/Dockerfile` `COPY`s
+the whole of `scripts/lib/nested_sampling`, there was no `.dockerignore`, and
+anything that imports those modules on the host - the CI check `python3 -m
+compileall -q scripts config`, a `--self-check`, a local interpreter of a
+different version - writes a `__pycache__` next to them. Every appearance,
+disappearance or version change of those `.pyc` moved the `ri.build-inputs`
+hash, so `scripts/build.sh polychord` did a full 1.98-2.43s rebuild instead of a
+0.05s skip, and shipped host bytecode into an image that compiles its own with
+its own interpreter one `RUN` later.
+
+A root `.dockerignore` keeps `**/__pycache__` and `**/*.pyc` out of every build
+context, and `inputs_hash` prunes the same paths so the hash matches what the
+build can actually see. Note the `**/` - a bare `__pycache__/` in a
+`.dockerignore` matches only a *top-level* directory and silently lets the
+nested ones through.
+
+Blocked A/B of `make nested-sampling-r2d2-poc`, alternating "delete
+`__pycache__`" and "run `compileall`" between runs, which is what a CI check or a
+self-check does to a working tree:
+
+| | run 1 (deleted) | run 2 (compiled) | run 3 (deleted) |
+|---|---:|---:|---:|
+| before | 3.19s | 5.34s | 4.57s |
+| after | 3.15s | 3.10s | 3.29s |
+
+Interleaving is invalid here for the same reason it was in the section above -
+each arm rewrites the label the other arm reads - so these are blocks, and run 1
+of the "before" block skips only because a tree with no `__pycache__` happens to
+hash the same both ways. `log(Z) = 99.92878 +/- 0.06674` in all six runs.
+
 #### Where the remaining R2D2 wall clock is, and why it is a floor
 
 Stage timestamps from inside `polychord_r2d2_poc.py` on a 4.55s end-to-end run
