@@ -37,7 +37,10 @@
 # Axes subclasses it builds one at a time, resolves a labelled column straight
 # to the one of anesthetic's four candidate lookups that always wins, caches
 # matplotlib's per-Axes axis map and its per-class kwarg alias maps, and hands
-# savefig a pre-measured tight bbox so it skips its own extra layout pass - see
+# savefig a pre-measured tight bbox so it skips its own extra layout pass. The
+# report is a batch process that exits when it is done, so it runs with the
+# cyclic garbage collector disabled - matplotlib's reference cycles keep it
+# busy for 9% of the build and refcounting frees the same objects anyway - see
 # docs/nested-sampling.md.
 set -euo pipefail
 

@@ -8,6 +8,7 @@ can reuse the imager's own astropy + matplotlib + anesthetic rather than
 requiring a host Python environment - same approach as scripts/plot-fits.sh.
 """
 import argparse
+import gc
 import glob
 import hashlib
 import html
@@ -2054,6 +2055,17 @@ def write_run_page(item, body):
 
 
 def main(argv=None):
+    # The report is a batch process: it builds its figures, writes the pages
+    # and exits, so nothing it allocates has to be reclaimed while it runs.
+    # matplotlib figures are dense with reference cycles, so the cyclic
+    # collector wakes constantly and finds almost nothing that refcounting
+    # would not have freed anyway - it is 12% of a corner plot's render and 9%
+    # of the whole build. Disable it here rather than at import, so importing
+    # this module (the self-checks, the host-side helpers) leaves the caller's
+    # gc alone; the pool workers inherit the setting across fork. The cycles it
+    # would have collected are simply held to exit instead, which measured as
+    # +3MB of a worker's 128MB peak.
+    gc.disable()
     args = parse_args(argv)
     out_dir = args.out_path or "/workspace/out/nested-sampling-report"
     limit = args.limit

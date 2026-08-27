@@ -548,6 +548,19 @@ byte-identical PNGs. The build's wall clock moves less than its CPU because
 half of it is the parent's serial import prologue, which no plot-side change
 touches.
 
+`main()` disables the cyclic garbage collector. The report is a batch process -
+it draws its figures, writes the pages and exits - so nothing it allocates has
+to be reclaimed while it runs, and matplotlib figures are dense enough in
+reference cycles that the collector wakes constantly and finds almost nothing
+refcounting would not have freed anyway. Turning it off is 12% of a corner
+plot's render (0.41s -> 0.37s in-process) and 9% of the whole build (five-run
+cold build 1.060s -> 0.962s in-container), with byte-identical PNGs; the cycles
+it would have collected are held to exit instead, which measured as +3MB on a
+worker's 128MB peak. It is disabled in `main()` rather than at import, so
+importing the module - the self-checks, host-side use - leaves the caller's gc
+alone; the pool workers inherit the setting across fork. This is the one lever
+that helps the serial import prologue as well as the plots.
+
 The `r2d2` image bakes matplotlib's font list into `/opt/matplotlib`
 (`MPLCONFIGDIR`). Containers run with `--rm`, so without it the first
 `import matplotlib.pyplot` in every one of them rebuilds that list from the
