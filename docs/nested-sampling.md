@@ -374,7 +374,13 @@ The container is given a single BLAS thread
 BLAS only oversubscribes the CPU). Override with `R2D2_OMP_THREADS=`. It also
 runs with `--network none`: the report only reads the repo and writes
 `reports/`, and setting up the container's network is ~0.3s of every
-invocation - most of the cost of a build that draws nothing.
+invocation - most of the cost of a build that draws nothing. The container is
+removed from an `EXIT` trap rather than by `docker run --rm`, which blocks the
+CLI for another ~0.12s tearing the rootfs down after the report has already
+been written to the bind mount: five-run cold build 1.75s -> 1.63s on the host
+and a rebuild that draws nothing 0.55s -> 0.48s, with byte-identical output.
+The trap also fires on the failure paths, so a container is removed whether the
+report succeeded or not.
 
 The corner plot itself is the build's longest task, and roughly a fifth of it
 was pandas repeating work. anesthetic draws the grid as 15 separate pandas plot
