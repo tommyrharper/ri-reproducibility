@@ -31,14 +31,16 @@ BUILD_INPUTS_LABEL="ri.build-inputs"
 # Directories are walked. Names go into the hash as well as contents, so that
 # renaming a file inside a COPYed directory is a rebuild. <flavour> carries the
 # platform and any build args - same files, different flags, different image.
+# `__pycache__` is pruned to match `.dockerignore`: those files never reach a
+# build context, so they must not invalidate a hash either.
 # Usage: inputs_hash <flavour> <path...>
 inputs_hash() {
   local flavour="$1"
   shift
   {
     printf '%s\n' "${flavour}"
-    find "$@" -type f -print | LC_ALL=C sort
-    find "$@" -type f -print0 | LC_ALL=C sort -z | xargs -0 cat
+    find "$@" -name '__pycache__' -prune -o -type f -print | LC_ALL=C sort
+    find "$@" -name '__pycache__' -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 cat
   } | sha256sum | cut -d' ' -f1
 }
 

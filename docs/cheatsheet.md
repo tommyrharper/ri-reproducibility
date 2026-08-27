@@ -35,6 +35,8 @@ platform + build args) hash to what the existing image's `ri.build-inputs`
 label already says is skipped: ~0.08s instead of ~2s. `FORCE_BUILD=1` builds
 anyway, for the drift Docker's layer cache does not see either (`apt-get`/`pip`
 output under a pinned base image, a moved upstream git ref).
+`.dockerignore` keeps host `__pycache__` out of both the context and the hash,
+so a `compileall` or a `--self-check` does not force a rebuild.
 
 ```bash
 # CPU-native WSClean for benchmarking on THIS machine -> tag :native
