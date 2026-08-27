@@ -163,6 +163,12 @@ check(
 )
 
 check(
+    "self-check reaches the r2d2 imaging worker's own set",
+    [["scripts/self-check.sh", "r2d2-serve"]],
+    plan("self-check", "r2d2-serve")[1],
+)
+
+check(
     "smoke with no target runs both imagers",
     [["scripts/smoke-test-wsclean.sh"], ["scripts/smoke-test-r2d2.sh"]],
     plan("smoke")[1],
