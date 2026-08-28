@@ -374,7 +374,7 @@ def _parse_sidecars(out: str) -> list[dict[str, object]]:
 
 
 def meminfo_mb(key: str) -> int | None:
-    """One /proc/meminfo field in MB, or None off Linux.
+    """One /proc/meminfo field in MB, its macOS equivalent, or None elsewhere.
 
     scripts/lib/rank-budget.sh is the authority on what a run may take;
     `MemAvailable` here only reports the number its decision will be made from.
@@ -384,8 +384,62 @@ def meminfo_mb(key: str) -> int | None:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith(f"{key}:"):
                 return int(line.split()[1]) // 1024
-    except (OSError, ValueError, IndexError):
+    except OSError:
+        return _meminfo_mb_macos(key) if sys.platform == "darwin" else None
+    except (ValueError, IndexError):
         return None
+    return None
+
+
+def _sysctl(name: str) -> str | None:
+    try:
+        return subprocess.run(["sysctl", "-n", name], capture_output=True,
+                               text=True, check=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _vm_stat_pages() -> dict[str, int] | None:
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                              check=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pages = {}
+    for line in out.splitlines():
+        name, sep, rest = line.partition(":")
+        digits = rest.strip().rstrip(".")
+        if sep and digits.isdigit():
+            pages[name.strip()] = int(digits)
+    return pages
+
+
+def _meminfo_mb_macos(key: str) -> int | None:
+    """`meminfo_mb`'s four keys, read from `sysctl` and `vm_stat` instead.
+
+    macOS has no MemAvailable of its own; free + inactive + speculative pages
+    is the same reclaimable-without-paging estimate Activity Monitor's "Memory
+    Used" figure is built from, and the one rank-budget.sh's headroom check
+    needs to mean the same thing on both platforms.
+    """
+    if key == "MemTotal":
+        total = _sysctl("hw.memsize")
+        return int(total) // 1024 // 1024 if total and total.isdigit() else None
+    if key == "MemAvailable":
+        pages, page_size = _vm_stat_pages(), _sysctl("hw.pagesize")
+        if not pages or not page_size or not page_size.isdigit():
+            return None
+        free_pages = sum(pages.get(k, 0) for k in
+                          ("Pages free", "Pages inactive", "Pages speculative"))
+        return free_pages * int(page_size) // 1024 // 1024
+    if key in ("SwapTotal", "SwapFree"):
+        usage = _sysctl("vm.swapusage")
+        match = usage and re.search(
+            rf"{'total' if key == 'SwapTotal' else 'free'}\s*=\s*([\d.]+)([MG])", usage)
+        if not match:
+            return None
+        value, unit = float(match.group(1)), match.group(2)
+        return int(value * 1024) if unit == "G" else int(value)
     return None
 
 
