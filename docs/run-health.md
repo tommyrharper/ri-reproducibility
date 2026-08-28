@@ -60,8 +60,11 @@ under this checkout, so warnings about a foreign run give it a path.
 machine-readable form.
 
 It reads files and runs one `ps` and one `docker ps`, plus a one second CPU
-sample when a run has live ranks. Nothing is started and nothing is imaged, so
-a live run does not notice it. Exit status is 1 when something needs attention.
+sample when a run has live ranks. A run whose ranks fork inside their own
+container's PID namespace - invisible to that `ps`, the ordinary case under
+Docker Desktop - costs one `docker top` and its own five-second sample instead.
+Nothing is started and nothing is imaged, so a live run does not notice it.
+Exit status is 1 when something needs attention.
 
 ## Status
 
