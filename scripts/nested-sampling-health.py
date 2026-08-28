@@ -35,9 +35,12 @@ Four things it checks, each one a way a run has actually gone wrong here:
 
 * **Where the time goes.** A falling evaluation rate is either a slower imager
   or idle ranks, and the rate alone cannot tell them apart. `imaging` reports
-  the imager's own wall clock per evaluation and, against the gaps between
-  them, how much of the run's hardware that cost is actually keeping busy - the
-  only place here where memory a run holds but is not using is visible.
+  the imager's own wall clock per evaluation and, against the wall clock the
+  run has spent, how much of its hardware that cost is actually keeping busy -
+  the only place here where memory a run holds but is not using is visible.
+  `occupancy` is that same duty cycle binned over the run's life, which is what
+  separates hardware that has been earning its keep all along from hardware
+  that happens to be busy at the moment it was asked.
 
 * **Cost, again, in memory and cores.** Memory is what caps a run here, so
   what the run holds is reported next to what the host has left - over every
@@ -334,23 +337,15 @@ def stage(run_dir: Path) -> str:
     return "starting up"
 
 
-def history(times: list[float]) -> dict[str, object] | None:
-    """The shape of the run's throughput over its own life, as one line of text.
-
-    The two medians already reported say how fast the run is going now against
-    how fast it has gone; neither can show the shape, and the shape is the
-    thing a reader actually wants. A dip that recovered, a step down that did
-    not, and a steady run all produce the same pair of numbers on the way past
-    each other - the observed collapse-and-recovery here (104, 23, 26, 93
-    against a 104-165 baseline) reads as an ordinary slowdown from the medians
-    alone and as an obvious V from twenty slices.
+def _bucket(times: list[float],
+            values: list[float]) -> tuple[list[float], float] | None:
+    """Sum `values` into HISTORY_BUCKETS even slices of [first, last].
 
     Binned over [first evaluation, last evaluation] rather than up to now, so
     every slice is a full one. A slice ending at the present moment is partial
     by definition and reads low by exactly the fraction of it that has not
     happened yet, which is indistinguishable from a real collapse - the same
-    trap the gap-based rate above exists to avoid. How long ago the last
-    evaluation landed is the activity line's job, not this one's.
+    trap the gap-based rate elsewhere exists to avoid.
 
     None below two evaluations a slice, where the counts are too small to be a
     shape rather than noise, and below a second a slice, where the slice rates
@@ -362,9 +357,31 @@ def history(times: list[float]) -> dict[str, object] | None:
     if span < HISTORY_BUCKETS * MIN_RATE_SPAN_SECONDS:
         return None
     width = span / HISTORY_BUCKETS
-    counts = [0] * HISTORY_BUCKETS
-    for when in times:
-        counts[min(HISTORY_BUCKETS - 1, int((when - times[0]) / width))] += 1
+    sums = [0.0] * HISTORY_BUCKETS
+    for when, value in zip(times, values):
+        sums[min(HISTORY_BUCKETS - 1, int((when - times[0]) / width))] += value
+    return sums, width
+
+
+def history(times: list[float]) -> dict[str, object] | None:
+    """The shape of the run's throughput over its own life, as one line of text.
+
+    The two medians already reported say how fast the run is going now against
+    how fast it has gone; neither can show the shape, and the shape is the
+    thing a reader actually wants. A dip that recovered, a step down that did
+    not, and a steady run all produce the same pair of numbers on the way past
+    each other - the observed collapse-and-recovery here (104, 23, 26, 93
+    against a 104-165 baseline) reads as an ordinary slowdown from the medians
+    alone and as an obvious V from twenty slices.
+
+    Slicing, and the reasons for it, are in `_bucket`. How long ago the last
+    evaluation landed is the activity line's job, not this one's.
+    """
+    binned = _bucket(times, [1.0] * len(times))
+    if binned is None:
+        return None
+    sums, width = binned
+    counts = [int(c) for c in sums]  # _bucket sums floats; these are tallies
     peak = max(counts)
     return {
         # Scaled to the run's own peak: this answers "what changed", and an
@@ -374,6 +391,51 @@ def history(times: list[float]) -> dict[str, object] | None:
                        for c in counts),
         "low_per_minute": min(counts) * 60 / width,
         "high_per_minute": peak * 60 / width,
+        "bucket_seconds": width,
+    }
+
+
+def occupancy(times: list[float], costs: list[float | None],
+              procs: int) -> dict[str, object] | None:
+    """The shape of the run's rank utilisation over its own life.
+
+    `imaging` says what fraction of the ranks the cost of an evaluation is
+    keeping busy right now; `history` says how the arrival rate has moved.
+    Neither answers the question a shared host actually raises, which is
+    whether the memory this run is holding has been earning its keep all along
+    - and the two cannot be read off each other, because the imager's own cost
+    drifts as the search concentrates. The live R2D2 search here got twice as
+    fast per evaluation while its arrival rate fell fivefold, so `history`
+    showed a collapse over a period the ranks were merely idle for.
+
+    Per slice: imaging seconds landed, over the rank-seconds the slice had to
+    spend. A duty cycle, so unlike `history` the scale is absolute - a full bar
+    is every rank imaging, and a run whose bar never leaves the floor is one
+    that should have been given fewer ranks or a larger `--nlive`.
+
+    Summed rather than taken from medians, because a duty cycle is a total over
+    an interval; evaluations with no recorded cost are simply not counted, so a
+    run whose imager never wrote `wall_seconds` gets no line rather than a
+    misleadingly empty one.
+    """
+    if procs <= 0 or not any(c is not None for c in costs):
+        return None
+    binned = _bucket(times, [c or 0.0 for c in costs])
+    if binned is None:
+        return None
+    seconds, width = binned
+    # Clamped for the same reason the `imaging` line clamps: an evaluation is
+    # attributed to the slice it *finished* in while its cost was spent partly
+    # in the one before, so a slice can bank more imaging seconds than it had.
+    fractions = [min(s / (width * procs), 1.0) for s in seconds]
+    return {
+        "bar": "".join(HISTORY_EMPTY if f == 0 else
+                       HISTORY_LEVELS[min(int(f * len(HISTORY_LEVELS)),
+                                          len(HISTORY_LEVELS) - 1)]
+                       for f in fractions),
+        "low_fraction": min(fractions),
+        "high_fraction": max(fractions),
+        "ranks": procs,
         "bucket_seconds": width,
     }
 
@@ -411,7 +473,7 @@ def free_bytes(path: Path) -> tuple[int, int] | None:
     return fs.f_bavail * fs.f_frsize, fs.f_blocks * fs.f_frsize
 
 
-def evaluation_scan(run_dir: Path) -> dict[str, object]:
+def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
     """Counts, timings and failures, in one pass over evaluations/.
 
     The stat and the read are the same pass because the interesting things -
@@ -492,34 +554,42 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     # What one evaluation costs the imager, against how fast evaluations are
     # arriving. The arrival rate alone cannot separate "the imager got slower"
     # from "the ranks are idle": both read as a smaller rate. The imager's own
-    # wall clock separates them, and their ratio - imaging seconds per
-    # inter-arrival second - is how many ranks the run is actually keeping
-    # busy, which is the number that says whether the memory it is holding is
-    # being used.
+    # wall clock separates them, and the imaging seconds banked per second of
+    # wall clock is how many ranks the run is actually keeping busy, which is
+    # the number that says whether the memory it is holding is being used.
     #
-    # Medians throughout, and paired with the gap medians over the same window,
-    # because evaluation cost genuinely varies with the parameters drawn and a
-    # nested-sampling run concentrates: the live R2D2 search here ran at a
-    # 25.4s median over its life and 12.2s over its last 50, with no fault.
+    # The cost is a median, because evaluation cost genuinely varies with the
+    # parameters drawn and a nested-sampling run concentrates: the live R2D2
+    # search here ran at a 25.4s median over its life and 12.2s over its last
+    # 50, with no fault.
     def _cost(rows: list) -> float | None:
         seen = [w for _, _, _, w in rows if w is not None]
         return statistics.median(seen) if seen else None
 
+    # The occupancy is a total, not a ratio of the two medians. A duty cycle is
+    # by definition seconds worked over seconds elapsed, and the median gap is
+    # shorter than the mean whenever a run stalls at all, so the ratio of
+    # medians reads systematically high - the live R2D2 search here printed a
+    # clamped "100% busy" over a life its own slices put at 6-92%. Two figures
+    # in one report disagreeing about the same thing is worse than either.
     #
     # Gated on the same span floor as the rate, and for the same reason: a run
     # killed inside its opening parallel batch has every evaluation landing in
-    # the same millisecond, so the gap median is zero or near it and the ratio
-    # is a division by noise rather than an occupancy.
+    # the same millisecond, so the elapsed time is mtime granularity and the
+    # ratio is a division by noise rather than an occupancy.
+    def _duty(rows: list) -> float | None:
+        if len(rows) < 2:
+            return None
+        elapsed = rows[-1][0] - rows[0][0]
+        if elapsed < MIN_RATE_SPAN_SECONDS:
+            return None
+        return sum(w for _, _, _, w in rows if w is not None) / elapsed
+
     cost, recent_cost = _cost(records), None
-    busy_ranks, recent_busy_ranks = None, None
-    trustworthy = span >= MIN_RATE_SPAN_SECONDS
-    if cost is not None and trustworthy and gaps and statistics.median(gaps) > 0:
-        busy_ranks = cost / statistics.median(gaps)
-    if trustworthy and len(gaps) >= 2 * RATE_WINDOW:
+    busy_ranks, recent_busy_ranks = _duty(records), None
+    if span >= MIN_RATE_SPAN_SECONDS and len(gaps) >= 2 * RATE_WINDOW:
         recent_cost = _cost(records[-RATE_WINDOW:])
-        window = statistics.median(gaps[-RATE_WINDOW:])
-        if recent_cost is not None and window > 0:
-            recent_busy_ranks = recent_cost / window
+        recent_busy_ranks = _duty(records[-RATE_WINDOW:])
 
     # Spread over the run's life rather than taken from its tail. An
     # evaluation's size follows its parameters, and a nested-sampling run
@@ -552,6 +622,7 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "disk_bytes_per_hour": (per_evaluation * rate * 60
                                 if per_evaluation and rate else None),
         "history": history(times),
+        "occupancy": occupancy(times, [w for _, _, _, w in records], procs),
         "slowdown_factor": slowdown,
         "stall_threshold_seconds": threshold,
         "stall_count": len(stalls),
@@ -869,7 +940,7 @@ def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> in
 def describe(run_dir: Path, processes: list[dict[str, object]],
              stale_seconds: float, busy: dict[int, float] | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
-    scan = evaluation_scan(run_dir)
+    scan = evaluation_scan(run_dir, _setting(run_env, "NS_MPI_PROCS") or 0)
     owned = run_processes(run_dir, processes)
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
     spinning = spinning_ranks(ranks, busy or {})
@@ -1148,10 +1219,10 @@ def render(run: dict[str, object]) -> None:
     # using shows up as such.
     cost = run["seconds_per_evaluation"]
     if cost is not None:
-        # As a percentage of the ranks the run was given, clamped: the imaging
-        # median and the inter-arrival median are independent statistics over
-        # sets that only mostly coincide, so a fully loaded run reads a few
-        # percent either side of 100 and the raw ratio would print "23 of 16".
+        # As a percentage of the ranks the run was given, clamped: an
+        # evaluation is banked at the moment it finished while its cost was
+        # spent before that, so a window can hold more imaging seconds than it
+        # had rank-seconds to spend and the raw ratio would print "23 of 16".
         procs = settings.get("NS_MPI_PROCS") or (str(run["ranks"]) or "")
         def _busy(value: object) -> str:
             if value is None or not str(procs).isdigit() or int(procs) <= 0:
@@ -1167,6 +1238,18 @@ def render(run: dict[str, object]) -> None:
                        f"{_busy(run['recent_busy_ranks']).replace(' ranks', '')})")
         lines.append(("imaging", f"{float(cost):.1f}s per evaluation"
                                  + _busy(run["busy_ranks"]) + changed))
+    # ...and that occupancy as a shape, which is the one line here that says
+    # whether the hardware the run is holding has been earning its keep all
+    # along or only at the moment it was asked. Absolute scale, unlike
+    # `history` above: a full bar is every rank imaging.
+    used = run["occupancy"]
+    if used:
+        assert isinstance(used, dict)
+        lines.append(("occupancy",
+                      (f"{used['bar']}  {float(used['low_fraction']):.0%}-"
+                       f"{float(used['high_fraction']):.0%} of "
+                       f"{used['ranks']} ranks busy per "
+                       f"{format_hms(float(used['bucket_seconds']))} slice")))
     # What the search has actually found, and what each dead point cost it.
     # Every other line here is operational; this one is the result, and the
     # calls-per-dead-point is the sampler's own efficiency - the thing an
@@ -1758,16 +1841,41 @@ def self_check() -> None:
             serial = describe(idle, [], DEFAULT_STALE_SECONDS)
             assert float(serial["seconds_per_evaluation"]) == 20.0, serial
             assert float(serial["recent_seconds_per_evaluation"]) == 5.0, serial
-            assert abs(float(serial["busy_ranks"]) - 10) < 0.1, serial
-            assert abs(float(serial["recent_busy_ranks"]) - 0.5) < 0.05, serial
-            # 20s of imaging per 2s of wall clock is 125% of 8 ranks: the cost
-            # median and the gap median are independent statistics over sets
-            # that only mostly coincide, so a fully loaded run reads either
-            # side of full and the printed figure is clamped where the raw one
-            # is not.
-            occupancy = io_capture(serial)
-            assert "20.0s per evaluation, ranks 100% busy" in occupancy, occupancy
-            assert "(last 50: 5.0s, 6% busy)" in occupancy, occupancy
+            # 3281 imaging seconds banked over 898 of wall clock is 3.65 of the
+            # 8 ranks kept busy across a life that was full for its first third
+            # and idle after; the last 50 evaluations are all in the idle phase
+            # at 250s over 490, half a rank. A ratio of the two medians would
+            # have said 125% and 50% - see _duty.
+            assert abs(float(serial["busy_ranks"]) - 3.654) < 0.01, serial
+            assert abs(float(serial["recent_busy_ranks"]) - 0.510) < 0.01, serial
+            rendered_idle = io_capture(serial)
+            assert "20.0s per evaluation, ranks 46% busy" in rendered_idle, rendered_idle
+            assert "(last 50: 5.0s, 6% busy)" in rendered_idle, rendered_idle
+            # The same run as a shape. Its slices are 44.9s, so an early one
+            # banks 22 evaluations at 20s - more imaging seconds than 8 ranks
+            # had to spend, hence the clamp - and a late one banks 4 at 5s.
+            used = serial["occupancy"]
+            assert used is not None, serial
+            assert used["bar"][0] == HISTORY_LEVELS[-1], used
+            assert used["bar"][-1] == HISTORY_LEVELS[0], used
+            assert abs(float(used["high_fraction"]) - 1.0) < 0.01, used
+            assert abs(float(used["low_fraction"]) - 0.0625) < 0.01, used
+            assert "6%-100% of 8 ranks busy per 0:00:44 slice" in rendered_idle, rendered_idle
+            # Absolute scale, unlike `history` above: a run that spent its
+            # whole life at half occupancy must draw half-height bars, not the
+            # full ones a peak-relative scale would give it.
+            half = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T025700Z"
+            (half / "chains").mkdir(parents=True)
+            (half / "run.env").write_text("NS_MPI_PROCS=8\n")
+            for i in range(200):
+                write_eval(half, i + 1, now - 3600 + i * 2, wall_seconds=8.0)
+            steady = describe(half, [], DEFAULT_STALE_SECONDS)["occupancy"]
+            assert set(steady["bar"]) == {HISTORY_LEVELS[4]}, steady
+            assert abs(float(steady["high_fraction"]) - 0.5) < 0.01, steady
+            # A run whose rank count is not recorded has no denominator, so it
+            # gets no shape rather than one drawn against a guess.
+            (half / "run.env").write_text("")
+            assert describe(half, [], DEFAULT_STALE_SECONDS)["occupancy"] is None
 
             # A run whose evaluations all landed in the same millisecond has no
             # occupancy to report, for the same reason it has no rate: the gap

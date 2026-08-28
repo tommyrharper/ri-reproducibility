@@ -307,7 +307,8 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
-  imaging   25.4s per evaluation, ranks 100% busy  (last 50: 12.3s, 6% busy)
+  imaging   25.4s per evaluation, ranks 66% busy  (last 50: 12.3s, 6% busy)
+  occupancy ▇▆▆▇▇▂▆▆▇▆▆▆▇▆█▆▇▂▁▆  6%-88% of 16 ranks busy per 0:07:29 slice
   sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
   forecast  ~38% done, ~454 dead points total, ~4h54m left
   ranks     16 ranks of 16, 7 busy-waiting
@@ -420,24 +421,44 @@ What each line is reading, and why it is worth a line:
   evaluations a minute. `metrics.json` carries the imager's own wall clock, and
   this scan already reads every one of those files in full, so the median costs
   a regex over a string already in memory and no extra I/O.
-  Beside it, that median divided by the median gap between evaluations, as a
-  percentage of the ranks the run was given: 25.4s of imaging per 1.5s of wall
-  clock is sixteen ranks kept busy, which is all sixteen. It is the only place
-  in the report where memory a run is *holding but not using* shows up as such.
+  Beside it, the imaging seconds the run has banked per second of wall clock,
+  as a percentage of the ranks it was given: 3,281 seconds of imaging over 898
+  of wall clock is 3.7 of 8 ranks kept busy. It is the only place in the report
+  where memory a run is *holding but not using* shows up as such.
+  A total over the window rather than the ratio of the two medians, which is
+  what this was first written as and read systematically high - a duty cycle is
+  seconds worked over seconds elapsed, and the median gap is shorter than the
+  mean the moment a run stalls at all, so the live R2D2 search printed a
+  clamped "100% busy" over a life its own slices put at 6-88%. Two figures in
+  one report disagreeing about the same thing is worse than either.
   Both are shown over the last 50 evaluations too when either has moved
   materially - which is how the live R2D2 search's 5-fold slowdown was
-  diagnosed: 25.4s at 100% over its life against 12.3s at 6% over its last 50,
+  diagnosed: 25.4s at 66% over its life against 12.3s at 6% over its last 50,
   so the imager had got twice as *fast* while fifteen of its sixteen ranks -
   and the ~44GB they hold - went idle waiting on the sampler.
-  Clamped at 100%: the cost median and the gap median are independent
-  statistics over sets that only mostly coincide, so a fully loaded run reads
-  either side of full and the raw ratio would print "23 of 16".
+  Clamped at 100%: an evaluation is banked at the moment it finished while its
+  cost was spent before that, so a window can hold more imaging seconds than it
+  had rank-seconds to spend and the raw ratio would print "23 of 16".
   Reported, never warned on. Every WSClean run on this host ends its last 50
   evaluations near 23% simply by shutting down, and the live R2D2 run's own
   twenty slices ranged 4.4 to 23.1 effective ranks with no fault - there is no
   threshold here that would not mostly fire on ordinary phases. Withheld
-  entirely below the same one-second span floor as the rate, where the gap
-  median is zero and the ratio is a division by noise.
+  entirely below the same one-second span floor as the rate, where the elapsed
+  time is mtime granularity and the ratio is a division by noise.
+- **occupancy** - that same duty cycle binned into the twenty slices
+  **history** uses, which is the only line here that says whether the hardware
+  a run is holding has been earning its keep *all along* or only at the moment
+  it was asked. **history** cannot answer that: the imager's own cost drifts as
+  the search concentrates, so the live R2D2 run got twice as fast per
+  evaluation while its arrival rate fell fivefold, and **history** drew a
+  collapse over a stretch the ranks were merely idle for.
+  Per slice: imaging seconds landed, over the rank-seconds the slice had to
+  spend. The scale is absolute rather than **history**'s peak-relative one,
+  because a duty cycle has a natural full - a solid bar is every rank imaging,
+  and a bar that never leaves the floor is a run that should have been given
+  fewer ranks or a larger `--nlive`. Free: the costs and the slicing are both
+  already computed for the two lines above. Withheld when `run.env` does not
+  record `NS_MPI_PROCS`, since without a rank count there is no denominator.
 - **sampler** - PolyChord's own running total, out of `chains/*.stats`, which
   it rewrites at every checkpoint. Every other line here is operational; this
   is the number the search exists to produce, and `logZ` moving is the only
