@@ -38,7 +38,11 @@ Four things it checks, each one a way a run has actually gone wrong here:
   over. A resumed WSClean run did 64 evaluations in 17 seconds of work either
   side of a 4h16m stop; over wall clock that reads `0.2/min`, 0% occupancy and
   a stall costing 100% of the run. `history` and `occupancy` stay on wall clock
-  on purpose, because a stop is part of the shape they exist to show.
+  on purpose, because a stop is part of the shape they exist to show. The same
+  file answers what is *left* of the self-healing: `run_with_retries` stops
+  after `NS_RETRIES`, so a live run that has already spent them is one crash
+  from sitting there until someone types `./ri resume`, and the `restarts` line
+  says so while it is still running.
 
 * **Shape.** Every number above is one moment. `history` is the run's
   throughput binned over its own life, which is what separates a dip that
@@ -272,6 +276,13 @@ STALL_WATCHDOG_POLL_SECONDS = 60.0
 # +%Y-%m-%dT%H:%M:%SZ`, so it is truncated to whole seconds and names an
 # instant up to a second later than it reads.
 RESTART_STAMP_SECONDS = 1.0
+
+# `run_with_retries`' NS_RETRY_RESET_SECONDS default, from
+# scripts/lib/progress-bar.sh: an attempt that ran this long before dying hands
+# the retry budget back, so a long search is not out of restarts for the rest
+# of the week because it healed itself twice on day one. Not a `ri` flag and so
+# not recorded in run.env - the default is the only value any run here has had.
+RETRY_RESET_SECONDS = 1800.0
 
 # rank-budget.sh's NS_RANK_BUDGET_HEADROOM_MB. Reported, not enforced: it is
 # the line under which the next run will refuse to size itself.
@@ -961,21 +972,74 @@ def restarts(run_dir: Path) -> list[str]:
         return []
 
 
-def restart_times(run_dir: Path) -> list[float]:
-    """Epoch seconds of each restart, for the gap accounting to skip over.
+def restart_stamp(line: str) -> float | None:
+    """Epoch seconds of one restarts.log line, or None if it has no stamp.
 
     progress-bar.sh writes the line with `date -u`, so the stamp is UTC and
     has to be read as such - read as local time it would land hours away from
     the evaluation mtimes it is compared against and match no gap at all.
     """
-    stamps = []
-    for line in restarts(run_dir):
-        try:
-            when = time.strptime(line.split()[0], "%Y-%m-%dT%H:%M:%SZ")
-        except (ValueError, IndexError):
+    try:
+        return calendar.timegm(time.strptime(line.split()[0], "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, IndexError):
+        return None
+
+
+def restart_times(run_dir: Path) -> list[float]:
+    """Epoch seconds of each restart, for the gap accounting to skip over."""
+    return [when for when in map(restart_stamp, restarts(run_dir)) if when is not None]
+
+
+def restart_budget(run_dir: Path, retries: int | None,
+                   lines: list[str], now: float) -> dict[str, int] | None:
+    """How many self-healed restarts are left before the next crash is final.
+
+    `run_with_retries` stops retrying once it has spent `NS_RETRIES`, and then
+    the run simply sits there until a human types `./ri resume`. A search that
+    has already used its budget is therefore one crash from being over, and
+    nothing here said so: the `restarts` line reported what had happened and
+    never what was left, so the run that most needed watching looked exactly
+    like one that had healed and moved on.
+
+    Reconstructed from restarts.log rather than recorded, because the counter
+    lives in the retry loop's own shell and resets: an attempt that ran
+    RETRY_RESET_SECONDS before dying hands the budget back, and `./ri resume`
+    starts a fresh loop at zero. Each restart line is one increment of that
+    counter, so replaying the log with the same two rules gives the same
+    number. The one approximation is the first attempt's start, taken as
+    run.env's mtime - written when the run directory was claimed, which is
+    before the ranks start (minutes of it on an R2D2 search), so an attempt
+    that died just under the reset can read as one that cleared it.
+
+    None when run.env does not record NS_RETRIES: a budget nobody can name is
+    not one to report.
+    """
+    if retries is None:
+        return None
+    try:
+        boundary = (run_dir / "run.env").stat().st_mtime
+    except OSError:
+        return None
+    used = 0
+    for line in lines:
+        when = restart_stamp(line)
+        if when is None:
             continue
-        stamps.append(calendar.timegm(when))
-    return stamps
+        if " resumed " in line:
+            # `./ri resume` runs its own run_with_retries, which starts at
+            # attempt 0 whatever the restarts before it cost.
+            used, boundary = 0, when
+            continue
+        if when - boundary >= RETRY_RESET_SECONDS:
+            used = 0
+        used, boundary = used + 1, when
+    # The attempt now running earns the reset the moment it clears the window,
+    # not when it eventually dies - the loop checks elapsed time before the
+    # budget - so a run hours past its last restart has its whole budget back.
+    if now - boundary >= RETRY_RESET_SECONDS:
+        used = 0
+    return {"limit": retries, "used": min(used, retries),
+            "left": max(retries - used, 0)}
 
 
 def log_tail(run_dir: Path) -> dict[str, object] | None:
@@ -1634,6 +1698,12 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "forecast": forecast,
         "log_tail": tail,
         "restarts": restarted,
+        # Only for a run that can still crash: what a finished or stopped run
+        # had left is history, and a stopped run's "0 left" would read as the
+        # reason it stopped when the reason is in its run.log.
+        "restart_budget": (restart_budget(run_dir, _setting(run_env, "NS_RETRIES"),
+                                          restarted, time.time())
+                           if status in ("healthy", "stalled", "starting") else None),
         "warnings": warnings,
         **scan,
     }
@@ -2067,11 +2137,32 @@ def render(run: dict[str, object]) -> None:
     events = list(run["restarts"])
     healed = [e for e in events if " resumed " not in e]
     resumed = [e for e in events if " resumed " in e]
-    for label, kind, these in (("restarts", "self-healed restart", healed),
-                               ("resumes", "manual resume", resumed)):
+    # What is left of the budget, on the restarts line only: it bounds the
+    # self-healing, and a manual resume is unbounded by it. A run down to zero
+    # is one crash from sitting there until a human notices, which is the whole
+    # point of saying it while the run is still alive - but it is still fine
+    # right now, so it stays a report and never a warning.
+    budget = run.get("restart_budget")
+    budget_note = ""
+    if budget:
+        if not budget["left"]:
+            # No `./ri resume` command here: the crash has not happened, and
+            # the stopped warning prints the right one for this run when it
+            # does.
+            budget_note = (f"; {budget['used']} of {budget['limit']} used, so the next "
+                           "crash stops the run until someone resumes it")
+        elif not budget["used"]:
+            budget_note = (f"; {budget['left']} of {budget['limit']} left, the budget "
+                           "handed back by an attempt that has run over "
+                           f"{format_hms(RETRY_RESET_SECONDS)}")
+        else:
+            budget_note = f"; {budget['left']} of {budget['limit']} left"
+    for label, kind, these, note in (("restarts", "self-healed restart", healed,
+                                      budget_note),
+                                     ("resumes", "manual resume", resumed, "")):
         if these:
             lines.append((label, f"{len(these)} {kind}{'' if len(these) == 1 else 's'}, "
-                                 f"last {these[-1]}"))
+                                 f"last {these[-1]}{note}"))
     lines += [
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE"
                      + (f" ({run['recent_failed']} of the last {RATE_WINDOW})"
@@ -2995,6 +3086,99 @@ def self_check() -> None:
             assert ("restarts  2 self-healed restarts, last 2026-08-28T11:00:00Z "
                     "exit 1 after 91 dead points") in shown, shown
             (live / "restarts.log").unlink()
+
+            # What is left of that self-healing. `run_with_retries` stops after
+            # NS_RETRIES, so a run that has spent them is one crash from
+            # sitting there until a human types `./ri resume` - and the
+            # `restarts` line above says only what has already happened.
+            # Fixtures are relative to `now` because both rules that decide the
+            # answer are durations: the reset window, and how long the attempt
+            # running right now has lasted.
+            def budget_report(retries: str, entries: list[tuple[float, str]],
+                              age: float) -> str:
+                (live / "run.env").write_text(
+                    f"NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\nNS_NLIVE=4\n{retries}")
+                # The first attempt's start, which restart_budget takes from
+                # run.env's mtime.
+                os.utime(live / "run.env", (now - age, now - age))
+                (live / "restarts.log").write_text("".join(
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - ago))
+                    + f" {what}\n" for ago, what in entries))
+                return io_capture(describe(live, ranks, 5.0))
+
+            crash = "exit 1 after 40 evaluations"
+            # A run whose run.env predates NS_RETRIES being recorded: the
+            # budget is unknown, so the line says nothing about it rather than
+            # asserting the default the run may not have had.
+            def restarts_line(text: str) -> str:
+                return [line for line in text.splitlines()
+                        if line.strip().startswith("restarts ")][0]
+
+            silent = restarts_line(budget_report("", [(600, crash)], 1000))
+            assert "self-healed restart," in silent, silent
+            assert " left" not in silent and " used," not in silent, silent
+
+            # Two restarts against `--retries 2`, both inside the reset window:
+            # the budget is gone and the next crash is final.
+            spent = budget_report("NS_RETRIES=2\n", [(900, crash), (600, crash)], 1000)
+            assert ("2 of 2 used, so the next crash stops the run until someone "
+                    "resumes it") in spent, spent
+            # Still a report, not a warning - the run is fine at this instant,
+            # and warning would make `./ri health` exit nonzero for one that is.
+            assert not any("crash stops the run" in w
+                           for w in describe(live, ranks, 5.0)["warnings"])
+
+            half = budget_report("NS_RETRIES=2\n", [(600, crash)], 1000)
+            assert "; 1 of 2 left" in half, half
+            assert "next crash" not in half, half
+
+            # The attempt running now has already cleared the reset window, so
+            # the budget is back whatever the restart before it cost.
+            back = budget_report("NS_RETRIES=2\n", [(4000, crash)], 5000)
+            assert ("; 2 of 2 left, the budget handed back by an attempt that has "
+                    "run over 0:30:00") in back, back
+
+            # Three restarts and only one counted: the attempt between the
+            # second and the third ran past the reset window, which is exactly
+            # what keeps a multi-day search from running out of retries on the
+            # strength of a bad first hour.
+            long_lived = budget_report(
+                "NS_RETRIES=2\n", [(9500, crash), (5000, crash), (600, crash)], 10000)
+            assert "3 self-healed restarts" in long_lived, long_lived
+            assert "; 1 of 2 left" in long_lived, long_lived
+
+            # `./ri resume` starts a fresh retry loop, so the restarts before
+            # it are not charged against the budget of the one after it - and
+            # the budget belongs to the restarts line, not to the resumes line.
+            continued = budget_report("NS_RETRIES=2\n", [
+                (900, crash), (800, "resumed at 40 evaluations"), (600, crash)], 1000)
+            assert "; 1 of 2 left" in continued, continued
+            assert "resumes   1 manual resume" in continued, continued
+            assert "manual resume, last 2" in continued.replace(
+                "; 1 of 2 left", ""), continued
+            assert continued.count(" of 2 left") == 1, continued
+
+            # A line with no stamp is not a restart. Nothing writes one, but
+            # restarts.log is appended to by two scripts across a crash, and
+            # counting an unparseable line would spend a budget the run still
+            # has - the mirror of the corrupt metrics.json that used to end a
+            # search outright.
+            (live / "restarts.log").write_text(
+                "not a stamp at all\n"
+                + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 600))
+                + f" {crash}\n")
+            garbled = describe(live, ranks, 5.0)
+            assert garbled["restart_budget"]["used"] == 1, garbled["restart_budget"]
+            stamps = restart_times(live)
+            assert len(stamps) == 1 and abs(stamps[0] - (now - 600)) <= 1, stamps
+
+            # A run that has stopped or finished cannot spend the budget, and
+            # "0 left" there would read as the reason it stopped.
+            assert describe(live, [], 5.0)["restart_budget"] is None
+            assert describe(live, ranks, 5.0)["restart_budget"] is not None
+            (live / "restarts.log").unlink()
+            (live / "run.env").write_text(
+                "NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\nNS_NLIVE=4\n")
 
             # Same run, same files, no ranks: a stale mtime is only a stall
             # while something is still running.

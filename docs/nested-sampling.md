@@ -868,6 +868,24 @@ What each line is reading, and why it is worth a line:
   is healthy now, so warning would make `./ri health` exit nonzero for a run
   that is fine. It is still the line to read first on a run that looks slower
   than it should. See "A run that dies restarts itself".
+
+  For a run that is **still going** it also says what is left of the budget -
+  `; 1 of 2 left`, or `; 2 of 2 used, so the next crash stops the run until
+  someone resumes it`. That is the half the count alone cannot give: once
+  `run_with_retries` has spent `NS_RETRIES`, the next crash leaves the search
+  sitting there until a human types `./ri resume`, and until this line said so
+  a run one crash from that looked exactly like one that had healed and moved
+  on. Reconstructed from `restarts.log` rather than recorded, replaying the
+  same two rules the retry loop uses: an attempt that ran
+  `NS_RETRY_RESET_SECONDS` (1800) before dying hands the budget back, and a
+  `./ri resume` starts a fresh loop at zero - so a run whose current attempt
+  has already cleared that window reads `; 2 of 2 left, the budget handed back
+  by an attempt that has run over 0:30:00` however many restarts are in the
+  file. Silent when `run.env` does not record `NS_RETRIES`, and withheld from a
+  finished or stopped run, where "0 left" would read as the reason it stopped
+  when the reason is in its `run.log`. The first attempt's start is taken as
+  `run.env`'s mtime, which is the moment the run directory was claimed and so a
+  little before the ranks start.
 - **resumes** - the same file, the same stamp, and the other half of what is in
   it: a `./ri resume` someone typed, written by
   `scripts/resume-nested-sampling-run.sh` as `<stamp> resumed at N evaluations`
