@@ -332,8 +332,12 @@ with tempfile.TemporaryDirectory() as runs_dir:
         # A real path of that name still wins, so nothing that worked stops.
         check(f"{script} keeps a path that exists", elsewhere.resolve(),
               resolved(str(elsewhere)))
-        check(f"{script} leaves an unknown path alone", Path("/tmp/ri-no-such-run"),
-              resolved("/tmp/ri-no-such-run"))
+        # "alone" means not rewritten into NESTED_SAMPLING_DIR; each resolver
+        # still canonicalises it, and on macOS /tmp is itself a symlink to
+        # /private/tmp, so the expectation has to be resolved too.
+        unknown = "/tmp/ri-no-such-run"
+        check(f"{script} leaves an unknown path alone", Path(unknown).resolve(),
+              resolved(unknown))
 
 if failures:
     print(f"{len(failures)} check(s) failed", file=sys.stderr)
