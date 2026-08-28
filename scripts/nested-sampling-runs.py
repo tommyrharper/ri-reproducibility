@@ -90,6 +90,9 @@ def read_run_env(run_dir: Path) -> dict[str, str]:
     return values
 
 
+RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
+
+
 def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
@@ -119,7 +122,14 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
 def find_runs(running: set[str] | None = None) -> list[dict[str, object]]:
     if not NESTED_SAMPLING_DIR.is_dir():
         return []
-    runs = [d for d in NESTED_SAMPLING_DIR.iterdir() if d.is_dir()]
+    # A directory with none of these is not a run at all, and listing one as
+    # `incomplete` pairs it with a `./ri resume` that refuses it for having no
+    # run.env. `run.env` is written milliseconds after the run directory is
+    # claimed; the rest are for runs from before it existed and for the
+    # summary-only directories `./ri merge` writes. Same rule as
+    # `is_run_directory` in scripts/nested-sampling-health.py.
+    runs = [d for d in NESTED_SAMPLING_DIR.iterdir() if d.is_dir()
+            and any((d / artifact).exists() for artifact in RUN_ARTIFACTS)]
     runs.sort(key=lambda d: d.name, reverse=True)
     if running is None:
         running = running_run_dirs()
@@ -207,10 +217,36 @@ def self_check() -> None:
             assert runs[stopped.name]["settings"]["NS_MPI_PROCS"] == "7"
 
             # An interrupted run with no checkpoint is still reported, because
-            # being told it is there matters more than being able to continue it.
+            # being told it is there matters more than being able to continue
+            # it. It is a run because of the run.env written milliseconds
+            # after its directory was claimed, which is all a run that died
+            # before its first evaluation ever has.
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
             bare.mkdir()
+            (bare / "run.env").write_text("NS_ALGORITHM=r2d2\n")
             assert {r["name"]: r for r in find_runs(running=set())}[bare.name]["status"] == "incomplete"
+
+            # A directory with none of those is not a run, and listing it as
+            # `incomplete` paired it with a `./ri resume` that refuses it for
+            # having no run.env.
+            stray = NESTED_SAMPLING_DIR / "notes-20260103T000001Z"
+            stray.mkdir()
+            (stray / "scratch.txt").write_text("not a run\n")
+            assert stray.name not in {r["name"] for r in find_runs(running=set())}
+            # Any one artifact makes it one again - a legacy run predating
+            # run.env has evaluations, and `./ri merge` writes summary.json
+            # alone. Spelled out rather than looped over RUN_ARTIFACTS, which
+            # would make deleting an entry delete its own case.
+            for artifact in ("run.env", "run.log", "summary.json",
+                             "evaluations", "chains"):
+                target = stray / artifact
+                target.mkdir() if artifact in ("evaluations", "chains") \
+                    else target.write_text("")
+                assert stray.name in {r["name"] for r in find_runs(running=set())}, \
+                    artifact
+                target.rmdir() if target.is_dir() else target.unlink()
+            (stray / "scratch.txt").unlink()
+            stray.rmdir()
 
             # A run that is still going looks exactly like one that stopped,
             # right down to the checkpoint - so calling it `resumable` and

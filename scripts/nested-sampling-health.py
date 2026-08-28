@@ -2030,11 +2030,34 @@ def started_at(run_dir: Path) -> str:
     return match.group(1) if match else run_dir.name
 
 
+# What a nested-sampling run leaves in its directory, so that a directory
+# which is not one can be told apart from a run that stopped. Every other
+# reading here is the absence of something - no ranks, no evaluations, no
+# summary.json - which is exactly what an unrelated directory looks like, and
+# `./ri health results/nested-sampling` used to headline the runs directory
+# itself as a STOPPED run and offer `./ri resume` on it. `./ri resume` then
+# refuses it ("has no run.env"), so the report was advising a command that
+# cannot work.
+#
+# `run.env` is written milliseconds after the run directory is claimed
+# (write_run_config, scripts/lib/run-config.sh) and before anything can go
+# wrong, so any run started since it existed has one however early it died.
+# The rest are for the runs on this host that predate it, and for the
+# summary-only directories `./ri merge` writes.
+RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
+
+
+def is_run_directory(path: Path) -> bool:
+    """Whether anything in this directory says a nested-sampling run used it."""
+    return any((path / artifact).exists() for artifact in RUN_ARTIFACTS)
+
+
 def run_directories() -> list[Path]:
     """Every run on disk, newest first."""
     if not NESTED_SAMPLING_DIR.is_dir():
         return []
-    return sorted((d for d in NESTED_SAMPLING_DIR.iterdir() if d.is_dir()),
+    return sorted((d for d in NESTED_SAMPLING_DIR.iterdir()
+                   if d.is_dir() and is_run_directory(d)),
                   key=started_at, reverse=True)
 
 
@@ -2110,6 +2133,14 @@ def resolve(name: str | None,
                 if run.name == name:
                     return run
             raise SystemExit(f"No such run: {name}")
+        # A directory that is not a run is not a run that stopped. Only the
+        # filesystem candidate is asked: a run found in the process list is
+        # one by definition, whatever it has managed to write yet.
+        if not is_run_directory(candidate):
+            raise SystemExit(
+                f"Not a nested-sampling run: {candidate}\n"
+                f"       Nothing here that a run leaves behind "
+                f"({', '.join(RUN_ARTIFACTS)}). `./ri runs` lists the runs.")
         return candidate
     return default_directories(processes)[0]
 
@@ -3425,8 +3456,44 @@ def self_check() -> None:
             assert resolve(None).name == fast.name
             newest = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260104T000000Z"
             newest.mkdir()
+            # A run that died before its first evaluation still has the
+            # run.env written milliseconds after its directory was claimed,
+            # which is what makes it a run and not a stray directory.
+            (newest / "run.env").write_text("NS_ALGORITHM=r2d2\n")
             assert resolve(None).name == newest.name
             assert [d.name for d in run_directories()][0] == newest.name
+
+            # A directory that is not a run is not a run that stopped. Both
+            # the listing and the resolver used to take any directory: `./ri
+            # health results/nested-sampling` headlined the runs directory
+            # itself as STOPPED and offered `./ri resume` on it, which `./ri
+            # resume` refuses for having no run.env.
+            stray = NESTED_SAMPLING_DIR / "notes-20260104T000001Z"
+            stray.mkdir()
+            (stray / "scratch.txt").write_text("not a run\n")
+            assert not is_run_directory(stray)
+            assert stray not in run_directories(), run_directories()
+            assert resolve(None).name == newest.name, resolve(None).name
+            try:
+                resolve(str(stray))
+            except SystemExit as error:
+                assert "Not a nested-sampling run" in str(error), error
+            else:
+                assert False, "resolved a directory with nothing a run leaves"
+            # Any one of them is enough - a legacy run predating run.env has
+            # evaluations, and `./ri merge` writes summary.json alone. Spelled
+            # out rather than looped over RUN_ARTIFACTS, which would make
+            # deleting an entry delete its own case.
+            for artifact in ("run.env", "run.log", "summary.json",
+                             "evaluations", "chains"):
+                target = stray / artifact
+                target.mkdir() if artifact in ("evaluations", "chains") \
+                    else target.write_text("")
+                assert is_run_directory(stray), artifact
+                assert resolve(str(stray)) == stray, artifact
+                shutil.rmtree(target) if target.is_dir() else target.unlink()
+                assert not is_run_directory(stray), artifact
+            shutil.rmtree(stray)
             # But a run with ranks outranks every newer one that has none:
             # `live` is the oldest directory here and the only one running, and
             # it is the run the report exists to be about. `ranks` carry its
@@ -3480,7 +3547,10 @@ def self_check() -> None:
                 # ...and that bare name resolves back. The headline names a
                 # foreign run by its name alone, and `./ri health <that name>`
                 # used to answer "No such run" for the run `./ri health` had
-                # printed one line above.
+                # printed one line above. `foreign` is an empty directory, so
+                # this also pins that the not-a-run guard above is asked only
+                # of a filesystem candidate: a run in the process table is a
+                # run whatever it has managed to write yet.
                 assert resolve(foreign.name, abroad) == foreign
                 # Exactly that name: a prefix of it is not a match, and a name
                 # nothing is running is still an error rather than a guess.
@@ -3541,7 +3611,7 @@ def self_check() -> None:
             assert default_directories(gone) == [newest]
             # An explicit run still wins over both.
             assert resolve(fast.name, ranks).name == fast.name
-            newest.rmdir()
+            shutil.rmtree(newest)
 
             # And the whole thing renders and scores. Into a sink, because what
             # is checked is that both forms run and reach the right exit status,

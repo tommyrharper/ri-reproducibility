@@ -412,6 +412,19 @@ says nothing:
 | `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it. |
 | `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
 
+A directory with none of `run.env`, `run.log`, `summary.json`, `evaluations/`
+or `chains/` in it is not a run at all, and gets `Not a nested-sampling run`
+rather than a status. Every status above is decided by the absence of
+something - no ranks, no evaluations, no `summary.json` - which is exactly what
+an unrelated directory looks like, so `./ri health results/nested-sampling`
+used to headline the runs directory itself as `STOPPED` and offer
+`./ri resume` on it, a command `./ri resume` then refuses for having no
+`run.env`. `./ri runs` skips the same directories for the same reason.
+`run.env` is written milliseconds after a run directory is claimed, so a run
+that died before its first evaluation is still a run; the other four are for
+the runs here that predate `run.env` and for the summary-only directories
+`./ri merge` writes.
+
 **The headline carries the warning count**, because it is the whole report for
 a reader who does not get to the bottom of it - and because under `--all` it is
 the only line worth scanning:
