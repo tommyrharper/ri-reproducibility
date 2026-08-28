@@ -227,13 +227,38 @@ _ns_truncate_pad() {
   printf '%-*.*s' "${width}" "${width}" "${text}"
 }
 
-_ns_count_glob() {
-  local dir="$1" pattern="$2" n=0 f
-  for f in "${dir}"/${pattern}; do
-    [ -e "${f}" ] || continue
-    n=$((n + 1))
-  done
-  echo "${n}"
+# "<evaluations> <of those, landed after `reference` was written>". `find`
+# rather than the glob loop this replaced, which cost 283ms of every
+# one-second redraw on a live 7,200-evaluation run - one find answering both
+# questions costs ~100ms, so the second count is free and the bar got cheaper.
+_ns_count_evals() {
+  local dir="$1" reference="${2:-}" total since=0
+  total="$(find "${dir}" -maxdepth 1 -name 'eval-*' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ -n "${reference}" ] && [ -e "${reference}" ]; then
+    since="$(find "${dir}" -maxdepth 1 -name 'eval-*' -newer "${reference}" 2>/dev/null |
+      wc -l | tr -d ' ')"
+  fi
+  echo "${total} ${since}"
+}
+
+# Dead points now, rather than at the last checkpoint. PolyChord writes
+# chains/ every `nlive` dead points, so between writes the count is frozen by
+# construction: on the 16-rank R2D2 search here that is two hours at a time,
+# and a bar that sits still for two hours and then jumps fifty points is not a
+# progress bar. Evaluation directories appear every few seconds instead, and
+# the slice sampler spends a near-constant number of them per dead point
+# (num_repeats times the dimension), so the evaluations banked since the
+# checkpoint convert straight back into dead points. `banked` is the count as
+# of the checkpoint, so the ratio is not contaminated by the evaluations being
+# converted. Same estimate `./ri health` prints on its forecast line; carries
+# a `~` wherever it is shown.
+_ns_dead_now() {
+  local dead="$1" since="$3" banked=$(($2 - $3))
+  if [ "${dead}" -le 0 ] || [ "${banked}" -le 0 ] || [ "${since}" -le 0 ]; then
+    echo "${dead}"
+    return
+  fi
+  echo $((dead + (since * dead + banked / 2) / banked))
 }
 
 _ns_dead_birth_file() {
@@ -262,53 +287,61 @@ _ns_render_bar() {
 
 _ns_status_line() {
   local output_dir="$1" max_ndead="$2" nlive="$3" start="$4"
-  local now elapsed dead_file dead_count eval_count
+  local now elapsed dead_file dead_count counts eval_count since dead_now
 
   now="$(date +%s)"
   elapsed=$((now - start))
   dead_file="$(_ns_dead_birth_file "${output_dir}/chains")"
   dead_count=0
   [ -n "${dead_file}" ] && dead_count="$(_ns_count_lines "${dead_file}")"
-  eval_count="$(_ns_count_glob "${output_dir}/evaluations" 'eval-*')"
+  counts="$(_ns_count_evals "${output_dir}/evaluations" "${dead_file}")"
+  eval_count="${counts%% *}"
+  since="${counts##* }"
+  dead_now="$(_ns_dead_now "${dead_count}" "${eval_count}" "${since}")"
 
   # PolyChord treats max_ndead <= 0 as "no bound, stop on evidence tolerance
   # instead" - there's no dead-point budget to measure a percent or ETA
   # against, but the tolerance itself is a real number we can approximate
-  # progress against instead (see _ns_evidence_pct).
+  # progress against instead (see _ns_evidence_total).
   if [ "${max_ndead}" -le 0 ]; then
-    local evidence
-    if evidence="$(_ns_evidence_pct "${output_dir}/chains" "${dead_count}" "${nlive}")"; then
-      # "<percent> <estimated total>", split rather than word-split so an empty
-      # or malformed answer cannot silently shift the arguments along.
-      _ns_evidence_line "${evidence%% *}" "${evidence##* }" \
-        "${dead_count}" "${eval_count}" "${elapsed}"
+    local total
+    # The total is estimated from the checkpoint's own dead count, because the
+    # log(Z) and live points it needs were written by that same checkpoint;
+    # only the position within it is carried forward.
+    if total="$(_ns_evidence_total "${output_dir}/chains" "${dead_count}" "${nlive}")"; then
+      _ns_evidence_line "${total}" "${dead_now}" "${eval_count}" "${elapsed}"
     else
       _ns_unbounded_line "${dead_count}" "${eval_count}" "${elapsed}"
     fi
     return
   fi
 
-  local pct eta bar
-  pct=$((dead_count * 100 / max_ndead))
+  local pct eta bar carried=""
+  [ "${dead_now}" -ne "${dead_count}" ] && carried="~"
+  pct=$((dead_now * 100 / max_ndead))
   [ "${pct}" -gt 100 ] && pct=100
 
   eta="?"
-  if [ "${dead_count}" -gt 0 ] && [ "$((max_ndead - dead_count))" -gt 0 ]; then
-    eta="$(_ns_format_hms $(((max_ndead - dead_count) * elapsed / dead_count)))"
-  elif [ "${dead_count}" -ge "${max_ndead}" ]; then
+  if [ "${dead_now}" -gt 0 ] && [ "$((max_ndead - dead_now))" -gt 0 ]; then
+    eta="$(_ns_format_hms $(((max_ndead - dead_now) * elapsed / dead_now)))"
+  elif [ "${dead_now}" -ge "${max_ndead}" ]; then
     eta="0:00:00"
   fi
 
   bar="$(_ns_render_bar "${pct}" 30)"
 
-  printf '[%s] %3d%%  %d/%d dead points (%d evaluations)  elapsed %s  eta %s' \
-    "${bar}" "${pct}" "${dead_count}" "${max_ndead}" "${eval_count}" "$(_ns_format_hms "${elapsed}")" "${eta}"
+  # The cap is a number the operator asked for and stays plain; the position
+  # within it is carried across the checkpoint interval, so it and everything
+  # derived from it take the `~` whenever it is not the checkpoint's own count.
+  printf '[%s] %s%3d%%  %s%d/%d dead points (%d evaluations)  elapsed %s  eta %s%s' \
+    "${bar}" "${carried}" "${pct}" "${carried}" "${dead_now}" "${max_ndead}" \
+    "${eval_count}" "$(_ns_format_hms "${elapsed}")" "${carried}" "${eta}"
 }
 
 # A block bouncing back and forth across the bar, one step per elapsed
 # second, so a no-budget run still visibly ticks over instead of sitting
 # frozen. Position, not percent: there is nothing to be a percent of. Used
-# only until _ns_evidence_pct has enough data to give a real number (before
+# only until _ns_evidence_total has enough data to give a real number (before
 # the first dead point, chains/*.stats and chains/*_phys_live.txt don't
 # exist yet).
 _ns_unbounded_line() {
@@ -335,16 +368,18 @@ _ns_unbounded_line() {
 # the run's own evidence implies, and a bar that looks the same either way
 # would hide that difference.
 _ns_evidence_line() {
-  local pct="$1" total="$2" dead_count="$3" eval_count="$4" elapsed="$5"
-  local bar eta="?"
+  local total="$1" dead_now="$2" eval_count="$3" elapsed="$4"
+  local bar eta="?" pct
+  pct=$((dead_now * 100 / total))
+  [ "${pct}" -gt 100 ] && pct=100
   bar="$(_ns_render_bar "${pct}" 30)"
-  if [ "$((total - dead_count))" -gt 0 ] && [ "${dead_count}" -gt 0 ]; then
-    eta="$(_ns_format_hms $(((total - dead_count) * elapsed / dead_count)))"
-  elif [ "${dead_count}" -ge "${total}" ]; then
+  if [ "$((total - dead_now))" -gt 0 ] && [ "${dead_now}" -gt 0 ]; then
+    eta="$(_ns_format_hms $(((total - dead_now) * elapsed / dead_now)))"
+  elif [ "${dead_now}" -ge "${total}" ]; then
     eta="0:00:00"
   fi
-  printf '[%s] ~%3d%%  %d/~%d dead points (%d evaluations)  elapsed %s  eta ~%s  (evidence tolerance, no --max-ndead cap)' \
-    "${bar}" "${pct}" "${dead_count}" "${total}" "${eval_count}" \
+  printf '[%s] ~%3d%%  ~%d/~%d dead points (%d evaluations)  elapsed %s  eta ~%s  (evidence tolerance, no --max-ndead cap)' \
+    "${bar}" "${pct}" "${dead_now}" "${total}" "${eval_count}" \
     "$(_ns_format_hms "${elapsed}")" "${eta}"
 }
 
@@ -375,8 +410,8 @@ _ns_phys_live_file() {
   done
 }
 
-# How far through an uncapped run (--max-ndead <= 0) is, as "<percent>
-# <estimated total dead points>", from the same output files ./ri report and
+# How many dead points an uncapped run (--max-ndead <= 0) will take in total,
+# from the same output files ./ri report and
 # scripts/lib/nested_sampling/anesthetic_io.py already read: chains/*.stats
 # for the accumulated log(Z) and chains/*_phys_live.txt for the live points'
 # current log-likelihoods (last column of each row). PolyChord's own
@@ -387,14 +422,14 @@ _ns_phys_live_file() {
 # (chains/*.stats' `ncluster` line) will see this diverge further from
 # PolyChord's own exact per-cluster figure than a single-cluster run does.
 #
-# The percent is a fraction of dead points, not of the evidence ratio. The
-# prior volume shrinks one e-fold per `nlive` dead points, so how much further
-# the ratio has to fall converts to a count of dead points - and a count is
-# what the rate so far can be extrapolated into an ETA against, the same way
-# the --max-ndead branch does it. Dividing the criterion by the ratio instead
-# measures progress in a quantity that falls exponentially, which read 3% on a
-# live search that this model and `./ri health` both put at 38%.
-_ns_evidence_pct() {
+# A count of dead points, not the evidence ratio itself. The prior volume
+# shrinks one e-fold per `nlive` dead points, so how much further the ratio
+# has to fall converts to a count - and a count is what the rate so far can be
+# extrapolated into a percent and an ETA against, the same way the --max-ndead
+# branch does it. Dividing the criterion by the ratio instead measures progress
+# in a quantity that falls exponentially, which read 3% on a live search that
+# this model and `./ri health` both put at 38%.
+_ns_evidence_total() {
   local chains_dir="$1" dead_count="$2" nlive="$3"
   local stats_file live_file logz
   [ "${dead_count}" -gt 0 ] && [ "${nlive}" -gt 0 ] || return 1
@@ -419,10 +454,7 @@ _ns_evidence_pct() {
       live_logz = (max + log(s)) - log(n) + (-ndead / nlive)
       remaining = nlive * (live_logz - logz - log(ratio))
       if (remaining < 0) remaining = 0
-      total = ndead + int(remaining + 0.5)
-      pct = 100 * ndead / total
-      if (pct > 100) pct = 100
-      printf "%d %d", pct, total
+      printf "%d", ndead + int(remaining + 0.5)
     }
   ' "${live_file}"
 }
@@ -443,7 +475,34 @@ self_check() {
 
   mkdir "${tmp}/evaluations/eval-0001-a" "${tmp}/evaluations/eval-0002-b" \
     "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
-  [ "$(_ns_count_glob "${tmp}/evaluations" 'eval-*')" = "4" ] || { echo "FAIL: evaluations count"; exit 1; }
+  local dead_file="${tmp}/chains/wsclean_vlaa_dead-birth.txt"
+  [ "$(_ns_count_evals "${tmp}/evaluations")" = "4 0" ] || {
+    echo "FAIL: evaluations count: $(_ns_count_evals "${tmp}/evaluations")"; exit 1
+  }
+  # -t rather than -d: the timestamp form is POSIX and BSD touch has no -d.
+  touch -t 202601010000 "${tmp}/evaluations"/eval-*
+  touch -t 202601010100 "${dead_file}"
+  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  [ "$(_ns_count_evals "${tmp}/evaluations" "${dead_file}")" = "4 2" ] || {
+    echo "FAIL: split either side of the checkpoint: $(_ns_count_evals "${tmp}/evaluations" "${dead_file}")"
+    exit 1
+  }
+  [ "$(_ns_count_evals "${tmp}/evaluations" "${tmp}/chains/absent")" = "4 0" ] || {
+    echo "FAIL: missing reference must not split"; exit 1
+  }
+
+  # Carrying the frozen dead-point count across the checkpoint interval: 100
+  # dead points banked over 900 evaluations is one per nine, so the 100
+  # evaluations since the checkpoint are worth 11 more.
+  [ "$(_ns_dead_now 100 1000 100)" = "111" ] || { echo "FAIL: dead_now: $(_ns_dead_now 100 1000 100)"; exit 1; }
+  # Rounded, not truncated - truncation pins a slow run to its checkpoint.
+  [ "$(_ns_dead_now 10 100 5)" = "11" ] || { echo "FAIL: dead_now rounds up"; exit 1; }
+  [ "$(_ns_dead_now 10 100 4)" = "10" ] || { echo "FAIL: dead_now rounds down"; exit 1; }
+  # Nothing to extrapolate from, or nothing to extrapolate: the checkpoint's
+  # own count, never a division by zero.
+  [ "$(_ns_dead_now 0 1000 100)" = "0" ] || { echo "FAIL: dead_now with no dead points"; exit 1; }
+  [ "$(_ns_dead_now 100 1000 0)" = "100" ] || { echo "FAIL: dead_now on a fresh checkpoint"; exit 1; }
+  [ "$(_ns_dead_now 100 100 100)" = "100" ] || { echo "FAIL: dead_now with nothing banked"; exit 1; }
 
   [ "$(_ns_format_hms 3661)" = "1:01:01" ] || { echo "FAIL: format_hms"; exit 1; }
   [ "$(_ns_format_hms 59)" = "0:00:59" ] || { echo "FAIL: format_hms short"; exit 1; }
@@ -468,11 +527,24 @@ self_check() {
   # 3 dead points against a cap of 12 must drive the percent/ETA, not the 4
   # evaluations - that mismatch (dead points lag evaluations) is exactly the
   # R2D2 run that showed "29/12 dead points" before this used dead-birth.txt.
+  #
+  # Two of the four evaluations landed after the checkpoint and two before, so
+  # the three checkpointed dead points carry forward to ~6 - and every figure
+  # that came from the carry is marked `~`, while the cap the operator asked
+  # for is not.
   local line
   line="$(_ns_status_line "${tmp}" 12 8 "$(($(date +%s) - 60))")"
   case "${line}" in
-    *"3/12 dead points (4 evaluations)"*) ;;
+    *"~ 50%  ~6/12 dead points (4 evaluations)"*) ;;
     *) echo "FAIL: status line dead/eval split: ${line}"; exit 1 ;;
+  esac
+  # A checkpoint newer than every evaluation has nothing to carry, and then the
+  # count is exact and says so by dropping the `~`.
+  touch "${dead_file}"
+  line="$(_ns_status_line "${tmp}" 12 8 "$(($(date +%s) - 60))")"
+  case "${line}" in
+    *" 25%  3/12 dead points (4 evaluations)"*) ;;
+    *) echo "FAIL: fresh checkpoint must not be marked estimated: ${line}"; exit 1 ;;
   esac
 
   # max_ndead <= 0 has no budget to divide by - must not claim an ETA or a
@@ -515,30 +587,43 @@ self_check() {
   # nlive dead points is 8 more dead points - 10/18 = 55%.
   printf 'log(Z)       =   0.0 +/-   0.1\n' >"${tmp}/chains/wsclean_vlaa.stats"
   printf '0.1 0.2 0.0\n0.3 0.4 0.0\n' >"${tmp}/chains/wsclean_vlaa_phys_live.txt"
-  [ "$(_ns_evidence_pct "${tmp}/chains" 10 2)" = "55 18" ] || {
-    echo "FAIL: evidence pct: $(_ns_evidence_pct "${tmp}/chains" 10 2)"; exit 1
+  [ "$(_ns_evidence_total "${tmp}/chains" 10 2)" = "18" ] || {
+    echo "FAIL: evidence total: $(_ns_evidence_total "${tmp}/chains" 10 2)"; exit 1
   }
   # _ns_status_line reads ndead from chains/*_dead-birth.txt itself, so match
-  # the 10 dead points the hand-computed 55% above assumes. 8 dead points left
-  # at 10 per 60s is a 48s eta, and every estimated figure carries a `~`.
-  seq 1 10 >"${tmp}/chains/wsclean_vlaa_dead-birth.txt"
+  # the 10 dead points the hand-computed 18 above assumes, with the checkpoint
+  # newer than every evaluation so there is nothing to carry: 10/18 is 55%, and
+  # 8 dead points left at 10 per 60s is a 48s eta.
+  seq 1 10 >"${dead_file}"
   line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
   case "${line}" in
-    *"~ 55%"*"10/~18 dead points"*"eta ~0:00:48"*"evidence tolerance"*) ;;
-    *) echo "FAIL: status line did not switch to evidence pct: ${line}"; exit 1 ;;
+    *"~ 55%"*"~10/~18 dead points"*"eta ~0:00:48"*"evidence tolerance"*) ;;
+    *) echo "FAIL: status line did not switch to the evidence total: ${line}"; exit 1 ;;
   esac
+  # ...and with two of the four evaluations landing after that checkpoint, the
+  # 10 banked over 2 carry forward to 20 - which is past the estimated total,
+  # so the percent clamps at 100 rather than printing "111%" on a run that is
+  # about to stop anyway.
+  touch -t 202601010100 "${dead_file}"
+  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
+  case "${line}" in
+    *"~100%"*"~20/~18 dead points"*"eta ~0:00:00"*) ;;
+    *) echo "FAIL: carried count past the estimated total: ${line}"; exit 1 ;;
+  esac
+  touch "${dead_file}"
   # No dead points yet means no ndead/nlive to divide by - must fall back to
   # the bounce rather than divide by zero or report a bogus percent.
-  _ns_evidence_pct "${tmp}/chains" 0 2 >/dev/null && { echo "FAIL: evidence pct with 0 dead points should fail"; exit 1; }
+  _ns_evidence_total "${tmp}/chains" 0 2 >/dev/null && { echo "FAIL: evidence total with 0 dead points should fail"; exit 1; }
   # ...and neither does the first e-fold, where the live set is still the
   # prior: the answer there is nlive*ln(1/RATIO), the function's own constant.
-  _ns_evidence_pct "${tmp}/chains" 1 2 >/dev/null && { echo "FAIL: evidence pct inside the first e-fold should fail"; exit 1; }
+  _ns_evidence_total "${tmp}/chains" 1 2 >/dev/null && { echo "FAIL: evidence total inside the first e-fold should fail"; exit 1; }
   # A run that is already past the stopping ratio (ndead=20, nlive=2 puts
   # live_logZ at -10, below ln(1.2e-4) = -9.03) has negative work left. The
   # total must stay at the dead points it has rather than going below them and
   # printing "20/~19 dead points" on a run about to stop.
-  [ "$(_ns_evidence_pct "${tmp}/chains" 20 2)" = "100 20" ] || {
-    echo "FAIL: past the stopping ratio: $(_ns_evidence_pct "${tmp}/chains" 20 2)"; exit 1
+  [ "$(_ns_evidence_total "${tmp}/chains" 20 2)" = "20" ] || {
+    echo "FAIL: past the stopping ratio: $(_ns_evidence_total "${tmp}/chains" 20 2)"; exit 1
   }
 
   # The pinned status line and `./ri health` forecast an uncapped run from the

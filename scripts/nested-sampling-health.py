@@ -62,7 +62,9 @@ Four things it checks, each one a way a run has actually gone wrong here:
   actually accumulated and what each dead point cost in likelihood calls, and
   with the live points beside it that gives the one thing a `--max-ndead -1`
   run has nowhere else: a denominator. `forecast` turns the prior volume still
-  to be compressed into dead points left and hours left.
+  to be compressed into dead points left and hours left - carrying the count
+  forward across PolyChord's checkpoint interval, which otherwise freezes it
+  for two hours at a time on a 16-rank R2D2 search.
 
 Plus the host: memory, free disk, and sidecar containers whose run is gone. A killed run
 leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank. The next
@@ -87,6 +89,7 @@ can gate a script.
 from __future__ import annotations
 
 import argparse
+import bisect
 import calendar
 import json
 import math
@@ -502,12 +505,17 @@ class Evaluation(NamedTuple):
     peak_memory_bytes: float | None
 
 
-def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
+def evaluation_scan(run_dir: Path, procs: int = 0,
+                    checkpoint: float | None = None) -> dict[str, object]:
     """Counts, timings and failures, in one pass over evaluations/.
 
     The stat and the read are the same pass because the interesting things -
     when an evaluation landed, and whether it landed on a failure - are one per
-    file and there is no cheaper place to get either.
+    file and there is no cheaper place to get either. `checkpoint` (the mtime
+    of PolyChord's dead-point file) is here for the same reason: splitting the
+    evaluations either side of it is what lets `dead_points_now` carry the
+    frozen dead-point count forward, and a second pass to count them would
+    stat every directory again.
     """
     evaluations = run_dir / "evaluations"
     directories = 0
@@ -645,6 +653,8 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
 
     return {
         "completed": len(times),
+        "completed_by_checkpoint": (bisect.bisect_right(times, checkpoint)
+                                    if checkpoint else len(times)),
         "in_flight": directories - len(times),
         "failed": failed,
         "last_activity_seconds": time.time() - times[-1] if times else None,
@@ -744,24 +754,51 @@ def log_tail(run_dir: Path) -> dict[str, object] | None:
 
 
 def dead_points(run_dir: Path) -> tuple[int, float | None]:
-    """PolyChord's progress and how old that number is.
+    """PolyChord's progress and when that number was written.
 
-    The age is not decoration. PolyChord writes its checkpoint roughly every
-    `nlive` dead points, so between writes the count cannot move by
+    The timestamp is not decoration. PolyChord writes its checkpoint roughly
+    every `nlive` dead points, so between writes the count cannot move by
     construction - and a count that has not moved for fifty minutes looks
     exactly like a run that has stopped making progress. That misreading has
     already cost an hour of investigation here, and it survived being checked
     against the terminal, because PolyChord's own feedback box and these files
     are written by the same event: two displays of one signal, not two
-    witnesses. Nothing here decides anything from this count; it is reported
-    with its age so that nobody else does either.
+    witnesses. The `stage` line reports this count with its age so that nobody
+    reads it as current; `dead_points_now` is what anything measuring progress
+    uses instead.
     """
     for path in (run_dir / "chains").glob("*_dead-birth.txt"):
         try:
-            return sum(1 for _ in path.open()), time.time() - path.stat().st_mtime
+            return sum(1 for _ in path.open()), path.stat().st_mtime
         except OSError:
             return 0, None
     return 0, None
+
+
+def dead_points_now(dead: int, completed: int, banked: int) -> int:
+    """Dead points now, estimated across PolyChord's checkpoint interval.
+
+    `dead` is frozen between checkpoint writes - two hours at a time on the
+    16-rank R2D2 search here, which is 22% of that run - so every figure
+    derived from it (the percent done, the ETA, the pinned progress bar)
+    sits still and then jumps by a whole `nlive`. Reported live it put the
+    search at 38% done with 8h12m left when the very next write showed it was
+    really past 50%.
+
+    The evaluation directories do not have that problem: they appear every few
+    seconds, and PolyChord's slice sampler spends a near-constant number of
+    them per dead point (`num_repeats` times the dimension), so the
+    evaluations banked since the checkpoint convert straight back into dead
+    points. `banked` is how many had landed when the checkpoint was written,
+    which is what makes the ratio the run's own rather than one contaminated
+    by the very evaluations being converted.
+
+    An estimate, and marked `~` everywhere it is printed.
+    """
+    since = completed - banked
+    if dead <= 0 or banked <= 0 or since <= 0:
+        return dead
+    return dead + round(since * dead / banked)
 
 
 def _setting(run_env: dict[str, str], key: str) -> int | None:
@@ -822,7 +859,8 @@ def live_loglikelihoods(run_dir: Path) -> list[float]:
 
 
 def evidence_forecast(run_dir: Path, stats: dict[str, object] | None,
-                      nlive: int | None, max_ndead: int | None) -> dict[str, object] | None:
+                      nlive: int | None, max_ndead: int | None,
+                      ndead_now: int | None = None) -> dict[str, object] | None:
     """How far through the search is, and how many dead points are left.
 
     The gap this closes is that with `--max-ndead -1`, the default, a run has
@@ -840,6 +878,11 @@ def evidence_forecast(run_dir: Path, stats: dict[str, object] | None,
 
     An explicit `--max-ndead` is a hard stop the sampler will hit first, so it
     is used directly and the answer is not an estimate at all.
+
+    The total is worked out from the checkpoint's own `ndead`, because the
+    log(Z) and the live points it is computed with were written by that same
+    checkpoint. How far *through* that total the run is comes from
+    `ndead_now`, which does not have to wait for the next write.
     """
     if not stats or "ndead" not in stats or not nlive:
         return None
@@ -862,9 +905,12 @@ def evidence_forecast(run_dir: Path, stats: dict[str, object] | None,
         remaining = nlive * (log_z_live - float(stats["log_z"])
                              - math.log(TERMINATION_EVIDENCE_RATIO))
         total, estimated = ndead + max(0, round(remaining)), True
+    now = ndead if ndead_now is None else max(ndead, min(ndead_now, total))
     return {
         "total_dead_points": total,
-        "fraction": min(1.0, ndead / total) if total > 0 else None,
+        "dead_points": ndead,
+        "dead_points_now": now,
+        "fraction": min(1.0, now / total) if total > 0 else None,
         "estimated": estimated,
     }
 
@@ -981,7 +1027,10 @@ def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> in
 def describe(run_dir: Path, processes: list[dict[str, object]],
              stale_seconds: float, busy: dict[int, float] | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
-    scan = evaluation_scan(run_dir, _setting(run_env, "NS_MPI_PROCS") or 0)
+    dead, checkpoint_time = dead_points(run_dir)
+    checkpoint_age = time.time() - checkpoint_time if checkpoint_time else None
+    scan = evaluation_scan(run_dir, _setting(run_env, "NS_MPI_PROCS") or 0,
+                           checkpoint_time)
     owned = run_processes(run_dir, processes)
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
     spinning = spinning_ranks(ranks, busy or {})
@@ -992,7 +1041,6 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # read to answer "can another run fit".
     resident_mb = sum(int(p["rss_mb"]) for p in owned)
     cores_busy = sum((busy or {}).get(int(p["pid"]), 0.0) for p in owned)
-    dead, checkpoint_age = dead_points(run_dir)
     tail = log_tail(run_dir)
     restarted = restarts(run_dir)
     idle = scan["last_activity_seconds"]
@@ -1016,14 +1064,19 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     stats = sampler_stats(run_dir)
     forecast = None
     if status in ("healthy", "stalled", "starting"):
-        forecast = evidence_forecast(run_dir, stats, _setting(run_env, "NS_NLIVE"),
-                                     _setting(run_env, "NS_MAX_NDEAD"))
-    if forecast and stats and float(scan["span_seconds"] or 0) >= MIN_RATE_SPAN_SECONDS:
+        forecast = evidence_forecast(
+            run_dir, stats, _setting(run_env, "NS_NLIVE"),
+            _setting(run_env, "NS_MAX_NDEAD"),
+            dead_points_now(int(stats["ndead"]), int(scan["completed"]),
+                            int(scan["completed_by_checkpoint"]))
+            if stats and "ndead" in stats else None)
+    if forecast and float(scan["span_seconds"] or 0) >= MIN_RATE_SPAN_SECONDS:
         # Dead points per second over the run's own life. Not the evaluation
         # rate: the two are related by the sampler efficiency this line exists
         # to make visible, and that efficiency changes as the search moves.
-        left = int(forecast["total_dead_points"]) - int(stats["ndead"])
-        rate = int(stats["ndead"]) / float(scan["span_seconds"])
+        now = int(forecast["dead_points_now"])
+        left = int(forecast["total_dead_points"]) - now
+        rate = now / float(scan["span_seconds"])
         forecast["hours_remaining"] = left / rate / 3600 if rate > 0 else None
 
     warnings: list[str] = []
@@ -1326,9 +1379,13 @@ def render(run: dict[str, object]) -> None:
         assert isinstance(ahead, dict)
         about = "~" if ahead["estimated"] else ""
         left = ahead.get("hours_remaining")
+        # The numerator is marked separately: with an explicit --max-ndead the
+        # total is exact and only the carried-forward count is an estimate.
+        now = int(ahead["dead_points_now"])
+        carried = "~" if now != int(ahead["dead_points"]) else ""
         lines.append(("forecast",
                       f"{about}{float(ahead['fraction']):.0%} done, "
-                      f"{about}{ahead['total_dead_points']} dead points total"
+                      f"{carried}{now} of {about}{ahead['total_dead_points']} dead points"
                       + (f", {about}{format_hours(float(left))} left" if left else "")))
     lines.append(("ranks", ranks))
     # Only for a run that still holds something. "0.0GB over 0 processes" is
@@ -1684,16 +1741,58 @@ def self_check() -> None:
             shown = io_capture(report)
             # 4800 calls over 200 dead points.
             assert "logZ = 0.000 +/- 0.002, 24 likelihood calls per dead point" in shown, shown
-            assert "~44% done, ~451 dead points total, ~4h11m left" in shown, shown
+            # Nothing to carry while the checkpoint is newer than every
+            # evaluation, so the position is the checkpoint's own count and
+            # prints without a tilde of its own.
+            assert report["completed_by_checkpoint"] == 60, report
+            assert ahead["dead_points_now"] == 200, ahead
+            assert "~44% done, 200 of ~451 dead points, ~4h11m left" in shown, shown
 
-            # An explicit --max-ndead is a hard stop, so the count is known
-            # rather than estimated and prints without the tildes.
+            # PolyChord rewrites chains/ only every `nlive` dead points, so
+            # between writes the count is frozen and everything derived from it
+            # sits still and then jumps by fifty - two hours at a time on the
+            # 16-rank R2D2 search here, which put it at 38% done with 8h12m
+            # left when the next write showed it was past half way. Ten of the
+            # sixty evaluations landed after this checkpoint, and the fifty
+            # before it bought 200 dead points, so those ten are worth 40 more.
+            # Rounded, not truncated - truncation pins a slow run to its
+            # checkpoint - and never a division by zero at either end of a run.
+            assert dead_points_now(200, 60, 49) == 245, dead_points_now(200, 60, 49)
+            assert dead_points_now(200, 60, 50) == 240, dead_points_now(200, 60, 50)
+            assert dead_points_now(0, 60, 50) == 0
+            assert dead_points_now(200, 60, 0) == 200
+            assert dead_points_now(200, 60, 60) == 200
+            os.utime(fc / "chains" / "w_dead-birth.txt", (now - 2000, now - 2000))
+            carried = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
+            assert carried["completed_by_checkpoint"] == 50, carried
+            assert carried["dead_points"] == 200, carried
+            assert carried["forecast"]["dead_points_now"] == 240, carried["forecast"]
+            # The total still comes from the checkpoint's own ndead, because
+            # the log(Z) and live points it is computed from were written by
+            # that same checkpoint.
+            assert carried["forecast"]["total_dead_points"] == 451, carried["forecast"]
+            # 211 left at the 240-per-12000s the carried count implies.
+            assert 2.8 < float(carried["forecast"]["hours_remaining"]) < 3.0, carried
+            assert ("~53% done, ~240 of ~451 dead points, ~2h55m left"
+                    in io_capture(carried)), io_capture(carried)
+
+            # An explicit --max-ndead is a hard stop, so the total is known
+            # rather than estimated and prints without a tilde - but the
+            # position within it is still carried across the checkpoint
+            # interval, and keeps its own.
             (fc / "run.env").write_text(
                 "NS_ALGORITHM=wsclean\nNS_MPI_PROCS=4\nNS_NLIVE=50\nNS_MAX_NDEAD=300\n")
             capped = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
             assert capped["forecast"]["total_dead_points"] == 300, capped["forecast"]
             assert capped["forecast"]["estimated"] is False, capped["forecast"]
-            assert "67% done, 300 dead points total, 1h40m left" in io_capture(capped)
+            assert "80% done, ~240 of 300 dead points, 0h50m left" in io_capture(capped)
+            # ...and a carried count cannot run past the total and report more
+            # than 100% done on a run that is about to stop.
+            os.utime(fc / "chains" / "w_dead-birth.txt", (now - 11000, now - 11000))
+            past = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
+            assert past["forecast"]["dead_points_now"] == 300, past["forecast"]
+            assert past["forecast"]["fraction"] == 1.0, past["forecast"]
+            os.utime(fc / "chains" / "w_dead-birth.txt", (now, now))
 
             # Inside the first e-fold the live set is still the prior, so the
             # estimate would be reporting its own constant and not this run.

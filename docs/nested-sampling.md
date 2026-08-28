@@ -44,9 +44,20 @@ count, which is always higher since PolyChord's slice sampler makes several
 evaluations per accepted dead point), a percent, and an ETA extrapolated from
 the rate so far (`scripts/lib/progress-bar.sh`). With `--max-ndead <= 0` (run
 until the evidence tolerance is met, no fixed cap) there is no dead-point cap
-to measure a percent against, so `_ns_evidence_pct` estimates one from the
+to measure a percent against, so `_ns_evidence_total` estimates one from the
 run's own evidence, and every figure derived from it is marked `~`:
-`~ 38%  173/~454 dead points ... eta ~6:08:10`.
+`~ 53%  ~241/~452 dead points ... eta ~4:35:00`.
+
+PolyChord rewrites `chains/` only every `nlive` dead points, so the dead-point
+count is frozen between writes by construction - two hours at a time on a
+16-rank R2D2 search, which is a bar that sits still for two hours and then
+jumps fifty. `_ns_dead_now` carries it across that interval: the evaluation
+directories appear every few seconds, the slice sampler spends a near-constant
+number of them per dead point, so the evaluations that landed after the
+checkpoint convert back into dead points at the run's own measured ratio. The
+carried count takes a `~` of its own even when the denominator is an exact
+`--max-ndead`, and `./ri health`'s **forecast** line carries the count the same
+way from the same ratio.
 
 That estimate is the same model `./ri health`'s **forecast** line uses, from
 the same two files (`chains/*.stats` for the accumulated `log(Z)`,
@@ -320,7 +331,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   imaging   25.4s per evaluation, ranks 66% busy  (last 50: 12.3s, 6% busy)
   occupancy ▇▆▆▇▇▂▆▆▇▆▆▆▇▆█▆▇▂▁▆  6%-88% of 16 ranks busy per 0:07:29 slice
   sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
-  forecast  ~38% done, ~454 dead points total, ~4h54m left
+  forecast  ~26% done, ~120 of ~454 dead points, ~2h11m left
   ranks     16 ranks of 16, 7 busy-waiting
   resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
   memory    3.3GB peak imager memory, 53.2GB across 16 ranks
@@ -495,6 +506,26 @@ What each line is reading, and why it is worth a line:
   one e-fold per `nlive` dead points, which turns "how much further that ratio
   has to fall" into a count of dead points, and the run's own dead-point rate
   turns that into hours.
+
+  The position within that total does not wait for the next checkpoint.
+  PolyChord rewrites `chains/` every `nlive` dead points, so `ndead` is frozen
+  between writes and everything derived from it sits still and then jumps by
+  fifty: the live 16-rank R2D2 search read `~38% done, ~8h12m left` two hours
+  into an interval that ended with it past half way. The evaluation
+  directories are not frozen, and the sampler spends a near-constant number of
+  them per dead point, so the evaluations banked *since* the checkpoint convert
+  straight back into dead points (`dead_points_now`). The total still comes
+  from the checkpoint's own `ndead`, because the `log(Z)` and live points it
+  needs were written by the same checkpoint; only the position is carried, and
+  it is printed with its own `~` whenever it differs from the checkpointed
+  count. **stage** still reports the raw count with its age, which is the
+  honest statement of what PolyChord last wrote down.
+
+  Measured against a live wsclean search (`--nlive 5 --num-repeats 2
+  --mpi-procs 3`, 48 dead points over six checkpoint writes): sampled once a
+  second, the carried count immediately before each write was 0, +7, 0, +1,
+  -1 and -5 out of what that write then revealed, where the raw count was
+  short by the whole write every time (-7, -7, -6, -7, -6, -9).
 
   The stopping fraction is measured rather than taken from the documentation.
   `precision_criterion` defaults to 1e-3, but the two searches on this host
