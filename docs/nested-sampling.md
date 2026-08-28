@@ -695,12 +695,25 @@ it in place, up to `--retries` times (default 2). The restart is an ordinary
 resume: same `OUTPUT_DIR`, PolyChord reads its own `.resume` file and the
 evaluations already on disk are adopted, exactly as `./ri resume` does.
 
-**It only retries an attempt that made forward progress**, measured in dead
-points added. That guard is what stops it spinning: a code bug every rank hits
-deterministically, a missing image, a bad parameter space - all of those fail
-before the attempt's first dead point, so they stop immediately instead of
-failing three times as slowly. Only something that killed a run which was
-working gets another go.
+**It only retries an attempt that made forward progress**, measured in
+evaluations the attempt actually scored. That guard is what stops it spinning:
+a code bug every rank hits deterministically, a missing image, a bad parameter
+space - all of those fail before a single evaluation is scored, so they stop
+immediately instead of failing three times as slowly. Only something that
+killed a run which was working gets another go.
+
+The measure used to be dead points added, which silently disabled the retry
+for most of a real run. PolyChord writes `chains/` only every `nlive` dead
+points, so inside that interval - up to seventy minutes on the 16-rank R2D2
+search, and the whole of a fresh run before its first checkpoint - the
+dead-point count is frozen at the number the attempt started from, however
+much imaging happened. A real search SIGKILLed at 31 scored evaluations and 0
+dead points printed `not retrying: ... added no dead points` and stayed dead;
+the same kill now logs `attempt failed (exit 137) at 31 evaluations` and the
+run finishes. Retrying does not repeat that work either: the restart adopts
+the finished evaluations and serves those points from its cache. An
+evaluation directory with no `metrics.json` is one that was in flight when
+the run died, and does not count - the next attempt deletes it.
 
 Two things to know about a restarted run:
 

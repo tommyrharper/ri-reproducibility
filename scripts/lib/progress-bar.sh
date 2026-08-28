@@ -95,11 +95,22 @@ run_with_progress() {
 # is then simply gone until a human notices and types `./ri resume`.
 #
 # Retried only while the failed attempt made forward progress, measured in
-# dead points. That is the whole guard against spinning: a code bug every rank
-# hits deterministically, a bad parameter space, a missing image - all fail
-# before the first dead point of the attempt, so they stop immediately rather
-# than failing three times as slowly. Something that killed a run which was
-# working is the only thing that gets another go.
+# completed evaluations. That is the whole guard against spinning: a code bug
+# every rank hits deterministically, a bad parameter space, a missing image -
+# all fail before a single evaluation is scored, so they stop immediately
+# rather than failing three times as slowly. Something that killed a run which
+# was working is the only thing that gets another go.
+#
+# Evaluations rather than the dead points this used to count, because
+# PolyChord writes chains/ only every `nlive` dead points: a crash inside that
+# interval - up to seventy minutes of imaging on the 16-rank R2D2 search, and
+# every crash before the first checkpoint of a fresh run - leaves the
+# dead-point count at exactly the number the attempt started from, so the
+# guard fired on runs that had been working for an hour and called them
+# deterministic. Reproduced with a real search killed at 31 scored
+# evaluations and 0 dead points: it refused to retry. Nor is that work lost
+# by retrying - the retry adopts the finished evaluations and serves those
+# points from its cache (adopt_completed_evaluations in common.py).
 #
 # The retry reuses the sidecar containers this run already started, but not
 # their pooled workers: those exit on EOF when the dying ranks close their end
@@ -113,17 +124,17 @@ run_with_retries() {
   shift
   local attempt=0 status=0 before after
   while :; do
-    before="$(_ns_ndead "${output_dir}")"
+    before="$(_ns_completed_evals "${output_dir}")"
     status=0
     run_with_progress "$@" || status=$?
     [ "${status}" -eq 0 ] && return 0
-    after="$(_ns_ndead "${output_dir}")"
+    after="$(_ns_completed_evals "${output_dir}")"
     if [ "${attempt}" -ge "${retries}" ]; then
       break
     fi
     if [ "${after}" -le "${before}" ]; then
       _ns_retry_say "${output_dir}" \
-        "not retrying: the attempt that just failed (exit ${status}) added no dead points," \
+        "not retrying: the attempt that just failed (exit ${status}) scored no evaluations," \
         "so another one fails the same way. Why it stopped is above;" \
         "./ri resume ${output_dir##*/} tries again anyway."
       break
@@ -133,11 +144,11 @@ run_with_retries() {
     # themselves. Its own file because `./ri health` wants the count of a run
     # that has been going for a day, and run.log by then is megabytes of
     # PolyChord feedback with the restart lines scattered through it.
-    printf '%s exit %s after %s dead points\n' \
+    printf '%s exit %s after %s evaluations\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${status}" "${after}" \
       >>"${output_dir}/restarts.log"
     _ns_retry_say "${output_dir}" \
-      "attempt failed (exit ${status}) at ${after} dead points; resuming from PolyChord's" \
+      "attempt failed (exit ${status}) at ${after} evaluations; resuming from PolyChord's" \
       "checkpoint - retry ${attempt} of ${retries}. Why it stopped is above."
   done
   return "${status}"
@@ -152,8 +163,13 @@ _ns_retry_say() {
   echo "run_with_retries: $*" | tee -a "${output_dir}/run.log" >&2
 }
 
-_ns_ndead() {
-  _ns_count_lines "$(_ns_dead_birth_file "$1/chains")"
+# Evaluations this run has finished, across every attempt. metrics.json
+# rather than the directory holding it, because a directory without one is an
+# evaluation that was in flight when the run died and the next attempt deletes
+# those before it starts - so this counts work that survived, and cannot be
+# inflated by the handful of directories a crash leaves half-written.
+_ns_completed_evals() {
+  find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
 }
 
 # Appends a command to whatever trap is already registered for a signal
@@ -683,18 +699,22 @@ self_check() {
   # And the pipe it went through is not left behind in the run directory.
   [ ! -e "${run_dir}/.run.log.fifo" ] || { echo "FAIL: fifo left behind"; exit 1; }
 
-  # run_with_retries: a failure that banked dead points gets another go, a
-  # failure that banked none does not, and the exit status still travels.
+  # run_with_retries: a failure that scored evaluations gets another go, a
+  # failure that scored none does not, and the exit status still travels.
   #
-  # The command counts its own attempts through a file and appends a dead
-  # point each time, which is what a checkpointing run does - so "retried"
-  # and "made progress" are the same fixture.
+  # The command counts its own attempts through a file and scores one more
+  # evaluation each time, which is what a working run does - so "retried" and
+  # "made progress" are the same fixture. Deliberately no dead points
+  # anywhere in it: that is the case this used to get wrong, a run killed
+  # inside PolyChord's checkpoint interval after real work.
   local retry_dir="${tmp}/retry"
   mkdir -p "${retry_dir}/chains"
   # Single quotes deliberately: $0 is the directory argument passed to the
   # child `sh` below, not this shell's own name.
   # shellcheck disable=SC2016
-  local progressing='echo x >>"$0"/chains/r_dead-birth.txt; echo a >>"$0"/attempts; exit 5'
+  local progressing='n=$(ls "$0"/evaluations 2>/dev/null | wc -l);
+    mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
+    echo a >>"$0"/attempts; exit 5'
   status=0
   run_with_retries 2 "${retry_dir}" -1 2 -- sh -c "${progressing}" "${retry_dir}" \
     >/dev/null 2>&1 || status=$?
@@ -708,19 +728,48 @@ self_check() {
     exit 1
   }
 
-  # Same command, no dead points: a deterministic failure must stop after one
-  # attempt rather than fail three times as slowly.
+  # Same command, scoring nothing: a deterministic failure - a missing image,
+  # a bad parameter space - must stop after one attempt rather than fail three
+  # times as slowly. It leaves behind the half-written evaluation directory a
+  # crashed rank does, which must not read as work: no metrics.json, no score.
   local stuck_dir="${tmp}/stuck"
   mkdir -p "${stuck_dir}/chains"
   status=0
   # shellcheck disable=SC2016
-  run_with_retries 2 "${stuck_dir}" -1 2 -- sh -c 'echo a >>"$0"/attempts; exit 5' \
+  run_with_retries 2 "${stuck_dir}" -1 2 -- \
+    sh -c 'mkdir -p "$0"/evaluations/eval-in-flight; echo a >>"$0"/attempts; exit 5' \
     "${stuck_dir}" >/dev/null 2>&1 || status=$?
   [ "${status}" = "5" ] || { echo "FAIL: stuck exit status ${status}, want 5"; exit 1; }
   [ "$(_ns_count_lines "${stuck_dir}/attempts")" = "1" ] || {
     echo "FAIL: no-progress failure retried $(_ns_count_lines "${stuck_dir}/attempts") times"; exit 1
   }
   [ ! -e "${stuck_dir}/restarts.log" ] || { echo "FAIL: restart logged without a retry"; exit 1; }
+
+  # A run that banked dead points before it died is still retried, which is
+  # the case that worked before evaluations became the measure - the two
+  # counters must not have swapped places.
+  local banked_dir="${tmp}/banked"
+  mkdir -p "${banked_dir}/chains"
+  echo x >"${banked_dir}/chains/r_dead-birth.txt"
+  status=0
+  run_with_retries 1 "${banked_dir}" -1 2 -- sh -c "${progressing}" "${banked_dir}" \
+    >/dev/null 2>&1 || status=$?
+  [ "$(_ns_count_lines "${banked_dir}/attempts")" = "2" ] || {
+    echo "FAIL: run with dead points retried $(_ns_count_lines "${banked_dir}/attempts") times"
+    exit 1
+  }
+
+  # And the counter itself: finished evaluations only, from the directory the
+  # run writes them to.
+  [ "$(_ns_completed_evals "${stuck_dir}")" = "0" ] || {
+    echo "FAIL: in-flight evaluation counted as completed"; exit 1
+  }
+  [ "$(_ns_completed_evals "${tmp}/absent")" = "0" ] || {
+    echo "FAIL: missing run directory did not count zero"; exit 1
+  }
+  [ "$(_ns_completed_evals "${retry_dir}")" = "3" ] || {
+    echo "FAIL: completed evaluations $(_ns_completed_evals "${retry_dir}"), want 3"; exit 1
+  }
 
   # 0 retries is the old behaviour exactly, and a command that succeeds runs
   # once and returns 0.
