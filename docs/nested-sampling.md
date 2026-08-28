@@ -601,7 +601,11 @@ What each line is reading, and why it is worth a line:
   below has an owner. Taken over every live process carrying the run
   directory, not just its ranks: a rank is ~10MB and the imager worker it
   talks to is ~3.3GB, and the workers name the run by their `--fifo-dir`
-  rather than by `--output-dir`. RSS, so a page shared between processes is
+  rather than by `--output-dir`. Everything except this tool's own process
+  tree, which carries the run directory too whenever the run is named as an
+  argument: a finished run reported by path used to print `0.1GB resident over
+  3 processes` - the report measuring itself. RSS, so a page shared between
+  processes is
   counted once per holder - overcounting, which is the safe direction for a
   number read to answer "will another run fit". Cores busy is the same one
   second CPU sample as the spin check, summed over those processes, so it

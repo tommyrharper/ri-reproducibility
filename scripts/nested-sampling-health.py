@@ -266,7 +266,7 @@ def _clock_seconds(field: str) -> float | None:
 
 
 def process_table() -> list[dict[str, object]]:
-    """Every process, as (pid, state, elapsed, cpu, rss, args).
+    """Every process, as (pid, ppid, state, elapsed, cpu, rss, args).
 
     One call, because everything here needs it: the ranks of a run, whether a
     sidecar's launcher is still alive, how much of its life a rank has spent on
@@ -274,19 +274,22 @@ def process_table() -> list[dict[str, object]]:
     """
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid=,state=,etime=,time=,rss=,args="],
+            ["ps", "-eo", "pid=,ppid=,state=,etime=,time=,rss=,args="],
             capture_output=True, text=True, check=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return []
     rows: list[dict[str, object]] = []
     for line in out.splitlines():
-        fields = line.split(None, 5)
-        if len(fields) < 6 or not fields[0].isdigit():
+        fields = line.split(None, 6)
+        if len(fields) < 7 or not fields[0].isdigit():
             continue
-        pid, state, etime, cpu, rss, args = fields
+        pid, ppid, state, etime, cpu, rss, args = fields
         rows.append({
             "pid": int(pid),
+            # Only so this tool can leave its own process tree out of the run
+            # it is measuring; see own_process_tree.
+            "ppid": int(ppid) if ppid.isdigit() else 0,
             # A process killed while its parent is not wait()ing stays as a
             # zombie, and `kill -0` succeeds on one - so state, not existence,
             # is what says a process is alive.
@@ -971,10 +974,30 @@ def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dic
     Wider than the ranks on purpose: the memory a run actually holds is almost
     all in its imager workers, which name the run by their --fifo-dir and are
     visible on the host even though they live inside the sidecar containers. A
-    rank itself is ~10MB against an R2D2 worker's ~3.3GB.
+    rank itself is ~10MB against an R2D2 worker's ~3.3GB. Wide enough that it
+    would otherwise match this tool, which is why own_process_tree is here.
     """
     marker = str(run_dir.resolve())
-    return [p for p in processes if p["alive"] and marker in str(p["args"])]
+    mine = own_process_tree(processes)
+    return [p for p in processes if p["alive"] and marker in str(p["args"])
+            and int(p["pid"]) not in mine]
+
+
+def own_process_tree(processes: list[dict[str, object]]) -> set[int]:
+    """This tool's own pids: itself and everything that started it.
+
+    `./ri health <run>` carries the run directory in its own arguments, and so
+    do the `ri` and the shell above it, so without this the tool is part of
+    what it measures: a finished run with no ranks left still reported
+    `resources 0.1GB resident over 3 processes`, and the CPU sample in `main`
+    spent its second measuring this process.
+    """
+    parents = {int(p["pid"]): int(p.get("ppid", 0) or 0) for p in processes}
+    tree, pid = set(), os.getpid()
+    while pid > 1 and pid not in tree:
+        tree.add(pid)
+        pid = parents.get(pid, 0)
+    return tree
 
 
 def rank_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -1797,6 +1820,34 @@ def self_check() -> None:
             # the process table and these reads are a moment apart, and a rank
             # exiting between them is ordinary.
             assert swap_mb([]) == {} and swap_mb([-1]) == {}
+
+            # The ppid column, against the real `ps`: this process's parent
+            # has to be in its own tree, or the tool counts itself as part of
+            # the run below.
+            assert {os.getpid(), os.getppid()} <= own_process_tree(table)
+
+            # `./ri health <run>` puts the run directory in this process's
+            # arguments and in its parent's, so a finished run reported by
+            # path used to come back holding "0.1GB over 3 processes" - the
+            # tool measuring itself. A process that is neither must still
+            # count.
+            # Not created: nothing here reads the directory, and a stray one
+            # under NESTED_SAMPLING_DIR would be a run to every glob below.
+            named = NESTED_SAMPLING_DIR / "named-by-argument"
+            marker = str(named.resolve())
+            self_named = [
+                {"pid": os.getpid(), "ppid": os.getppid(), "alive": True,
+                 "elapsed_seconds": 1.0, "cpu_seconds": 1.0, "rss_mb": 50,
+                 "args": f"python3 nested-sampling-health.py {marker}"},
+                {"pid": os.getppid(), "ppid": 1, "alive": True,
+                 "elapsed_seconds": 1.0, "cpu_seconds": 1.0, "rss_mb": 50,
+                 "args": f"ri health {marker}"},
+            ]
+            assert run_processes(named, self_named) == []
+            stranger = {"pid": -7, "ppid": 1, "alive": True, "elapsed_seconds": 1.0,
+                        "cpu_seconds": 1.0, "rss_mb": 3300,
+                        "args": f"python3 r2d2_serve.py --fifo-dir {marker}/.r2d2-workers"}
+            assert run_processes(named, self_named + [stranger]) == [stranger]
 
             # `[[dd-]hh:]mm:ss` in every form ps prints it.
             assert _clock_seconds("00:12") == 12
