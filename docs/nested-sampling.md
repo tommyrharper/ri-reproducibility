@@ -305,6 +305,10 @@ so the rank that asked for that simulate blocked forever, and because PolyChord
 keeps every rank in the same collective, the other 19 burned a core each behind
 it. A 20-rank run left overnight came back stopped rather than finished.
 
+Those burning ranks are not the symptom: a rank blocked in a collective spins
+whether its peer is wedged or imaging perfectly normally, so the count on its
+own says nothing. "Is the run healthy?" below has the measurements.
+
 Three bounds now stand in the way, each one shorter than the one outside it:
 
 | Bound | Where | What it does when it expires |
@@ -343,6 +347,15 @@ R=$(ls -1dt results/nested-sampling/wsclean-* | head -1)
 cat "$R"/evaluations/*/meqserver-wedged.log 2>/dev/null | wc -l
 ```
 
+If a wedge ever gets past all three, one of the bounds has a bug, and
+`./ri health` reports it as ranks burning CPU with nothing completing. To
+localise it by hand: the stuck evaluation is the old `evaluations/eval-*`
+directory with no `metrics.json` and two zero-byte simulate logs, and the rank
+waiting on it is the one holding that worker's FIFO pair open, so
+`ls -l /proc/<pid>/fd` matched against `.simulate-workers/<n>` names the
+worker. The deadlock itself is that worker and its `meqserver` child both
+parked in `futex_wait_queue_me` at 0% CPU.
+
 ### Is the run healthy?
 
 `./ri runs` answers "did it finish?". `./ri health` answers the question you
@@ -351,8 +364,7 @@ have while one is still going:
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 113 dead points as of 8m18s ago, next at 163+
-  at risk   184 evaluations scored since that checkpoint, 8m18s of imaging a restart would redo
+  stage     sampling, 173 dead points as of 1:14:00 ago, next past ~223
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 2s ago, 27.3/min over 47m06s
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 7m29s slice
@@ -469,63 +481,25 @@ What each line is reading, and why it is worth a line:
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
   stops a reader doing so either. An age of an hour or more is ordinary rather
-  than alarming, and it grows as a run goes on: one 16-rank R2D2 search took
-  31 minutes to its first checkpoint and 72 more to its second, because each
-  batch of `nlive` dead points costs more likelihood evaluations than the last
-  (its `<nlike>` went 14.10 to 32.50 over the same two). So a later reading
-  longer than an earlier one is the expected shape, not a slowdown. `next at`
-  appears only while the run is going: a finished or dead run's count will
-  never move again, and promising it a next value is the one thing that would
-  make its stale-by-design checkpoint read as work still to come.
-
-  It is written `163+` rather than `~163` because `nlive` is a floor on the
-  interval, not an estimate of it. Two throwaway WSClean searches here logged
-  every write: at `--nlive 20` the gaps ran 22, 23, 22, 26, 26 and 36 dead
-  points, and at `--nlive 50` they ran 51, 51, 52, 54 and 92 - never under
-  `nlive`, usually a little over, and largest for the write that ends the run.
-  A `~` invited the reading that a checkpoint which has not landed by then is
-  overdue, and on the live 16-rank R2D2 search here that reading was wrong for
-  hours at a stretch.
-- **at risk** - what standing behind that checkpoint would cost, which is the
-  half of `8m18s ago` a reader cannot work out alone: the evaluations scored
-  since the checkpoint, and the imaging time they took. A restart or a
-  `./ri resume` picks the sampler up at the checkpoint's dead points and images
-  its way back over different proposals, so none of that work is reused.
-  Measured, because the opposite is true of the other case and is written into
-  `polychord_r2d2.py`: a WSClean search killed after its checkpoint and resumed
-  shared exactly the 122 evaluations it had scored before the kill with an
-  uninterrupted control from the same seed, and *none* of the 146 it scored
-  after the resume. The seed makes a run deterministic from its start, which is
-  what makes a restart with no `.resume` file free - it redraws the same points
-  and the point cache answers them - but a resume re-seeds and then skips ahead
-  to the checkpoint, so the stream no longer lines up with the points on disk.
-  Downtime inside the window comes out of the time, the same way it comes out
-  of every rate here. Reported and **never warned on**: on a healthy run this
-  only grows until the next checkpoint lands, and there is nothing to do about
-  it - four hours of it on the 16-rank R2D2 search here was the ordinary
-  end-of-run shape, not a fault. A finished run does not print it, having
-  nothing left to redo.
+  than alarming, and the interval varies a lot: one 16-rank R2D2 search
+  checkpointed at 31, 103, 170, 305, 455 and 592 minutes. The first interval
+  is short because the run's startup counts toward it; the rest are not a
+  property of PolyChord to extrapolate from, because the interval is a
+  *consequence* of two things that both move - how fast evaluations land, and
+  how many of them each dead point costs. Between the third checkpoint and the
+  fourth both moved at once, throughput down about 30% and likelihood calls
+  per dead point up 43% (29.0, 30.7, then 43.8), and neither alone explains
+  the doubling. The next two steps went the other way: 134 minutes to 150 with
+  cost flat, then 150 to 137 while cost rose a further 39%. Consecutive
+  intervals can differ by 2x with nothing wrong, in either direction.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
-  stuck at once. On a run with no ranks left they are counted as *abandoned*
-  instead - what the ranks were holding when it died, not work still going.
-- **activity** - the overall rate, and the rate over the last 50 evaluations
-  when the two have diverged. Both are evaluations over elapsed time, which is
-  the only way to read one against the other: the recent one used to be taken
-  from the *median* gap of that window while the overall one is the count over
-  the span, and the median gap is shorter than the mean whenever a run stalls
-  at all. On the live 16-rank R2D2 search that gap-median rate read 26.8/min
-  against an overall 22.5/min - a speedup - at a moment the divergence gate had
-  fired on a slowdown, and against a recent occupancy (25% of 16 ranks at 17.8s
-  an evaluation) that independently says 14/min. Measured the same way as the
-  overall, it reads 14.2/min. Nothing was lost by dropping the median's
-  robustness: walking both gates over every moment of that run, the mean ratio
-  crosses the 2x threshold in 9.1% of 10,720 sampled moments against the median
-  ratio's 10.2%, and over a 1,051-moment WSClean run neither fires at all.
-  A run can collapse to a fraction of its own throughput without ever going
-  quiet long enough to look stalled, and that
+  stuck at once.
+- **activity** - the overall rate, and the rate over the most recent tenth of
+  the run when the two have diverged. A run can collapse to a fraction of its
+  own throughput without ever going quiet long enough to look stalled, and that
   state passes every other check here: on a live 16-rank R2D2 search, 25/min
   fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
   Both numbers are shown and **neither is warned on**, because the same run
@@ -553,162 +527,37 @@ What each line is reading, and why it is worth a line:
   throughput, and dividing by it printed things like `6176.5/min over
   0s`. The same floor silences **history**, twenty times over.
 
-  Both rates are medians of the gaps between evaluations, not counts in a
-  window, and that is deliberate: the most recent window is always partial, so
-  it reads low by whatever fraction of it has not elapsed. On this run,
-  mid-window, the partial bucket said 23.8/min against a 91-165 per five
-  minutes baseline - a collapse, apparently - while the gaps said 52.5/min and
-  the bucket finished at 164, the highest of the run. A gap cannot be measured
-  until both of its ends exist, so there is no partial window to misread. The
-  one thing gaps cannot see is a stall that began *after* the last completed
+  Both are evaluations divided by the time they took, so the two can be
+  compared. Two things about how that window is drawn, each got wrong first.
+
+  Its ends are both completed evaluations, never "the last N minutes" - a
+  clock window is always partial, so it reads low by whatever fraction has not
+  elapsed, which at the moment of sampling is indistinguishable from a
+  slowdown: a partial five-minute bucket on this run said 23.8/min against a
+  91-165 baseline, apparently a collapse, and finished at 164, the highest of
+  the run. What it cannot see is a stall beginning *after* the last completed
   evaluation, which is what the idle thresholds cover; the two look redundant
   and are complementary.
 
-  Do not conclude from a falling rate that the evaluations got harder -
-  **imaging** below is what answers that, and on this run it answered *no*.
-  Whether a falling rate means stragglers is a third question, answered by the
-  *spread* of `metrics.json` `timing.image_container_seconds` rather than its
-  median: a fat tail is one slow evaluation gating a batch, while a tight
-  distribution (that run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means
-  the missing wall clock is going into sampler overhead, contention or
-  synchronisation. The three want different responses.
-- **history** - the same throughput binned into twenty equal slices of the
-  run's own life, scaled to its own peak. The two rates above are the only
-  numbers here that change over time, and as numbers they cannot show the
-  *shape*: a dip that recovered and a step down that did not read identically
-  on the way past each other. The collapse-and-recovery described above -
-  bins of 104, 23, 26, 93 against a 104-165 baseline - is an obvious V here
-  and an ordinary-looking slowdown from the two rates alone. A slice where
-  nothing landed is marked `·` rather than drawn as merely slow. Binned over
-  first-to-last evaluation, never up to now, for the partial-window reason
-  above; how long ago the last one landed is **activity**'s job.
-- **imaging** - what one evaluation costs the imager, and how much of the
-  run's hardware that cost is being spread over. The arrival rate in
-  **activity** cannot tell a slower imager from idle ranks: both read as fewer
-  evaluations a minute. `metrics.json` carries the imager's own wall clock, and
-  this scan already reads every one of those files in full, so the median costs
-  a regex over a string already in memory and no extra I/O.
-  Beside it, the imaging seconds the run has banked per second of wall clock,
-  as a percentage of the ranks it was given: 3,281 seconds of imaging over 898
-  of wall clock is 3.7 of 8 ranks kept busy. It is the only place in the report
-  where memory a run is *holding but not using* shows up as such.
-  A total over the window rather than the ratio of the two medians, which is
-  what this was first written as and read systematically high - a duty cycle is
-  seconds worked over seconds elapsed, and the median gap is shorter than the
-  mean the moment a run stalls at all, so the live R2D2 search printed a
-  clamped "100% busy" over a life its own slices put at 6-88%. Two figures in
-  one report disagreeing about the same thing is worse than either.
-  Both are shown over the last 50 evaluations too when either has moved
-  materially - which is how the live R2D2 search's 5-fold slowdown was
-  diagnosed: 25.4s at 66% over its life against 12.3s at 6% over its last 50,
-  so the imager had got twice as *fast* while fifteen of its sixteen ranks -
-  and the ~44GB they hold - went idle waiting on the sampler.
-  Clamped at 100%: an evaluation is banked at the moment it finished while its
-  cost was spent before that, so a window can hold more imaging seconds than it
-  had rank-seconds to spend and the raw ratio would print "23 of 16".
-  Reported, never warned on. Every WSClean run on this host ends its last 50
-  evaluations near 23% simply by shutting down, and the live R2D2 run's own
-  twenty slices ranged 4.4 to 23.1 effective ranks with no fault - there is no
-  threshold here that would not mostly fire on ordinary phases. Withheld
-  entirely below the same one-second span floor as the rate, where the elapsed
-  time is mtime granularity and the ratio is a division by noise.
-- **occupancy** - that same duty cycle binned into the twenty slices
-  **history** uses, which is the only line here that says whether the hardware
-  a run is holding has been earning its keep *all along* or only at the moment
-  it was asked. **history** cannot answer that: the imager's own cost drifts as
-  the search concentrates, so the live R2D2 run got twice as fast per
-  evaluation while its arrival rate fell fivefold, and **history** drew a
-  collapse over a stretch the ranks were merely idle for.
-  Per slice: imaging seconds landed, over the rank-seconds the slice had to
-  spend. The scale is absolute rather than **history**'s peak-relative one,
-  because a duty cycle has a natural full - a solid bar is every rank imaging,
-  and a bar that never leaves the floor is a run that should have been given
-  fewer ranks or a larger `--nlive`. Free: the costs and the slicing are both
-  already computed for the two lines above. Withheld when `run.env` does not
-  record `NS_MPI_PROCS`, since without a rank count there is no denominator.
-- **sampler** - PolyChord's own running total, out of `chains/*.stats`, which
-  it rewrites at every checkpoint. Every other line here is operational; this
-  is the number the search exists to produce, and `logZ` moving is the only
-  direct evidence that the sampler is integrating rather than merely running.
-  The likelihood calls per dead point beside it is the sampler's efficiency -
-  what the evaluation rate in **activity** is being *spent* on. A run whose
-  rate holds while this climbs is working just as hard for less, which no
-  other line here can show.
-- **forecast** - how far through the search is, and how long is left. With
-  `--max-ndead -1`, the default for a real search, there is otherwise no
-  denominator anywhere: a run could be reported healthy and fast for three
-  days without this report ever saying whether it was a tenth done or nearly
-  finished. Nested sampling supplies one. Each dead point shrinks the prior
-  volume by the same factor, so `exp(-ndead/nlive)` is what is left of it; the
-  evidence still to come is that volume times the mean likelihood of the live
-  points now in it (`chains/*_phys_live.txt`), and PolyChord stops when that
-  falls to a fixed fraction of the evidence already banked. The volume shrinks
-  one e-fold per `nlive` dead points, which turns "how much further that ratio
-  has to fall" into a count of dead points, and the run's own dead-point rate
-  turns that into hours.
+  And it is bounded on both axes, because a run varies on both. In evaluations
+  it is a share of the run, since a fixed count covers a wildly different span
+  depending on pace - fifty evaluations is two minutes at 25/min and ten at
+  5/min, so the window grows exactly when the run slows (the last fifty here
+  swung 4.9, 31.5, 37.6 where a tenth gave 28.1, 37.6, 33.4 over the same
+  samples). In time it is capped at half an hour, since a share of the run
+  grows without limit: seven and a half hours in, a tenth had reached 62
+  minutes, and a real half-hour slowdown to a third of the run's pace diluted
+  against the recovered half hour before it and did not show at all.
 
-  The wait is printed twice, as a duration and as the clock time it ends at
-  (`~2h11m left (~14:37)`, local time, gaining a day name - `~9d 6h left
-  (~Thu 12:00)` - once it is not today). The duration is the measurement and
-  stays first; the clock time is the arithmetic the reader would otherwise do
-  against `date` to answer the only question a multi-hour wait raises, which
-  is when to come back.
-
-  The position within that total does not wait for the next checkpoint.
-  PolyChord rewrites `chains/` every `nlive` dead points, so `ndead` is frozen
-  between writes and everything derived from it sits still and then jumps by
-  fifty: the live 16-rank R2D2 search read `~38% done, ~8h12m left` two hours
-  into an interval that ended with it past half way. The evaluation
-  directories are not frozen, and the sampler spends a near-constant number of
-  them per dead point, so the evaluations banked *since* the checkpoint convert
-  straight back into dead points (`dead_points_now`). The total still comes
-  from the checkpoint's own `ndead`, because the `log(Z)` and live points it
-  needs were written by the same checkpoint; only the position is carried, and
-  it is printed with its own `~` whenever it differs from the checkpointed
-  count. **stage** still reports the raw count with its age, which is the
-  honest statement of what PolyChord last wrote down.
-
-  A carried count can walk past an estimated total, because the total is only
-  as fresh as the checkpoint it came from. The arithmetic then gives `~100%
-  done, ~452 of ~452 dead points` and no hours left, which the live 16-rank
-  R2D2 search here printed for over three hours while it was still sampling -
-  the one reading of this line that is flatly wrong. A run that has overtaken
-  its own estimate says so instead:
-
-  ```
-  forecast  past its ~452 dead-point estimate, set by the checkpoint 3h37m ago and revised by the next one
-  ```
-
-  An explicit `--max-ndead` is different and keeps the ordinary words: it is a
-  hard stop the sampler will honour, so 100% of it is the truth.
-
-  Measured against a live wsclean search (`--nlive 5 --num-repeats 2
-  --mpi-procs 3`, 48 dead points over six checkpoint writes): sampled once a
-  second, the carried count immediately before each write was 0, +7, 0, +1,
-  -1 and -5 out of what that write then revealed, where the raw count was
-  short by the whole write every time (-7, -7, -6, -7, -6, -9).
-
-  The stopping fraction is measured rather than taken from the documentation.
-  `precision_criterion` defaults to 1e-3, but the two searches on this host
-  that ran to natural termination (wsclean, nlive=50, seeds 123 and 372)
-  stopped at 446 and 463 dead points where 1e-3 predicts 350 for both; the
-  ratio they actually reached was 1.3e-4 and 9.6e-5. Calibrated to their mean
-  (`TERMINATION_EVIDENCE_RATIO`), replaying those two runs through the shipped
-  code forecasts 452-459 from `ndead=100` onward - within 3% of both, and
-  stable across the whole run rather than drifting. It also holds at a very
-  different `nlive`: a wsclean search at `--nlive 5 --max-ndead -1` was watched
-  live from 12% onward forecasting 45-47 dead points, and terminated naturally
-  at 47. Recalibrate there if a PolyChord upgrade or a non-default
-  `precision_criterion` moves it - and in `_NS_TERMINATION_EVIDENCE_RATIO` in
-  `scripts/lib/progress-bar.sh`, whose pinned status line forecasts from the
-  same model so that the bar and this line cannot disagree; its self-check
-  fails if the two copies drift.
-
-  Withheld inside the first e-fold, where the live set is still the prior and
-  the estimate would be reporting its own constant rather than this run, and
-  withheld from a run that is not going: a stopped run's remaining dead points
-  are not remaining, they are lost. An explicit `--max-ndead` is a hard stop
-  the sampler hits first, so it is used directly and printed without the `~`.
+  Two things not to conclude from a falling rate. It does not mean the
+  evaluations got harder: on that run per-evaluation cost was *falling* at the
+  same time, because the search was converging on cheaper parameters. And
+  whether it means stragglers is answered by the spread of
+  `metrics.json` `timing.image_container_seconds`, not by the rate - a fat
+  tail is one slow evaluation gating a batch, while a tight distribution (that
+  run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means the missing wall
+  clock is going somewhere other than the likelihood, into sampler overhead,
+  contention or synchronisation. The two want different responses.
 - **ranks** - found by the `--output-dir` they were launched with, so no ranks
   means no run. `busy-waiting` counts the ranks that spent a whole one-second
   sample on CPU. Open MPI's `ob1` busy-waits, so a rank blocked in a collective
@@ -2145,12 +1994,12 @@ up as its own card automatically. Evidence prefers a `log_z` /
 `log_z_err` pair already in the summary (written for merged runs); otherwise
 it parses PolyChord `chains/*.stats` for log(Z). It shows
 each run's total wall-clock duration (from `total_wall_seconds`, when present)
-top-right in the card header. Per-run images - the shared synthesized
+top-right in the card header. The run page itself carries only the
+best-effort `anesthetic` KDE contour corner plot, so it loads without
+decoding one raster per evaluation; per-run images - the shared synthesized
 ground-truth image and a per-evaluation card gallery (reconstruction,
-objective, and searched parameters) - sit in an Images tab, and the
-best-effort `anesthetic` KDE contour corner plot sits in a Likelihood tab, both inside
-one collapsed-by-default details block, separate from the collapsed raw
-metrics table. Corner plots are weighted by the raw log-likelihood (the
+objective, and searched parameters) - live on their own
+`<run>-images.html` page, linked from the run page and written alongside it. Corner plots are weighted by the raw log-likelihood (the
 failure score), not by nested-sampling posterior mass. Runs are ordered newest-first by the UTC timestamp in the
 run directory name.
 

@@ -220,14 +220,16 @@ DEFAULT_STALE_SECONDS = 600.0
 # something well inside a minute.
 SPIN_IDLE_SECONDS = 60.0
 
-# Evaluations in the "how is it going now" window, and how far it has to
-# diverge from the run's own median before both numbers are worth printing
-# rather than one. Doubled rather than half again, because a healthy run's own
-# pace is noisier than it looks: five minute bins over 107 minutes of one
-# ranged 91-165 with no fault present. Walking that run's history, this fires
-# at 269 sampled moments in 15% of them at 1.5x and 5% at 2.0x, and the knee is
-# where the ordinary swing stops and the one real event starts.
+# The "how is it going now" window - a tenth of the run, never fewer than this
+# many evaluations, never longer than the cap - and how far it must diverge
+# from the run's overall pace before both numbers are worth printing.
+# Doubled rather than half again because a healthy run's pace is noisier than
+# it looks: five-minute bins over 107 fault-free minutes ranged 91-165. Across
+# 269 sampled moments of that run the display fires in 15% at 1.5x and 5% at
+# 2.0x, the knee where ordinary swing stops and real events start.
 RATE_WINDOW = 50
+RATE_WINDOW_DIVISOR = 10
+RATE_WINDOW_MAX_SECONDS = 1800.0
 RATE_DIVERGENCE_FACTOR = 2.0
 
 # Below this much elapsed time, dividing a count by it measures mtime
@@ -814,54 +816,47 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
 
     span = _elapsed(0)
 
-    # How the run is going now against how it has gone, as a ratio of mean
-    # gaps - which is to say, of throughput, because evaluations over elapsed
-    # time (`rate` below) *is* the mean gap inverted.
+    # How the run is going now against how it has gone. Both rates are
+    # evaluations divided by the time they took, so the two can be divided.
+    # The recent one used to be 60 / median(recent gaps), a different quantity
+    # from the count-over-span beside it: 33.3/min against 18.2 at one instant
+    # where an independent thirty-minute window said 17.0.
     #
-    # The mean and not the median, even though the median is the more robust
-    # statistic, because this number is printed beside `rate` and has to be
-    # the same measurement to be read against it. The median gap is shorter
-    # than the mean whenever a run stalls at all - the same trap `_duty` below
-    # documents - so a median-gap rate reads systematically high: on the live
-    # 16-rank R2D2 search the two spellings of "overall" were 38.2/min (median
-    # gap) against 22.6/min (elapsed), and the report could print "22.6/min
-    # over 7:54:22 (22.5/min over the last 50)" at the moment the median ratio
-    # declared a 1.7x change. The robustness the median was there for costs
-    # nothing to give up here: walking both gates over every moment of that
-    # run, the mean ratio crosses RATE_DIVERGENCE_FACTOR in 9.1% of 10,720
-    # sampled moments against the median ratio's 10.2%, and over a 1,051-moment
-    # WSClean run neither fires at all. Quieter, not noisier - a single long
-    # gap moves a 50-sample mean by a fiftieth of itself, and the stalls this
-    # workload actually produces are tens of seconds, not thousands.
+    # Both ends of the window are completed evaluations, never "the last N
+    # minutes" - a clock window is partial, so it reads low by however much has
+    # not elapsed, which at the moment of sampling is indistinguishable from a
+    # slowdown. One partial five-minute bucket read 23.8/min against a 91-165
+    # baseline, then finished at 164, the highest of the run.
     #
-    # Gaps rather than "evaluations in the last N minutes", which is the
-    # obvious simplification and is wrong: the most recent window is always
-    # partial, so it reads low by exactly the fraction of it that has not
-    # elapsed yet, and at the moment of sampling that is indistinguishable from
-    # a real slowdown. Measured on a live run mid-window - 23.8/min from the
-    # partial bucket against a 91-165 per five minutes baseline, which looks
-    # like a collapse starting, where the gaps said 52.5/min and the bucket
-    # went on to finish at 164, the highest of the run. An inter-arrival gap
-    # cannot be measured until both ends exist, so there is no partial window
-    # to misread.
+    # Bounded on both axes because a run varies on both. In evaluations, a
+    # share of the run: a fixed fifty is two minutes at 25/min and ten at
+    # 5/min, so it grows exactly when the run slows (last-fifty swung 4.9,
+    # 31.5, 37.6 where a tenth gave 28.1, 37.6, 33.4). In time, capped, because
+    # a share grows without limit: seven and a half hours in a tenth reached 62
+    # minutes, and a real half-hour slowdown to a third of the run's pace
+    # diluted to 1.36x and did not show.
     #
-    # The one thing gaps cannot see is a stall that began after the last
-    # completed evaluation, because that open-ended interval has no far end
-    # yet. last_activity_seconds is exactly that interval, and the idle clauses
-    # in describe() are what cover the hole. The two look redundant and are
-    # complementary; do not drop either.
-    #
-    # Written through `_elapsed` rather than as a mean of gaps because the two
-    # are the same number - the mean gap over a window *is* its elapsed time
-    # divided by its gap count - and only `_elapsed` drops a restart's or a
-    # resume's downtime. A resume lands inside the last RATE_WINDOW gaps
-    # exactly when someone is watching the run it continued.
-    recent_rate, slowdown = None, None
-    if len(gaps) >= 2 * RATE_WINDOW:
-        recent = _elapsed(len(gaps) - RATE_WINDOW) / RATE_WINDOW
-        overall = span / len(gaps)
-        recent_rate = 60 / recent if recent > 0 else None
-        slowdown = recent / overall if overall > 0 else None
+    # None of it sees a stall beginning after the last completed evaluation;
+    # last_activity_seconds and the idle clauses in describe() cover that. The
+    # two look redundant and are complementary; do not drop either.
+    recent_rate, slowdown, recent_span = None, None, None
+    window = max(RATE_WINDOW, len(times) // RATE_WINDOW_DIVISOR)
+    if len(times) >= 2 * window:
+        recent_times = times[-window:]
+        # Capped, but never below the floor: a run too slow to fit fifty
+        # evaluations inside the cap still gets a sample, just a longer one.
+        cutoff = times[-1] - RATE_WINDOW_MAX_SECONDS
+        capped = [t for t in recent_times if t >= cutoff]
+        if len(capped) >= RATE_WINDOW:
+            recent_times = capped
+        # Through _elapsed, so a restart's or a resume's downtime comes out of
+        # this window exactly as it comes out of the span beside it - a resume
+        # lands inside it precisely when someone is watching the run.
+        recent_span = _elapsed(len(times) - len(recent_times))
+        overall_rate = len(times) * 60 / span if span > 0 else None
+        if recent_span > 0 and overall_rate:
+            recent_rate = len(recent_times) * 60 / recent_span
+            slowdown = overall_rate / recent_rate if recent_rate > 0 else None
 
     # What one evaluation costs the imager, against how fast evaluations are
     # arriving. The arrival rate alone cannot separate "the imager got slower"
@@ -960,6 +955,7 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
         "recent_failed": recent_failed,
         "evals_per_minute": rate,
         "recent_evals_per_minute": recent_rate,
+        "recent_span_seconds": recent_span,
         "seconds_per_evaluation": cost,
         "recent_seconds_per_evaluation": recent_cost,
         "peak_memory_bytes": peak_memory,
@@ -1954,23 +1950,20 @@ def render(run: dict[str, object]) -> None:
     idle = run["last_activity_seconds"]
     rate = run["evals_per_minute"]
     slowdown = run["slowdown_factor"]
-    # Where the count will next move to, so a reader who comes back has
-    # something to compare against rather than a number that looks stuck. Only
-    # for a run that is still going: a finished or dead run's count will never
-    # move again, and promising a next value is the one thing that would make
-    # its stale-by-design mtime read as work still to come.
-    #
-    # `nlive` is a floor on that interval, not an estimate of it, so the number
-    # carries a `+` rather than a `~`: measured over two throwaway WSClean
-    # searches here, the gap between writes ran 22-36 dead points at nlive=20
-    # and never came in under nlive. A `~` invited the opposite reading, that a
-    # checkpoint which had not landed by then was overdue - and that reading is
-    # wrong often enough to be worth not offering.
+    # Where the count will next move past, so a reader coming back has
+    # something to compare against rather than a number that looks stuck.
+    # "past" because nlive is the cadence PolyChord checkpoints on, not the
+    # size of the jump: six writes on one nlive=50 run moved the count by 57,
+    # 56, 60, 57, 56, 56. A floor, not a band fitted to those - a short series
+    # cannot carry one, which is the over-reading this line exists to prevent.
+    # Only for a run still going: a finished or dead run's count never moves
+    # again, and promising a next value would make it read as work still to
+    # come.
     next_update = ""
     if run["status"] in ("healthy", "stalled", "starting") \
             and settings.get("NS_NLIVE", "").isdigit() \
             and run["checkpoint_age_seconds"] is not None:
-        next_update = f", next at {int(run['dead_points']) + int(settings['NS_NLIVE'])}+"
+        next_update = f", next past ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
     lines = [
         # Only for a run this checkout did not start. The default report now
         # reaches every run with ranks on the host, and two worktrees' runs
@@ -2016,10 +2009,12 @@ def render(run: dict[str, object]) -> None:
                      # as a report of the wrong run.
                      + (f" + {format_elapsed(float(run['downtime_seconds']))} stopped"
                         if rate and float(run["downtime_seconds"] or 0) >= 1 else "")
-                     # Only when the run has changed pace materially, in either
-                     # direction: the two numbers agreeing says nothing.
+                     # Only when pace has changed materially, either
+                     # direction: two agreeing numbers say nothing. Labelled in
+                     # time, not evaluations - the window is a share of the
+                     # run, so its span is what the reader needs.
                      + (f" ({run['recent_evals_per_minute']:.1f}/min over the last "
-                        f"{RATE_WINDOW})"
+                        f"{format_elapsed(float(run['recent_span_seconds']))})"
                         if slowdown is not None and (
                             float(slowdown) > RATE_DIVERGENCE_FACTOR
                             or float(slowdown) < 1 / RATE_DIVERGENCE_FACTOR) else "")),
@@ -2642,9 +2637,10 @@ def self_check() -> None:
             assert 590 < float(report["checkpoint_age_seconds"]) < 620, report
             aged = io_capture(report)
             assert "3 dead points as of 10m00s ago" in aged, aged
-            # ...and where it will next move to, so a reader coming back has
-            # something to compare against. nlive is 4 in this fixture.
-            assert "next at 7+" in aged, aged
+            # ...and where it next moves past. nlive is 4 here, and the
+            # bound is a floor: the count overshoots nlive, by 57, 56 and 60
+            # on one nlive=50 run.
+            assert "next past ~7" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report
@@ -3319,13 +3315,13 @@ def self_check() -> None:
             shutil.rmtree(fresh)
             # A stalled run's count can still move; a stopped one's cannot, so
             # only the first may say where it will move to.
-            assert "next at 7+" in io_capture(describe(live, ranks, 5.0))
-            assert "next at" not in io_capture(describe(live, [], 5.0))
+            assert "next past ~7" in io_capture(describe(live, ranks, 5.0))
+            assert "next past" not in io_capture(describe(live, [], 5.0))
             # ...and once it finishes, neither is true however old it gets.
             (live / "summary.json").write_text("{}")
             assert describe(live, [], 5.0)["status"] == "finished"
             assert describe(live, [], 5.0)["warnings"] == []
-            assert "next at" not in io_capture(describe(live, [], 5.0))
+            assert "next past" not in io_capture(describe(live, [], 5.0))
 
             # Half a summary.json is not a finished run: it is one no report,
             # merge or profile can read, and calling it finished was the worst
@@ -3425,21 +3421,16 @@ def self_check() -> None:
             # timeout - which is exactly why the rate had to be measured.
             assert report["status"] == "healthy", report
             assert float(report["last_activity_seconds"]) < SPIN_IDLE_SECONDS, report
-            assert abs(float(report["recent_evals_per_minute"]) - 5) < 0.5, report
-            # 260 evaluations over 919s is 17.0/min, and the last 50 arrive at
-            # 5/min: a 3.4-fold drop. The gate that decides whether both
-            # numbers are printed has to be the ratio of exactly those two
-            # numbers, or the report announces a change of one size and shows
-            # one of another - measuring the recent rate off median gaps and
-            # the overall off elapsed time put 12 here while the rendered pair
-            # read 3.4.
-            assert abs(float(report["slowdown_factor"]) - 3.4) < 0.1, report
-            # To within the fencepost - `rate` divides by the span while the
-            # gate divides by the mean of the N-1 gaps inside it - and nowhere
-            # near the 3.5-fold disagreement the old spelling produced.
-            assert abs(float(report["evals_per_minute"])
-                       / float(report["recent_evals_per_minute"])
-                       / float(report["slowdown_factor"]) - 1) < 0.02, report
+            # Both rates are evaluations over the time they took, so they
+            # divide: 60/min over the fast phase, 5 over the collapse, 17
+            # overall since the fast phase is most of the run. Median-of-gaps
+            # would read 5 against 60 and call it a twelvefold collapse.
+            assert abs(float(report["recent_evals_per_minute"]) - 5.1) < 0.2, report
+            assert abs(float(report["evals_per_minute"]) - 17.0) < 0.2, report
+            assert abs(float(report["slowdown_factor"]) - 3.3) < 0.2, report
+            # The window reports the time it covers, not a count: the last
+            # fifty of this run's 8,8,8,24 cycle are ten minutes of it.
+            assert abs(float(report["recent_span_seconds"]) - 600) < 2, report
             # Measured and shown, never warned on: a run that halves its pace
             # and recovers is a phase, and warning on it would teach the reader
             # to ignore the warnings that mean something.
@@ -3549,9 +3540,10 @@ def self_check() -> None:
             assert flat["busy_ranks"] is None, flat
             assert "% busy" not in io_capture(flat), io_capture(flat)
             rendered = io_capture(report)
-            # The pair as a reader sees it: 17.0 against 4.9 is the same
-            # 3.4-fold drop `slowdown_factor` gated on, in the same units.
-            assert "17.0/min over 15m19s (4.9/min over the last 50)" in rendered, rendered
+            # The pair as a reader sees it, in the same units, and the
+            # recent window labelled by the time it covers.
+            assert "17.0/min over 15m19s" in rendered, rendered
+            assert "5.0/min over the last 10m00s" in rendered, rendered
             # The same collapse as a shape: the healthy phase fills the early
             # slices to the peak and the collapse empties the late ones, which
             # is the difference two numbers cannot show.
@@ -3630,6 +3622,36 @@ def self_check() -> None:
             # Too few evaluations to compare a window against a history: no
             # ratio at all rather than one drawn from a handful of gaps.
             assert describe(live, ranks, DEFAULT_STALE_SECONDS)["slowdown_factor"] is None
+
+            # The window is bounded in wall clock as well as in evaluations.
+            # A tenth of a long run reaches back further and further, until
+            # "recent" stops meaning recent - seven hours into one search it
+            # had grown to 62 minutes and hid a real half-hour slowdown.
+            def evenly_spaced(name: str, count: int, spacing: float) -> Path:
+                run = NESTED_SAMPLING_DIR / name
+                (run / "chains").mkdir(parents=True)
+                for i in range(count):
+                    eval_dir = run / "evaluations" / f"eval-{i:05d}-a"
+                    eval_dir.mkdir(parents=True)
+                    metrics = eval_dir / "metrics.json"
+                    metrics.write_text("{}")
+                    when = now - (count - i) * spacing
+                    os.utime(metrics, (when, when))
+                return run
+
+            # A tenth is 100 evaluations spanning 2000s, so the cap trims it to
+            # the last 1800s - which still holds 90, comfortably over the floor.
+            long_run = evenly_spaced("r2d2-vlaa-20260101T035000Z", 1000, 20.0)
+            capped = describe(long_run, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(capped["recent_span_seconds"]) - 1800) < 40, capped
+
+            # But the floor outranks the cap: at one evaluation a minute the
+            # cap would leave 30, so the window stays at the proportional 60
+            # and reaches back further than the cap asks. A short sample is
+            # worse than a long one.
+            slow_run = evenly_spaced("r2d2-vlaa-20260101T040000Z", 600, 60.0)
+            floored = describe(slow_run, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(floored["recent_span_seconds"]) - 3540) < 120, floored
 
             # A run whose imager is broken: every count healthy, every point
             # worthless. This is the one the other checks cannot see.

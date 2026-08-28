@@ -1005,36 +1005,6 @@ def objective_fill(objective, obj_min, obj_max):
     return 1.0
 
 
-def run_tab_id(run_name):
-    """Sanitize a run directory name into a valid unique HTML id fragment."""
-    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", run_name).strip("-") or "run"
-    digest = hashlib.sha1(run_name.encode()).hexdigest()[:8]
-    return f"{sanitized}-{digest}"
-
-
-def render_images_likelihood_collapsible(tab_id, eval_images_html, likelihood_html):
-    """Collapsed-by-default Images / Likelihood tabs for one nested-sampling run."""
-    if not eval_images_html and not likelihood_html:
-        return ""
-    safe_id = html.escape(tab_id)
-    tabset = f"""
-    <div class="run-media-tabset">
-      <input type="radio" class="tab-images-radio" name="tabs-{safe_id}" id="tab-images-{safe_id}">
-      <label for="tab-images-{safe_id}">Images</label>
-      <input type="radio" class="tab-likelihood-radio" name="tabs-{safe_id}" id="tab-likelihood-{safe_id}" checked>
-      <label for="tab-likelihood-{safe_id}">Likelihood</label>
-      <div class="tab-panel tab-panel-images">{eval_images_html}</div>
-      <div class="tab-panel tab-panel-likelihood">{likelihood_html}</div>
-    </div>
-    """
-    return f"""
-    <details>
-      <summary>Run images and likelihood</summary>
-      {tabset}
-    </details>
-    """
-
-
 # Categorical slot per top-level stage, assigned by identity and never by size,
 # so a stage keeps its colour whether or not the other stages are present.
 PROFILING_STAGE_COLOURS = {
@@ -1456,7 +1426,6 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
     """`likelihood_html` pre-rendered by the caller, or None to draw it inline."""
     run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
-    tab_id = run_tab_id(run_name)
     with open(summary_path) as f:
         summary = json.load(f)
     run_dirs = [run_dir] + merged_source_run_dirs(summary)
@@ -1564,21 +1533,18 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
         "<tr><th>eval</th>"
         + "".join(f"<th>{html.escape(name)}</th>" for name in param_names)
         + "".join(f"<th>{html.escape(key)}</th>" for key in metric_keys)
-        + "<th>objective</th><th>image</th></tr>"
+        + "<th>objective</th></tr>"
     )
     eval_rows = []
     for ev in evaluations:
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
-        image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
-        thumb = render_eval_recon(image_path, ev.get("eval_id", "?"))
         eval_rows.append(
             "<tr>"
             f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
             + "".join(f"<td>{fmt_value(params.get(name))}</td>" for name in param_names)
             + "".join(f"<td>{fmt_value(metrics.get(key))}</td>" for key in metric_keys)
             + f"<td>{fmt_value(ev.get('objective'))}</td>"
-            f"<td>{thumb}</td>"
             "</tr>"
         )
 
@@ -1603,15 +1569,15 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
     evaluations_html = ""
     if eval_rows:
         glance_summary_html = render_eval_glance_summary(evaluations, metric, len(failed))
-        eval_images_html = render_eval_images(evaluations, metric, run_dirs, parameter_space)
-        images_collapsible = render_images_likelihood_collapsible(
-            tab_id, eval_images_html, likelihood_html
+        images_link_html = (
+            f'<p class="nav nav-images"><a href="{html.escape(run_images_page_name(run_name))}">'
+            f"View {len(eval_rows)} evaluation images &rarr;</a></p>"
         )
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
           {glance_summary_html}
-          {images_collapsible}
+          {images_link_html}
           <details>
             <summary>{len(eval_rows)} evaluations (raw table)</summary>
             <div class="eval-table-wrap">
@@ -1622,13 +1588,6 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
             </div>
           </details>
           {failed_html}
-        </section>
-        """
-    elif likelihood_html:
-        evaluations_html = f"""
-        <section>
-          <h3>Evaluations</h3>
-          {render_images_likelihood_collapsible(tab_id, "", likelihood_html)}
         </section>
         """
 
@@ -1652,6 +1611,7 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
       {header}
       {meta_html}
       {evidence_html}
+      {likelihood_html}
       {evaluations_html}
       {render_profiling(summary)}
       {render_parameter_space_section(parameter_space)}
@@ -1659,6 +1619,34 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
       <p class="manifest-name">{html.escape(rel_summary)}</p>
     </article>
     """
+
+
+def render_run_images_page(summary_path):
+    """Body of one run's images page: every evaluation raster, and nothing else.
+
+    Kept off the run page so the details load without decoding one PNG per
+    evaluation; the run page links here.
+    """
+    run_dir = os.path.dirname(summary_path)
+    run_name = os.path.basename(run_dir)
+    with open(summary_path) as f:
+        summary = json.load(f)
+    run_dirs = [run_dir] + merged_source_run_dirs(summary)
+
+    evaluations = [ev for ev in summary.get("evaluations", []) if "error" not in ev]
+    evaluations.sort(key=lambda item: (-float(item.get("objective", 0)), item.get("eval_id", 0)))
+    images_html = render_eval_images(
+        evaluations,
+        summary.get("metric", ""),
+        run_dirs,
+        summary.get("parameter_space", []),
+    )
+    nav = (
+        f'<p class="nav"><a href="{html.escape(run_page_name(run_name))}">&larr; Run details</a>'
+        ' &middot; <a href="index.html">All runs</a></p>'
+    )
+    body = images_html or '<p class="empty">No evaluation images for this run.</p>'
+    return f'{nav}<article class="card">{body}</article>'
 
 
 CSS = """
@@ -1877,40 +1865,12 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
   line-height: 1.35;
   word-break: break-word;
 }
-.eval-table .eval-recon { min-width: 120px; }
 .likelihood-plot { margin: 0.5rem 0; }
 .likelihood-plot img { max-width: 100%; height: auto; border-radius: 6px; }
-.run-media-tabset { margin-top: 0.5rem; }
-.run-media-tabset input[type="radio"] {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
-  margin: 0;
-}
-.run-media-tabset label {
-  display: inline-block;
-  cursor: pointer;
-  font-size: 0.85rem;
-  padding: 0.35rem 0.75rem;
-  margin: 0 0.15rem 0 0;
-  border: 1px solid transparent;
-  border-radius: 6px 6px 0 0;
-  opacity: 0.65;
-}
-.run-media-tabset input.tab-images-radio:checked + label,
-.run-media-tabset input.tab-likelihood-radio:checked + label {
-  opacity: 1;
-  background: color-mix(in srgb, CanvasText 6%, transparent);
-  border-color: color-mix(in srgb, CanvasText 15%, transparent);
-  border-bottom-color: Canvas;
-}
-.run-media-tabset .tab-panel { display: none; padding-top: 0.75rem; }
-.run-media-tabset input.tab-images-radio:checked ~ .tab-panel-images { display: block; }
-.run-media-tabset input.tab-likelihood-radio:checked ~ .tab-panel-likelihood { display: block; }
 .nav { font-size: 0.9rem; margin: 0 0 1rem; }
 .nav a { color: inherit; opacity: 0.7; text-decoration: none; }
 .nav a:hover { opacity: 1; text-decoration: underline; }
+.nav-images { margin: 0.75rem 0 0; }
 .index-entry { display: block; color: inherit; text-decoration: none; }
 /* [hidden] alone loses to the rule above: both are one-class/one-attribute
    specificity, and this author sheet already beat the UA sheet's own
@@ -2005,6 +1965,10 @@ def nested_sampling_run_paths(limit=None, run=None):
         key=nested_sampling_run_sort_key,
     )
     return paths[:limit] if limit is not None else paths
+
+
+def run_images_page_name(run_name):
+    return run_page_name(run_name)[: -len(".html")] + "-images.html"
 
 
 def run_page_name(run_name):
@@ -2498,11 +2462,12 @@ def parse_args(argv=None):
 
 
 def run_body_task(item):
-    """Page body with LIKELIHOOD_SLOT standing in for the corner plot section."""
+    """Both page bodies, with LIKELIHOOD_SLOT standing in for the corner plot."""
     summary_path = item[0]
-    return index_nav_html() + render_nested_sampling_run(
+    body = index_nav_html() + render_nested_sampling_run(
         summary_path, likelihood_html=LIKELIHOOD_SLOT
     )
+    return body, render_run_images_page(summary_path)
 
 
 def likelihood_task(item):
@@ -2516,7 +2481,7 @@ def likelihood_task(item):
     return render_likelihood_plot(os.path.dirname(summary_path), space_names)
 
 
-def write_run_page(item, body):
+def write_run_page(item, body, images_body):
     run_name = item[2]
     assert LIKELIHOOD_SLOT not in body, "likelihood slot was never filled in"
     write_html_doc(
@@ -2527,6 +2492,12 @@ def write_run_page(item, body):
             "summary.json</code>."
         ),
         body=body,
+    )
+    write_html_doc(
+        os.path.join(os.path.dirname(item[1]), run_images_page_name(run_name)),
+        title=f"nested-sampling images: {run_name}",
+        subtitle="One reconstruction per evaluation, best objective first.",
+        body=images_body,
     )
 
 
@@ -2616,9 +2587,11 @@ def main(argv=None):
                 # instead of trying to redraw in place.
                 start = time.monotonic()
                 for i, (item, plot, body) in enumerate(zip(todo, plots, bodies), start=1):
+                    page_body, images_body = body.get()
                     write_run_page(
                         item,
-                        body.get().replace(LIKELIHOOD_SLOT, likelihood_section(plot.get())),
+                        page_body.replace(LIKELIHOOD_SLOT, likelihood_section(plot.get())),
+                        images_body,
                     )
                     elapsed = time.monotonic() - start
                     eta = format_duration(elapsed / i * (len(todo) - i)) if i < len(todo) else "0s"
@@ -3289,12 +3262,60 @@ def _self_check_run_page_name():
     assert run_page_name("wsclean-vlaa-20260826T010221Z") == "wsclean-vlaa-20260826T010221Z.html"
     # Anything that would escape the output directory is flattened.
     assert run_page_name("../etc/passwd") == ".._etc_passwd.html"
+    assert run_images_page_name("wsclean-vlaa-20260826T010221Z") == (
+        "wsclean-vlaa-20260826T010221Z-images.html"
+    )
+
+
+def _self_check_run_page_split():
+    """The run page carries no evaluation raster - only a link to the page that
+    does - so opening the details does not decode one PNG per evaluation."""
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    try:
+        run_dir = os.path.join(tmp_dir, "r2d2-run")
+        os.makedirs(run_dir)
+        summary_path = os.path.join(run_dir, "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump({
+                "algorithm": "r2d2",
+                "metric": "snr",
+                "parameter_space": [{"name": "log10_dynamic_range", "min": 2.0, "max": 3.0}],
+                "evaluations": [
+                    {
+                        "eval_id": 1,
+                        "objective": 1.0,
+                        "params": {"log10_dynamic_range": 2.5},
+                        "paths": {"image": "evals/1/image.fits"},
+                    },
+                    {"eval_id": 2, "objective": 0.5, "params": {"log10_dynamic_range": 2.1}},
+                ],
+            }, f)
+
+        page = render_nested_sampling_run(summary_path, likelihood_html=LIKELIHOOD_SLOT)
+        assert "<img" not in page, page
+        assert "eval-gallery" not in page, page
+        assert page.index(LIKELIHOOD_SLOT) < page.index("<h3>Evaluations</h3>"), page
+        assert 'href="r2d2-run-images.html"' in page, page
+        assert "View 2 evaluation images" in page, page
+        # The raw table lost its thumbnail column with them.
+        assert "<th>image</th>" not in page, page
+
+        images_page = render_run_images_page(summary_path)
+        assert 'href="r2d2-run.html"' in images_page, images_page
+        assert "eval-gallery" in images_page, images_page
+        assert "#1" in images_page and "#2" in images_page, images_page
+    finally:
+        shutil.rmtree(tmp_dir)
 
 
 if __name__ == "__main__":
     if os.environ.get("GENERATE_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
+        _self_check_run_page_split()
         _self_check_mplot3d_skip()
         _self_check_cached_png()
         _self_check_render_array_png()
