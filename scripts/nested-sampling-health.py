@@ -78,6 +78,12 @@ Four things it checks, each one a way a run has actually gone wrong here:
   forward across PolyChord's checkpoint interval, which otherwise freezes it
   for two hours at a time on a 16-rank R2D2 search.
 
+With no argument it reports every run with ranks on this *host*, found in the
+process list rather than by globbing this checkout - several worktrees share
+this machine, and from one of them the biggest consumer of the host block below
+is usually a run whose directory this checkout has no path to. Such a run is
+named by a `path` line.
+
 Plus the host: memory, swap in use, free disk, and sidecar containers whose run
 is gone. A killed run leaves its `ri-ns-sidecar-*` containers holding ~3.4GB
 per R2D2 rank. The next run frees those itself before it sizes itself, so this
@@ -89,7 +95,7 @@ busy host nothing to ask.
 
 Usage:
 
-  uv run scripts/nested-sampling-health.py            # the run that is going
+  uv run scripts/nested-sampling-health.py            # every run that is going
   uv run scripts/nested-sampling-health.py <run>
   uv run scripts/nested-sampling-health.py --all
   uv run scripts/nested-sampling-health.py --json
@@ -118,6 +124,9 @@ from typing import NamedTuple
 NESTED_SAMPLING_DIR = Path("results/nested-sampling")
 
 # A run's own MPI ranks, as `ps` shows them.
+# Anchored at the interpreter because `mpirun` and the host-side `docker
+# exec` both carry the whole rank command line in their own arguments, and
+# counting those as ranks puts the count two over `NS_MPI_PROCS`.
 RANK_COMMAND = re.compile(r"\S*python[\d.]*\s+\S*polychord_\w+\.py\b")
 
 # What counts as the line worth quoting out of run.log. Deliberately broad: the
@@ -1060,19 +1069,6 @@ def own_process_tree(processes: list[dict[str, object]]) -> set[int]:
     return tree
 
 
-def rank_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
-    """This run's MPI ranks, found by the --output-dir they were launched with.
-
-    Which is also how the run is known to be alive at all: no ranks, no run.
-
-    Anchored at the interpreter because `mpirun` and the host-side `docker
-    exec` both carry the whole rank command line in their own arguments, and
-    counting those as ranks puts the count two over `NS_MPI_PROCS`.
-    """
-    return [p for p in run_processes(run_dir, processes)
-            if RANK_COMMAND.match(str(p["args"]))]
-
-
 def _cpu_seconds(pid: int) -> float | None:
     """CPU time for one process, in ticks rather than whole seconds.
 
@@ -1513,6 +1509,12 @@ def render(run: dict[str, object]) -> None:
             and run["checkpoint_age_seconds"] is not None:
         next_update = f", next at ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
     lines = [
+        # Only for a run this checkout did not start. The default report now
+        # reaches every run with ranks on the host, and two worktrees' runs
+        # otherwise render as two identical names over one shared host block.
+        *([("path", str(run["path"]))]
+          if Path(str(run["path"])).resolve().parent != NESTED_SAMPLING_DIR.resolve()
+          else []),
         # The dead-point count never appears without how old it is. PolyChord
         # writes it every ~nlive points, so it is stale by design between
         # writes and a frozen-looking count means nothing on its own.
@@ -1755,6 +1757,27 @@ def run_directories() -> list[Path]:
                   key=started_at, reverse=True)
 
 
+def live_run_directories(processes: list[dict[str, object]]) -> list[Path]:
+    """Every run with ranks on this host, newest first - wherever it lives.
+
+    Read out of the ranks' own `--output-dir` rather than by filtering
+    `run_directories()`, because a run directory is only under this checkout's
+    `NESTED_SAMPLING_DIR` if this checkout started it, and this host runs
+    several worktrees at once. Memory is what caps a run here, so a report that
+    can only see its own checkout answers "why do I have 11GB left" with a host
+    block whose whole cause is a 48GB search it has no path to.
+
+    Ranks rather than every process carrying the run directory: a killed run's
+    sidecar workers outlive it until the next run reaps them, and they are not
+    a run still going.
+    """
+    live = {Path(match.group(1)) for p in processes
+            if RANK_COMMAND.match(str(p["args"]))
+            for match in [re.search(r"--output-dir\s+(\S+)", str(p["args"]))]
+            if match and Path(match.group(1)).is_dir()}
+    return sorted(live, key=started_at, reverse=True)
+
+
 def default_directories(processes: list[dict[str, object]] | None = None) -> list[Path]:
     """Every run that still has ranks, newest first - or the newest run.
 
@@ -1762,23 +1785,21 @@ def default_directories(processes: list[dict[str, object]] | None = None) -> lis
     that is going, and the newest run stops being that one the moment a short
     test lands after a multi-hour search - the test finishes in minutes, the
     search does not, and "the newest run" then names the only one of the two
-    nobody is asking about. Falls back to the newest on a host with nothing
-    running, which is every host most of the time.
+    nobody is asking about. Falls back to the newest run in this checkout on a
+    host with nothing running, which is every host most of the time.
 
     All of them rather than the newest live one, because memory is what caps a
     run here and this host is shared: a second search is the usual reason the
     one being asked about is slow, and hiding it leaves the report explaining a
     squeezed run with numbers whose cause is off the page.
-
-    Ranks rather than every process carrying the run directory: a killed run's
-    sidecar workers outlive it until the next run reaps them, and they are not
-    a run still going.
     """
+    live = live_run_directories(processes or [])
+    if live:
+        return live
     runs = run_directories()
     if not runs:
-        raise SystemExit(f"No runs under {NESTED_SAMPLING_DIR}/.")
-    live = [run for run in runs if rank_processes(run, processes or [])]
-    return live or runs[:1]
+        raise SystemExit(f"Nothing running, and no runs under {NESTED_SAMPLING_DIR}/.")
+    return runs[:1]
 
 
 def resolve(name: str | None,
@@ -1799,8 +1820,11 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run", nargs="?", metavar="RUN",
                         help="run directory or its name (default: every run "
-                             "that is still running, else the newest run)")
-    parser.add_argument("--all", action="store_true", help="every run on disk")
+                             "still running anywhere on this host, whichever "
+                             "checkout started it, else this checkout's "
+                             "newest run)")
+    parser.add_argument("--all", action="store_true",
+                        help="every run on disk under this checkout")
     parser.add_argument("--stale-seconds", type=float, default=DEFAULT_STALE_SECONDS,
                         help="a live run silent for this long is stalled "
                              "(default: %(default)s)")
@@ -2871,6 +2895,40 @@ def self_check() -> None:
                 [newest.name, live.name], default_directories(ranks + also_live)
             # With nothing running it is still exactly one run, not all of them.
             assert [d.name for d in default_directories(processes)] == [newest.name]
+            # A live run in another checkout is reported too, and named by its
+            # path so it is not mistaken for one of this checkout's. This is
+            # the common case on this host: the report used to answer "why is
+            # there no memory left" from a worktree by showing that worktree's
+            # newest finished smoke run, with the 48GB search that owned the
+            # machine off the page because its directory is under a different
+            # repository.
+            # Its own temporary directory, not a subdirectory of this one:
+            # anything under NESTED_SAMPLING_DIR is a run to every glob here.
+            with tempfile.TemporaryDirectory() as other_checkout:
+                foreign = Path(other_checkout) / "r2d2-vlaa-20260105T000000Z"
+                foreign.mkdir()
+                abroad = [dict(ranks[0], pid=778,
+                               args=f"python3 polychord_r2d2.py --output-dir {foreign}")]
+                assert default_directories(abroad) == [foreign], \
+                    default_directories(abroad)
+                assert [d.name for d in default_directories(ranks + abroad)] == \
+                    [foreign.name, live.name], default_directories(ranks + abroad)
+                # ...and it says where it is. Only that one: a `path` line on
+                # every run would be noise, and two worktrees' runs under one
+                # shared host block are indistinguishable without it.
+                here = describe(live, ranks, DEFAULT_STALE_SECONDS)
+                assert "\n  path " not in io_capture(here), io_capture(here)
+                there = io_capture({**here, "path": str(foreign)})
+                assert f"\n  path      {foreign}\n" in there, there
+            # mpirun and the host-side `docker exec` carry --output-dir too and
+            # are not ranks: counting them would work here but would resurrect
+            # a run whose ranks have all gone while its client is still exiting.
+            assert default_directories(not_ranks) == [newest]
+            # A rank whose directory has been deleted underneath it is dropped
+            # rather than reported as a run with no files.
+            gone = [dict(ranks[0], pid=779,
+                         args=f"python3 polychord_r2d2.py --output-dir {tmp}/deleted")]
+            assert default_directories(gone) == [newest]
             # An explicit run still wins over both.
             assert resolve(fast.name, ranks).name == fast.name
             newest.rmdir()

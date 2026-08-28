@@ -380,9 +380,13 @@ five-minute test started after a ten-hour search would otherwise be "the newest
 run" and hide the only one of the two worth asking about; all of them rather
 than the newest live one because memory is what caps a run here and this host is
 shared - a second search is the usual reason the first is slow, and reporting
-one of the two explains a squeezed run with its cause off the page. `--all`
-covers every run on disk and `--json` is
-the machine-readable form. It reads files and runs one `ps` and one `docker
+one of the two explains a squeezed run with its cause off the page. Live runs
+are found in the host process list rather than by globbing this checkout's
+`results/nested-sampling/`, so a run started from another worktree is reported
+too, named by a `path` line - from a worktree the report used to answer "why is
+there no memory left" with that worktree's newest finished smoke run while the
+48GB search that owned the machine stayed off the page. `--all` covers every run
+on disk under this checkout and `--json` is the machine-readable form. It reads files and runs one `ps` and one `docker
 ps`, plus a one second CPU sample when a run has live ranks - nothing is
 started and nothing is imaged, so a run in progress does not notice it. Exit
 status is 1 when something needs attention, so it can gate a script.
