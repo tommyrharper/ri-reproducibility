@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# A pinned status line for a nested-sampling search: elapsed time, dead
-# points against the run's --max-ndead cap (when it has one) with a percent
-# and ETA extrapolated from the rate so far, plus the raw evaluation count.
+# A pinned status line for a nested-sampling search: elapsed time, dead points
+# with a percent and an ETA extrapolated from the rate so far, plus the raw
+# evaluation count. The denominator is the run's --max-ndead cap when it has
+# one and, when it does not, the total its own evidence implies - the same
+# estimate `./ri health` reports, marked `~` so the two cannot be confused.
 #
 # Dead points come from PolyChord's own chains/*_dead-birth.txt (one line per
 # dead point) - the same file scripts/lib/nested_sampling/anesthetic_io.py
@@ -272,9 +274,12 @@ _ns_status_line() {
   # against, but the tolerance itself is a real number we can approximate
   # progress against instead (see _ns_evidence_pct).
   if [ "${max_ndead}" -le 0 ]; then
-    local evidence_pct
-    if evidence_pct="$(_ns_evidence_pct "${output_dir}/chains" "${dead_count}" "${nlive}")"; then
-      _ns_evidence_line "${evidence_pct}" "${dead_count}" "${eval_count}" "${elapsed}"
+    local evidence
+    if evidence="$(_ns_evidence_pct "${output_dir}/chains" "${dead_count}" "${nlive}")"; then
+      # "<percent> <estimated total>", split rather than word-split so an empty
+      # or malformed answer cannot silently shift the arguments along.
+      _ns_evidence_line "${evidence%% *}" "${evidence##* }" \
+        "${dead_count}" "${eval_count}" "${elapsed}"
     else
       _ns_unbounded_line "${dead_count}" "${eval_count}" "${elapsed}"
     fi
@@ -323,20 +328,36 @@ _ns_unbounded_line() {
     "${bar}" "${dead_count}" "${eval_count}" "${rate}" "$(_ns_format_hms "${elapsed}")"
 }
 
+# Every figure derived from the estimated total carries a `~`: the cap branch
+# above divides by a number the operator asked for, this one divides by one
+# the run's own evidence implies, and a bar that looks the same either way
+# would hide that difference.
 _ns_evidence_line() {
-  local pct="$1" dead_count="$2" eval_count="$3" elapsed="$4"
-  local bar
+  local pct="$1" total="$2" dead_count="$3" eval_count="$4" elapsed="$5"
+  local bar eta="?"
   bar="$(_ns_render_bar "${pct}" 30)"
-  printf '[%s] %3d%%  %d dead points (%d evaluations)  elapsed %s  (evidence tolerance, no --max-ndead cap)' \
-    "${bar}" "${pct}" "${dead_count}" "${eval_count}" "$(_ns_format_hms "${elapsed}")"
+  if [ "$((total - dead_count))" -gt 0 ] && [ "${dead_count}" -gt 0 ]; then
+    eta="$(_ns_format_hms $(((total - dead_count) * elapsed / dead_count)))"
+  elif [ "${dead_count}" -ge "${total}" ]; then
+    eta="0:00:00"
+  fi
+  printf '[%s] ~%3d%%  %d/~%d dead points (%d evaluations)  elapsed %s  eta ~%s  (evidence tolerance, no --max-ndead cap)' \
+    "${bar}" "${pct}" "${dead_count}" "${total}" "${eval_count}" \
+    "$(_ns_format_hms "${elapsed}")" "${eta}"
 }
 
-# PolyChord's stopping test (source: PolyChordLite's nested_sampling.F90 -
-# `live_logZ(...) < log(precision_criterion) + RTI%logZ`) is not currently
-# exposed as a --flag by this repo: neither polychord_wsclean.py nor
-# polychord_r2d2.py override it, so pypolychord's own default applies.
-# Update this if that ever changes.
-_NS_PRECISION_CRITERION=0.001
+# The fraction of the banked evidence at which a run actually stops. Measured,
+# not read out of PolyChord's documentation: its `precision_criterion` defaults
+# to 1e-3 (source: PolyChordLite's nested_sampling.F90 - `live_logZ(...) <
+# log(precision_criterion) + RTI%logZ`, not currently exposed as a flag here),
+# but the two searches on this host that terminated naturally stopped at 1.3e-4
+# and 9.6e-5, so 1e-3 predicted 350 dead points for runs that took 446 and 463.
+#
+# scripts/nested-sampling-health.py carries the same number as
+# TERMINATION_EVIDENCE_RATIO and forecasts from the same model, so that the
+# pinned status line and `./ri health` cannot report different progress for the
+# same run. self_check below fails if the two copies drift apart.
+_NS_TERMINATION_EVIDENCE_RATIO=1.2e-4
 
 _ns_stats_file() {
   local chains_dir="$1" f
@@ -352,28 +373,40 @@ _ns_phys_live_file() {
   done
 }
 
-# Approximates how close an uncapped run (--max-ndead <= 0) is to PolyChord's
-# real stopping test, from the same output files ./ri report and
+# How far through an uncapped run (--max-ndead <= 0) is, as "<percent>
+# <estimated total dead points>", from the same output files ./ri report and
 # scripts/lib/nested_sampling/anesthetic_io.py already read: chains/*.stats
 # for the accumulated log(Z) and chains/*_phys_live.txt for the live points'
 # current log-likelihoods (last column of each row). PolyChord's own
 # live_logZ is logsumexp(live loglikes) - log(nlive) + logXp, where logXp
 # (the remaining prior volume) is tracked per-cluster internally; this
 # approximates it as a single global -ndead/nlive, the textbook single-
-# cluster expectation. Good enough to watch a number climb toward 100 - a
-# run whose live points split across several clusters (chains/*.stats'
-# `ncluster` line) will see this diverge further from PolyChord's own exact
-# per-cluster figure than a single-cluster run does.
+# cluster expectation. A run whose live points split across several clusters
+# (chains/*.stats' `ncluster` line) will see this diverge further from
+# PolyChord's own exact per-cluster figure than a single-cluster run does.
+#
+# The percent is a fraction of dead points, not of the evidence ratio. The
+# prior volume shrinks one e-fold per `nlive` dead points, so how much further
+# the ratio has to fall converts to a count of dead points - and a count is
+# what the rate so far can be extrapolated into an ETA against, the same way
+# the --max-ndead branch does it. Dividing the criterion by the ratio instead
+# measures progress in a quantity that falls exponentially, which read 3% on a
+# live search that this model and `./ri health` both put at 38%.
 _ns_evidence_pct() {
   local chains_dir="$1" dead_count="$2" nlive="$3"
   local stats_file live_file logz
   [ "${dead_count}" -gt 0 ] && [ "${nlive}" -gt 0 ] || return 1
+  # Inside the first e-fold the live set is still the prior, so the ratio is
+  # ~1 and the estimate would be reporting nlive*ln(1/RATIO) - its own
+  # constant, and nothing about this run. The bounce is more honest.
+  [ "${dead_count}" -ge "${nlive}" ] || return 1
   stats_file="$(_ns_stats_file "${chains_dir}")"
   live_file="$(_ns_phys_live_file "${chains_dir}")"
   [ -n "${stats_file}" ] && [ -n "${live_file}" ] || return 1
   logz="$(grep -m1 '^log(Z)' "${stats_file}" 2>/dev/null | awk '{print $3}')"
   [ -n "${logz}" ] || return 1
-  awk -v logz="${logz}" -v ndead="${dead_count}" -v nlive="${nlive}" -v pc="${_NS_PRECISION_CRITERION}" '
+  awk -v logz="${logz}" -v ndead="${dead_count}" -v nlive="${nlive}" \
+      -v ratio="${_NS_TERMINATION_EVIDENCE_RATIO}" '
     { n++; ll[n] = $NF }
     END {
       if (n == 0) exit 1
@@ -382,18 +415,18 @@ _ns_evidence_pct() {
       s = 0
       for (i = 1; i <= n; i++) s += exp(ll[i] - max)
       live_logz = (max + log(s)) - log(n) + (-ndead / nlive)
-      ratio = exp(live_logz - logz)
-      if (ratio <= 0) exit 1
-      pct = 100 * pc / ratio
+      remaining = nlive * (live_logz - logz - log(ratio))
+      if (remaining < 0) remaining = 0
+      total = ndead + int(remaining + 0.5)
+      pct = 100 * ndead / total
       if (pct > 100) pct = 100
-      if (pct < 0) pct = 0
-      printf "%d", pct
+      printf "%d %d", pct, total
     }
   ' "${live_file}"
 }
 
 self_check() {
-  local tmp
+  local tmp health_report
   tmp="$(mktemp -d)"
   mkdir "${tmp}/chains" "${tmp}/evaluations"
 
@@ -473,26 +506,51 @@ self_check() {
   [ "$(_ns_bar_pos "$(_ns_unbounded_line 0 0 58)")" = "0" ] || { echo "FAIL: bounce at t=58 (full period)"; exit 1; }
 
   # Once chains/*.stats and chains/*_phys_live.txt exist, an uncapped run
-  # (--max-ndead <= 0) should switch from the ambiguous bounce to a real
-  # percent, approximating PolyChord's own stopping test (nlive=2,
-  # ndead=10, both live points at loglike 0, log(Z)=0.0 -> 14%, checked by
-  # hand against the same formula this function implements).
+  # (--max-ndead <= 0) should switch from the ambiguous bounce to a percent
+  # and an estimated total. nlive=2, ndead=10, both live points at loglike 0,
+  # log(Z)=0.0: live_logZ = logsumexp(0,0) - log(2) - 10/2 = -5, so the ratio
+  # still has ln(1.2e-4) - (-5) = 4.03 nats to fall, which at one e-fold per
+  # nlive dead points is 8 more dead points - 10/18 = 55%.
   printf 'log(Z)       =   0.0 +/-   0.1\n' >"${tmp}/chains/wsclean_vlaa.stats"
   printf '0.1 0.2 0.0\n0.3 0.4 0.0\n' >"${tmp}/chains/wsclean_vlaa_phys_live.txt"
-  [ "$(_ns_evidence_pct "${tmp}/chains" 10 2)" = "14" ] || {
+  [ "$(_ns_evidence_pct "${tmp}/chains" 10 2)" = "55 18" ] || {
     echo "FAIL: evidence pct: $(_ns_evidence_pct "${tmp}/chains" 10 2)"; exit 1
   }
   # _ns_status_line reads ndead from chains/*_dead-birth.txt itself, so match
-  # the 10 dead points the hand-computed 14% above assumes.
+  # the 10 dead points the hand-computed 55% above assumes. 8 dead points left
+  # at 10 per 60s is a 48s eta, and every estimated figure carries a `~`.
   seq 1 10 >"${tmp}/chains/wsclean_vlaa_dead-birth.txt"
   line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
   case "${line}" in
-    *"14%"*"evidence tolerance"*) ;;
+    *"~ 55%"*"10/~18 dead points"*"eta ~0:00:48"*"evidence tolerance"*) ;;
     *) echo "FAIL: status line did not switch to evidence pct: ${line}"; exit 1 ;;
   esac
   # No dead points yet means no ndead/nlive to divide by - must fall back to
   # the bounce rather than divide by zero or report a bogus percent.
   _ns_evidence_pct "${tmp}/chains" 0 2 >/dev/null && { echo "FAIL: evidence pct with 0 dead points should fail"; exit 1; }
+  # ...and neither does the first e-fold, where the live set is still the
+  # prior: the answer there is nlive*ln(1/RATIO), the function's own constant.
+  _ns_evidence_pct "${tmp}/chains" 1 2 >/dev/null && { echo "FAIL: evidence pct inside the first e-fold should fail"; exit 1; }
+  # A run that is already past the stopping ratio (ndead=20, nlive=2 puts
+  # live_logZ at -10, below ln(1.2e-4) = -9.03) has negative work left. The
+  # total must stay at the dead points it has rather than going below them and
+  # printing "20/~19 dead points" on a run about to stop.
+  [ "$(_ns_evidence_pct "${tmp}/chains" 20 2)" = "100 20" ] || {
+    echo "FAIL: past the stopping ratio: $(_ns_evidence_pct "${tmp}/chains" 20 2)"; exit 1
+  }
+
+  # The pinned status line and `./ri health` forecast an uncapped run from the
+  # same calibrated stopping fraction. Two hardcoded copies of a measured
+  # constant drift; this fails the moment they do, because a bar and a report
+  # disagreeing about the same run is exactly what this replaced.
+  health_report="${BASH_SOURCE[0]%/*}/../nested-sampling-health.py"
+  if [ -f "${health_report}" ]; then
+    grep -q "^TERMINATION_EVIDENCE_RATIO = ${_NS_TERMINATION_EVIDENCE_RATIO}\$" \
+      "${health_report}" || {
+      echo "FAIL: ${health_report} no longer carries TERMINATION_EVIDENCE_RATIO = ${_NS_TERMINATION_EVIDENCE_RATIO}"
+      exit 1
+    }
+  fi
 
   # _ns_add_trap must append to an existing trap, not replace it - a naive
   # `trap ... EXIT` here would silently disable start-sidecars.sh's Docker

@@ -43,22 +43,32 @@ Once the containers are up, a status line tracks the search against its
 count, which is always higher since PolyChord's slice sampler makes several
 evaluations per accepted dead point), a percent, and an ETA extrapolated from
 the rate so far (`scripts/lib/progress-bar.sh`). With `--max-ndead <= 0` (run
-until the evidence tolerance is met, no fixed cap) there is no dead-point
-total to measure a percent against, but the evidence tolerance itself is a
-real number: PolyChord stops once the evidence still held by the live points
-drops below `precision_criterion` (0.001, PolyChord's own default - not
-currently exposed as a flag here) of the accumulated evidence
-([`nested_sampling.F90`](https://github.com/PolyChord/PolyChordLite/blob/master/src/polychord/nested_sampling.F90)'s
-`live_logZ(...) < log(precision_criterion) + RTI%logZ`). `_ns_evidence_pct`
-approximates that from `chains/*.stats` (accumulated `log(Z)`) and
-`chains/*_phys_live.txt` (the live points' current log-likelihoods),
-using a single-cluster estimate of the remaining prior volume
-(`-ndead/nlive`) in place of PolyChord's own per-cluster tracking - close
-enough to watch climb toward 100 without being a substitute for the run's
-own numbers, and it can reach the 100% clamp a little ahead of the run
-actually stopping, more so at small `--nlive`. Before the first dead point
-(no `.stats` or `phys_live.txt` yet) it falls back to a bouncing bar and the
-raw dead-point rate. On a real terminal the line is pinned to the bottom via
+until the evidence tolerance is met, no fixed cap) there is no dead-point cap
+to measure a percent against, so `_ns_evidence_pct` estimates one from the
+run's own evidence, and every figure derived from it is marked `~`:
+`~ 38%  173/~454 dead points ... eta ~6:08:10`.
+
+That estimate is the same model `./ri health`'s **forecast** line uses, from
+the same two files (`chains/*.stats` for the accumulated `log(Z)`,
+`chains/*_phys_live.txt` for the live points' current log-likelihoods) and the
+same measured stopping fraction - see the **forecast** field below for the
+calibration and its evidence. The bar's copy of that constant is
+`_NS_TERMINATION_EVIDENCE_RATIO`, and `progress-bar.sh --self-check` fails if
+it and the health script's `TERMINATION_EVIDENCE_RATIO` drift apart: a status
+line and a report disagreeing about the same run is what this replaced. The
+earlier bar divided PolyChord's documented `precision_criterion` by the
+current evidence ratio, which is both uncalibrated and exponential in the
+quantity being reported - it read 3% on a live 16-rank R2D2 search that this
+model puts at 38%.
+
+Like the health forecast, it approximates the remaining prior volume as a
+single global `-ndead/nlive` rather than PolyChord's own per-cluster tracking,
+so a run whose live points split across several clusters (`chains/*.stats`'
+`ncluster` line) will diverge further from PolyChord's exact figure than a
+single-cluster run does. Before the first e-fold (`ndead < nlive`, where the
+live set is still the prior and the estimate would report its own constant),
+and before `.stats` or `phys_live.txt` exist at all, the line falls back to a
+bouncing bar and the raw dead-point rate. On a real terminal it is pinned to the bottom via
 a scroll region, so PolyChord's own feedback scrolling past above it doesn't
 bury it; only drawn
 on a TTY, so piped or logged runs are unaffected.
@@ -487,8 +497,14 @@ What each line is reading, and why it is worth a line:
   ratio they actually reached was 1.3e-4 and 9.6e-5. Calibrated to their mean
   (`TERMINATION_EVIDENCE_RATIO`), replaying those two runs through the shipped
   code forecasts 452-459 from `ndead=100` onward - within 3% of both, and
-  stable across the whole run rather than drifting. Recalibrate there if a
-  PolyChord upgrade or a non-default `precision_criterion` moves it.
+  stable across the whole run rather than drifting. It also holds at a very
+  different `nlive`: a wsclean search at `--nlive 5 --max-ndead -1` was watched
+  live from 12% onward forecasting 45-47 dead points, and terminated naturally
+  at 47. Recalibrate there if a PolyChord upgrade or a non-default
+  `precision_criterion` moves it - and in `_NS_TERMINATION_EVIDENCE_RATIO` in
+  `scripts/lib/progress-bar.sh`, whose pinned status line forecasts from the
+  same model so that the bar and this line cannot disagree; its self-check
+  fails if the two copies drift.
 
   Withheld inside the first e-fold, where the live set is still the prior and
   the estimate would be reporting its own constant rather than this run, and
