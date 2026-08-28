@@ -630,9 +630,15 @@ def render(run: dict[str, object]) -> None:
     slowdown = run["slowdown_factor"]
     # Where the count will next move to, so a reader who comes back has
     # something to compare against rather than a number that looks stuck.
+    #
+    # "past", because nlive is the cadence PolyChord checkpoints on and not the
+    # size of the jump: three consecutive writes on one nlive=50 run moved the
+    # count by 57, 56 and 60. Stated as a floor rather than fitted to those
+    # three, which would be the same over-reading of a short series that this
+    # whole line exists to prevent.
     next_update = ""
     if settings.get("NS_NLIVE", "").isdigit() and run["checkpoint_age_seconds"] is not None:
-        next_update = f", next at ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
+        next_update = f", next past ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
     lines = [
         # The dead-point count never appears without how old it is. PolyChord
         # writes it every ~nlive points, so it is stale by design between
@@ -827,9 +833,11 @@ def self_check() -> None:
             assert 590 < float(report["checkpoint_age_seconds"]) < 620, report
             aged = io_capture(report)
             assert "3 dead points as of 0:10:0" in aged, aged
-            # ...and where it will next move to, so a reader coming back has
-            # something to compare against. nlive is 4 in this fixture.
-            assert "next at ~7" in aged, aged
+            # ...and where it will next move past, so a reader coming back
+            # has something to compare against. nlive is 4 in this fixture, and
+            # the bound is a floor: PolyChord checkpoints every nlive points
+            # but the count overshoots, by 57, 56 and 60 on one nlive=50 run.
+            assert "next past ~7" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report

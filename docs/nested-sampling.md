@@ -302,7 +302,7 @@ have while one is still going:
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 113 dead points as of 0:08:18 ago, next at ~163
+  stage     sampling, 173 dead points as of 1:14:00 ago, next past ~223
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   ranks     16 ranks of 16, 7 busy-waiting
@@ -351,11 +351,13 @@ What each line is reading, and why it is worth a line:
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
   stops a reader doing so either. An age of an hour or more is ordinary rather
-  than alarming, and it grows as a run goes on: one 16-rank R2D2 search took
-  31 minutes to its first checkpoint and 72 more to its second, because each
-  batch of `nlive` dead points costs more likelihood evaluations than the last
-  (its `<nlike>` went 14.10 to 32.50 over the same two). So a later reading
-  longer than an earlier one is the expected shape, not a slowdown.
+  than alarming. One 16-rank R2D2 search checkpointed at 31, 103 and 170
+  minutes: the first comes early because the run's startup counts toward it,
+  and the intervals after that settle near 70 minutes rather than growing (72
+  then 67). Its `<nlike>` did the same, 14.10 to 32.50 to 36.80 - a steep
+  first segment and then flat. So a second and third look should be broadly
+  comparable, and one longer than the last is not by itself a sign of
+  anything.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
