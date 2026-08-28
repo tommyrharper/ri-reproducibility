@@ -391,12 +391,17 @@ What each line is reading, and why it is worth a line:
   which is what the idle thresholds cover; the two look redundant and are
   complementary.
 
-  And it is a share of the run rather than a fixed count of evaluations,
-  because a fixed count covers a wildly different span depending on pace -
-  fifty evaluations is two minutes at 25/min and ten at 5/min, so the window
-  grows exactly when the run slows. The last fifty on this run swung
-  4.9 -> 31.5 -> 37.6 across forty minutes where a tenth of the run gave
-  28.1 -> 37.6 -> 33.4 over the same samples.
+  And it is bounded on both axes, because a run varies on both. In
+  evaluations it is a share of the run rather than a fixed count, since a
+  fixed count covers a wildly different span depending on pace - fifty
+  evaluations is two minutes at 25/min and ten at 5/min, so the window grows
+  exactly when the run slows. The last fifty on this run swung
+  4.9 -> 31.5 -> 37.6 across forty minutes where a tenth gave
+  28.1 -> 37.6 -> 33.4 over the same samples. In time it is capped at half an
+  hour, since a share of the run grows without limit as the run does: seven
+  and a half hours in, a tenth had reached 62 minutes, and a real half-hour
+  slowdown to a third of the run's pace diluted against the recovered half
+  hour before it and did not show at all.
 
   Two things not to conclude from a falling rate. It does not mean the
   evaluations got harder: on that run per-evaluation cost was *falling* at the

@@ -95,6 +95,7 @@ SPIN_IDLE_SECONDS = 60.0
 # ordinary swing stops and the real events start.
 RATE_WINDOW = 50
 RATE_WINDOW_DIVISOR = 10
+RATE_WINDOW_MAX_SECONDS = 1800.0
 RATE_DIVERGENCE_FACTOR = 2.0
 
 # A gap between consecutive evaluations counts as a stall when it is this many
@@ -304,18 +305,35 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     # window said 17.0. Printing those two side by side invited exactly the
     # comparison they could not support.
     #
-    # A share of the run rather than a fixed count, because a fixed one covers
-    # a wildly different span depending on pace - fifty evaluations is two
-    # minutes at 25/min and ten at 5/min, so the window grows precisely when
-    # the run slows and the reading whipsaws. The last fifty here swung
-    # 4.9 -> 31.5 -> 37.6 over forty minutes; a tenth of the run gave
-    # 28.1 -> 37.6 -> 33.4 across the same samples. Both ends of the window are
-    # completed evaluations, so this stays immune to the partial-window problem
-    # above.
+    # The window is bounded on both axes, because a run varies on both and
+    # fixing only one leaves the other free to drift:
+    #
+    # In evaluations, a share of the run rather than a fixed count. A fixed
+    # count covers a wildly different span depending on pace - fifty is two
+    # minutes at 25/min and ten at 5/min, so it grows precisely when the run
+    # slows and the reading whipsaws. The last fifty on one run swung
+    # 4.9 -> 31.5 -> 37.6 over forty minutes where a tenth gave
+    # 28.1 -> 37.6 -> 33.4 across the same samples.
+    #
+    # In time, capped, because a share of the run grows without limit as the
+    # run does. Seven and a half hours into that same search a tenth had
+    # reached 62 minutes, and a genuine half-hour slowdown to 7.2/min - a third
+    # of the run's own pace - diluted against the recovered half hour before it
+    # to 1.36x and did not show at all. "Recent" has to keep meaning recent.
+    #
+    # Both ends are still completed evaluations, so this stays immune to the
+    # partial-window problem above.
     recent_rate, slowdown = None, None
     window = max(RATE_WINDOW, len(times) // RATE_WINDOW_DIVISOR)
     if len(times) >= 2 * window:
         recent_times = times[-window:]
+        # Trimmed to the cap, but never below the floor: a run slow enough that
+        # fifty evaluations do not fit in the cap still gets a sample, just a
+        # longer one than the cap asks for.
+        cutoff = times[-1] - RATE_WINDOW_MAX_SECONDS
+        capped = [t for t in recent_times if t >= cutoff]
+        if len(capped) >= RATE_WINDOW:
+            recent_times = capped
         recent_span = recent_times[-1] - recent_times[0]
         overall_rate = len(times) * 60 / span if span > 0 else None
         if recent_span > 0 and overall_rate:
@@ -1018,6 +1036,36 @@ def self_check() -> None:
             # Too few evaluations to compare a window against a history: no
             # ratio at all rather than one drawn from a handful of gaps.
             assert describe(live, ranks, DEFAULT_STALE_SECONDS)["slowdown_factor"] is None
+
+            # The window is bounded in wall clock as well as in evaluations.
+            # A tenth of a long run reaches back further and further, until
+            # "recent" stops meaning recent - seven hours into one search it
+            # had grown to 62 minutes and hid a real half-hour slowdown.
+            def evenly_spaced(name: str, count: int, spacing: float) -> Path:
+                run = NESTED_SAMPLING_DIR / name
+                (run / "chains").mkdir(parents=True)
+                for i in range(count):
+                    eval_dir = run / "evaluations" / f"eval-{i:05d}-a"
+                    eval_dir.mkdir(parents=True)
+                    metrics = eval_dir / "metrics.json"
+                    metrics.write_text("{}")
+                    when = now - (count - i) * spacing
+                    os.utime(metrics, (when, when))
+                return run
+
+            # A tenth is 100 evaluations spanning 2000s, so the cap trims it to
+            # the last 1800s - which still holds 90, comfortably over the floor.
+            long_run = evenly_spaced("r2d2-vlaa-20260101T030000Z", 1000, 20.0)
+            capped = describe(long_run, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(capped["recent_span_seconds"]) - 1800) < 40, capped
+
+            # But the floor outranks the cap: at one evaluation a minute the
+            # cap would leave 30, so the window stays at the proportional 60
+            # and reaches back further than the cap asks. A short sample is
+            # worse than a long one.
+            slow_run = evenly_spaced("r2d2-vlaa-20260101T040000Z", 600, 60.0)
+            floored = describe(slow_run, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(floored["recent_span_seconds"]) - 3540) < 120, floored
 
             # A run whose imager is broken: every count healthy, every point
             # worthless. This is the one the other checks cannot see.
