@@ -11,11 +11,17 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 )
 
-func TestParseRunsPutsLiveRunsFirst(t *testing.T) {
+func TestParseRunsKeepsNewestFirst(t *testing.T) {
+	// ./ri runs --json in the order it prints, which is newest first. The
+	// newest run here is a finished one and the oldest is still going, so
+	// anything reordering by status would show up.
 	runs, err := parseRuns([]byte(`[
-		{"name": "done", "status": "complete", "algorithm": "wsclean", "evaluations": 9322},
-		{"name": "stopped", "status": "resumable", "algorithm": "r2d2", "evaluations": 12},
-		{"name": "going", "status": "running", "algorithm": "r2d2", "evaluations": 3}
+		{"name": "newest", "status": "complete", "algorithm": "wsclean", "evaluations": 9322,
+		 "started_label": "today 18:38 (2h ago)"},
+		{"name": "middle", "status": "resumable", "algorithm": "r2d2", "evaluations": 12,
+		 "started_label": "yesterday 22:54 (22h ago)"},
+		{"name": "oldest", "status": "running", "algorithm": "r2d2", "evaluations": 3,
+		 "started_label": "Wed 26 Aug 18:46 (2d ago)"}
 	]`))
 	if err != nil {
 		t.Fatal(err)
@@ -24,11 +30,16 @@ func TestParseRunsPutsLiveRunsFirst(t *testing.T) {
 	for _, run := range runs {
 		order = append(order, run.Name)
 	}
-	if got := strings.Join(order, ","); got != "going,stopped,done" {
+	if got := strings.Join(order, ","); got != "newest,middle,oldest" {
 		t.Errorf("runs out of order: %s", got)
 	}
-	if runs[0].Evaluations != 3 || runs[0].Algorithm != "r2d2" {
+	if runs[0].Evaluations != 9322 || runs[0].Algorithm != "wsclean" {
 		t.Errorf("run fields lost: %+v", runs[0])
+	}
+	// The column is drawn from this string, so losing it empties the column
+	// rather than failing anywhere.
+	if runs[0].StartedLabel != "today 18:38 (2h ago)" {
+		t.Errorf("started label lost: %+v", runs[0])
 	}
 }
 

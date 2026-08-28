@@ -233,10 +233,11 @@ checkout started while it is running, because it reports those too.
 ```
 
 A terminal interface over the three commands above: the table is `./ri runs`,
-`enter` shows `./ri health` for the selected run and re-runs it every 5
-seconds, `l` swaps that for the tail of the run's `run.log`, `a` narrows the
-table to what is running, and `n` opens a form that starts a search. Keys are
-listed along the bottom of every screen.
+in its order (newest run at the top, whichever imager it belongs to) and with
+its `started` column, `enter` shows `./ri health` for the selected run and
+re-runs it every 5 seconds, `l` swaps that for the tail of the run's `run.log`,
+`a` narrows the table to what is running, and `n` opens a form that starts a
+search. Keys are listed along the bottom of every screen.
 
 A search started there is detached, so quitting the interface leaves it going,
 and its output until the run directory exists goes to

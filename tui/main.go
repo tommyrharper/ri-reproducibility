@@ -96,9 +96,14 @@ var imagers = []string{"wsclean", "r2d2"}
 func newModel(r ri) model {
 	columns := []table.Column{
 		{Title: "run", Width: 40},
-		{Title: "imager", Width: 8},
-		{Title: "status", Width: 11},
-		{Title: "evaluations", Width: 11},
+		// Each as wide as its widest value ("wsclean", "incomplete"), because
+		// what those two characters buy on an 80-column terminal is the clock
+		// time in the column below.
+		{Title: "imager", Width: 7},
+		{Title: "status", Width: 10},
+		{Title: "evals", Width: 7},
+		// "yesterday 22:54 (22h ago)" is the longest this gets.
+		{Title: "started", Width: 25},
 	}
 	t := table.New(table.WithColumns(columns), table.WithFocused(true))
 	style := table.DefaultStyles()
@@ -200,7 +205,10 @@ func (m model) visible() []Run {
 func (m *model) setRows() {
 	rows := []table.Row{}
 	for _, run := range m.visible() {
-		rows = append(rows, table.Row{run.Name, run.Algorithm, run.Status, strconv.Itoa(run.Evaluations)})
+		rows = append(rows, table.Row{
+			run.Name, run.Algorithm, run.Status,
+			strconv.Itoa(run.Evaluations), run.StartedLabel,
+		})
 	}
 	m.table.SetRows(rows)
 }
@@ -213,7 +221,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		columns := m.table.Columns()
 		// Wide enough for a run name and no wider: the other columns are what
 		// the eye is scanning, and a 40-character gap between them hurts.
-		columns[0].Width = min(44, max(20, msg.Width-38))
+		//
+		// The name is the identity - two runs of the same imager differ only in
+		// the timestamp at the end of it - so on a narrow terminal it keeps the
+		// 29 characters that takes and `started`, which says the same thing in
+		// a form that can be read, gives up its width instead of the name's
+		// tail. 34 is what the other three columns cost, padding included.
+		name := min(44, max(29, msg.Width-59))
+		columns[0].Width = name
+		columns[4].Width = min(25, max(12, msg.Width-34-name))
 		m.table.SetColumns(columns)
 		m.view.Width, m.view.Height = msg.Width, max(3, msg.Height-4)
 
