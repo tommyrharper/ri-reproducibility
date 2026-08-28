@@ -302,7 +302,7 @@ have while one is still going:
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 113 dead points as of 0:08:18 ago, next at ~163
+  stage     sampling, 173 dead points as of 1:14:00 ago, next past ~223
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   ranks     16 ranks of 16, 7 busy-waiting
@@ -351,19 +351,25 @@ What each line is reading, and why it is worth a line:
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
   stops a reader doing so either. An age of an hour or more is ordinary rather
-  than alarming, and it grows as a run goes on: one 16-rank R2D2 search took
-  31 minutes to its first checkpoint and 72 more to its second, because each
-  batch of `nlive` dead points costs more likelihood evaluations than the last
-  (its `<nlike>` went 14.10 to 32.50 over the same two). So a later reading
-  longer than an earlier one is the expected shape, not a slowdown.
+  than alarming, and the interval varies a lot: one 16-rank R2D2 search
+  checkpointed at 31, 103, 170, 305, 455 and 592 minutes. The first interval
+  is short because the run's startup counts toward it; the rest are not a
+  property of PolyChord to extrapolate from, because the interval is a
+  *consequence* of two things that both move - how fast evaluations land, and
+  how many of them each dead point costs. Between the third checkpoint and the
+  fourth both moved at once, throughput down about 30% and likelihood calls
+  per dead point up 43% (29.0, 30.7, then 43.8), and neither alone explains
+  the doubling. The next two steps went the other way: 134 minutes to 150 with
+  cost flat, then 150 to 137 while cost rose a further 39%. Consecutive
+  intervals can differ by 2x with nothing wrong, in either direction.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
   stuck at once.
-- **activity** - the overall rate, and the rate over the last 50 evaluations
-  when the two have diverged. A run can collapse to a fraction of its own
-  throughput without ever going quiet long enough to look stalled, and that
+- **activity** - the overall rate, and the rate over the most recent tenth of
+  the run when the two have diverged. A run can collapse to a fraction of its
+  own throughput without ever going quiet long enough to look stalled, and that
   state passes every other check here: on a live 16-rank R2D2 search, 25/min
   fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
   Both numbers are shown and **neither is warned on**, because the same run
@@ -371,16 +377,27 @@ What each line is reading, and why it is worth a line:
   23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
   grounds for telling anyone to act.
 
-  Both rates are medians of the gaps between evaluations, not counts in a
-  window, and that is deliberate: the most recent window is always partial, so
-  it reads low by whatever fraction of it has not elapsed. On this run,
-  mid-window, the partial bucket said 23.8/min against a 91-165 per five
-  minutes baseline - a collapse, apparently - while the gaps said 52.5/min and
-  the bucket finished at 164, the highest of the run. A gap cannot be measured
-  until both of its ends exist, so there is no partial window to misread. The
-  one thing gaps cannot see is a stall that began *after* the last completed
+  Both are evaluations divided by the time they took, so the two can be
+  compared. Two things about how that window is drawn, each got wrong first.
+
+  Its ends are both completed evaluations, never "the last N minutes" - a
+  clock window is always partial, so it reads low by whatever fraction has not
+  elapsed, which at the moment of sampling is indistinguishable from a
+  slowdown: a partial five-minute bucket on this run said 23.8/min against a
+  91-165 baseline, apparently a collapse, and finished at 164, the highest of
+  the run. What it cannot see is a stall beginning *after* the last completed
   evaluation, which is what the idle thresholds cover; the two look redundant
   and are complementary.
+
+  And it is bounded on both axes, because a run varies on both. In evaluations
+  it is a share of the run, since a fixed count covers a wildly different span
+  depending on pace - fifty evaluations is two minutes at 25/min and ten at
+  5/min, so the window grows exactly when the run slows (the last fifty here
+  swung 4.9, 31.5, 37.6 where a tenth gave 28.1, 37.6, 33.4 over the same
+  samples). In time it is capped at half an hour, since a share of the run
+  grows without limit: seven and a half hours in, a tenth had reached 62
+  minutes, and a real half-hour slowdown to a third of the run's pace diluted
+  against the recovered half hour before it and did not show at all.
 
   Two things not to conclude from a falling rate. It does not mean the
   evaluations got harder: on that run per-evaluation cost was *falling* at the
