@@ -176,12 +176,14 @@ run_with_retries() {
   shift
   local reset_after="${NS_RETRY_RESET_SECONDS:-1800}"
   local attempt=0 status=0 before after started ranks arg prev resized
+  local log_before=0 from_where
   # The command is re-run rather than re-built, and the one part of it a
   # restart must not replay verbatim is the rank count - see the re-clamp
   # below - so it is held in an array this loop can rewrite.
   local -a args=("$@") rescaled
   while :; do
     before="$(_ns_completed_evals "${output_dir}")"
+    log_before="$(_ns_log_size "${output_dir}")"
     status=0
     started="$(date +%s)"
     run_with_progress "${args[@]}" || status=$?
@@ -201,12 +203,52 @@ run_with_retries() {
       fi
       break
     fi
+    from_where="PolyChord's checkpoint"
     if [ "${after}" -le "${before}" ]; then
-      _ns_retry_say "${output_dir}" \
-        "not retrying: the attempt that just failed (exit ${status}) scored no evaluations," \
-        "so another one fails the same way. Why it stopped is above;" \
-        "./ri resume ${output_dir##*/} tries again anyway."
-      break
+      # An attempt that scores nothing is normally deterministic and retrying
+      # it only fails slower - except for the one input a restart can change:
+      # PolyChord's checkpoint. A rank killed part-way through writing
+      # `chains/*.resume` leaves a truncated file, and reading one aborts in
+      # Fortran before evaluation 1, so the guard below fires, no restart is
+      # ever tried, and every later `./ri resume` dies in the same place. The
+      # search is then permanently stuck with all of its scored evaluations
+      # sitting unreachable on disk - the same shape as the unreadable
+      # metrics.json in common.py, and reproduced the same way, by truncating
+      # a real 44KB `.resume` and resuming.
+      #
+      # Moving it aside is the whole fix: `polychord_*.py` sets `read_resume`
+      # off that file's existence, so the next attempt starts the sampler from
+      # scratch and `adopt_completed_evaluations` replays every evaluation
+      # already scored out of the point cache without imaging any of them.
+      # Renamed rather than deleted, because a checkpoint the run could not
+      # read is still the only record of where the sampler had reached.
+      #
+      # Only on evidence that the checkpoint is what broke - a gfortran
+      # runtime error naming PolyChord's read_write.F90, in the output of the
+      # attempt that just failed rather than anywhere in run.log, which
+      # accumulates across attempts. A missing image or a bad parameter space
+      # also scores nothing, and throwing away a good checkpoint for one of
+      # those would cost a long search its position for no reason. Not capped
+      # to one recovery per run: a full disk tears every checkpoint it writes,
+      # and the retry budget above - which an attempt that ran for
+      # NS_RETRY_RESET_SECONDS hands back - is already what bounds a fault
+      # that keeps coming straight back.
+      if _ns_attempt_output "${output_dir}" "${log_before}" \
+           | grep -q 'read_write\.F90' \
+        && _ns_quarantine_checkpoint "${output_dir}"; then
+        from_where="scratch"
+        _ns_retry_say "${output_dir}" \
+          "the attempt that just failed (exit ${status}) died inside PolyChord's checkpoint" \
+          "I/O before scoring anything, so its checkpoint cannot be read: moved aside as" \
+          "chains/*.resume.unreadable. Restarting the sampler from scratch, which replays" \
+          "the ${after} evaluations already scored from the point cache without imaging."
+      else
+        _ns_retry_say "${output_dir}" \
+          "not retrying: the attempt that just failed (exit ${status}) scored no evaluations," \
+          "so another one fails the same way. Why it stopped is above;" \
+          "./ri resume ${output_dir##*/} tries again anyway."
+        break
+      fi
     fi
     # The rank count this attempt ran at was `ns_budget_ranks`' answer to how
     # much memory was free when the run *started*, which on a host several
@@ -266,8 +308,8 @@ run_with_retries() {
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${status}" "${after}" \
       >>"${output_dir}/restarts.log"
     _ns_retry_say "${output_dir}" \
-      "attempt failed (exit ${status}) at ${after} evaluations; resuming from PolyChord's" \
-      "checkpoint - retry ${attempt} of ${retries}${resized}. Why it stopped is above."
+      "attempt failed (exit ${status}) at ${after} evaluations; resuming from ${from_where}" \
+      "- retry ${attempt} of ${retries}${resized}. Why it stopped is above."
   done
   return "${status}"
 }
@@ -316,6 +358,32 @@ _ns_retry_say() {
 # inflated by the handful of directories a crash leaves half-written.
 _ns_completed_evals() {
   find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
+}
+
+# run.log's size, so the next attempt's output can be told from every earlier
+# one's: the file is appended to across attempts and a failure this loop has
+# already recovered from must not be read as the current one's.
+_ns_log_size() {
+  [ -f "$1/run.log" ] || { printf '0\n'; return 0; }
+  wc -c <"$1/run.log" | tr -d ' '
+}
+
+# Usage: _ns_attempt_output <output_dir> <bytes written before the attempt>
+_ns_attempt_output() {
+  [ -f "$1/run.log" ] || return 0
+  tail -c "+$(($2 + 1))" "$1/run.log"
+}
+
+# Move a run's PolyChord checkpoint out of the way, reporting whether there
+# was one to move. `chains/*.resume` is the path polychord_*.py builds from
+# `base_dir` and `file_root`, and a run only ever has the one.
+_ns_quarantine_checkpoint() {
+  local f moved=''
+  for f in "$1"/chains/*.resume; do
+    [ -f "${f}" ] || continue
+    mv -f "${f}" "${f}.unreadable" && moved=1
+  done
+  [ -n "${moved}" ]
 }
 
 # Stops the watchdog run_with_progress started, from the normal path and from
@@ -975,6 +1043,94 @@ self_check() {
     echo "FAIL: no-progress failure retried $(_ns_count_lines "${stuck_dir}/attempts") times"; exit 1
   }
   [ ! -e "${stuck_dir}/restarts.log" ] || { echo "FAIL: restart logged without a retry"; exit 1; }
+
+  # The one no-progress failure that is *not* deterministic: a truncated
+  # PolyChord checkpoint, which aborts in Fortran before evaluation 1 and then
+  # kills every later `./ri resume` the same way. The checkpoint has to be
+  # moved aside and the attempt retried, or the search is stuck for good with
+  # its scored evaluations unreachable. The fixture fails the way a real one
+  # does - the gfortran error naming read_write.F90 - and succeeds once the
+  # checkpoint is gone, which is exactly what starting the sampler from
+  # scratch does.
+  local torn_dir="${tmp}/torn"
+  mkdir -p "${torn_dir}/chains"
+  echo truncated >"${torn_dir}/chains/r.resume"
+  status=0
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${torn_dir}" -1 2 -- sh -c '
+    echo a >>"$0"/attempts
+    [ -f "$0"/chains/r.resume ] || exit 0
+    echo "At line 354 of file read_write.F90 (unit = 10, file = '\''$0/chains/r.resume'\'')"
+    echo "Fortran runtime error: End of file"
+    exit 2' "${torn_dir}" >/dev/null 2>&1 || status=$?
+  [ "${status}" = "0" ] || { echo "FAIL: torn checkpoint exit ${status}, want 0"; exit 1; }
+  [ "$(_ns_count_lines "${torn_dir}/attempts")" = "2" ] || {
+    echo "FAIL: torn checkpoint attempts $(_ns_count_lines "${torn_dir}/attempts"), want 2"; exit 1
+  }
+  [ -f "${torn_dir}/chains/r.resume.unreadable" ] || {
+    echo "FAIL: torn checkpoint not kept as evidence"; exit 1
+  }
+  [ ! -e "${torn_dir}/chains/r.resume" ] || {
+    echo "FAIL: torn checkpoint left in place, so the restart reads it again"; exit 1
+  }
+  # ./ri health reads this file, and a run that healed itself this way healed
+  # itself like any other.
+  [ "$(_ns_count_lines "${torn_dir}/restarts.log")" = "1" ] || {
+    echo "FAIL: checkpoint recovery left no restart line"; exit 1
+  }
+
+  # A fault that tears the checkpoint again every time it is written - a full
+  # disk - is bounded by the retry budget like any other, not by capping the
+  # recovery at one: a multi-day search that healed itself this way on day one
+  # must still be able to on day three.
+  local torn_again_dir="${tmp}/torn-again"
+  mkdir -p "${torn_again_dir}/chains"
+  echo truncated >"${torn_again_dir}/chains/r.resume"
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${torn_again_dir}" -1 2 -- sh -c '
+    echo a >>"$0"/attempts; echo truncated >"$0"/chains/r.resume
+    echo "At line 354 of file read_write.F90"; exit 2' \
+    "${torn_again_dir}" >/dev/null 2>&1 || true
+  [ "$(_ns_count_lines "${torn_again_dir}/attempts")" = "3" ] || {
+    echo "FAIL: repeated checkpoint tear ran $(_ns_count_lines "${torn_again_dir}/attempts")" \
+      "attempts, want 1 + 2 retries"; exit 1
+  }
+
+  # And only on that evidence. A missing image or a bad parameter space also
+  # scores nothing, and a good checkpoint thrown away for one of those costs a
+  # long search its sampler position for nothing.
+  local intact_dir="${tmp}/intact"
+  mkdir -p "${intact_dir}/chains"
+  echo fine >"${intact_dir}/chains/r.resume"
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${intact_dir}" -1 2 -- \
+    sh -c 'echo a >>"$0"/attempts; echo "docker: no such image" >&2; exit 5' \
+    "${intact_dir}" >/dev/null 2>&1 || true
+  [ "$(_ns_count_lines "${intact_dir}/attempts")" = "1" ] || {
+    echo "FAIL: unrelated failure retried $(_ns_count_lines "${intact_dir}/attempts") times"; exit 1
+  }
+  [ "$(cat "${intact_dir}/chains/r.resume")" = "fine" ] || {
+    echo "FAIL: good checkpoint moved aside for an unrelated failure"; exit 1
+  }
+
+  # The evidence has to come from the attempt that just failed, not from
+  # anywhere in run.log: the file is appended to across attempts, so an
+  # earlier checkpoint failure this loop already recovered from would
+  # otherwise condemn a good checkpoint written since. Attempt 1 hits it and
+  # scores an evaluation, attempt 2 fails for an unrelated reason.
+  local stale_dir="${tmp}/stale"
+  mkdir -p "${stale_dir}/chains"
+  echo fine >"${stale_dir}/chains/r.resume"
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${stale_dir}" -1 2 -- sh -c '
+    if [ ! -f "$0"/attempts ]; then
+      mkdir -p "$0"/evaluations/eval-0; echo {} >"$0"/evaluations/eval-0/metrics.json
+      echo "At line 354 of file read_write.F90 (unit = 10, file = r.resume)"
+    fi
+    echo a >>"$0"/attempts; exit 5' "${stale_dir}" >/dev/null 2>&1 || true
+  [ "$(cat "${stale_dir}/chains/r.resume")" = "fine" ] || {
+    echo "FAIL: an earlier attempt's checkpoint error condemned a later good one"; exit 1
+  }
 
   # A run that banked dead points before it died is still retried, which is
   # the case that worked before evaluations became the measure - the two

@@ -1028,6 +1028,37 @@ stopped `run_with_retries` from trying again. Records are now written under
 one is closed for new runs and the tolerance covers the runs already on
 disk (and any half-written record left by a full disk).
 
+**One no-progress failure is retried anyway: an unreadable checkpoint.** A
+rank killed part-way through writing `chains/*.resume` leaves a truncated
+file, and PolyChord aborts reading it - in Fortran, before evaluation 1 - so
+the forward-progress guard above stopped the run, and every later `./ri
+resume` died in the same place. The search was then stuck for good with every
+evaluation it had scored sitting unreachable on disk. Reproduced by
+truncating a real 44KB `.resume` to half its bytes and resuming: `Fortran
+runtime error: End of file` at `read_write.F90:354`, then `not retrying: ...
+scored no evaluations`.
+
+The checkpoint is the one input a restart can change, so `run_with_retries`
+now moves it to `chains/*.resume.unreadable` and retries. `polychord_*.py`
+sets `read_resume` off that file's existence, so the next attempt starts the
+sampler from scratch and `adopt_completed_evaluations` replays every scored
+evaluation out of the point cache without imaging any of them - the same run
+finished normally, still at 170 evaluations, having imaged none of them
+again. Renamed rather than deleted, because a checkpoint the run could not
+read is still the only record of where the sampler had reached.
+
+It happens only on the evidence that the checkpoint is what broke - a
+gfortran runtime error naming `read_write.F90` in the output of the attempt
+that just failed, not anywhere in `run.log`, which accumulates across
+attempts. A missing image scores nothing too, and a good checkpoint thrown
+away for one of those would cost a long search its sampler position for
+nothing. It is not capped at one recovery per run either: a full disk tears
+every checkpoint it writes, and the retry budget - which an attempt that ran
+for `NS_RETRY_RESET_SECONDS` hands back - is already what bounds a fault that
+keeps coming straight back. The recovery is an ordinary restart in every
+other way, so it appends to `restarts.log` and `./ri health` reports it as a
+self-healed restart.
+
 Two things to know about a restarted run:
 
 - It reuses the sidecar containers but not their pooled workers, which exited
@@ -1142,7 +1173,7 @@ can act on, instead of hanging it.
 
 `./ri self-check self-heal` is the end-to-end check of all of the above, and
 it is part of `./ri self-check`. It starts a real WSClean search on a throwaway
-directory and breaks it five times, in the five ways that recover through
+directory and breaks it six times, in the six ways that recover through
 different machinery:
 
 - **`SIGKILL` once it has scored 8 evaluations** - fewer than `--nlive`, so the
@@ -1173,6 +1204,16 @@ different machinery:
   containers are started once, in front of the loop, so every attempt after the
   removal `docker exec`ed into a name that no longer existed, scored nothing,
   and the run stopped for good at exit 1 with no `summary.json`.
+- **A truncated `chains/*.resume` on that same fifth run**, now that it has
+  finished: `summary.json` deleted, the checkpoint cut to half its bytes, and
+  `./ri resume` typed at it. No sixth search, because nothing about this break
+  needs a live one - it is what a rank killed part-way through writing the
+  checkpoint leaves behind, and PolyChord aborts reading it in Fortran before
+  evaluation 1. The assertions are that the resume finishes, that `run.log`
+  says the sampler started over rather than reading the file again, that the
+  torn checkpoint is kept as `*.resume.unreadable`, and that the evaluation
+  count is unchanged - every point the restart drew came back out of the cache,
+  so none of them was imaged twice.
 
 The first two assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes

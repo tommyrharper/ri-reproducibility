@@ -16,7 +16,8 @@
 # second, ~0.6GB WSClean searches: one killed, one hung by freezing a rank, one
 # killed with no retries left and resumed by hand, one whose workers are killed
 # under it, and one whose sidecar container is removed, each watched until it
-# recovers - because the thing it checks
+# recovers, plus a sixth break with no search of its own - the fifth run's
+# PolyChord checkpoint truncated and resumed - because the thing it checks
 # only exists in a real run. It is safe alongside another run:
 # 3 ranks at ~200MB, sized and refused by scripts/lib/rank-budget.sh like any
 # other, on a throwaway directory the report and `./ri runs` never see.

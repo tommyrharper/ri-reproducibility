@@ -11,7 +11,7 @@
 # fixture and obvious to a real kill. So: start a real search, break it, and
 # assert it finishes anyway.
 #
-# Five ways of breaking it, because they recover through different machinery.
+# Six ways of breaking it, because they recover through different machinery.
 # A SIGKILL is the crash `run_with_retries` was written for - the run exits and
 # the loop sees a status. A frozen rank is the failure it cannot see: PolyChord
 # calls the likelihood from Fortran, so one rank that stops answering leaves
@@ -44,6 +44,13 @@
 # search died at exit 1 with no summary.json. `sidecar_restore` in
 # scripts/lib/start-sidecars.sh starts the missing container again, under the
 # same name, before each retry.
+#
+# The sixth is the checkpoint itself: a rank killed part-way through writing
+# `chains/*.resume` leaves a truncated file, which PolyChord aborts on before
+# evaluation 1, so the run scored nothing, the anti-spin guard refused to
+# restart it, and every later `./ri resume` died in the identical place. Broken
+# by truncating the file rather than by another kill, and on the run scenario
+# five just finished, because nothing about it needs a live search.
 #
 # ~5 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
 # the report never see. WSClean rather than R2D2 because it reaches its first
@@ -90,7 +97,7 @@ cleanup() {
   if [ -n "${PASSED}" ]; then
     rm -rf "${OUT}" "${OUT}.log" "${HUNG_OUT}" "${HUNG_OUT}.log" \
       "${RESUME_OUT}" "${RESUME_OUT}.log" "${WORKER_OUT}" "${WORKER_OUT}.log" \
-      "${SIDECAR_OUT}" "${SIDECAR_OUT}.log"
+      "${SIDECAR_OUT}" "${SIDECAR_OUT}.log" "${SIDECAR_OUT}.torn.log"
   else
     echo "self-heal: left ${OUT}*, ${HUNG_OUT}*, ${RESUME_OUT}*, ${WORKER_OUT}* and ${SIDECAR_OUT}* for inspection" >&2
   fi
@@ -477,6 +484,44 @@ sidecar_after="$(completed_evals "${SIDECAR_OUT}")"
   || fail "no evaluation completed after the sidecar was removed (${sidecar_before} then ${sidecar_after})"
 
 echo "self-heal: sidecar removed at ${sidecar_before} evaluations, started again and finished at ${sidecar_after}"
+
+# Scenario six: the checkpoint itself is what is broken. A rank killed part-way
+# through writing `chains/*.resume` leaves a truncated file, and PolyChord
+# aborts reading it in Fortran before evaluation 1 - so the run scored nothing,
+# `run_with_retries`' anti-spin guard refused to restart it, and every later
+# `./ri resume` died in the identical place with every scored evaluation
+# unreachable on disk. The recovery is to move the checkpoint aside and let the
+# sampler start over, which replays those evaluations out of the point cache
+# without imaging any of them.
+#
+# On the run scenario five just finished rather than a sixth search: the break
+# is deterministic (truncate a file) and needs no kill timing, so the only
+# thing a fresh run would add is another minute. Deleting summary.json is what
+# the resume script itself documents as the way to make a finished run
+# resumable.
+resume_file="$(find "${SIDECAR_OUT}/chains" -maxdepth 1 -name '*.resume' | head -1)"
+[ -n "${resume_file}" ] || fail "the finished run left no checkpoint to tear; see ${SIDECAR_OUT}/chains"
+torn_before="$(completed_evals "${SIDECAR_OUT}")"
+rm -f "${SIDECAR_OUT}/summary.json"
+truncate -s "$(( $(wc -c <"${resume_file}") / 2 ))" "${resume_file}"
+echo "self-heal: truncating ${resume_file##*/} and resuming at ${torn_before} evaluations"
+"${REPO_ROOT}/ri" resume "${SIDECAR_OUT}" --no-build >"${SIDECAR_OUT}.torn.log" 2>&1 \
+  || fail "an unreadable checkpoint stopped the run for good; see ${SIDECAR_OUT}.torn.log"
+[ -f "${SIDECAR_OUT}/summary.json" ] || fail "the resume finished with no summary.json"
+# The checkpoint was moved, not deleted: it is the only record of where the
+# sampler had reached, and unreadable to PolyChord is not unreadable to a human.
+[ -f "${resume_file}.unreadable" ] \
+  || fail "the torn checkpoint was not kept as evidence; see ${SIDECAR_OUT}/chains"
+# Started over rather than resumed, which is the whole point of moving the file.
+grep -q 'no checkpoint to resume from, re-sampling from the cache' "${SIDECAR_OUT}/run.log" \
+  || fail "the retry read the torn checkpoint again; see ${SIDECAR_OUT}/run.log"
+# And the work already on disk survived it. Equal, not greater: every point the
+# restart drew came back out of the cache, so nothing was imaged twice.
+torn_after="$(completed_evals "${SIDECAR_OUT}")"
+[ "${torn_after}" -ge "${torn_before}" ] \
+  || fail "the checkpoint recovery lost work: ${torn_before} evaluations before, ${torn_after} after"
+
+echo "self-heal: torn checkpoint at ${torn_before} evaluations, sampler restarted and finished at ${torn_after}"
 
 PASSED=1
 echo "self-heal check passed"
