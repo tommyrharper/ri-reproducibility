@@ -49,6 +49,11 @@ Four things it checks, each one a way a run has actually gone wrong here:
   swap, which RSS excludes: a squeezed run reads as holding less memory than
   it does while a worker that is mostly on disk has to read itself back before
   it can image, which shows up as slow evaluations and never as a failure.
+  Whether it is being read back is a separate question from whether it is out
+  there, and only the kernel can answer it: `pressure` is the fraction of the
+  last minute and the last five that tasks here spent stalled on memory and on
+  I/O, and it is what decides whether pages on disk are reported as a cost or
+  merely reported.
   `memory` is the same cost measured by the run itself rather than sampled off
   the host: `peak_memory_bytes` out of each evaluation's metrics, multiplied
   out over the ranks. That is the standing estimate
@@ -218,6 +223,18 @@ HEADROOM_MB = 4096
 # swapped) from the nineteen ranks and shims sitting at 10MB against 14MB.
 PAGED_OUT_MB = 200
 
+# Percent of wall clock the kernel says tasks spent stalled waiting on memory
+# (`some avg300` from /proc/pressure/memory) before pages on disk are read as
+# costing this run anything. Swap that nobody is faulting back in costs
+# nothing: the 16-rank R2D2 search here ran for hours with one worker at 52MB
+# resident against 2.9GB swapped while the host reported avg300=0.02%, i.e.
+# ~0.06s of stall across five minutes in which the run scored ~110
+# evaluations - so the paged-out warning fired every time it was asked, exited
+# 1, and named a cost that was not being paid. Five percent is 250x that idle
+# baseline and ~1.3s per evaluation on the same run, which is the point where
+# it stops hiding inside the ordinary spread of evaluation cost.
+MEMORY_STALL_PERCENT = 5.0
+
 # Disk is the one resource nothing here reserves, checks or frees, and the only
 # one that only ever grows: an evaluation directory keeps its measurement set,
 # its .mat and the imager's output, ~1.7MB on this host, and nothing deletes
@@ -343,6 +360,33 @@ def meminfo_mb(key: str) -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def pressure(resource: str) -> dict[str, float] | None:
+    """Kernel PSI for `resource`, or None where there is none (macOS, pre-4.20).
+
+    `some avgN` is the percentage of the last N seconds in which at least one
+    task was stalled waiting on this resource. It is the only reading here that
+    says what a shortage is *costing* rather than that one exists: free memory,
+    swap in use and a process's own VmSwap all describe a state the host may
+    have entered days ago and be paying nothing for, which is exactly how the
+    paged-out warning came to fire on a run that was not waiting on anything.
+
+    Three averages come out of the file; the two kept are the ones that answer
+    different questions - a minute for "is this happening now" and five for
+    "has it been happening long enough to explain the run's numbers".
+    """
+    try:
+        line = next(row for row in
+                    Path(f"/proc/pressure/{resource}").read_text().splitlines()
+                    if row.startswith("some "))
+    except (OSError, StopIteration):
+        return None
+    fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
+    try:
+        return {k: float(fields[k]) for k in ("avg60", "avg300")}
+    except (KeyError, ValueError):
+        return None
 
 
 def swap_mb(pids: list[int]) -> dict[int, int]:
@@ -1099,7 +1143,8 @@ def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> in
 
 def describe(run_dir: Path, processes: list[dict[str, object]],
              stale_seconds: float, busy: dict[int, float] | None = None,
-             swapped: dict[int, int] | None = None) -> dict[str, object]:
+             swapped: dict[int, int] | None = None,
+             memory_stall_pct: float | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     dead, checkpoint_time = dead_points(run_dir)
     checkpoint_age = time.time() - checkpoint_time if checkpoint_time else None
@@ -1241,7 +1286,14 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"{scan['stall_fraction']:.0%} of wall clock lost to gaps over "
             f"{scan['stall_threshold_seconds']:.0f}s"
         )
-    if paged_out:
+    # Pages on disk are a warning only while something is waiting on them.
+    # `memory_stall_pct` is the kernel's own answer to that (MEMORY_STALL_PERCENT);
+    # None means the host cannot be asked, where the old unconditional warning
+    # is still the best available reading. The swapped total stays on the
+    # `resources` line either way, so the fact is never hidden - what is
+    # withheld is the claim that it is costing evaluation time, which on the
+    # run this was written for it was not.
+    if paged_out and (memory_stall_pct is None or memory_stall_pct >= MEMORY_STALL_PERCENT):
         worst = max(paged_out, key=lambda p: swapped.get(int(p["pid"]), 0))
         one = len(paged_out) == 1
         warnings.append(
@@ -1252,6 +1304,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"{format_gb(int(worst['rss_mb']) * 1024 ** 2)} resident) - the host squeezed "
             "the run, and a paged-out worker reads itself back from disk before it can "
             "image, which costs evaluation time rather than failing"
+            + (f"; the host spent {memory_stall_pct:.0f}% of the last five minutes "
+               "stalled on memory" if memory_stall_pct is not None else "")
         )
     # Nothing reserves disk, nothing frees it, and no evaluation directory is
     # ever deleted, so the only warning available is the run's own write rate
@@ -1339,11 +1393,28 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
             f"{memory}MB available is below the {HEADROOM_MB}MB headroom rank-budget.sh "
             "keeps free; a new run will refuse to size itself"
         )
+    # What the shortage is costing, as against how large it is. io as well as
+    # memory because they are the two this workload can lose real time to and
+    # they are read from the same place at the same price - one file each, no
+    # sample interval - while cpu pressure on a box deliberately run at every
+    # core busy is the normal state and says nothing.
+    memory_pressure = pressure("memory")
+    io_pressure = pressure("io")
+    memory_stall = memory_pressure["avg300"] if memory_pressure else None
+    if memory_stall is not None and memory_stall >= MEMORY_STALL_PERCENT:
+        warnings.append(
+            f"the host spent {memory_stall:.0f}% of the last five minutes stalled on "
+            "memory - runs here are waiting on pages rather than on their imager, and "
+            "the fix is fewer ranks or fewer concurrent runs, not a faster imager"
+        )
     space = free_bytes(NESTED_SAMPLING_DIR if NESTED_SAMPLING_DIR.exists() else Path("."))
     swap_total = meminfo_mb("SwapTotal")
     swap_free = meminfo_mb("SwapFree")
     return {
         "available_mb": memory,
+        "memory_pressure": memory_pressure,
+        "io_pressure": io_pressure,
+        "memory_stall_percent": memory_stall,
         "total_mb": meminfo_mb("MemTotal"),
         "swap_total_mb": swap_total,
         # Reported, never warned on: swap in use says the host went over at
@@ -1623,6 +1694,16 @@ def render_host(host: dict[str, object]) -> None:
     if swap_total and host["swap_used_mb"] is not None:
         print(f"  {'swap':<9} {int(host['swap_used_mb']) / 1024:.1f}GB of "
               f"{int(swap_total) / 1024:.1f}GB used")
+    # Omitted rather than printed as "unknown" where the kernel has no PSI:
+    # every other line here works on macOS and this is the one that does not,
+    # so a permanent "unknown" would be the only thing a mac user ever read.
+    memory_pressure, io_pressure = host["memory_pressure"], host["io_pressure"]
+    if memory_pressure or io_pressure:
+        def _psi(name: str, values: dict[str, float] | None) -> str:
+            return (f"{name} {values['avg60']:.1f}% / {values['avg300']:.1f}%"
+                    if values else f"{name} unknown")
+        print(f"  {'pressure':<9} {_psi('memory', memory_pressure)}, "
+              f"{_psi('io', io_pressure)} of wall clock stalled (1m / 5m)")
     space = host["disk_free_bytes"]
     print(f"  {'disk':<9} " + ("unknown" if space is None
                                else f"{float(space) / 1024 ** 3:.0f}GB free of "
@@ -1727,8 +1808,12 @@ def main(argv: list[str] | None = None) -> int:
     # workers do the work - sampling only the ranks measures the waiting.
     busy = cpu_busy_fractions(
         [int(p["pid"]) for d in directories for p in run_processes(d, processes)])
-    runs = [describe(d, processes, args.stale_seconds, busy) for d in directories]
+    # Before the runs, not after: the host's memory-pressure reading is what
+    # decides whether a run's paged-out pages are costing it anything.
     host = host_report(processes)
+    runs = [describe(d, processes, args.stale_seconds, busy,
+                     memory_stall_pct=host["memory_stall_percent"])
+            for d in directories]
 
     if args.json:
         print(json.dumps({"runs": runs, "host": host}, indent=2))
@@ -1754,7 +1839,7 @@ def self_check() -> None:
             render(report)
         return sink.getvalue()
 
-    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb
+    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb, pressure
     saved = NESTED_SAMPLING_DIR
     now = time.time()
 
@@ -1961,6 +2046,30 @@ def self_check() -> None:
             assert ("1 of this run's 7 processes is mostly on disk rather than in "
                     "memory (3.3GB swapped against 3.2GB resident)"
                     in io_capture(parked)), io_capture(parked)
+
+            # ...but only while the kernel says something is waiting on those
+            # pages. The same parked worker on a host reporting no memory
+            # stalls is the live 16-rank R2D2 search, which warned and exited 1
+            # on every call while `some avg300` sat at 0.02%. The swapped total
+            # stays on the resources line; only the claim of a cost goes.
+            def parked_at(stall: float | None) -> dict[str, object]:
+                return describe(live, not_ranks + ranks, DEFAULT_STALE_SECONDS,
+                                None, {92: 3400}, memory_stall_pct=stall)
+
+            quiet = parked_at(0.02)
+            assert quiet["processes_paged_out"] == 1, quiet
+            assert not any("on disk" in w for w in quiet["warnings"]), quiet
+            assert "+3.3GB swapped out" in io_capture(quiet), io_capture(quiet)
+            # At the threshold it warns and says what it measured, so the
+            # number the decision turned on is next to the decision.
+            stalling = parked_at(MEMORY_STALL_PERCENT)
+            assert any("on disk" in w for w in stalling["warnings"]), stalling
+            assert "stalled on memory" in io_capture(stalling), io_capture(stalling)
+            assert f"{MEMORY_STALL_PERCENT:.0f}% of the last five minutes" \
+                in io_capture(stalling), io_capture(stalling)
+            # Just under it is quiet, so the comparison is a real one.
+            assert not any("on disk" in w
+                           for w in parked_at(MEMORY_STALL_PERCENT - 0.1)["warnings"])
 
             # A rank at 10MB resident with 100MB swapped is mostly on disk by
             # the ratio alone and means nothing - every long-lived Python
@@ -2652,6 +2761,50 @@ def self_check() -> None:
             assert real["swap_total_mb"] == total, real
             assert real["swap_used_mb"] == (None if total is None or free is None
                                             else total - free), (real, total, free)
+
+            # Pressure, against the real /proc/pressure on Linux: this is the
+            # one reading here that says what a shortage costs rather than that
+            # one exists, and its file format is the thing that can break under
+            # it. None where there is no PSI (macOS, pre-4.20 kernels), which
+            # is why every use of it is written to fall back rather than fail.
+            live_psi = pressure("memory")
+            if Path("/proc/pressure/memory").exists():
+                assert live_psi is not None and set(live_psi) == {"avg60", "avg300"}, live_psi
+                assert all(0.0 <= v <= 100.0 for v in live_psi.values()), live_psi
+            assert pressure("no-such-resource") is None
+
+            calm = {"avg60": 0.0, "avg300": 0.02}
+            thrashing = {"avg60": 40.0, "avg300": 30.0}
+            quiet_host = dict(host, memory_pressure=calm, io_pressure=calm,
+                              memory_stall_percent=calm["avg300"])
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(quiet_host)
+            assert "pressure  memory 0.0% / 0.0%, io 0.0% / 0.0% of wall clock stalled" \
+                in rendered_host.getvalue(), rendered_host.getvalue()
+            # No PSI at all drops the line rather than printing "unknown"
+            # forever on every macOS report.
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(dict(host, memory_pressure=None, io_pressure=None,
+                                 memory_stall_percent=None))
+            assert "pressure" not in rendered_host.getvalue(), rendered_host.getvalue()
+
+            original_pressure = pressure
+            try:
+                pressure = lambda r: thrashing if r == "memory" else calm  # noqa: E731
+                thrashed = host_report([])
+                assert thrashed["memory_stall_percent"] == 30.0, thrashed
+                assert any("30% of the last five minutes stalled on memory" in w
+                           for w in thrashed["warnings"]), thrashed
+                pressure = lambda r: calm  # noqa: E731
+                assert not any("stalled on memory" in w
+                               for w in host_report([])["warnings"])
+                # No PSI is not "no pressure": nothing is claimed either way.
+                pressure = lambda r: None  # noqa: E731
+                assert host_report([])["memory_stall_percent"] is None
+            finally:
+                pressure = original_pressure
 
             # Resolution: a bare name, a path, and the newest by default.
             assert resolve(live.name) == live

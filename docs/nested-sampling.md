@@ -351,6 +351,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
 host
   memory    8.9GB available of 62.6GB, 4GB reserved as headroom
   swap      5.1GB of 32.0GB used
+  pressure  memory 0.0% / 0.0%, io 0.0% / 0.0% of wall clock stalled (1m / 5m)
   disk      233GB free of 436GB
   sidecars  3 running, 0 leaked
 ```
@@ -625,6 +626,31 @@ What each line is reading, and why it is worth a line:
   naming was a single imager worker at 52MB resident against 2.9GB swapped -
   parked, with 2.9GB to read back before its next evaluation, and invisible in
   every other number on the page.
+
+  That warning is then held back unless the kernel says something is actually
+  waiting on those pages - **pressure** below. Being on disk and being read
+  back off it are different things, and only the second costs the run anything:
+  the parked worker above sat there for hours while the host reported 0.02% of
+  each five minutes stalled on memory, i.e. ~0.06s of waiting across five
+  minutes in which the run scored ~110 evaluations. `./ri health` warned and
+  exited 1 on every call for a cost of nothing. The swapped total stays on the
+  **resources** line either way; what is withheld is the claim that it is
+  slowing the run down.
+- **pressure** - the kernel's own Pressure Stall Information (`some avgN` from
+  `/proc/pressure/memory` and `/proc/pressure/io`): the percentage of the last
+  minute, and of the last five, during which at least one task was stalled
+  waiting on that resource. Every other resource number here says how large a
+  shortage is; this is the only one that says what it is *costing*, which is
+  why the paged-out warning above and the host's own memory warning are both
+  decided by it - at or above `MEMORY_STALL_PERCENT` (5%, ~250x this host's
+  idle baseline and ~1.3s per evaluation on the live R2D2 search, which is
+  where it stops hiding inside the ordinary spread of evaluation cost) the
+  host is short of RAM and the answer is fewer ranks or fewer concurrent runs,
+  not a faster imager. Two averages because they answer different questions: a
+  minute for "is this happening now", five for "has it been happening long
+  enough to explain the run's numbers". The line is omitted, and every
+  decision that rests on it falls back to its old unconditional form, on a
+  host with no PSI - macOS, or a kernel before 4.20.
 
   The host block reports swap in use but never warns on it: swap that is in
   use may have been paged out days ago and cost nothing since. Whose pages
