@@ -349,12 +349,20 @@ docker builder prune -a && ./ri build   # true cold rebuild
 ## Checks (what CI runs)
 
 ```bash
-shellcheck -x scripts/*.sh
-bash -n scripts/*.sh
+shellcheck -x scripts/*.sh scripts/lib/*.sh   # info-level findings fail the build too
+bash -n scripts/*.sh scripts/lib/*.sh
 python3 -m compileall -q scripts config
+NESTED_SAMPLING_RUNS_SELF_CHECK=1 uv run --no-project python3 scripts/nested-sampling-runs.py
+NESTED_SAMPLING_HEALTH_SELF_CHECK=1 uv run --no-project python3 scripts/nested-sampling-health.py
+for f in rank-budget start-sidecars run-config progress-bar; do bash scripts/lib/$f.sh --self-check; done
+bash scripts/resume-nested-sampling-run.sh --self-check
+uv run --no-project python3 scripts/test_watchdogs.py
+uv run --no-project python3 scripts/test_self_checks.py
 scripts/test-defaults.sh
 uv run --no-project scripts/test_cli.py
 ```
+
+Everything above needs no Docker. `./ri self-check` is the half that does.
 
 ## Layout
 

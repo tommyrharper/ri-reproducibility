@@ -330,8 +330,9 @@ SEARCH_PID=""
 # the kill landed, so it can only be >= what completed - a resume that ignored
 # the previous attempt would print 0 and re-image everything.
 adopted="$(grep -o '[0-9]\+ evaluations already done' "${RESUME_OUT}.log" | head -1 | cut -d' ' -f1)"
-[ -n "${adopted}" ] && [ "${adopted}" -ge "${resume_before}" ] \
-  || fail "./ri resume started from '${adopted:-nothing}' rather than the ${resume_before} evaluations already on disk; see ${RESUME_OUT}.log"
+if [ -z "${adopted}" ] || [ "${adopted}" -lt "${resume_before}" ]; then
+  fail "./ri resume started from '${adopted:-nothing}' rather than the ${resume_before} evaluations already on disk; see ${RESUME_OUT}.log"
+fi
 resume_after="$(completed_evals "${RESUME_OUT}")"
 [ "${resume_after}" -ge "${resume_before}" ] \
   || fail "the resume lost work: ${resume_before} evaluations before the kill, ${resume_after} after"

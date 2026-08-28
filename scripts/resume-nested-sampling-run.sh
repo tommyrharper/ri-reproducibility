@@ -80,6 +80,8 @@ if [ "${1:-}" = "--self-check" ]; then
   mkdir -p "${TMP}/bin"
   printf '#!/bin/sh\nexit 0\n' >"${TMP}/bin/docker"
   chmod +x "${TMP}/bin/docker"
+  # shellcheck disable=SC2031  # the self-check block exits; there is no
+  # enclosing shell for the export to be lost to
   export PATH="${TMP}/bin:${PATH}"
   export NS_RANK_BUDGET_DIR="${TMP}/budget"
 

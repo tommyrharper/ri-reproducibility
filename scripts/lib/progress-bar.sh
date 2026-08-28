@@ -1001,6 +1001,8 @@ self_check() {
     echo "$*" >>"$0"/attempts; exit 5'
   status=0
   # 4096MB of headroom plus two R2D2 ranks, against a command asking for 8.
+  # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
+  # gets its own budget dir, PATH and free-memory reading and leaks neither
   (
     export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
     export NS_AVAILABLE_MB=$((4096 + 2 * 3500))
@@ -1027,6 +1029,8 @@ self_check() {
   local starved_dir="${tmp}/starved"
   mkdir -p "${starved_dir}/chains"
   status=0
+  # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
+  # gets its own budget dir, PATH and free-memory reading and leaks neither
   (
     export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
     export NS_AVAILABLE_MB=$((4096 + 100))
@@ -1049,6 +1053,8 @@ self_check() {
   local roomy_dir="${tmp}/roomy"
   mkdir -p "${roomy_dir}/chains"
   status=0
+  # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
+  # gets its own budget dir, PATH and free-memory reading and leaks neither
   (
     export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
     export NS_AVAILABLE_MB=$((4096 + 64 * 3500))

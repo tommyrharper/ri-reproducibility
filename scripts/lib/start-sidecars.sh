@@ -182,6 +182,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   REPO_ROOT="${REPO_ROOT:-$(pwd)}"
   _log="$(mktemp)"
+  # shellcheck disable=SC2317  # called indirectly, by sidecar_launch below
   docker() { printf '%s\n' "$*" >>"${_log}"; }
   sidecar_launch linux/amd64 img:a -v /sock:/sock
   sidecar_launch linux/amd64 img:b
