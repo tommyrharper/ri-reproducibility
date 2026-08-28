@@ -138,6 +138,37 @@ def worker_reply(stream: Any, timeout: float) -> str | None:
     return stream.readline()
 
 
+def worker_send(stream: Any, request: str) -> bool:
+    """Write one request to a worker; False if its pipe is already closed.
+
+    The counterpart to worker_reply, and the case it did not cover. Every
+    request path here caches its worker between evaluations, so the death that
+    matters most is the one that happens while nobody is talking to it - the
+    host's OOM killer taking an idle 3.4GB R2D2 worker, or a sidecar container
+    going away - and that death is invisible until the next write, which then
+    fails before the request has been sent. Unhandled, that BrokenPipeError
+    unwound out of the likelihood: PolyChord calls it from Fortran, so instead
+    of the WORKER_DIED retry these loops exist to give it, one dead worker
+    aborted the whole job with a traceback. Reproduced by removing a live
+    WSClean search's sidecar container - the run died on the next evaluation
+    with no retry attempted at all.
+    """
+    try:
+        stream.write(request)
+        stream.flush()
+    except OSError:
+        # Closed here, and the failure of the close swallowed too: the buffer
+        # still holds the request that could not be written, so Python retries
+        # the flush when it collects the object and prints "Exception ignored:
+        # BrokenPipeError" from a worker this rank gave up on long before.
+        try:
+            stream.close()
+        except OSError:
+            pass
+        return False
+    return True
+
+
 class WorkerDied(RuntimeError):
     """A worker died and did not come back, so the host failed, not the algorithm.
 
@@ -811,10 +842,11 @@ def sidecar_run(
 
     The command's own output goes to the log files, so only the exit code `echo`
     comes back down the shell's stdout and nothing a sidecar prints can be
-    mistaken for a reply. A shell that dies without answering is dropped from
-    the cache, so the retry below starts a fresh one; a death that survives
-    that is reported as WORKER_DIED rather than as an exit status the command
-    never returned.
+    mistaken for a reply. A shell that dies - without answering, or before the
+    request could even be written to it (worker_send) - is dropped from the
+    cache, so the retry below starts a fresh one; a death that survives that is
+    reported as WORKER_DIED rather than as an exit status the command never
+    returned.
     """
     request = (
         f"cd {shlex.quote(str(workdir))} && {shlex.join(cmd)}"
@@ -823,8 +855,11 @@ def sidecar_run(
     started = time.perf_counter()
     for attempt in worker_attempts():
         shell = sidecar_shell(image, platform)
-        shell.stdin.write(request)
-        shell.stdin.flush()
+        if not worker_send(shell.stdin, request):
+            # The shell died between evaluations, so the request never left
+            # this rank; the next attempt opens a fresh `docker exec`.
+            _SIDECAR_SHELLS.pop(image, None)
+            continue
         reply = worker_reply(shell.stdout, SHELL_REPLY_TIMEOUT)
         if reply:
             wall_seconds = time.perf_counter() - started
@@ -1637,13 +1672,17 @@ def run_r2d2_imaging(
     short, so a death here is retried against a fresh worker and, if it
     happens again, reported as WORKER_DIED - never as an `imager.py` exit
     status, which is what the sampler would otherwise score as a failure mode.
+    A worker killed while it was idle between evaluations counts: the pipe is
+    already broken when the next request is written, which is what worker_send
+    turns back into a retry.
     """
     request = {"argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}
     started = time.perf_counter()
     for attempt in worker_attempts():
         worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
-        worker.stdin.write(json.dumps(request) + "\n")
-        worker.stdin.flush()
+        if not worker_send(worker.stdin, json.dumps(request) + "\n"):
+            _R2D2_WORKERS.pop(r2d2_image, None)
+            continue
         reply = worker_reply(worker.stdout, IMAGING_REPLY_TIMEOUT)
         if reply:
             answer = json.loads(reply)
@@ -1702,7 +1741,8 @@ def simulate_worker_request(
 ) -> int:
     """Send one request to this rank's simulate worker and report its exit code.
 
-    A worker that dies without answering is dropped from the cache so the retry
+    A worker that dies without answering, or before the request could be
+    written to it at all (worker_send), is dropped from the cache so the retry
     gets a fresh one instead of inheriting the corpse. One that stops answering
     without dying - the MeqTrees/meqserver deadlock SIMULATE_REPLY_TIMEOUT
     exists for - is killed first, so that it leaves the same way. Either one
@@ -1711,8 +1751,9 @@ def simulate_worker_request(
     """
     for attempt in worker_attempts():
         worker = simulate_worker(meqtrees_image, platform)
-        worker.stdin.write(json.dumps(request) + "\n")
-        worker.stdin.flush()
+        if not worker_send(worker.stdin, json.dumps(request) + "\n"):
+            _SIMULATE_WORKERS.pop(meqtrees_image, None)
+            continue
         reply = worker_reply(worker.stdout, SIMULATE_REPLY_TIMEOUT)
         if reply:
             return int(json.loads(reply)["returncode"])
@@ -1836,10 +1877,18 @@ def self_check_worker_timeout() -> None:
     class Worker:
         """A worker whose reply never arrives, or arrives, on a real fd."""
 
-        def __init__(self, reply: str | None) -> None:
+        def __init__(self, reply: str | None, broken_stdin: bool = False) -> None:
             read_fd, self._write_fd = os.pipe()
             self.stdout = os.fdopen(read_fd, "r")
-            self.stdin = open(os.devnull, "w")
+            if broken_stdin:
+                # A worker that died while nothing was talking to it: the pipe
+                # is closed at the far end, so the next write raises rather
+                # than the next read returning "".
+                request_read, request_write = os.pipe()
+                os.close(request_read)
+                self.stdin = os.fdopen(request_write, "w")
+            else:
+                self.stdin = open(os.devnull, "w")
             self.killed = False
             if reply is not None:
                 os.write(self._write_fd, reply.encode())
@@ -1854,6 +1903,10 @@ def self_check_worker_timeout() -> None:
     answered = Worker('{"returncode": 3}\n')
     assert worker_reply(answered.stdout, 5.0) == '{"returncode": 3}\n'
     assert worker_reply(Worker(None).stdout, 0.05) is None
+    # And the death worker_reply cannot see: a worker that went before the
+    # request was written to it at all.
+    assert worker_send(Worker(None).stdin, "x\n") is True
+    assert worker_send(Worker(None, broken_stdin=True).stdin, "x\n") is False
 
     original = {name: globals()[name] for name in ("simulate_worker", "WORKER_RETRY_DELAYS", "SIMULATE_REPLY_TIMEOUT")}
     workers: list[Worker] = []
@@ -1887,6 +1940,29 @@ def self_check_worker_timeout() -> None:
             assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
             assert not stderr_path.exists()
         assert len(workers) == 1 and not workers[0].killed
+
+        # A worker killed between two evaluations - the OOM killer taking an
+        # idle 3.4GB R2D2 worker is the real shape of this - leaves a broken
+        # pipe, so the write fails before the request is sent. That has to be
+        # the same retry as a death mid-request: unhandled, the BrokenPipeError
+        # unwound out of the likelihood and MPI_Abort ended the whole run on
+        # the first attempt, with no retry made and no WORKER_DIED reported.
+        workers.clear()
+
+        def spawn_broken_then_answering(*_args: Any, **_kwargs: Any) -> Worker:
+            first = not workers
+            workers.append(Worker(None if first else '{"returncode": 7}\n',
+                                  broken_stdin=first))
+            return workers[-1]
+
+        globals()["simulate_worker"] = spawn_broken_then_answering
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr_path = Path(tmp) / "simulate.stderr.log"
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
+            assert not stderr_path.exists()
+        assert len(workers) == 2, len(workers)
+        # Nothing to kill: it was already gone, which is why the write failed.
+        assert not workers[0].killed
     finally:
         globals().update(original)
 

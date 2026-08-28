@@ -1008,7 +1008,7 @@ can act on, instead of hanging it.
 
 `./ri self-check self-heal` is the end-to-end check of all of the above, and
 it is part of `./ri self-check`. It starts a real WSClean search on a throwaway
-directory and breaks it three times, in the three ways that recover through
+directory and breaks it four times, in the four ways that recover through
 different machinery:
 
 - **`SIGKILL` once it has scored 8 evaluations** - fewer than `--nlive`, so the
@@ -1022,9 +1022,17 @@ different machinery:
   budget. Nothing restarts it, so this is the one scenario that reaches the
   manual path: `./ri health` has to headline it `STOPPED` and name
   `./ri resume <run>`, and that resume has to continue the search rather than
-  begin one.
+  begin one. The command is taken out of the report and typed verbatim rather
+  than compared against a spelling, because which of the two forms is right
+  depends on where the run directory is.
+- **`SIGKILL` on every worker of a fourth search**, from inside the sidecar,
+  which is what the host's OOM killer does to the biggest resident process on a
+  box several searches share. This one is supposed to cost nothing: the death
+  is absorbed inside the evaluation by the retry loops in `common.py`, so the
+  assertion is that the run finishes with `restarts.log` never written. It did
+  not - see `worker_send` below.
 
-The first two then assert that the run restarts itself, records the kill in
+The first two assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes
 `summary.json`, and comes out of `./ri health` with nothing on its own
 headline. Its headline rather than the exit status, which is 1 for a host
@@ -1038,15 +1046,46 @@ no `summary.json`, `./ri health` headlines it `STOPPED` and prints the
 `./ri resume` line for it, and that resume then picks up at least the
 evaluations already on disk (its own "N evaluations already done" count) and
 finishes the search - after which resuming again is a no-op rather than a
-second job over the same chains. The
+second job over the same chains. The fourth asserts that nothing happened at
+all beyond a gap: the search finishes, more evaluations land after the kill
+than before it, and no restart was spent. The
 wait for recovery is bounded, because the failure it is most likely to catch is
-a hang rather than an exit. ~3 minutes and ~0.6GB, so it is safe to run beside
+a hang rather than an exit. ~4 minutes and ~0.6GB, so it is safe to run beside
 another search. Fixtures cannot stand in for it - every bug found in this
 machinery so far (the retry reading a checkpoint-frozen counter, the stall
 accounting refusing to excuse a run's own restart, the restart colliding with
-its own evaluation directories, and this report calling a run killed a second
-ago `STARTING` for the ten minutes it took the mtime to go stale) passed the
-fixtures and failed a real kill.
+its own evaluation directories, this report calling a run killed a second
+ago `STARTING` for the ten minutes it took the mtime to go stale, and the
+broken pipe below) passed the fixtures and failed a real kill.
+
+#### A worker that died while nobody was talking to it
+
+Each rank keeps one long-lived worker per sidecar - a `docker exec` shell for
+WSClean, a pooled `simulate` for MeqTrees, a `r2d2_serve.py` for R2D2 - and
+each request path retries a worker that dies or goes silent mid-request against
+a fresh one, reporting `WORKER_DIED` only if that fails too. What none of them
+covered was the worker that died *between* requests, which is the common one:
+the biggest resident process on this host is always an imager worker, an idle
+R2D2 one still holds ~3.4GB, and the OOM killer takes it while its rank is
+waiting in a collective. The pipe is then already broken when the next request
+is written, and the write raised before any of the retry machinery was reached.
+Because PolyChord calls the likelihood from Fortran, that `BrokenPipeError`
+went to `abort_run`: one dead worker ended the whole job and spent a restart.
+
+`worker_send` in `common.py` is the counterpart to `worker_reply` - it reports
+a failed write as "this worker is gone" instead of raising - and all three
+request paths now drop the worker and retry on it. Measured on a real search
+whose workers were killed at 10 evaluations: before, the job aborted and
+`run_with_retries` spent a restart to reach the same 54 evaluations; after, it
+finished with no restart at all.
+
+Still open: the same reproduction with the *container* removed rather than its
+workers (`docker rm -f` on a sidecar) now ends cleanly as `WORKER_DIED` instead
+of a traceback, but it cannot heal - `run-nested-sampling.sh` starts the
+sidecars once, before `run_with_retries`, so every restart lands on the same
+missing container, scores nothing, and stops. Re-launching a container that has
+gone before the next attempt is the fix, and it needs `sidecar_launch` to
+remember each container's own `docker run` arguments.
 
 ### Finding and resuming a run that stopped
 

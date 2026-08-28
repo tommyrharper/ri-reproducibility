@@ -11,7 +11,7 @@
 # fixture and obvious to a real kill. So: start a real search, break it, and
 # assert it finishes anyway.
 #
-# Three ways of breaking it, because they recover through different machinery.
+# Four ways of breaking it, because they recover through different machinery.
 # A SIGKILL is the crash `run_with_retries` was written for - the run exits and
 # the loop sees a status. A frozen rank is the failure it cannot see: PolyChord
 # calls the likelihood from Fortran, so one rank that stops answering leaves
@@ -25,7 +25,17 @@
 # nothing is driving end on it, and so does every message `run_with_retries`
 # gives up with - and nothing joined it to a real interrupted run either.
 #
-# ~3 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
+# The fourth is the only one that is supposed to cost nothing: a worker killed
+# while its rank was between evaluations, which is what the host's OOM killer
+# does to the biggest process on a box several searches share. That death is
+# meant to be absorbed inside the evaluation - dropped, retried against a fresh
+# worker, WORKER_DIED only if that fails too - so the assertion is that the run
+# finishes with no restart at all. It did not: the pipe to a worker that died
+# while idle is already broken when the next request is written, and the
+# BrokenPipeError unwound out of the likelihood into MPI_Abort, ending the run
+# and spending a restart on every one.
+#
+# ~4 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
 # the report never see. WSClean rather than R2D2 because it reaches its first
 # checkpoint in ~15s where R2D2 takes over an hour.
 set -euo pipefail
@@ -40,6 +50,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${REPO_ROOT}/results/.self-heal-check-$$"
 HUNG_OUT="${REPO_ROOT}/results/.self-heal-hang-check-$$"
 RESUME_OUT="${REPO_ROOT}/results/.self-heal-resume-check-$$"
+WORKER_OUT="${REPO_ROOT}/results/.self-heal-worker-check-$$"
 # Deliberately fewer than `--nlive`, so the kill lands before PolyChord has
 # written its first `.resume` - the regime that was broken. A run killed after
 # one takes the same path with strictly more on disk to adopt.
@@ -63,11 +74,12 @@ cleanup() {
   pkill -9 -f "polychord_wsclean.py --output-dir ${OUT}" 2>/dev/null || true
   pkill -9 -f "polychord_wsclean.py --output-dir ${HUNG_OUT}" 2>/dev/null || true
   pkill -9 -f "polychord_wsclean.py --output-dir ${RESUME_OUT}" 2>/dev/null || true
+  pkill -9 -f "polychord_wsclean.py --output-dir ${WORKER_OUT}" 2>/dev/null || true
   if [ -n "${PASSED}" ]; then
     rm -rf "${OUT}" "${OUT}.log" "${HUNG_OUT}" "${HUNG_OUT}.log" \
-      "${RESUME_OUT}" "${RESUME_OUT}.log"
+      "${RESUME_OUT}" "${RESUME_OUT}.log" "${WORKER_OUT}" "${WORKER_OUT}.log"
   else
-    echo "self-heal: left ${OUT}*, ${HUNG_OUT}* and ${RESUME_OUT}* for inspection" >&2
+    echo "self-heal: left ${OUT}*, ${HUNG_OUT}*, ${RESUME_OUT}* and ${WORKER_OUT}* for inspection" >&2
   fi
   return 0
 }
@@ -275,15 +287,22 @@ case "$(printf '%s\n' "${health}" | head -1)" in
   *) fail "./ri health does not headline the killed run STOPPED:
 ${health}" ;;
 esac
-grep -qF "./ri resume ${RESUME_OUT##*/}" <<<"${health}" \
+# Taken from the report and run verbatim, rather than compared against a
+# spelling this check believes in. `./ri health` gives a run under
+# results/nested-sampling/ its bare name and any other run - these throwaway
+# directories included - its path, and asserting either one here only says
+# which branch was taken. What matters is that the command a human is handed
+# is one `./ri resume` accepts, and the only way to know that is to type it.
+resume_advice="$(grep -o './ri resume [^ ]*' <<<"${health}" | head -1)"
+[ -n "${resume_advice}" ] \
   || fail "./ri health does not offer ./ri resume on a stopped run:
 ${health}"
 
 # `./ri resume` reads run.env for every setting the run was started with and
 # re-clamps only the rank count, so this also covers that file being written,
 # sourceable, and complete enough to finish a search from.
-echo "self-heal: resuming ${RESUME_OUT##*/} by hand"
-"${REPO_ROOT}/ri" resume "${RESUME_OUT}" >>"${RESUME_OUT}.log" 2>&1 &
+echo "self-heal: resuming by hand with what the report offered: ${resume_advice}"
+"${REPO_ROOT}/ri" resume "${resume_advice##* }" >>"${RESUME_OUT}.log" 2>&1 &
 SEARCH_PID=$!
 wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
   || fail "./ri resume neither finished nor died within ${RECOVER_TIMEOUT_SECONDS}s - a rank is stuck in an MPI collective; see ${RESUME_OUT}.log"
@@ -312,6 +331,61 @@ grep -qF "already finished" <<<"${again}" \
   || fail "./ri resume re-ran a finished run instead of saying so: ${again}"
 
 echo "self-heal: killed unretried at ${resume_before} evaluations, resumed by hand and finished at ${resume_after}"
+
+# Scenario four: nothing about the run is killed - one of its workers is, while
+# the rank that owns it is between evaluations. That is the host's OOM killer's
+# usual victim (the biggest resident process on a shared box is always an
+# imager worker, and an idle R2D2 one still holds ~3.4GB), and common.py's
+# retry loops exist to absorb it inside the evaluation. So this is the one
+# scenario where a *restart* is the failure: the run has to finish with
+# restarts.log never written.
+echo "self-heal: starting a fourth wsclean search in ${WORKER_OUT}"
+"${REPO_ROOT}/ri" search wsclean \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 --no-build \
+  --output-dir "${WORKER_OUT}" >"${WORKER_OUT}.log" 2>&1 &
+SEARCH_PID=$!
+
+for _ in $(seq 1 120); do
+  [ "$(completed_evals "${WORKER_OUT}")" -ge "${KILL_AFTER_EVALS}" ] && break
+  kill -0 "${SEARCH_PID}" 2>/dev/null || fail "fourth search exited before scoring ${KILL_AFTER_EVALS} evaluations; see ${WORKER_OUT}.log"
+  sleep 1
+done
+worker_before="$(completed_evals "${WORKER_OUT}")"
+[ "${worker_before}" -ge "${KILL_AFTER_EVALS}" ] \
+  || fail "only ${worker_before} evaluations after 120s; see ${WORKER_OUT}.log"
+
+# Found by this run's own `ri.run-dir` label, so no other search on this host
+# can be caught in it - and killed from inside the container, because the
+# workers are the `sh` processes on the far end of each rank's `docker exec`
+# and there is nothing on the host to signal but the client. Every rank's
+# worker at once: which of the three is idle at this instant is a race, and a
+# rank killed mid-request already had a covered path (its reply never comes).
+worker_sidecar="$(docker ps --filter "label=ri.run-dir=${WORKER_OUT}" \
+  --format '{{.Names}}\t{{.Image}}' | grep -i wsclean | cut -f1)"
+[ -n "${worker_sidecar}" ] || fail "no wsclean sidecar labelled for ${WORKER_OUT}"
+echo "self-heal: killing every wsclean worker in ${worker_sidecar} at ${worker_before} evaluations"
+# /proc rather than pkill: the wsclean image ships no procps. `$$` is this
+# `sh`, which is itself named sh and would otherwise kill itself first.
+docker exec "${worker_sidecar}" sh -c \
+  'for d in /proc/[0-9]*; do p="${d#/proc/}"; [ "$(cat "${d}/comm" 2>/dev/null)" = sh ] && [ "${p}" != "$$" ] && kill -9 "${p}"; done; true' \
+  || fail "could not kill the workers in ${worker_sidecar}"
+
+wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
+  || fail "the search neither finished nor died within ${RECOVER_TIMEOUT_SECONDS}s of losing its workers; see ${WORKER_OUT}.log"
+wait "${SEARCH_PID}" && worker_status=0 || worker_status=$?
+SEARCH_PID=""
+[ "${worker_status}" -eq 0 ] \
+  || fail "the search did not survive losing its workers (exit ${worker_status}); see ${WORKER_OUT}.log"
+[ -f "${WORKER_OUT}/summary.json" ] || fail "run finished with no summary.json"
+# The whole point. A restart here means the death escaped the evaluation and
+# aborted the job, which is what it did before worker_send in common.py.
+[ -e "${WORKER_OUT}/restarts.log" ] \
+  && fail "losing a worker cost a whole restart instead of being retried in place: $(cat "${WORKER_OUT}/restarts.log")"
+worker_after="$(completed_evals "${WORKER_OUT}")"
+[ "${worker_after}" -gt "${worker_before}" ] \
+  || fail "no evaluation completed after the workers were killed (${worker_before} then ${worker_after})"
+
+echo "self-heal: workers killed at ${worker_before} evaluations, retried in place and finished at ${worker_after}"
 
 PASSED=1
 echo "self-heal check passed"
