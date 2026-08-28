@@ -45,7 +45,12 @@ Four things it checks, each one a way a run has actually gone wrong here:
 * **Cost, again, in memory and cores.** Memory is what caps a run here, so
   what the run holds is reported next to what the host has left - over every
   process carrying the run directory, because a rank is ~10MB and the imager
-  worker behind it is ~3.3GB.
+  worker behind it is ~3.3GB. `memory` is the same cost measured by the run
+  itself rather than sampled off the host: `peak_memory_bytes` out of each
+  evaluation's metrics, multiplied out over the ranks. That is the standing estimate
+  `scripts/lib/rank-budget.sh` sizes every run from, so this is the only place
+  it gets checked against the images actually in use - and it survives the run,
+  which the process table does not.
 
 * **Cost, again, on disk.** The one resource nothing here reserves, checks or
   frees, and the only one that only ever grows: an evaluation directory keeps
@@ -92,6 +97,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 NESTED_SAMPLING_DIR = Path("results/nested-sampling")
 
@@ -113,6 +119,14 @@ FAILURE_OBJECTIVE_MARKER = '"objective": 100.0'
 # no extra I/O. Pulled out by pattern rather than json.loads for the same
 # reason the failure marker is: 5,000 files a run, and only one number wanted.
 WALL_SECONDS_PATTERN = re.compile(r'"wall_seconds":\s*([0-9.eE+-]+)')
+
+# ...and the imager's peak resident set for that same evaluation, from the same
+# string. Memory is what caps a run on this host - rank count is the knob that
+# has to fit in RAM, and scripts/lib/rank-budget.sh sizes it from a fixed
+# MB-per-rank measured once, by hand, on one set of images. This is that same
+# number measured continuously by the run itself, which is the only thing that
+# would notice the estimate going stale.
+PEAK_MEMORY_PATTERN = re.compile(r'"peak_memory_bytes":\s*([0-9.eE+-]+)')
 
 # Long enough that no legitimate evaluation reaches it: the slowest measured
 # here is ~33s of R2D2 imaging, and common.py's own ceilings (10s for a
@@ -473,6 +487,21 @@ def free_bytes(path: Path) -> tuple[int, int] | None:
     return fs.f_bavail * fs.f_frsize, fs.f_blocks * fs.f_frsize
 
 
+class Evaluation(NamedTuple):
+    """One finished evaluation, as the single pass over evaluations/ sees it.
+
+    Ordered so that sorting these sorts by when they landed. Named rather than
+    a bare tuple only because there are now five fields and most readers of it
+    want one.
+    """
+
+    when: float
+    failed: bool
+    path: Path
+    wall_seconds: float | None
+    peak_memory_bytes: float | None
+
+
 def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
     """Counts, timings and failures, in one pass over evaluations/.
 
@@ -482,10 +511,10 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
     """
     evaluations = run_dir / "evaluations"
     directories = 0
-    # (when it landed, whether it failed, where it is), kept together so that
-    # "how the run is going now" can be asked of failures as well as of pace,
-    # and so the newest few can be measured for size without a second glob.
-    records: list[tuple[float, bool, Path, float | None]] = []
+    # Kept together so that "how the run is going now" can be asked of
+    # failures as well as of pace, and so the newest few can be measured for
+    # size without a second glob.
+    records: list[Evaluation] = []
     wedged_lines = 0
     for entry in evaluations.glob("eval-*"):
         if not entry.is_dir():
@@ -498,16 +527,19 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
             pass  # in flight, or a leftover the next run will sweep
         else:
             cost = WALL_SECONDS_PATTERN.search(text)
-            records.append((when, FAILURE_OBJECTIVE_MARKER in text, entry,
-                            float(cost.group(1)) if cost else None))
+            peak = PEAK_MEMORY_PATTERN.search(text)
+            records.append(Evaluation(
+                when, FAILURE_OBJECTIVE_MARKER in text, entry,
+                float(cost.group(1)) if cost else None,
+                float(peak.group(1)) if peak else None))
         try:
             wedged_lines += len((entry / "meqserver-wedged.log").read_text().splitlines())
         except OSError:
             pass
     records.sort()
-    times = [when for when, _, _, _ in records]
-    failed = sum(1 for _, bad, _, _ in records if bad)
-    recent_failed = (sum(1 for _, bad, _, _ in records[-RATE_WINDOW:] if bad)
+    times = [r.when for r in records]
+    failed = sum(1 for r in records if r.failed)
+    recent_failed = (sum(1 for r in records[-RATE_WINDOW:] if r.failed)
                      if len(records) >= RATE_WINDOW else None)
     gaps = [b - a for a, b in zip(times, times[1:])]
     threshold = MIN_STALL_GAP_SECONDS
@@ -562,8 +594,8 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
     # parameters drawn and a nested-sampling run concentrates: the live R2D2
     # search here ran at a 25.4s median over its life and 12.2s over its last
     # 50, with no fault.
-    def _cost(rows: list) -> float | None:
-        seen = [w for _, _, _, w in rows if w is not None]
+    def _median(rows: list[Evaluation], field: str) -> float | None:
+        seen = [v for v in (getattr(r, field) for r in rows) if v is not None]
         return statistics.median(seen) if seen else None
 
     # The occupancy is a total, not a ratio of the two medians. A duty cycle is
@@ -577,18 +609,25 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
     # killed inside its opening parallel batch has every evaluation landing in
     # the same millisecond, so the elapsed time is mtime granularity and the
     # ratio is a division by noise rather than an occupancy.
-    def _duty(rows: list) -> float | None:
+    def _duty(rows: list[Evaluation]) -> float | None:
         if len(rows) < 2:
             return None
-        elapsed = rows[-1][0] - rows[0][0]
+        elapsed = rows[-1].when - rows[0].when
         if elapsed < MIN_RATE_SPAN_SECONDS:
             return None
-        return sum(w for _, _, _, w in rows if w is not None) / elapsed
+        return sum(r.wall_seconds for r in rows if r.wall_seconds is not None) / elapsed
 
-    cost, recent_cost = _cost(records), None
+    cost, recent_cost = _median(records, "wall_seconds"), None
+    # A median for the same reason the cost is: peak memory follows the
+    # parameters drawn, and a run that concentrates drifts away from its own
+    # opening. Peak rather than resident, because peak is what the OOM killer
+    # reacts to and what a rank has to be budgeted for.
+    peak_memory = _median(records, "peak_memory_bytes")
+    recent_peak_memory = None
     busy_ranks, recent_busy_ranks = _duty(records), None
     if span >= MIN_RATE_SPAN_SECONDS and len(gaps) >= 2 * RATE_WINDOW:
-        recent_cost = _cost(records[-RATE_WINDOW:])
+        recent_cost = _median(records[-RATE_WINDOW:], "wall_seconds")
+        recent_peak_memory = _median(records[-RATE_WINDOW:], "peak_memory_bytes")
         recent_busy_ranks = _duty(records[-RATE_WINDOW:])
 
     # Spread over the run's life rather than taken from its tail. An
@@ -599,7 +638,7 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
     # Strided rather than random so the number does not move between two
     # readings of an unchanged run.
     stride = max(1, len(records) // DISK_SAMPLE)
-    sample = [where for _, _, where, _ in records[::stride]]
+    sample = [r.path for r in records[::stride]]
     per_evaluation = (statistics.mean(_dir_bytes(where) for where in sample)
                       if sample else None)
     rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
@@ -615,6 +654,8 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
         "recent_evals_per_minute": recent_rate,
         "seconds_per_evaluation": cost,
         "recent_seconds_per_evaluation": recent_cost,
+        "peak_memory_bytes": peak_memory,
+        "recent_peak_memory_bytes": recent_peak_memory,
         "busy_ranks": busy_ranks,
         "recent_busy_ranks": recent_busy_ranks,
         "bytes_per_evaluation": per_evaluation,
@@ -622,7 +663,7 @@ def evaluation_scan(run_dir: Path, procs: int = 0) -> dict[str, object]:
         "disk_bytes_per_hour": (per_evaluation * rate * 60
                                 if per_evaluation and rate else None),
         "history": history(times),
-        "occupancy": occupancy(times, [w for _, _, _, w in records], procs),
+        "occupancy": occupancy(times, [r.wall_seconds for r in records], procs),
         "slowdown_factor": slowdown,
         "stall_threshold_seconds": threshold,
         "stall_count": len(stalls),
@@ -1140,8 +1181,14 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
 
 
 def format_gb(value: float) -> str:
-    """GB at one decimal, MB below that, so a young run does not read as 0.0GB."""
-    return (f"{value / 1024 ** 3:.1f}GB" if value >= 0.1 * 1024 ** 3
+    """GB at one decimal, MB under a gigabyte, so a young run does not read as 0.0GB.
+
+    The switch is at 1GB and not at 0.1GB because these figures get multiplied
+    together in front of the reader: a 49MB WSClean evaluation over 3 ranks is
+    147MB, and rounding that to "0.1GB" beside the "49MB" it came from reads as
+    an arithmetic error rather than as a unit.
+    """
+    return (f"{value / 1024 ** 3:.1f}GB" if value >= 1024 ** 3
             else f"{value / 1024 ** 2:.0f}MB")
 
 
@@ -1296,6 +1343,34 @@ def render(run: dict[str, object]) -> None:
                       + (f", {run['cores_busy']:.1f}"
                          + (f" of {cores}" if cores else "")
                          + " cores busy" if run["cores_busy"] else "")))
+    # What the imager peaks at, and what that costs across the whole rank
+    # complement. `resources` above is what the run holds right now and only
+    # exists while it is alive; this is measured by the run itself, survives
+    # it, and is the number rank-budget.sh's fixed MB-per-rank is a standing
+    # estimate of - so a drift in the imaging stack's footprint shows up here
+    # before it shows up as an OOM kill. Not "per evaluation": WSClean's
+    # figure is GNU time on that one imaging run, while R2D2's is the warm
+    # worker's own high-water RSS and so is a running maximum over the rank's
+    # life. Both answer what one rank has to be budgeted, which is the
+    # question; neither is an average. Recent value only when it has moved
+    # materially, because on this host it does not - 3.45-3.57GB across 6,600
+    # R2D2 evaluations - so printing it twice unchanged would be noise while a
+    # doubling is exactly what wants saying.
+    peak = run["peak_memory_bytes"]
+    if peak:
+        across = ""
+        if str(settings.get("NS_MPI_PROCS", "")).isdigit():
+            procs = int(settings["NS_MPI_PROCS"])
+            across = (f", {format_gb(float(peak) * procs)} across "
+                      f"{procs} rank{'' if procs == 1 else 's'}")
+        recent_peak = run["recent_peak_memory_bytes"]
+        moved = ""
+        if recent_peak is not None and not (
+                1 / RATE_DIVERGENCE_FACTOR < float(recent_peak) / float(peak)
+                < RATE_DIVERGENCE_FACTOR):
+            moved = f"  (last {RATE_WINDOW}: {format_gb(float(recent_peak))})"
+        lines.append(("memory", f"{format_gb(float(peak))} peak imager memory"
+                                + across + moved))
     # Memory and cores are held and given back; disk is only ever taken, and
     # by the time it runs out the run is over. So the run's own share is shown
     # as a rate and, while it is still writing, as the time that rate has left.
@@ -1464,13 +1539,19 @@ def self_check() -> None:
     now = time.time()
 
     def write_eval(run: Path, index: int, mtime: float, objective: float = 0.008,
-                   wedges: int = 0, wall_seconds: float | None = None) -> None:
+                   wedges: int = 0, wall_seconds: float | None = None,
+                   peak_memory_bytes: float | None = None) -> None:
         eval_dir = run / "evaluations" / f"eval-{index:04d}-abc"
         eval_dir.mkdir(parents=True)
         metrics = eval_dir / "metrics.json"
         body: dict[str, object] = {"eval_id": index, "objective": objective}
-        if wall_seconds is not None:
-            body["metrics"] = {"wall_seconds": wall_seconds}
+        if wall_seconds is not None or peak_memory_bytes is not None:
+            metric_values: dict[str, float] = {}
+            if wall_seconds is not None:
+                metric_values["wall_seconds"] = wall_seconds
+            if peak_memory_bytes is not None:
+                metric_values["peak_memory_bytes"] = peak_memory_bytes
+            body["metrics"] = metric_values
         metrics.write_text(json.dumps(body, indent=2))
         os.utime(metrics, (mtime, mtime))
         if wedges:
@@ -1862,10 +1943,14 @@ def self_check() -> None:
                 stamp += 2
                 # One 1s outlier, so the cost is a median and not whatever the
                 # first or the cheapest evaluation happened to be.
-                write_eval(idle, i + 1, stamp, wall_seconds=1.0 if i == 0 else 20.0)
+                write_eval(idle, i + 1, stamp, wall_seconds=1.0 if i == 0 else 20.0,
+                           peak_memory_bytes=1024.0 ** 3)
             for i in range(60):
                 stamp += 10
-                write_eval(idle, 151 + i, stamp, wall_seconds=5.0)
+                # Four times the footprint over the tail, which is the drift
+                # that would put a 16-rank R2D2 run past what the host holds.
+                write_eval(idle, 151 + i, stamp, wall_seconds=5.0,
+                           peak_memory_bytes=4 * 1024.0 ** 3)
             serial = describe(idle, [], DEFAULT_STALE_SECONDS)
             assert float(serial["seconds_per_evaluation"]) == 20.0, serial
             assert float(serial["recent_seconds_per_evaluation"]) == 5.0, serial
@@ -1889,6 +1974,17 @@ def self_check() -> None:
             assert abs(float(used["high_fraction"]) - 1.0) < 0.01, used
             assert abs(float(used["low_fraction"]) - 0.0625) < 0.01, used
             assert "6%-100% of 8 ranks busy per 0:00:44 slice" in rendered_idle, rendered_idle
+            # ...and what the imager peaked at over them. A median: 150 of
+            # the 210 at 1GB and 60 at 4GB, so the mean would be 1.9GB and only
+            # the median is 1.0. Multiplied out over the ranks, because what
+            # the host has to hold is every rank's worker at once, and the
+            # recent window printed alongside it because a 4x drift is the
+            # whole reason to measure this rather than trust rank-budget.sh's
+            # fixed MB-per-rank.
+            assert float(serial["peak_memory_bytes"]) == 1024.0 ** 3, serial
+            assert float(serial["recent_peak_memory_bytes"]) == 4 * 1024.0 ** 3, serial
+            assert ("memory    1.0GB peak imager memory, 8.0GB across 8 ranks"
+                    "  (last 50: 4.0GB)") in rendered_idle, rendered_idle
             # Absolute scale, unlike `history` above: a run that spent its
             # whole life at half occupancy must draw half-height bars, not the
             # full ones a peak-relative scale would give it.
@@ -1896,14 +1992,27 @@ def self_check() -> None:
             (half / "chains").mkdir(parents=True)
             (half / "run.env").write_text("NS_MPI_PROCS=8\n")
             for i in range(200):
-                write_eval(half, i + 1, now - 3600 + i * 2, wall_seconds=8.0)
-            steady = describe(half, [], DEFAULT_STALE_SECONDS)["occupancy"]
+                write_eval(half, i + 1, now - 3600 + i * 2, wall_seconds=8.0,
+                           peak_memory_bytes=2 * 1024.0 ** 3)
+            flat_memory = describe(half, [], DEFAULT_STALE_SECONDS)
+            steady = flat_memory["occupancy"]
             assert set(steady["bar"]) == {HISTORY_LEVELS[4]}, steady
             assert abs(float(steady["high_fraction"]) - 0.5) < 0.01, steady
+            # A run whose footprint has not moved says so once, not twice: the
+            # recent window is measured (200 evaluations is past the 2x50 the
+            # window needs) and withheld because it agrees.
+            assert float(flat_memory["recent_peak_memory_bytes"]) == 2 * 1024.0 ** 3, \
+                flat_memory
+            assert ("memory    2.0GB peak imager memory, 16.0GB across 8 ranks\n"
+                    in io_capture(flat_memory)), io_capture(flat_memory)
             # A run whose rank count is not recorded has no denominator, so it
             # gets no shape rather than one drawn against a guess.
             (half / "run.env").write_text("")
-            assert describe(half, [], DEFAULT_STALE_SECONDS)["occupancy"] is None
+            no_procs = describe(half, [], DEFAULT_STALE_SECONDS)
+            assert no_procs["occupancy"] is None
+            # ...and no rank multiple either, rather than one against a guess.
+            assert "memory    2.0GB peak imager memory\n" in io_capture(no_procs), \
+                io_capture(no_procs)
 
             # A run whose evaluations all landed in the same millisecond has no
             # occupancy to report, for the same reason it has no rate: the gap
@@ -1913,6 +2022,11 @@ def self_check() -> None:
             for i in range(100):
                 write_eval(burst, i + 1, now - 3600 + i * 0.005, wall_seconds=13.0)
             flat = describe(burst, [], DEFAULT_STALE_SECONDS)
+            # Its evaluations record no peak memory, so there is no line at all
+            # rather than a zero - runs predating the field must not read as
+            # having cost nothing.
+            assert flat["peak_memory_bytes"] is None, flat
+            assert "memory" not in io_capture(flat), io_capture(flat)
             assert flat["busy_ranks"] is None, flat
             assert "% busy" not in io_capture(flat), io_capture(flat)
             rendered = io_capture(report)

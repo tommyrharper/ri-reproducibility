@@ -323,6 +323,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   forecast  ~38% done, ~454 dead points total, ~4h54m left
   ranks     16 ranks of 16, 7 busy-waiting
   resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
+  memory    3.3GB peak imager memory, 53.2GB across 16 ranks
   disk      7.5GB written, +2.6GB/hour, 93h of space left at that rate
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
   stalls    8 gaps over 13s, 154s = 5.5% of wall clock
@@ -542,6 +543,34 @@ What each line is reading, and why it is worth a line:
   number read to answer "will another run fit". Cores busy is the same one
   second CPU sample as the spin check, summed over those processes, so it
   measures the imaging rather than the ranks waiting on it.
+- **memory** - the same cost measured by the run itself instead of sampled off
+  the host: the median `peak_memory_bytes` its evaluations recorded, and that
+  multiplied out over `NS_MPI_PROCS`, because what the host has to hold is
+  every rank's worker at once. Two things **resources** above cannot do. It
+  survives the run - a finished or OOM-killed run has no processes left to
+  sample, and this is the only place its footprint is still on record. And it
+  is the measurement behind `scripts/lib/rank-budget.sh`, which sizes every
+  run on this host from a fixed 3500MB per R2D2 rank and 200MB per WSClean
+  rank, hand-measured once against one set of images and carrying its own
+  `ponytail:` note asking to be re-measured if the imaging stack changes.
+  This line is that re-measurement, running continuously: the live 16-rank
+  R2D2 search here reads 3.3GB against the 3.42GB budgeted, so the estimate
+  is 3% conservative and the run fits.
+
+  Not "per evaluation", because the two imagers measure different things
+  under the same key: WSClean's is GNU `time -v` on that one imaging run,
+  R2D2's is the warm worker's own high-water RSS and therefore a running
+  maximum over the rank's whole life. Both answer "what does one rank have to
+  be budgeted", which is the question; neither is an average, and R2D2's can
+  only ever rise.
+
+  The last-50 figure is printed only when it has moved by more than 2x.
+  Footprint is flat on this host - 3.45-3.57GB across 6,600 R2D2 evaluations,
+  0.05GB dead flat across 1,800 WSClean ones - so a second number that agrees
+  is noise, while a doubling is a parameter region or a leak that the budgeter
+  cannot see coming. Reported and not warned on: the host block below already
+  warns on the only threshold that is a fact rather than an inference, free
+  memory under the headroom `rank-budget.sh` reserves.
 - **disk** - the resource nothing here reserves, checks or frees, and the only
   one that only ever grows. An evaluation directory keeps its measurement set,
   its `.mat` and the imager's output - ~1.7MB on this host - and nothing
