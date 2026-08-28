@@ -70,7 +70,7 @@ busy host nothing to ask.
 
 Usage:
 
-  uv run scripts/nested-sampling-health.py            # the newest run
+  uv run scripts/nested-sampling-health.py            # the run that is going
   uv run scripts/nested-sampling-health.py <run>
   uv run scripts/nested-sampling-health.py --all
   uv run scripts/nested-sampling-health.py --json
@@ -1171,9 +1171,14 @@ def render(run: dict[str, object]) -> None:
     rate = run["evals_per_minute"]
     slowdown = run["slowdown_factor"]
     # Where the count will next move to, so a reader who comes back has
-    # something to compare against rather than a number that looks stuck.
+    # something to compare against rather than a number that looks stuck. Only
+    # for a run that is still going: a finished or dead run's count will never
+    # move again, and promising a next value is the one thing that would make
+    # its stale-by-design mtime read as work still to come.
     next_update = ""
-    if settings.get("NS_NLIVE", "").isdigit() and run["checkpoint_age_seconds"] is not None:
+    if run["status"] in ("healthy", "stalled", "starting") \
+            and settings.get("NS_NLIVE", "").isdigit() \
+            and run["checkpoint_age_seconds"] is not None:
         next_update = f", next at ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
     lines = [
         # The dead-point count never appears without how old it is. PolyChord
@@ -1370,8 +1375,22 @@ def run_directories() -> list[Path]:
                   key=started_at, reverse=True)
 
 
-def resolve(name: str | None) -> Path:
-    """A run directory from a path, a bare run name, or nothing at all."""
+def resolve(name: str | None,
+            processes: list[dict[str, object]] | None = None) -> Path:
+    """A run directory from a path, a bare run name, or nothing at all.
+
+    With nothing at all, the newest run that still has ranks - not simply the
+    newest run. This report's question is about a search that is going, and the
+    newest run stops being that one the moment a short test lands after a
+    multi-hour search: the test finishes in minutes, the search does not, and
+    "the newest run" then names the only one of the two nobody is asking about.
+    Falls back to the newest on a host with nothing running, which is every
+    host most of the time.
+
+    Ranks rather than every process carrying the run directory: a killed run's
+    sidecar workers outlive it until the next run reaps them, and they are not
+    a run still going.
+    """
     if name:
         candidate = Path(name)
         if not candidate.is_dir():
@@ -1382,6 +1401,9 @@ def resolve(name: str | None) -> Path:
     runs = run_directories()
     if not runs:
         raise SystemExit(f"No runs under {NESTED_SAMPLING_DIR}/.")
+    for run in runs:
+        if rank_processes(run, processes or []):
+            return run
     return runs[0]
 
 
@@ -1389,7 +1411,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run", nargs="?", metavar="RUN",
-                        help="run directory or its name (default: the newest run)")
+                        help="run directory or its name (default: the newest "
+                             "run that is still running, else the newest run)")
     parser.add_argument("--all", action="store_true", help="every run on disk")
     parser.add_argument("--stale-seconds", type=float, default=DEFAULT_STALE_SECONDS,
                         help="a live run silent for this long is stalled "
@@ -1401,7 +1424,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--all takes no run argument")
 
     processes = process_table()
-    directories = run_directories() if args.all else [resolve(args.run)]
+    directories = run_directories() if args.all else [resolve(args.run, processes)]
     # One sample interval for every run being reported, not one each: only a
     # run with live processes is sampled at all, and there is rarely more than
     # one. A report over finished runs costs nothing. Everything the run owns
@@ -1436,7 +1459,7 @@ def self_check() -> None:
             render(report)
         return sink.getvalue()
 
-    global NESTED_SAMPLING_DIR
+    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions
     saved = NESTED_SAMPLING_DIR
     now = time.time()
 
@@ -1726,10 +1749,15 @@ def self_check() -> None:
             # while something is still running.
             assert describe(live, [], 5.0)["status"] == "stopped"
             assert describe(live, ranks, 5.0)["status"] == "stalled"
+            # A stalled run's count can still move; a stopped one's cannot, so
+            # only the first may say where it will move to.
+            assert "next at ~7" in io_capture(describe(live, ranks, 5.0))
+            assert "next at" not in io_capture(describe(live, [], 5.0))
             # ...and once it finishes, neither is true however old it gets.
             (live / "summary.json").write_text("{}")
             assert describe(live, [], 5.0)["status"] == "finished"
             assert describe(live, [], 5.0)["warnings"] == []
+            assert "next at" not in io_capture(describe(live, [], 5.0))
             (live / "summary.json").unlink()
 
             # Ranks that spend a whole sample on CPU are the deadlock
@@ -2061,6 +2089,25 @@ def self_check() -> None:
             newest.mkdir()
             assert resolve(None).name == newest.name
             assert [d.name for d in run_directories()][0] == newest.name
+            # But a run with ranks outranks every newer one that has none:
+            # `live` is the oldest directory here and the only one running, and
+            # it is the run the report exists to be about. `ranks` carry its
+            # --output-dir; `processes` (a bare `sh`) carry nobody's.
+            assert resolve(None, ranks).name == live.name
+            assert resolve(None, processes).name == newest.name
+            # Ranks, not every process carrying the run directory: a killed
+            # run's sidecar workers outlive it holding ~3.4GB each, and
+            # defaulting to a dead run because it leaked containers would show
+            # the wrong run for exactly as long as nobody reaped them.
+            leftover = [p for p in not_ranks if "r2d2_serve.py" in str(p["args"])]
+            assert leftover and resolve(None, leftover).name == newest.name
+            # Two runs going at once - the shared host this is written for -
+            # and the newer of them wins, so "newest" still means newest.
+            also_live = [dict(ranks[0], pid=777,
+                              args=f"python3 polychord_r2d2.py --output-dir {newest.resolve()}")]
+            assert resolve(None, ranks + also_live).name == newest.name
+            # An explicit run still wins over both.
+            assert resolve(fast.name, ranks).name == fast.name
             newest.rmdir()
 
             # And the whole thing renders and scores. Into a sink, because what
@@ -2072,16 +2119,29 @@ def self_check() -> None:
             import io
 
             global meminfo_mb
-            original_memory = meminfo_mb
+            original_memory, original_table = meminfo_mb, process_table
+            original_cpu = cpu_busy_fractions
             try:
                 sidecar_containers = lambda: []  # noqa: E731
                 meminfo_mb = lambda key: HEADROOM_MB * 2  # noqa: E731
                 with contextlib.redirect_stdout(io.StringIO()):
                     assert main(["--all", "--json"]) == 1
                     assert main([live.name]) == 0
+                # ...and no-argument `./ri health` reaches the running run,
+                # not the newest directory: `fast` is newer and finished.
+                process_table = lambda: ranks
+                # ...and no CPU sample for four pids that do not exist: the
+                # real one sleeps a second to take it.
+                cpu_busy_fractions = lambda pids: {}
+                sink = io.StringIO()
+                with contextlib.redirect_stdout(sink):
+                    main([])
+                assert sink.getvalue().startswith(live.name), sink.getvalue()
             finally:
                 sidecar_containers = original
                 meminfo_mb = original_memory
+                process_table = original_table
+                cpu_busy_fractions = original_cpu
     finally:
         NESTED_SAMPLING_DIR = saved
     print("nested-sampling-health self-check passed")

@@ -128,7 +128,7 @@ check(
 # positional rather than a flag - so it is the one place a mistranslation would
 # silently report on the wrong run.
 check(
-    "health with no arguments asks about the newest run",
+    "health with no arguments leaves the run choice to the script",
     ({}, [["uv", "run", "scripts/nested-sampling-health.py"]]),
     plan("health"),
 )

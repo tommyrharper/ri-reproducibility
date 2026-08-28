@@ -333,12 +333,14 @@ host
   sidecars  3 running, 0 leaked
 ```
 
-With no argument it reports on the newest run; `--all` covers every run on
-disk and `--json` is the machine-readable form. It reads files and runs one
-`ps` and one `docker ps`, plus a one second CPU sample when a run has live
-ranks - nothing is started and nothing is imaged, so a run in progress does not
-notice it. Exit status is 1 when something needs attention, so it can gate a
-script.
+With no argument it reports on the newest run that still has ranks, falling
+back to the newest run when nothing is going: a five-minute test started after
+a ten-hour search would otherwise be "the newest run" and hide the only one of
+the two worth asking about. `--all` covers every run on disk and `--json` is
+the machine-readable form. It reads files and runs one `ps` and one `docker
+ps`, plus a one second CPU sample when a run has live ranks - nothing is
+started and nothing is imaged, so a run in progress does not notice it. Exit
+status is 1 when something needs attention, so it can gate a script.
 
 **The status is decided in this order, and the order is the point.** A run
 that finished and a run that died both stop writing, so a stale mtime alone
@@ -374,7 +376,10 @@ What each line is reading, and why it is worth a line:
   31 minutes to its first checkpoint and 72 more to its second, because each
   batch of `nlive` dead points costs more likelihood evaluations than the last
   (its `<nlike>` went 14.10 to 32.50 over the same two). So a later reading
-  longer than an earlier one is the expected shape, not a slowdown.
+  longer than an earlier one is the expected shape, not a slowdown. `next at`
+  appears only while the run is going: a finished or dead run's count will
+  never move again, and promising it a next value is the one thing that would
+  make its stale-by-design checkpoint read as work still to come.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
