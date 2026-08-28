@@ -251,13 +251,14 @@ and `go -C tui test ./...` checks it.
 ./ri health                # every live run, plus host memory and leaked sidecars
 ./ri health <run>
 ./ri health --all
+./ri health --monitor      # redraw in place every 5s instead of printing once
 ```
 
-`HEALTHY` / `STALLED` / `STOPPED` / `FINISHED`, with the rate, the share of
-wall clock lost to stalls, and how many evaluations scored
-`FAILURE_OBJECTIVE` - which PolyChord maximizes, so a run whose imager is
-broken looks like a run finding spectacular failures. Exits 1 when something
-needs attention. Details: docs/run-health.md.
+`STARTING` / `RESTARTING` / `HEALTHY` / `STALLED` / `STOPPED` / `FINISHED`,
+with the rate, the share of wall clock lost to stalls, and how many
+evaluations scored `FAILURE_OBJECTIVE` - which PolyChord maximizes, so a run
+whose imager is broken looks like a run finding spectacular failures. Exits 1
+when something needs attention. Details: docs/run-health.md.
 
 ## Reports
 

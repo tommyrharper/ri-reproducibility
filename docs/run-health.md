@@ -5,9 +5,10 @@ have while one is still going. See [nested-sampling.md](nested-sampling.md) for
 how to start a run, and [robustness.md](robustness.md) for what happens when
 one breaks.
 
-`./ri tui` is this report on a timer: the same text, re-run every 5 seconds,
-next to the run table and a form that starts a search. Everything below is
-what it shows.
+`./ri tui` is this report on a timer next to the run table and a form that
+starts a search - needs Go. `./ri health --monitor` is the lighter version of
+the same idea: just this report, redrawn in place, no other tool required.
+Everything below is what both of them show.
 
 ```console
 $ ./ri health
@@ -37,9 +38,9 @@ host
   sidecars  3 running, 0 leaked
 ```
 
-`./ri health --monitor` redraws this report in place every `--interval`
-seconds (default 5) instead of printing once, so watching a run does not fill
-the terminal with one scrollback entry per poll. Ctrl-C to stop.
+`--monitor` redraws every `--interval` seconds (default 5, matching the TUI's
+own timer) instead of printing once, so watching a run does not fill the
+terminal with one scrollback entry per poll. Ctrl-C to stop.
 
 ## Which runs it reports on
 
