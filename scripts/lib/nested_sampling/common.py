@@ -138,6 +138,37 @@ def worker_reply(stream: Any, timeout: float) -> str | None:
     return stream.readline()
 
 
+def worker_send(stream: Any, request: str) -> bool:
+    """Write one request to a worker; False if its pipe is already closed.
+
+    The counterpart to worker_reply, and the case it did not cover. Every
+    request path here caches its worker between evaluations, so the death that
+    matters most is the one that happens while nobody is talking to it - the
+    host's OOM killer taking an idle 3.4GB R2D2 worker, or a sidecar container
+    going away - and that death is invisible until the next write, which then
+    fails before the request has been sent. Unhandled, that BrokenPipeError
+    unwound out of the likelihood: PolyChord calls it from Fortran, so instead
+    of the WORKER_DIED retry these loops exist to give it, one dead worker
+    aborted the whole job with a traceback. Reproduced by removing a live
+    WSClean search's sidecar container - the run died on the next evaluation
+    with no retry attempted at all.
+    """
+    try:
+        stream.write(request)
+        stream.flush()
+    except OSError:
+        # Closed here, and the failure of the close swallowed too: the buffer
+        # still holds the request that could not be written, so Python retries
+        # the flush when it collects the object and prints "Exception ignored:
+        # BrokenPipeError" from a worker this rank gave up on long before.
+        try:
+            stream.close()
+        except OSError:
+            pass
+        return False
+    return True
+
+
 class WorkerDied(RuntimeError):
     """A worker died and did not come back, so the host failed, not the algorithm.
 
@@ -811,10 +842,11 @@ def sidecar_run(
 
     The command's own output goes to the log files, so only the exit code `echo`
     comes back down the shell's stdout and nothing a sidecar prints can be
-    mistaken for a reply. A shell that dies without answering is dropped from
-    the cache, so the retry below starts a fresh one; a death that survives
-    that is reported as WORKER_DIED rather than as an exit status the command
-    never returned.
+    mistaken for a reply. A shell that dies - without answering, or before the
+    request could even be written to it (worker_send) - is dropped from the
+    cache, so the retry below starts a fresh one; a death that survives that is
+    reported as WORKER_DIED rather than as an exit status the command never
+    returned.
     """
     request = (
         f"cd {shlex.quote(str(workdir))} && {shlex.join(cmd)}"
@@ -823,8 +855,11 @@ def sidecar_run(
     started = time.perf_counter()
     for attempt in worker_attempts():
         shell = sidecar_shell(image, platform)
-        shell.stdin.write(request)
-        shell.stdin.flush()
+        if not worker_send(shell.stdin, request):
+            # The shell died between evaluations, so the request never left
+            # this rank; the next attempt opens a fresh `docker exec`.
+            _SIDECAR_SHELLS.pop(image, None)
+            continue
         reply = worker_reply(shell.stdout, SHELL_REPLY_TIMEOUT)
         if reply:
             wall_seconds = time.perf_counter() - started
@@ -1332,10 +1367,36 @@ def mpi_rank() -> int:
         return 0
 
 
+def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
+    """One evaluation's metrics.json, or None if it is not a readable record.
+
+    A metrics.json that does not parse is a write something interrupted - the
+    OOM killer, the stall watchdog, ENOSPC - and it is not recoverable, so
+    every reader here has to be able to go on without it. Raising instead ends
+    the run for good: the file is read at startup by every restart and every
+    `./ri resume`, all of which then die before scoring anything, which is
+    also what stops `run_with_retries` from trying again.
+    """
+    try:
+        record = json.loads(metrics_path.read_text())
+    except FileNotFoundError:
+        # An evaluation that was still in flight. The ordinary case on every
+        # resume, and not worth a word.
+        return None
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict):
+        print(f"WARNING: ignoring unreadable {metrics_path}", file=sys.stderr, flush=True)
+        return None
+    return record
+
+
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for metrics_path in sorted(evaluations_dir.glob("eval-*/metrics.json")):
-        records.append(json.loads(metrics_path.read_text()))
+        record = read_evaluation_record(metrics_path)
+        if record is not None:
+            records.append(record)
     return records
 
 
@@ -1353,21 +1414,25 @@ def adopt_completed_evaluations(
     reason to resume rather than start again.
 
     The evaluations that were still in flight when the run stopped are thrown
-    away first. An evaluation directory with no metrics.json holds nothing
-    worth keeping - the run died between creating it and scoring it - and
-    simulate_measurement_set() creates each one with `exist_ok=False`, on
-    purpose, so that two ranks cannot land on the same directory. Left in
-    place, one of these would crash the resumed run the moment the sampler
-    proposed that point again: the very run this is supposed to rescue.
+    away. An evaluation directory with no readable metrics.json holds nothing
+    worth keeping - the run died between creating it and scoring it, or in the
+    middle of writing the record - and simulate_measurement_set() creates each
+    one with `exist_ok=False`, on purpose, so that two ranks cannot land on the
+    same directory. Left in place, one of these would crash the resumed run the
+    moment the sampler proposed that point again: the very run this is supposed
+    to rescue.
     """
     import shutil
 
-    for leftover in sorted(evaluations_dir.glob("eval-*")):
-        if leftover.is_dir() and not (leftover / "metrics.json").exists():
+    for eval_dir in sorted(evaluations_dir.glob("eval-*")):
+        if not eval_dir.is_dir():
+            continue
+        record = read_evaluation_record(eval_dir / "metrics.json")
+        if record is None:
             # ignore_errors because every rank runs this, and they are all
             # removing the same directories at the same moment.
-            shutil.rmtree(leftover, ignore_errors=True)
-    for record in load_evaluations_from_dir(evaluations_dir):
+            shutil.rmtree(eval_dir, ignore_errors=True)
+            continue
         evaluations.append(record)
         cache[params_key(record["params"])] = record
     return len(evaluations)
@@ -1414,14 +1479,76 @@ def self_check_resume_adoption() -> None:
         assert not in_flight.exists()
 
     with tempfile.TemporaryDirectory() as tmp:
+        # A metrics.json the run was killed in the middle of writing. Before
+        # this was tolerated, one zero-byte file like this ended a search for
+        # good: json.loads raised on every restart and on every ./ri resume,
+        # before either scored anything, so the retry loop gave up too.
+        evaluations_dir = Path(tmp)
+        good = evaluations_dir / "eval-0001-abc"
+        good.mkdir()
+        write_evaluation_record(good, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        killed = evaluations_dir / "eval-0002-def"
+        killed.mkdir()
+        (killed / "metrics.json").write_text("")
+        half = evaluations_dir / "eval-0003-ghi"
+        half.mkdir()
+        (half / "metrics.json").write_text('{\n  "eval_id": 3,\n  "para')
+
+        evaluations = []
+        cache = {}
+        assert load_evaluations_from_dir(evaluations_dir) == [
+            {"eval_id": 1, "params": {"a": 1}, "objective": 0.5}
+        ]
+        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert good.exists()
+        # Removed, not merely skipped: simulate_measurement_set() creates the
+        # directory with exist_ok=False, so a kept one crashes the run this is
+        # rescuing the moment the sampler proposes that point again.
+        assert not killed.exists()
+        assert not half.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The record is renamed into place rather than truncated and rewritten,
+        # so a rank killed mid-write leaves no metrics.json at all instead of
+        # half of one. A rename gives a new inode; an in-place write does not.
+        eval_dir = Path(tmp) / "eval-0001-abc"
+        eval_dir.mkdir()
+        write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        first_inode = (eval_dir / "metrics.json").stat().st_ino
+        write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.7})
+        assert (eval_dir / "metrics.json").stat().st_ino != first_inode
+        assert list(eval_dir.iterdir()) == [eval_dir / "metrics.json"]
+
+    with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
         evaluations = []
         cache = {}
         assert adopt_completed_evaluations(Path(tmp), evaluations, cache) == 0
 
 
+def write_json_atomic(path: Path, payload: Any) -> None:
+    """Write `payload` as JSON, or leave `path` as it was.
+
+    Written under a temporary name and renamed into place, so a rank killed
+    mid-write - the OOM killer, the stall watchdog, ENOSPC - leaves either no
+    file or the whole one, never half of one. The rename is atomic (same
+    directory, so same filesystem) and costs one syscall.
+
+    Both files this writes are read by something that cannot go on without
+    them: half a metrics.json used to end a search for good (see
+    read_evaluation_record), and half a summary.json makes a finished run
+    unreportable, unmergeable and - because every reader calls a run with a
+    summary.json finished - unrepairable. summary.json is the bigger window by
+    far: it carries every evaluation of the run, so an R2D2 search spends
+    seconds inside this call, not microseconds.
+    """
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(json.dumps(payload, indent=2) + "\n")
+    partial.replace(path)
+
+
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
-    (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
+    write_json_atomic(eval_dir / "metrics.json", record)
     return record
 
 
@@ -1512,9 +1639,9 @@ def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWork
     a live point at once, so all of it used to land on the wall clock in front
     of evaluation one. The run scripts make one warm worker per rank the
     sidecar's own startup command instead, and this connects to it. Falling back
-    to a rank-started worker is what happens when there is no pool - an
-    OUTPUT_DIR outside the bind mount, so the FIFOs are not visible in both
-    containers.
+    to a rank-started worker is what happens when there is no pool - no
+    NS_SIMULATE_FIFO_DIR at all, or a pool this rank has already abandoned
+    because its worker died.
     """
     fifo_dir = os.environ.get(fifo_dir_var)
     if not fifo_dir or _FIFO_POOL_ABANDONED:
@@ -1637,13 +1764,17 @@ def run_r2d2_imaging(
     short, so a death here is retried against a fresh worker and, if it
     happens again, reported as WORKER_DIED - never as an `imager.py` exit
     status, which is what the sampler would otherwise score as a failure mode.
+    A worker killed while it was idle between evaluations counts: the pipe is
+    already broken when the next request is written, which is what worker_send
+    turns back into a retry.
     """
     request = {"argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}
     started = time.perf_counter()
     for attempt in worker_attempts():
         worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
-        worker.stdin.write(json.dumps(request) + "\n")
-        worker.stdin.flush()
+        if not worker_send(worker.stdin, json.dumps(request) + "\n"):
+            _R2D2_WORKERS.pop(r2d2_image, None)
+            continue
         reply = worker_reply(worker.stdout, IMAGING_REPLY_TIMEOUT)
         if reply:
             answer = json.loads(reply)
@@ -1702,7 +1833,8 @@ def simulate_worker_request(
 ) -> int:
     """Send one request to this rank's simulate worker and report its exit code.
 
-    A worker that dies without answering is dropped from the cache so the retry
+    A worker that dies without answering, or before the request could be
+    written to it at all (worker_send), is dropped from the cache so the retry
     gets a fresh one instead of inheriting the corpse. One that stops answering
     without dying - the MeqTrees/meqserver deadlock SIMULATE_REPLY_TIMEOUT
     exists for - is killed first, so that it leaves the same way. Either one
@@ -1711,8 +1843,9 @@ def simulate_worker_request(
     """
     for attempt in worker_attempts():
         worker = simulate_worker(meqtrees_image, platform)
-        worker.stdin.write(json.dumps(request) + "\n")
-        worker.stdin.flush()
+        if not worker_send(worker.stdin, json.dumps(request) + "\n"):
+            _SIMULATE_WORKERS.pop(meqtrees_image, None)
+            continue
         reply = worker_reply(worker.stdout, SIMULATE_REPLY_TIMEOUT)
         if reply:
             return int(json.loads(reply)["returncode"])
@@ -1836,10 +1969,18 @@ def self_check_worker_timeout() -> None:
     class Worker:
         """A worker whose reply never arrives, or arrives, on a real fd."""
 
-        def __init__(self, reply: str | None) -> None:
+        def __init__(self, reply: str | None, broken_stdin: bool = False) -> None:
             read_fd, self._write_fd = os.pipe()
             self.stdout = os.fdopen(read_fd, "r")
-            self.stdin = open(os.devnull, "w")
+            if broken_stdin:
+                # A worker that died while nothing was talking to it: the pipe
+                # is closed at the far end, so the next write raises rather
+                # than the next read returning "".
+                request_read, request_write = os.pipe()
+                os.close(request_read)
+                self.stdin = os.fdopen(request_write, "w")
+            else:
+                self.stdin = open(os.devnull, "w")
             self.killed = False
             if reply is not None:
                 os.write(self._write_fd, reply.encode())
@@ -1854,6 +1995,10 @@ def self_check_worker_timeout() -> None:
     answered = Worker('{"returncode": 3}\n')
     assert worker_reply(answered.stdout, 5.0) == '{"returncode": 3}\n'
     assert worker_reply(Worker(None).stdout, 0.05) is None
+    # And the death worker_reply cannot see: a worker that went before the
+    # request was written to it at all.
+    assert worker_send(Worker(None).stdin, "x\n") is True
+    assert worker_send(Worker(None, broken_stdin=True).stdin, "x\n") is False
 
     original = {name: globals()[name] for name in ("simulate_worker", "WORKER_RETRY_DELAYS", "SIMULATE_REPLY_TIMEOUT")}
     workers: list[Worker] = []
@@ -1887,6 +2032,29 @@ def self_check_worker_timeout() -> None:
             assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
             assert not stderr_path.exists()
         assert len(workers) == 1 and not workers[0].killed
+
+        # A worker killed between two evaluations - the OOM killer taking an
+        # idle 3.4GB R2D2 worker is the real shape of this - leaves a broken
+        # pipe, so the write fails before the request is sent. That has to be
+        # the same retry as a death mid-request: unhandled, the BrokenPipeError
+        # unwound out of the likelihood and MPI_Abort ended the whole run on
+        # the first attempt, with no retry made and no WORKER_DIED reported.
+        workers.clear()
+
+        def spawn_broken_then_answering(*_args: Any, **_kwargs: Any) -> Worker:
+            first = not workers
+            workers.append(Worker(None if first else '{"returncode": 7}\n',
+                                  broken_stdin=first))
+            return workers[-1]
+
+        globals()["simulate_worker"] = spawn_broken_then_answering
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr_path = Path(tmp) / "simulate.stderr.log"
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
+            assert not stderr_path.exists()
+        assert len(workers) == 2, len(workers)
+        # Nothing to kill: it was already gone, which is why the write failed.
+        assert not workers[0].killed
     finally:
         globals().update(original)
 

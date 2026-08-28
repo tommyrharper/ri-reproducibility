@@ -1,39 +1,29 @@
+# shellcheck shell=bash  # sourced, so no shebang
 # Clamp a run's rank count to the memory the host can actually give it.
 #
 # Rank count, not NS_NLIVE, is what costs memory: every rank keeps one warm
-# worker holding its own copy of the imaging stack. Measured on a 20-CPU,
-# 62GB host, holding NS_NLIVE fixed at 12 and varying only the rank count:
-# 4 ranks 13.5GB, 12 ranks 40.6GB - 3.4GB per R2D2 rank, dead linear. So
-# NS_NLIVE can be raised for search quality without touching memory, and
-# NS_MPI_PROCS is the knob that has to fit in RAM.
+# worker holding its own copy of the imaging stack. Measured on this 20-CPU,
+# 62GB host with NS_NLIVE fixed: 4 ranks 13.5GB, 12 ranks 40.6GB - 3.4GB per
+# R2D2 rank, dead linear. So raise NS_NLIVE freely; NS_MPI_PROCS is the knob
+# that has to fit in RAM.
 #
-# Nothing here used to check that. NS_MPI_PROCS defaulted to
-# `min(NS_NLIVE, host CPUs)`, which on this host is 20 ranks - 68GB, more
-# than the box has. The failure is silent rather than loud: the host OOM
-# killer takes an imaging worker, the rank's `readline()` on the reply FIFO
-# returns empty, and common.py records the evaluation with FAILURE_OBJECTIVE
-# (100.0). PolyChord maximizes the objective, and a real `total_rms_jy` is
-# ~0.008, so an OOM kill scores as the best point the search has ever seen
-# and it concentrates live points there. A run that ran out of memory
-# reports "R2D2 fails catastrophically in this corner of the parameter
-# space", which is exactly the conclusion this repo exists to draw. Worse,
-# the dead worker is dropped from the cache, so the next evaluation starts a
-# fresh one - another ~3.4GB - while already out of memory.
+# The failure it prevents is silent, not loud. The OOM killer takes an imaging
+# worker, the rank's `readline()` on the reply FIFO returns empty, and
+# common.py scores FAILURE_OBJECTIVE (100.0) - which PolyChord maximizes,
+# against a real `total_rms_jy` of ~0.008. A run that ran out of memory reports
+# "R2D2 fails catastrophically in this corner of the parameter space", which is
+# exactly the conclusion this repo exists to draw. Worse, the dead worker is
+# dropped from the cache and the next evaluation starts a fresh ~3.4GB one
+# while already out of memory.
 #
-# Several agent sessions share this host and each run sizes itself from
-# `nproc` alone, so the common way to hit that wall is two sessions starting
-# runs, not one oversized run. MemAvailable covers a run that starts while
-# another is already warm. It does not cover two runs sizing themselves in
-# the same second, before either has allocated anything, so a run also
-# reserves what it is about to take.
-#
-# Reservations are files named by the reserving PID, holding "<expiry> <MB>".
-# A reader skips entries whose PID is gone or whose expiry has passed, so
-# there is no release path to get wrong - a run killed with SIGKILL leaves an
-# entry that the next reader prunes. They expire because a reservation only
-# has to cover the gap between deciding a rank count and the workers actually
-# allocating; after that MemAvailable is the truth and still counting the
-# reservation would double-count it.
+# Several sessions share this host, so the common way to hit the wall is two
+# runs sizing themselves in the same second, before either has allocated
+# anything - MemAvailable cannot see that, so a run also reserves what it is
+# about to take. Reservations are files named by the reserving PID holding
+# "<expiry> <MB>"; a reader skips entries whose PID is gone or whose expiry has
+# passed, so there is no release path to get wrong. They expire because a
+# reservation only has to cover the gap between deciding a rank count and the
+# workers actually allocating.
 #
 # Source this, then:
 #
@@ -151,11 +141,110 @@ _ns_unlock() {
   fi
 }
 
+# A pgrep -f regex matching exactly the host-visible processes driving the run
+# in `$1`: the ranks, and the `mpirun` and `docker exec` that wrap them - each
+# spells the run out as `--output-dir <dir>` in its own command line, and the
+# container's processes are visible in host `ps`. Anchored on the end of the
+# directory so a run whose name is a prefix of another is not caught. Sidecar
+# workers name their run by `--fifo-dir` instead and are correctly excluded:
+# they outlive a killed run until the next one reaps them.
+ns_run_process_pattern() {
+  printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
+}
+
+# Whether a job is still driving the run in `$1`, by that same pattern. Both
+# live in this file, the lowest layer every run script and the retry loop
+# already source, because the leaked-sidecar rule below needs them and this
+# file is what progress-bar.sh sources rather than the other way round.
+# Every caller has to agree on what "still running" means: `./ri resume`
+# refuses one, and so must a `./ri search --output-dir` naming it - a second
+# MPI job over the same checkpoint and the same FIFO directories corrupts both,
+# and the new job's first act is to `rm -rf` the FIFOs the live ranks are
+# reading.
+#
+# Both spellings of the path, because a run reached through a symlinked
+# directory was launched with whichever one its own caller used. The directory
+# need not exist: a `--output-dir` that is about to be created is not live.
+ns_run_is_live() {
+  local dir="$1" real
+  pgrep -f "$(ns_run_process_pattern "${dir}")" >/dev/null 2>&1 && return 0
+  [ -d "${dir}" ] || return 1
+  real="$(cd "${dir}" && pwd -P)"
+  [ "${real}" = "${dir}" ] && return 1
+  pgrep -f "$(ns_run_process_pattern "${real}")" >/dev/null 2>&1
+}
+
+# A run killed with SIGKILL leaves its `ri-ns-sidecar-*` containers running,
+# each holding ~3.4GB of warm imaging worker that nothing will ever free. That
+# is the same shape of debris as a stale reservation above, and the rule starts
+# the same way: the launcher's pid is in the container name, so a name whose
+# pid is gone is a candidate. Until now `./ri health` only named them and
+# the FATAL below only suggested looking, which meant the next run was sized
+# against - or refused for - memory a dead run was sitting on.
+#
+# The pid alone is not enough, which is what the `ri.run-dir` label is for. A
+# run script killed with SIGKILL leaves the run itself going - the ranks are
+# children of containerd-shim, not of the shell - so its containers have a dead
+# launcher pid and a live search inside them. Reaping those kills the search,
+# and `./ri health` was handing out the `docker rm -f` line for them. So a
+# container whose labelled run still has processes is never dead, whatever its
+# pid says; the pid rule is the fallback for a container started before the
+# label existed, and for common.py's per-rank fallback containers, which have
+# no run directory to name.
+#
+# The label exempts by run, so a container genuinely leaked by an earlier
+# attempt at a run that is live again would be exempted too. It cannot survive
+# to be: this function runs from ns_budget_ranks, before the new attempt's
+# ranks exist, so the run is not live at the moment the question is asked.
+#
+# Reads `<name><TAB><run dir>` so the rule can be checked without a daemon.
+# Names are `ri-ns-sidecar-<launcher pid>-<n>` (start-sidecars.sh) and
+# `ri-ns-sidecar-<rank pid>-<uuid8>` (common.py's fallback); the pid is in the
+# same position in both. Pid reuse only ever makes this skip a container, never
+# take a live one, which is the direction to be wrong in.
+_ns_dead_sidecar_names() {
+  local line name run_dir pid
+  while IFS= read -r line; do
+    name="${line%%$'\t'*}"
+    run_dir=""
+    [ "${line}" = "${name}" ] || run_dir="${line#*$'\t'}"
+    pid="${name#ri-ns-sidecar-}"
+    pid="${pid%%-*}"
+    case "${pid}" in
+      '' | *[!0-9]*) continue ;;
+    esac
+    if [ -n "${run_dir}" ] && ns_run_is_live "${run_dir}"; then
+      continue
+    fi
+    kill -0 "${pid}" 2>/dev/null || printf '%s\n' "${name}"
+  done
+}
+
+ns_reap_leaked_sidecars() {
+  local dead
+  command -v docker >/dev/null 2>&1 || return 0
+  dead="$(docker ps --filter name=ri-ns-sidecar \
+      --format '{{.Names}}\t{{.Label "ri.run-dir"}}' 2>/dev/null \
+    | _ns_dead_sidecar_names)"
+  [ -n "${dead}" ] || return 0
+  # Said out loud: this is another run's wreckage being removed, and a silent
+  # `docker rm --force` is not something to do on someone else's host.
+  # shellcheck disable=SC2086  # container names cannot contain whitespace
+  echo "NOTE: removing sidecar container(s) left behind by a run that is gone," \
+    "which were holding memory against this run:" ${dead} >&2
+  # shellcheck disable=SC2086  # container names cannot contain whitespace
+  docker rm --force ${dead} >/dev/null 2>&1 || true
+}
+
 # Echoes the rank count to use. Never more than requested, never less than 1.
 ns_budget_ranks() {
   local requested="$1" mb_per_rank="$2" label="$3"
   local dir="${NS_RANK_BUDGET_DIR:-${TMPDIR:-/tmp}/ri-ns-rank-budget-$(id -u)}"
   local available reserved=0 budget affordable now entry pid expiry mb
+
+  # Before the read, so the memory a dead run is still holding is counted as
+  # free rather than clamping this run down to fit around it.
+  ns_reap_leaked_sidecars
 
   # No memory reading (neither /proc/meminfo nor vm_stat, i.e. a platform
   # this hasn't been taught) means no clamp: the guard is a safety net on
@@ -203,9 +292,9 @@ ns_budget_ranks() {
       echo "FATAL: not enough free memory for a single ${label} rank:" \
         "${available}MB available, ${reserved}MB reserved by other runs," \
         "${NS_RANK_BUDGET_HEADROOM_MB}MB headroom, ${mb_per_rank}MB needed per rank." \
-        "Wait for the other runs to finish, or free memory. If nothing is" \
-        "running, check for sidecars a killed run left behind:" \
-        "docker ps --filter name=ri-ns-sidecar" >&2
+        "Sidecars left by a dead run were already removed, so this is memory" \
+        "something live is holding: wait for the other runs to finish," \
+        "or see ./ri health." >&2
       _ns_unlock "${dir}"
       return 1
     fi
@@ -229,6 +318,7 @@ ns_budget_ranks() {
 ns_budget_warn_if_over() {
   local requested="$1" mb_per_rank="$2" label="$3"
   local available
+  ns_reap_leaked_sidecars
   _ns_available_mb >/dev/null 2>&1 || return 0
   available="$(_ns_available_mb)"
   if [ "$((requested * mb_per_rank))" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
@@ -270,6 +360,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   # call leaves a reservation of its own behind.
   clear_reservations() { rm -f "${NS_RANK_BUDGET_DIR}"/[0-9]*; }
 
+  # The budget functions reap leaked sidecars, which is a `docker rm --force`
+  # against whatever is on this host - not something a check may do. The rule
+  # it reaps by is checked directly below instead.
+  ns_reap_leaked_sidecars() { :; }
+
   # Asking for less than the budget affords is left alone.
   [ "$(ns_budget_ranks 8 3400 r2d2)" = 8 ]
   # ...and reserves what it is about to take, for whoever reads next.
@@ -284,7 +379,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   clear_reservations
 
   # Not even one rank fits: refuses, rather than sampling the OOM killer.
-  ! NS_AVAILABLE_MB=5000 ns_budget_ranks 8 3400 r2d2 >/dev/null 2>&1
+  # `cmd && exit 1` rather than `! cmd`, because bash exempts a negated
+  # command from errexit - the `!` form is an assertion that cannot fail.
+  NS_AVAILABLE_MB=5000 ns_budget_ranks 8 3400 r2d2 >/dev/null 2>&1 && {
+    echo "FAIL: 8 ranks of 3400MB granted against 5000MB free"; exit 1
+  }
   clear_reservations
 
   # Another run's live reservation comes out of this one's budget:
@@ -306,6 +405,50 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "$(ns_budget_ranks 8 3400 r2d2)" = 8 ]
   [ ! -f "${NS_RANK_BUDGET_DIR}/${PPID}" ]
   clear_reservations
+
+  # The leaked-sidecar rule, without a daemon: a container whose launcher pid
+  # is gone is named for removal, one whose pid is this shell is left alone.
+  # Both name shapes are covered, because common.py's fallback path uses a
+  # uuid rather than an index after the pid.
+  [ "$(printf 'ri-ns-sidecar-999999-0\nri-ns-sidecar-%s-1\n' "$$" | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-0" ]
+  [ "$(printf 'ri-ns-sidecar-999999-a1b2c3d4\n' | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-a1b2c3d4" ]
+  # Anything that is not that name shape is left alone rather than guessed at.
+  [ -z "$(printf 'ri-ns-sidecar-notapid-0\nsomething-else\n' | _ns_dead_sidecar_names)" ]
+  [ -z "$(printf '' | _ns_dead_sidecar_names)" ]
+
+  # The orphaned run: launcher pid gone, `ri.run-dir` label naming a run that
+  # still has ranks. Reaping these is what killed the search - so the label
+  # wins over the pid. A real process with the real command line, because this
+  # is what pgrep has to see, spelled the way a rank spells it.
+  _orphan_dir="$(mktemp -d)"
+  _orphan_run="${_orphan_dir}/wsclean-vlaa-20260101T000001Z"
+  mkdir -p "${_orphan_run}"
+  # Labelled but not live yet: nothing is running, so the pid still decides.
+  [ "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}" | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-0" ]
+  printf 'import time\ntime.sleep(30)\n' >"${_orphan_dir}/polychord_wsclean.py"
+  python3 "${_orphan_dir}/polychord_wsclean.py" --output-dir "${_orphan_run}" --nlive 50 &
+  _orphan_pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    ns_run_is_live "${_orphan_run}" && break
+    sleep 0.2
+  done
+  ns_run_is_live "${_orphan_run}" \
+    || { echo "FAIL: a live rank on this run must be seen"; kill "${_orphan_pid}"; exit 1; }
+  [ -z "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}" | _ns_dead_sidecar_names)" ] \
+    || { echo "FAIL: a live run's sidecar was offered up for removal"
+         kill "${_orphan_pid}"; exit 1; }
+  # A label naming a *different* run that is not live still reaps, so the
+  # label cannot become a blanket exemption.
+  [ "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}-other" | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-0" ] \
+    || { echo "FAIL: a dead run's labelled sidecar must still be reaped"
+         kill "${_orphan_pid}"; exit 1; }
+  kill "${_orphan_pid}" 2>/dev/null || true
+  wait "${_orphan_pid}" 2>/dev/null || true
+  rm -rf "${_orphan_dir}"
 
   # An explicit rank count is obeyed, and warned about when it will not fit.
   ns_budget_warn_if_over 8 3400 r2d2 2>/dev/null

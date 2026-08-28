@@ -12,8 +12,15 @@
 # libraries - no rebuild needed to check a change. A run executes the copy baked
 # into the image instead, so rebuild before running one.
 #
-# Nothing here starts a search or writes into results/, so it is safe to run
-# while someone else's run is in progress.
+# All but the last of these start no search. The self-heal check does - five ~45
+# second, ~0.6GB WSClean searches: one killed, one hung by freezing a rank, one
+# killed with no retries left and resumed by hand, one whose workers are killed
+# under it, and one whose sidecar container is removed, each watched until it
+# recovers, plus a sixth break with no search of its own - the fifth run's
+# PolyChord checkpoint truncated and resumed - because the thing it checks
+# only exists in a real run. It is safe alongside another run:
+# 3 ranks at ~200MB, sized and refused by scripts/lib/rank-budget.sh like any
+# other, on a throwaway directory the report and `./ri runs` never see.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,9 +43,18 @@ docker_run() {
 
 nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 
+# Through uv, like every other host-side entry point in `ri`, and pinned the
+# way scripts/lib/defaults.sh pins it: test_self_checks.py imports common.py,
+# which needs tomllib to read defaults.toml. A host whose `python3` predates
+# 3.11 - Ubuntu 22.04's 3.10 is one - took the whole of `./ri self-check` down
+# on that import, self-heal check included, so the only check that starts a
+# real search was unreachable through its own documented front door.
+# --no-project because these two need nothing from pyproject.toml.
+host_python() { uv run --no-project --python ">=3.11" python "$@"; }
+
 echo "=== host-side checks ==="
-python3 "${REPO_ROOT}/scripts/test_watchdogs.py"
-python3 "${REPO_ROOT}/scripts/test_self_checks.py"
+host_python "${REPO_ROOT}/scripts/test_watchdogs.py"
+host_python "${REPO_ROOT}/scripts/test_self_checks.py"
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "simulate" ]]; then
   echo
@@ -67,6 +83,26 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2" ]]; then
   echo "=== r2d2 sampler (${POLYCHORD_IMAGE}) ==="
   docker_run -e POLYCHORD_R2D2_SELF_CHECK=1 --entrypoint python3 \
     "${POLYCHORD_IMAGE}" -u "$(nested_sampling polychord_r2d2.py)"
+fi
+
+if [[ "${TARGET}" == "all" || "${TARGET}" == "report" ]]; then
+  echo
+  echo "=== HTML report (${R2D2_IMAGE}) ==="
+  # In the image that builds the report, because most of these check the
+  # matplotlib fast paths the corner plots depend on. Until this existed the
+  # whole family was written and never run - the same gap the header above
+  # describes, one file further out.
+  docker_run -e GENERATE_REPORT_SELF_CHECK=1 --entrypoint python3 \
+    "${R2D2_IMAGE}" -u "${REPO_ROOT}/scripts/lib/generate_report.py"
+fi
+
+if [[ "${TARGET}" == "all" || "${TARGET}" == "self-heal" ]]; then
+  echo
+  echo "=== self-healing (real searches, killed and hung) ==="
+  # Host-side, unlike the checks above: what is under test - run_with_retries in
+  # scripts/lib/progress-bar.sh and `./ri health` - runs on the host from the
+  # working tree. The search it drives executes the copy baked into the images.
+  bash "${REPO_ROOT}/scripts/test_self_heal.sh"
 fi
 
 echo

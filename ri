@@ -46,6 +46,8 @@ SEARCH_ENV = (
     ("seed", "NS_SEED"),
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
+    ("retries", "NS_RETRIES"),
+    ("stall_timeout", "NS_STALL_TIMEOUT"),
     ("omp_threads", "R2D2_OMP_THREADS"),
     ("output_dir", "OUTPUT_DIR"),
 )
@@ -131,7 +133,10 @@ def do_health(args):
 
 
 def do_resume(args):
-    return {}, [["scripts/resume-nested-sampling-run.sh", args.run]]
+    # The build is the resume script's own, because only run.env knows which
+    # images this run needs - unlike ./ri search, where the imager is a flag.
+    env = {"NS_NO_BUILD": "1"} if args.no_build else {}
+    return env, [["scripts/resume-nested-sampling-run.sh", args.run]]
 
 
 def do_report(args):
@@ -267,9 +272,13 @@ def build_parser():
                     "and so cannot run in CI. The working tree is what runs, so "
                     "no rebuild is needed to check a change - but a run executes "
                     "the copy baked into the image, so rebuild before starting "
-                    "one. Starts no search and writes nothing into results/.")
+                    "one. All but the self-heal check start no search; that one "
+                    "runs two ~45 second throwaway WSClean searches, kills one and "
+                    "freezes a rank of the other, and checks both recover on "
+                    "their own.")
     self_check.add_argument("target", nargs="?", default="all",
-        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2"),
+        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "report",
+                 "self-heal"),
         help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",
@@ -319,7 +328,19 @@ def build_parser():
                         help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
-    search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")
+    search.add_argument("--retries", type=int, metavar="N",
+                        help="times a search that died after scoring evaluations "
+                             "restarts itself from its checkpoint, counting only "
+                             "failures that come straight back; 0 disables "
+                             "[NS_RETRIES]")
+    search.add_argument("--stall-timeout", type=int, metavar="SECONDS",
+                        help="seconds without a finished evaluation before a search is "
+                             "killed as hung, so --retries can restart it from its "
+                             "checkpoint; 0 disables [NS_STALL_TIMEOUT]")
+    search.add_argument(
+        "--output-dir",
+        help="run directory, which must be inside the repository - the containers see nothing else [OUTPUT_DIR]",
+    )
     search.add_argument("--enable-param", action="append", metavar="NAME",
                         help="search this parameter_space dimension even if defaults.toml "
                              "has it disabled; repeatable [NS_ENABLE_PARAMS]")
@@ -353,8 +374,13 @@ def build_parser():
         description=(
             "One line per run under results/nested-sampling/, with whether it\n"
             "finished. A run writes summary.json only once PolyChord returns, so\n"
-            "a run without one stopped early - and the HTML report, which globs\n"
-            "for summary.json, does not show it at all.\n"
+            "a run without a whole one stopped early - and the HTML report,\n"
+            "which globs for summary.json, does not show it at all.\n"
+            "\n"
+            "A run that is still going has no summary.json either, so it is\n"
+            "told apart from a stopped one by its processes and shown as\n"
+            "running - it is offered to ./ri health, never to ./ri resume,\n"
+            "which would start a second job over its own checkpoint.\n"
             "\n"
             "Anything unfinished is listed again at the end with the ./ri resume\n"
             "line that continues it."
@@ -371,20 +397,41 @@ def build_parser():
             "might be working, stalled, or long dead, and one that is working\n"
             "might be scoring nothing but its own failures.\n"
             "\n"
-            "Reports progress and rate, whether the ranks are still there, how\n"
-            "much wall clock went to stalls, how many evaluations scored\n"
-            "FAILURE_OBJECTIVE - which PolyChord maximizes, so a broken imager\n"
-            "looks like a spectacular discovery - and any sidecar container left\n"
-            "holding memory by a run that is gone.\n"
+            "Reports progress and rate, how far through the search is and\n"
+            "roughly how long is left, what a restart would have to redo\n"
+            "from behind the last checkpoint, whether the ranks are still\n"
+            "there, what an evaluation costs the imager and how much of\n"
+            "the run's hardware that cost is keeping busy now and over its\n"
+            "whole life, the memory and cores the run is holding, how much\n"
+            "of it the host has pushed out to swap and whether anything is\n"
+            "waiting on those pages, against what the host has left and what\n"
+            "the host as a whole is loaded to,\n"
+            "what one evaluation peaks at and what that\n"
+            "costs across every rank, how fast it is filling the disk and\n"
+            "how long that leaves, how much running time went to stalls, how\n"
+            "many evaluations scored FAILURE_OBJECTIVE - which PolyChord\n"
+            "maximizes, so a broken imager looks like a spectacular\n"
+            "discovery - how many self-healed restarts a live run has left\n"
+            "before the next crash leaves it waiting for a ./ri resume,\n"
+            "and any sidecar container left holding memory by\n"
+            "a run that is gone.\n"
             "\n"
-            "Reads files, runs one ps and one docker ps, and samples rank CPU\n"
+            "Reads files, runs one ps and one docker ps, and samples CPU\n"
             "for a second when a run is live, so it costs a busy\n"
-            "host nothing. Exits 1 when something needs attention."
+            "host nothing. Exits 1 when something needs attention, and\n"
+            "says so on the run's headline as a warning count - coloured\n"
+            "on a terminal, and never when piped or under NO_COLOR."
         ),
     )
     health.add_argument("run", nargs="?", metavar="RUN",
-                        help="run directory or its name (default: the newest run)")
-    health.add_argument("--all", action="store_true", help="every run on disk")
+                        help="run directory, or the name this report prints - "
+                             "including a run another checkout started, while "
+                             "it is still running (default: every run "
+                             "still running anywhere on this host, whichever "
+                             "checkout started it, else this checkout's "
+                             "newest run)")
+    health.add_argument("--all", action="store_true",
+                        help="every run on disk under this checkout")
     health.add_argument("--stale-seconds", type=float, metavar="SECONDS",
                         help="a live run silent for this long is stalled (default: 600)")
     health.add_argument("--json", action="store_true", help="raw JSON instead of a report")
@@ -396,11 +443,21 @@ def build_parser():
             "already finished. The run directory records the settings it was\n"
             "started with, so no flags are needed and none can be misremembered.\n"
             "\n"
-            "./ri runs lists what there is to resume."
+            "./ri runs lists what there is to resume. A run that is still\n"
+            "going is refused: a second job over its checkpoint and FIFO\n"
+            "directories would corrupt both.\n"
+            "\n"
+            "The images the run needs are built first, exactly as ./ri search\n"
+            "does - a run executes the code baked into them, so without it a\n"
+            "resume silently continues on whatever was baked last time. Free\n"
+            "when nothing changed; --no-build skips it."
         ),
     )
     resume.add_argument("run", metavar="RUN",
                         help="run directory, or its name under results/nested-sampling/")
+    resume.add_argument("--no-build", action="store_true",
+                        help="skip the image builds this resume would do first, so the "
+                             "run continues on the code already baked into them")
 
     # Results
     report = add("report", do_report, "build the HTML run report",

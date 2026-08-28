@@ -24,11 +24,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck
 
+      # scripts/lib/*.sh too, not just the entrypoints: the libraries hold the
+      # rank budgeting, the sidecar launcher and the restart loop, and three of
+      # their self-check assertions were written `! cmd` - a form bash exempts
+      # from errexit, so they could never fail. SC2251 is what caught that.
       - name: Lint shell scripts
-        run: shellcheck -x scripts/*.sh
+        run: shellcheck -x scripts/*.sh scripts/lib/*.sh
 
       - name: Check shell syntax
-        run: bash -n scripts/*.sh
+        run: bash -n scripts/*.sh scripts/lib/*.sh
 
       - name: Check Python syntax
         run: python3 -m compileall -q scripts config
@@ -57,6 +61,7 @@ jobs:
           bash scripts/lib/rank-budget.sh --self-check
           bash scripts/lib/start-sidecars.sh --self-check
           bash scripts/lib/run-config.sh --self-check
+          bash scripts/resume-nested-sampling-run.sh --self-check
           bash scripts/lib/progress-bar.sh
           uv run --no-project python3 scripts/nested-sampling-runs.py
         env:

@@ -44,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "runs",
         nargs="*",
-        help="Run directories to merge (>= 2). Omit to discover all compatible groups.",
+        help="Run directories or names to merge (>= 2). "
+        "Omit to discover all compatible groups.",
     )
     parser.add_argument(
         "--out",
@@ -57,9 +58,17 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_run_dir(raw: str) -> Path:
     path = Path(raw).expanduser()
+    # The bare run name `./ri runs` prints, as well as a path - the same door
+    # `./ri health` and `./ri resume` open. A real path of that name wins.
+    if not path.exists() and (NESTED_SAMPLING_DIR / raw).is_dir():
+        return NESTED_SAMPLING_DIR / raw
+    # Resolved whether or not it was absolute, like resolve_run() in
+    # profile-nested-sampling-run.py: an absolute path through a symlink is a
+    # different string for the same directory, which is every temp path on
+    # macOS (/var -> /private/var).
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    return path
+        path = Path.cwd() / path
+    return path.resolve()
 
 
 def relative_to_repo_root(run_dir: Path) -> str:
@@ -222,7 +231,15 @@ def discover_sources() -> list[tuple[Path, dict[str, Any]]]:
         summary_path = run_dir / "summary.json"
         summary: dict[str, Any] | None = None
         if summary_path.is_file():
-            summary = json.loads(summary_path.read_text())
+            try:
+                summary = json.loads(summary_path.read_text())
+            except ValueError:
+                # Half a summary.json, from a rank killed writing it. Skipped
+                # like any other run that did not finish, rather than taking
+                # the merge of every other run down with it.
+                print(f"skip {run_dir.name}: half-written summary.json - "
+                      f"./ri resume {run_dir.name} rewrites it")
+                continue
             if summary.get("merged_from"):
                 print(f"skip {run_dir.name}: already a merge (merged_from)")
                 continue

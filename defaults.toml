@@ -25,6 +25,11 @@ POLYCHORD_IMAGE = "ri-reproducibility/polychord:lite"
 # from `uname -m` in scripts/lib/defaults.sh. Export it to override.
 
 CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
+# The checkpoint set the R2D2 imager loads, as a directory under
+# CHECKPOINTS_DIR on the host and under /checkpoints in the container.
+# A name rather than a path, because the two sides disagree about the
+# path and only ever agree about this.
+R2D2_CKPT_NAME = "R2D2_A1"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
 # PolyChord sampler settings for the nested-sampling runs.
@@ -34,6 +39,23 @@ NS_NUM_REPEATS = 2
 NS_MAX_NDEAD = 12
 NS_SEED = 41
 NS_METRIC = "total_rms_jy"
+
+# How many times a search that died with work already banked restarts itself
+# from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
+# scored no evaluations is never retried, and one that ran longer than
+# NS_RETRY_RESET_SECONDS (1800) before dying hands the budget back, so this
+# bounds a crash loop rather than the lifetime of a multi-day search - see
+# run_with_retries in scripts/lib/progress-bar.sh.
+NS_RETRIES = 2
+
+# Seconds a run may go without finishing a single evaluation before it is
+# killed so that NS_RETRIES can restart it from PolyChord's checkpoint. The
+# backstop for a hang rather than a crash: run_with_retries only sees a run
+# that exits, and a rank deadlocked in an MPI collective never does. 0
+# disables it. Must stay clear of IMAGING_REPLY_TIMEOUT (3600s, common.py),
+# which is how long one evaluation is already allowed to take - see
+# _ns_stall_watchdog in scripts/lib/progress-bar.sh.
+NS_STALL_TIMEOUT = 7200
 
 # The parameter space the sampler searches, read by `load_parameter_space()`
 # in scripts/lib/nested_sampling/common.py. The order is the order of

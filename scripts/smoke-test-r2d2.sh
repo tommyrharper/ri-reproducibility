@@ -68,7 +68,7 @@ print(f'OK: {path} is structurally valid ({cfg[\"architecture\"]}, {cfg[\"im_dim
 "
 
 echo "==> [5/5] checking for pretrained DNN checkpoints"
-CKPT_DIR_A1="${CHECKPOINTS_DIR}/R2D2_A1"
+CKPT_DIR_A1="${CHECKPOINTS_DIR}/${R2D2_CKPT_NAME}"
 if [ ! -f "${CKPT_DIR_A1}/R2D2_UNet_N1.ckpt" ]; then
   cat <<EOF
 
@@ -87,5 +87,5 @@ EOF
 fi
 
 echo "    checkpoints found, running one real R2D2 imaging pass"
-run ./src/imager.py --config /workspace/config/R2D2_U-Net.yaml --ckpt_path /checkpoints/R2D2_A1
+run ./src/imager.py --config /workspace/config/R2D2_U-Net.yaml --ckpt_path "/checkpoints/${R2D2_CKPT_NAME}"
 echo "OK: R2D2-RI smoke test complete, including real inference. Output in ${RESULTS_DIR}/smoke-test-r2d2"

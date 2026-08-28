@@ -38,13 +38,36 @@ from common import (  # noqa: E402
 
 LABEL_WIDTH = 42
 COLUMN_WIDTH = 12
+NESTED_SAMPLING_DIR = Path(__file__).resolve().parents[1] / "results" / "nested-sampling"
+
+
+def resolve_run(raw: str) -> Path:
+    """A path, or the bare run name `./ri runs` prints in its first column.
+
+    The name is what a reader has in front of them, and `./ri health` and
+    `./ri resume` both take one, so a path-only profiler was the odd door out.
+    Only when nothing of that name exists as a path: a real `./wsclean-.../`
+    in the working directory still wins, as it does for every other command.
+    """
+    target = Path(raw).expanduser()
+    return NESTED_SAMPLING_DIR / raw if not target.exists() \
+        and (NESTED_SAMPLING_DIR / raw).is_dir() else target.resolve()
 
 
 def load_summary(target: Path) -> dict[str, Any]:
     summary_path = target / "summary.json" if target.is_dir() else target
     if not summary_path.is_file():
         raise SystemExit(f"no summary.json found at {summary_path}")
-    return json.loads(summary_path.read_text())
+    try:
+        return json.loads(summary_path.read_text())
+    except ValueError:
+        # Half a summary.json, from a rank killed writing it. Said plainly,
+        # with the command that rewrites it, rather than as a JSONDecodeError.
+        raise SystemExit(
+            f"{summary_path} is only half written - the run was killed while "
+            f"writing it.\n./ri resume {summary_path.parent.name} rewrites it "
+            "from the evaluations already on disk."
+        ) from None
 
 
 def print_report(summary: dict[str, Any]) -> None:
@@ -121,11 +144,11 @@ def print_report(summary: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("run", help="Run directory or summary.json path")
+    parser.add_argument("run", help="Run directory, run name, or summary.json path")
     parser.add_argument("--json", action="store_true", help="Print the raw profiling dict as JSON instead of a table")
     args = parser.parse_args()
 
-    summary = load_summary(Path(args.run).resolve())
+    summary = load_summary(resolve_run(args.run))
     if args.json:
         json.dump(summary.get("profiling"), sys.stdout, indent=2)
         print()

@@ -15,6 +15,7 @@ import importlib.machinery
 import importlib.util
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +53,22 @@ check(
     "search flags become NS_* overrides",
     {"NS_NLIVE": "8", "NS_METRIC": "-snr", "NS_MPI_PROCS": "1"},
     plan("search", "wsclean", "--nlive", "8", "--metric=-snr", "--mpi-procs", "1")[0],
+)
+
+# --retries 0 is the flag most likely to be dropped by env_from(), because 0 is
+# falsy and turning off the self-restart has to reach the run script.
+check(
+    "search --retries 0 reaches the run script",
+    {"NS_RETRIES": "0"},
+    plan("search", "wsclean", "--retries", "0")[0],
+)
+
+# Same falsy-zero hazard, same reason: 0 turns the stall watchdog off, which
+# is the setting somebody reaches for when it is misfiring on their run.
+check(
+    "search --stall-timeout 0 reaches the run script",
+    {"NS_STALL_TIMEOUT": "0"},
+    plan("search", "wsclean", "--stall-timeout", "0")[0],
 )
 
 # ...and a flag that was not given contributes nothing, so an environment
@@ -120,7 +137,7 @@ check(
 # positional rather than a flag - so it is the one place a mistranslation would
 # silently report on the wrong run.
 check(
-    "health with no arguments asks about the newest run",
+    "health with no arguments leaves the run choice to the script",
     ({}, [["uv", "run", "scripts/nested-sampling-health.py"]]),
     plan("health"),
 )
@@ -147,11 +164,22 @@ check(
 )
 
 # No flags: resuming reads the settings back out of the run directory, so the
-# run name is the only thing that has to travel.
+# run name is the only thing that has to travel. The image builds a resume does
+# are the resume script's own, because only run.env knows which images the run
+# needs - so nothing but the run name is on this command line either.
 check(
     "resume passes the run through and nothing else",
     ({}, [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
     plan("resume", "r2d2-vlaa-20260827T101500Z"),
+)
+
+# ...and the one way to stop it rebuilding, for a working tree that has moved
+# on since the run started.
+check(
+    "resume --no-build reaches the script as an environment override",
+    ({"NS_NO_BUILD": "1"},
+     [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
+    plan("resume", "r2d2-vlaa-20260827T101500Z", "--no-build"),
 )
 
 check(
@@ -263,6 +291,53 @@ for path in command_paths(ri.build_parser()):
     )
     label = " ".join(["./ri", *path, "--help"])
     check(f"{label} renders", (0, True), (result.returncode, bool(result.stdout)))
+
+# The name in the first column of `./ri runs` is what a reader copies, and it
+# has to work in every command that takes a run. `health` and `resume` resolve
+# it in the shell/Python they dispatch to; these three each own a resolver, and
+# each one used to accept only a path - `./ri profile <name>` answered "no
+# summary.json found at <cwd>/<name>". Checked here rather than three new
+# self-checks because "every run-taking command takes the name" is a property
+# of the front door, not of any one script.
+def load_script(name):
+    path = REPO_ROOT / "scripts" / name
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    module = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+with tempfile.TemporaryDirectory() as runs_dir:
+    # Pointed at a temporary directory rather than the real one: a fixture run
+    # under results/nested-sampling/ is a run to every glob in this repo.
+    named = Path(runs_dir) / "wsclean-vlaa-20260101T000000Z"
+    named.mkdir()
+    elsewhere = Path(runs_dir) / "elsewhere"
+    elsewhere.mkdir()
+    for script, resolver in (("profile-nested-sampling-run.py", "resolve_run"),
+                             ("merge-nested-sampling-runs.py", "resolve_run_dir"),
+                             ("anesthetic-gui.py", "resolve_target")):
+        module = load_script(script)
+        module.NESTED_SAMPLING_DIR = Path(runs_dir)
+        # Each resolver is fed what its own argparse hands it - a str for two
+        # of them, a Path for the GUI's - rather than a normalised type.
+        resolve = getattr(module, resolver)
+        wants_path = script == "anesthetic-gui.py"
+
+        def resolved(raw):
+            return resolve(Path(raw) if wants_path else raw)
+
+        check(f"{script} resolves a bare run name", named, resolved(named.name))
+        # A real path of that name still wins, so nothing that worked stops.
+        check(f"{script} keeps a path that exists", elsewhere.resolve(),
+              resolved(str(elsewhere)))
+        # "alone" means not rewritten into NESTED_SAMPLING_DIR; each resolver
+        # still canonicalises it, and on macOS /tmp is itself a symlink to
+        # /private/tmp, so the expectation has to be resolved too.
+        unknown = "/tmp/ri-no-such-run"
+        check(f"{script} leaves an unknown path alone", Path(unknown).resolve(),
+              resolved(unknown))
 
 if failures:
     print(f"{len(failures)} check(s) failed", file=sys.stderr)

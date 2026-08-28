@@ -1931,12 +1931,37 @@ def resolve_nested_sampling_summary(run):
     )
 
 
+def summary_is_complete(summary_path):
+    """Whether `summary_path` is a whole summary.json rather than half of one.
+
+    A run killed while writing its summary - the OOM killer, ENOSPC - leaves a
+    truncated file, and one of those used to take the entire report down:
+    every page and the index are built in one pass, so json.load raising on one
+    run left every other run with no report at all. Runs written since
+    write_json_atomic() cannot produce one; this is for the ones already on
+    disk, and for a filesystem that fills up between the rename and the read.
+
+    Tested by the last byte rather than by parsing, because this runs over
+    every run in the results directory and a finished R2D2 search's summary
+    carries all of its evaluations - tens of MB to parse for a question the
+    tail answers in one seek. json.dumps ends every complete write with `}`.
+    """
+    try:
+        with open(summary_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64))
+            return f.read().decode("utf-8", "replace").rstrip().endswith("}")
+    except OSError:
+        return False
+
+
 def nested_sampling_run_paths(limit=None, run=None):
     """summary.json paths, newest first, optionally filtered to one run or newest N."""
     if run:
         return [resolve_nested_sampling_summary(run)]
     paths = sorted(
-        glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "summary.json")),
+        (p for p in glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "summary.json"))
+         if summary_is_complete(p)),
         key=nested_sampling_run_sort_key,
     )
     return paths[:limit] if limit is not None else paths
@@ -2306,14 +2331,17 @@ def unfinished_run_names():
     """Runs that stopped before finishing, newest first.
 
     summary.json is written only once PolyChord returns, so a run directory
-    without one stopped early. That matters here more than anywhere: the index
-    below is built by globbing for summary.json, so an interrupted run is not
-    listed as failed, it is simply missing - and a run that silently vanishes
-    from the report is the one nobody goes back to.
+    without a readable one stopped early. That matters here more than
+    anywhere: the index below is built by globbing for summary.json, so an
+    interrupted run is not listed as failed, it is simply missing - and a run
+    that silently vanishes from the report is the one nobody goes back to. A
+    torn summary (summary_is_complete) belongs in the same list: the run is
+    unreportable until it is rewritten, and `./ri resume` is what rewrites it,
+    from the point cache and without imaging anything again.
     """
     names = []
     for path in sorted(glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*")), reverse=True):
-        if os.path.isdir(path) and not os.path.exists(os.path.join(path, "summary.json")):
+        if os.path.isdir(path) and not summary_is_complete(os.path.join(path, "summary.json")):
             names.append(os.path.basename(path))
     return names
 
@@ -2331,7 +2359,8 @@ def render_unfinished_runs():
     return (
         '<section class="unfinished">'
         f"<h2>{count} run{'' if count == 1 else 's'} stopped before finishing</h2>"
-        "<p>These have no <code>summary.json</code>, so they have no page below. "
+        "<p>These have no readable <code>summary.json</code>, so they have no page "
+        "below. "
         "Each can be continued where it left off, keeping every evaluation it "
         "already finished:</p>"
         f"<ul>{items}</ul>"
@@ -2683,6 +2712,46 @@ def _self_check_page_status():
         f.write("<!doctype html><html><head><title>old</title></head></html>")
     assert page_status(tmp_dir, "run-b") == "outdated"
     shutil.rmtree(tmp_dir)
+
+
+def _self_check_torn_summary():
+    """One half-written summary.json must not take the whole report down.
+
+    Every page and the index are built in one pass, so json.load raising on one
+    run left every other run with no report at all - reproduced by truncating a
+    real 285KB summary. The run is not lost either: it joins the runs that
+    stopped before finishing, with the `./ri resume` that rewrites it.
+    """
+    import shutil
+    import tempfile
+
+    global NESTED_SAMPLING_DIR
+    saved = NESTED_SAMPLING_DIR
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    try:
+        NESTED_SAMPLING_DIR = tmp_dir
+        whole, torn = os.path.join(tmp_dir, "wsclean-ok"), os.path.join(tmp_dir, "wsclean-torn")
+        os.makedirs(whole)
+        os.makedirs(torn)
+        with open(os.path.join(whole, "summary.json"), "w") as f:
+            json.dump({"algorithm": "wsclean", "evaluations": []}, f, indent=2)
+        # Where a kill tears it: mid-record, inside the evaluations list.
+        with open(os.path.join(torn, "summary.json"), "w") as f:
+            f.write('{\n  "evaluations": [\n    {\n      "eval')
+        assert summary_is_complete(os.path.join(whole, "summary.json"))
+        assert not summary_is_complete(os.path.join(torn, "summary.json"))
+        # An empty one is what a full disk leaves, and there is no file at all
+        # for a run that is still going.
+        open(os.path.join(tmp_dir, "empty.json"), "w").close()
+        assert not summary_is_complete(os.path.join(tmp_dir, "empty.json"))
+        assert not summary_is_complete(os.path.join(tmp_dir, "no-such.json"))
+
+        assert nested_sampling_run_paths() == [os.path.join(whole, "summary.json")], \
+            nested_sampling_run_paths()
+        assert unfinished_run_names() == ["wsclean-torn"], unfinished_run_names()
+    finally:
+        NESTED_SAMPLING_DIR = saved
+        shutil.rmtree(tmp_dir)
 
 
 def _self_check_index_toolbar():
@@ -3253,6 +3322,7 @@ if __name__ == "__main__":
         _self_check_profiling()
         _self_check_page_status()
         _self_check_index_toolbar()
+        _self_check_torn_summary()
         _self_check_parameter_space_section()
         _self_check_tick_housekeeping()
         _self_check_shared_axes_dedupe()

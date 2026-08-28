@@ -66,10 +66,12 @@ a run executes the baked copy, so rebuild before starting one. They start no
 search and write nothing into `results/`, so they are safe alongside a run.
 
 ```bash
-./ri self-check            # host-side checks, then all three images
+./ri self-check            # host-side checks, all three images, then the self-heal kills
 ./ri self-check simulate   # MeqTrees: skeleton cache, forest reuse, deadlock recovery
 ./ri self-check wsclean    # the WSClean sampler's checks
 ./ri self-check r2d2       # the R2D2 sampler's checks
+./ri self-check report     # the HTML report's checks (matplotlib fast paths, torn summaries)
+./ri self-check self-heal  # kill and hang real searches, check they restart themselves (~90s)
 ```
 
 ## Shells into an image
@@ -218,10 +220,16 @@ and the report, which globs for `summary.json`, will not show it at all.
 
 `resume` takes no settings: the run recorded its own in `run.env`.
 
+Every command that takes a run - `resume`, `health`, `profile`, `merge`,
+`plot gui` - takes either a path or the bare name `./ri runs` prints, so the
+name can be copied straight out of that table. A path of the same name in the
+working directory still wins. `health` also takes the name of a run another
+checkout started while it is running, because it reports those too.
+
 ## Is the run that is going still worth going?
 
 ```bash
-./ri health                # the newest run, plus host memory and leaked sidecars
+./ri health                # every live run, plus host memory and leaked sidecars
 ./ri health <run>
 ./ri health --all
 ```
@@ -230,7 +238,7 @@ and the report, which globs for `summary.json`, will not show it at all.
 wall clock lost to stalls, and how many evaluations scored
 `FAILURE_OBJECTIVE` - which PolyChord maximizes, so a run whose imager is
 broken looks like a run finding spectacular failures. Exits 1 when something
-needs attention. Details: docs/nested-sampling.md.
+needs attention. Details: docs/run-health.md.
 
 ## Reports
 
@@ -342,12 +350,20 @@ docker builder prune -a && ./ri build   # true cold rebuild
 ## Checks (what CI runs)
 
 ```bash
-shellcheck -x scripts/*.sh
-bash -n scripts/*.sh
+shellcheck -x scripts/*.sh scripts/lib/*.sh   # info-level findings fail the build too
+bash -n scripts/*.sh scripts/lib/*.sh
 python3 -m compileall -q scripts config
+NESTED_SAMPLING_RUNS_SELF_CHECK=1 uv run --no-project python3 scripts/nested-sampling-runs.py
+NESTED_SAMPLING_HEALTH_SELF_CHECK=1 uv run --no-project python3 scripts/nested-sampling-health.py
+for f in rank-budget start-sidecars run-config progress-bar; do bash scripts/lib/$f.sh --self-check; done
+bash scripts/resume-nested-sampling-run.sh --self-check
+uv run --no-project python3 scripts/test_watchdogs.py
+uv run --no-project python3 scripts/test_self_checks.py
 scripts/test-defaults.sh
 uv run --no-project scripts/test_cli.py
 ```
+
+Everything above needs no Docker. `./ri self-check` is the half that does.
 
 ## Layout
 
@@ -363,6 +379,8 @@ uv run --no-project scripts/test_cli.py
 | `results/` -> `/results` | Run output, smoke-test output, nested-sampling runs |
 | `reports/manifests/` | One JSON manifest per recorded run |
 | `docs/nested-sampling.md` | Nested-sampling design, metrics, output files |
+| `docs/run-health.md` | `./ri health`: every line of the report and what warns |
+| `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |

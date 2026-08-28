@@ -10,8 +10,6 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 # shellcheck source=scripts/lib/progress-bar.sh
 source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/nested-sampling/wsclean-vlaa-${RUN_ID}}"
-
 # Needed before the launches, because the containers' commands below want one
 # FIFO pair per rank to already exist. On Linux `nproc` is what mpirun will
 # see too, since the daemon is the host kernel. On macOS the daemon runs
@@ -41,16 +39,32 @@ else
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_WSCLEAN_MB_PER_RANK}" wsclean
 fi
 
-mkdir -p "${OUTPUT_DIR}"
-# Written before anything can go wrong, so that a run which stops - out of
-# memory, Ctrl-C, reboot - still says how to start it again exactly.
 # shellcheck source=scripts/lib/run-config.sh
 . "${REPO_ROOT}/scripts/lib/run-config.sh"
+# Claimed here rather than named at the top of the script, so a run refused by
+# the memory guard above leaves no empty directory for `./ri runs` and the
+# health report to puzzle over. An OUTPUT_DIR given on the command line is the
+# caller's to name and may already exist - but not while a job is still in it;
+# the default one is claimed, because two searches started in the same second
+# would otherwise share it.
+if [ -n "${OUTPUT_DIR:-}" ]; then
+  ns_refuse_live_run "${OUTPUT_DIR}"
+  mkdir -p "${OUTPUT_DIR}"
+  # Absolute and `..`-free from here on, so that the containment test below is
+  # a string comparison and so that run.env, run.log and the health report all
+  # name the run the same way whatever the caller typed.
+  OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
+  ns_refuse_unmounted_run "${OUTPUT_DIR}"
+else
+  OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" wsclean-vlaa-)"
+fi
+# Written before anything can go wrong, so that a run which stops - out of
+# memory, Ctrl-C, reboot - still says how to start it again exactly.
 write_run_config "${OUTPUT_DIR}" wsclean
 # The simulate workers are reached over FIFOs, so this has to sit on the bind
 # mount the rank's container and the meqtrees sidecar both see - REPO_ROOT,
-# which OUTPUT_DIR is under by default. Point OUTPUT_DIR outside the repo and
-# the ranks simply fall back to starting their own workers.
+# which OUTPUT_DIR is always under, because ns_refuse_unmounted_run above is
+# what makes that true.
 SIMULATE_FIFO_DIR="${OUTPUT_DIR}/.simulate-workers"
 rm -rf "${SIMULATE_FIFO_DIR}"
 mkdir -p "${SIMULATE_FIFO_DIR}"
@@ -159,7 +173,7 @@ scripts/record-environment.sh \
 sidecar_wait
 
 mkdir -p "${OUTPUT_DIR}/evaluations"
-run_with_progress "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" "${NS_NLIVE}" -- "${RUN_COMMAND[@]}"
+run_with_retries "${NS_RETRIES}" "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" "${NS_NLIVE}" -- "${RUN_COMMAND[@]}"
 
 rm -rf "${SIMULATE_FIFO_DIR}"
 echo "OK: nested-sampling output in ${OUTPUT_DIR}"
