@@ -520,6 +520,30 @@ _ns_dead_birth_file() {
   done
 }
 
+# Usage: _ns_run_bounded <seconds> <command...>  ->  124 if it did not finish
+#
+# GNU coreutils' `timeout` is not on macOS, and this is the only place that
+# wants one - the self-check below has to bound a fixture that is *supposed* to
+# hang, and CI runs that check on both runners. Same contract as `timeout` for
+# the one case used here, including its exit 124. Like `timeout`, it signals
+# only the command it started; the self-check pkills the fixture's own ranks.
+_ns_run_bounded() {
+  local seconds="$1" pid waited=0
+  shift
+  "$@" &
+  pid=$!
+  while kill -0 "${pid}" 2>/dev/null; do
+    if [ "${waited}" -ge "${seconds}" ]; then
+      kill -9 "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "${pid}"
+}
+
 _ns_count_lines() {
   local file="$1"
   [ -f "${file}" ] || { echo 0; return; }
@@ -1421,12 +1445,14 @@ PY
   # makes the `BASH_SOURCE == $0` guard at the bottom true, and the sub-shell
   # re-runs this whole self-check instead of the one line it was asked for -
   # which then hits the 8s timeout and "passes" whatever the guard does.
+  export STALL_FIXTURE_HANGS=1
+  status=0
   # shellcheck disable=SC2016  # $1..$3 are the sub-shell's, not ours
-  STALL_FIXTURE_HANGS=1 timeout 8 bash -c '
+  _ns_run_bounded 8 bash -c '
     . "$1"; run_with_progress "$2" -1 2 -- python3 "$3" --output-dir "$2"' \
     watchdog-off "${BASH_SOURCE[0]}" "${off_dir}" "${tmp}/polychord_stall.py" \
-    >/dev/null 2>&1
-  status=$?
+    >/dev/null 2>&1 || status=$?
+  unset STALL_FIXTURE_HANGS
   [ "${status}" = "124" ] || {
     echo "FAIL: NS_STALL_TIMEOUT=0 still killed the run (exit ${status}, want 124)"; exit 1
   }
