@@ -407,10 +407,10 @@ says nothing:
 
 | | |
 |---|---|
-| `FINISHED` | `summary.json` is there. |
+| `FINISHED` | A whole `summary.json` is there. |
 | `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). The warning says what happens next: how long until the stall watchdog kills and restarts the run, that `--stall-timeout 0` turned the watchdog off, or - for a run still stalled more than a poll past its own timeout - that no watchdog is left to kill it. Silent about the watchdog for runs started before `run.env` recorded the timeout. |
 | `STARTING` | No ranks yet, but the run is being driven: its `docker exec` client is alive. An R2D2 search spends minutes here while sixteen workers load their models. |
-| `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if it never wrote one; the warning says which. |
+| `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if it never wrote one; the warning says which. A run whose `summary.json` is only half written is here too, with a second warning saying so: it reached the end of sampling, but no report, merge or profile can read the file, and the resume is what rewrites it. |
 | `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
 
 A directory with none of `run.env`, `run.log`, `summary.json`, `evaluations/`
@@ -1028,6 +1028,28 @@ stopped `run_with_retries` from trying again. Records are now written under
 one is closed for new runs and the tolerance covers the runs already on
 disk (and any half-written record left by a full disk).
 
+**Half a `summary.json` is not a finished run.** The same window one level
+out: `summary.json` is written once, after PolyChord returns, and it carries
+every evaluation of the run - hundreds of MB and seconds of writing for a
+long R2D2 search - so a rank killed there leaves a truncated file. Every
+reader called a run with a `summary.json` finished, which made that the worst
+of both: `./ri runs` and `./ri health` said `complete`, the HTML report died
+on `json.load` and took *every other run's* page down with it, `./ri merge`
+and `./ri profile` refused, and `./ri resume` - the one command that could
+rewrite the file - declined because the run had "already finished".
+
+Both halves are fixed. The write goes through `write_json_atomic` in
+`common.py` (a `.partial` file renamed into place, the same treatment
+`metrics.json` gets), so a new run leaves either no summary or a whole one.
+And "finished" now means a *whole* summary: `./ri runs`, `./ri health`, the
+report and `./ri resume` each test the last byte rather than parsing tens of
+MB, so a torn one reads as a run that stopped and is paired with the
+`./ri resume` that repairs it. Verified end to end on a copy of a real
+finished 54-evaluation search with its 285KB summary cut in half: the report
+built again with the run listed among those that stopped, and the resume
+rewrote a whole summary with the same 54 evaluations in 0.014s of sampling,
+imaging nothing.
+
 **One no-progress failure is retried anyway: an unreadable checkpoint.** A
 rank killed part-way through writing `chains/*.resume` leaves a truncated
 file, and PolyChord aborts reading it - in Fortran, before evaluation 1 - so
@@ -1214,6 +1236,13 @@ different machinery:
   torn checkpoint is kept as `*.resume.unreadable`, and that the evaluation
   count is unchanged - every point the restart drew came back out of the cache,
   so none of them was imaged twice.
+- **A truncated `summary.json` on that same run**, once the checkpoint
+  recovery has rewritten one: the file cut to half its bytes, `./ri health`
+  asked, and `./ri resume` typed at it. Again no search of its own. The
+  assertions are that the report calls it half written rather than `FINISHED`,
+  that the resume finishes and leaves a summary that parses, and that the
+  evaluation count is unchanged - the summary is rebuilt from what is already
+  on disk, so nothing is imaged again.
 
 The first two assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes
@@ -1370,8 +1399,8 @@ that cannot afford even one rank stops here rather than at evaluation 1.
 `--mpi-procs` on `./ri search` is still obeyed as typed and only warned about
 - the difference is that a resume did not type anything.
 
-`STATUS` is `complete` when `summary.json` is there, `running` when the run
-still has a process driving it, `resumable` when neither but a PolyChord
+`STATUS` is `complete` when a whole `summary.json` is there, `running` when
+the run still has a process driving it, `resumable` when neither but a PolyChord
 `.resume` file is there, and `incomplete` when a run stopped before it
 checkpointed anything. `./ri runs --incomplete` lists only the ones needing
 attention, and `--json` is the machine-readable form.

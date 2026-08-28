@@ -156,6 +156,28 @@ if [ "${1:-}" = "--self-check" ]; then
       echo "FAIL: --no-build must skip the builds, got: ${OUT}"; exit 1 ;;
   esac
 
+  # A whole summary.json is a finished run and stops here...
+  echo '{ "evaluations": [] }' >"${COUNT_RUN}/summary.json"
+  OUT="$(NS_NO_BUILD=1 NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
+  case "${OUT}" in
+    *"already finished"*) ;;
+    *) echo "FAIL: a finished run must not be resumed, got: ${OUT}"; exit 1 ;;
+  esac
+  # ...and half of one does not. The whole point: nothing else can repair it,
+  # because every other reader calls a run with a summary.json finished.
+  printf '{\n  "evaluations": [\n    {\n      "eval_id": 1,\n      "para' \
+    >"${COUNT_RUN}/summary.json"
+  OUT="$(NS_NO_BUILD=1 NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
+  case "${OUT}" in
+    *"already finished"*)
+      echo "FAIL: a torn summary must not count as finished, got: ${OUT}"; exit 1 ;;
+  esac
+  case "${OUT}" in
+    *"half-written summary.json"*"2 evaluations already done"*) ;;
+    *) echo "FAIL: the resume must say it is rewriting the summary, got: ${OUT}"; exit 1 ;;
+  esac
+  rm -f "${COUNT_RUN}/summary.json"
+
   echo "resume-nested-sampling-run self-check passed"
   exit 0
 fi
@@ -185,10 +207,26 @@ if ns_run_is_live "${RUN_DIR}"; then
   exit 1
 fi
 
-if [ -e "${RUN_DIR}/summary.json" ]; then
+# Only a *whole* summary.json means finished. Half of one - a rank killed
+# while writing it, or a full disk - is a run whose results cannot be
+# reported, merged or profiled, and this is the command that repairs it:
+# resuming rewrites the summary from the checkpoint and the point cache,
+# without imaging anything again. Refusing here left it unrepairable, since
+# every other reader calls a run with a summary.json finished too.
+#
+# Tested by the last byte rather than by parsing, because a finished R2D2
+# search's summary carries all of its evaluations - tens of MB for a question
+# the tail answers in one seek. Same test as summary_is_complete() in
+# scripts/lib/generate_report.py and nested-sampling-health.py.
+if [ -s "${RUN_DIR}/summary.json" ] \
+  && [ "$(tail -c 64 "${RUN_DIR}/summary.json" | tr -d '[:space:]' | tail -c 1)" = "}" ]; then
   echo "Nothing to do: ${RUN_DIR##*/} already finished (it has a summary.json)."
   echo "Start a new search instead, or delete the summary to force a rerun."
   exit 0
+fi
+if [ -e "${RUN_DIR}/summary.json" ]; then
+  echo "${RUN_DIR##*/} has a half-written summary.json, so it did not finish."
+  echo "Resuming rewrites it from the evaluations already on disk."
 fi
 
 if [ ! -e "${RUN_DIR}/run.env" ]; then

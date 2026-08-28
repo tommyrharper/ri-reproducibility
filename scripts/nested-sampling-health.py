@@ -14,10 +14,11 @@ Four things it checks, each one a way a run has actually gone wrong here:
   flight (which should sit near `NS_MPI_PROCS`).
 * **Liveness.** A run that stopped and a run that finished both stop writing,
   so a mtime on its own means nothing in either direction. The order matters:
-  `summary.json` present is finished; ranks running is healthy, or stalled once
-  the mtime goes stale; no ranks but a live `docker exec` client is a run still
-  starting up; nothing driving it at all is stopped, however recently it
-  wrote. A stalled run also says what is coming for it: the stall watchdog's
+  a *whole* `summary.json` is finished; ranks running is healthy, or stalled
+  once the mtime goes stale; no ranks but a live `docker exec` client is a run
+  still starting up; nothing driving it at all is stopped, however recently it
+  wrote. Half a `summary.json` is a run nothing can report on, merge or
+  profile, so it is stopped too, with the `./ri resume` that rewrites it. A stalled run also says what is coming for it: the stall watchdog's
   timeout out of `run.env`, as a countdown, as "due", or - past a poll of it -
   as the observation that no watchdog is left to kill it.
 * **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
@@ -534,6 +535,31 @@ def read_run_env(run_dir: Path) -> dict[str, str]:
     return values
 
 
+def summary_is_complete(run_dir: Path) -> bool:
+    """Whether the run has a whole summary.json rather than half of one.
+
+    A summary.json is what every reader here calls "finished", so half of one -
+    a rank killed while writing it, or a full disk - used to be the worst of
+    both: the run was called finished, while the HTML report, `./ri merge` and
+    `./ri profile` could not read it and `./ri resume` refused to rewrite it.
+    Not finished, then; a stopped run, which is the one status that prints the
+    `./ri resume` that repairs it (from the point cache, imaging nothing).
+
+    Tested by the last byte rather than by parsing, because this runs over
+    every run in the results directory and a finished R2D2 search's summary
+    carries all of its evaluations - tens of MB to parse for a question the
+    tail answers in one seek. json.dumps ends every complete write with `}`.
+    Runs written since write_json_atomic() cannot produce a torn one.
+    """
+    try:
+        with open(run_dir / "summary.json", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64))
+            return f.read().decode("utf-8", "replace").rstrip().endswith("}")
+    except OSError:
+        return False
+
+
 def stage(run_dir: Path) -> str:
     """How far into PolyChord the run got.
 
@@ -541,7 +567,7 @@ def stage(run_dir: Path) -> str:
     without a single dead point, and looks from every count like a run that
     simply has not got going yet.
     """
-    if (run_dir / "summary.json").exists():
+    if summary_is_complete(run_dir):
         return "finished"
     chains = run_dir / "chains"
     if any(chains.glob("*.resume")):
@@ -1439,7 +1465,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     tail = log_tail(run_dir)
     restarted = restarts(run_dir)
     idle = scan["last_activity_seconds"]
-    complete = (run_dir / "summary.json").exists()
+    complete = summary_is_complete(run_dir)
 
     # The order is the whole point. A finished run and a dead one both stop
     # writing, and a run that has only just started has not written yet, so
@@ -1570,6 +1596,16 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
                "it has no checkpoint, so the sampler starts over - "
                f"./ri resume {resume_target(run_dir)} reuses the evaluations "
                "already scored and drops the rest")
+        )
+    # A run that reached the end of sampling and was killed writing its
+    # summary is not the same failure as one that stopped mid-flight, so it
+    # says so on its own line: nothing stopped it, and what it needs is not a
+    # continuation but a rewrite of the one file every other tool reads.
+    if status == "stopped" and (run_dir / "summary.json").exists():
+        warnings.append(
+            "its summary.json is half written, so no report, merge or profile can "
+            f"read this run - ./ri resume {resume_target(run_dir)} rewrites it from "
+            "the evaluations already on disk"
         )
     # A run whose shell was killed keeps going and keeps looking healthy - the
     # one thing it has lost is invisible in every other number here, and only
@@ -3275,7 +3311,27 @@ def self_check() -> None:
             assert describe(live, [], 5.0)["status"] == "finished"
             assert describe(live, [], 5.0)["warnings"] == []
             assert "next at" not in io_capture(describe(live, [], 5.0))
+
+            # Half a summary.json is not a finished run: it is one no report,
+            # merge or profile can read, and calling it finished was the worst
+            # of both, since nothing else offers the `./ri resume` that
+            # rewrites it. The same fixture as the finished case, with only
+            # the bytes of its summary changed, so nothing but the
+            # completeness test can be what moves it.
+            (live / "summary.json").write_text('{\n  "evaluations": [\n    {\n      "eval')
+            torn = describe(live, [], 5.0)
+            assert torn["status"] == "stopped", torn
+            assert torn["stage"] != "finished", torn["stage"]
+            assert any("summary.json is half written" in w and "./ri resume" in w
+                       for w in torn["warnings"]), torn["warnings"]
+            # ...and a whole one is still a finished run, with nothing said.
+            (live / "summary.json").write_text("{}")
+            assert describe(live, [], 5.0)["warnings"] == []
             (live / "summary.json").unlink()
+            # Nothing to say about a run that has no summary at all - that is
+            # every stopped run, and the half-written line must not be on it.
+            assert not any("half written" in w
+                           for w in describe(live, [], 5.0)["warnings"])
 
             # Ranks that spend a whole sample on CPU are the deadlock
             # signature; ranks that wait on their imager are the healthy one,

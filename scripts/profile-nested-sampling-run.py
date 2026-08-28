@@ -58,7 +58,16 @@ def load_summary(target: Path) -> dict[str, Any]:
     summary_path = target / "summary.json" if target.is_dir() else target
     if not summary_path.is_file():
         raise SystemExit(f"no summary.json found at {summary_path}")
-    return json.loads(summary_path.read_text())
+    try:
+        return json.loads(summary_path.read_text())
+    except ValueError:
+        # Half a summary.json, from a rank killed writing it. Said plainly,
+        # with the command that rewrites it, rather than as a JSONDecodeError.
+        raise SystemExit(
+            f"{summary_path} is only half written - the run was killed while "
+            f"writing it.\n./ri resume {summary_path.parent.name} rewrites it "
+            "from the evaluations already on disk."
+        ) from None
 
 
 def print_report(summary: dict[str, Any]) -> None:

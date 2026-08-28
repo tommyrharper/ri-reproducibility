@@ -85,6 +85,17 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2" ]]; then
     "${POLYCHORD_IMAGE}" -u "$(nested_sampling polychord_r2d2.py)"
 fi
 
+if [[ "${TARGET}" == "all" || "${TARGET}" == "report" ]]; then
+  echo
+  echo "=== HTML report (${R2D2_IMAGE}) ==="
+  # In the image that builds the report, because most of these check the
+  # matplotlib fast paths the corner plots depend on. Until this existed the
+  # whole family was written and never run - the same gap the header above
+  # describes, one file further out.
+  docker_run -e GENERATE_REPORT_SELF_CHECK=1 --entrypoint python3 \
+    "${R2D2_IMAGE}" -u "${REPO_ROOT}/scripts/lib/generate_report.py"
+fi
+
 if [[ "${TARGET}" == "all" || "${TARGET}" == "self-heal" ]]; then
   echo
   echo "=== self-healing (real searches, killed and hung) ==="

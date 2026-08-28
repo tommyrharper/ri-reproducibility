@@ -56,6 +56,7 @@ from common import (
     summarize_profiling,
     window_fit_summary_line,
     write_evaluation_record,
+    write_json_atomic,
     write_polychord_paramnames,
 )
 
@@ -598,7 +599,10 @@ def main() -> None:
             "spectral_window_fitting": window_fit_stats,
         }
         summary_path = output_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+        # Atomic: every reader treats a run with a summary.json as finished,
+        # so half of one is a finished run nobody can report on, merge or
+        # resume. See write_json_atomic().
+        write_json_atomic(summary_path, summary)
         print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")
 

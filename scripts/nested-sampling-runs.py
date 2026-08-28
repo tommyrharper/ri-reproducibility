@@ -93,6 +93,31 @@ def read_run_env(run_dir: Path) -> dict[str, str]:
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 
 
+def summary_is_complete(run_dir: Path) -> bool:
+    """Whether the run has a whole summary.json rather than half of one.
+
+    A summary.json is what every reader here calls "finished", so half of one -
+    a rank killed while writing it, or a full disk - used to be the worst of
+    both: the run was called finished, while the HTML report, `./ri merge` and
+    `./ri profile` could not read it and `./ri resume` refused to rewrite it.
+    Not finished, then: `resumable`, which is the status that pairs the run
+    with the command that repairs it.
+
+    Tested by the last byte rather than by parsing, because this runs over
+    every run in the results directory and a finished R2D2 search's summary
+    carries all of its evaluations - tens of MB to parse for a question the
+    tail answers in one seek. json.dumps ends every complete write with `}`.
+    Runs written since write_json_atomic() cannot produce a torn one.
+    """
+    try:
+        with open(run_dir / "summary.json", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64))
+            return f.read().decode("utf-8", "replace").rstrip().endswith("}")
+    except OSError:
+        return False
+
+
 def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
@@ -105,7 +130,7 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     # disagreed with `./ri health`, which has always counted the scored ones.
     # Costs 0.15s against 0.04s on the largest run here (17,760 evaluations).
     evaluations = len(list((run_dir / "evaluations").glob("eval-*/metrics.json")))
-    complete = (run_dir / "summary.json").exists()
+    complete = summary_is_complete(run_dir)
     # PolyChord's checkpoint. A completed run keeps its resume file too, so
     # this only distinguishes "can be continued" among the incomplete ones.
     resumable = any((run_dir / "chains").glob("*.resume"))
@@ -358,6 +383,19 @@ def self_check() -> None:
             # And the run that died before scoring anything reports 0, not the
             # 7 directories its ranks left behind.
             assert f"{bare.name:<29}  r2d2       incomplete  0" in text, text
+
+            # Half a summary.json is not a finished run: it is one nothing can
+            # report on, merge or profile, and the unfinished list is where it
+            # gets paired with the command that rewrites it. The same run as
+            # `done` above, with only the bytes of its summary changed, so
+            # nothing but the completeness test can be what moves it.
+            whole = (done / "summary.json").read_text()
+            (done / "summary.json").write_text('{\n  "evaluations": [\n    {\n      "eval')
+            torn_run = {r["name"]: r for r in find_runs(running=set())}[done.name]
+            assert torn_run["status"] == "incomplete", torn_run
+            (done / "summary.json").write_text(whole)
+            assert {r["name"]: r for r in find_runs(running=set())
+                    }[done.name]["status"] == "complete"
     finally:
         NESTED_SAMPLING_DIR = saved
     print("nested-sampling-runs self-check passed")

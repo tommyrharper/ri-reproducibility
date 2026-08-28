@@ -1526,15 +1526,29 @@ def self_check_resume_adoption() -> None:
         assert adopt_completed_evaluations(Path(tmp), evaluations, cache) == 0
 
 
+def write_json_atomic(path: Path, payload: Any) -> None:
+    """Write `payload` as JSON, or leave `path` as it was.
+
+    Written under a temporary name and renamed into place, so a rank killed
+    mid-write - the OOM killer, the stall watchdog, ENOSPC - leaves either no
+    file or the whole one, never half of one. The rename is atomic (same
+    directory, so same filesystem) and costs one syscall.
+
+    Both files this writes are read by something that cannot go on without
+    them: half a metrics.json used to end a search for good (see
+    read_evaluation_record), and half a summary.json makes a finished run
+    unreportable, unmergeable and - because every reader calls a run with a
+    summary.json finished - unrepairable. summary.json is the bigger window by
+    far: it carries every evaluation of the run, so an R2D2 search spends
+    seconds inside this call, not microseconds.
+    """
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(json.dumps(payload, indent=2) + "\n")
+    partial.replace(path)
+
+
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
-    # Written under a temporary name and renamed into place, so a rank killed
-    # mid-write leaves either no metrics.json or the whole one, never half of
-    # one. The rename is atomic (same directory, so same filesystem) and costs
-    # one syscall against an evaluation that took at least a tenth of a second
-    # to image. Reading side: read_evaluation_record().
-    partial = eval_dir / "metrics.json.partial"
-    partial.write_text(json.dumps(record, indent=2) + "\n")
-    partial.replace(eval_dir / "metrics.json")
+    write_json_atomic(eval_dir / "metrics.json", record)
     return record
 
 

@@ -70,6 +70,7 @@ search and write nothing into `results/`, so they are safe alongside a run.
 ./ri self-check simulate   # MeqTrees: skeleton cache, forest reuse, deadlock recovery
 ./ri self-check wsclean    # the WSClean sampler's checks
 ./ri self-check r2d2       # the R2D2 sampler's checks
+./ri self-check report     # the HTML report's checks (matplotlib fast paths, torn summaries)
 ./ri self-check self-heal  # kill and hang real searches, check they restart themselves (~90s)
 ```
 

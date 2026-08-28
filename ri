@@ -277,7 +277,8 @@ def build_parser():
                     "freezes a rank of the other, and checks both recover on "
                     "their own.")
     self_check.add_argument("target", nargs="?", default="all",
-        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "self-heal"),
+        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "report",
+                 "self-heal"),
         help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",
@@ -373,8 +374,8 @@ def build_parser():
         description=(
             "One line per run under results/nested-sampling/, with whether it\n"
             "finished. A run writes summary.json only once PolyChord returns, so\n"
-            "a run without one stopped early - and the HTML report, which globs\n"
-            "for summary.json, does not show it at all.\n"
+            "a run without a whole one stopped early - and the HTML report,\n"
+            "which globs for summary.json, does not show it at all.\n"
             "\n"
             "A run that is still going has no summary.json either, so it is\n"
             "told apart from a stopped one by its processes and shown as\n"

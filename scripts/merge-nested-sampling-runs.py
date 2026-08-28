@@ -227,7 +227,15 @@ def discover_sources() -> list[tuple[Path, dict[str, Any]]]:
         summary_path = run_dir / "summary.json"
         summary: dict[str, Any] | None = None
         if summary_path.is_file():
-            summary = json.loads(summary_path.read_text())
+            try:
+                summary = json.loads(summary_path.read_text())
+            except ValueError:
+                # Half a summary.json, from a rank killed writing it. Skipped
+                # like any other run that did not finish, rather than taking
+                # the merge of every other run down with it.
+                print(f"skip {run_dir.name}: half-written summary.json - "
+                      f"./ri resume {run_dir.name} rewrites it")
+                continue
             if summary.get("merged_from"):
                 print(f"skip {run_dir.name}: already a merge (merged_from)")
                 continue

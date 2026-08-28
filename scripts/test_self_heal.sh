@@ -97,7 +97,8 @@ cleanup() {
   if [ -n "${PASSED}" ]; then
     rm -rf "${OUT}" "${OUT}.log" "${HUNG_OUT}" "${HUNG_OUT}.log" \
       "${RESUME_OUT}" "${RESUME_OUT}.log" "${WORKER_OUT}" "${WORKER_OUT}.log" \
-      "${SIDECAR_OUT}" "${SIDECAR_OUT}.log" "${SIDECAR_OUT}.torn.log"
+      "${SIDECAR_OUT}" "${SIDECAR_OUT}.log" "${SIDECAR_OUT}.torn.log" \
+      "${SIDECAR_OUT}.summary.log"
   else
     echo "self-heal: left ${OUT}*, ${HUNG_OUT}*, ${RESUME_OUT}*, ${WORKER_OUT}* and ${SIDECAR_OUT}* for inspection" >&2
   fi
@@ -522,6 +523,34 @@ torn_after="$(completed_evals "${SIDECAR_OUT}")"
   || fail "the checkpoint recovery lost work: ${torn_before} evaluations before, ${torn_after} after"
 
 echo "self-heal: torn checkpoint at ${torn_before} evaluations, sampler restarted and finished at ${torn_after}"
+
+# Scenario seven: the summary is what is broken. summary.json is written once,
+# after PolyChord returns, and carries every evaluation of the run - seconds of
+# writing on a long R2D2 search - so a rank killed there leaves half a file.
+# Every reader called a run with a summary.json finished, which made that the
+# worst case of all: `./ri health` said FINISHED, the report died on it, and
+# `./ri resume` - the only command that can rewrite it - refused. Again on the
+# run scenario six just finished, because tearing a file needs no kill timing.
+summary_before="$(completed_evals "${SIDECAR_OUT}")"
+head -c "$(( $(wc -c <"${SIDECAR_OUT}/summary.json") / 2 ))" \
+  "${SIDECAR_OUT}/summary.json" >"${SIDECAR_OUT}/summary.half"
+mv "${SIDECAR_OUT}/summary.half" "${SIDECAR_OUT}/summary.json"
+echo "self-heal: tearing summary.json at ${summary_before} evaluations"
+summary_health="$("${REPO_ROOT}/ri" health "${SIDECAR_OUT}" 2>&1 || true)"
+case "${summary_health}" in
+  *"summary.json is half written"*"./ri resume"*) ;;
+  *) fail "./ri health called a torn summary a finished run: ${summary_health}" ;;
+esac
+"${REPO_ROOT}/ri" resume "${SIDECAR_OUT}" --no-build >"${SIDECAR_OUT}.summary.log" 2>&1 \
+  || fail "a torn summary.json could not be repaired; see ${SIDECAR_OUT}.summary.log"
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${SIDECAR_OUT}/summary.json" \
+  || fail "the resume left a summary.json that still does not parse"
+# Rewritten from the evaluations on disk, so none of them was imaged again.
+summary_after="$(completed_evals "${SIDECAR_OUT}")"
+[ "${summary_after}" -eq "${summary_before}" ] \
+  || fail "repairing the summary changed the evaluations: ${summary_before} then ${summary_after}"
+
+echo "self-heal: torn summary.json rewritten at ${summary_after} evaluations"
 
 PASSED=1
 echo "self-heal check passed"
