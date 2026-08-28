@@ -155,6 +155,13 @@ check(
     plan("health", "--all"),
 )
 
+check(
+    "health --monitor passes the redraw interval through",
+    ({}, [["uv", "run", "scripts/nested-sampling-health.py",
+           "--monitor", "--interval", "10.0"]]),
+    plan("health", "--monitor", "--interval", "10"),
+)
+
 # Both at once is a mistake, and it has to reach the script to be rejected -
 # dropping one here would report on the wrong thing without saying so.
 # The TUI is the one command that is not Python or Docker: it shells back into

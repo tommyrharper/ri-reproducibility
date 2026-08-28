@@ -37,6 +37,10 @@ host
   sidecars  3 running, 0 leaked
 ```
 
+`./ri health --monitor` redraws this report in place every `--interval`
+seconds (default 5) instead of printing once, so watching a run does not fill
+the terminal with one scrollback entry per poll. Ctrl-C to stop.
+
 ## Which runs it reports on
 
 With no argument, every run being driven anywhere on this host - ranks running,

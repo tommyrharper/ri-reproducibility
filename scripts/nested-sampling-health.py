@@ -54,6 +54,7 @@ Usage:
   uv run scripts/nested-sampling-health.py <run>
   uv run scripts/nested-sampling-health.py --all
   uv run scripts/nested-sampling-health.py --json
+  uv run scripts/nested-sampling-health.py --monitor  # redraw in place every --interval
 
 Exit status is 0 when nothing needs attention and 1 when something does, so it
 can gate a script; the headline says the same in words and in colour, and only
@@ -2385,11 +2386,34 @@ def main(argv: list[str] | None = None) -> int:
                         help="a live run silent for this long is stalled "
                              "(default: %(default)s)")
     parser.add_argument("--json", action="store_true", help="raw JSON instead of a report")
+    parser.add_argument("--monitor", action="store_true",
+                        help="redraw in place every --interval instead of "
+                             "printing once and exiting (Ctrl-C to stop)")
+    parser.add_argument("--interval", type=float, default=5.0,
+                        help="seconds between redraws under --monitor "
+                             "(default: %(default)s)")
     args = parser.parse_args(argv)
 
     if args.all and args.run:
         parser.error("--all takes no run argument")
 
+    if not args.monitor:
+        return report_once(args)
+
+    try:
+        while True:
+            # Clear-and-redraw rather than one line appended per tick: a
+            # terminal watched for hours would otherwise scroll its whole
+            # history away in redraws nobody is reading.
+            sys.stdout.write("\033[2J\033[H")
+            report_once(args)
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def report_once(args: argparse.Namespace) -> int:
     processes = process_table()
     if args.all:
         directories = run_directories()
