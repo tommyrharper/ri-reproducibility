@@ -114,7 +114,9 @@ Usage:
 
 Exit status is 0 when nothing needs attention and 1 when something does, so it
 can gate a script; the headline says the same thing in words, as a warning
-count next to the run's status.
+count next to the run's status, and in colour on a terminal - the headline and
+the WARNING label only, so the two things worth scanning for are the two things
+that stand out. Piped, redirected or under NO_COLOR the output is unchanged.
 """
 
 from __future__ import annotations
@@ -1571,6 +1573,32 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
 # --- rendering ---------------------------------------------------------------
 
 
+# Colour goes on the two things a reader scans a twenty-line-per-run report for
+# - the status word and the warnings - and on nothing else, because a report
+# where every line is coloured is one where no line stands out. Bold as well as
+# coloured so the headline still reads on a terminal whose palette makes one of
+# these hard to see.
+GREEN, YELLOW, RED, CYAN = "32", "33", "31", "36"
+STATUS_COLORS = {"healthy": GREEN, "finished": GREEN, "starting": CYAN,
+                 "stalled": RED, "stopped": RED}
+
+
+def use_color() -> bool:
+    """Whether to emit escapes: a terminal, honouring NO_COLOR (no-color.org).
+
+    Off whenever stdout is not a tty, so `./ri health > report.txt`, a pipe
+    into grep, and --json stay byte-identical to what they printed before -
+    which also keeps every self-check assertion here reading plain text, since
+    they capture through a StringIO.
+    """
+    return (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+            and os.environ.get("TERM") != "dumb")
+
+
+def paint(text: str, code: str | None) -> str:
+    return f"\033[1;{code}m{text}\033[0m" if code and use_color() else text
+
+
 def format_gb(value: float) -> str:
     """GB at one decimal, MB under a gigabyte, so a young run does not read as 0.0GB.
 
@@ -1627,11 +1655,17 @@ def render(run: dict[str, object]) -> None:
     # visible: no suffix on any run and no host warning is exactly exit 0.
     warnings = list(run["warnings"])
     headline = str(run["status"])
+    color = STATUS_COLORS.get(headline)
     if warnings:
         if headline == "healthy":
             headline = "running"
         headline += f" - {len(warnings)} warning{'' if len(warnings) == 1 else 's'}"
-    print(f"{run['name']}  {run['algorithm']}  {headline.upper()}")
+        # Amber for anything warning that is not already red: FINISHED and
+        # STARTING carry warnings too, and a green headline over a warning is
+        # the exact miscue the rename above exists to avoid.
+        if color != RED:
+            color = YELLOW
+    print(f"{run['name']}  {run['algorithm']}  {paint(headline.upper(), color)}")
     settings = run["settings"]
     assert isinstance(settings, dict)
     ranks = f"{run['ranks']} ranks"
@@ -1842,7 +1876,7 @@ def render(run: dict[str, object]) -> None:
     for label, value in lines:
         print(f"  {label:<9} {value}")
     for warning in run["warnings"]:
-        print(f"  WARNING   {warning}")
+        print(f"  {paint('WARNING', YELLOW)}   {warning}")
 
 
 def render_host(host: dict[str, object]) -> None:
@@ -1877,7 +1911,7 @@ def render_host(host: dict[str, object]) -> None:
     else:
         print(f"  {'sidecars':<9} {len(sidecars)} running, {len(host['leaked_sidecars'])} leaked")
     for warning in host["warnings"]:
-        print(f"  WARNING   {warning}")
+        print(f"  {paint('WARNING', YELLOW)}   {warning}")
 
 
 # --- entry point -------------------------------------------------------------
@@ -2045,7 +2079,8 @@ def self_check() -> None:
             render(report)
         return sink.getvalue()
 
-    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb, pressure
+    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb, \
+        pressure, use_color
     saved = NESTED_SAMPLING_DIR
     now = time.time()
 
@@ -2238,6 +2273,56 @@ def self_check() -> None:
             # the count, so STALLED never becomes RUNNING.
             stalled = io_capture({**report, "status": "stalled", "warnings": ["a"]})
             assert stalled.splitlines()[0].endswith("  STALLED - 1 WARNING"), stalled
+            # Colour, on a terminal only. Every assertion here reads plain
+            # text because io_capture pipes through a StringIO - which is what
+            # a `> file` or a `| grep` gives too, and is why the escapes can be
+            # added without rewriting any of them.
+            class _Tty(io.StringIO):
+                def isatty(self) -> bool:
+                    return True
+
+            saved_env = dict(os.environ)
+            try:
+                os.environ.pop("NO_COLOR", None)
+                os.environ["TERM"] = "xterm"
+                with contextlib.redirect_stdout(_Tty()):
+                    assert use_color()
+                    os.environ["TERM"] = "dumb"
+                    assert not use_color(), "TERM=dumb still coloured"
+                    os.environ["TERM"] = "xterm"
+                    os.environ["NO_COLOR"] = "1"
+                    assert not use_color(), "NO_COLOR ignored"
+                os.environ.pop("NO_COLOR")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert not use_color(), "coloured a non-terminal"
+            finally:
+                os.environ.clear()
+                os.environ.update(saved_env)
+
+            def _always_color() -> bool:
+                return True
+
+            plain = use_color
+            use_color = _always_color
+            try:
+                lit = io_capture({**report, "warnings": ["a"]})
+                assert f"\033[1;{YELLOW}mRUNNING - 1 WARNING\033[0m" in lit, repr(lit)
+                # The warning label too, and only the label - so the sentence
+                # after it still greps and the column stays aligned.
+                assert f"  \033[1;{YELLOW}mWARNING\033[0m   a\n" in lit, repr(lit)
+                assert f"\033[1;{GREEN}mHEALTHY\033[0m" in io_capture(report)
+                assert f"\033[1;{CYAN}mSTARTING\033[0m" in io_capture(
+                    {**report, "status": "starting"})
+                # Already red stays red rather than being softened to amber...
+                assert f"\033[1;{RED}mSTALLED - 1 WARNING\033[0m" in io_capture(
+                    {**report, "status": "stalled", "warnings": ["a"]})
+                # ...and a status that is not a claim about health still loses
+                # its green once something is warning underneath it.
+                assert f"\033[1;{YELLOW}mFINISHED - 1 WARNING\033[0m" in io_capture(
+                    {**report, "status": "finished", "warnings": ["a"]})
+            finally:
+                use_color = plain
+            assert "\033[" not in io_capture(report), repr(io_capture(report))
             # ...and the same run with its shell killed: still healthy by
             # every measurement, warning about the one thing it has lost.
             orphaned = describe(live, [p for p in not_ranks if p["pid"] != 89] + ranks,

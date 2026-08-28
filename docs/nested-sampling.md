@@ -429,6 +429,13 @@ something to say: a run holding a worker that is 98% paged out headlined
 words already say trouble and only gain the count. No suffix on any run and no
 host warning is exactly exit 0.
 
+On a terminal the headline and the `WARNING` label are coloured - green for
+`HEALTHY` and `FINISHED`, cyan for `STARTING`, amber for anything warning and
+red for `STALLED` and `STOPPED` - and nothing else is, so the two things worth
+scanning for are the two things that stand out. Piped, redirected or under
+[`NO_COLOR`](https://no-color.org) the output is byte-identical to what it has
+always been, so `./ri health | grep` is unaffected.
+
 What each line is reading, and why it is worth a line:
 
 - **stage** - how far into PolyChord the run got, from `chains/`: `*.resume`
