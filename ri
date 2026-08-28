@@ -458,8 +458,9 @@ def build_parser():
             "that every 5 seconds, and the form starts ./ri search.\n"
             "\n"
             "A search started here runs detached, so quitting the interface -\n"
-            "or closing the terminal - leaves it going. Needs Go installed;\n"
-            "nothing else here does.\n"
+            "or closing the terminal - leaves it going. It joins the table as\n"
+            "`starting` straight away, before the images it builds are built.\n"
+            "Needs Go installed; nothing else here does.\n"
             "\n"
             "Keys are listed along the bottom of each screen."
         ),

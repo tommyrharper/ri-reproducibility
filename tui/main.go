@@ -75,15 +75,18 @@ type model struct {
 	logTitle string
 	// What the log pane re-runs on a refresh. Set when the pane is opened.
 	reload func(ri) (string, error)
-	// Set when the pane is showing a run, so 'l' can swap health for run.log.
-	logRun     string
+	// The run the log pane is showing, and which of its two sides: 'l' swaps
+	// the health report for the log and back, esc goes to the table, and enter
+	// there comes back here - which is the whole navigation.
+	logRun     Run
 	showingLog bool
 	paused     bool
 	refreshed  time.Time
 
-	imager  int
-	fields  []field
-	focused int
+	imager   int
+	fields   []field
+	launches []launch
+	focused  int
 
 	notice string
 	err    string
@@ -92,6 +95,19 @@ type model struct {
 }
 
 var imagers = []string{"wsclean", "r2d2"}
+
+// A search this session started. It sits in the table as `starting` until
+// `./ri runs` can see its run directory, which takes as long as the image
+// builds and the memory guard in front of the run do - a run started here used
+// to be the one run the table did not list.
+//
+// The log outlives the wait: it holds the build output and any failure from
+// before the run directory existed, so it stays the log side of `l` for this
+// run for as long as the interface is up.
+type launch struct {
+	run Run
+	log string
+}
 
 func newModel(r ri) model {
 	columns := []table.Column{
@@ -181,6 +197,20 @@ func (m *model) openLog(title string, load func(ri) (string, error)) tea.Cmd {
 	return loadLog(m.ri, load)
 }
 
+// showRun opens the log pane on one of a run's two sides: the health report,
+// or the log it is writing. Everything that opens the pane goes through here,
+// so `l` toggles the same two views the table's enter arrives on.
+func (m *model) showRun(run Run, showHealth bool) tea.Cmd {
+	m.logRun, m.showingLog = run, !showHealth
+	if showHealth {
+		return m.openLog(run.Name, health(run.Name))
+	}
+	if log := m.launchLogFor(run.Name); log != "" {
+		return m.openLog(run.Name+" launch", launchLog(log))
+	}
+	return m.openLog(run.Name+" run.log", runLog(run.Path))
+}
+
 func (m model) selected() (Run, bool) {
 	rows := m.visible()
 	if i := m.table.Cursor(); i >= 0 && i < len(rows) {
@@ -190,16 +220,40 @@ func (m model) selected() (Run, bool) {
 }
 
 func (m model) visible() []Run {
+	listed := map[string]bool{}
+	for _, run := range m.runs {
+		listed[run.Name] = true
+	}
+	var runs []Run
+	for _, l := range m.launches {
+		if !listed[l.run.Name] {
+			runs = append(runs, l.run)
+		}
+	}
+	runs = append(runs, m.runs...)
 	if !m.runningOnly {
-		return m.runs
+		return runs
 	}
 	var live []Run
-	for _, run := range m.runs {
-		if run.Status == "running" {
+	for _, run := range runs {
+		// `starting` is a run of ours that has not reached the process table
+		// yet, which is the one thing a running-only table must not hide.
+		if run.Status == "running" || run.Status == "starting" {
 			live = append(live, run)
 		}
 	}
 	return live
+}
+
+// launchLogFor is the log a run this session started is writing to, or "" for
+// any other run.
+func (m model) launchLogFor(name string) string {
+	for _, l := range m.launches {
+		if l.run.Name == name {
+			return l.log
+		}
+	}
+	return ""
 }
 
 func (m *model) setRows() {
@@ -325,8 +379,11 @@ func (m model) updateRuns(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
-		m.logRun, m.showingLog = run.Path, false
-		return m, m.openLog(run.Name, health(run.Name))
+		// A run that has not claimed its directory yet has nothing for
+		// ./ri health to report on, and everything to say in its log. The
+		// command is bound first because showRun sets up the model it returns.
+		cmd := m.showRun(run, run.Status != "starting")
+		return m, cmd
 	}
 	var cmd tea.Cmd
 	m.table, cmd = m.table.Update(msg)
@@ -344,15 +401,8 @@ func (m model) updateLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.paused = !m.paused
 		return m, nil
 	case "l":
-		if m.logRun == "" {
-			return m, nil
-		}
-		m.showingLog = !m.showingLog
-		name := filepath.Base(m.logRun)
-		if m.showingLog {
-			return m, m.openLog(name+" run.log", runLog(m.logRun))
-		}
-		return m, m.openLog(name, health(name))
+		cmd := m.showRun(m.logRun, m.showingLog)
+		return m, cmd
 	}
 	var cmd tea.Cmd
 	m.view, cmd = m.view.Update(msg)
@@ -386,15 +436,32 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case "enter":
-		args := searchArgs(imagers[m.imager], m.fields)
-		log, err := m.ri.launch(args)
+		imager := imagers[m.imager]
+		dir, err := m.ri.claimRunDir(imager)
 		if err != nil {
 			m.err = err.Error()
 			return m, nil
 		}
-		m.notice = "launched: ./ri " + strings.Join(args, " ")
-		m.logRun, m.showingLog = "", false
-		return m, m.openLog(filepath.Base(log), launchLog(log))
+		args := searchArgs(imager, m.fields, dir)
+		log, err := m.ri.launch(dir, args)
+		if err != nil {
+			// The directory was claimed for a run that never started, so give
+			// it back rather than leave a name no run can be given again.
+			os.Remove(filepath.Join(m.ri.root, dir))
+			m.err = err.Error()
+			return m, nil
+		}
+		run := Run{
+			Name: filepath.Base(dir), Path: dir, Algorithm: imager,
+			Status: "starting", StartedLabel: "just now",
+		}
+		// Newest first, like the listing it is prepended to.
+		m.launches = append([]launch{{run: run, log: log}}, m.launches...)
+		m.err, m.notice = "", "launched "+run.Name
+		m.setRows()
+		m.table.SetCursor(0)
+		cmd := m.showRun(run, false)
+		return m, cmd
 	}
 	if m.focused == 0 {
 		return m, nil
@@ -434,7 +501,7 @@ func (m model) runsView() string {
 		lines = append(lines, errStyle.Render(m.err))
 	}
 	lines = append(lines, helpStyle.Render(
-		"enter health  ·  n new run  ·  a running only  ·  r refresh  ·  q quit"))
+		"enter watch  ·  n new run  ·  a running only  ·  r refresh  ·  q quit"))
 	return strings.Join(lines, "\n")
 }
 
@@ -446,11 +513,8 @@ func (m model) logView() string {
 	if !m.refreshed.IsZero() {
 		state += ", read " + m.refreshed.Format("15:04:05")
 	}
-	help := "esc back  ·  r refresh  ·  p pause  ·  ↑/↓ scroll  ·  q back"
-	if m.logRun != "" {
-		help = "esc back  ·  l " + map[bool]string{true: "health", false: "run.log"}[m.showingLog] +
-			"  ·  r refresh  ·  p pause  ·  ↑/↓ scroll"
-	}
+	help := "esc runs  ·  l " + map[bool]string{true: "health", false: "log"}[m.showingLog] +
+		"  ·  r refresh  ·  p pause  ·  ↑/↓ scroll"
 	return strings.Join([]string{
 		titleStyle.Render(m.logTitle) + helpStyle.Render("  "+state),
 		m.view.View(),
