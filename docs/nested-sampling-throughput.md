@@ -13,15 +13,21 @@ every stage is at its floor can still spend half its cores idle.
 
 Every run's `summary.json` carries a `profiling` block. Its
 `accounted_worker_seconds` is the time the ranks spent inside a likelihood
-evaluation; `total_wall_seconds x mpi_procs` is the worker-time budget the run
-had. The ratio is rank utilisation, and `./ri profile <run>` prints its
+evaluation; `total_wall_seconds x (mpi_procs - 1)` is the worker-time budget
+the run had. The ratio is worker utilisation, and `./ri profile <run>` prints its
 complement as "unaccounted (PolyChord sampling + idle)":
 
 ```bash
 python3 -c 'import json,sys; j=json.load(open(sys.argv[1]+"/summary.json")); p=j["profiling"]
-print("%.0f%% utilised" % (100*p["accounted_worker_seconds"]/(p["total_wall_seconds"]*p["mpi_procs"])))' \
+n=p["mpi_procs"]; w=n-1 if n>1 else 1
+print("%.0f%% utilised" % (100*p["accounted_worker_seconds"]/(p["total_wall_seconds"]*w)))' \
   results/nested-sampling/<run>
 ```
+
+The denominator is the *worker* count, one less than the rank count: rank 0 is
+PolyChord's administrator and never evaluates a likelihood. See
+[rank 0 is not a worker](#rank-0-is-not-a-worker) below, which is also why the
+figures on this page are not the ones it was first written with.
 
 PolyChord's own sampling is not in that remainder in any meaningful quantity -
 it is a Cholesky decomposition and a live-point insertion per iteration
@@ -34,12 +40,12 @@ Measured across the runs on disk before any of this changed:
 
 | Run | ranks | nlive | num_repeats | wall | utilisation |
 |---|---:|---:|---:|---:|---:|
-| `r2d2-vlaa-20260827T205418Z` | 16 | 50 | 10 | 14.0h | 54% |
-| `wsclean-vlaa-20260827T190109Z` | 20 | 50 | 10 | 501s | 45% |
-| `wsclean-vlaa-20260827T201926Z` | 20 | 50 | 10 | 290s | 67% |
+| `r2d2-vlaa-20260827T205418Z` | 16 | 50 | 10 | 14.0h | 58% |
+| `wsclean-vlaa-20260827T190109Z` | 20 | 50 | 10 | 501s | 47% |
+| `wsclean-vlaa-20260827T201926Z` | 20 | 50 | 10 | 290s | 71% |
 
 Two things to read off that. Half the machine was idle. And the same settings
-gave 45% and 67% on two consecutive runs - the throughput was not just low, it
+gave 47% and 71% on two consecutive runs - the throughput was not just low, it
 was not repeatable, which is what makes a run's remaining time impossible to
 predict.
 
@@ -51,10 +57,10 @@ any moment. Over that run:
 
 ```
 concurrency:  1 rank busy 17% of the time,  2 busy 11%,  15 busy 37%
-mean 8.7 of 16 ranks
+mean 8.7 of the 15 workers
 ```
 
-Bimodal, not a uniform 54%: the ranks were either all working or nearly all
+Bimodal, not a uniform 58%: the ranks were either all working or nearly all
 stopped. Plotted against time it is a sawtooth - every rank starts together,
 they finish staggered, the last one finishes minutes after the first, and only
 then does the next round start.
@@ -106,15 +112,15 @@ A/B on WSClean, same seed within each pair, 15 ranks, `--nlive 50
 
 | seed | mode | wall | rank utilisation | dead points | s / dead point | log(Z) |
 |---:|---|---:|---:|---:|---:|---|
-| 4242 | synchronous | 293.1s | 64% | 435 | 0.674 | 0.024636 ± 0.000024 |
-| 4242 | **asynchronous** | **238.8s** | **92%** | 497 | **0.480** | 0.024620 ± 0.000023 |
-| 7 | synchronous | 316.6s | 64% | 438 | 0.723 | 0.024625 ± 0.000024 |
-| 7 | **asynchronous** | **243.7s** | **91%** | 502 | **0.486** | 0.024625 ± 0.000024 |
-| 99 | synchronous | 293.2s | 67% | 440 | 0.666 | 0.024697 ± 0.000030 |
-| 99 | **asynchronous** | **245.7s** | **91%** | 502 | **0.489** | 0.024709 ± 0.000031 |
+| 4242 | synchronous | 293.1s | 69% | 435 | 0.674 | 0.024636 ± 0.000024 |
+| 4242 | **asynchronous** | **238.8s** | **98%** | 497 | **0.480** | 0.024620 ± 0.000023 |
+| 7 | synchronous | 316.6s | 68% | 438 | 0.723 | 0.024625 ± 0.000024 |
+| 7 | **asynchronous** | **243.7s** | **97%** | 502 | **0.486** | 0.024625 ± 0.000024 |
+| 99 | synchronous | 293.2s | 72% | 440 | 0.666 | 0.024697 ± 0.000030 |
+| 99 | **asynchronous** | **245.7s** | **98%** | 502 | **0.489** | 0.024709 ± 0.000031 |
 
 Three pairs, no exceptions: **27-33% less wall clock per dead point**, rank
-utilisation 64-67% -> 91-92%. The asynchronous runs went *further* as well as
+utilisation 68-72% -> 97-98%. The asynchronous runs went *further* as well as
 faster - each ran to the same termination criterion and got ~60 more dead
 points out of it, so the raw wall-clock column understates the gain.
 
@@ -125,8 +131,8 @@ asynchronous), so the extra points are not bought by sampling more cheaply -
 asynchronous mode is not doing less work per point, it is doing the same work
 on more cores.
 
-And the utilisation is *steady*: 91, 91, 92 against 64, 64, 67, and against
-45% and 67% on two historical 20-rank runs at the same settings. The
+And the utilisation is *steady*: 97, 98, 98 against 68, 69, 72, and against
+47% and 71% on two historical 20-rank runs at the same settings. The
 straggler tail is where the run-to-run variance in throughput was coming from,
 so removing it makes a run's remaining time predictable as well as shorter.
 The evidences agree to within 0.5 sigma on every pair.
@@ -167,3 +173,128 @@ defensible as a *measurement of Z* should be started with `--synchronous`, and
 - **Host oversubscription.** The 14-hour run's idle time is bimodal and
   synchronised across ranks. Contention would have shown up as every
   evaluation being uniformly slower, not as all ranks stopping together.
+
+
+<a id="rank-0-is-not-a-worker"></a>
+
+## Rank 0 is not a worker, and the utilisation numbers above were wrong
+
+PolyChord's rank 0 is the *administrator*: it hands slice-sampling chains out,
+collects them, keeps the live set and writes the files. It never calls the
+likelihood. `nested_sampling.F90` says so in its own array shapes -
+`worker_cluster(nprocs-1)`, `worker_epochs(nprocs-1)` - and `generate.F90`
+sets `active_workers = nprocs-1` when it makes the initial live points.
+
+So a job of N ranks has N-1 workers, and its worker-time budget is
+`wall x (N-1)`, not `wall x N`. Everything above this section, and
+`./ri profile`, and the report's profiling table, used the rank count. That
+understated utilisation by (N-1)/N - 7% at 15 ranks - and the shortfall reads
+as idle time, which is the one thing on this page anybody is trying to remove.
+`worker_procs()` in `common.py` is the fix, and every figure above has been
+restated through it: the asynchronous pairs move from 91-92% to 97-98%.
+
+The conclusion of the section above does not change - the barrier was real and
+removing it was worth 27-33%. What changes is what is left: **the workers are
+97-98% busy, not 91-92%.** There is no meaningful idle time left to recover at
+these settings, and any further speed has to come from a cheaper evaluation,
+fewer evaluations per dead point, or more workers.
+
+To read utilisation off a run:
+
+```bash
+python3 -c 'import json,sys; j=json.load(open(sys.argv[1]+"/summary.json")); p=j["profiling"]
+n=p["mpi_procs"]; w=n-1 if n>1 else 1
+print("%.0f%% utilised" % (100*p["accounted_worker_seconds"]/(p["total_wall_seconds"]*w)))' \
+  results/nested-sampling/<run>
+```
+
+## The administrator burns a hardware thread, and nothing tried gets it back
+
+Rank 0 waits for chains inside a blocking `MPI_Recv` (`catch_babies` in
+`mpi_utils.F90`), and Open MPI's progress engine spins on it in userspace
+rather than sleeping. Measured on a 15-rank WSClean search, sampling
+`ps -o pcpu` every 10s for the length of the run:
+
+```
+rank:    0     1    2    3    4    5   ...  14
+%CPU:  99.9  1.2  1.1  1.3  1.4  1.6   ...  1.2
+```
+
+`/proc/<rank 0>/syscall` reads `running` on every sample - it is not in a
+syscall, it is spinning. The working ranks sit at 1-2% because their imaging
+happens in the sidecars; the number that matters is the 99.9%. One hardware
+thread of a 20-thread host, for the length of every run.
+
+Three ways to get it back were measured. **None of them changed the
+throughput**, so none of them shipped:
+
+| change | evaluations/s (3 interleaved pairs, WSClean, `--nlive 50 --num-repeats 10`) |
+|---|---|
+| baseline, 20 ranks | 44.4, 42.9, 41.3 |
+| `-np 21 --oversubscribe` (20 workers instead of 19) | 43.6, 41.7, 42.0 |
+| baseline, 20 ranks | 45.5, 44.8, 43.4 |
+| administrator at `nice 19` | 44.5, 44.5, 43.2 |
+
+- **`OMPI_MCA_mpi_yield_when_idle=1`** does nothing. It makes the progress loop
+  call `sched_yield()`, which is close to a no-op for a CFS task; rank 0 still
+  measures 99% CPU with it set, confirmed from `/proc/<pid>/environ`.
+- **One more rank**, so the *worker* count matches the thread count rather than
+  being one short, is 2% *slower* if anything. The box is already saturated at
+  19 workers.
+- **`nice 19` on the administrator**, which does work where `sched_yield` does
+  not (its `ni` really is 19 and it really is descheduled under load), is also
+  within noise. The thread it gives up is not one the workers can use.
+
+The last two are the same result seen twice, and the section below says why:
+this host is already past the point where another worker is worth much, so
+freeing a thread for one buys nothing. That may not hold on a bigger box or a
+cheaper likelihood, and the thing to carry forward is the measurement rather
+than the verdict - `ps -o pcpu,ni` across the ranks plus `evals/s` from
+`summary.json` is enough to re-run any of it in ten minutes.
+
+## What is left: the evaluation gets more expensive the more workers there are
+
+With the idle time gone, scaling a run is no longer about keeping the workers
+busy - they are 96-99% busy at every rank count. It is about what a worker
+gets done while it is busy, and that falls off sharply. One WSClean search per
+row, same seed (4242), same settings (`--nlive 50 --num-repeats 10`), only
+`--mpi-procs` changed:
+
+| workers | evals/s | evals/s per worker | simulate | `wsclean` | per evaluation | utilisation |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 21.7 | 5.43 | 40ms | 136ms | 183ms | 99% |
+| 8 | 31.3 | 3.92 | 61ms | 180ms | 248ms | 97% |
+| 12 | 37.7 | 3.14 | 70ms | 228ms | 306ms | 96% |
+| 19 | 45.5 | 2.39 | 105ms | 290ms | 403ms | 97% |
+| 20 | 43.6 | 2.18 | 122ms | 309ms | 440ms | 96% |
+
+Five times the workers buys 2.1x the throughput. The workers are not waiting -
+**an evaluation costs 2.4x more at 20 workers than at 4** (183ms -> 440ms),
+and both halves of it inflate: simulate 3.1x, `wsclean` 2.3x. The container
+round-trip overhead does not (5.9ms -> 7.0ms), so this is not the daemon.
+
+Two things make that shape unsurprising on this host, and they pull apart when
+extrapolating:
+
+- **The cores are not equal.** This is an i5-13500: 6 P-cores with two threads
+  each, plus 8 single-threaded E-cores, for the 20 that `nproc` reports. The
+  first few workers get a P-core to themselves; the twentieth gets whatever is
+  left. A homogeneous server should fall off less steeply.
+- **An evaluation is not one core.** Each one runs a MeqTrees predict and a
+  `wsclean` in the sidecars, and they share memory bandwidth and last-level
+  cache with every other worker's.
+
+What to take from it when sizing a bigger run:
+
+- **More ranks still helps** - 45.5 evals/s against 21.7 - so `NS_MPI_PROCS =
+  min(NS_NLIVE, host threads)` stays the default. One rank *more* than that,
+  so the worker count rather than the rank count matches the threads, was
+  measured and is not worth it (the section above).
+- **But the marginal worker is worth about 40% of the first one**, which
+  changes the arithmetic on the memory wall. An R2D2 search capped at ~14
+  workers by RAM (`scripts/lib/rank-budget.sh`) is not losing what the rank
+  count suggests, and spending the same memory on a larger `--nlive` is a
+  better trade than it looks.
+- **Anything that makes one evaluation cheaper is now worth more than anything
+  that adds a worker**, and `wsclean` itself is 69% of the worker-time budget
+  at the default rank count (`./ri profile <run>`).

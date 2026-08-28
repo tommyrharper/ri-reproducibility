@@ -406,7 +406,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/run-health.md` | `./ri health`: every line of the report and what warns |
 | `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
-| `docs/nested-sampling-throughput.md` | Rank utilisation: why the ranks idle, and what fixed it |
+| `docs/nested-sampling-throughput.md` | Worker utilisation: why the ranks idled, what fixed it, and why rank 0 is not one |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 

@@ -8,8 +8,9 @@ human-readable table, so you can see which stage actually dominates wall time
 without guessing.
 
 Every share is a fraction of the run's worker-time budget (wall clock x
-mpi_procs), so the top-level stages plus the unaccounted remainder add up to
-100% of what the whole process spent. The same breakdown - and the same
+workers, which is one less than the rank count - PolyChord's rank 0
+administrates and never evaluates a likelihood), so the top-level stages plus
+the unaccounted remainder add up to 100% of what the whole process spent. The same breakdown - and the same
 numbers - back the Profiling section of the HTML run report.
 
 Usage:
@@ -80,13 +81,15 @@ def print_report(summary: dict[str, Any]) -> None:
 
     breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
     mpi_procs = breakdown["mpi_procs"]
+    workers = breakdown["worker_procs"]
     budget = breakdown["worker_seconds_budget"]
 
     print(f"algorithm:        {summary.get('algorithm')}")
     print(f"evaluations:      {len(summary.get('evaluations', []))}")
-    print(f"mpi_procs:        {mpi_procs}")
+    ranks = f"{mpi_procs}" if workers == mpi_procs else f"{mpi_procs} ({workers} workers + administrator)"
+    print(f"mpi_procs:        {ranks}")
     print(f"wall clock:       {format_duration(breakdown['total_wall_seconds'])}")
-    print(f"worker-time:      {format_duration(budget)}  ({mpi_procs} x wall clock)")
+    print(f"worker-time:      {format_duration(budget)}  ({workers} x wall clock)")
     print()
 
     header = (
@@ -134,8 +137,8 @@ def print_report(summary: dict[str, Any]) -> None:
     ]
     if mpi_procs != 1:
         terms.append(f"= {format_duration(budget)} of worker-time")
-        terms.append(f"/ {mpi_procs} workers")
-    wall = (budget / mpi_procs) if budget else 0.0
+        terms.append(f"/ {workers} workers")
+    wall = (budget / workers) if budget else 0.0
     terms.append(f"= {format_duration(wall)} end-to-end wall clock")
     print(" ".join(terms))
     print()

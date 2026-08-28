@@ -1226,9 +1226,10 @@ UNACCOUNTED_LABEL = "unaccounted (PolyChord sampling + idle)"
 
 PROFILING_VIEW_NOTE = (
     "stage totals are summed worker-seconds across every evaluation; shares are "
-    "of the run's worker-time budget (wall clock x mpi_procs), so the top-level "
+    "of the run's worker-time budget (wall clock x workers, and rank 0 is the "
+    "administrator rather than a worker), so the top-level "
     "stages plus the unaccounted remainder come to 100%. Dividing a worker-second "
-    "total by mpi_procs gives what that stage cost in wall clock, since the workers "
+    "total by the worker count gives what that stage cost in wall clock, since they "
     "spend it side by side, and those wall-clock figures add up to the run's "
     "end-to-end wall time."
 )
@@ -1239,11 +1240,13 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
 
     Shared by the HTML report and scripts/profile-nested-sampling-run.py so the
     two cannot drift apart. Every share is a fraction of the run's total
-    worker-time budget - wall clock x mpi_procs - so the top-level stages plus
+    worker-time budget - wall clock x workers - so the top-level stages plus
     the unaccounted remainder add up to 100% of what the whole process spent.
-    That holds for serial and MPI runs alike: at mpi_procs == 1 the budget is
-    just the wall clock and the remainder is PolyChord's own sampling, while at
-    mpi_procs > 1 the remainder also absorbs the time workers sat idle.
+    The worker count is `worker_procs(mpi_procs)`, not the rank count - rank 0
+    administrates. That holds for serial and MPI runs alike: at mpi_procs == 1
+    the budget is just the wall clock and the remainder is PolyChord's own
+    sampling, while at mpi_procs > 1 the remainder also absorbs the time
+    workers sat idle.
     """
     imager = algorithm or "image"
     mpi_procs = int(profiling.get("mpi_procs") or 1)
@@ -1256,7 +1259,8 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
         accounted = profiling.get("accounted_seconds")
     accounted = float(accounted or 0.0)
 
-    budget = None if total_wall is None else total_wall * mpi_procs
+    workers = worker_procs(mpi_procs)
+    budget = None if total_wall is None else total_wall * workers
     # A budget below what the stages already accounted for would push shares
     # over 100%; an oversubscribed host or a clock jump can produce one, so fall
     # back to the accounted total and keep the breakdown adding up.
@@ -1289,6 +1293,7 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
     return {
         "imager": imager,
         "mpi_procs": mpi_procs,
+        "worker_procs": workers,
         "evals": max((row["evals"] for row in rows), default=0),
         "total_wall_seconds": total_wall,
         "worker_seconds_budget": denominator,
@@ -1365,6 +1370,19 @@ def mpi_rank() -> int:
         return int(MPI.COMM_WORLD.Get_rank())
     except ImportError:
         return 0
+
+
+def worker_procs(mpi_procs: int) -> int:
+    """How many of a job's ranks actually evaluate a likelihood.
+
+    Not all of them: PolyChord's rank 0 is the administrator, and
+    `nested_sampling.F90` sizes its worker arrays `nprocs-1`. A run of N ranks
+    therefore has a worker-time budget of `wall x (N-1)`, not `wall x N`, and
+    using N understated rank utilisation by a factor (N-1)/N - 7% at 15 ranks -
+    which reads as idle time that no scheduling change can ever recover. A
+    serial run has no administrator: rank 0 is the worker.
+    """
+    return mpi_procs - 1 if mpi_procs > 1 else 1
 
 
 def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
@@ -2536,7 +2554,7 @@ def self_check_profiling() -> None:
     assert empty_profiling["accounted_worker_seconds"] == 0.0
     assert empty_profiling["polychord_overhead_seconds"] == 5.0
 
-    mpi_profiling = summarize_profiling(evaluations, total_wall_seconds=5.0, mpi_procs=4)
+    mpi_profiling = summarize_profiling(evaluations, total_wall_seconds=10.0, mpi_procs=4)
     assert mpi_profiling["accounted_worker_seconds"] == 19.5
     assert mpi_profiling["accounted_seconds"] is None
     assert mpi_profiling["polychord_overhead_seconds"] is None
@@ -2556,6 +2574,7 @@ def self_check_profiling() -> None:
 
     # Serial run: budget is the wall clock, so stages + unaccounted make 100%.
     serial = profiling_breakdown(profiling, algorithm="wsclean")
+    assert serial["worker_procs"] == 1
     assert serial["worker_seconds_budget"] == 25.0
     assert serial["evals"] == 3
     labels = [row["label"] for row in serial["rows"]]
@@ -2569,11 +2588,15 @@ def self_check_profiling() -> None:
     top_level = sum(row["share"] for row in serial["rows"] if not row["is_sub"])
     assert abs(top_level + serial["unaccounted_share"] - 1.0) < 1e-9
 
-    # MPI run: budget is wall clock x workers, and idle time lands in unaccounted.
+    # MPI run: the budget is wall clock x *workers*, and 4 ranks are 3 workers
+    # plus the administrator - counting rank 0 would invent 5s of idle time
+    # that no rank could ever have spent imaging.
+    assert (worker_procs(1), worker_procs(2), worker_procs(15)) == (1, 1, 14)
     mpi = profiling_breakdown(mpi_profiling, algorithm="r2d2")
-    assert mpi["worker_seconds_budget"] == 20.0
-    assert abs(mpi["accounted_share"] - 0.975) < 1e-9
-    assert abs(mpi["unaccounted_seconds"] - 0.5) < 1e-9
+    assert mpi["worker_procs"] == 3
+    assert mpi["worker_seconds_budget"] == 30.0  # not 40.0: rank 0 is not a worker
+    assert abs(mpi["accounted_share"] - 0.65) < 1e-9
+    assert abs(mpi["unaccounted_seconds"] - 10.5) < 1e-9
     assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
 
     # Accounted time above the nominal budget must not push shares over 100%.
