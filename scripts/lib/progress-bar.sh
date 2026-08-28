@@ -560,9 +560,21 @@ _ns_count_lines() {
   wc -l <"${file}" | tr -d ' '
 }
 
-_ns_format_hms() {
+# `24s`, `7m36s`, `10h24m`, `2d 6h` - a duration, not a clock time. The same
+# rendering as `format_elapsed` in scripts/nested-sampling-health.py, so an
+# interval reads the same on the pinned status line and in `./ri health`;
+# `H:MM:SS` read as a timestamp beside the ISO stamps both surfaces also print.
+_ns_format_elapsed() {
   local s="$1"
-  printf '%d:%02d:%02d' $((s / 3600)) $(((s % 3600) / 60)) $((s % 60))
+  if [ "${s}" -lt 60 ]; then
+    printf '%ds' "${s}"
+  elif [ "${s}" -lt 3600 ]; then
+    printf '%dm%02ds' $((s / 60)) $((s % 60))
+  elif [ "${s}" -lt 86400 ]; then
+    printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60))
+  else
+    printf '%dd %dh' $((s / 86400)) $(((s % 86400) / 3600))
+  fi
 }
 
 _ns_render_bar() {
@@ -609,9 +621,9 @@ _ns_status_line() {
 
   eta="?"
   if [ "${dead_now}" -gt 0 ] && [ "$((max_ndead - dead_now))" -gt 0 ]; then
-    eta="$(_ns_format_hms $(((max_ndead - dead_now) * elapsed / dead_now)))"
+    eta="$(_ns_format_elapsed $(((max_ndead - dead_now) * elapsed / dead_now)))"
   elif [ "${dead_now}" -ge "${max_ndead}" ]; then
-    eta="0:00:00"
+    eta="0s"
   fi
 
   bar="$(_ns_render_bar "${pct}" 30)"
@@ -621,7 +633,7 @@ _ns_status_line() {
   # derived from it take the `~` whenever it is not the checkpoint's own count.
   printf '[%s] %s%3d%%  %s%d/%d dead points (%d evaluations)  elapsed %s  eta %s%s' \
     "${bar}" "${carried}" "${pct}" "${carried}" "${dead_now}" "${max_ndead}" \
-    "${eval_count}" "$(_ns_format_hms "${elapsed}")" "${carried}" "${eta}"
+    "${eval_count}" "$(_ns_format_elapsed "${elapsed}")" "${carried}" "${eta}"
 }
 
 # A block bouncing back and forth across the bar, one step per elapsed
@@ -646,7 +658,7 @@ _ns_unbounded_line() {
   [ "${elapsed}" -gt 0 ] && rate="$((dead_count * 60 / elapsed))/min"
 
   printf '[%s] %d dead points (%d evaluations)  rate %s  elapsed %s  (no --max-ndead cap, stopping on evidence tolerance)' \
-    "${bar}" "${dead_count}" "${eval_count}" "${rate}" "$(_ns_format_hms "${elapsed}")"
+    "${bar}" "${dead_count}" "${eval_count}" "${rate}" "$(_ns_format_elapsed "${elapsed}")"
 }
 
 # Every figure derived from the estimated total carries a `~`: the cap branch
@@ -661,9 +673,9 @@ _ns_evidence_line() {
   bar="$(_ns_render_bar "${pct}" 30)"
   local note="(evidence tolerance, no --max-ndead cap)"
   if [ "$((total - dead_now))" -gt 0 ] && [ "${dead_now}" -gt 0 ]; then
-    eta="$(_ns_format_hms $(((total - dead_now) * elapsed / dead_now)))"
+    eta="$(_ns_format_elapsed $(((total - dead_now) * elapsed / dead_now)))"
   elif [ "${dead_now}" -ge "${total}" ]; then
-    # Not "eta 0:00:00". The total came from the last checkpoint and is as
+    # Not "eta 0s". The total came from the last checkpoint and is as
     # stale as it is, so a carried count reaching it means the estimate has
     # been overtaken, not that the run is done - the live R2D2 search here sat
     # past its own estimate for over three hours while still sampling. The
@@ -672,7 +684,7 @@ _ns_evidence_line() {
   fi
   printf '[%s] ~%3d%%  ~%d/~%d dead points (%d evaluations)  elapsed %s  eta ~%s  %s' \
     "${bar}" "${pct}" "${dead_now}" "${total}" "${eval_count}" \
-    "$(_ns_format_hms "${elapsed}")" "${eta}" "${note}"
+    "$(_ns_format_elapsed "${elapsed}")" "${eta}" "${note}"
 }
 
 # The fraction of the banked evidence at which a run actually stops. Measured,
@@ -796,8 +808,11 @@ self_check() {
   [ "$(_ns_dead_now 100 1000 0)" = "100" ] || { echo "FAIL: dead_now on a fresh checkpoint"; exit 1; }
   [ "$(_ns_dead_now 100 100 100)" = "100" ] || { echo "FAIL: dead_now with nothing banked"; exit 1; }
 
-  [ "$(_ns_format_hms 3661)" = "1:01:01" ] || { echo "FAIL: format_hms"; exit 1; }
-  [ "$(_ns_format_hms 59)" = "0:00:59" ] || { echo "FAIL: format_hms short"; exit 1; }
+  [ "$(_ns_format_elapsed 3661)" = "1h01m" ] || { echo "FAIL: format_elapsed"; exit 1; }
+  [ "$(_ns_format_elapsed 59)" = "59s" ] || { echo "FAIL: format_elapsed short"; exit 1; }
+  [ "$(_ns_format_elapsed 65)" = "1m05s" ] || { echo "FAIL: format_elapsed minutes"; exit 1; }
+  [ "$(_ns_format_elapsed 3599)" = "59m59s" ] || { echo "FAIL: format_elapsed hour boundary"; exit 1; }
+  [ "$(_ns_format_elapsed 194400)" = "2d 6h" ] || { echo "FAIL: format_elapsed days"; exit 1; }
 
   # A pinned draw is written to a fixed row and never re-checked, so a line
   # even one column wider than the terminal wraps onto the row above (inside
@@ -889,13 +904,13 @@ self_check() {
   seq 1 10 >"${dead_file}"
   line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
   case "${line}" in
-    *"~ 55%"*"~10/~18 dead points"*"eta ~0:00:48"*"evidence tolerance"*) ;;
+    *"~ 55%"*"~10/~18 dead points"*"eta ~48s"*"evidence tolerance"*) ;;
     *) echo "FAIL: status line did not switch to the evidence total: ${line}"; exit 1 ;;
   esac
   # ...and with two of the four evaluations landing after that checkpoint, the
   # 10 banked over 2 carry forward to 20 - which is past the estimated total,
   # so the percent clamps at 100 rather than printing "111%" on a run that is
-  # about to stop anyway. The eta does *not* become 0:00:00: the total came
+  # about to stop anyway. The eta does *not* become 0s: the total came
   # from the checkpoint and is as stale as it is, so overtaking it means the
   # estimate is out of date rather than that the run has finished.
   touch -t 202601010100 "${dead_file}"
@@ -906,7 +921,7 @@ self_check() {
     *) echo "FAIL: carried count past the estimated total: ${line}"; exit 1 ;;
   esac
   case "${line}" in
-    *"0:00:00"*|*"evidence tolerance"*)
+    *"eta ~0s"*|*"evidence tolerance"*)
       echo "FAIL: past the estimate still claims it is done: ${line}"; exit 1 ;;
   esac
   touch "${dead_file}"

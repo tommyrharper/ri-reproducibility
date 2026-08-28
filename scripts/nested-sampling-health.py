@@ -234,7 +234,7 @@ RATE_DIVERGENCE_FACTOR = 2.0
 # granularity rather than throughput. Parallel ranks land their first batch
 # together - so the opening evaluations of any run share a timestamp to within
 # milliseconds - and a run killed during that batch is left holding nothing
-# else. Real runs on this host printed "6176.5/min over 0:00:00" from 14
+# else. Real runs on this host printed "6176.5/min over 0s" from 14
 # evaluations 0.14s apart and "8700112/min" from 42 of them 0.3ms apart, both
 # of which are the arithmetic working exactly as written on an input that
 # means nothing. One second, because that is the resolution the span is
@@ -1565,7 +1565,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             # the case where waiting is the wrong thing to do.
             if idle < timeout:
                 due = ("; the stall watchdog kills and restarts it in "
-                       f"{format_hms(timeout - idle)}")
+                       f"{format_elapsed(timeout - idle)}")
             elif idle <= timeout + STALL_WATCHDOG_POLL_SECONDS:
                 due = f"; the {timeout}s stall watchdog is due to kill and restart it"
             else:
@@ -1873,9 +1873,24 @@ def format_gb(value: float) -> str:
             else f"{value / 1024 ** 2:.0f}MB")
 
 
-def format_hms(seconds: float) -> str:
-    seconds = int(seconds)
-    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+def format_elapsed(seconds: float) -> str:
+    """`24s`, `7m36s`, `10h24m`, `2d 6h` - a duration that is not a clock time.
+
+    This used to be `H:MM:SS`, which every line here wears at least once and
+    which the report itself teaches the reader to misread: `last evaluation
+    10:24:14 ago` sits three lines above a real `2026-08-28T02:48:23Z`, and
+    `0:00:24` spends three fields on a value with one.
+
+    Above an hour it is `format_hours` exactly, so the same interval reads the
+    same way measured backwards (`checkpoint 4h16m ago`) and forwards (`~4h16m
+    left`); seconds are dropped there with it, being noise at that scale.
+    """
+    seconds = int(max(0.0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return format_hours(seconds / 3600)
 
 
 def format_hours(hours: float) -> str:
@@ -1966,11 +1981,11 @@ def render(run: dict[str, object]) -> None:
         # writes it every ~nlive points, so it is stale by design between
         # writes and a frozen-looking count means nothing on its own.
         ("stage", f"{run['stage']}, {run['dead_points']} dead points"
-                  + (f" as of {format_hms(float(run['checkpoint_age_seconds']))} ago"
+                  + (f" as of {format_elapsed(float(run['checkpoint_age_seconds']))} ago"
                      f"{next_update}"
                      if run["checkpoint_age_seconds"] is not None else "")),
         # ...and what standing behind that checkpoint costs, which is the half
-        # of "3:53 ago" nobody can work out for themselves. A restart carries
+        # of "3m53s ago" nobody can work out for themselves. A restart carries
         # on from the checkpoint's dead points and re-images its way back with
         # different proposals - the seed that makes a from-scratch restart free
         # is re-drawn from the top on a resume, so the point cache answers none
@@ -1980,7 +1995,7 @@ def render(run: dict[str, object]) -> None:
         # grows until the next checkpoint lands, and there is nothing to do
         # about it. Withheld from a finished run, which has nothing to redo.
         *([("at risk", f"{run['at_risk']} evaluations scored since that checkpoint"
-                       + (f", {format_hms(float(run['at_risk_seconds']))} of imaging "
+                       + (f", {format_elapsed(float(run['at_risk_seconds']))} of imaging "
                           "a restart would redo"
                           if run["at_risk_seconds"] else ""))]
           if int(run["at_risk"] or 0) and run["status"] != "finished" else []),
@@ -1992,14 +2007,14 @@ def render(run: dict[str, object]) -> None:
         ("progress", f"{run['completed']} evaluations, {run['in_flight']} "
                      + ("in flight" if run["ranks"] else "abandoned")),
         ("activity", "nothing yet" if idle is None else
-                     f"last evaluation {format_hms(float(idle))} ago"
-                     + (f", {rate:.1f}/min over {format_hms(float(run['span_seconds']))}"
+                     f"last evaluation {format_elapsed(float(idle))} ago"
+                     + (f", {rate:.1f}/min over {format_elapsed(float(run['span_seconds']))}"
                         if rate else "")
                      # The span is running time, not age, so a run that was
                      # ever stopped has to say where the difference went -
-                     # otherwise "over 0:00:18" on a run four hours old reads
+                     # otherwise "over 18s" on a run four hours old reads
                      # as a report of the wrong run.
-                     + (f" + {format_hms(float(run['downtime_seconds']))} stopped"
+                     + (f" + {format_elapsed(float(run['downtime_seconds']))} stopped"
                         if rate and float(run["downtime_seconds"] or 0) >= 1 else "")
                      # Only when the run has changed pace materially, in either
                      # direction: the two numbers agreeing says nothing.
@@ -2018,7 +2033,7 @@ def render(run: dict[str, object]) -> None:
         lines.append(("history",
                       (f"{past['bar']}  {past['low_per_minute']:.0f}-"
                        f"{past['high_per_minute']:.0f}/min per "
-                       f"{format_hms(float(past['bucket_seconds']))} slice")))
+                       f"{format_elapsed(float(past['bucket_seconds']))} slice")))
     # What an evaluation costs and how much of the run's hardware that cost is
     # spread over. `activity` reports arrival rate, which confounds a slower
     # imager with idle ranks; this line separates them, and the occupancy is
@@ -2056,7 +2071,7 @@ def render(run: dict[str, object]) -> None:
                       (f"{used['bar']}  {float(used['low_fraction']):.0%}-"
                        f"{float(used['high_fraction']):.0%} of "
                        f"{used['ranks']} ranks busy per "
-                       f"{format_hms(float(used['bucket_seconds']))} slice")))
+                       f"{format_elapsed(float(used['bucket_seconds']))} slice")))
     # What the search has actually found, and what each dead point cost it.
     # Every other line here is operational; this one is the result, and the
     # calls-per-dead-point is the sampler's own efficiency - the thing an
@@ -2098,7 +2113,7 @@ def render(run: dict[str, object]) -> None:
             age = run["checkpoint_age_seconds"]
             lines.append(("forecast",
                           f"past its ~{ahead['total_dead_points']} dead-point estimate"
-                          + (f", set by the checkpoint {format_hms(float(age))} ago"
+                          + (f", set by the checkpoint {format_elapsed(float(age))} ago"
                              if age is not None else "")
                           + " and revised by the next one"))
         else:
@@ -2190,7 +2205,7 @@ def render(run: dict[str, object]) -> None:
         elif not budget["used"]:
             budget_note = (f"; {budget['left']} of {budget['limit']} left, the budget "
                            "handed back by an attempt that has run over "
-                           f"{format_hms(RETRY_RESET_SECONDS)}")
+                           f"{format_elapsed(RETRY_RESET_SECONDS)}")
         else:
             budget_note = f"; {budget['left']} of {budget['limit']} left"
     for label, kind, these, note in (("restarts", "self-healed restart", healed,
@@ -2626,7 +2641,7 @@ def self_check() -> None:
             assert report["status"] == "healthy", report
             assert 590 < float(report["checkpoint_age_seconds"]) < 620, report
             aged = io_capture(report)
-            assert "3 dead points as of 0:10:0" in aged, aged
+            assert "3 dead points as of 10m00s ago" in aged, aged
             # ...and where it will next move to, so a reader coming back has
             # something to compare against. nlive is 4 in this fixture.
             assert "next at 7+" in aged, aged
@@ -2879,7 +2894,7 @@ def self_check() -> None:
             # has been standing.
             assert carried["at_risk"] == 10, carried
             assert abs(float(carried["at_risk_seconds"]) - 2000) < 1, carried
-            assert ("at risk   10 evaluations scored since that checkpoint, 0:33:20 "
+            assert ("at risk   10 evaluations scored since that checkpoint, 33m20s "
                     "of imaging a restart would redo" in io_capture(carried)), io_capture(carried)
             assert carried["dead_points"] == 200, carried
             assert carried["forecast"]["dead_points_now"] == 240, carried["forecast"]
@@ -2926,7 +2941,7 @@ def self_check() -> None:
             assert overshot["forecast"]["fraction"] == 1.0, overshot["forecast"]
             shown = io_capture(overshot)
             assert re.search(r"forecast +past its ~451 dead-point estimate, set by the "
-                             r"checkpoint \d+:\d\d:\d\d ago and revised by the next one",
+                             r"checkpoint \d+h\d\dm ago and revised by the next one",
                              shown), shown
             assert "% done" not in shown, shown
             # Only a live run says any of this: a stopped one is not waiting
@@ -3172,7 +3187,7 @@ def self_check() -> None:
             # the budget is back whatever the restart before it cost.
             back = budget_report("NS_RETRIES=2\n", [(4000, crash)], 5000)
             assert ("; 2 of 2 left, the budget handed back by an attempt that has "
-                    "run over 0:30:00") in back, back
+                    "run over 30m00s") in back, back
 
             # Three restarts and only one counted: the attempt between the
             # second and the third ran past the reset window, which is exactly
@@ -3234,7 +3249,7 @@ def self_check() -> None:
 
             base = "NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\nNS_NLIVE=4\n"
             waiting = stall_warning(base + "NS_STALL_TIMEOUT=7200\n")
-            assert "stall watchdog kills and restarts it in 1:5" in waiting, waiting
+            assert "stall watchdog kills and restarts it in 1h59m" in waiting, waiting
             # 0 is the setting's opposite and must not read as "any moment now".
             off = stall_warning(base + "NS_STALL_TIMEOUT=0\n")
             assert "turned the stall watchdog off" in off, off
@@ -3477,7 +3492,7 @@ def self_check() -> None:
             assert used["bar"][-1] == HISTORY_LEVELS[0], used
             assert abs(float(used["high_fraction"]) - 1.0) < 0.01, used
             assert abs(float(used["low_fraction"]) - 0.0625) < 0.01, used
-            assert "6%-100% of 8 ranks busy per 0:00:44 slice" in rendered_idle, rendered_idle
+            assert "6%-100% of 8 ranks busy per 44s slice" in rendered_idle, rendered_idle
             # ...and what the imager peaked at over them. A median: 150 of
             # the 210 at 1GB and 60 at 4GB, so the mean would be 1.9GB and only
             # the median is 1.0. Multiplied out over the ranks, because what
@@ -3536,7 +3551,7 @@ def self_check() -> None:
             rendered = io_capture(report)
             # The pair as a reader sees it: 17.0 against 4.9 is the same
             # 3.4-fold drop `slowdown_factor` gated on, in the same units.
-            assert "17.0/min over 0:15:19 (4.9/min over the last 50)" in rendered, rendered
+            assert "17.0/min over 15m19s (4.9/min over the last 50)" in rendered, rendered
             # The same collapse as a shape: the healthy phase fills the early
             # slices to the peak and the collapse empties the late ones, which
             # is the difference two numbers cannot show.
@@ -3564,7 +3579,7 @@ def self_check() -> None:
             # A run killed inside its opening batch: the ranks all landed
             # together, so the span is mtime granularity and every rate derived
             # from it is arithmetic on noise. Real runs here printed
-            # "6176.5/min over 0:00:00" and a "0-8700112/min" sparkline off
+            # "6176.5/min over 0s" and a "0-8700112/min" sparkline off
             # exactly this shape, which discredits the honest numbers beside
             # them. Neither line is printed rather than printed wrong.
             batch = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260101T040000Z"
@@ -3675,7 +3690,7 @@ def self_check() -> None:
             assert abs(float(healed["downtime_seconds"]) - 20) < 0.1, healed
             assert abs(float(healed["span_seconds"]) - 9) < 0.1, healed
             assert abs(float(healed["evals_per_minute"]) - 11 * 60 / 9) < 1, healed
-            assert (f" + {format_hms(float(healed['downtime_seconds']))} stopped"
+            assert (f" + {format_elapsed(float(healed['downtime_seconds']))} stopped"
                     in io_capture(healed)), io_capture(healed)
             # A `./ri resume` writes the same stamp to the same file with
             # "resumed" in place of "exit", so the downtime accounting is
@@ -3739,7 +3754,7 @@ def self_check() -> None:
             assert exposed["completed_by_checkpoint"] == 5, exposed
             assert exposed["at_risk"] == 6, exposed
             assert abs(float(exposed["at_risk_seconds"]) - 14) < 0.1, exposed
-            assert ("at risk   6 evaluations scored since that checkpoint, 0:00:14 of "
+            assert ("at risk   6 evaluations scored since that checkpoint, 14s of "
                     "imaging a restart would redo" in io_capture(exposed)), io_capture(exposed)
             # Without the restart the same window is the full 35s.
             (risky / "restarts.log").unlink()

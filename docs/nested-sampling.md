@@ -46,7 +46,7 @@ the rate so far (`scripts/lib/progress-bar.sh`). With `--max-ndead <= 0` (run
 until the evidence tolerance is met, no fixed cap) there is no dead-point cap
 to measure a percent against, so `_ns_evidence_total` estimates one from the
 run's own evidence, and every figure derived from it is marked `~`:
-`~ 53%  ~241/~452 dead points ... eta ~4:35:00`.
+`~ 53%  ~241/~452 dead points ... eta ~4h35m`.
 
 PolyChord rewrites `chains/` only every `nlive` dead points, so the dead-point
 count is frozen between writes by construction - two hours at a time on a
@@ -351,13 +351,13 @@ have while one is still going:
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 113 dead points as of 0:08:18 ago, next at 163+
-  at risk   184 evaluations scored since that checkpoint, 0:08:18 of imaging a restart would redo
+  stage     sampling, 113 dead points as of 8m18s ago, next at 163+
+  at risk   184 evaluations scored since that checkpoint, 8m18s of imaging a restart would redo
   progress  1287 evaluations, 15 in flight
-  activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
-  history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
+  activity  last evaluation 2s ago, 27.3/min over 47m06s
+  history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 7m29s slice
   imaging   25.4s per evaluation, ranks 66% busy  (last 50: 12.3s, 6% busy)
-  occupancy ▇▆▆▇▇▂▆▆▇▆▆▆▇▆█▆▇▂▁▆  6%-88% of 16 ranks busy per 0:07:29 slice
+  occupancy ▇▆▆▇▇▂▆▆▇▆▆▆▇▆█▆▇▂▁▆  6%-88% of 16 ranks busy per 7m29s slice
   sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
   forecast  ~26% done, ~120 of ~454 dead points, ~2h11m left (~14:37)
   ranks     16 ranks of 16, 7 busy-waiting
@@ -487,7 +487,7 @@ What each line is reading, and why it is worth a line:
   overdue, and on the live 16-rank R2D2 search here that reading was wrong for
   hours at a stretch.
 - **at risk** - what standing behind that checkpoint would cost, which is the
-  half of `0:08:18 ago` a reader cannot work out alone: the evaluations scored
+  half of `8m18s ago` a reader cannot work out alone: the evaluations scored
   since the checkpoint, and the imaging time they took. A restart or a
   `./ri resume` picks the sampler up at the checkpoint's dead points and images
   its way back over different proposals, so none of that work is reused.
@@ -536,11 +536,11 @@ What each line is reading, and why it is worth a line:
   run was *running*, not over its age. Downtime - the gap around a self-healed
   restart or a `./ri resume`, identified from `restarts.log` exactly as
   **stalls** already identified it - comes out of the span, and the activity
-  line names what it took out: `213.6/min over 0:00:17 + 4:16:10 stopped`. Wall
+  line names what it took out: `213.6/min over 17s + 4h16m stopped`. Wall
   clock was the wrong denominator for precisely the runs this project's
   self-healing produces. A resumed WSClean run here did its 64 evaluations in
   17 seconds of work either side of a 4h16m stop, and the report called that
-  `0.2/min over 4:16:28`, put its occupancy at 0% of 1 rank, warned that 100%
+  `0.2/min over 4h16m`, put its occupancy at 0% of 1 rank, warned that 100%
   of its wall clock was lost to gaps, and would have forecast the remainder off
   that rate had it not already finished. **history** and **occupancy** are the
   exception and stay on wall clock, because the stop is a real feature of the
@@ -551,7 +551,7 @@ What each line is reading, and why it is worth a line:
   under a second apart: parallel ranks land their opening batch together, so a
   run killed inside it has a span that measures mtime granularity rather than
   throughput, and dividing by it printed things like `6176.5/min over
-  0:00:00`. The same floor silences **history**, twenty times over.
+  0s`. The same floor silences **history**, twenty times over.
 
   Both rates are medians of the gaps between evaluations, not counts in a
   window, and that is deliberate: the most recent window is always partial, so
@@ -676,7 +676,7 @@ What each line is reading, and why it is worth a line:
   its own estimate says so instead:
 
   ```
-  forecast  past its ~452 dead-point estimate, set by the checkpoint 3:37:38 ago and revised by the next one
+  forecast  past its ~452 dead-point estimate, set by the checkpoint 3h37m ago and revised by the next one
   ```
 
   An explicit `--max-ndead` is different and keeps the ordinary words: it is a
@@ -880,7 +880,7 @@ What each line is reading, and why it is worth a line:
   `NS_RETRY_RESET_SECONDS` (1800) before dying hands the budget back, and a
   `./ri resume` starts a fresh loop at zero - so a run whose current attempt
   has already cleared that window reads `; 2 of 2 left, the budget handed back
-  by an attempt that has run over 0:30:00` however many restarts are in the
+  by an attempt that has run over 30m00s` however many restarts are in the
   file. Silent when `run.env` does not record `NS_RETRIES`, and withheld from a
   finished or stopped run, where "0 left" would read as the reason it stopped
   when the reason is in its `run.log`. The first attempt's start is taken as
