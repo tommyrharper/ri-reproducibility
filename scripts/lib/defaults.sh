@@ -56,6 +56,26 @@ fi
 eval "${_ri_defaults}"
 unset _ri_defaults
 
+# The PolyChord seed is deliberately not in defaults.toml either, and for the
+# same reason: it is a property of the run, not of the project. A committed
+# value makes every search - here, on the next host, and on the tenth rerun -
+# walk the same points in the same order, so the second search costs a day and
+# discovers what the first one already did. Randomised per run instead.
+#
+# Still overridable, which is what repeating one run exactly needs, and only
+# ever generated when NS_SEED is unset or empty - so `./ri search --seed 41`
+# and `./ri resume` (which exports run.env's NS_SEED before this is sourced)
+# both keep the seed they were given. The value a run actually used is in its
+# run.env and summary.json.
+#
+# Bash's own RANDOM rather than /dev/urandom: two 15-bit draws are a big
+# enough space for this, and it costs no subprocess. Positive and below 2^30,
+# because PolyChord treats a seed <= 0 as "seed from the clock" and the
+# per-evaluation noise seeds derived from it (stable_seed, common.py) are
+# taken modulo 2^31-1.
+: "${NS_SEED:=$(((RANDOM << 15 | RANDOM) + 1))}"
+export NS_SEED
+
 # The Docker platform is deliberately not in defaults.toml: it is a property
 # of the host, not of the project, so any committed value is wrong on half
 # the machines this repo runs on. Derived from the host architecture here and

@@ -318,7 +318,7 @@ def build_parser():
                         help="exploration per replacement live point [NS_NUM_REPEATS]")
     search.add_argument("--max-ndead", type=int,
                         help="dead-point budget, terminates the run [NS_MAX_NDEAD]")
-    search.add_argument("--seed", type=int, help="PolyChord seed [NS_SEED]")
+    search.add_argument("--seed", type=int, help="PolyChord seed, random per run [NS_SEED]")
     search.add_argument("--metric",
                         help="objective to maximise: badness, a bare metric name such "
                              "as total_rms_jy or sigma_res, or an arithmetic expression "
