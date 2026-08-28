@@ -195,6 +195,11 @@ HISTORY_EMPTY = "\u00b7"
 STALL_GAP_FACTOR = 10.0
 MIN_STALL_GAP_SECONDS = 2.0
 
+# Resolution of a restarts.log stamp: progress-bar.sh writes it with `date -u
+# +%Y-%m-%dT%H:%M:%SZ`, so it is truncated to whole seconds and names an
+# instant up to a second later than it reads.
+RESTART_STAMP_SECONDS = 1.0
+
 # rank-budget.sh's NS_RANK_BUDGET_HEADROOM_MB. Reported, not enforced: it is
 # the line under which the next run will refuse to size itself.
 HEADROOM_MB = 4096
@@ -593,9 +598,17 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # cause. Measured on a self-healed wsclean run whose only gap over the
     # threshold was its own 12s restart: "13% of wall clock lost to gaps over
     # 2s", which reads as the MeqTrees deadlock this number exists to size.
+    #
+    # The window opens a second early because the stamp is whole seconds while
+    # the mtimes it is compared against are fractional, and the crash lands in
+    # the same second as the last evaluation that survived it - so the stamp
+    # routinely reads a fraction of a second *before* the gap it explains.
+    # Measured on the self-healed wsclean run above: gap start ...45.09,
+    # restart stamp ...45, no overlap, warning fired anyway.
     downtime = restart_times(run_dir)
     stalls = [gap for start, gap in zip(times, gaps)
-              if gap > threshold and not any(start <= t <= start + gap for t in downtime)]
+              if gap > threshold
+              and not any(start - RESTART_STAMP_SECONDS <= t <= start + gap for t in downtime)]
     span = times[-1] - times[0] if len(times) > 1 else 0.0
 
     # How the run is going now against how it has gone, as a ratio of median
@@ -2396,21 +2409,40 @@ def self_check() -> None:
             # says so. Written in UTC as progress-bar.sh writes it, so reading
             # it as local time here would miss the gap on any host east or
             # west of Greenwich.
-            def _restart_at(when: float) -> None:
+            def _restart_at(run: Path, when: float) -> None:
                 stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
-                (stalled / "restarts.log").write_text(
+                (run / "restarts.log").write_text(
                     f"{stamp} exit 137 after 25 dead points\n")
 
-            _restart_at(now - 20)
+            _restart_at(stalled, now - 20)
             healed = describe(stalled, [], DEFAULT_STALE_SECONDS)
             assert healed["stall_count"] == 0, healed
             assert healed["stall_seconds"] == 0, healed
             assert not any("of wall clock lost" in w for w in healed["warnings"]), healed
             # And a restart outside the gap excuses nothing - otherwise any
             # restarts.log at all would silence the check for the rest of the run.
-            _restart_at(now - 5)
+            _restart_at(stalled, now - 5)
             assert describe(stalled, [], DEFAULT_STALE_SECONDS)["stall_count"] == 1
             (stalled / "restarts.log").unlink()
+
+            # The stamp is whole seconds and an evaluation mtime is not, and a
+            # crash lands in the same second as the last evaluation that
+            # survived it - so the stamp routinely reads just *before* the gap
+            # it explains. Observed on a real self-healed wsclean run: gap
+            # start ...45.09 against a ...45 stamp, missed by 90ms, and the
+            # run was warned about for having healed itself.
+            edge = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260103T003000Z"
+            (edge / "chains").mkdir(parents=True)
+            whole = float(int(now)) - 60      # an exact second, as a stamp is
+            for i in range(10):               # a second apart, so threshold 10s
+                write_eval(edge, i + 1, whole - 10 + i + 0.09)
+            write_eval(edge, 11, whole + 19)  # ...and then a 20s hole
+            _restart_at(edge, whole - 1)      # the truncation of whole - 1 + 0.09
+            assert describe(edge, [], DEFAULT_STALE_SECONDS)["stall_count"] == 0
+            # Only the truncation is forgiven: a restart a whole second before
+            # the gap opened is a different event and excuses nothing.
+            _restart_at(edge, whole - 3)
+            assert describe(edge, [], DEFAULT_STALE_SECONDS)["stall_count"] == 1
 
             # The same shape at WSClean's own pace - 30 evaluations a second -
             # must not turn ordinary jitter into stalls, which is what the

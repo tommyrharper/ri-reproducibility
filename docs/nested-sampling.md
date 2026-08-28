@@ -670,7 +670,12 @@ What each line is reading, and why it is worth a line:
   the run was not running, the reason is known, and it is already on the
   `restarts` line. A self-healed WSClean run whose only gap over the threshold
   was its own 12s restart used to report "13% of wall clock lost", which reads
-  as the deadlock this number exists to size.
+  as the deadlock this number exists to size. That window opens a second before
+  the gap, because `restarts.log` stamps whole seconds while evaluation mtimes
+  are fractional and the crash lands in the same second as the last evaluation
+  that survived it - so the stamp reads just *before* the gap it explains, and
+  a self-healed run was warned about for having healed itself (gap start
+  `...45.09` against a `...45` stamp, missed by 90ms).
 - **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
   keeps, free disk on the filesystem holding `results/` (nothing reserves it,
   so this is the denominator the per-run projection above divides), and
