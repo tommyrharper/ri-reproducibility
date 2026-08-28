@@ -73,6 +73,7 @@ can gate a script.
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import math
 import os
@@ -436,7 +437,15 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     threshold = MIN_STALL_GAP_SECONDS
     if gaps:
         threshold = max(threshold, STALL_GAP_FACTOR * statistics.median(gaps))
-    stalls = [g for g in gaps if g > threshold]
+    # A restart's downtime is not a stall. The run was not running, the reason
+    # is known, and it is already on the `restarts` line - counting it here
+    # warned twice about one event and pointed the second warning at the wrong
+    # cause. Measured on a self-healed wsclean run whose only gap over the
+    # threshold was its own 12s restart: "13% of wall clock lost to gaps over
+    # 2s", which reads as the MeqTrees deadlock this number exists to size.
+    downtime = restart_times(run_dir)
+    stalls = [gap for start, gap in zip(times, gaps)
+              if gap > threshold and not any(start <= t <= start + gap for t in downtime)]
     span = times[-1] - times[0] if len(times) > 1 else 0.0
 
     # How the run is going now against how it has gone, as a ratio of median
@@ -517,6 +526,23 @@ def restarts(run_dir: Path) -> list[str]:
                 if line.strip()]
     except OSError:
         return []
+
+
+def restart_times(run_dir: Path) -> list[float]:
+    """Epoch seconds of each restart, for the gap accounting to skip over.
+
+    progress-bar.sh writes the line with `date -u`, so the stamp is UTC and
+    has to be read as such - read as local time it would land hours away from
+    the evaluation mtimes it is compared against and match no gap at all.
+    """
+    stamps = []
+    for line in restarts(run_dir):
+        try:
+            when = time.strptime(line.split()[0], "%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, IndexError):
+            continue
+        stamps.append(calendar.timegm(when))
+    return stamps
 
 
 def log_tail(run_dir: Path) -> dict[str, object] | None:
@@ -1733,6 +1759,27 @@ def self_check() -> None:
             assert abs(float(report["stall_fraction"]) - 20 / 29) < 0.01, report
             assert report["meqserver_wedges"] == 1, report
             assert any("of wall clock lost" in w for w in report["warnings"]), report
+
+            # The same hole, now explained: a restart landing inside it means
+            # the run was down, not stalled, and the `restarts` line already
+            # says so. Written in UTC as progress-bar.sh writes it, so reading
+            # it as local time here would miss the gap on any host east or
+            # west of Greenwich.
+            def _restart_at(when: float) -> None:
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+                (stalled / "restarts.log").write_text(
+                    f"{stamp} exit 137 after 25 dead points\n")
+
+            _restart_at(now - 20)
+            healed = describe(stalled, [], DEFAULT_STALE_SECONDS)
+            assert healed["stall_count"] == 0, healed
+            assert healed["stall_seconds"] == 0, healed
+            assert not any("of wall clock lost" in w for w in healed["warnings"]), healed
+            # And a restart outside the gap excuses nothing - otherwise any
+            # restarts.log at all would silence the check for the rest of the run.
+            _restart_at(now - 5)
+            assert describe(stalled, [], DEFAULT_STALE_SECONDS)["stall_count"] == 1
+            (stalled / "restarts.log").unlink()
 
             # The same shape at WSClean's own pace - 30 evaluations a second -
             # must not turn ordinary jitter into stalls, which is what the

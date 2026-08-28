@@ -520,7 +520,11 @@ What each line is reading, and why it is worth a line:
   and never less than 2s. Relative because WSClean lands 30-50 evaluations a
   second and R2D2 roughly one every two, so no fixed threshold suits both.
   Before the watchdogs above, the MeqTrees deadlock cost 23-27% of wall clock
-  here; after them, 0.
+  here; after them, 0. A gap containing one of the restarts below is skipped -
+  the run was not running, the reason is known, and it is already on the
+  `restarts` line. A self-healed WSClean run whose only gap over the threshold
+  was its own 12s restart used to report "13% of wall clock lost", which reads
+  as the deadlock this number exists to size.
 - **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
   keeps, free disk on the filesystem holding `results/` (nothing reserves it,
   so this is the denominator the per-run projection above divides), and
