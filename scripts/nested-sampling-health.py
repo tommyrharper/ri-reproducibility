@@ -658,10 +658,11 @@ def render(run: dict[str, object]) -> None:
     # something to compare against rather than a number that looks stuck.
     #
     # "past", because nlive is the cadence PolyChord checkpoints on and not the
-    # size of the jump: three consecutive writes on one nlive=50 run moved the
-    # count by 57, 56 and 60. Stated as a floor rather than fitted to those
-    # three, which would be the same over-reading of a short series that this
-    # whole line exists to prevent.
+    # size of the jump: four consecutive writes on one nlive=50 run moved the
+    # count by 57, 56, 60 and 57. Stated as a floor rather than fitted to those
+    # - the interval between those same writes varied by 2x over the same
+    # series, so anything tighter than a bound invites the over-reading of a
+    # short series that this whole line exists to prevent.
     next_update = ""
     if settings.get("NS_NLIVE", "").isdigit() and run["checkpoint_age_seconds"] is not None:
         next_update = f", next past ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"

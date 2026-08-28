@@ -351,12 +351,16 @@ What each line is reading, and why it is worth a line:
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
   stops a reader doing so either. An age of an hour or more is ordinary rather
-  than alarming. One 16-rank R2D2 search checkpointed at 31, 103 and 170
-  minutes: the first comes early because the run's startup counts toward it,
-  and the intervals after that settle near 70 minutes rather than growing (72
-  then 67). Its `<nlike>` did the same, 14.10 to 32.50 to 36.80 - a steep
-  first segment and then flat. So a second and third look should be broadly
-  comparable, and one longer than the last is not by itself a sign of
+  than alarming, and it varies a lot. One 16-rank R2D2 search checkpointed at
+  31, 103, 170 and 305 minutes - intervals of 31, 72, 67 and 134. The first is
+  short because the run's startup counts toward it; the rest are not a
+  property of PolyChord to be extrapolated from, because the interval is a
+  *consequence* of two things that both move: how fast evaluations are
+  landing, and how many of them each dead point costs. On that run both moved
+  at once between the third and fourth checkpoints - throughput fell about 30%
+  while the likelihood calls per dead point rose 43% (29.0, 30.7, then 43.8) -
+  and neither alone explains the doubling. So consecutive intervals can differ
+  by 2x with nothing wrong, and a longer one is not by itself a sign of
   anything.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
