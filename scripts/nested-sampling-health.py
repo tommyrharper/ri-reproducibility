@@ -1612,22 +1612,35 @@ def run_directories() -> list[Path]:
                   key=started_at, reverse=True)
 
 
-def resolve(name: str | None,
-            processes: list[dict[str, object]] | None = None) -> Path:
-    """A run directory from a path, a bare run name, or nothing at all.
+def default_directories(processes: list[dict[str, object]] | None = None) -> list[Path]:
+    """Every run that still has ranks, newest first - or the newest run.
 
-    With nothing at all, the newest run that still has ranks - not simply the
-    newest run. This report's question is about a search that is going, and the
-    newest run stops being that one the moment a short test lands after a
-    multi-hour search: the test finishes in minutes, the search does not, and
-    "the newest run" then names the only one of the two nobody is asking about.
-    Falls back to the newest on a host with nothing running, which is every
-    host most of the time.
+    Runs rather than the newest run: this report's question is about a search
+    that is going, and the newest run stops being that one the moment a short
+    test lands after a multi-hour search - the test finishes in minutes, the
+    search does not, and "the newest run" then names the only one of the two
+    nobody is asking about. Falls back to the newest on a host with nothing
+    running, which is every host most of the time.
+
+    All of them rather than the newest live one, because memory is what caps a
+    run here and this host is shared: a second search is the usual reason the
+    one being asked about is slow, and hiding it leaves the report explaining a
+    squeezed run with numbers whose cause is off the page.
 
     Ranks rather than every process carrying the run directory: a killed run's
     sidecar workers outlive it until the next run reaps them, and they are not
     a run still going.
     """
+    runs = run_directories()
+    if not runs:
+        raise SystemExit(f"No runs under {NESTED_SAMPLING_DIR}/.")
+    live = [run for run in runs if rank_processes(run, processes or [])]
+    return live or runs[:1]
+
+
+def resolve(name: str | None,
+            processes: list[dict[str, object]] | None = None) -> Path:
+    """A run directory from a path or a bare run name."""
     if name:
         candidate = Path(name)
         if not candidate.is_dir():
@@ -1635,21 +1648,15 @@ def resolve(name: str | None,
         if not candidate.is_dir():
             raise SystemExit(f"No such run: {name}")
         return candidate
-    runs = run_directories()
-    if not runs:
-        raise SystemExit(f"No runs under {NESTED_SAMPLING_DIR}/.")
-    for run in runs:
-        if rank_processes(run, processes or []):
-            return run
-    return runs[0]
+    return default_directories(processes)[0]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run", nargs="?", metavar="RUN",
-                        help="run directory or its name (default: the newest "
-                             "run that is still running, else the newest run)")
+                        help="run directory or its name (default: every run "
+                             "that is still running, else the newest run)")
     parser.add_argument("--all", action="store_true", help="every run on disk")
     parser.add_argument("--stale-seconds", type=float, default=DEFAULT_STALE_SECONDS,
                         help="a live run silent for this long is stalled "
@@ -1661,7 +1668,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--all takes no run argument")
 
     processes = process_table()
-    directories = run_directories() if args.all else [resolve(args.run, processes)]
+    if args.all:
+        directories = run_directories()
+    elif args.run:
+        directories = [resolve(args.run, processes)]
+    else:
+        directories = default_directories(processes)
     # One sample interval for every run being reported, not one each: only a
     # run with live processes is sampled at all, and there is rarely more than
     # one. A report over finished runs costs nothing. Everything the run owns
@@ -2556,6 +2568,14 @@ def self_check() -> None:
             also_live = [dict(ranks[0], pid=777,
                               args=f"python3 polychord_r2d2.py --output-dir {newest.resolve()}")]
             assert resolve(None, ranks + also_live).name == newest.name
+            # ...and both are reported by default, newest first, rather than
+            # only that one: memory is what caps a run here and the host block
+            # under them is shared, so a report showing one of two live
+            # searches explains a squeezed run with its cause off the page.
+            assert [d.name for d in default_directories(ranks + also_live)] == \
+                [newest.name, live.name], default_directories(ranks + also_live)
+            # With nothing running it is still exactly one run, not all of them.
+            assert [d.name for d in default_directories(processes)] == [newest.name]
             # An explicit run still wins over both.
             assert resolve(fast.name, ranks).name == fast.name
             newest.rmdir()
@@ -2586,6 +2606,18 @@ def self_check() -> None:
                 with contextlib.redirect_stdout(sink):
                     main([])
                 assert sink.getvalue().startswith(live.name), sink.getvalue()
+                # Two live runs and the report has two blocks, newest first,
+                # over the one host block they are sharing.
+                second = [dict(ranks[0], pid=778,
+                               args="python3 polychord_wsclean.py "
+                                    f"--output-dir {fast.resolve()}")]
+                process_table = lambda: ranks + second  # noqa: E731
+                sink = io.StringIO()
+                with contextlib.redirect_stdout(sink):
+                    main([])
+                headlines = [line.split()[0] for line in sink.getvalue().splitlines()
+                             if line and not line[0].isspace()]
+                assert headlines == [fast.name, live.name, "host"], sink.getvalue()
             finally:
                 sidecar_containers = original
                 meminfo_mb = original_memory

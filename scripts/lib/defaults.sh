@@ -80,10 +80,6 @@ export DOCKER_DEFAULT_PLATFORM
 # shellcheck disable=SC2034  # read by the sourcing script
 PLATFORM="${DOCKER_DEFAULT_PLATFORM}"
 
-# Generated per run rather than configured, so it stays here and not in
-# defaults.toml.
-: "${RUN_ID:=$(date -u +%Y%m%dT%H%M%SZ)}"
-
 # Host path of the Docker socket, for the containers that drive other
 # containers. Rootless Docker listens on $XDG_RUNTIME_DIR/docker.sock, not
 # /var/run/docker.sock, and a bind mount needs the real host path; DOCKER_HOST

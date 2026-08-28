@@ -410,8 +410,8 @@ def build_parser():
         ),
     )
     health.add_argument("run", nargs="?", metavar="RUN",
-                        help="run directory or its name (default: the newest "
-                             "run that is still running, else the newest run)")
+                        help="run directory or its name (default: every run "
+                             "that is still running, else the newest run)")
     health.add_argument("--all", action="store_true", help="every run on disk")
     health.add_argument("--stale-seconds", type=float, metavar="SECONDS",
                         help="a live run silent for this long is stalled (default: 600)")

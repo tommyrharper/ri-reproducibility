@@ -96,6 +96,14 @@ Outputs:
 results/nested-sampling/wsclean-vlaa-<UTC timestamp>/
 ```
 
+The timestamp is claimed with a bare `mkdir`, not assumed: two searches started
+in the same second - two sessions sharing this host, or one script launching a
+pair - would otherwise resolve to the same directory and write each other's
+evaluations, FIFOs and `summary.json`, with the first to finish deleting the
+FIFO directory the other was reading. The loser of the race waits for the next
+second rather than decorating its name, so a run directory always ends in a
+stamp. An `--output-dir` you name yourself is yours and may already exist.
+
 Useful overrides:
 
 ```bash
@@ -347,10 +355,14 @@ host
   sidecars  3 running, 0 leaked
 ```
 
-With no argument it reports on the newest run that still has ranks, falling
-back to the newest run when nothing is going: a five-minute test started after
-a ten-hour search would otherwise be "the newest run" and hide the only one of
-the two worth asking about. `--all` covers every run on disk and `--json` is
+With no argument it reports on every run that still has ranks, falling back to
+the newest run when nothing is going. Runs rather than the newest run because a
+five-minute test started after a ten-hour search would otherwise be "the newest
+run" and hide the only one of the two worth asking about; all of them rather
+than the newest live one because memory is what caps a run here and this host is
+shared - a second search is the usual reason the first is slow, and reporting
+one of the two explains a squeezed run with its cause off the page. `--all`
+covers every run on disk and `--json` is
 the machine-readable form. It reads files and runs one `ps` and one `docker
 ps`, plus a one second CPU sample when a run has live ranks - nothing is
 started and nothing is imaged, so a run in progress does not notice it. Exit

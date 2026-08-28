@@ -222,7 +222,7 @@ and the report, which globs for `summary.json`, will not show it at all.
 ## Is the run that is going still worth going?
 
 ```bash
-./ri health                # the newest run, plus host memory and leaked sidecars
+./ri health                # every live run, plus host memory and leaked sidecars
 ./ri health <run>
 ./ri health --all
 ```
