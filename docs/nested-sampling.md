@@ -1174,12 +1174,12 @@ up as its own card automatically. Evidence prefers a `log_z` /
 `log_z_err` pair already in the summary (written for merged runs); otherwise
 it parses PolyChord `chains/*.stats` for log(Z). It shows
 each run's total wall-clock duration (from `total_wall_seconds`, when present)
-top-right in the card header. Per-run images - the shared synthesized
+top-right in the card header. The run page itself carries only the
+best-effort `anesthetic` KDE contour corner plot, so it loads without
+decoding one raster per evaluation; per-run images - the shared synthesized
 ground-truth image and a per-evaluation card gallery (reconstruction,
-objective, and searched parameters) - sit in an Images tab, and the
-best-effort `anesthetic` KDE contour corner plot sits in a Likelihood tab, both inside
-one collapsed-by-default details block, separate from the collapsed raw
-metrics table. Corner plots are weighted by the raw log-likelihood (the
+objective, and searched parameters) - live on their own
+`<run>-images.html` page, linked from the run page and written alongside it. Corner plots are weighted by the raw log-likelihood (the
 failure score), not by nested-sampling posterior mass. Runs are ordered newest-first by the UTC timestamp in the
 run directory name.
 
