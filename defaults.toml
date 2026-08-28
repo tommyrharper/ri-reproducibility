@@ -25,6 +25,11 @@ POLYCHORD_IMAGE = "ri-reproducibility/polychord:lite"
 # from `uname -m` in scripts/lib/defaults.sh. Export it to override.
 
 CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
+# The checkpoint set the R2D2 imager loads, as a directory under
+# CHECKPOINTS_DIR on the host and under /checkpoints in the container.
+# A name rather than a path, because the two sides disagree about the
+# path and only ever agree about this.
+R2D2_CKPT_NAME = "R2D2_A1"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
 # PolyChord sampler settings for the nested-sampling runs.

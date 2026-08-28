@@ -57,6 +57,7 @@ fi
 
 # shellcheck source=scripts/lib/run-config.sh
 . "${REPO_ROOT}/scripts/lib/run-config.sh"
+ns_refuse_missing_checkpoints "${CHECKPOINTS_DIR}" "${R2D2_CKPT_NAME}"
 # Claimed here rather than named at the top of the script, so a run refused by
 # the memory guard above leaves no empty directory for `./ri runs` and the
 # health report to puzzle over. An OUTPUT_DIR given on the command line is the

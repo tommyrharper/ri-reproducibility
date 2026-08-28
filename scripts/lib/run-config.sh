@@ -117,6 +117,46 @@ ns_refuse_live_run() {
 #
 #   ns_refuse_unmounted_run <output-dir>
 
+# A missing checkpoint set is the one input whose absence the search cannot
+# report. R2D2 exits non-zero without it, which common.py scores as
+# FAILURE_OBJECTIVE (100.0) - and PolyChord maximizes, against a real
+# total_rms_jy of ~0.008, so every evaluation becomes the best point the search
+# has ever seen. Measured: an 8-rank run in a fresh worktree scored 55 of 55
+# that way and terminated at logZ = 99.93, a triumphant-looking number for a
+# search that imaged nothing. `./ri health` names it afterwards; this is the
+# same fault caught in 0.01s instead of after the run.
+#
+# Checked in front of the run directory being claimed, like the memory guard,
+# so a refused run leaves nothing for `./ri runs` to puzzle over. Only that
+# some checkpoint is there - which realisations the run needs is the imager's
+# business, and it says so itself once it can start.
+#
+#   ns_refuse_missing_checkpoints <checkpoints-dir> <set-name>
+
+ns_refuse_missing_checkpoints() {
+  local dir="$1/$2" candidate found=''
+  if [ -d "${dir}" ]; then
+    for candidate in "${dir}"/*.ckpt; do
+      if [ -e "${candidate}" ]; then
+        found=1
+        break
+      fi
+    done
+  fi
+  if [ -n "${found}" ]; then
+    return 0
+  fi
+  echo "FATAL: no R2D2 checkpoints in ${dir}" >&2
+  echo "       Without them every evaluation fails, and a failed evaluation scores" >&2
+  echo "       FAILURE_OBJECTIVE, which PolyChord maximizes - so the search would not" >&2
+  echo "       stop, it would report the broken imager as its best discovery." >&2
+  echo "       Get them with:  ./ri fetch-checkpoints" >&2
+  echo "       Extract so that ${dir}/R2D2_UNet_N<k>.ckpt exists." >&2
+  echo "       Set CHECKPOINTS_DIR to look somewhere else - a worktree does not" >&2
+  echo "       share the checkpoints of the checkout it was made from." >&2
+  exit 1
+}
+
 ns_refuse_unmounted_run() {
   case "$1/" in
     "${REPO_ROOT}/"*) return 0 ;;
@@ -245,6 +285,34 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   ( ns_refuse_unmounted_run "${_outside}" 2>/dev/null ) && :
   [ -d "${_outside}/evaluations" ] ||
     { echo "FAIL: a refused directory with contents must be left alone"; exit 1; }
+
+  # A missing checkpoint set is refused before the run starts, because the
+  # search cannot report its own absence: every evaluation would score
+  # FAILURE_OBJECTIVE, which PolyChord maximizes.
+  _ckpts="${_dir}/checkpoints"
+  mkdir -p "${_ckpts}/R2D2_A1"
+  if _out="$( ns_refuse_missing_checkpoints "${_ckpts}" R2D2_A1 2>&1 )"; then
+    echo "FAIL: an empty checkpoint directory must be refused, got: ${_out}"; exit 1
+  fi
+  case "${_out}" in
+    *"no R2D2 checkpoints"*"fetch-checkpoints"*"CHECKPOINTS_DIR"*) ;;
+    *) echo "FAIL: the refusal must say how to fix it, got: ${_out}"; exit 1 ;;
+  esac
+  # A directory that is not there at all is the worktree case, and reads the same.
+  if _out="$( ns_refuse_missing_checkpoints "${_ckpts}" R2D2_MISSING 2>&1 )"; then
+    echo "FAIL: a missing checkpoint directory must be refused, got: ${_out}"; exit 1
+  fi
+  # ...and one checkpoint is enough: which realisations the run needs is the
+  # imager's business, and it says so itself once it can start.
+  touch "${_ckpts}/R2D2_A1/R2D2_UNet_N1.ckpt"
+  ( ns_refuse_missing_checkpoints "${_ckpts}" R2D2_A1 ) ||
+    { echo "FAIL: a populated checkpoint directory must be allowed"; exit 1; }
+  # The name is a name, not a path: the same set under a different
+  # CHECKPOINTS_DIR is found, which is what makes a worktree fixable.
+  mkdir -p "${_dir}/elsewhere/R2D2_A1"
+  touch "${_dir}/elsewhere/R2D2_A1/R2D2_UNet_N1.ckpt"
+  ( ns_refuse_missing_checkpoints "${_dir}/elsewhere" R2D2_A1 ) ||
+    { echo "FAIL: CHECKPOINTS_DIR must be what decides where to look"; exit 1; }
 
   rm -rf "${_dir}"
   echo "run-config self-check passed"

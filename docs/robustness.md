@@ -30,6 +30,39 @@ is no honest value: scoring it high makes the sampler chase the OOM killer, and
 scoring it low carves a hole out of exactly the corner where the real failure
 modes live.
 
+## A missing R2D2 checkpoint set
+
+The one input whose absence the search cannot report. R2D2 exits non-zero
+without its pretrained checkpoints, which is scored `FAILURE_OBJECTIVE` - so
+the run does not stop, it reports the broken imager as its best discovery.
+Measured: an 8-rank search in a fresh worktree scored 55 of 55 that way and
+terminated at `logZ = 99.93`, a triumphant-looking number for a search that
+imaged nothing.
+
+`ns_refuse_missing_checkpoints` checks for them before the run directory is
+claimed, so this now costs 0.4s and an explanation instead of a run:
+
+```console
+$ ./ri search r2d2
+FATAL: no R2D2 checkpoints in /.../checkpoints/R2D2_A1
+       Without them every evaluation fails, and a failed evaluation scores
+       FAILURE_OBJECTIVE, which PolyChord maximizes - so the search would not
+       stop, it would report the broken imager as its best discovery.
+       Get them with:  ./ri fetch-checkpoints
+       Extract so that /.../checkpoints/R2D2_A1/R2D2_UNet_N<k>.ckpt exists.
+       Set CHECKPOINTS_DIR to look somewhere else - a worktree does not
+       share the checkpoints of the checkout it was made from.
+```
+
+`checkpoints/*` is gitignored, so a worktree starts without them and this is
+the case it is most likely to catch. `CHECKPOINTS_DIR` is where to look and
+`R2D2_CKPT_NAME` is which set - both from `defaults.toml`, both overridable,
+and the same two the imager itself is given, so the check and the run cannot
+look in different places. Only that *some* checkpoint is there: which
+realisations a run needs is the imager's business, and it says so itself once
+it can start. `./ri health` still names the fault after the fact for a run that
+started before the checkpoints went away.
+
 ## When MeqTrees stops answering
 
 MeqTrees deadlocks with its `meqserver` roughly once every 2,000 to 5,000

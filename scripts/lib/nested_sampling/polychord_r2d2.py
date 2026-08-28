@@ -65,6 +65,14 @@ DEFAULT_R2D2_NUM_CHANS = 64
 DEFAULT_R2D2_ARCHITECTURE = "unet"
 DEFAULT_R2D2_CKPT_REALISATIONS = 1
 
+# The checkpoint set, under the container's read-only /checkpoints mount. The
+# name comes from R2D2_CKPT_NAME in defaults.toml, which the run script exports
+# and `ns_refuse_missing_checkpoints` uses to check the host side before a run
+# starts - one name, so the two cannot look in different places. The mount
+# point is fixed rather than a host path so that the ckpt_path recorded in
+# every evaluation means the same thing on every machine.
+R2D2_CKPT_PATH = f"/checkpoints/{os.environ.get('R2D2_CKPT_NAME', 'R2D2_A1')}"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -103,7 +111,7 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         f"architecture: {DEFAULT_R2D2_ARCHITECTURE}",
         "prune: True",
         "sigma_res_tol: 1e-4",
-        "ckpt_path: /checkpoints/R2D2_A1",
+        f"ckpt_path: {R2D2_CKPT_PATH}",
         f"ckpt_realisations: {DEFAULT_R2D2_CKPT_REALISATIONS}",
         # R2D2's set_common_args() calls torch.set_num_threads() itself, from
         # psutil's CPU affinity, and that overrides the OMP_NUM_THREADS the
@@ -175,7 +183,7 @@ def evaluate(
         "--config",
         str(config_path),
         "--ckpt_path",
-        "/checkpoints/R2D2_A1",
+        R2D2_CKPT_PATH,
     ]
     run_result = run_r2d2_imaging(
         args.r2d2_image, args.platform, args.checkpoints_dir, r2d2_cmd, r2d2_stdout, r2d2_stderr
@@ -588,7 +596,7 @@ def main() -> None:
                 "num_chans": DEFAULT_R2D2_NUM_CHANS,
                 "architecture": DEFAULT_R2D2_ARCHITECTURE,
                 "super_resolution": DEFAULT_SUPER_RESOLUTION,
-                "ckpt_path": "/checkpoints/R2D2_A1",
+                "ckpt_path": R2D2_CKPT_PATH,
                 "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
             },
             "parameter_space": load_parameter_space(),
