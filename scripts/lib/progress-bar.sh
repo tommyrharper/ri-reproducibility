@@ -227,6 +227,25 @@ ns_run_process_pattern() {
   printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
 }
 
+# Whether a job is still driving the run in `$1`, by that same pattern. Lives
+# here, next to the pattern, because every caller has to agree on what "still
+# running" means: `./ri resume` refuses one, and so must a `./ri search
+# --output-dir` naming it - a second MPI job over the same checkpoint and the
+# same FIFO directories corrupts both, and the new job's first act is to
+# `rm -rf` the FIFOs the live ranks are reading.
+#
+# Both spellings of the path, because a run reached through a symlinked
+# directory was launched with whichever one its own caller used. The directory
+# need not exist: a `--output-dir` that is about to be created is not live.
+ns_run_is_live() {
+  local dir="$1" real
+  pgrep -f "$(ns_run_process_pattern "${dir}")" >/dev/null 2>&1 && return 0
+  [ -d "${dir}" ] || return 1
+  real="$(cd "${dir}" && pwd -P)"
+  [ "${real}" = "${dir}" ] && return 1
+  pgrep -f "$(ns_run_process_pattern "${real}")" >/dev/null 2>&1
+}
+
 # Usage: _ns_stall_watchdog <output_dir> <timeout seconds>
 #
 # The failure run_with_retries cannot see: a run that hangs instead of dying.

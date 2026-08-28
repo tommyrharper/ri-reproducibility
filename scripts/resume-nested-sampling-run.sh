@@ -15,25 +15,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-# For ns_run_process_pattern - the same command lines the stall watchdog kills
-# are the ones that make a run too alive to resume, so there is one spelling.
-# shellcheck source=scripts/lib/progress-bar.sh
-. "${REPO_ROOT}/scripts/lib/progress-bar.sh"
-
-# A run is still going if anything on the host still carries its output
-# directory on a polychord_*.py command line - the ranks themselves, and the
-# `mpirun` and `docker exec` that wrap them during startup before any rank
-# exists. Sidecar workers name their run by --fifo-dir and so are correctly not
-# counted: a killed run's workers outlive it until the next run reaps them.
-#
-# The guard belongs here rather than in each place that suggests a resume,
+# For ns_run_is_live - the same command lines the stall watchdog kills are the
+# ones that make a run too alive to resume, so there is one spelling. The guard
+# belongs in a shared file rather than in each place that suggests a resume,
 # because resuming a live run starts a second MPI job over the same checkpoint
 # and the same FIFO directories - and `./ri runs` printed exactly that command
 # for a live run, while the HTML report still can (it is a snapshot, and
 # liveness in a static page would be stale by the time anyone read it).
-ns_run_is_live() {
-  pgrep -f "$(ns_run_process_pattern "$1")" >/dev/null 2>&1
-}
+# shellcheck source=scripts/lib/progress-bar.sh
+. "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
 if [ "${1:-}" = "--self-check" ]; then
   TMP="$(mktemp -d)"
@@ -93,9 +83,7 @@ else
   exit 1
 fi
 
-# Both spellings, because a run reached through a symlinked directory was
-# launched with whichever one its own caller used.
-if ns_run_is_live "${RUN_DIR}" || ns_run_is_live "$(cd "${RUN_DIR}" && pwd -P)"; then
+if ns_run_is_live "${RUN_DIR}"; then
   echo "FATAL: ${RUN_DIR##*/} is still running, so there is nothing to resume." >&2
   echo "       A second job over the same checkpoint would corrupt both." >&2
   echo "       Watch it instead:  ./ri health ${RUN_DIR##*/}" >&2

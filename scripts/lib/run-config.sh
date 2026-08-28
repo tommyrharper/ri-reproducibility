@@ -71,6 +71,28 @@ ns_claim_run_dir() {
   return 1
 }
 
+# The other way two jobs end up in one run directory: not a stamp collision but
+# a `--output-dir` naming a run that is still going. `./ri resume` has always
+# refused that, and `./ri search` has always allowed it - measured, the second
+# search deleted the live run's FIFO directory, recreated it with its own rank
+# count, and wrote its own chains/*.resume over the live checkpoint, while the
+# first run was still imaging. `mkdir -p` cannot see any of this; only the
+# host's process list can.
+#
+# Refuses rather than claiming a different name, because a caller who named the
+# directory meant that directory - and the run they want to join is the one
+# already in it.
+#
+#   ns_refuse_live_run <output-dir>
+
+ns_refuse_live_run() {
+  ns_run_is_live "$1" || return 0
+  echo "FATAL: ${1##*/} is still running, so it is not a directory to start into." >&2
+  echo "       A second job over the same checkpoint and FIFOs would corrupt both." >&2
+  echo "       Watch it instead:  ./ri health ${1##*/}" >&2
+  exit 1
+}
+
 # `bash scripts/lib/run-config.sh --self-check` - that what is written can be
 # sourced back to the same values, including a metric that needs quoting.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
@@ -115,6 +137,37 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     "${_parent}/wsclean-vlaa-"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
     *) echo "FAIL: claimed run directory is not stamp-named: ${_second}"; exit 1 ;;
   esac
+
+  # A `--output-dir` naming a live run is refused, not started into. A real
+  # process with the real command line, rather than a faked argv: this is what
+  # pgrep has to see, spelled the way a rank spells it.
+  # shellcheck source=scripts/lib/progress-bar.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/progress-bar.sh"
+  _live="${_dir}/wsclean-vlaa-20260101T000001Z"
+  mkdir -p "${_live}"
+  # Nothing is running yet, so the guard must let the directory through - and
+  # `exit 1` inside it would take this check down with it.
+  ( ns_refuse_live_run "${_live}" ) || { echo "FAIL: nothing live, so the guard must not fire"; exit 1; }
+  printf 'import time\ntime.sleep(30)\n' > "${_dir}/polychord_wsclean.py"
+  python3 "${_dir}/polychord_wsclean.py" --output-dir "${_live}" --nlive 50 &
+  _fake=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    ns_run_is_live "${_live}" && break
+    sleep 0.2
+  done
+  ns_run_is_live "${_live}" || { echo "FAIL: a live rank on this run must be seen"; kill "${_fake}"; exit 1; }
+  # A neighbouring run whose name this one is a prefix of must not be caught.
+  ( ns_refuse_live_run "${_live%Z}" ) || { echo "FAIL: a prefix of the run directory must not match"; kill "${_fake}"; exit 1; }
+  if _out="$( ns_refuse_live_run "${_live}" 2>&1 )"; then
+    echo "FAIL: starting into a live run must be refused, got: ${_out}"; kill "${_fake}"; exit 1
+  fi
+  case "${_out}" in
+    *"still running"*) ;;
+    *) echo "FAIL: the refusal must say why, got: ${_out}"; kill "${_fake}"; exit 1 ;;
+  esac
+  kill "${_fake}" 2>/dev/null || true
+  wait "${_fake}" 2>/dev/null || true
+
   rm -rf "${_dir}"
   echo "run-config self-check passed"
 fi

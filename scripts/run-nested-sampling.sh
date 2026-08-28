@@ -44,9 +44,11 @@ fi
 # Claimed here rather than named at the top of the script, so a run refused by
 # the memory guard above leaves no empty directory for `./ri runs` and the
 # health report to puzzle over. An OUTPUT_DIR given on the command line is the
-# caller's to name and may already exist; the default one is claimed, because
-# two searches started in the same second would otherwise share it.
+# caller's to name and may already exist - but not while a job is still in it;
+# the default one is claimed, because two searches started in the same second
+# would otherwise share it.
 if [ -n "${OUTPUT_DIR:-}" ]; then
+  ns_refuse_live_run "${OUTPUT_DIR}"
   mkdir -p "${OUTPUT_DIR}"
 else
   OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" wsclean-vlaa-)"

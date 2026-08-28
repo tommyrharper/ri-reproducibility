@@ -102,7 +102,14 @@ pair - would otherwise resolve to the same directory and write each other's
 evaluations, FIFOs and `summary.json`, with the first to finish deleting the
 FIFO directory the other was reading. The loser of the race waits for the next
 second rather than decorating its name, so a run directory always ends in a
-stamp. An `--output-dir` you name yourself is yours and may already exist.
+stamp. An `--output-dir` you name yourself is yours and may already exist -
+unless a job is still in it, which is refused for the same reason
+`./ri resume` refuses a live run: measured, a second search into a live run
+directory deleted its FIFOs, recreated them with its own rank count, and
+wrote its own `chains/*.resume` over the live checkpoint while the first run
+was still imaging. Liveness is the host's process list (`ns_run_is_live` in
+`scripts/lib/progress-bar.sh`), which is the only thing `mkdir -p` cannot
+see.
 
 Useful overrides:
 
@@ -890,7 +897,8 @@ pid is the `docker exec` client, and the ranks are children of
 `containerd-shim`, not of it, so killing the client leaves the run running.
 `ns_run_process_pattern` builds the pattern, anchored on the run's own
 `--output-dir` so a search somebody else is running on the host is untouched -
-the same pattern `./ri resume` uses to refuse a run that is still going.
+the same pattern `ns_run_is_live` builds on, which is what `./ri resume` and
+`./ri search --output-dir` both use to refuse a run that is still going.
 
 **The default is 7200s, and it is deliberately far above anything legitimate.**
 `IMAGING_REPLY_TIMEOUT` in `common.py` already lets a single evaluation take an
