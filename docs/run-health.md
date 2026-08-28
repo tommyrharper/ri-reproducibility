@@ -379,10 +379,24 @@ twenty minutes broken is ~2% overall and silent. Half the window is the bar,
 which needs no tuning - across 37,000 evaluations of six real runs here the
 failure count is zero, so any sustained burst is a fault.
 
-**stalls** - gaps between evaluations more than 10x the run's own median, never
-less than 2s. Relative, because WSClean lands 30-50 evaluations a second and
-R2D2 one every two. Before the watchdogs the MeqTrees deadlock cost 23-27% of
-wall clock here; after them, 0. A gap containing a restart is skipped - the run
+**stalls** - gaps between evaluations more than 10x the run's own median gap,
+never less than 2s, and never less than 3x what one evaluation costs the
+imager. Relative, because WSClean lands 30-50 evaluations a second and R2D2 one
+every two.
+
+That last floor is the one that matters on a multi-rank run. P ranks do not
+arrive one at a time - they finish together, so the gaps are bimodal: a burst
+of near-zero gaps, then one evaluation's worth while the next batch images. The
+median sits inside the burst, so on the gap statistic alone the threshold fell
+to its 2s floor and every ordinary inter-batch gap counted. A healthy 8-rank
+R2D2 search read `86% of running time lost to gaps over 5s`, and exited 1, with
+its ranks 78% busy, zero failures and its largest gap a single 14.4s
+evaluation. A gap only means something when it is long against the work one
+evaluation does: 3 x 14.1s is 42s, and none of that run's gaps is a stall,
+while a rank that stops answering for a minute still is.
+
+Before the watchdogs the MeqTrees deadlock cost 23-27% of wall clock here;
+after them, 0. A gap containing a restart is skipped - the run
 was not running and the reason is already on the `restarts` line. That window
 opens a second before the gap, because `restarts.log` stamps whole seconds
 while evaluation mtimes are fractional. The percentage is of running time, not

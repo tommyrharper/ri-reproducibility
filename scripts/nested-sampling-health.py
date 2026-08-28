@@ -174,12 +174,32 @@ HISTORY_LEVELS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
 HISTORY_EMPTY = "\u00b7"
 
 # A gap between consecutive evaluations counts as a stall when it is this many
-# times the run's own median gap. Relative because the two imagers are two
+# times the run's own *mean* gap. Relative because the two imagers are two
 # orders of magnitude apart - WSClean lands 30-50 evaluations a second, R2D2
 # roughly one every two seconds - so any fixed number is either blind on one or
 # crying wolf on the other. Floored at MIN_STALL_GAP_SECONDS so a fast run's
 # ordinary jitter does not register either.
+#
+# The gap statistic alone is not enough, because P ranks do not arrive one at a
+# time: they finish together, so the gaps are bimodal - a burst of near-zero
+# gaps, then one the length of an evaluation while the next batch images. The
+# median sits inside the burst, which pinned the threshold to its 2s floor and
+# made every ordinary inter-batch gap a stall. Measured on a healthy 8-rank
+# R2D2 search: a 0.48s median gap put the threshold at 4.8s and called 17 of
+# its 87 gaps stalls - "86% of running time lost" - on a run whose largest gap
+# was one 14.4s evaluation and whose ranks were 78% busy.
+#
+# So the threshold is also floored at STALL_COST_FACTOR times what one
+# evaluation costs the imager, which is the length of exactly those
+# inter-batch gaps and is already measured for the `imaging` line. A gap only
+# means something when it is long against the work one evaluation does. On
+# that run: 3 x 14.1s = 42.3s, and none of its gaps is a stall. The MeqTrees
+# deadlock this line exists to size cost 23-27% of wall clock in gaps far
+# longer than that, and the mean is not used instead because on a short run a
+# single stall inflates it enough to hide itself - 11 evaluations with one 20s
+# gap put the mean threshold at 29s and caught nothing.
 STALL_GAP_FACTOR = 10.0
+STALL_COST_FACTOR = 3.0
 MIN_STALL_GAP_SECONDS = 2.0
 
 # `_ns_stall_watchdog` in scripts/lib/progress-bar.sh polls every
@@ -691,6 +711,9 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     threshold = MIN_STALL_GAP_SECONDS
     if gaps:
         threshold = max(threshold, STALL_GAP_FACTOR * statistics.median(gaps))
+    imaging_costs = [r.wall_seconds for r in records if r.wall_seconds is not None]
+    if imaging_costs:
+        threshold = max(threshold, STALL_COST_FACTOR * statistics.median(imaging_costs))
     # A restart's downtime is not a stall. The run was not running, the reason
     # is known, and it is already on the `restarts` line - counting it here
     # warned twice about one event and pointed the second warning at the wrong
@@ -3568,6 +3591,33 @@ def self_check() -> None:
             assert report["recent_failed"] is None, report
             # It died before PolyChord's main loop, which no count shows.
             assert report["stage"] == "starting up", report
+
+            # P ranks finish together, so the gaps are bimodal: bursts of
+            # near-zero, then one evaluation's worth while the next batch
+            # images. The median sits in the burst, so on the gap statistic
+            # alone the threshold was its 2s floor and every ordinary
+            # inter-batch gap was a stall - a real healthy 8-rank R2D2 search
+            # read "86% of running time lost" with its ranks 78% busy. The
+            # cost floor is what stops that, so this is the shape of that run:
+            # 11 batches of 8, 14s apart, each batch landing in 40ms.
+            batched = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T015000Z"
+            (batched / "chains").mkdir(parents=True)
+            for batch in range(11):
+                for rank in range(8):
+                    write_eval(batched, batch * 8 + rank + 1,
+                               now - 300 + batch * 14 + rank * 0.005,
+                               wall_seconds=14.0)
+            burst = describe(batched, [], DEFAULT_STALE_SECONDS)
+            # 3 x the 14s an evaluation costs, not 10 x the 0.005s median gap.
+            assert abs(float(burst["stall_threshold_seconds"]) - 42.0) < 0.1, burst
+            assert burst["stall_count"] == 0, burst
+            assert burst["stall_fraction"] == 0.0, burst
+            assert not any("lost to gaps" in w for w in burst["warnings"]), burst
+            # ...and a rank that stops answering for a minute is still a stall
+            # on the same run, so the floor did not simply switch the check off.
+            write_eval(batched, 200, now - 300 + 11 * 14 + 60, wall_seconds=14.0)
+            wedged = describe(batched, [], DEFAULT_STALE_SECONDS)
+            assert wedged["stall_count"] == 1, wedged
 
             # Stall accounting: an outlier gap against the run's own steady
             # state. Ten evaluations a second apart and then one 20s hole -
