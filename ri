@@ -132,6 +132,13 @@ def do_health(args):
     return {}, [uv("scripts/nested-sampling-health.py", *flags)]
 
 
+def do_tui(args):
+    # `go -C tui` rather than a go.mod at the repository root: the TUI is the
+    # only Go in here, and `go run` caches its build, so a second start is
+    # instant. It shells back into this script for everything it shows.
+    return {}, [["go", "-C", "tui", "run", "."]]
+
+
 def do_resume(args):
     # The build is the resume script's own, because only run.env knows which
     # images this run needs - unlike ./ri search, where the imager is a flag.
@@ -436,6 +443,21 @@ def build_parser():
                         help="a live run silent for this long is stalled (default: 600)")
     health.add_argument("--json", action="store_true", help="raw JSON instead of a report")
 
+    add(
+        "tui", do_tui, "watch runs, and start one, from a terminal UI",
+        description=(
+            "A terminal front end over the commands above: the run table is\n"
+            "./ri runs, selecting a run shows ./ri health for it and re-runs\n"
+            "that every 5 seconds, and the form starts ./ri search.\n"
+            "\n"
+            "A search started here runs detached, so quitting the interface -\n"
+            "or closing the terminal - leaves it going. Needs Go installed;\n"
+            "nothing else here does.\n"
+            "\n"
+            "Keys are listed along the bottom of each screen."
+        ),
+    )
+
     resume = add(
         "resume", do_resume, "continue a run that stopped early",
         description=(
@@ -585,7 +607,12 @@ def main(argv=None):
 
     child_env = {**os.environ, **env}
     for command in commands:
-        result = subprocess.run(command, cwd=REPO_ROOT, env=child_env, check=False)
+        try:
+            result = subprocess.run(command, cwd=REPO_ROOT, env=child_env, check=False)
+        except FileNotFoundError:
+            print(f"ERROR: {command[0]} is not installed or not on PATH",
+                  file=sys.stderr)
+            return 127
         if result.returncode != 0:
             return result.returncode
     return 0

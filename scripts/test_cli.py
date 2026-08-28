@@ -157,6 +157,15 @@ check(
 
 # Both at once is a mistake, and it has to reach the script to be rejected -
 # dropping one here would report on the wrong thing without saying so.
+# The TUI is the one command that is not Python or Docker: it shells back into
+# this script for everything it shows, and `go -C tui` is what lets its module
+# live in tui/ without a go.mod at the repository root.
+check(
+    "tui runs the Go module in tui/",
+    ({}, [["go", "-C", "tui", "run", "."]]),
+    plan("tui"),
+)
+
 check(
     "health sends a run and --all together rather than picking one",
     ({}, [["uv", "run", "scripts/nested-sampling-health.py", "somerun", "--all"]]),

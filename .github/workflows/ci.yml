@@ -37,6 +37,20 @@ jobs:
       - name: Check Python syntax
         run: python3 -m compileall -q scripts config
 
+      # The TUI is the only compiled thing here that needs no Docker, so it is
+      # checked where the rest of the no-Docker work is. `go vet` catches the
+      # mistakes a terminal interface hides until somebody presses the key.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tui/go.mod
+          cache-dependency-path: tui/go.sum
+
+      - name: Check the terminal interface
+        run: |
+          go -C tui vet ./...
+          go -C tui test ./...
+
   # These execute code, and the code branches on the platform - rank-budget.sh
   # reads /proc/meminfo on Linux and vm_stat on macOS, and defaults.sh picks an
   # image architecture from `uname -m`. Both hosts run real searches, so both

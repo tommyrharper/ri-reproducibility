@@ -88,6 +88,7 @@ finished run down per stage:
 ## 3. Reading the results
 
 ```bash
+./ri tui                # runs, live health and a new-run form in one screen (needs Go)
 ./ri report             # all runs
 ./ri report --last 1    # newest run only
 ./ri serve              # read the report from a browser on another machine
