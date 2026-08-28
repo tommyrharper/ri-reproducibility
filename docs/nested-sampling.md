@@ -362,6 +362,13 @@ What each line is reading, and why it is worth a line:
   and neither alone explains the doubling. So consecutive intervals can differ
   by 2x with nothing wrong, and a longer one is not by itself a sign of
   anything.
+
+  Nor is a shorter one, which is the case worth stating because it is the one
+  a reader will doubt. The next two intervals on that run went 134 to 150 with
+  cost flat, so throughput alone lengthened it, and then 150 to 137 while cost
+  rose a further 39%, so throughput alone shortened it against a rising cost.
+  Three consecutive steps, each from a different combination of the two, and
+  no ordering between the interval and the cost.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
