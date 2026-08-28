@@ -18,6 +18,7 @@ r2d2_thread_count() {
 }
 
 R2D2_OMP_THREADS="${R2D2_OMP_THREADS:-$(r2d2_thread_count)}"
+# shellcheck disable=SC2034  # expanded by the sourcing script
 R2D2_DOCKER_ENV_FLAGS=(
   -e "OMP_NUM_THREADS=${R2D2_OMP_THREADS}"
   -e "MKL_NUM_THREADS=${R2D2_OMP_THREADS}"

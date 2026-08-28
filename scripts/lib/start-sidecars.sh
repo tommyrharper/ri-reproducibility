@@ -1,3 +1,4 @@
+# shellcheck shell=bash  # sourced, so no shebang
 # Start the long-lived containers a run `docker exec`s into, and export
 # NS_SIDECARS.
 #
@@ -133,7 +134,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   sidecar_wait
   grep -q -- '-v /sock:/sock --entrypoint sleep img:a infinity' "${_log}"
   grep -q -- '--entrypoint sleep img:b infinity' "${_log}"
-  ! grep -q -- 'img:b.*/sock' "${_log}"
+  grep -q -- 'img:b.*/sock' "${_log}" && {
+    echo "FAIL: img:a's -v flag leaked into img:b"; exit 1
+  }
   grep -q -- "--entrypoint sh img:c -c echo hi sh /some/dir" "${_log}"
   [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1","img:c":"ri-ns-sidecar-'"$$"'-2"}' ]
   rm -f "${_log}"

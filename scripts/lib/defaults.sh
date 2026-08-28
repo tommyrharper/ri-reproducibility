@@ -1,3 +1,4 @@
+# shellcheck shell=bash  # sourced, so no shebang
 # Loads the shared runtime defaults from defaults.toml at the repository root.
 #
 # defaults.toml is the file to edit; this one only reads it. Every scalar key
@@ -76,6 +77,7 @@ if [[ -z "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
   esac
 fi
 export DOCKER_DEFAULT_PLATFORM
+# shellcheck disable=SC2034  # read by the sourcing script
 PLATFORM="${DOCKER_DEFAULT_PLATFORM}"
 
 # Generated per run rather than configured, so it stays here and not in

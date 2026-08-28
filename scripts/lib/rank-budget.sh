@@ -1,3 +1,4 @@
+# shellcheck shell=bash  # sourced, so no shebang
 # Clamp a run's rank count to the memory the host can actually give it.
 #
 # Rank count, not NS_NLIVE, is what costs memory: every rank keeps one warm
@@ -184,6 +185,7 @@ ns_reap_leaked_sidecars() {
   [ -n "${dead}" ] || return 0
   # Said out loud: this is another run's wreckage being removed, and a silent
   # `docker rm --force` is not something to do on someone else's host.
+  # shellcheck disable=SC2086  # container names cannot contain whitespace
   echo "NOTE: removing sidecar container(s) left behind by a run that is gone," \
     "which were holding memory against this run:" ${dead} >&2
   # shellcheck disable=SC2086  # container names cannot contain whitespace
@@ -333,7 +335,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   clear_reservations
 
   # Not even one rank fits: refuses, rather than sampling the OOM killer.
-  ! NS_AVAILABLE_MB=5000 ns_budget_ranks 8 3400 r2d2 >/dev/null 2>&1
+  # `cmd && exit 1` rather than `! cmd`, because bash exempts a negated
+  # command from errexit - the `!` form is an assertion that cannot fail.
+  NS_AVAILABLE_MB=5000 ns_budget_ranks 8 3400 r2d2 >/dev/null 2>&1 && {
+    echo "FAIL: 8 ranks of 3400MB granted against 5000MB free"; exit 1
+  }
   clear_reservations
 
   # Another run's live reservation comes out of this one's budget:

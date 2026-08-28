@@ -174,6 +174,8 @@ _ns_add_trap() {
     eval "set -- ${line}"
     existing="$3"
   fi
+  # shellcheck disable=SC2064  # expanding now is the point: the trap
+  # must carry the commands as they are, not re-read these locals later
   if [ -n "${existing}" ]; then
     trap "${new}; ${existing}" "${sig}"
   else
@@ -557,6 +559,7 @@ self_check() {
   # cleanup on exit/Ctrl-C.
   (
     log="${tmp}/trap.log"
+    # shellcheck disable=SC2064  # ${log} must expand before the subshell exits
     trap "echo existing >>'${log}'" EXIT
     _ns_add_trap "echo new >>'${log}'" EXIT
   )
@@ -585,6 +588,7 @@ self_check() {
   # The whole of a noisy run's output, not just the start of it: the last line
   # before a crash is the one worth having. Sized past the pipe buffer so this
   # is a real completeness check rather than one satisfied by a single write.
+  # shellcheck disable=SC2016  # $i is sh's, not ours
   run_with_progress "${run_dir}" -1 2 -- \
     sh -c 'i=0; while [ $i -lt 20000 ]; do echo "line-$i"; i=$((i + 1)); done; exit 3' \
     >/dev/null 2>&1
