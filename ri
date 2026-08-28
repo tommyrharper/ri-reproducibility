@@ -129,6 +129,8 @@ def do_health(args):
     flags += ["--all"] if args.all else []
     flags += ["--stale-seconds", str(args.stale_seconds)] if args.stale_seconds else []
     flags += ["--json"] if args.json else []
+    flags += ["--monitor"] if args.monitor else []
+    flags += ["--interval", str(args.interval)] if args.interval else []
     return {}, [uv("scripts/nested-sampling-health.py", *flags)]
 
 
@@ -442,6 +444,11 @@ def build_parser():
     health.add_argument("--stale-seconds", type=float, metavar="SECONDS",
                         help="a live run silent for this long is stalled (default: 600)")
     health.add_argument("--json", action="store_true", help="raw JSON instead of a report")
+    health.add_argument("--monitor", action="store_true",
+                        help="redraw in place every --interval instead of "
+                             "printing once and exiting (Ctrl-C to stop)")
+    health.add_argument("--interval", type=float, metavar="SECONDS",
+                        help="seconds between redraws under --monitor (default: 5)")
 
     add(
         "tui", do_tui, "watch runs, and start one, from a terminal UI",

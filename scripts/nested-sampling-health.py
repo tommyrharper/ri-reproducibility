@@ -15,8 +15,8 @@ directory without knowing what to look at:
 * **Liveness.** A run that stopped and a run that finished both stop writing,
   so an mtime alone means nothing. The order is the point: a *whole*
   `summary.json` is finished, ranks running is healthy or stalled, a live
-  `docker exec` client with no ranks is still starting, nothing driving it is
-  stopped however recently it wrote.
+  `docker exec` client with no ranks is starting (or restarting, if it already
+  has progress), nothing driving it is stopped however recently it wrote.
 * **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
   PolyChord maximizes against a real `total_rms_jy` of ~0.008, so a run whose
   imager is broken concentrates its live points on its own failures and looks
@@ -46,7 +46,9 @@ checkout has no path to. Such a run is named by a `path` line.
 
 Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
 when a run has live processes; nothing started, nothing imaged, so it costs a
-busy host nothing to ask.
+busy host nothing to ask. A run whose ranks host `ps` cannot see (they fork
+inside a container - the ordinary case under Docker Desktop) costs one
+`docker top` and its own five-second sample instead, only for that run.
 
 Usage:
 
@@ -54,6 +56,7 @@ Usage:
   uv run scripts/nested-sampling-health.py <run>
   uv run scripts/nested-sampling-health.py --all
   uv run scripts/nested-sampling-health.py --json
+  uv run scripts/nested-sampling-health.py --monitor  # redraw in place every --interval
 
 Exit status is 0 when nothing needs attention and 1 when something does, so it
 can gate a script; the headline says the same in words and in colour, and only
@@ -293,22 +296,10 @@ def _clock_seconds(field: str) -> float | None:
     )
 
 
-def process_table() -> list[dict[str, object]]:
-    """Every process, as (pid, ppid, state, elapsed, cpu, rss, args).
-
-    One call, because everything here needs it: the ranks of a run, whether a
-    sidecar's launcher is still alive, how much of its life a rank has spent on
-    CPU, and how much memory the run is holding.
-    """
-    try:
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,state=,etime=,time=,rss=,args="],
-            capture_output=True, text=True, check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return []
+def _parse_ps_rows(lines: list[str]) -> list[dict[str, object]]:
+    """(pid, ppid, state, elapsed, cpu, rss, args) rows, shared by every source."""
     rows: list[dict[str, object]] = []
-    for line in out.splitlines():
+    for line in lines:
         fields = line.split(None, 6)
         if len(fields) < 7 or not fields[0].isdigit():
             continue
@@ -329,6 +320,73 @@ def process_table() -> list[dict[str, object]]:
             "args": args,
         })
     return rows
+
+
+def process_table() -> list[dict[str, object]]:
+    """Every process, as (pid, ppid, state, elapsed, cpu, rss, args).
+
+    One call, because everything here needs it: the ranks of a run, whether a
+    sidecar's launcher is still alive, how much of its life a rank has spent on
+    CPU, and how much memory the run is holding.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,state=,etime=,time=,rss=,args="],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return _parse_ps_rows(out.splitlines())
+
+
+def container_processes(container: str) -> list[dict[str, object]]:
+    """A sidecar's own processes - the ranks host `ps` can never see.
+
+    Ranks fork inside the polychord sidecar's own PID namespace. `docker top`
+    is the daemon reading its own view of a container's processes, so it needs
+    nothing installed in the image (this repo's images ship no `ps`) and works
+    whether or not the daemon shares the caller's kernel - Docker Desktop runs
+    it in a separate Linux VM, and a plain host `ps` never sees into any
+    container, on any platform, `--pid=host` or not.
+
+    Unlike `ps -eo field=`, `docker top` cannot suppress its header - it looks
+    for the literal column names to find field boundaries, so an all-`=`
+    format errors with "Couldn't find PID field" - and the first line here is
+    always that header, not a row.
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "top", container, "-eo", "pid,ppid,state,etime,time,rss,args"],
+            capture_output=True, text=True, check=True, timeout=20,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _parse_ps_rows(out.splitlines()[1:])
+
+
+def container_busy_fractions(container: str, pids: list[int]) -> dict[int, float]:
+    """cpu_busy_fractions, sourced from `docker top` for ranks host `ps` misses.
+
+    Its own sample rather than a share of the shared host one in `main`: these
+    pids are the container's own, meaningless to /proc or a host `ps -p`
+    lookup, and never worth mixing into a dict keyed by host pids that a
+    container pid could coincidentally collide with. Five seconds, not one:
+    `docker top`'s TIME column is whole seconds like plain `ps`'s cumulative
+    time, the same coarse case `cpu_busy_fractions` widens its own window for.
+    """
+    if not pids:
+        return {}
+
+    def sample() -> dict[int, float]:
+        return {int(r["pid"]): float(r["cpu_seconds"]) for r in container_processes(container)
+                if r["cpu_seconds"] is not None}
+
+    interval = 5.0
+    before = sample()
+    time.sleep(interval)
+    after = sample()
+    return {pid: (after[pid] - before[pid]) / interval for pid in pids
+            if pid in before and pid in after}
 
 
 def sidecar_containers() -> list[dict[str, object]] | None:
@@ -1424,14 +1482,31 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     owned = run_processes(run_dir, processes)
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
     watched = supervised(owned, processes)
-    spinning = spinning_ranks(ranks, busy or {})
+    effective_busy = dict(busy or {})
+    # A run's ranks fork inside its polychord sidecar's own PID namespace,
+    # invisible to host `ps` under Docker Desktop (a separate Linux VM) and
+    # any container not sharing the host's PID namespace generally - which
+    # this repo's containers never do. `watched` already proved the run is
+    # live, so no ranks here means look inside the one container that runs
+    # them rather than conclude there are none.
+    if not ranks and watched:
+        polychord = [c for c in (sidecar_containers() or [])
+                     if c["run_dir"] == str(run_dir.resolve())
+                     and "polychord" in str(c["image"])]
+        if polychord:
+            name = str(polychord[0]["name"])
+            ranks = [p for p in container_processes(name)
+                     if RANK_COMMAND.match(str(p["args"]))]
+            effective_busy.update(
+                container_busy_fractions(name, [int(p["pid"]) for p in ranks]))
+    spinning = spinning_ranks(ranks, effective_busy)
     # RSS, so shared pages are counted once per process holding them. The
     # imager workers are separate containers with separate model copies, so on
     # the run this exists for the sum lands within a percent of what the host
     # reports as used - and overcounting is the safe direction for a number
     # read to answer "can another run fit".
     resident_mb = sum(int(p["rss_mb"]) for p in owned)
-    cores_busy = sum((busy or {}).get(int(p["pid"]), 0.0) for p in owned)
+    cores_busy = sum(effective_busy.get(int(p["pid"]), 0.0) for p in owned)
     # Swap is read here rather than hoisted into main the way `busy` is: it is
     # a handful of /proc reads with no sample interval to share.
     if swapped is None:
@@ -1467,22 +1542,28 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # calling that STARTING gave a search killed mid-flight ten silent minutes
     # at exit 0. What that clause covered is the gap between attempts, and the
     # client covers all but the ~1s before the next `docker exec` is issued.
+    run_stage = stage(run_dir)
     if complete:
         status = "finished"
     elif ranks:
         status = "stalled" if idle is not None and idle > stale_seconds else "healthy"
     elif watched is not None:
-        status = "starting"
+        # A run whose ranks vanished mid-search and whose client is already
+        # back is a self-heal restart, not a fresh start - `run_stage` is
+        # "starting up" only before anything has touched `chains/` at all, so
+        # a run with a live point file or a checkpoint already has the
+        # progress a first-time STARTING would wrongly promise is not there
+        # yet.
+        status = "starting" if run_stage == "starting up" else "restarting"
     else:
         status = "stopped"
-    run_stage = stage(run_dir)
 
     # Only for a run that is still going: a stopped run's remaining dead
     # points are not remaining, they are lost, and its hours-left would be
     # counted off a rate that stopped.
     stats = sampler_stats(run_dir)
     forecast = None
-    if status in ("healthy", "stalled", "starting"):
+    if status in ("healthy", "stalled", "starting", "restarting"):
         forecast = evidence_forecast(
             run_dir, stats, _setting(run_env, "NS_NLIVE"),
             _setting(run_env, "NS_MAX_NDEAD"),
@@ -1655,7 +1736,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     space = free_bytes(run_dir)
     per_hour = scan["disk_bytes_per_hour"]
     disk_hours = None
-    if space is not None and per_hour and status in ("healthy", "starting", "stalled"):
+    if space is not None and per_hour \
+            and status in ("healthy", "starting", "restarting", "stalled"):
         disk_hours = space[0] / float(per_hour)
         # Against how much longer this run needs, not against a fixed number of
         # hours: space running out after the search is over is not a problem
@@ -1714,7 +1796,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         # reason it stopped when the reason is in its run.log.
         "restart_budget": (restart_budget(run_dir, _setting(run_env, "NS_RETRIES"),
                                           restarted, time.time())
-                           if status in ("healthy", "stalled", "starting") else None),
+                           if status in ("healthy", "stalled", "starting", "restarting") else None),
         "warnings": warnings,
         **scan,
     }
@@ -1811,7 +1893,7 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
 # these hard to see.
 GREEN, YELLOW, RED, CYAN = "32", "33", "31", "36"
 STATUS_COLORS = {"healthy": GREEN, "finished": GREEN, "starting": CYAN,
-                 "stalled": RED, "stopped": RED}
+                 "restarting": CYAN, "stalled": RED, "stopped": RED}
 
 
 def use_color() -> bool:
@@ -1906,9 +1988,9 @@ def render(run: dict[str, object]) -> None:
         if headline == "healthy":
             headline = "running"
         headline += f" - {len(warnings)} warning{'' if len(warnings) == 1 else 's'}"
-        # Amber for anything warning that is not already red: FINISHED and
-        # STARTING carry warnings too, and a green headline over a warning is
-        # the exact miscue the rename above exists to avoid.
+        # Amber for anything warning that is not already red: FINISHED,
+        # STARTING and RESTARTING carry warnings too, and a green headline
+        # over a warning is the exact miscue the rename above exists to avoid.
         if color != RED:
             color = YELLOW
     print(f"{run['name']}  {run['algorithm']}  {paint(headline.upper(), color)}")
@@ -1933,7 +2015,7 @@ def render(run: dict[str, object]) -> None:
     # again, and promising a next value would make it read as work still to
     # come.
     next_update = ""
-    if run["status"] in ("healthy", "stalled", "starting") \
+    if run["status"] in ("healthy", "stalled", "starting", "restarting") \
             and settings.get("NS_NLIVE", "").isdigit() \
             and run["checkpoint_age_seconds"] is not None:
         next_update = f", next past ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
@@ -2385,11 +2467,34 @@ def main(argv: list[str] | None = None) -> int:
                         help="a live run silent for this long is stalled "
                              "(default: %(default)s)")
     parser.add_argument("--json", action="store_true", help="raw JSON instead of a report")
+    parser.add_argument("--monitor", action="store_true",
+                        help="redraw in place every --interval instead of "
+                             "printing once and exiting (Ctrl-C to stop)")
+    parser.add_argument("--interval", type=float, default=5.0,
+                        help="seconds between redraws under --monitor "
+                             "(default: %(default)s)")
     args = parser.parse_args(argv)
 
     if args.all and args.run:
         parser.error("--all takes no run argument")
 
+    if not args.monitor:
+        return report_once(args)
+
+    try:
+        while True:
+            # Clear-and-redraw rather than one line appended per tick: a
+            # terminal watched for hours would otherwise scroll its whole
+            # history away in redraws nobody is reading.
+            sys.stdout.write("\033[2J\033[H")
+            report_once(args)
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def report_once(args: argparse.Namespace) -> int:
     processes = process_table()
     if args.all:
         directories = run_directories()
@@ -2437,9 +2542,20 @@ def self_check() -> None:
         return sink.getvalue()
 
     global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb, \
-        pressure, use_color
+        pressure, use_color, sidecar_containers, container_processes, \
+        container_busy_fractions
     saved = NESTED_SAMPLING_DIR
     now = time.time()
+    # Saved before being stubbed below, so the direct test of its own
+    # arithmetic further down can still reach the real implementation.
+    real_container_busy_fractions = container_busy_fractions
+    # No sidecar, anywhere, unless a block below says otherwise: describe()
+    # only reaches for `docker top` when host `ps` found no ranks on a watched
+    # run, which is most of the fixtures below, and the real ones would shell
+    # out to an actual `docker ps`/`docker top` this suite must never touch.
+    sidecar_containers = lambda: []  # noqa: E731
+    container_processes = lambda name: []  # noqa: E731
+    container_busy_fractions = lambda name, pids: {}  # noqa: E731
 
     def write_eval(run: Path, index: int, mtime: float, objective: float = 0.008,
                    wedges: int = 0, wall_seconds: float | None = None,
@@ -2676,6 +2792,8 @@ def self_check() -> None:
                 assert f"\033[1;{GREEN}mHEALTHY\033[0m" in io_capture(report)
                 assert f"\033[1;{CYAN}mSTARTING\033[0m" in io_capture(
                     {**report, "status": "starting"})
+                assert f"\033[1;{CYAN}mRESTARTING\033[0m" in io_capture(
+                    {**report, "status": "restarting"})
                 # Already red stays red rather than being softened to amber...
                 assert f"\033[1;{RED}mSTALLED - 1 WARNING\033[0m" in io_capture(
                     {**report, "status": "stalled", "warnings": ["a"]})
@@ -3267,19 +3385,20 @@ def self_check() -> None:
             assert just_died["status"] == "stopped", just_died
             assert any("./ri resume" in w for w in just_died["warnings"]), just_died
             # ...and no ranks *yet* is neither. A live `docker exec` client is
-            # the run saying it has started: an R2D2 search spends minutes
-            # there while its workers load their models, and every second of
-            # that used to headline STOPPED and offer `./ri resume` on a run
-            # that was fine. The mtimes here are already past stale_seconds,
-            # so only the client can tell the two apart.
+            # the run saying it has started, and every second of that used to
+            # headline STOPPED and offer `./ri resume` on a run that was fine.
+            # The mtimes here are already past stale_seconds, so only the
+            # client can tell the two apart. `live` already has evaluations
+            # and a checkpoint (RESTARTING, a self-heal mid-search); a run
+            # with nothing of its own written yet is a genuine first start
+            # (STARTING) and the case the whole rule exists for.
             exec_client = [p for p in not_ranks if p["pid"] == 91]
             launcher = [p for p in not_ranks if p["pid"] == 89]
-            starting = describe(live, exec_client + launcher, 5.0)
-            assert starting["status"] == "starting", starting
-            assert not any("./ri resume" in w for w in starting["warnings"]), starting
-            assert io_capture(starting).splitlines()[0].endswith("  STARTING"), starting
-            # A run with nothing of its own written yet is the same answer, and
-            # the case the whole rule exists for.
+            restarting = describe(live, exec_client + launcher, 5.0)
+            assert restarting["status"] == "restarting", restarting
+            assert not any("./ri resume" in w for w in restarting["warnings"]), restarting
+            assert io_capture(restarting).splitlines()[0].endswith("  RESTARTING"), \
+                restarting
             fresh = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260106T000000Z"
             fresh.mkdir()
             (fresh / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\n")
@@ -3287,12 +3406,46 @@ def self_check() -> None:
                                  args=f"/usr/bin/docker exec c mpirun python3 "
                                       f"polychord_r2d2.py --output-dir "
                                       f"{fresh.resolve()}")]
-            assert describe(fresh, fresh_client + launcher, 5.0)["status"] == "starting"
+            # An R2D2 search spends minutes here while its workers load their
+            # models, with no chains/ of its own yet - the STARTING case.
+            starting = describe(fresh, fresh_client + launcher, 5.0)
+            assert starting["status"] == "starting", starting
+            assert io_capture(starting).splitlines()[0].endswith("  STARTING"), starting
             # Without the client it is a run that never got going, which is
             # the one that wants resuming.
             dead_start = describe(fresh, launcher, 5.0)
             assert dead_start["status"] == "stopped", dead_start
             assert any("./ri resume" in w for w in dead_start["warnings"]), dead_start
+            # `live`'s ranks fork inside its own container, exactly the case
+            # host `ps` can never see (Docker Desktop, or any container not
+            # sharing the host's PID namespace - every container this repo
+            # starts). Without the `docker top` fallback this is what stayed
+            # RESTARTING forever, `ranks` empty, even while the run kept
+            # landing evaluations right up to a clean finish.
+            container_ranks = [
+                {"pid": 501 + i, "ppid": 500, "alive": True, "elapsed_seconds": 30.0,
+                 "cpu_seconds": 5.0, "rss_mb": 10,
+                 "args": "python3 /opt/ri-nested-sampling/polychord_r2d2.py "
+                         f"--output-dir {live.resolve()}"}
+                for i in range(4)
+            ]
+            try:
+                sidecar_containers = lambda: [  # noqa: E731
+                    {"name": "ri-ns-sidecar-1-2",
+                     "image": "ri-reproducibility/polychord:lite",
+                     "owner_pid": 1, "run_dir": str(live.resolve())}]
+                container_processes = lambda name: container_ranks  # noqa: E731
+                via_container = describe(live, exec_client + launcher, 5.0)
+                assert via_container["status"] in ("healthy", "stalled"), via_container
+                assert via_container["ranks"] == 4, via_container
+                # A sidecar for some other run, or none at all, leaves `ranks`
+                # exactly as empty as it was before this fallback existed.
+                sidecar_containers = lambda: []  # noqa: E731
+                still_restarting = describe(live, exec_client + launcher, 5.0)
+                assert still_restarting["status"] == "restarting", still_restarting
+            finally:
+                sidecar_containers = lambda: []  # noqa: E731
+                container_processes = lambda name: []  # noqa: E731
             shutil.rmtree(fresh)
             # A stalled run's count can still move; a stopped one's cannot, so
             # only the first may say where it will move to.
@@ -3372,6 +3525,26 @@ def self_check() -> None:
                 spinner.wait()
             assert sampled.get(spinner.pid, 0) > 0.5, sampled
             assert sampled.get(os.getpid(), 1) < 0.5, sampled
+
+            # container_busy_fractions samples `docker top`'s own cumulative
+            # TIME twice, five seconds apart - a real wait, like the spin
+            # check above, to prove the arithmetic against a real clock
+            # rather than trust the division by eye.
+            assert real_container_busy_fractions("c", []) == {}
+            calls = {"n": 0}
+
+            def fake_container_processes(_name: str) -> list[dict[str, object]]:
+                calls["n"] += 1
+                seconds = 0.0 if calls["n"] == 1 else 2.0
+                return [{"pid": 501, "ppid": 500, "alive": True, "elapsed_seconds": 5.0,
+                         "cpu_seconds": seconds, "rss_mb": 10, "args": "python3 x"}]
+
+            try:
+                container_processes = fake_container_processes
+                fractions = real_container_busy_fractions("c", [501])
+            finally:
+                container_processes = lambda name: []  # noqa: E731
+            assert abs(fractions[501] - 0.4) < 1e-9, fractions
 
             # A run that has gone serial: still landing evaluations, so never
             # idle long enough to look stalled, but at a fraction of its own
@@ -3857,7 +4030,6 @@ def self_check() -> None:
                           "cpu_seconds": 0.0, "rss_mb": 0, "args": "sh"}]
             live_container = {"name": "ri-ns-sidecar-4242-0", "image": "i", "owner_pid": 4242}
             leaked = {"name": "ri-ns-sidecar-9999-0", "image": "i", "owner_pid": 9999}
-            global sidecar_containers
             original = sidecar_containers
             orphan_home = tempfile.mkdtemp()
             try:
@@ -4144,8 +4316,8 @@ def self_check() -> None:
             # default report is what makes another session's "12GB available"
             # have no owner. The cost is that a run whose ranks have all gone
             # is listed for as long as its client takes to exit, where it
-            # headlines STARTING rather than STOPPED - sub-second, against
-            # minutes of a healthy run being invisible.
+            # headlines STARTING or RESTARTING rather than STOPPED -
+            # sub-second, against minutes of a healthy run being invisible.
             assert default_directories(not_ranks) == [live], \
                 default_directories(not_ranks)
             # The sidecar workers still do not count: they outlive a killed run

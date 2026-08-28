@@ -5,9 +5,10 @@ have while one is still going. See [nested-sampling.md](nested-sampling.md) for
 how to start a run, and [robustness.md](robustness.md) for what happens when
 one breaks.
 
-`./ri tui` is this report on a timer: the same text, re-run every 5 seconds,
-next to the run table and a form that starts a search. Everything below is
-what it shows.
+`./ri tui` is this report on a timer next to the run table and a form that
+starts a search - needs Go. `./ri health --monitor` is the lighter version of
+the same idea: just this report, redrawn in place, no other tool required.
+Everything below is what both of them show.
 
 ```console
 $ ./ri health
@@ -37,6 +38,10 @@ host
   sidecars  3 running, 0 leaked
 ```
 
+`--monitor` redraws every `--interval` seconds (default 5, matching the TUI's
+own timer) instead of printing once, so watching a run does not fill the
+terminal with one scrollback entry per poll. Ctrl-C to stop.
+
 ## Which runs it reports on
 
 With no argument, every run being driven anywhere on this host - ranks running,
@@ -56,8 +61,11 @@ under this checkout, so warnings about a foreign run give it a path.
 machine-readable form.
 
 It reads files and runs one `ps` and one `docker ps`, plus a one second CPU
-sample when a run has live ranks. Nothing is started and nothing is imaged, so
-a live run does not notice it. Exit status is 1 when something needs attention.
+sample when a run has live ranks. A run whose ranks fork inside their own
+container's PID namespace - invisible to that `ps`, the ordinary case under
+Docker Desktop - costs one `docker top` and its own five-second sample instead.
+Nothing is started and nothing is imaged, so a live run does not notice it.
+Exit status is 1 when something needs attention.
 
 ## Status
 
@@ -68,7 +76,8 @@ stop writing:
 |---|---|
 | `FINISHED` | A whole `summary.json` is there. |
 | `STALLED` | Ranks running, but no evaluation in `--stale-seconds` (default 600). The warning says how long until the stall watchdog restarts the run, or that `--stall-timeout 0` turned it off, or that no watchdog is left. |
-| `STARTING` | No ranks yet, but a `docker exec` client is alive. An R2D2 search spends minutes here loading models. |
+| `STARTING` | No ranks yet, but a `docker exec` client is alive, and nothing is in `chains/` yet - a genuine first start. An R2D2 search spends minutes here loading models. |
+| `RESTARTING` | The same, but `chains/` already has a live-point file or a checkpoint - a self-heal restart mid-search, not a first start. |
 | `STOPPED` | No ranks and no client, however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if there is none; the warning says which. A half-written `summary.json` lands here too, with a warning saying so. |
 | `HEALTHY` | Ranks running, evaluations landing, nothing warned about. |
 
@@ -94,7 +103,7 @@ point, so it stands down to `RUNNING` when there is something to say. No suffix
 and no host warning is exactly exit 0.
 
 On a terminal the headline and `WARNING` labels are coloured - green for
-`HEALTHY`/`FINISHED`, cyan for `STARTING`, amber for warnings, red for
+`HEALTHY`/`FINISHED`, cyan for `STARTING`/`RESTARTING`, amber for warnings, red for
 `STALLED`/`STOPPED` - and nothing else is. Piped, redirected or under
 [`NO_COLOR`](https://no-color.org) the output is byte-identical.
 
