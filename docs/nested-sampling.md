@@ -404,8 +404,8 @@ says nothing:
 |---|---|
 | `FINISHED` | `summary.json` is there. |
 | `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
-| `STARTING` | No ranks yet, but the run is being driven: its `docker exec` client is alive, or something was written recently. An R2D2 search spends minutes here while sixteen workers load their models. |
-| `STOPPED` | No ranks, no client, nothing recent. `./ri resume <run>` continues it. |
+| `STARTING` | No ranks yet, but the run is being driven: its `docker exec` client is alive. An R2D2 search spends minutes here while sixteen workers load their models. |
+| `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it. |
 | `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
 
 **The headline carries the warning count**, because it is the whole report for
@@ -991,8 +991,8 @@ can act on, instead of hanging it.
 
 `./ri self-check self-heal` is the end-to-end check of all of the above, and
 it is part of `./ri self-check`. It starts a real WSClean search on a throwaway
-directory and breaks it twice, in the two ways that recover through different
-machinery:
+directory and breaks it three times, in the three ways that recover through
+different machinery:
 
 - **`SIGKILL` once it has scored 8 evaluations** - fewer than `--nlive`, so the
   kill lands before any checkpoint, which is the regime that was broken.
@@ -1000,20 +1000,36 @@ machinery:
   job is fully alive and simply not progressing, so only the stall watchdog can
   notice. Run with `--stall-timeout 20` and a 2s poll so it costs a minute
   rather than two hours; the code path is the shipped one.
+- **`SIGKILL` on a third search started with `--retries 0`**, which does not
+  recover on its own - the state a run is left in once it has spent its retry
+  budget. Nothing restarts it, so this is the one scenario that reaches the
+  manual path: `./ri health` has to headline it `STOPPED` and name
+  `./ri resume <run>`, and that resume has to continue the search rather than
+  begin one.
 
-Both then assert that the run restarts itself, records the kill in
+The first two then assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes
 `summary.json`, and comes out of `./ri health` with nothing on its own
 headline. Its headline rather than the exit status, which is 1 for a host
-warning too: this host is shared, and the check failed on the just-finished
-search's own containers, still running for the ~0.4s `_sidecar_remove` takes to
-remove them in the background after their launcher pid is gone. The
+warning too: this host is shared, and both scenarios have failed on the
+just-finished search's own containers, still running for the ~0.4s
+`_sidecar_remove` takes to remove them in the background after their launcher
+pid is gone.
+
+The third asserts the opposite of all that: the killed run exits nonzero with
+no `summary.json`, `./ri health` headlines it `STOPPED` and prints the
+`./ri resume` line for it, and that resume then picks up at least the
+evaluations already on disk (its own "N evaluations already done" count) and
+finishes the search - after which resuming again is a no-op rather than a
+second job over the same chains. The
 wait for recovery is bounded, because the failure it is most likely to catch is
-a hang rather than an exit. ~90 seconds and ~0.6GB, so it is safe to run beside
+a hang rather than an exit. ~3 minutes and ~0.6GB, so it is safe to run beside
 another search. Fixtures cannot stand in for it - every bug found in this
 machinery so far (the retry reading a checkpoint-frozen counter, the stall
 accounting refusing to excuse a run's own restart, the restart colliding with
-its own evaluation directories) passed the fixtures and failed a real kill.
+its own evaluation directories, and this report calling a run killed a second
+ago `STARTING` for the ten minutes it took the mtime to go stale) passed the
+fixtures and failed a real kill.
 
 ### Finding and resuming a run that stopped
 

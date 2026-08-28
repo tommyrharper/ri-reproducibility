@@ -11,15 +11,21 @@
 # fixture and obvious to a real kill. So: start a real search, break it, and
 # assert it finishes anyway.
 #
-# Two ways of breaking it, because they recover through different machinery. A
-# SIGKILL is the crash `run_with_retries` was written for - the run exits and
+# Three ways of breaking it, because they recover through different machinery.
+# A SIGKILL is the crash `run_with_retries` was written for - the run exits and
 # the loop sees a status. A frozen rank is the failure it cannot see: PolyChord
 # calls the likelihood from Fortran, so one rank that stops answering leaves
 # every other rank in a collective forever, with no exit for anything to act
 # on. `_ns_stall_watchdog` in scripts/lib/progress-bar.sh is what turns the
-# second into the first, and SIGSTOP on one rank reproduces it exactly.
+# second into the first, and SIGSTOP on one rank reproduces it exactly. The
+# third is the one that does not heal: a run killed with its retry budget
+# already spent, which is where `./ri health` stops reporting and starts
+# telling a human to type `./ri resume`. That advice is the last line of
+# defence for a multi-day search - both of `./ri health`'s warnings about a run
+# nothing is driving end on it, and so does every message `run_with_retries`
+# gives up with - and nothing joined it to a real interrupted run either.
 #
-# ~90 seconds and ~0.6GB, on throwaway output directories that `./ri runs` and
+# ~3 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
 # the report never see. WSClean rather than R2D2 because it reaches its first
 # checkpoint in ~15s where R2D2 takes over an hour.
 set -euo pipefail
@@ -33,6 +39,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # globs results/nested-sampling/* - never sees it.
 OUT="${REPO_ROOT}/results/.self-heal-check-$$"
 HUNG_OUT="${REPO_ROOT}/results/.self-heal-hang-check-$$"
+RESUME_OUT="${REPO_ROOT}/results/.self-heal-resume-check-$$"
 # Deliberately fewer than `--nlive`, so the kill lands before PolyChord has
 # written its first `.resume` - the regime that was broken. A run killed after
 # one takes the same path with strictly more on disk to adopt.
@@ -55,10 +62,12 @@ cleanup() {
   pkill -CONT -f "polychord_wsclean.py --output-dir ${HUNG_OUT}" 2>/dev/null || true
   pkill -9 -f "polychord_wsclean.py --output-dir ${OUT}" 2>/dev/null || true
   pkill -9 -f "polychord_wsclean.py --output-dir ${HUNG_OUT}" 2>/dev/null || true
+  pkill -9 -f "polychord_wsclean.py --output-dir ${RESUME_OUT}" 2>/dev/null || true
   if [ -n "${PASSED}" ]; then
-    rm -rf "${OUT}" "${OUT}.log" "${HUNG_OUT}" "${HUNG_OUT}.log"
+    rm -rf "${OUT}" "${OUT}.log" "${HUNG_OUT}" "${HUNG_OUT}.log" \
+      "${RESUME_OUT}" "${RESUME_OUT}.log"
   else
-    echo "self-heal: left ${OUT}* and ${HUNG_OUT}* for inspection" >&2
+    echo "self-heal: left ${OUT}*, ${HUNG_OUT}* and ${RESUME_OUT}* for inspection" >&2
   fi
   return 0
 }
@@ -139,11 +148,17 @@ grep -q "exit 137" "${OUT}/restarts.log" || fail "restarts.log did not record th
 after="$(completed_evals "${OUT}")"
 [ "${after}" -ge "${before}" ] || fail "restart lost work: ${before} evaluations before the kill, ${after} after"
 
-# The run healed itself, so the report must not call that a fault: a false
-# warning here is a false alarm in anything scripted on ./ri health's exit code.
-health="$("${REPO_ROOT}/ri" health "${OUT}" 2>&1)" && health_status=0 || health_status=$?
-[ "${health_status}" -eq 0 ] || fail "./ri health warns about a run that healed itself (exit ${health_status}):
-${health}"
+# The run healed itself, so the report must not call that a fault. The run's
+# own headline, not the exit status: that is 1 for a host warning too, and this
+# host is shared - the same race the hang scenario below documents caught this
+# assertion on the search that had just finished one line above, whose three
+# sidecars are still running for the ~0.4s `_sidecar_remove` takes to remove
+# them in the background after their launcher pid is gone.
+health="$("${REPO_ROOT}/ri" health "${OUT}" 2>&1)" || true
+case "$(printf '%s\n' "${health}" | head -1)" in
+  *WARNING*) fail "./ri health warns about a run that healed itself:
+${health}" ;;
+esac
 grep -q "self-healed restart" <<<"${health}" || fail "./ri health does not report the restart:
 ${health}"
 
@@ -211,6 +226,92 @@ case "$(printf '%s\n' "${health}" | head -1)" in
 ${health}" ;;
 esac
 
-PASSED=1
 echo "self-heal: hung at ${hung_before} evaluations, recovered and finished at ${hung_after}"
+
+# Scenario three: the run does not heal itself, and a human puts it back. Every
+# route into `./ri resume` that `./ri health` prints - the STOPPED warning, the
+# orphaned-launcher warning, all three "not retrying" messages
+# `run_with_retries` gives up with - is a promise that a search interrupted hours in can be continued
+# rather than restarted, and none of it was checked against a real one. The two
+# scenarios above cannot reach it: they finish on their own, and a finished run
+# is the one thing `./ri resume` refuses.
+#
+# --retries 0, so the SIGKILL is final. That is also exactly what a run looks
+# like once it has spent its retry budget on the fault that keeps coming back.
+echo "self-heal: starting a third wsclean search in ${RESUME_OUT}"
+"${REPO_ROOT}/ri" search wsclean \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 0 --no-build \
+  --output-dir "${RESUME_OUT}" >"${RESUME_OUT}.log" 2>&1 &
+SEARCH_PID=$!
+
+for _ in $(seq 1 120); do
+  [ "$(completed_evals "${RESUME_OUT}")" -ge "${KILL_AFTER_EVALS}" ] && break
+  kill -0 "${SEARCH_PID}" 2>/dev/null \
+    || fail "third search exited before scoring ${KILL_AFTER_EVALS} evaluations; see ${RESUME_OUT}.log"
+  sleep 0.5
+done
+resume_before="$(completed_evals "${RESUME_OUT}")"
+[ "${resume_before}" -ge "${KILL_AFTER_EVALS}" ] \
+  || fail "only ${resume_before} evaluations after 60s; see ${RESUME_OUT}.log"
+
+echo "self-heal: killing the third sampler at ${resume_before} evaluations, with no retries left"
+pkill -9 -f "polychord_wsclean.py --output-dir ${RESUME_OUT}" || fail "no third sampler to kill"
+wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
+  || fail "the un-retried run neither exited nor was noticed within ${RECOVER_TIMEOUT_SECONDS}s; see ${RESUME_OUT}.log"
+wait "${SEARCH_PID}" && resume_status=0 || resume_status=$?
+SEARCH_PID=""
+[ "${resume_status}" -eq 0 ] \
+  && fail "a search killed with no retries left must not exit 0; see ${RESUME_OUT}.log"
+[ -e "${RESUME_OUT}/summary.json" ] \
+  && fail "the killed search wrote a summary.json, so there would be nothing to resume"
+
+# The report is how anyone finds out, so it is asserted before the resume: a
+# stopped run has to headline STOPPED and name the command that continues it.
+# Not the exit status - that is 1 for a host warning too, on a host this check
+# shares with other searches.
+health="$("${REPO_ROOT}/ri" health "${RESUME_OUT}" 2>&1)" || true
+case "$(printf '%s\n' "${health}" | head -1)" in
+  *STOPPED*) ;;
+  *) fail "./ri health does not headline the killed run STOPPED:
+${health}" ;;
+esac
+grep -qF "./ri resume ${RESUME_OUT##*/}" <<<"${health}" \
+  || fail "./ri health does not offer ./ri resume on a stopped run:
+${health}"
+
+# `./ri resume` reads run.env for every setting the run was started with and
+# re-clamps only the rank count, so this also covers that file being written,
+# sourceable, and complete enough to finish a search from.
+echo "self-heal: resuming ${RESUME_OUT##*/} by hand"
+"${REPO_ROOT}/ri" resume "${RESUME_OUT}" >>"${RESUME_OUT}.log" 2>&1 &
+SEARCH_PID=$!
+wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
+  || fail "./ri resume neither finished nor died within ${RECOVER_TIMEOUT_SECONDS}s - a rank is stuck in an MPI collective; see ${RESUME_OUT}.log"
+wait "${SEARCH_PID}" && resumed_status=0 || resumed_status=$?
+SEARCH_PID=""
+[ "${resumed_status}" -eq 0 ] \
+  || fail "./ri resume did not finish the run (exit ${resumed_status}); see ${RESUME_OUT}.log"
+[ -f "${RESUME_OUT}/summary.json" ] || fail "the resumed run finished with no summary.json"
+
+# Continued, not restarted. The count the resume script prints is evaluation
+# *directories*, which is the completed ones plus any that were in flight when
+# the kill landed, so it can only be >= what completed - a resume that ignored
+# the previous attempt would print 0 and re-image everything.
+adopted="$(grep -o '[0-9]\+ evaluations already done' "${RESUME_OUT}.log" | head -1 | cut -d' ' -f1)"
+[ -n "${adopted}" ] && [ "${adopted}" -ge "${resume_before}" ] \
+  || fail "./ri resume started from '${adopted:-nothing}' rather than the ${resume_before} evaluations already on disk; see ${RESUME_OUT}.log"
+resume_after="$(completed_evals "${RESUME_OUT}")"
+[ "${resume_after}" -ge "${resume_before}" ] \
+  || fail "the resume lost work: ${resume_before} evaluations before the kill, ${resume_after} after"
+
+# And now it is finished, so the advice stops: resuming a second time is a
+# no-op rather than a second job over the same chains.
+again="$("${REPO_ROOT}/ri" resume "${RESUME_OUT}" 2>&1)" \
+  || fail "./ri resume on a finished run must succeed and do nothing, got: ${again}"
+grep -qF "already finished" <<<"${again}" \
+  || fail "./ri resume re-ran a finished run instead of saying so: ${again}"
+
+echo "self-heal: killed unretried at ${resume_before} evaluations, resumed by hand and finished at ${resume_after}"
+
+PASSED=1
 echo "self-heal check passed"

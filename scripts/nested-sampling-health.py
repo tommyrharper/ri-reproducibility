@@ -13,9 +13,11 @@ Four things it checks, each one a way a run has actually gone wrong here:
   last sign of life, and the directories without one are the evaluations in
   flight (which should sit near `NS_MPI_PROCS`).
 * **Liveness.** A run that stopped and a run that finished both stop writing,
-  so a stale mtime on its own means nothing. The order matters: `summary.json`
-  present is finished; no rank processes is stopped; only a live run with a
-  stale mtime is stalled.
+  so a mtime on its own means nothing in either direction. The order matters:
+  `summary.json` present is finished; ranks running is healthy, or stalled once
+  the mtime goes stale; no ranks but a live `docker exec` client is a run still
+  starting up; nothing driving it at all is stopped, however recently it
+  wrote.
 * **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
   PolyChord maximizes, while a real `total_rms_jy` is ~0.008. A run whose
   imager is broken - a missing checkpoint mount, an OOM-killed worker - is
@@ -1265,11 +1267,24 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # yet fell straight through to `stopped` - so the whole of an R2D2
     # search's startup, minutes of sixteen workers loading their models,
     # headlined STOPPED and offered `./ri resume` on a run that was fine.
+    #
+    # And it is the *only* answer. A recent evaluation used to count as well,
+    # which is the same mistake pointing the other way: a run with no ranks
+    # and no client that wrote a second ago has not started, it has just died,
+    # and calling that STARTING gave a search killed mid-flight ten silent
+    # minutes - no warning, exit 0 - before the mtime went stale enough for
+    # the report to notice. Caught by the resume scenario in
+    # scripts/test_self_heal.sh, on a real search SIGKILLed with no retries
+    # left. What the mtime clause was covering is the gap between
+    # `run_with_retries` attempts, and the client covers all but the ~1s of it
+    # before the next `docker exec` is issued; a blink of STOPPED there is a
+    # true statement about that instant, where the old rule was a false
+    # all-clear over a run that was never coming back.
     if complete:
         status = "finished"
     elif ranks:
         status = "stalled" if idle is not None and idle > stale_seconds else "healthy"
-    elif watched is not None or (idle is not None and idle <= stale_seconds):
+    elif watched is not None:
         status = "starting"
     else:
         status = "stopped"
@@ -2539,6 +2554,16 @@ def self_check() -> None:
             # while something is still running.
             assert describe(live, [], 5.0)["status"] == "stopped"
             assert describe(live, ranks, 5.0)["status"] == "stalled"
+            # The same with the shipped 600s window, which is the case that
+            # mattered: this fixture's evaluations were written a second ago,
+            # so a run SIGKILLed just now sits well inside it. Counting a
+            # recent write as "started" gave such a run ten minutes of
+            # STARTING - no warning, exit 0 - before the mtime aged enough for
+            # the report to say anything. Nothing is driving it, however
+            # recently it wrote.
+            just_died = describe(live, [], 600.0)
+            assert just_died["status"] == "stopped", just_died
+            assert any("./ri resume" in w for w in just_died["warnings"]), just_died
             # ...and no ranks *yet* is neither. A live `docker exec` client is
             # the run saying it has started: an R2D2 search spends minutes
             # there while its workers load their models, and every second of
@@ -3185,13 +3210,19 @@ def self_check() -> None:
                 meminfo_mb = lambda key: HEADROOM_MB * 2  # noqa: E731
                 with contextlib.redirect_stdout(io.StringIO()):
                     assert main(["--all", "--json"]) == 1
-                    assert main([live.name]) == 0
-                # ...and no-argument `./ri health` reaches the running run,
-                # not the newest directory: `fast` is newer and finished.
+                # `live` scores 0 only with its ranks in the process table:
+                # STARTING and HEALTHY are both states of a run something is
+                # still driving, and this fixture used to reach exit 0 through
+                # the mtime clause dropped from `describe` above - i.e. by
+                # being a dead run too freshly dead to notice.
                 process_table = lambda: ranks
                 # ...and no CPU sample for four pids that do not exist: the
                 # real one sleeps a second to take it.
                 cpu_busy_fractions = lambda pids: {}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert main([live.name]) == 0
+                # ...and no-argument `./ri health` reaches the running run,
+                # not the newest directory: `fast` is newer and finished.
                 sink = io.StringIO()
                 with contextlib.redirect_stdout(sink):
                     main([])
