@@ -333,7 +333,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
   forecast  ~26% done, ~120 of ~454 dead points, ~2h11m left
   ranks     16 ranks of 16, 7 busy-waiting
-  resources 48.9GB resident over 51 processes, 16.0 of 20 cores busy
+  resources 48.9GB resident (+4.5GB swapped out) over 51 processes, 16.0 of 20 cores busy
   memory    3.3GB peak imager memory, 53.2GB across 16 ranks
   disk      7.5GB written, +2.6GB/hour, 93h of space left at that rate
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
@@ -341,6 +341,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
 
 host
   memory    8.9GB available of 62.6GB, 4GB reserved as headroom
+  swap      5.1GB of 32.0GB used
   disk      233GB free of 436GB
   sidecars  3 running, 0 leaked
 ```
@@ -574,6 +575,25 @@ What each line is reading, and why it is worth a line:
   number read to answer "will another run fit". Cores busy is the same one
   second CPU sample as the spin check, summed over those processes, so it
   measures the imaging rather than the ranks waiting on it.
+
+  Swap is shown beside it because RSS excludes it, so a run the host has
+  squeezed reads as holding *less* memory than it does - and the pages it is
+  missing cost a disk read the next time it touches them, which surfaces as
+  slow evaluations and never as a failure. A process is warned about when
+  more of it is in swap than in memory **and** what is out there is at least
+  200MB (`PAGED_OUT_MB`, the smallest per-rank footprint
+  `scripts/lib/rank-budget.sh` budgets - a whole WSClean rank). Both clauses
+  are needed: on the live 16-rank R2D2 search here every healthy imager worker
+  kept ~70MB of cold startup pages swapped against a 3.2GB footprint and cost
+  nothing, while nineteen ranks and shims sat at 10MB resident against 14MB
+  swapped and were "mostly on disk" by ratio alone. The one process worth
+  naming was a single imager worker at 52MB resident against 2.9GB swapped -
+  parked, with 2.9GB to read back before its next evaluation, and invisible in
+  every other number on the page.
+
+  The host block reports swap in use but never warns on it: swap that is in
+  use may have been paged out days ago and cost nothing since. Whose pages
+  those are is the actionable question, and that is the per-run warning.
 - **memory** - the same cost measured by the run itself instead of sampled off
   the host: the median `peak_memory_bytes` its evaluations recorded, and that
   multiplied out over `NS_MPI_PROCS`, because what the host has to hold is

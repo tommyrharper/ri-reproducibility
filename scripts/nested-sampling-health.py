@@ -45,9 +45,13 @@ Four things it checks, each one a way a run has actually gone wrong here:
 * **Cost, again, in memory and cores.** Memory is what caps a run here, so
   what the run holds is reported next to what the host has left - over every
   process carrying the run directory, because a rank is ~10MB and the imager
-  worker behind it is ~3.3GB. `memory` is the same cost measured by the run
-  itself rather than sampled off the host: `peak_memory_bytes` out of each
-  evaluation's metrics, multiplied out over the ranks. That is the standing estimate
+  worker behind it is ~3.3GB, and next to what the kernel has pushed out to
+  swap, which RSS excludes: a squeezed run reads as holding less memory than
+  it does while a worker that is mostly on disk has to read itself back before
+  it can image, which shows up as slow evaluations and never as a failure.
+  `memory` is the same cost measured by the run itself rather than sampled off
+  the host: `peak_memory_bytes` out of each evaluation's metrics, multiplied
+  out over the ranks. That is the standing estimate
   `scripts/lib/rank-budget.sh` sizes every run from, so this is the only place
   it gets checked against the images actually in use - and it survives the run,
   which the process table does not.
@@ -66,10 +70,10 @@ Four things it checks, each one a way a run has actually gone wrong here:
   forward across PolyChord's checkpoint interval, which otherwise freezes it
   for two hours at a time on a 16-rank R2D2 search.
 
-Plus the host: memory, free disk, and sidecar containers whose run is gone. A killed run
-leaves its `ri-ns-sidecar-*` containers holding ~3.4GB per R2D2 rank. The next
-run frees those itself before it sizes itself, so this is here to explain where
-the host's memory went, not as a chore.
+Plus the host: memory, swap in use, free disk, and sidecar containers whose run
+is gone. A killed run leaves its `ri-ns-sidecar-*` containers holding ~3.4GB
+per R2D2 rank. The next run frees those itself before it sizes itself, so this
+is here to explain where the host's memory went, not as a chore.
 
 Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
 when a run has live processes; nothing started, nothing imaged, so it costs a
@@ -195,6 +199,16 @@ MIN_STALL_GAP_SECONDS = 2.0
 # the line under which the next run will refuse to size itself.
 HEADROOM_MB = 4096
 
+# A process is reported as paged out when more of it is in swap than in memory
+# AND what is in swap is at least this much. The floor is
+# `NS_WSCLEAN_MB_PER_RANK` from scripts/lib/rank-budget.sh - the smallest
+# footprint this repo budgets a rank at - so anything over it is a whole
+# worker's worth of pages on disk rather than the tens of MB of cold startup
+# pages every long-lived Python process here accumulates. On the run this was
+# written for it separates one parked imager worker (52MB resident, 2.9GB
+# swapped) from the nineteen ranks and shims sitting at 10MB against 14MB.
+PAGED_OUT_MB = 200
+
 # Disk is the one resource nothing here reserves, checks or frees, and the only
 # one that only ever grows: an evaluation directory keeps its measurement set,
 # its .mat and the imager's output, ~1.7MB on this host, and nothing deletes
@@ -318,6 +332,26 @@ def meminfo_mb(key: str) -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def swap_mb(pids: list[int]) -> dict[int, int]:
+    """How much of each process the kernel has pushed to disk, in MB.
+
+    `ps` has no column for it and RSS excludes it, so a squeezed run reads as
+    holding less memory than it does while every page it touches next costs a
+    disk read - which surfaces as slow evaluations, never as a failure. Linux
+    only; processes whose /proc entry cannot be read are simply absent.
+    """
+    swapped: dict[int, int] = {}
+    for pid in pids:
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmSwap:"):
+                    swapped[pid] = int(line.split()[1]) // 1024
+                    break
+        except (OSError, ValueError, IndexError):
+            continue
+    return swapped
 
 
 # --- one run ----------------------------------------------------------------
@@ -1025,7 +1059,8 @@ def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> in
 
 
 def describe(run_dir: Path, processes: list[dict[str, object]],
-             stale_seconds: float, busy: dict[int, float] | None = None) -> dict[str, object]:
+             stale_seconds: float, busy: dict[int, float] | None = None,
+             swapped: dict[int, int] | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     dead, checkpoint_time = dead_points(run_dir)
     checkpoint_age = time.time() - checkpoint_time if checkpoint_time else None
@@ -1041,6 +1076,19 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # read to answer "can another run fit".
     resident_mb = sum(int(p["rss_mb"]) for p in owned)
     cores_busy = sum((busy or {}).get(int(p["pid"]), 0.0) for p in owned)
+    # Swap is read here rather than hoisted into main the way `busy` is: it is
+    # a handful of /proc reads with no sample interval to share.
+    if swapped is None:
+        swapped = swap_mb([int(p["pid"]) for p in owned])
+    swapped_mb = sum(swapped.get(int(p["pid"]), 0) for p in owned)
+    # A process with more of itself on disk than in memory has to be paged back
+    # in before it can do anything. Self-relative rather than a threshold in
+    # GB: on the run this exists for, every healthy imager worker keeps ~70MB
+    # of cold startup pages swapped against a 3.2GB footprint and costs
+    # nothing, while the one worker the host squeezed sat at 52MB resident
+    # against 2.9GB swapped - parked, and invisible in every number here.
+    paged_out = [p for p in owned
+                 if swapped.get(int(p["pid"]), 0) > max(int(p["rss_mb"]), PAGED_OUT_MB)]
     tail = log_tail(run_dir)
     restarted = restarts(run_dir)
     idle = scan["last_activity_seconds"]
@@ -1154,6 +1202,18 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"{scan['stall_fraction']:.0%} of wall clock lost to gaps over "
             f"{scan['stall_threshold_seconds']:.0f}s"
         )
+    if paged_out:
+        worst = max(paged_out, key=lambda p: swapped.get(int(p["pid"]), 0))
+        one = len(paged_out) == 1
+        warnings.append(
+            f"{len(paged_out)} of this run's {len(owned)} processes "
+            f"{'is' if one else 'are'} mostly on disk rather than in memory "
+            f"({'' if one else 'worst: '}"
+            f"{format_gb(swapped.get(int(worst['pid']), 0) * 1024 ** 2)} swapped against "
+            f"{format_gb(int(worst['rss_mb']) * 1024 ** 2)} resident) - the host squeezed "
+            "the run, and a paged-out worker reads itself back from disk before it can "
+            "image, which costs evaluation time rather than failing"
+        )
     # Nothing reserves disk, nothing frees it, and no evaluation directory is
     # ever deleted, so the only warning available is the run's own write rate
     # against what the filesystem has left. Asked only of a run that is still
@@ -1181,6 +1241,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "ranks_spinning": spinning,
         "processes": len(owned),
         "resident_mb": resident_mb,
+        "swapped_mb": swapped_mb,
+        "processes_paged_out": len(paged_out),
         "cores_busy": round(cores_busy, 1),
         "host_cores": os.cpu_count(),
         "disk_free_bytes": space[0] if space is not None else None,
@@ -1218,9 +1280,18 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
             "keeps free; a new run will refuse to size itself"
         )
     space = free_bytes(NESTED_SAMPLING_DIR if NESTED_SAMPLING_DIR.exists() else Path("."))
+    swap_total = meminfo_mb("SwapTotal")
+    swap_free = meminfo_mb("SwapFree")
     return {
         "available_mb": memory,
         "total_mb": meminfo_mb("MemTotal"),
+        "swap_total_mb": swap_total,
+        # Reported, never warned on: swap in use says the host went over at
+        # some point, which may have been days ago and cost nothing since.
+        # What is actionable is whose pages are out there, and that is the
+        # per-run paged_out warning.
+        "swap_used_mb": (swap_total - swap_free
+                         if swap_total is not None and swap_free is not None else None),
         "disk_free_bytes": space[0] if space is not None else None,
         "disk_total_bytes": space[1] if space is not None else None,
         "cores": os.cpu_count(),
@@ -1395,8 +1466,10 @@ def render(run: dict[str, object]) -> None:
     if run["processes"]:
         cores = run["host_cores"]
         lines.append(("resources",
-                      f"{int(run['resident_mb']) / 1024:.1f}GB resident over "
-                      f"{run['processes']} processes"
+                      f"{int(run['resident_mb']) / 1024:.1f}GB resident"
+                      + (f" (+{format_gb(int(run['swapped_mb']) * 1024 ** 2)} swapped out)"
+                         if run["swapped_mb"] else "")
+                      + f" over {run['processes']} processes"
                       + (f", {run['cores_busy']:.1f}"
                          + (f" of {cores}" if cores else "")
                          + " cores busy" if run["cores_busy"] else "")))
@@ -1472,6 +1545,10 @@ def render_host(host: dict[str, object]) -> None:
                                  else f"{int(memory) / 1024:.1f}GB available"
                                       + (f" of {int(total) / 1024:.1f}GB" if total else "")
                                       + f", {HEADROOM_MB / 1024:.0f}GB reserved as headroom"))
+    swap_total = host["swap_total_mb"]
+    if swap_total and host["swap_used_mb"] is not None:
+        print(f"  {'swap':<9} {int(host['swap_used_mb']) / 1024:.1f}GB of "
+              f"{int(swap_total) / 1024:.1f}GB used")
     space = host["disk_free_bytes"]
     print(f"  {'disk':<9} " + ("unknown" if space is None
                                else f"{float(space) / 1024 ** 3:.0f}GB free of "
@@ -1591,7 +1668,7 @@ def self_check() -> None:
             render(report)
         return sink.getvalue()
 
-    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions
+    global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb
     saved = NESTED_SAMPLING_DIR
     now = time.time()
 
@@ -1629,6 +1706,34 @@ def self_check() -> None:
             mine = [p for p in table if p["pid"] == os.getpid()]
             assert len(mine) == 1, f"{len(mine)} rows for pid {os.getpid()}"
             assert mine[0]["alive"] and int(mine[0]["rss_mb"]) > 0, mine
+            # Real /proc, because VmSwap and the kB the kernel prints it in
+            # are what this parses. Pinned against the kernel's own text, for
+            # this interpreter and then for the first process on the host with
+            # more than a megabyte out: this one's VmSwap is 0, which pins the
+            # field (VmRSS sits three lines away and would read as gigabytes of
+            # swap for every process) but not the kB-to-MB divide, since 0 kB
+            # is 0 MB either way. A host with no swap in use pins only the
+            # field, which is all there is to pin there.
+            def vmswap_kb(pid: int) -> int | None:
+                try:
+                    status = Path(f"/proc/{pid}/status").read_text()
+                except OSError:
+                    return None
+                for line in status.splitlines():
+                    if line.startswith("VmSwap:"):
+                        return int(line.split()[1])
+                return None
+
+            for pid in [os.getpid()] + [int(p["pid"]) for p in table]:
+                kb = vmswap_kb(pid)
+                if kb is not None:
+                    assert swap_mb([pid]) == {pid: kb // 1024}, (pid, kb)
+                    if kb > 1024:
+                        break
+            # A pid that is gone must be absent rather than zero or a raise:
+            # the process table and these reads are a moment apart, and a rank
+            # exiting between them is ordinary.
+            assert swap_mb([]) == {} and swap_mb([-1]) == {}
 
             # `[[dd-]hh:]mm:ss` in every form ps prints it.
             assert _clock_seconds("00:12") == 12
@@ -1697,6 +1802,52 @@ def self_check() -> None:
             with_cpu = io_capture(describe(live, not_ranks + ranks,
                                            DEFAULT_STALE_SECONDS, {92: 0.9}))
             assert "0.9 of " in with_cpu and "cores busy" in with_cpu, with_cpu
+
+            # Swap. Nothing swapped is the ordinary case and must add nothing
+            # to the line - RSS excludes swap, so what is out there is real
+            # memory the run holds that no other number here accounts for.
+            assert report["swapped_mb"] == 0 and report["processes_paged_out"] == 0, report
+            assert "swapped out" not in aged, aged
+
+            def with_swap(pages: dict[int, int]) -> dict[str, object]:
+                return describe(live, not_ranks + ranks, DEFAULT_STALE_SECONDS,
+                                None, pages)
+
+            # Summed over everything the run owns, not just its ranks, and a
+            # pid outside the run does not count towards it.
+            spread = with_swap({92: 1000, 100: 100, 999: 5000})
+            assert spread["swapped_mb"] == 1100, spread
+            assert "3.3GB resident (+1.1GB swapped out) over 7 processes" \
+                in io_capture(spread), io_capture(spread)
+
+            # The worker holds 3300MB resident, so 3000MB out is a squeeze it
+            # is still winning: more than PAGED_OUT_MB, but not most of it.
+            partly = with_swap({92: 3000})
+            assert partly["processes_paged_out"] == 0, partly
+            assert not any("on disk" in w for w in partly["warnings"]), partly
+
+            # ...and 3400MB out is the parked worker this exists for: 52MB
+            # resident against 2.9GB swapped was the live 16-rank R2D2 search.
+            parked = with_swap({92: 3400})
+            assert parked["processes_paged_out"] == 1, parked
+            assert ("1 of this run's 7 processes is mostly on disk rather than in "
+                    "memory (3.3GB swapped against 3.2GB resident)"
+                    in io_capture(parked)), io_capture(parked)
+
+            # A rank at 10MB resident with 100MB swapped is mostly on disk by
+            # the ratio alone and means nothing - every long-lived Python
+            # process here accumulates tens of MB of cold startup pages. The
+            # floor is what keeps the warning about workers.
+            trivial = with_swap({pid: 100 for pid in range(100, 104)})
+            assert trivial["swapped_mb"] == 400, trivial
+            assert trivial["processes_paged_out"] == 0, trivial
+            assert not any("on disk" in w for w in trivial["warnings"]), trivial
+
+            # Two of them, and the loudest is the one named.
+            both = with_swap({92: 3400, 91: 900})
+            assert both["processes_paged_out"] == 2, both
+            assert ("2 of this run's 7 processes are mostly on disk rather than in "
+                    "memory (worst: 3.3GB swapped" in io_capture(both)), io_capture(both)
 
             # The sampler's own view: what PolyChord has found, and how much
             # of the search is left. nlive 50 and 200 dead points is four
@@ -2292,6 +2443,31 @@ def self_check() -> None:
             finally:
                 sidecar_containers = original
 
+            # Host swap, against the real /proc/meminfo: reported and never
+            # warned on, because swap in use may date from days ago and cost
+            # nothing since - what is actionable is whose pages are out there,
+            # and that is the per-run warning above. The line is suppressed
+            # entirely on a host with no swap rather than printing 0.0 of 0.0.
+            with_swap_host = dict(host, swap_total_mb=32768, swap_used_mb=5222)
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(with_swap_host)
+            assert "swap      5.1GB of 32.0GB used" in rendered_host.getvalue(), \
+                rendered_host.getvalue()
+            no_swap_host = dict(host, swap_total_mb=0, swap_used_mb=0)
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(no_swap_host)
+            assert "swap" not in rendered_host.getvalue(), rendered_host.getvalue()
+            # SwapTotal minus SwapFree, in that direction: reporting the free
+            # half as "used" would read as a host under pressure on an idle
+            # one, and as an idle one under pressure.
+            real = host_report([])
+            total, free = meminfo_mb("SwapTotal"), meminfo_mb("SwapFree")
+            assert real["swap_total_mb"] == total, real
+            assert real["swap_used_mb"] == (None if total is None or free is None
+                                            else total - free), (real, total, free)
+
             # Resolution: a bare name, a path, and the newest by default.
             assert resolve(live.name) == live
             assert resolve(str(stalled)) == stalled
@@ -2331,7 +2507,6 @@ def self_check() -> None:
             import contextlib
             import io
 
-            global meminfo_mb
             original_memory, original_table = meminfo_mb, process_table
             original_cpu = cpu_busy_fractions
             try:
