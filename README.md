@@ -159,10 +159,15 @@ Re-running a build whose inputs have not changed skips `docker build` outright
 **Portable vs. host-optimized WSClean**: `WSCLEAN_PORTABLE=ON` (default)
 builds a binary that runs on any CPU of the build architecture, per
 WSClean's own documented `-DPORTABLE` CMake option. `./ri build wsclean
---native` (`WSCLEAN_PORTABLE=OFF`) tags `ri-reproducibility/wsclean:native`, built
-for the building machine's exact instruction set - faster, but it will
-die with an illegal-instruction error anywhere else, and it changes
-WSClean's timings, so do not mix the two within one search.
+--native` (`WSCLEAN_PORTABLE=OFF`) rebuilds the same
+`ri-reproducibility/wsclean:v3.7` tag for the building machine's exact
+instruction set - measurably faster (see
+[docs/nested-sampling-throughput.md](docs/nested-sampling-throughput.md)),
+but it will die with an illegal-instruction error anywhere else, and it
+changes WSClean's timings, so do not mix the two within one search.
+Because it is the same tag, the next build without `--native` puts the
+portable binary back: to search with it, pass `./ri search wsclean
+--native`, which carries the flag into the build the search does first.
 
 ### Does the imager under test actually run?
 

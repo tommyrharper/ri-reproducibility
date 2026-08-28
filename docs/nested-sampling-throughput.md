@@ -298,3 +298,188 @@ What to take from it when sizing a bigger run:
 - **Anything that makes one evaluation cheaper is now worth more than anything
   that adds a worker**, and `wsclean` itself is 69% of the worker-time budget
   at the default rank count (`./ri profile <run>`).
+
+## Where the evaluation's time actually goes
+
+The section above ends on "anything that makes one evaluation cheaper is now
+worth more than anything that adds a worker". This one takes that apart.
+
+The measurements below replay a real run's `wsclean` commands instead of
+starting searches: `results/nested-sampling/<run>/summary.json` records the
+exact argv of every evaluation's `wsclean`, so 200 of them can be fed to *N*
+`sh` processes inside one sidecar container. That reproduces the run's
+concurrency and its per-rank `-j 1` without PolyChord, an MPI layer or a
+stochastic evaluation count in the way, and it is repeatable to about 1%,
+which the end-to-end evals/s is not. Keep a run's `evaluations/` directory
+alive to do it - `./ri search` writes one `sim.ms` per evaluation and they are
+the input.
+
+`wsclean` prints its own accounting. Over 400 evaluations of one run:
+
+| | per evaluation |
+|---|---:|
+| inversion | 54.4ms |
+| prediction | 35.8ms |
+| deconvolution | 9.3ms |
+| **imaging total** | **99.6ms (77%)** |
+| everything else | 29.7ms (23%) |
+| `wsclean` binary, wall | 129.3ms |
+
+The 23% that is not imaging is process start, opening and reordering the
+Measurement Set, and writing five FITS files. `wsclean --version` alone - fork,
+exec, 73 shared libraries, C++ static initialisers - is 15ms of it, and the
+dynamic loader is only 1.4ms of that 15ms, so it is constructor work inside
+casacore and friends and there is no flag for it.
+
+The imaging 77% is a major-cycle loop: `-mgain 0.8` with `-niter 100` runs a
+mean of **6.76 major iterations**, each one a full prediction and a full
+inversion. That is the shape of the cost, and it is set by the deconvolution
+settings, not by anything the harness controls.
+
+## The host saturates at ~56 evaluations/s, and it is memory, not scheduling
+
+Replaying the same 200 evaluations at increasing concurrency, with host CPU
+sampled from `/proc/stat` across each arm:
+
+| workers | evals/s | per evaluation | host CPU |
+|---:|---:|---:|---:|
+| 1 | 7.1 | 140ms | 5% |
+| 2 | 14.8 | 135ms | 10% |
+| 4 | 27.7 | 145ms | 20% |
+| 6 | 37.8 | 159ms | 30% |
+| 8 | 39.2 | 204ms | 38% |
+| 12 | 45.3 | 265ms | 54% |
+| 16 | 53.0 | 302ms | 74% |
+| 20 | 56.4 | 354ms | 92% |
+| 24 | 55.2 | 435ms | 91% |
+
+Scaling is linear to 4 workers and then bends; past 20 it goes backwards. Host
+CPU tracks the worker count almost exactly the whole way (1 worker = 5% = one
+of twenty threads), so nobody is blocking on anything - the workers are all
+running, each just gets less done.
+
+Pinning with `taskset` inside the container says what they are contending on.
+This host is an i5-13500: CPUs 0-11 are the six P-cores' hyperthread pairs,
+CPUs 12-19 are eight single-threaded E-cores.
+
+| placement | workers | evals/s |
+|---|---:|---:|
+| 6 P-cores, one thread each (0,2,4,6,8,10) | 6 | 39.7 |
+| 8 E-cores (12-19) | 8 | 26.8 |
+| 12 P-core threads (0-11) | 12 | 52.7 |
+| 6 P-cores + 8 E-cores | 14 | 43.3 |
+| all 20 threads | 20 | 54.8 |
+| 20, unpinned | 20 | 56.6 |
+| 12, unpinned | 12 | 45.3 |
+
+Two things fall out of that table:
+
+- **The parts do not add up.** 6 P-cores alone do 39.7 evals/s and 8 E-cores
+  alone do 26.8, but the same 14 workers together do 43.3, not 66.5. Nothing
+  is idle and nothing is scheduled badly; they are competing for last-level
+  cache and memory bandwidth. That is the wall, and it is why every CPU-side
+  win below shrinks by roughly two thirds between one worker and twenty.
+- **The E-cores are nearly free of charge and nearly worthless.** Twelve
+  workers on the P-core threads do 52.7 evals/s; adding all eight E-cores on
+  top gets 54.8. The last eight ranks of a 20-rank run are buying ~4%. For
+  WSClean that costs nothing worth counting, but an R2D2 rank is ~3.4GB
+  (`scripts/lib/rank-budget.sh`), so on a memory-capped R2D2 search the same
+  RAM is better spent on `--nlive`.
+
+Pinning is not worth wiring in: at the rank count runs actually use, letting
+the kernel place the workers (56.6) beat every fixed placement tried (54.8).
+It only helps at rank counts nobody runs - 12 pinned to the P-core threads is
+52.7 against 45.3 unpinned.
+
+## Six ways of making the evaluation cheaper that do not work
+
+All measured by replay, 200 evaluations, serial and at 20 concurrent workers,
+each arm run at least twice interleaved with the baseline. None of them is in
+the working tree.
+
+| change | serial evals/s | 20-worker evals/s | verdict |
+|---|---:|---:|---|
+| baseline | 7.3 | 70.3 | - |
+| evaluation directories on `/dev/shm` | 7.4 | 66.6 | noise |
+| `-no-reorder` | 3.7 | 36.1 | 2x slower |
+| `-gridder wstacking` | 7.4 | 67.3 | noise |
+| `-nwlayers 1` | 7.3 | 57.6 | slower |
+| `-no-small-inversion` | 7.2 | 54.9 | slower |
+| `-abs-mem 0.05` | 7.3 | 56.1 | slower |
+
+Two are worth spelling out.
+
+**Disk is not the bottleneck.** An evaluation directory is ~1.9MB and a
+20-worker run writes ~100MB/s of them, which sounds like something until you
+copy them all to `/dev/shm` and measure no difference. The host's NVMe and the
+page cache absorb it. This also rules out the reorder temporaries, which live
+in the same directory (`-temp-dir`), and it means the `evaluations/` bloat
+noted below is a disk-space problem only, never a speed one.
+
+**`-no-reorder` is a trap.** WSClean's reordering pass looks like pure
+overhead for a single 2808-row Measurement Set - it copies the data out of the
+MS into temporary files before imaging - and removing it halves throughput,
+because the ~7 major cycles then re-read the casacore table instead of a flat
+file.
+
+### `-wgridder-accuracy`, which works and is still the wrong trade
+
+`-wgridder-accuracy 1e-2` against the 1e-4 default is 9.9 evals/s serial
+(+35%) and 74 at 20 workers (+5%), the largest single-flag effect found. It is
+rejected on the science, not the speed: 1e-2 of a 1 Jy peak is 10mJy of
+gridding error, and the objective this search maximises *is* the image RMS,
+which these runs measure between 0.1 and 25mJy. The knob would be moving the
+thing being searched for.
+
+Worth noticing while passing: the *default* 1e-4 is 100µJy against a 1 Jy
+peak, and some evaluations report an off-source RMS below that. Those numbers
+are the gridder's own error floor, not the imager's noise. That is a
+parameter-space concern rather than a throughput one, but it is the reason
+this flag is not a free 5%.
+
+## What does work: build WSClean for the CPU it runs on
+
+`docker/wsclean/Dockerfile` takes `WSCLEAN_PORTABLE`, which is WSClean's own
+`-DPORTABLE` CMake option, and defaults it to `ON` - a binary that runs on any
+x86-64, so no AVX2, no FMA. WSClean's gridder is the one place that costs the
+most.
+
+Replaying 200 evaluations, three interleaved repeats each:
+
+| | portable | native | |
+|---|---:|---:|---:|
+| 1 worker | 7.29 evals/s | 8.74 evals/s | **+19.8%** |
+| 20 workers | 70.3 evals/s | 74.8 evals/s | **+6.5%** |
+
+That gap between the two rows is the memory wall from the section above doing
+its work: a fifth off the CPU time is worth a fifth only when there is a core
+free to spend it on.
+
+End to end - `./ri search wsclean --nlive 25 --num-repeats 10`, default 20
+ranks, three seeds, portable and native alternating:
+
+| seed | evals/s portable | evals/s native | | `wsclean` binary |
+|---:|---:|---:|---:|---:|
+| 4242 | 43.2 | 47.6 | +10.3% | -9.5% |
+| 7 | 44.3 | 46.2 | +4.4% | -5.8% |
+| 99 | 41.2 | 48.4 | +17.6% | -15.6% |
+
+Native wins all three, by a median of 10%. The spread is the run-to-run
+throughput noise this repo has seen throughout - the replay's +6.5% at matched
+concurrency is the number to plan with, and the `wsclean` binary column, which
+is a mean over ~6000 evaluations rather than one wall clock, is the one to
+check a rebuild against.
+
+**It does not move the science.** Recomputing the objective from both builds'
+FITS output over 200 evaluations, the relative difference is a median of
+9.7e-8 and a maximum of 3.7e-7 - `-march=native`'s FMA contraction, four
+orders of magnitude below the gridder's own 1e-4 accuracy setting and further
+still below the PolyChord noise that makes two same-seed runs disagree on
+their evaluation count by 10%.
+
+**How to use it.** `./ri search wsclean --native`. The flag has to be on the
+*search*, not only on `./ri build wsclean --native`: both write the same
+`ri-reproducibility/wsclean:v3.7` tag, and a search builds its images first,
+so a plain `./ri search` puts the portable binary back under the tag before it
+runs. It stays opt-in because the binary will die with SIGILL on any other
+CPU, and the tag is shared with every other worktree on the host.

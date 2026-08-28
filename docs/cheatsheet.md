@@ -39,8 +39,10 @@ output under a pinned base image, a moved upstream git ref).
 so a `compileall` or a `--self-check` does not force a rebuild.
 
 ```bash
-# CPU-native WSClean for benchmarking on THIS machine -> tag :native
+# CPU-native WSClean, ~6% more evaluations/s on THIS machine (same v3.7 tag,
+# so the next plain build puts the portable binary back)
 ./ri build wsclean --native      # WSCLEAN_PORTABLE=OFF scripts/build.sh wsclean
+./ri search wsclean --native     # ...and carry it into the search's own build
 ```
 
 Never report the default `PORTABLE=ON` build as optimized-WSClean performance.
@@ -406,7 +408,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/run-health.md` | `./ri health`: every line of the report and what warns |
 | `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
-| `docs/nested-sampling-throughput.md` | Worker utilisation: why the ranks idled, what fixed it, and why rank 0 is not one |
+| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, and what does and does not make it cheaper |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 

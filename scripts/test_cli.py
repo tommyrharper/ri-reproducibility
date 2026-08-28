@@ -265,6 +265,18 @@ check(
 )
 
 check(
+    "search --native keeps its own build host-optimized",
+    "OFF",
+    plan("search", "wsclean", "--native")[0]["WSCLEAN_PORTABLE"],
+)
+
+check(
+    "search without --native leaves WSCLEAN_PORTABLE alone",
+    False,
+    "WSCLEAN_PORTABLE" in plan("search", "wsclean")[0],
+)
+
+check(
     "host-side analysis goes through uv",
     [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--json"]],
     plan("profile", "results/x", "--json")[1],
