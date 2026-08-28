@@ -998,7 +998,17 @@ the same kill now logs `attempt failed (exit 137) at 31 evaluations` and the
 run finishes. Retrying does not repeat that work either: the restart adopts
 the finished evaluations and serves those points from its cache. An
 evaluation directory with no `metrics.json` is one that was in flight when
-the run died, and does not count - the next attempt deletes it.
+the run died, and does not count - the next attempt deletes it. So is one
+whose `metrics.json` does not parse, which is what a rank killed in the
+middle of writing the record leaves behind: `read_evaluation_record` in
+`common.py` skips it with a `WARNING: ignoring unreadable` line in `run.log`
+and the directory is deleted like any other unscored one. That one file used
+to end a search for good - `json.loads` raised at startup in every restart
+and in every `./ri resume`, all before scoring anything, which is also what
+stopped `run_with_retries` from trying again. Records are now written under
+`metrics.json.partial` and renamed into place, so the window that produces
+one is closed for new runs and the tolerance covers the runs already on
+disk (and any half-written record left by a full disk).
 
 Two things to know about a restarted run:
 

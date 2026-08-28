@@ -1367,10 +1367,36 @@ def mpi_rank() -> int:
         return 0
 
 
+def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
+    """One evaluation's metrics.json, or None if it is not a readable record.
+
+    A metrics.json that does not parse is a write something interrupted - the
+    OOM killer, the stall watchdog, ENOSPC - and it is not recoverable, so
+    every reader here has to be able to go on without it. Raising instead ends
+    the run for good: the file is read at startup by every restart and every
+    `./ri resume`, all of which then die before scoring anything, which is
+    also what stops `run_with_retries` from trying again.
+    """
+    try:
+        record = json.loads(metrics_path.read_text())
+    except FileNotFoundError:
+        # An evaluation that was still in flight. The ordinary case on every
+        # resume, and not worth a word.
+        return None
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict):
+        print(f"WARNING: ignoring unreadable {metrics_path}", file=sys.stderr, flush=True)
+        return None
+    return record
+
+
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for metrics_path in sorted(evaluations_dir.glob("eval-*/metrics.json")):
-        records.append(json.loads(metrics_path.read_text()))
+        record = read_evaluation_record(metrics_path)
+        if record is not None:
+            records.append(record)
     return records
 
 
@@ -1388,21 +1414,25 @@ def adopt_completed_evaluations(
     reason to resume rather than start again.
 
     The evaluations that were still in flight when the run stopped are thrown
-    away first. An evaluation directory with no metrics.json holds nothing
-    worth keeping - the run died between creating it and scoring it - and
-    simulate_measurement_set() creates each one with `exist_ok=False`, on
-    purpose, so that two ranks cannot land on the same directory. Left in
-    place, one of these would crash the resumed run the moment the sampler
-    proposed that point again: the very run this is supposed to rescue.
+    away. An evaluation directory with no readable metrics.json holds nothing
+    worth keeping - the run died between creating it and scoring it, or in the
+    middle of writing the record - and simulate_measurement_set() creates each
+    one with `exist_ok=False`, on purpose, so that two ranks cannot land on the
+    same directory. Left in place, one of these would crash the resumed run the
+    moment the sampler proposed that point again: the very run this is supposed
+    to rescue.
     """
     import shutil
 
-    for leftover in sorted(evaluations_dir.glob("eval-*")):
-        if leftover.is_dir() and not (leftover / "metrics.json").exists():
+    for eval_dir in sorted(evaluations_dir.glob("eval-*")):
+        if not eval_dir.is_dir():
+            continue
+        record = read_evaluation_record(eval_dir / "metrics.json")
+        if record is None:
             # ignore_errors because every rank runs this, and they are all
             # removing the same directories at the same moment.
-            shutil.rmtree(leftover, ignore_errors=True)
-    for record in load_evaluations_from_dir(evaluations_dir):
+            shutil.rmtree(eval_dir, ignore_errors=True)
+            continue
         evaluations.append(record)
         cache[params_key(record["params"])] = record
     return len(evaluations)
@@ -1449,6 +1479,47 @@ def self_check_resume_adoption() -> None:
         assert not in_flight.exists()
 
     with tempfile.TemporaryDirectory() as tmp:
+        # A metrics.json the run was killed in the middle of writing. Before
+        # this was tolerated, one zero-byte file like this ended a search for
+        # good: json.loads raised on every restart and on every ./ri resume,
+        # before either scored anything, so the retry loop gave up too.
+        evaluations_dir = Path(tmp)
+        good = evaluations_dir / "eval-0001-abc"
+        good.mkdir()
+        write_evaluation_record(good, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        killed = evaluations_dir / "eval-0002-def"
+        killed.mkdir()
+        (killed / "metrics.json").write_text("")
+        half = evaluations_dir / "eval-0003-ghi"
+        half.mkdir()
+        (half / "metrics.json").write_text('{\n  "eval_id": 3,\n  "para')
+
+        evaluations = []
+        cache = {}
+        assert load_evaluations_from_dir(evaluations_dir) == [
+            {"eval_id": 1, "params": {"a": 1}, "objective": 0.5}
+        ]
+        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert good.exists()
+        # Removed, not merely skipped: simulate_measurement_set() creates the
+        # directory with exist_ok=False, so a kept one crashes the run this is
+        # rescuing the moment the sampler proposes that point again.
+        assert not killed.exists()
+        assert not half.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The record is renamed into place rather than truncated and rewritten,
+        # so a rank killed mid-write leaves no metrics.json at all instead of
+        # half of one. A rename gives a new inode; an in-place write does not.
+        eval_dir = Path(tmp) / "eval-0001-abc"
+        eval_dir.mkdir()
+        write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        first_inode = (eval_dir / "metrics.json").stat().st_ino
+        write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.7})
+        assert (eval_dir / "metrics.json").stat().st_ino != first_inode
+        assert list(eval_dir.iterdir()) == [eval_dir / "metrics.json"]
+
+    with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
         evaluations = []
         cache = {}
@@ -1456,7 +1527,14 @@ def self_check_resume_adoption() -> None:
 
 
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
-    (eval_dir / "metrics.json").write_text(json.dumps(record, indent=2) + "\n")
+    # Written under a temporary name and renamed into place, so a rank killed
+    # mid-write leaves either no metrics.json or the whole one, never half of
+    # one. The rename is atomic (same directory, so same filesystem) and costs
+    # one syscall against an evaluation that took at least a tenth of a second
+    # to image. Reading side: read_evaluation_record().
+    partial = eval_dir / "metrics.json.partial"
+    partial.write_text(json.dumps(record, indent=2) + "\n")
+    partial.replace(eval_dir / "metrics.json")
     return record
 
 

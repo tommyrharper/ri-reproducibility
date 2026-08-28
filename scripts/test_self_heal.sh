@@ -290,6 +290,15 @@ SEARCH_PID=""
 [ -e "${RESUME_OUT}/summary.json" ] \
   && fail "the killed search wrote a summary.json, so there would be nothing to resume"
 
+# One of its records is zeroed out first, which is what a rank killed in the
+# middle of writing a metrics.json leaves behind (and what a full disk leaves).
+# That one file used to end a search for good: json.loads raised at startup in
+# the resume and in every restart, all before scoring anything, so nothing
+# retried. The resume below has to skip it and finish anyway.
+corrupt_record="$(find "${RESUME_OUT}/evaluations" -maxdepth 2 -name metrics.json | sort | head -1)"
+[ -n "${corrupt_record}" ] || fail "the killed run scored nothing to corrupt"
+: >"${corrupt_record}"
+
 # The report is how anyone finds out, so it is asserted before the resume: a
 # stopped run has to headline STOPPED and name the command that continues it.
 # Not the exit status - that is 1 for a host warning too, on a host this check
@@ -324,6 +333,10 @@ SEARCH_PID=""
 [ "${resumed_status}" -eq 0 ] \
   || fail "./ri resume did not finish the run (exit ${resumed_status}); see ${RESUME_OUT}.log"
 [ -f "${RESUME_OUT}/summary.json" ] || fail "the resumed run finished with no summary.json"
+grep -qF "WARNING: ignoring unreadable ${corrupt_record}" "${RESUME_OUT}.log" \
+  || fail "the resume did not say it had skipped the half-written ${corrupt_record}; see ${RESUME_OUT}.log"
+[ -e "${corrupt_record%/metrics.json}" ] \
+  && fail "the half-written record's directory survived the resume, so the sampler collides with it when it proposes that point again"
 
 # Continued, not restarted. The count the resume script prints is evaluation
 # *directories*, which is the completed ones plus any that were in flight when
