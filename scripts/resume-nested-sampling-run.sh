@@ -150,11 +150,19 @@ if [ "${1:-}" = "--self-check" ]; then
     esac
   done
 
+  # The same three tags the assertion above looks for, rather than the bare
+  # `ri-reproducibility/` prefix they share. ${COUNT_RUN} is a temp directory,
+  # so every resume here ends by refusing it for being outside the repository,
+  # and that refusal prints the repository path - which on a checkout whose own
+  # path contains `ri-reproducibility/` (GitHub's work/<repo>/<repo> layout is
+  # one) matched the prefix and failed the build-free run for building nothing.
   OUT="$(NS_NO_BUILD=1 NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
-  case "${OUT}" in
-    *"ri-reproducibility/"*)
-      echo "FAIL: --no-build must skip the builds, got: ${OUT}"; exit 1 ;;
-  esac
+  for want in wsclean meqtrees polychord; do
+    case "${OUT}" in
+      *"ri-reproducibility/${want}"*)
+        echo "FAIL: --no-build must skip the ${want} build, got: ${OUT}"; exit 1 ;;
+    esac
+  done
 
   # A whole summary.json is a finished run and stops here...
   echo '{ "evaluations": [] }' >"${COUNT_RUN}/summary.json"
