@@ -34,6 +34,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 NESTED_SAMPLING_DIR = Path("results/nested-sampling")
@@ -118,6 +120,68 @@ def summary_is_complete(run_dir: Path) -> bool:
         return False
 
 
+RUN_ID_TS_RE = re.compile(r"(\d{8}T\d{6}Z)$")
+
+
+def started_at(run_dir: Path) -> float:
+    """When the run started, in epoch seconds.
+
+    Off the UTC stamp every run directory is named for, falling back to the
+    directory's own mtime for one named by hand. Sorting the names themselves
+    put every `wsclean-*` run below every `r2d2-*` one, so "newest first" came
+    out as the newest WSClean run followed by the newest R2D2 run - which on a
+    host running both is not the newest run. nested-sampling-health.py's
+    started_at() avoids the same trap for the same reason.
+    """
+    match = RUN_ID_TS_RE.search(run_dir.name)
+    if match:
+        try:
+            return datetime.strptime(
+                match.group(1), "%Y%m%dT%H%M%SZ"
+            ).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    try:
+        return run_dir.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def format_started(started: float, now: float | None = None) -> str:
+    """`today 17:38 (2h ago)` - when the run started, as the reader thinks of it.
+
+    Local time, because the reader is at a terminal on the host the run is on,
+    the same reason `./ri health` prints local finish times. The age answers
+    the question actually being asked ("is that the one I started before
+    lunch?"); the clock time is what still separates two runs once neither is
+    today's.
+    """
+    now = time.time() if now is None else now
+    day = date.fromtimestamp(started)
+    today = date.fromtimestamp(now)
+    if day == today:
+        label = "today"
+    # Calendar arithmetic rather than now - 86400, which is off by an hour
+    # across a DST change and would then call yesterday the day before.
+    elif day == today - timedelta(days=1):
+        label = "yesterday"
+    else:
+        label = time.strftime(
+            "%a %d %b" if day.year == today.year else "%d %b %Y",
+            time.localtime(started),
+        )
+    age = max(0.0, now - started)  # a stamp from the future is a skewed clock
+    if age < 90:
+        ago = "just now"
+    elif age < 3600:
+        ago = f"{int(age // 60)}m ago"
+    elif age < 86400:
+        ago = f"{int(age // 3600)}h ago"
+    else:
+        ago = f"{int(age // 86400)}d ago"
+    return f"{label} {time.strftime('%H:%M', time.localtime(started))} ({ago})"
+
+
 def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
@@ -145,6 +209,8 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     return {
         "name": run_dir.name,
         "path": str(run_dir),
+        "started": datetime.fromtimestamp(
+            started_at(run_dir), timezone.utc).isoformat(),
         "algorithm": algorithm,
         "status": status,
         "evaluations": evaluations,
@@ -163,7 +229,8 @@ def find_runs(running: set[str] | None = None) -> list[dict[str, object]]:
     # `is_run_directory` in scripts/nested-sampling-health.py.
     runs = [d for d in NESTED_SAMPLING_DIR.iterdir() if d.is_dir()
             and any((d / artifact).exists() for artifact in RUN_ARTIFACTS)]
-    runs.sort(key=lambda d: d.name, reverse=True)
+    # Newest first, by when the run started rather than by what it is named.
+    runs.sort(key=lambda d: (started_at(d), d.name), reverse=True)
     if running is None:
         running = running_run_dirs()
     return [describe(d, running) for d in runs]
@@ -192,11 +259,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     width = max(len(str(r["name"])) for r in runs)
-    print(f"{'RUN'.ljust(width)}  {'ALGORITHM':<9}  {'STATUS':<10}  EVALS")
+    evals = max(len("EVALS"), *(len(str(r["evaluations"])) for r in runs))
+    print(f"{'RUN'.ljust(width)}  {'ALGORITHM':<9}  {'STATUS':<10}  "
+          f"{'EVALS':>{evals}}  STARTED")
+    now = time.time()
     for run in runs:
         print(
             f"{str(run['name']).ljust(width)}  {str(run['algorithm']):<9}  "
-            f"{str(run['status']):<10}  {run['evaluations']}"
+            f"{str(run['status']):<10}  {run['evaluations']:>{evals}}  "
+            f"{format_started(started_at(Path(str(run['path']))), now)}"
         )
 
     if live:
@@ -287,6 +358,47 @@ def self_check() -> None:
             bare_run = {r["name"]: r for r in find_runs(running=set())}[bare.name]
             assert bare_run["status"] == "incomplete", bare_run
             assert bare_run["evaluations"] == 0, bare_run
+
+            # Newest first across algorithms, not within them. Sorted by name,
+            # this order was wsclean-0102, r2d2-0103, r2d2-0101: the newest run
+            # on the host was not the one at the top.
+            order = [r["name"] for r in find_runs(running=set())]
+            assert order == [bare.name, stopped.name, done.name], order
+            assert bare_run["started"] == "2026-01-03T00:00:00+00:00", bare_run
+            # A directory not named for a time still sorts and dates by
+            # something real, so one hand-named run cannot land it at the
+            # bottom for ever.
+            hand = NESTED_SAMPLING_DIR / "keep-this-one"
+            hand.mkdir()
+            (hand / "run.env").write_text("NS_ALGORITHM=r2d2\n")
+            os.utime(hand, (0, datetime(2026, 1, 4, tzinfo=timezone.utc).timestamp()))
+            assert [r["name"] for r in find_runs(running=set())][0] == hand.name
+
+            # The label, against a fixed clock so it does not depend on today.
+            noon = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+            def label(offset_seconds: float) -> str:
+                return format_started(noon - offset_seconds, noon)
+            assert label(0).startswith("today "), label(0)
+            assert label(0).endswith("(just now)"), label(0)
+            assert label(2 * 3600).endswith("(2h ago)"), label(2 * 3600)
+            assert label(20 * 60).endswith("(20m ago)"), label(20 * 60)
+            # Local midnight, not 24 hours: a run at 23:00 last night is
+            # yesterday's at 09:00 whatever the hour count says.
+            midnight = datetime.fromtimestamp(noon).replace(
+                hour=0, minute=0, second=0, microsecond=0).timestamp()
+            assert label(noon - midnight + 60).startswith("yesterday "), \
+                label(noon - midnight + 60)
+            assert label(30 * 86400).endswith("(30d ago)"), label(30 * 86400)
+            # A run from a previous year names the year; one from this year
+            # spends those characters on the weekday instead.
+            assert "2026" not in label(30 * 86400), label(30 * 86400)
+            assert "2025" in label(400 * 86400), label(400 * 86400)
+            # A stamp from the future is a clock disagreeing with itself, not a
+            # negative age.
+            assert label(-3600).endswith("(just now)"), label(-3600)
+
+            (hand / "run.env").unlink()
+            hand.rmdir()
 
             # A directory with none of those is not a run, and listing it as
             # `incomplete` paired it with a `./ri resume` that refuses it for
@@ -381,8 +493,16 @@ def self_check() -> None:
             assert continue_at < text.index(f"./ri resume {stopped.name}") < over_at, text
             assert over_at < text.index(f"./ri resume {bare.name}"), text
             # And the run that died before scoring anything reports 0, not the
-            # 7 directories its ranks left behind.
-            assert f"{bare.name:<29}  r2d2       incomplete  0" in text, text
+            # 7 directories its ranks left behind - beside the day it ran on,
+            # which is the column a run directory's name spells in UTC and
+            # nobody reads back as a time.
+            assert f"{bare.name:<29}  r2d2       incomplete      0  " in text, text
+            assert text.index("STARTED") < text.index(bare.name), text
+            for run_dir in (bare, stopped, done):
+                assert format_started(started_at(run_dir)) in text, run_dir
+            # Top of the table is the newest run, whichever imager it is.
+            assert text.index(bare.name) < text.index(stopped.name) < \
+                text.index(done.name), text
 
             # Half a summary.json is not a finished run: it is one nothing can
             # report on, merge or profile, and the unfinished list is where it

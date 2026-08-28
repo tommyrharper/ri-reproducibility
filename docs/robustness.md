@@ -315,11 +315,11 @@ without one stopped early. `./ri runs` is the list:
 
 ```console
 $ ./ri runs
-RUN                        ALGORITHM  STATUS      EVALS
-r2d2-vlaa-20260828T2054Z   r2d2       running     6882
-r2d2-vlaa-20260827T1015Z   r2d2       resumable   659
-r2d2-vlaa-20260827T0932Z   r2d2       incomplete  0
-wsclean-vlaa-20260827T09Z  wsclean    complete    1706
+RUN                        ALGORITHM  STATUS      EVALS  STARTED
+r2d2-vlaa-20260828T2054Z   r2d2       running      6882  today 21:54 (2h ago)
+r2d2-vlaa-20260827T1015Z   r2d2       resumable     659  yesterday 11:15 (1d ago)
+wsclean-vlaa-20260827T09Z  wsclean    complete     1706  yesterday 10:04 (1d ago)
+r2d2-vlaa-20260827T0932Z   r2d2       incomplete      0  yesterday 09:32 (1d ago)
 
 1 run still going. Check on it with:
   ./ri health r2d2-vlaa-20260828T2054Z
@@ -336,6 +336,10 @@ process is driving it, `resumable` when neither but a `.resume` file is, and
 `incomplete` when the run stopped before checkpointing anything.
 `./ri runs --incomplete` lists only the ones needing attention; `--json` is the
 machine-readable form.
+
+`STARTED` is that run's own UTC name read back as local time and an age, with
+the newest run at the top whichever imager it belongs to - sorting by name put
+every `wsclean-*` run below every `r2d2-*` one.
 
 `EVALS` counts evaluations that were *scored*, the same number `./ri health`
 calls `progress`. A directory with no `metrics.json` holds nothing and
