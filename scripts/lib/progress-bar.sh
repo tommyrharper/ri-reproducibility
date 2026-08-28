@@ -591,14 +591,20 @@ _ns_evidence_line() {
   pct=$((dead_now * 100 / total))
   [ "${pct}" -gt 100 ] && pct=100
   bar="$(_ns_render_bar "${pct}" 30)"
+  local note="(evidence tolerance, no --max-ndead cap)"
   if [ "$((total - dead_now))" -gt 0 ] && [ "${dead_now}" -gt 0 ]; then
     eta="$(_ns_format_hms $(((total - dead_now) * elapsed / dead_now)))"
   elif [ "${dead_now}" -ge "${total}" ]; then
-    eta="0:00:00"
+    # Not "eta 0:00:00". The total came from the last checkpoint and is as
+    # stale as it is, so a carried count reaching it means the estimate has
+    # been overtaken, not that the run is done - the live R2D2 search here sat
+    # past its own estimate for over three hours while still sampling. The
+    # same distinction `./ri health` draws on its forecast line.
+    note="(past the ~${total} estimate; the next checkpoint revises it)"
   fi
-  printf '[%s] ~%3d%%  ~%d/~%d dead points (%d evaluations)  elapsed %s  eta ~%s  (evidence tolerance, no --max-ndead cap)' \
+  printf '[%s] ~%3d%%  ~%d/~%d dead points (%d evaluations)  elapsed %s  eta ~%s  %s' \
     "${bar}" "${pct}" "${dead_now}" "${total}" "${eval_count}" \
-    "$(_ns_format_hms "${elapsed}")" "${eta}"
+    "$(_ns_format_hms "${elapsed}")" "${eta}" "${note}"
 }
 
 # The fraction of the banked evidence at which a run actually stops. Measured,
@@ -821,13 +827,19 @@ self_check() {
   # ...and with two of the four evaluations landing after that checkpoint, the
   # 10 banked over 2 carry forward to 20 - which is past the estimated total,
   # so the percent clamps at 100 rather than printing "111%" on a run that is
-  # about to stop anyway.
+  # about to stop anyway. The eta does *not* become 0:00:00: the total came
+  # from the checkpoint and is as stale as it is, so overtaking it means the
+  # estimate is out of date rather than that the run has finished.
   touch -t 202601010100 "${dead_file}"
   touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
   line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
   case "${line}" in
-    *"~100%"*"~20/~18 dead points"*"eta ~0:00:00"*) ;;
+    *"~100%"*"~20/~18 dead points"*"eta ~?"*"past the ~18 estimate; the next checkpoint revises it"*) ;;
     *) echo "FAIL: carried count past the estimated total: ${line}"; exit 1 ;;
+  esac
+  case "${line}" in
+    *"0:00:00"*|*"evidence tolerance"*)
+      echo "FAIL: past the estimate still claims it is done: ${line}"; exit 1 ;;
   esac
   touch "${dead_file}"
   # No dead points yet means no ndead/nlive to divide by - must fall back to

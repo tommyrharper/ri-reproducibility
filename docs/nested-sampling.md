@@ -351,7 +351,7 @@ have while one is still going:
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 113 dead points as of 0:08:18 ago, next at ~163
+  stage     sampling, 113 dead points as of 0:08:18 ago, next at 163+
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
@@ -476,6 +476,15 @@ What each line is reading, and why it is worth a line:
   appears only while the run is going: a finished or dead run's count will
   never move again, and promising it a next value is the one thing that would
   make its stale-by-design checkpoint read as work still to come.
+
+  It is written `163+` rather than `~163` because `nlive` is a floor on the
+  interval, not an estimate of it. Two throwaway WSClean searches here logged
+  every write: at `--nlive 20` the gaps ran 22, 23, 22, 26, 26 and 36 dead
+  points, and at `--nlive 50` they ran 51, 51, 52, 54 and 92 - never under
+  `nlive`, usually a little over, and largest for the write that ends the run.
+  A `~` invited the reading that a checkpoint which has not landed by then is
+  overdue, and on the live 16-rank R2D2 search here that reading was wrong for
+  hours at a stretch.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
@@ -638,6 +647,20 @@ What each line is reading, and why it is worth a line:
   it is printed with its own `~` whenever it differs from the checkpointed
   count. **stage** still reports the raw count with its age, which is the
   honest statement of what PolyChord last wrote down.
+
+  A carried count can walk past an estimated total, because the total is only
+  as fresh as the checkpoint it came from. The arithmetic then gives `~100%
+  done, ~452 of ~452 dead points` and no hours left, which the live 16-rank
+  R2D2 search here printed for over three hours while it was still sampling -
+  the one reading of this line that is flatly wrong. A run that has overtaken
+  its own estimate says so instead:
+
+  ```
+  forecast  past its ~452 dead-point estimate, set by the checkpoint 3:37:38 ago and revised by the next one
+  ```
+
+  An explicit `--max-ndead` is different and keeps the ordinary words: it is a
+  hard stop the sampler will honour, so 100% of it is the truth.
 
   Measured against a live wsclean search (`--nlive 5 --num-repeats 2
   --mpi-procs 3`, 48 dead points over six checkpoint writes): sampled once a

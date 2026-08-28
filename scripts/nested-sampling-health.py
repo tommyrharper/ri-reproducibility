@@ -1762,11 +1762,18 @@ def render(run: dict[str, object]) -> None:
     # for a run that is still going: a finished or dead run's count will never
     # move again, and promising a next value is the one thing that would make
     # its stale-by-design mtime read as work still to come.
+    #
+    # `nlive` is a floor on that interval, not an estimate of it, so the number
+    # carries a `+` rather than a `~`: measured over two throwaway WSClean
+    # searches here, the gap between writes ran 22-36 dead points at nlive=20
+    # and never came in under nlive. A `~` invited the opposite reading, that a
+    # checkpoint which had not landed by then was overdue - and that reading is
+    # wrong often enough to be worth not offering.
     next_update = ""
     if run["status"] in ("healthy", "stalled", "starting") \
             and settings.get("NS_NLIVE", "").isdigit() \
             and run["checkpoint_age_seconds"] is not None:
-        next_update = f", next at ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
+        next_update = f", next at {int(run['dead_points']) + int(settings['NS_NLIVE'])}+"
     lines = [
         # Only for a run this checkout did not start. The default report now
         # reaches every run with ranks on the host, and two worktrees' runs
@@ -1881,11 +1888,28 @@ def render(run: dict[str, object]) -> None:
         # total is exact and only the carried-forward count is an estimate.
         now = int(ahead["dead_points_now"])
         carried = "~" if now != int(ahead["dead_points"]) else ""
-        lines.append(("forecast",
-                      f"{about}{float(ahead['fraction']):.0%} done, "
-                      f"{carried}{now} of {about}{ahead['total_dead_points']} dead points"
-                      + (f", {about}{format_hours(float(left))} left "
-                         f"({about}{format_clock(float(left))})" if left else "")))
+        # An estimated total is only as fresh as the checkpoint it was computed
+        # from, and the carried-forward count can walk past it - at which point
+        # the arithmetic gives "~100% done, ~452 of ~452" and nothing left to
+        # run, which the live R2D2 search here printed for over three hours
+        # while it was still sampling. That is the one reading of this line
+        # that is flatly wrong, so a run that has overtaken its own estimate
+        # says so instead of claiming to be finished, and names the checkpoint
+        # that will revise it. Only a live run gets here at all: `describe`
+        # withholds the forecast entirely from one that has stopped.
+        if ahead["estimated"] and float(ahead["fraction"] or 0) >= 1.0:
+            age = run["checkpoint_age_seconds"]
+            lines.append(("forecast",
+                          f"past its ~{ahead['total_dead_points']} dead-point estimate"
+                          + (f", set by the checkpoint {format_hms(float(age))} ago"
+                             if age is not None else "")
+                          + " and revised by the next one"))
+        else:
+            lines.append(("forecast",
+                          f"{about}{float(ahead['fraction']):.0%} done, "
+                          f"{carried}{now} of {about}{ahead['total_dead_points']} dead points"
+                          + (f", {about}{format_hours(float(left))} left "
+                             f"({about}{format_clock(float(left))})" if left else "")))
     lines.append(("ranks", ranks))
     # Only for a run that still holds something. "0.0GB over 0 processes" is
     # what every finished run on disk would print, and none of them is the
@@ -2387,7 +2411,7 @@ def self_check() -> None:
             assert "3 dead points as of 0:10:0" in aged, aged
             # ...and where it will next move to, so a reader coming back has
             # something to compare against. nlive is 4 in this fixture.
-            assert "next at ~7" in aged, aged
+            assert "next at 7+" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report
@@ -2651,11 +2675,37 @@ def self_check() -> None:
             assert capped["forecast"]["estimated"] is False, capped["forecast"]
             assert "80% done, ~240 of 300 dead points, 0h50m left" in io_capture(capped)
             # ...and a carried count cannot run past the total and report more
-            # than 100% done on a run that is about to stop.
+            # than 100% done on a run that is about to stop. A --max-ndead is
+            # a hard stop the sampler will honour, so 100% of it is the truth
+            # and the line says so in the ordinary words.
             os.utime(fc / "chains" / "w_dead-birth.txt", (now - 11000, now - 11000))
             past = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
             assert past["forecast"]["dead_points_now"] == 300, past["forecast"]
             assert past["forecast"]["fraction"] == 1.0, past["forecast"]
+            assert "100% done, ~300 of 300 dead points" in io_capture(past), io_capture(past)
+
+            # An *estimated* total at 100% is a different claim, and a false
+            # one: the estimate came from a checkpoint that is now hours old,
+            # and the live R2D2 search here printed "~100% done, ~452 of ~452"
+            # for over three hours while it was still sampling. A run that has
+            # overtaken its own estimate says that instead of claiming to be
+            # done, and names the checkpoint that will revise it.
+            (fc / "run.env").write_text(
+                "NS_ALGORITHM=wsclean\nNS_MPI_PROCS=4\nNS_NLIVE=50\nNS_MAX_NDEAD=-1\n")
+            overshot = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
+            assert overshot["forecast"]["total_dead_points"] == 451, overshot["forecast"]
+            assert overshot["forecast"]["estimated"] is True, overshot["forecast"]
+            assert overshot["forecast"]["fraction"] == 1.0, overshot["forecast"]
+            shown = io_capture(overshot)
+            assert re.search(r"forecast +past its ~451 dead-point estimate, set by the "
+                             r"checkpoint \d+:\d\d:\d\d ago and revised by the next one",
+                             shown), shown
+            assert "% done" not in shown, shown
+            # Only a live run says any of this: a stopped one is not waiting
+            # for a checkpoint that will never come, and `describe` withholds
+            # its forecast altogether rather than the render doing it again.
+            stopped_shown = io_capture(describe(fc, [], DEFAULT_STALE_SECONDS))
+            assert "forecast" not in stopped_shown, stopped_shown
             os.utime(fc / "chains" / "w_dead-birth.txt", (now, now))
 
             # Inside the first e-fold the live set is still the prior, so the
@@ -2870,7 +2920,7 @@ def self_check() -> None:
             shutil.rmtree(fresh)
             # A stalled run's count can still move; a stopped one's cannot, so
             # only the first may say where it will move to.
-            assert "next at ~7" in io_capture(describe(live, ranks, 5.0))
+            assert "next at 7+" in io_capture(describe(live, ranks, 5.0))
             assert "next at" not in io_capture(describe(live, [], 5.0))
             # ...and once it finishes, neither is true however old it gets.
             (live / "summary.json").write_text("{}")
