@@ -256,6 +256,10 @@ so the rank that asked for that simulate blocked forever, and because PolyChord
 keeps every rank in the same collective, the other 19 burned a core each behind
 it. A 20-rank run left overnight came back stopped rather than finished.
 
+Those burning ranks are not the symptom: a rank blocked in a collective spins
+whether its peer is wedged or imaging perfectly normally, so the count on its
+own says nothing. "Is the run healthy?" below has the measurements.
+
 Three bounds now stand in the way, each one shorter than the one outside it:
 
 | Bound | Where | What it does when it expires |
@@ -293,6 +297,15 @@ Counting those files is the honest way to ask how much a run is paying:
 R=$(ls -1dt results/nested-sampling/wsclean-* | head -1)
 cat "$R"/evaluations/*/meqserver-wedged.log 2>/dev/null | wc -l
 ```
+
+If a wedge ever gets past all three, one of the bounds has a bug, and
+`./ri health` reports it as ranks burning CPU with nothing completing. To
+localise it by hand: the stuck evaluation is the old `evaluations/eval-*`
+directory with no `metrics.json` and two zero-byte simulate logs, and the rank
+waiting on it is the one holding that worker's FIFO pair open, so
+`ls -l /proc/<pid>/fd` matched against `.simulate-workers/<n>` names the
+worker. The deadlock itself is that worker and its `meqserver` child both
+parked in `futex_wait_queue_me` at 0% CPU.
 
 ### Is the run healthy?
 
