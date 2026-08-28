@@ -987,10 +987,31 @@ Continue where it left off, keeping every evaluation already done:
 
 `./ri resume <run>` continues it in place. No flags: each run records what it
 was started with (`run.env`, written at startup, holding the values actually
-used - including a rank count the memory guard clamped), so a resume cannot
-silently become a different search. PolyChord's own checkpointing supplies the
-live points and the evaluations already on disk are adopted, so their ids
-carry on and no point is paid for twice.
+used), so a resume cannot silently become a different search. PolyChord's own
+checkpointing supplies the live points and the evaluations already on disk are
+adopted, so their ids carry on and no point is paid for twice.
+
+The one setting a resume does not replay verbatim is the rank count. What
+`run.env` holds there is the memory guard's own output from when the run
+started, not a number anyone chose, and on a shared host the memory that was
+free yesterday is another session's run today - so `./ri resume` puts it back
+through `ns_budget_ranks` (scripts/lib/rank-budget.sh) and says what it did:
+
+```console
+$ ./ri resume wsclean-vlaa-20260828T0221Z
+NOTE: wsclean ranks 3 -> 1 (4400MB available, 0MB reserved by other runs, 200MB per rank)
+Resuming wsclean-vlaa-20260828T0221Z (wsclean, 31 evaluations already done, 1 rank)
+```
+
+Clamping down is free: the checkpoint carries live points, not ranks, and the
+run above finished normally after dropping from 3 ranks to 1. Without it a
+16-rank R2D2 run - 53GB - resumed onto a busy host has every rank that does
+not fit OOM-killed, and an OOM-killed worker is scored `FAILURE_OBJECTIVE`,
+which PolyChord maximizes: the run does not fail, it reports the corner of the
+parameter space where it ran out of memory as its best discovery. A resume
+that cannot afford even one rank stops here rather than at evaluation 1.
+`--mpi-procs` on `./ri search` is still obeyed as typed and only warned about
+- the difference is that a resume did not type anything.
 
 `STATUS` is `complete` when `summary.json` is there, `running` when the run
 still has a process driving it, `resumable` when neither but a PolyChord
