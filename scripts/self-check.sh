@@ -12,10 +12,11 @@
 # libraries - no rebuild needed to check a change. A run executes the copy baked
 # into the image instead, so rebuild before running one.
 #
-# All but the last of these start no search. The self-heal check does - four ~45
+# All but the last of these start no search. The self-heal check does - five ~45
 # second, ~0.6GB WSClean searches: one killed, one hung by freezing a rank, one
-# killed with no retries left and resumed by hand, and one whose workers are
-# killed under it, each watched until it recovers - because the thing it checks
+# killed with no retries left and resumed by hand, one whose workers are killed
+# under it, and one whose sidecar container is removed, each watched until it
+# recovers - because the thing it checks
 # only exists in a real run. It is safe alongside another run:
 # 3 ranks at ~200MB, sized and refused by scripts/lib/rank-budget.sh like any
 # other, on a throwaway directory the report and `./ri runs` never see.

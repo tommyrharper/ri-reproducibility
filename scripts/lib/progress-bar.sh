@@ -242,6 +242,21 @@ run_with_retries() {
       done
       args=("${rescaled[@]}")
     fi
+    # The containers are started once, in front of this loop, so a sidecar that
+    # died takes every remaining attempt with it: the `docker exec` fails
+    # instantly, the attempt scores nothing, and the guard above stops the run
+    # for looking deterministic - which it is, until the container is back.
+    # Defined by start-sidecars.sh, which every real search sources and no
+    # fixture does, so the retry loop stays runnable on its own.
+    # Teed into run.log for the same reason the messages below are: run.log is
+    # the only artifact that says why a run stopped, and a restart that had to
+    # replace a container first is part of that. `|| true` so a relaunch that
+    # fails does not take the run script out through `set -e` without a word -
+    # the docker error is in the log, and the attempt that follows it stops on
+    # the guard above.
+    if declare -F sidecar_restore >/dev/null; then
+      sidecar_restore 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
+    fi
     attempt=$((attempt + 1))
     # An index of the restarts, next to run.log which holds the tracebacks
     # themselves. Its own file because `./ri health` wants the count of a run
@@ -912,6 +927,23 @@ self_check() {
   # ./ri health counts its restarts from this file, one line per retry.
   [ "$(_ns_count_lines "${retry_dir}/restarts.log")" = "2" ] || {
     echo "FAIL: restarts.log has $(_ns_count_lines "${retry_dir}/restarts.log") lines, want 2"
+    exit 1
+  }
+
+  # Every retry gives the sidecars a chance to come back first. A container
+  # that died takes every later attempt with it - the `docker exec` fails
+  # instantly and the no-progress guard above then calls the run
+  # deterministic - so the hook has to fire once per retry, not once per run.
+  # Called by name because start-sidecars.sh is sourced by the run scripts and
+  # not by this file, which keeps the retry loop runnable without docker.
+  local hook_dir="${tmp}/hook"
+  mkdir -p "${hook_dir}/chains"
+  sidecar_restore() { echo r >>"${hook_dir}/restores"; }
+  run_with_retries 2 "${hook_dir}" -1 2 -- sh -c "${progressing}" "${hook_dir}" \
+    >/dev/null 2>&1 || true
+  unset -f sidecar_restore
+  [ "$(_ns_count_lines "${hook_dir}/restores")" = "2" ] || {
+    echo "FAIL: sidecar_restore called $(_ns_count_lines "${hook_dir}/restores") times, want 2"
     exit 1
   }
 

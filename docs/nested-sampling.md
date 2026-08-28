@@ -1008,7 +1008,7 @@ can act on, instead of hanging it.
 
 `./ri self-check self-heal` is the end-to-end check of all of the above, and
 it is part of `./ri self-check`. It starts a real WSClean search on a throwaway
-directory and breaks it four times, in the four ways that recover through
+directory and breaks it five times, in the five ways that recover through
 different machinery:
 
 - **`SIGKILL` once it has scored 8 evaluations** - fewer than `--nlive`, so the
@@ -1031,6 +1031,14 @@ different machinery:
   is absorbed inside the evaluation by the retry loops in `common.py`, so the
   assertion is that the run finishes with `restarts.log` never written. It did
   not - see `worker_send` below.
+- **`docker rm --force` on a fifth search's WSClean sidecar**, which is the
+  container going away rather than what is inside it - an OOM kill of its main
+  process, a daemon restart, a stray `docker rm`. This one does cost a restart:
+  there is nowhere left to start a replacement worker, so the run dies and the
+  retry loop is what has to fix it. Before `sidecar_restore` it could not: the
+  containers are started once, in front of the loop, so every attempt after the
+  removal `docker exec`ed into a name that no longer existed, scored nothing,
+  and the run stopped for good at exit 1 with no `summary.json`.
 
 The first two assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes
@@ -1048,9 +1056,12 @@ evaluations already on disk (its own "N evaluations already done" count) and
 finishes the search - after which resuming again is a no-op rather than a
 second job over the same chains. The fourth asserts that nothing happened at
 all beyond a gap: the search finishes, more evaluations land after the kill
-than before it, and no restart was spent. The
+than before it, and no restart was spent. The fifth asserts the search finishes
+anyway and that the `sidecar_restore:` line naming the missing container is in
+its `run.log` - a run that finished for some other reason would leave a
+`summary.json` too. The
 wait for recovery is bounded, because the failure it is most likely to catch is
-a hang rather than an exit. ~4 minutes and ~0.6GB, so it is safe to run beside
+a hang rather than an exit. ~5 minutes and ~0.6GB, so it is safe to run beside
 another search. Fixtures cannot stand in for it - every bug found in this
 machinery so far (the retry reading a checkpoint-frozen counter, the stall
 accounting refusing to excuse a run's own restart, the restart colliding with
@@ -1079,13 +1090,32 @@ whose workers were killed at 10 evaluations: before, the job aborted and
 `run_with_retries` spent a restart to reach the same 54 evaluations; after, it
 finished with no restart at all.
 
-Still open: the same reproduction with the *container* removed rather than its
-workers (`docker rm -f` on a sidecar) now ends cleanly as `WORKER_DIED` instead
-of a traceback, but it cannot heal - `run-nested-sampling.sh` starts the
-sidecars once, before `run_with_retries`, so every restart lands on the same
-missing container, scores nothing, and stops. Re-launching a container that has
-gone before the next attempt is the fix, and it needs `sidecar_launch` to
-remember each container's own `docker run` arguments.
+#### A sidecar container that went away
+
+The same reproduction with the *container* removed rather than its workers
+(`docker rm -f` on a sidecar, or its main process OOM-killed, or the daemon
+restarted) ends cleanly as `WORKER_DIED` rather than a traceback, but there is
+nowhere to start a replacement worker, so the evaluation cannot absorb it and
+the run dies. That part is correct; what was not is that it could not be
+restarted either. The containers are started once, in front of
+`run_with_retries`, so every attempt after the removal `docker exec`ed into a
+name that no longer existed, scored no evaluation, and the retry loop's
+anti-spin guard - "the attempt that just failed scored no evaluations, so
+another one fails the same way" - stopped the run for good. Measured on a real
+search with its WSClean sidecar removed at 13 evaluations: exit 1, no
+`summary.json`.
+
+`sidecar_launch` in `scripts/lib/start-sidecars.sh` now keeps each container's
+own `docker run` arguments, and `sidecar_restore` - called by
+`run_with_retries` before each retry - starts any container that is gone again,
+under the same name, so the command the ranks are re-run with still finds it.
+Only missing containers are touched, so an ordinary restart costs one
+`docker inspect` per container, and the line naming a container it had to start
+again is teed into `run.log` beside the restart itself. Re-launching is safe because the containers
+hold no run state: the workers inside them are started on demand by the ranks
+over FIFOs on the bind mount, and a restart's ranks start their own anyway.
+Same search, after: it restarted once and finished at 54 evaluations. Scenario
+five of `./ri self-check self-heal` is that search.
 
 ### Finding and resuming a run that stopped
 

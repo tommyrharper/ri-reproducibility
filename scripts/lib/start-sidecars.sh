@@ -42,6 +42,7 @@
 # .pyc, and the images now compile them at build time instead.
 SIDECAR_NAMES=()
 _SIDECAR_PIDS=()
+_SIDECAR_COMMANDS=()
 _SIDECAR_JSON=""
 
 # Backgrounded: `docker rm --force` of the three containers costs ~0.4s, and
@@ -89,14 +90,21 @@ sidecar_launch() {
   if [ "${#command[@]}" -gt 1 ]; then
     entrypoint_args=("${command[@]:1}")
   fi
-  docker run --detach --rm --name "${name}" \
-    ${label[@]+"${label[@]}"} \
-    --network none \
-    --shm-size 512m \
-    --platform "${platform}" \
-    -v "${REPO_ROOT}:${REPO_ROOT}" \
-    ${args[@]+"${args[@]}"} \
-    --entrypoint "${command[0]}" "${image}" ${entrypoint_args[@]+"${entrypoint_args[@]}"} >/dev/null &
+  local -a run=(
+    docker run --detach --rm --name "${name}"
+    ${label[@]+"${label[@]}"}
+    --network none
+    --shm-size 512m
+    --platform "${platform}"
+    -v "${REPO_ROOT}:${REPO_ROOT}"
+    ${args[@]+"${args[@]}"}
+    --entrypoint "${command[0]}" "${image}" ${entrypoint_args[@]+"${entrypoint_args[@]}"}
+  )
+  # Kept so `sidecar_restore` can start this exact container again. Quoted with
+  # %q into one string because bash has no array of arrays; nothing else reads
+  # it, so the eval that replays it only ever sees this shell's own quoting.
+  _SIDECAR_COMMANDS+=("$(printf '%q ' "${run[@]}")")
+  "${run[@]}" >/dev/null &
   _SIDECAR_PIDS+=("$!")
   SIDECAR_NAMES+=("${SIDECAR_NAME}")
   _SIDECAR_JSON="${_SIDECAR_JSON}${_SIDECAR_JSON:+,}\"${image}\":\"${SIDECAR_NAME}\""
@@ -113,6 +121,40 @@ sidecar_launch() {
   trap '_sidecar_remove' EXIT
   trap '_sidecar_remove; exit 130' INT
   trap '_sidecar_remove; exit 143' TERM
+}
+
+# Start any of this run's containers that has gone away again, under the same
+# name and the same `docker run` arguments, and wait for them.
+#
+# The containers are started once, before `run_with_retries`, so a container
+# that dies - the OOM killer taking its whole cgroup, a stray `docker rm`, a
+# daemon restart - is the one failure the retry loop could not heal: every
+# attempt after it `docker exec`s into a name that no longer exists, scores no
+# evaluation, and the run stops on "the attempt scored no evaluations, so
+# another one fails the same way". Re-launching is safe precisely because the
+# containers hold no run state: the workers inside them are started on demand
+# by the ranks over FIFOs on the bind mount, and a restart's ranks start their
+# own anyway (see run_with_retries in progress-bar.sh).
+#
+# Only containers that are actually gone are touched, so a normal restart -
+# by far the common case - costs one `docker inspect` each and changes nothing.
+sidecar_restore() {
+  local i restarted=0
+  for i in "${!SIDECAR_NAMES[@]}"; do
+    if [ "$(docker inspect --format '{{.State.Running}}' "${SIDECAR_NAMES[$i]}" 2>/dev/null)" = "true" ]; then
+      continue
+    fi
+    echo "sidecar_restore: ${SIDECAR_NAMES[$i]} is gone, starting it again" >&2
+    # `--rm` leaves nothing behind on a clean death, but a container the daemon
+    # still has a record of (created, exited, being removed) keeps the name.
+    docker rm --force "${SIDECAR_NAMES[$i]}" >/dev/null 2>&1 || true
+    eval "${_SIDECAR_COMMANDS[$i]}" >/dev/null &
+    _SIDECAR_PIDS+=("$!")
+    restarted=1
+  done
+  if [ "${restarted}" = 1 ]; then
+    sidecar_wait
+  fi
 }
 
 sidecar_wait() {
@@ -162,6 +204,39 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   OUTPUT_DIR=/some/run sidecar_launch linux/amd64 img:d
   sidecar_wait
   grep -q -- '--label ri.run-dir=/some/run' "${_log}"
+
+  # sidecar_restore starts the containers that are gone again - under the same
+  # name, because the run command already holds it - and leaves the running
+  # ones alone. Without it, a retry after a container died `docker exec`s into
+  # a name that no longer exists, scores nothing, and the run stops.
+  SIDECAR_NAMES=()
+  _SIDECAR_PIDS=()
+  _SIDECAR_COMMANDS=()
+  _SIDECAR_JSON=""
+  _gone=""
+  docker() {
+    printf '%s\n' "$*" >>"${_log}"
+    if [ "$1" = inspect ]; then
+      case " $* " in *" ${_gone} "*) return 1 ;; esac
+      echo true
+    fi
+  }
+  OUTPUT_DIR=/some/run sidecar_launch linux/amd64 img:e -v /sock:/sock
+  OUTPUT_DIR=/some/run sidecar_launch linux/amd64 img:f
+  sidecar_wait
+  : >"${_log}"
+  sidecar_restore
+  grep -q -- 'run --detach' "${_log}" && {
+    echo "FAIL: restarted a sidecar that was still running"; exit 1
+  }
+  _gone="${SIDECAR_NAMES[1]}"
+  : >"${_log}"
+  sidecar_restore 2>/dev/null
+  grep -q -- "run --detach --rm --name ${SIDECAR_NAMES[1]} .*--entrypoint sleep img:f" "${_log}" \
+    || { echo "FAIL: a sidecar that is gone was not started again"; exit 1; }
+  grep -q -- 'img:e' "${_log}" && {
+    echo "FAIL: restarted the sidecar that was still running"; exit 1
+  }
   rm -f "${_log}"
   echo "start-sidecars self-check passed"
 fi

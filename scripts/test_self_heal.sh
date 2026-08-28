@@ -11,7 +11,7 @@
 # fixture and obvious to a real kill. So: start a real search, break it, and
 # assert it finishes anyway.
 #
-# Four ways of breaking it, because they recover through different machinery.
+# Five ways of breaking it, because they recover through different machinery.
 # A SIGKILL is the crash `run_with_retries` was written for - the run exits and
 # the loop sees a status. A frozen rank is the failure it cannot see: PolyChord
 # calls the likelihood from Fortran, so one rank that stops answering leaves
@@ -35,7 +35,17 @@
 # BrokenPipeError unwound out of the likelihood into MPI_Abort, ending the run
 # and spending a restart on every one.
 #
-# ~4 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
+# The fifth breaks the run from underneath rather than inside: one of the
+# containers the ranks `docker exec` into is removed, which the OOM killer, a
+# daemon restart or a stray `docker rm` all do. The containers are started once,
+# in front of the retry loop, so this used to be the one failure retrying could
+# not fix - every later attempt exec'd into a name that no longer existed,
+# scored nothing, and the run stopped for looking deterministic. Measured: the
+# search died at exit 1 with no summary.json. `sidecar_restore` in
+# scripts/lib/start-sidecars.sh starts the missing container again, under the
+# same name, before each retry.
+#
+# ~5 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
 # the report never see. WSClean rather than R2D2 because it reaches its first
 # checkpoint in ~15s where R2D2 takes over an hour.
 set -euo pipefail
@@ -51,6 +61,7 @@ OUT="${REPO_ROOT}/results/.self-heal-check-$$"
 HUNG_OUT="${REPO_ROOT}/results/.self-heal-hang-check-$$"
 RESUME_OUT="${REPO_ROOT}/results/.self-heal-resume-check-$$"
 WORKER_OUT="${REPO_ROOT}/results/.self-heal-worker-check-$$"
+SIDECAR_OUT="${REPO_ROOT}/results/.self-heal-sidecar-check-$$"
 # Deliberately fewer than `--nlive`, so the kill lands before PolyChord has
 # written its first `.resume` - the regime that was broken. A run killed after
 # one takes the same path with strictly more on disk to adopt.
@@ -75,11 +86,13 @@ cleanup() {
   pkill -9 -f "polychord_wsclean.py --output-dir ${HUNG_OUT}" 2>/dev/null || true
   pkill -9 -f "polychord_wsclean.py --output-dir ${RESUME_OUT}" 2>/dev/null || true
   pkill -9 -f "polychord_wsclean.py --output-dir ${WORKER_OUT}" 2>/dev/null || true
+  pkill -9 -f "polychord_wsclean.py --output-dir ${SIDECAR_OUT}" 2>/dev/null || true
   if [ -n "${PASSED}" ]; then
     rm -rf "${OUT}" "${OUT}.log" "${HUNG_OUT}" "${HUNG_OUT}.log" \
-      "${RESUME_OUT}" "${RESUME_OUT}.log" "${WORKER_OUT}" "${WORKER_OUT}.log"
+      "${RESUME_OUT}" "${RESUME_OUT}.log" "${WORKER_OUT}" "${WORKER_OUT}.log" \
+      "${SIDECAR_OUT}" "${SIDECAR_OUT}.log"
   else
-    echo "self-heal: left ${OUT}*, ${HUNG_OUT}*, ${RESUME_OUT}* and ${WORKER_OUT}* for inspection" >&2
+    echo "self-heal: left ${OUT}*, ${HUNG_OUT}*, ${RESUME_OUT}*, ${WORKER_OUT}* and ${SIDECAR_OUT}* for inspection" >&2
   fi
   return 0
 }
@@ -386,6 +399,55 @@ worker_after="$(completed_evals "${WORKER_OUT}")"
   || fail "no evaluation completed after the workers were killed (${worker_before} then ${worker_after})"
 
 echo "self-heal: workers killed at ${worker_before} evaluations, retried in place and finished at ${worker_after}"
+
+# Scenario five: the container the workers live in is removed while the run is
+# using it. Unlike scenario four this cannot be absorbed inside the evaluation -
+# there is nowhere to start a replacement worker - so the run does die and does
+# spend a restart. What is being checked is that the restart lands somewhere:
+# before `sidecar_restore`, every attempt after the removal `docker exec`ed
+# into a name that no longer existed and scored nothing, so the run stopped for
+# good at exit 1 with no summary.json.
+echo "self-heal: starting a fifth wsclean search in ${SIDECAR_OUT}"
+"${REPO_ROOT}/ri" search wsclean \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 --no-build \
+  --output-dir "${SIDECAR_OUT}" >"${SIDECAR_OUT}.log" 2>&1 &
+SEARCH_PID=$!
+
+for _ in $(seq 1 120); do
+  [ "$(completed_evals "${SIDECAR_OUT}")" -ge "${KILL_AFTER_EVALS}" ] && break
+  kill -0 "${SEARCH_PID}" 2>/dev/null || fail "fifth search exited before scoring ${KILL_AFTER_EVALS} evaluations; see ${SIDECAR_OUT}.log"
+  sleep 1
+done
+sidecar_before="$(completed_evals "${SIDECAR_OUT}")"
+[ "${sidecar_before}" -ge "${KILL_AFTER_EVALS}" ] \
+  || fail "only ${sidecar_before} evaluations after 120s; see ${SIDECAR_OUT}.log"
+
+# This run's own label again, so no other search on this host is touched.
+sidecar_name="$(docker ps --filter "label=ri.run-dir=${SIDECAR_OUT}" \
+  --format '{{.Names}}\t{{.Image}}' | grep -i wsclean | cut -f1)"
+[ -n "${sidecar_name}" ] || fail "no wsclean sidecar labelled for ${SIDECAR_OUT}"
+echo "self-heal: removing the sidecar ${sidecar_name} at ${sidecar_before} evaluations"
+docker rm --force "${sidecar_name}" >/dev/null || fail "could not remove ${sidecar_name}"
+
+wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
+  || fail "the search neither finished nor died within ${RECOVER_TIMEOUT_SECONDS}s of losing its sidecar; see ${SIDECAR_OUT}.log"
+wait "${SEARCH_PID}" && sidecar_status=0 || sidecar_status=$?
+SEARCH_PID=""
+[ "${sidecar_status}" -eq 0 ] \
+  || fail "the search did not survive losing its sidecar (exit ${sidecar_status}); see ${SIDECAR_OUT}.log"
+[ -f "${SIDECAR_OUT}/summary.json" ] || fail "run finished with no summary.json"
+# Asserted as well as the finish, because a run that happened to be told to
+# stop by something else would also produce a summary: this is the line that
+# says the missing container is what came back. In run.log rather than the
+# terminal capture, because run.log is the artifact a stopped run is diagnosed
+# from and the restore is part of why it restarted.
+grep -q "sidecar_restore: .* starting it again" "${SIDECAR_OUT}/run.log" \
+  || fail "nothing restarted the removed sidecar; see ${SIDECAR_OUT}/run.log"
+sidecar_after="$(completed_evals "${SIDECAR_OUT}")"
+[ "${sidecar_after}" -gt "${sidecar_before}" ] \
+  || fail "no evaluation completed after the sidecar was removed (${sidecar_before} then ${sidecar_after})"
+
+echo "self-heal: sidecar removed at ${sidecar_before} evaluations, started again and finished at ${sidecar_after}"
 
 PASSED=1
 echo "self-heal check passed"
