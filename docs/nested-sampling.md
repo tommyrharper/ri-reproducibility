@@ -352,6 +352,7 @@ have while one is still going:
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   stage     sampling, 113 dead points as of 0:08:18 ago, next at 163+
+  at risk   184 evaluations scored since that checkpoint, 0:08:18 of imaging a restart would redo
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
@@ -485,6 +486,25 @@ What each line is reading, and why it is worth a line:
   A `~` invited the reading that a checkpoint which has not landed by then is
   overdue, and on the live 16-rank R2D2 search here that reading was wrong for
   hours at a stretch.
+- **at risk** - what standing behind that checkpoint would cost, which is the
+  half of `0:08:18 ago` a reader cannot work out alone: the evaluations scored
+  since the checkpoint, and the imaging time they took. A restart or a
+  `./ri resume` picks the sampler up at the checkpoint's dead points and images
+  its way back over different proposals, so none of that work is reused.
+  Measured, because the opposite is true of the other case and is written into
+  `polychord_r2d2.py`: a WSClean search killed after its checkpoint and resumed
+  shared exactly the 122 evaluations it had scored before the kill with an
+  uninterrupted control from the same seed, and *none* of the 146 it scored
+  after the resume. The seed makes a run deterministic from its start, which is
+  what makes a restart with no `.resume` file free - it redraws the same points
+  and the point cache answers them - but a resume re-seeds and then skips ahead
+  to the checkpoint, so the stream no longer lines up with the points on disk.
+  Downtime inside the window comes out of the time, the same way it comes out
+  of every rate here. Reported and **never warned on**: on a healthy run this
+  only grows until the next checkpoint lands, and there is nothing to do about
+  it - four hours of it on the 16-rank R2D2 search here was the ordinary
+  end-of-run shape, not a fault. A finished run does not print it, having
+  nothing left to redo.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near

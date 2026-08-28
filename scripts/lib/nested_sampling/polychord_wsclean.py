@@ -399,6 +399,13 @@ def main() -> None:
     # FileExistsError and the rest hung forever in a collective that never
     # completed. Sampling from scratch is cheap here anyway - PolyChord redraws
     # the same points from the same seed and the cache answers without imaging.
+    # That holds only for the from-scratch case, and measurably so: a killed
+    # WSClean search and an uninterrupted control from the same seed shared
+    # exactly the 122 evaluations scored before the kill, and none of the 146
+    # scored after a *resume*. A resume re-seeds and then skips ahead to the
+    # checkpoint, so the stream no longer lines up with the points on disk and
+    # the cache answers none of the stretch being redone - which is what
+    # `./ri health`'s `at risk` line puts a number on.
     done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
     if done:
         where = (f"resuming from {resume_path}" if settings.read_resume

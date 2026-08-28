@@ -96,6 +96,15 @@ Four things it checks, each one a way a run has actually gone wrong here:
   interval, which otherwise freezes it for two hours at a time on a 16-rank
   R2D2 search.
 
+* **What a restart would cost.** The other half of that checkpoint interval:
+  everything scored since the checkpoint is work a restart or a `./ri resume`
+  has to do again. Measured rather than assumed - a killed WSClean search and
+  an uninterrupted control from the same seed shared every evaluation before
+  the kill and none of the 146 after the resume, because a resume re-seeds and
+  then skips ahead, so the point cache cannot answer for the stretch it is
+  redoing. Four hours of it on the live R2D2 search here, and nothing else in
+  the report could see it.
+
 With no argument it reports every run with ranks on this *host*, found in the
 process list rather than by globbing this checkout - several worktrees share
 this machine, and from one of them the biggest consumer of the host block below
@@ -872,10 +881,32 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
                       if sample else None)
     rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
 
+    # What a restart would cost. PolyChord picks up at the checkpoint's dead
+    # points, so everything scored since is off the sampler's books - and it is
+    # imaged again from nothing, because the point cache cannot answer for it.
+    # Measured, because the opposite is written in polychord_r2d2.py and is
+    # true of the other case: a killed WSClean search resumed from its
+    # checkpoint and an uninterrupted control from the same seed shared exactly
+    # the 122 evaluations the kill preceded and none of the 146 after it. The
+    # seed makes a run deterministic from its start, which is what makes a
+    # restart with no resume file free; a resume re-seeds and then skips ahead,
+    # so the stream it draws from no longer lines up with the points on disk.
+    banked = bisect.bisect_right(times, checkpoint) if checkpoint else len(times)
+    at_risk_seconds = None
+    if checkpoint and len(times) > banked:
+        # To the last evaluation rather than to now, so a stopped run reports
+        # the work it is holding rather than growing it while nobody runs it,
+        # and minus any downtime inside the window for the same reason every
+        # other duration here drops it.
+        at_risk_seconds = (times[-1] - checkpoint
+                           - sum(gap for start, gap, skip in zip(times, gaps, explained)
+                                 if skip and start >= checkpoint))
+
     return {
         "completed": len(times),
-        "completed_by_checkpoint": (bisect.bisect_right(times, checkpoint)
-                                    if checkpoint else len(times)),
+        "completed_by_checkpoint": banked,
+        "at_risk": len(times) - banked if checkpoint else 0,
+        "at_risk_seconds": at_risk_seconds,
         "in_flight": directories - len(times),
         "failed": failed,
         "last_activity_seconds": time.time() - times[-1] if times else None,
@@ -1798,6 +1829,21 @@ def render(run: dict[str, object]) -> None:
                   + (f" as of {format_hms(float(run['checkpoint_age_seconds']))} ago"
                      f"{next_update}"
                      if run["checkpoint_age_seconds"] is not None else "")),
+        # ...and what standing behind that checkpoint costs, which is the half
+        # of "3:53 ago" nobody can work out for themselves. A restart carries
+        # on from the checkpoint's dead points and re-images its way back with
+        # different proposals - the seed that makes a from-scratch restart free
+        # is re-drawn from the top on a resume, so the point cache answers none
+        # of it (measured: a killed WSClean search and an uninterrupted control
+        # from the same seed shared every evaluation before the kill and none
+        # after the resume). Not a warning: on a healthy run this only ever
+        # grows until the next checkpoint lands, and there is nothing to do
+        # about it. Withheld from a finished run, which has nothing to redo.
+        *([("at risk", f"{run['at_risk']} evaluations scored since that checkpoint"
+                       + (f", {format_hms(float(run['at_risk_seconds']))} of imaging "
+                          "a restart would redo"
+                          if run["at_risk_seconds"] else ""))]
+          if int(run["at_risk"] or 0) and run["status"] != "finished" else []),
         # Directories without a metrics.json are evaluations in flight only
         # while something is still flying them. On a run with no ranks left
         # they are what the ranks were holding when it died, and calling those
@@ -2627,6 +2673,10 @@ def self_check() -> None:
             # evaluation, so the position is the checkpoint's own count and
             # prints without a tilde of its own.
             assert report["completed_by_checkpoint"] == 60, report
+            # Nothing behind the checkpoint either, so no restart exposure to
+            # report and no line for it.
+            assert report["at_risk"] == 0 and report["at_risk_seconds"] is None, report
+            assert "at risk" not in shown, shown
             assert ahead["dead_points_now"] == 200, ahead
             assert "~44% done, 200 of ~451 dead points, ~4h11m left" in shown, shown
             # The same wait as a clock time, so nobody has to add four hours to
@@ -2664,6 +2714,12 @@ def self_check() -> None:
             os.utime(fc / "chains" / "w_dead-birth.txt", (now - 2000, now - 2000))
             carried = describe(fc, fc_ranks, DEFAULT_STALE_SECONDS)
             assert carried["completed_by_checkpoint"] == 50, carried
+            # Ten of the sixty landed after the checkpoint, over the 2000s it
+            # has been standing.
+            assert carried["at_risk"] == 10, carried
+            assert abs(float(carried["at_risk_seconds"]) - 2000) < 1, carried
+            assert ("at risk   10 evaluations scored since that checkpoint, 0:33:20 "
+                    "of imaging a restart would redo" in io_capture(carried)), io_capture(carried)
             assert carried["dead_points"] == 200, carried
             assert carried["forecast"]["dead_points_now"] == 240, carried["forecast"]
             # The total still comes from the checkpoint's own ndead, because
@@ -3339,6 +3395,51 @@ def self_check() -> None:
             assert abs(float(mixed["stall_seconds"]) - 15) < 0.1, mixed
             assert abs(float(mixed["stall_fraction"]) - 15 / 27) < 0.01, mixed
             assert "15s = 55.6% of running time" in io_capture(mixed), io_capture(mixed)
+
+            # What a restart would throw away: the evaluations scored since the
+            # checkpoint, and the time they took. Measured against a real
+            # killed-and-resumed WSClean search, whose post-resume evaluations
+            # had nothing in common with an uninterrupted control from the same
+            # seed - so this work is re-imaged rather than served from the
+            # point cache. Ten evaluations either side of a checkpoint 60s old,
+            # with 21s of that spent stopped: 14s of imaging is at risk, not
+            # the 35s of wall clock, for the same reason every rate here drops
+            # a restart's downtime.
+            risky = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260103T002500Z"
+            (risky / "chains").mkdir(parents=True)
+            birth = risky / "chains" / "w_dead-birth.txt"
+            birth.write_text("x\n" * 20)
+            os.utime(birth, (now - 60, now - 60))
+            for i in range(5):
+                write_eval(risky, i + 1, now - 90 + i)   # before the checkpoint
+            for i in range(5):
+                write_eval(risky, i + 6, now - 50 + i)   # ...and after it
+            write_eval(risky, 11, now - 25)              # a 20s stop inside the window
+            _restart_at(risky, now - 45)
+            exposed = describe(risky, [], DEFAULT_STALE_SECONDS)
+            assert exposed["completed_by_checkpoint"] == 5, exposed
+            assert exposed["at_risk"] == 6, exposed
+            assert abs(float(exposed["at_risk_seconds"]) - 14) < 0.1, exposed
+            assert ("at risk   6 evaluations scored since that checkpoint, 0:00:14 of "
+                    "imaging a restart would redo" in io_capture(exposed)), io_capture(exposed)
+            # Without the restart the same window is the full 35s.
+            (risky / "restarts.log").unlink()
+            whole_window = describe(risky, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(whole_window["at_risk_seconds"]) - 35) < 0.1, whole_window
+            # A finished run has nothing to redo, whatever it left behind its
+            # own last checkpoint.
+            (risky / "summary.json").write_text("{}\n")
+            done_now = describe(risky, [], DEFAULT_STALE_SECONDS)
+            assert done_now["status"] == "finished" and done_now["at_risk"] == 6, done_now
+            assert "at risk" not in io_capture(done_now), io_capture(done_now)
+            (risky / "summary.json").unlink()
+            # And a run with no checkpoint at all is not standing behind one:
+            # `./ri resume` starts it over, which the stopped warning says.
+            birth.unlink()
+            fresh_start = describe(risky, [], DEFAULT_STALE_SECONDS)
+            assert fresh_start["at_risk"] == 0, fresh_start
+            assert fresh_start["at_risk_seconds"] is None, fresh_start
+            assert "at risk" not in io_capture(fresh_start), io_capture(fresh_start)
 
             # And a restart outside the gap excuses nothing - otherwise any
             # restarts.log at all would silence the check for the rest of the run.
