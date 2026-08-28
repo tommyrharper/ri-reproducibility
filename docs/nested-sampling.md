@@ -658,9 +658,27 @@ What each line is reading, and why it is worth a line:
   its `.mat` and the imager's output - ~1.7MB on this host - and nothing
   deletes it (`./ri clean` deliberately leaves `results/` alone), so a live
   R2D2 run writes ~2.6GB/hour and one WSClean run left 18GB behind. The
-  projection is that rate against what the filesystem has left, and it warns
-  under 12 hours: there is no other place that would say so before the run
-  ends on ENOSPC, hours of imaging from its last checkpoint.
+  projection is that rate against what the filesystem has left: there is no
+  other place that would say so before the run ends on ENOSPC, hours of
+  imaging from its last checkpoint.
+
+  It warns when that projection is shorter than **how much longer the run
+  needs**, not under a fixed number of hours, because space running out after
+  the search is over is not a problem the run has. A WSClean smoke run 35
+  seconds old, writing 29.6GB/hour against 218GB free, projected `~7h` and
+  warned under the old 12-hour floor - `RUNNING - 1 WARNING`, exit 1 - while
+  finishing in minutes; a multi-day R2D2 search with 20h of space never
+  tripped that floor at all.
+
+  "How much longer" is **forecast**'s hours left when there is one. There is
+  none before PolyChord's first checkpoint writes `chains/*.stats`, which is
+  the whole of a short run and was still true seven hours into the 16-rank
+  R2D2 search on this host, so the fallback is the run's own age: a run is
+  assumed to have at least as long ahead of it as behind, and the warning
+  fires once the space left is shorter than the run so far. The warning says
+  which of the two it used (`against ~4h20m still to run`, `against a run
+  already 6h11m old`). The `disk` line itself always reports the projection,
+  warned on or not.
 
   Estimated from a **strided sample of 20 evaluations**, not a walk. `du -s`
   on one live run cost 3-5s of I/O against the disk that run is using, which

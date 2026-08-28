@@ -60,7 +60,10 @@ Four things it checks, each one a way a run has actually gone wrong here:
   frees, and the only one that only ever grows: an evaluation directory keeps
   its measurement set and the imager's output, ~1.7MB, and nothing deletes it.
   A live R2D2 run writes ~2.6GB/hour, so the run's own rate against the free
-  space is the only warning available before it ends on ENOSPC.
+  space is the only warning available before it ends on ENOSPC - weighed
+  against how much longer the run needs (`forecast`, or its own age when it is
+  too young to have one), since space running out after the search ends is not
+  a problem the run has.
 
 * **How far through.** `chains/*.stats` carries the evidence the search has
   actually accumulated and what each dead point cost in likelihood calls, and
@@ -228,7 +231,6 @@ PAGED_OUT_MB = 200
 # which cost milliseconds, since what varies between them is imager output size
 # and not the shape of the directory.
 DISK_SAMPLE = 20
-DISK_WARN_HOURS = 12.0
 
 # Where PolyChord stops, as a fraction of the evidence already collected still
 # sitting in the live points. This is the one number the forecast rests on, and
@@ -1237,11 +1239,32 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     disk_hours = None
     if space is not None and per_hour and status in ("healthy", "starting", "stalled"):
         disk_hours = space[0] / float(per_hour)
-        if disk_hours < DISK_WARN_HOURS:
+        # Against how much longer this run needs, not against a fixed number of
+        # hours: space running out after the search is over is not a problem
+        # the run has. A WSClean smoke run 35s old writes 29.6GB/hour and
+        # projects "7h of space left" against 218GB free, which warned at
+        # HEAD's 12h floor and exited 1 while the run was minutes from
+        # finishing - and a multi-day R2D2 search with 20h of space never
+        # tripped that floor at all.
+        #
+        # `forecast` is the answer when there is one. There is none before
+        # PolyChord's first checkpoint writes chains/*.stats, which is the
+        # whole of a smoke run and was still true 7 hours into the 16-rank
+        # R2D2 search on this host, so the fallback is the run's own age on
+        # the flat assumption that a run has at least as long ahead of it as
+        # behind - it warns once the space left is shorter than the run so far.
+        left_hours = (float(forecast["hours_remaining"])
+                      if forecast and forecast.get("hours_remaining") else None)
+        horizon = (left_hours if left_hours is not None
+                   else float(scan["span_seconds"] or 0) / 3600)
+        if disk_hours < horizon:
             warnings.append(
-                f"{space[0] / 1024 ** 3:.0f}GB free is ~{disk_hours:.0f}h at this run's "
-                f"{float(per_hour) / 1024 ** 3:.1f}GB/hour - nothing here prunes "
-                "evaluations, so the run ends on ENOSPC unless space is made"
+                f"{space[0] / 1024 ** 3:.0f}GB free is ~{format_hours(disk_hours)} at this "
+                f"run's {float(per_hour) / 1024 ** 3:.1f}GB/hour, against "
+                + (f"~{format_hours(horizon)} still to run" if left_hours is not None
+                   else f"a run already {format_hours(horizon)} old")
+                + " - nothing here prunes evaluations, so the run ends on ENOSPC "
+                  "unless space is made"
             )
 
     return {
@@ -2047,12 +2070,17 @@ def self_check() -> None:
 
             # Free space is real and enormous on this host, so the projection
             # is exercised against a stub: the arithmetic is what is under
-            # test, not statvfs. Four hours left, which is under the warning.
+            # test, not statvfs. The fixture has no chains/, so these are the
+            # no-forecast cases, judged against its 39-minute life: four hours
+            # of space is the smoke run that warned at HEAD's 12h floor and
+            # must not now, and eighteen minutes is the one that must.
             per_hour = float(report["disk_bytes_per_hour"])
             real_free = globals()["free_bytes"]
             try:
                 globals()["free_bytes"] = lambda _p: (int(per_hour * 4), 400 * 1024 ** 3)
                 short = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
+                globals()["free_bytes"] = lambda _p: (int(per_hour * 0.3), 400 * 1024 ** 3)
+                tight = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
                 globals()["free_bytes"] = lambda _p: (500 * 1024 ** 3, 900 * 1024 ** 3)
                 roomy = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
                 # No ranks and a stale mtime: a stopped run's rate is history,
@@ -2062,8 +2090,11 @@ def self_check() -> None:
             finally:
                 globals()["free_bytes"] = real_free
             assert 3.9 < float(short["disk_hours_remaining"]) < 4.1, short
-            assert any("ENOSPC" in w for w in short["warnings"]), short["warnings"]
+            assert not any("ENOSPC" in w for w in short["warnings"]), short["warnings"]
             assert "of space left at that rate" in io_capture(short)
+            aged = [w for w in tight["warnings"] if "ENOSPC" in w]
+            assert len(aged) == 1, tight["warnings"]
+            assert "against a run already 0h39m old" in aged[0], aged[0]
             assert not any("ENOSPC" in w for w in roomy["warnings"]), roomy["warnings"]
             assert done["status"] == "stopped" and done["disk_hours_remaining"] is None, done
             ended = io_capture(done)
@@ -2071,6 +2102,36 @@ def self_check() -> None:
             # Megabytes, not "0.0GB": the fixture is 2.7MB, and so is a run ten
             # minutes old.
             assert "MB written" in ended, ended
+
+            # The same four hours of space against a forecast, which replaces
+            # the age when there is one: a run twelve minutes from finishing is
+            # not in trouble, a multi-day search with four hours of space is.
+            # The forecast is stubbed because the fixture has no chains/ -
+            # describe recomputes hours_remaining from the run's own span, so
+            # the totals are derived from it rather than guessed.
+            span = float(short["span_seconds"])
+            real_forecast = globals()["evidence_forecast"]
+
+            def _forecast_of(hours: float):
+                return lambda *_a, **_k: {
+                    "dead_points": 100, "dead_points_now": 100,
+                    "total_dead_points": 100 + round(hours * 3600 * 100 / span),
+                    "fraction": 0.5, "estimated": True,
+                }
+            try:
+                globals()["free_bytes"] = lambda _p: (int(per_hour * 4), 400 * 1024 ** 3)
+                globals()["evidence_forecast"] = _forecast_of(0.2)
+                brief = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
+                globals()["evidence_forecast"] = _forecast_of(40.0)
+                lengthy = describe(bulky, bulky_ranks, DEFAULT_STALE_SECONDS)
+            finally:
+                globals()["free_bytes"] = real_free
+                globals()["evidence_forecast"] = real_forecast
+            assert 0.1 < float(brief["forecast"]["hours_remaining"]) < 0.3, brief
+            assert not any("ENOSPC" in w for w in brief["warnings"]), brief["warnings"]
+            enospc = [w for w in lengthy["warnings"] if "ENOSPC" in w]
+            assert len(enospc) == 1, lengthy["warnings"]
+            assert "against ~1d 16h still to run" in enospc[0], enospc[0]
 
             # A stopped run says why, when the run script captured a log for it
             # - which is the whole reason run.log exists.
