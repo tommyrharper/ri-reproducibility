@@ -358,7 +358,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   imaging   25.4s per evaluation, ranks 66% busy  (last 50: 12.3s, 6% busy)
   occupancy ▇▆▆▇▇▂▆▆▇▆▆▆▇▆█▆▇▂▁▆  6%-88% of 16 ranks busy per 0:07:29 slice
   sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
-  forecast  ~26% done, ~120 of ~454 dead points, ~2h11m left
+  forecast  ~26% done, ~120 of ~454 dead points, ~2h11m left (~14:37)
   ranks     16 ranks of 16, 7 busy-waiting
   resources 48.9GB resident (+4.5GB swapped out) over 51 processes, 16.0 of 20 cores busy
   memory    3.3GB peak imager memory, 53.2GB across 16 ranks
@@ -390,7 +390,10 @@ there no memory left" with that worktree's newest finished smoke run while the
 headline still names the run by name alone, and `./ri health <that name>`
 accepts it: a bare name is looked for in this checkout first and then among
 whatever is running on the host, so every name this report prints is one it
-takes back. `--all` covers every run
+takes back. The same rule runs the other way for the commands it *names*:
+`./ri resume` takes a bare name only under this checkout, so the warnings that
+offer a resume give a foreign run its path instead - the bare name they used to
+print answered "no such run". `--all` covers every run
 on disk under this checkout and `--json` is the machine-readable form. It reads files and runs one `ps` and one `docker
 ps`, plus a one second CPU sample when a run has live ranks - nothing is
 started and nothing is imaged, so a run in progress does not notice it. Exit
@@ -578,6 +581,13 @@ What each line is reading, and why it is worth a line:
   one e-fold per `nlive` dead points, which turns "how much further that ratio
   has to fall" into a count of dead points, and the run's own dead-point rate
   turns that into hours.
+
+  The wait is printed twice, as a duration and as the clock time it ends at
+  (`~2h11m left (~14:37)`, local time, gaining a day name - `~9d 6h left
+  (~Thu 12:00)` - once it is not today). The duration is the measurement and
+  stays first; the clock time is the arithmetic the reader would otherwise do
+  against `date` to answer the only question a multi-hour wait raises, which
+  is when to come back.
 
   The position within that total does not wait for the next checkpoint.
   PolyChord rewrites `chains/` every `nlive` dead points, so `ndead` is frozen

@@ -83,9 +83,10 @@ Four things it checks, each one a way a run has actually gone wrong here:
   actually accumulated and what each dead point cost in likelihood calls, and
   with the live points beside it that gives the one thing a `--max-ndead -1`
   run has nowhere else: a denominator. `forecast` turns the prior volume still
-  to be compressed into dead points left and hours left - carrying the count
-  forward across PolyChord's checkpoint interval, which otherwise freezes it
-  for two hours at a time on a 16-rank R2D2 search.
+  to be compressed into dead points left, hours left, and the clock time those
+  hours end at - carrying the count forward across PolyChord's checkpoint
+  interval, which otherwise freezes it for two hours at a time on a 16-rank
+  R2D2 search.
 
 With no argument it reports every run with ranks on this *host*, found in the
 process list rather than by globbing this checkout - several worktrees share
@@ -1219,6 +1220,25 @@ def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> in
     return sum(1 for rank in ranks if busy.get(int(rank["pid"]), 0.0) > 0.95)
 
 
+def is_local_run(run_dir: Path) -> bool:
+    """Whether this checkout's `results/nested-sampling` is what holds this run."""
+    return run_dir.resolve().parent == NESTED_SAMPLING_DIR.resolve()
+
+
+def resume_target(run_dir: Path) -> str:
+    """What to paste after `./ri resume` for this run: its bare name, or its path.
+
+    `./ri resume` takes a bare name only under this checkout's
+    `results/nested-sampling`, while this report reaches runs anywhere on the
+    host - so every warning it wrote for a foreign run handed out a command
+    that answers "no such run". A name this report prints has to be one the
+    commands it names take back, which is the same rule that made `./ri health`
+    itself accept a live foreign run's name; the path is what stays true off
+    the checkout, and `./ri resume` has always taken one.
+    """
+    return run_dir.name if is_local_run(run_dir) else str(run_dir.resolve())
+
+
 def describe(run_dir: Path, processes: list[dict[str, object]],
              stale_seconds: float, busy: dict[int, float] | None = None,
              swapped: dict[int, int] | None = None,
@@ -1347,7 +1367,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             ending = (f'; run.log ends "{tail["line"]}"'
                       + (f" (x{copies} ranks)" if copies > 1 else ""))
         warnings.append(
-            f"stopped before finishing{ending}; continue it with ./ri resume {run_dir.name}"
+            f"stopped before finishing{ending}; continue it with "
+            f"./ri resume {resume_target(run_dir)}"
         )
     # A run whose shell was killed keeps going and keeps looking healthy - the
     # one thing it has lost is invisible in every other number here, and only
@@ -1356,7 +1377,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         warnings.append(
             "the shell that started this run is gone - the run is still going inside "
             "its containers, but nothing is left to restart it if it dies (./ri resume "
-            f"{run_dir.name} after it does) or to remove the sidecars when it stops"
+            f"{resume_target(run_dir)} after it does) or to remove the sidecars when it stops"
         )
     # All but one, because rank 0 is PolyChord's administrator and does nothing
     # else - and only once evaluations have stopped landing, which is the
@@ -1574,6 +1595,27 @@ def format_hours(hours: float) -> str:
     return f"{int(hours)}h{int(hours % 1 * 60):02d}m"
 
 
+def format_clock(hours: float, now: float | None = None) -> str:
+    """The clock time a wait of `hours` ends at: `19:47`, or `Sat 05:32` past today.
+
+    Local time, because the reader is at a terminal on the host the run is on.
+    A duration is the honest measurement and stays first; this is the arithmetic
+    the reader would otherwise do against a wall clock to answer the only
+    question a multi-hour wait raises, which is when to come back.
+
+    The day name only when the finish is not today - a bare `05:32` on a
+    fourteen-hour wait reads as this morning, the one time it cannot be. Nothing
+    beyond the day name even for a wait of weeks: the duration it is printed
+    beside (`~9d 6h left`) is what says which Tuesday.
+    """
+    now = time.time() if now is None else now
+    end = now + hours * 3600
+    # The calendar date rather than tm_yday, which repeats every year and would
+    # drop the day name off a wait that lands on the same date next year.
+    same_day = time.localtime(end)[:3] == time.localtime(now)[:3]
+    return time.strftime("%H:%M" if same_day else "%a %H:%M", time.localtime(end))
+
+
 def render(run: dict[str, object]) -> None:
     # The headline is the whole report for anyone who does not read to the
     # bottom, so it never says HEALTHY over a body that is warning - which is
@@ -1616,8 +1658,7 @@ def render(run: dict[str, object]) -> None:
         # reaches every run with ranks on the host, and two worktrees' runs
         # otherwise render as two identical names over one shared host block.
         *([("path", str(run["path"]))]
-          if Path(str(run["path"])).resolve().parent != NESTED_SAMPLING_DIR.resolve()
-          else []),
+          if not is_local_run(Path(str(run["path"]))) else []),
         # The dead-point count never appears without how old it is. PolyChord
         # writes it every ~nlive points, so it is stale by design between
         # writes and a frozen-looking count means nothing on its own.
@@ -1723,7 +1764,8 @@ def render(run: dict[str, object]) -> None:
         lines.append(("forecast",
                       f"{about}{float(ahead['fraction']):.0%} done, "
                       f"{carried}{now} of {about}{ahead['total_dead_points']} dead points"
-                      + (f", {about}{format_hours(float(left))} left" if left else "")))
+                      + (f", {about}{format_hours(float(left))} left "
+                         f"({about}{format_clock(float(left))})" if left else "")))
     lines.append(("ranks", ranks))
     # Only for a run that still holds something. "0.0GB over 0 processes" is
     # what every finished run on disk would print, and none of them is the
@@ -2334,6 +2376,23 @@ def self_check() -> None:
             assert report["completed_by_checkpoint"] == 60, report
             assert ahead["dead_points_now"] == 200, ahead
             assert "~44% done, 200 of ~451 dead points, ~4h11m left" in shown, shown
+            # The same wait as a clock time, so nobody has to add four hours to
+            # `date` by hand. Matched as a shape rather than against a second
+            # call to format_clock, which would disagree with the rendered one
+            # across a minute boundary.
+            assert re.search(r"~4h11m left \(~\d\d:\d\d\)", shown), shown
+            # Wednesday noon, in a week with no daylight-saving transition
+            # anywhere, so the arithmetic is the same in every timezone CI and
+            # this host run in.
+            noon = time.mktime((2026, 6, 10, 12, 0, 0, 0, 0, -1))
+            assert format_clock(1.5, noon) == "13:30", format_clock(1.5, noon)
+            # Past midnight the day name is what stops `08:00` reading as this
+            # morning, and it stays the whole answer for a wait of weeks -
+            # `~9d 6h left` beside it is what says which Wednesday.
+            assert format_clock(20, noon) == "Thu 08:00", format_clock(20, noon)
+            assert format_clock(24 * 8, noon) == "Thu 12:00", format_clock(24 * 8, noon)
+            # No wait at all is still today, whatever the hour it is asked at.
+            assert re.fullmatch(r"\d\d:\d\d", format_clock(0.0)), format_clock(0.0)
 
             # PolyChord rewrites chains/ only every `nlive` dead points, so
             # between writes the count is frozen and everything derived from it
@@ -3172,6 +3231,28 @@ def self_check() -> None:
                                   f"--output-dir {Path(other_checkout) / live.name}")]
                 (Path(other_checkout) / live.name).mkdir()
                 assert resolve(live.name, twin) == live
+
+                # Every `./ri resume` line this report writes has to be one
+                # `./ri resume` takes. It takes a bare name only under this
+                # checkout, so the headline name that iteration made resolvable
+                # here is the one thing the advice must not paste for a foreign
+                # run - both warnings that offer a resume answered "no such
+                # run" for every run outside this checkout. The path is what
+                # both commands take.
+                assert resume_target(live) == live.name, resume_target(live)
+                assert resume_target(foreign) == str(foreign), resume_target(foreign)
+                stopped_abroad = describe(foreign, [], DEFAULT_STALE_SECONDS)
+                assert stopped_abroad["status"] == "stopped", stopped_abroad
+                assert f"./ri resume {foreign}" in stopped_abroad["warnings"][0], \
+                    stopped_abroad["warnings"]
+                # The orphaned-launcher warning offers one too: the same
+                # processes as the local orphan case above, pointed abroad.
+                away = [dict(q, args=str(q["args"]).replace(str(live), str(foreign)))
+                        for q in [r for r in not_ranks if r["pid"] != 89] + ranks]
+                orphan_abroad = describe(foreign, away, DEFAULT_STALE_SECONDS)
+                assert orphan_abroad["supervised"] is False, orphan_abroad
+                assert f"./ri resume {foreign} after it does" \
+                    in orphan_abroad["warnings"][0], orphan_abroad["warnings"]
             # mpirun and the host-side `docker exec` carry --output-dir too and
             # are not ranks, but they do count: a run that has started and has
             # no ranks yet is a run, and on an R2D2 search that is minutes of
