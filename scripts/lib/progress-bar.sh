@@ -17,6 +17,13 @@
 # bury the line - the fix for a WSClean search producing dead points faster
 # than a human can read a scrolling counter.
 
+# `run_with_retries` below re-sizes a restart against the memory free at the
+# moment it restarts, which is `ns_budget_ranks`. Sourced here rather than left
+# to the caller so the retry loop is never silently the un-guarded version; the
+# run scripts source it again for their own first clamp, which is idempotent.
+# shellcheck source=scripts/lib/rank-budget.sh
+. "${BASH_SOURCE[0]%/*}/rank-budget.sh"
+
 # Usage: run_with_progress <output_dir> <max_ndead> <nlive> -- cmd args...
 run_with_progress() {
   local output_dir="$1" max_ndead="$2" nlive="$3"
@@ -154,12 +161,16 @@ run_with_retries() {
   local retries="$1" output_dir="$2"
   shift
   local reset_after="${NS_RETRY_RESET_SECONDS:-1800}"
-  local attempt=0 status=0 before after started
+  local attempt=0 status=0 before after started ranks arg prev resized
+  # The command is re-run rather than re-built, and the one part of it a
+  # restart must not replay verbatim is the rank count - see the re-clamp
+  # below - so it is held in an array this loop can rewrite.
+  local -a args=("$@") rescaled
   while :; do
     before="$(_ns_completed_evals "${output_dir}")"
     status=0
     started="$(date +%s)"
-    run_with_progress "$@" || status=$?
+    run_with_progress "${args[@]}" || status=$?
     [ "${status}" -eq 0 ] && return 0
     after="$(_ns_completed_evals "${output_dir}")"
     # Before the budget check, so the attempt that earned the reset is the one
@@ -183,6 +194,40 @@ run_with_retries() {
         "./ri resume ${output_dir##*/} tries again anyway."
       break
     fi
+    # The rank count this attempt ran at was `ns_budget_ranks`' answer to how
+    # much memory was free when the run *started*, which on a host several
+    # sessions share is not a fact about now: the common way a long search
+    # dies is another session's run growing into it, and replaying the old
+    # number puts the restart straight back into the OOM killer - which does
+    # not fail the run, it scores FAILURE_OBJECTIVE, which PolyChord
+    # maximizes. Same reasoning as `./ri resume`, which re-clamps the
+    # NS_MPI_PROCS it reads from run.env, and the same direction of error:
+    # clamping down costs wall clock, clamping up costs the run. Only ever
+    # down, because `ns_budget_ranks` never returns more than it is asked
+    # for. The FIFO pool the run script laid out for the original rank count
+    # is not a constraint here - a restart's ranks never use it, they start
+    # their own workers (see the note above), so the spare FIFOs go unread.
+    ranks="$(_ns_retry_rank_count "${args[@]}")"
+    if [ "${ranks}" = "0" ]; then
+      _ns_retry_say "${output_dir}" \
+        "not retrying: there is no longer memory for even one rank (the FATAL above" \
+        "says what is holding it), and a restart that cannot fit scores OOM kills as" \
+        "the search's best points. ./ri resume ${output_dir##*/} once there is room."
+      break
+    fi
+    resized=''
+    if [ -n "${ranks}" ]; then
+      resized=", re-sized to ${ranks} ranks to fit the memory free now"
+      rescaled=()
+      prev=''
+      for arg in "${args[@]}"; do
+        case "${prev}" in -np) arg="${ranks}" ;; esac
+        case "${arg}" in NS_MPI_PROCS=*) arg="NS_MPI_PROCS=${ranks}" ;; esac
+        rescaled+=("${arg}")
+        prev="${arg}"
+      done
+      args=("${rescaled[@]}")
+    fi
     attempt=$((attempt + 1))
     # An index of the restarts, next to run.log which holds the tracebacks
     # themselves. Its own file because `./ri health` wants the count of a run
@@ -193,9 +238,37 @@ run_with_retries() {
       >>"${output_dir}/restarts.log"
     _ns_retry_say "${output_dir}" \
       "attempt failed (exit ${status}) at ${after} evaluations; resuming from PolyChord's" \
-      "checkpoint - retry ${attempt} of ${retries}. Why it stopped is above."
+      "checkpoint - retry ${attempt} of ${retries}${resized}. Why it stopped is above."
   done
   return "${status}"
+}
+
+# The rank count a restart should run at, or empty for "leave the command
+# alone". Reads the current count and the algorithm out of the command itself
+# (`-np N`, and the `polychord_*.py` the ranks run) rather than being told
+# them, so nothing has to be threaded through the run scripts for the retry
+# loop to know what it is restarting. `0` means not even one rank fits, which
+# is the one answer the caller must not treat as a rank count.
+_ns_retry_rank_count() {
+  local arg prev='' current='' mb='' label='' ranks
+  for arg in "$@"; do
+    case "${prev}" in -np) current="${arg}" ;; esac
+    case "${arg}" in
+      *polychord_r2d2.py) mb="${NS_R2D2_MB_PER_RANK}" label=r2d2 ;;
+      *polychord_wsclean.py) mb="${NS_WSCLEAN_MB_PER_RANK}" label=wsclean ;;
+    esac
+    prev="${arg}"
+  done
+  # Not an mpirun command at all - the self-checks' fixtures, and any future
+  # caller of run_with_retries that is not a search.
+  [ -n "${current}" ] && [ -n "${mb}" ] || return 0
+  # `ns_budget_ranks` fails, loudly, only when one rank no longer fits.
+  ranks="$(ns_budget_ranks "${current}" "${mb}" "${label} restart")" || {
+    printf '0\n'
+    return 0
+  }
+  [ "${ranks}" -lt "${current}" ] && printf '%s\n' "${ranks}"
+  return 0
 }
 
 # Both to the terminal and into run.log, because run.log is the only artifact
@@ -876,6 +949,88 @@ self_check() {
     >/dev/null 2>&1 || status=$?
   [ "$(_ns_count_lines "${banked_dir}/attempts")" = "2" ] || {
     echo "FAIL: run with dead points retried $(_ns_count_lines "${banked_dir}/attempts") times"
+    exit 1
+  }
+
+  # A restart re-sizes itself against the memory free now. The rank count in
+  # the command is `ns_budget_ranks`' answer from when the run started, and
+  # the host it fitted then is several sessions' host now - so a restart that
+  # replays it lands in the OOM killer, which PolyChord scores as the best
+  # points of the search rather than as a failure.
+  #
+  # The fixture is the `progressing` command with an mpirun-shaped tail, and
+  # it writes back the arguments it was actually called with: that is the only
+  # place the rewrite is observable. `docker` is stubbed and the reservation
+  # directory is private because `ns_budget_ranks` reaps leaked sidecars and
+  # writes a real reservation - neither belongs in a self-check on a host
+  # other sessions are running searches on.
+  mkdir -p "${tmp}/bin"
+  printf '#!/bin/sh\nexit 0\n' >"${tmp}/bin/docker"
+  chmod +x "${tmp}/bin/docker"
+  local resize_dir="${tmp}/resize"
+  mkdir -p "${resize_dir}/chains"
+  # shellcheck disable=SC2016  # $0 and $* are the child `sh`'s, not ours
+  local recording='n=$(ls "$0"/evaluations 2>/dev/null | wc -l);
+    mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
+    echo "$*" >>"$0"/attempts; exit 5'
+  status=0
+  # 4096MB of headroom plus two R2D2 ranks, against a command asking for 8.
+  (
+    export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
+    export NS_AVAILABLE_MB=$((4096 + 2 * 3500))
+    run_with_retries 1 "${resize_dir}" -1 2 -- sh -c "${recording}" "${resize_dir}" \
+      -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
+  ) >/dev/null 2>&1 || status=$?
+  [ "${status}" = "5" ] || { echo "FAIL: re-sized retry exit ${status}, want 5"; exit 1; }
+  # The first attempt runs what the run script sized; only the restart moves.
+  case "$(sed -n 1p "${resize_dir}/attempts")" in
+    *"NS_MPI_PROCS=8"*"-np 8 "*) ;;
+    *) echo "FAIL: first attempt rewritten: $(sed -n 1p "${resize_dir}/attempts")"; exit 1 ;;
+  esac
+  # Both spellings of the rank count, because the ranks read NS_MPI_PROCS for
+  # summary.json while mpirun reads -np, and a run whose two disagree reports
+  # a rank count it never ran at.
+  case "$(sed -n 2p "${resize_dir}/attempts")" in
+    *"NS_MPI_PROCS=2"*"-np 2 "*) ;;
+    *) echo "FAIL: restart not re-sized: $(sed -n 2p "${resize_dir}/attempts")"; exit 1 ;;
+  esac
+
+  # Memory the run had and no longer has: a restart that cannot fit even one
+  # rank is not a restart worth making, so it stops here rather than spending
+  # the budget failing the same way.
+  local starved_dir="${tmp}/starved"
+  mkdir -p "${starved_dir}/chains"
+  status=0
+  (
+    export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
+    export NS_AVAILABLE_MB=$((4096 + 100))
+    run_with_retries 1 "${starved_dir}" -1 2 -- sh -c "${recording}" "${starved_dir}" \
+      -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
+  ) >/dev/null 2>&1 || status=$?
+  [ "${status}" = "5" ] || { echo "FAIL: starved retry exit ${status}, want 5"; exit 1; }
+  [ "$(_ns_count_lines "${starved_dir}/attempts")" = "1" ] || {
+    echo "FAIL: retried with no memory for a rank"; exit 1
+  }
+  [ ! -e "${starved_dir}/restarts.log" ] || {
+    echo "FAIL: restart logged for a retry that never ran"; exit 1
+  }
+  grep -q "memory for even one rank" "${starved_dir}/run.log" || {
+    echo "FAIL: run.log does not say why the restart was refused"; exit 1
+  }
+
+  # And a host with room leaves the command exactly as it was: the re-clamp
+  # is a guard, not a rewrite that happens every time.
+  local roomy_dir="${tmp}/roomy"
+  mkdir -p "${roomy_dir}/chains"
+  status=0
+  (
+    export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
+    export NS_AVAILABLE_MB=$((4096 + 64 * 3500))
+    run_with_retries 1 "${roomy_dir}" -1 2 -- sh -c "${recording}" "${roomy_dir}" \
+      -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
+  ) >/dev/null 2>&1 || status=$?
+  [ "$(sed -n 1p "${roomy_dir}/attempts")" = "$(sed -n 2p "${roomy_dir}/attempts")" ] || {
+    echo "FAIL: command changed with memory to spare: $(sed -n 2p "${roomy_dir}/attempts")"
     exit 1
   }
 

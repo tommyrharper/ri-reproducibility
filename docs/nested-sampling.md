@@ -868,6 +868,22 @@ Two things to know about a restarted run:
   `./ri health` shows the count and the latest one. It is reported, not warned
   on - the run is fine right now - but whatever killed it once will do it
   again, so the line is worth reading.
+- **It re-sizes itself.** The rank count in the command is what
+  `ns_budget_ranks` could afford when the run *started*, and on a host several
+  sessions share that is not a fact about now - the common way a long search
+  dies is another session's run growing into it, so replaying the number puts
+  the restart straight back into the OOM killer, which does not fail the run:
+  it scores `FAILURE_OBJECTIVE`, which PolyChord maximizes. So the count goes
+  back through the memory guard before each restart, exactly as `./ri resume`
+  does with the `NS_MPI_PROCS` in `run.env`, and the run says
+  `retry 1 of 2, re-sized to 4 ranks to fit the memory free now` when it
+  moved. Only ever downwards, because `ns_budget_ranks` never returns more
+  than it is asked for, and clamping down is free here: PolyChord's checkpoint
+  carries live points rather than ranks, and the FIFO pool laid out for the
+  original count is unused by a restart anyway (see above), so the spare FIFOs
+  simply go unread. If not even one rank fits any more the run stops there -
+  `not retrying: there is no longer memory for even one rank` - rather than
+  spending a restart to fail the same way.
 
 **The budget is for a crash loop, not for the run's lifetime.** An attempt
 that ran for `NS_RETRY_RESET_SECONDS` (1800) before dying hands the retry
