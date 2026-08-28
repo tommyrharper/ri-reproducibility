@@ -1258,11 +1258,18 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # The order is the whole point. A finished run and a dead one both stop
     # writing, and a run that has only just started has not written yet, so
     # neither a stale mtime nor a missing summary means anything on its own.
+    #
+    # `watched is not None` is the answer to "has this run started": it means
+    # a `docker exec` client carrying this run directory is alive, whether or
+    # not the shell above it still is. Without it a run with no evaluations
+    # yet fell straight through to `stopped` - so the whole of an R2D2
+    # search's startup, minutes of sixteen workers loading their models,
+    # headlined STOPPED and offered `./ri resume` on a run that was fine.
     if complete:
         status = "finished"
     elif ranks:
         status = "stalled" if idle is not None and idle > stale_seconds else "healthy"
-    elif idle is not None and idle <= stale_seconds:
+    elif watched is not None or (idle is not None and idle <= stale_seconds):
         status = "starting"
     else:
         status = "stopped"
@@ -1332,9 +1339,9 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # shows up as the crash it never came back from.
     if watched is False:
         warnings.append(
-            "the shell that started this run is gone - the ranks are still going, "
-            "but nothing is left to restart them if they die (./ri resume "
-            f"{run_dir.name} after they do) or to remove the sidecars when they stop"
+            "the shell that started this run is gone - the run is still going inside "
+            "its containers, but nothing is left to restart it if it dies (./ri resume "
+            f"{run_dir.name} after it does) or to remove the sidecars when it stops"
         )
     # All but one, because rank 0 is PolyChord's administrator and does nothing
     # else - and only once evaluations have stopped landing, which is the
@@ -1839,7 +1846,7 @@ def run_directories() -> list[Path]:
 
 
 def live_run_directories(processes: list[dict[str, object]]) -> list[Path]:
-    """Every run with ranks on this host, newest first - wherever it lives.
+    """Every run being driven on this host, newest first - wherever it lives.
 
     Read out of the ranks' own `--output-dir` rather than by filtering
     `run_directories()`, because a run directory is only under this checkout's
@@ -1848,19 +1855,26 @@ def live_run_directories(processes: list[dict[str, object]]) -> list[Path]:
     can only see its own checkout answers "why do I have 11GB left" with a host
     block whose whole cause is a 48GB search it has no path to.
 
-    Ranks rather than every process carrying the run directory: a killed run's
-    sidecar workers outlive it until the next run reaps them, and they are not
-    a run still going.
+    Matched anywhere in the command line rather than only at its start, so the
+    `docker exec` client and the mpirun under it - both of which carry the whole
+    rank command, `--output-dir` and all - count as well as the ranks. That is
+    the difference between a run that has started and a run that has ranks: an
+    R2D2 search spends minutes in `docker exec` while sixteen workers load
+    their models, and anchoring here left it invisible for all of it.
+
+    Still not every process carrying the run directory: a killed run's sidecar
+    workers outlive it until the next run reaps them, and they are not a run
+    still going. The client and the mpirun die with it.
     """
     live = {Path(match.group(1)) for p in processes
-            if RANK_COMMAND.match(str(p["args"]))
+            if RANK_COMMAND.search(str(p["args"]))
             for match in [re.search(r"--output-dir\s+(\S+)", str(p["args"]))]
             if match and Path(match.group(1)).is_dir()}
     return sorted(live, key=started_at, reverse=True)
 
 
 def default_directories(processes: list[dict[str, object]] | None = None) -> list[Path]:
-    """Every run that still has ranks, newest first - or the newest run.
+    """Every run being driven on this host, newest first - or the newest run.
 
     Runs rather than the newest run: this report's question is about a search
     that is going, and the newest run stops being that one the moment a short
@@ -2525,6 +2539,33 @@ def self_check() -> None:
             # while something is still running.
             assert describe(live, [], 5.0)["status"] == "stopped"
             assert describe(live, ranks, 5.0)["status"] == "stalled"
+            # ...and no ranks *yet* is neither. A live `docker exec` client is
+            # the run saying it has started: an R2D2 search spends minutes
+            # there while its workers load their models, and every second of
+            # that used to headline STOPPED and offer `./ri resume` on a run
+            # that was fine. The mtimes here are already past stale_seconds,
+            # so only the client can tell the two apart.
+            exec_client = [p for p in not_ranks if p["pid"] == 91]
+            launcher = [p for p in not_ranks if p["pid"] == 89]
+            starting = describe(live, exec_client + launcher, 5.0)
+            assert starting["status"] == "starting", starting
+            assert not any("./ri resume" in w for w in starting["warnings"]), starting
+            assert io_capture(starting).splitlines()[0].endswith("  STARTING"), starting
+            # A run with nothing of its own written yet is the same answer, and
+            # the case the whole rule exists for.
+            fresh = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260106T000000Z"
+            fresh.mkdir()
+            (fresh / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\n")
+            fresh_client = [dict(exec_client[0],
+                                 args=f"/usr/bin/docker exec c mpirun python3 "
+                                      f"polychord_r2d2.py --output-dir {fresh}")]
+            assert describe(fresh, fresh_client + launcher, 5.0)["status"] == "starting"
+            # Without the client it is a run that never got going, which is
+            # the one that wants resuming.
+            dead_start = describe(fresh, launcher, 5.0)
+            assert dead_start["status"] == "stopped", dead_start
+            assert any("./ri resume" in w for w in dead_start["warnings"]), dead_start
+            shutil.rmtree(fresh)
             # A stalled run's count can still move; a stopped one's cannot, so
             # only the first may say where it will move to.
             assert "next at ~7" in io_capture(describe(live, ranks, 5.0))
@@ -3107,9 +3148,19 @@ def self_check() -> None:
                 (Path(other_checkout) / live.name).mkdir()
                 assert resolve(live.name, twin) == live
             # mpirun and the host-side `docker exec` carry --output-dir too and
-            # are not ranks: counting them would work here but would resurrect
-            # a run whose ranks have all gone while its client is still exiting.
-            assert default_directories(not_ranks) == [newest]
+            # are not ranks, but they do count: a run that has started and has
+            # no ranks yet is a run, and on an R2D2 search that is minutes of
+            # sixteen workers loading ~3.4GB models each. Leaving it off the
+            # default report is what makes another session's "12GB available"
+            # have no owner. The cost is that a run whose ranks have all gone
+            # is listed for as long as its client takes to exit, where it
+            # headlines STARTING rather than STOPPED - sub-second, against
+            # minutes of a healthy run being invisible.
+            assert default_directories(not_ranks) == [live], \
+                default_directories(not_ranks)
+            # The sidecar workers still do not count: they outlive a killed run
+            # holding ~3.4GB each, and that is not a run still going.
+            assert default_directories(leftover) == [newest]
             # A rank whose directory has been deleted underneath it is dropped
             # rather than reported as a run with no files.
             gone = [dict(ranks[0], pid=779,

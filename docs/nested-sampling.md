@@ -374,7 +374,8 @@ host
   sidecars  3 running, 0 leaked
 ```
 
-With no argument it reports on every run that still has ranks, falling back to
+With no argument it reports on every run being driven anywhere on this host -
+ranks running, or a `docker exec` client still starting them - falling back to
 the newest run when nothing is going. Runs rather than the newest run because a
 five-minute test started after a ten-hour search would otherwise be "the newest
 run" and hide the only one of the two worth asking about; all of them rather
@@ -403,8 +404,8 @@ says nothing:
 |---|---|
 | `FINISHED` | `summary.json` is there. |
 | `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
-| `STARTING` | No ranks yet, but something was written recently. |
-| `STOPPED` | No ranks and nothing recent. `./ri resume <run>` continues it. |
+| `STARTING` | No ranks yet, but the run is being driven: its `docker exec` client is alive, or something was written recently. An R2D2 search spends minutes here while sixteen workers load their models. |
+| `STOPPED` | No ranks, no client, nothing recent. `./ri resume <run>` continues it. |
 | `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
 
 **The headline carries the warning count**, because it is the whole report for
