@@ -408,7 +408,7 @@ says nothing:
 | | |
 |---|---|
 | `FINISHED` | `summary.json` is there. |
-| `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
+| `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). The warning says what happens next: how long until the stall watchdog kills and restarts the run, that `--stall-timeout 0` turned the watchdog off, or - for a run still stalled more than a poll past its own timeout - that no watchdog is left to kill it. Silent about the watchdog for runs started before `run.env` recorded the timeout. |
 | `STARTING` | No ranks yet, but the run is being driven: its `docker exec` client is alive. An R2D2 search spends minutes here while sixteen workers load their models. |
 | `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if it never wrote one; the warning says which. |
 | `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
@@ -1096,6 +1096,11 @@ that machinery is still working on. Against that, the widest gap between
 evaluations measured over 6.3 hours of a live 16-rank R2D2 search was 23.5s.
 This is the backstop for when nobody is watching; `./ri health` answers the
 same question in seconds for somebody who is. `--stall-timeout 0` disables it.
+
+The timeout is recorded in `run.env` with everything else the run was started
+with, so `./ri resume` replays it: a search deliberately given a longer one, or
+given `0`, used to get the 7200s default back the moment it was resumed. It is
+also what lets `./ri health` say when a stalled run is due to be killed.
 
 A restart adopts what the previous attempt evaluated **whether or not
 PolyChord left a checkpoint behind**, and that distinction is load-bearing.

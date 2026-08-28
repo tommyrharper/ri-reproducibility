@@ -29,6 +29,13 @@ write_run_config() {
     printf 'NS_METRIC=%q\n' "${NS_METRIC}"
     printf 'NS_MPI_PROCS=%q\n' "${NS_MPI_PROCS}"
     printf 'NS_RETRIES=%q\n' "${NS_RETRIES}"
+    # The stall watchdog's timeout is a setting of the run, not of the shell
+    # that launched it: a search deliberately given a longer one - or given 0
+    # to turn the watchdog off - used to get the 7200s default back the moment
+    # it was resumed, silently, which is the opposite of what `--stall-timeout`
+    # was typed for. It is also the only thing that can tell `./ri health` when
+    # a stalled run is due to be killed and restarted.
+    printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
     fi
@@ -135,6 +142,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   _dir="$(mktemp -d)"
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=2 \
     NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 \
+    NS_STALL_TIMEOUT=3600 \
     write_run_config "${_dir}" r2d2
   # A subshell, so the sourced values cannot leak into the checks below it.
   (
@@ -147,11 +155,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${NS_RETRIES}" = 2 ]
     [ "${NS_METRIC}" = 'total_rms_jy - 0.5 * snr' ]
     [ "${R2D2_OMP_THREADS}" = 2 ]
+    # Not the 7200s default: a resume replays this file, so a watchdog the
+    # caller retuned has to survive it.
+    [ "${NS_STALL_TIMEOUT}" = 3600 ]
   )
   # WSClean has no thread setting, and must not write an empty one.
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
+    NS_STALL_TIMEOUT=0 \
     write_run_config "${_dir}" wsclean
+  # 0 turns the watchdog off and must be written as 0, not dropped: an absent
+  # key reads as the default, which is the setting's opposite.
+  grep -qx 'NS_STALL_TIMEOUT=0' "${_dir}/run.env" || {
+    echo "FAIL: --stall-timeout 0 not recorded in run.env"; exit 1
+  }
   grep -q R2D2_OMP_THREADS "${_dir}/run.env" && {
     echo "FAIL: empty R2D2_OMP_THREADS written for wsclean"; exit 1
   }

@@ -17,7 +17,9 @@ Four things it checks, each one a way a run has actually gone wrong here:
   `summary.json` present is finished; ranks running is healthy, or stalled once
   the mtime goes stale; no ranks but a live `docker exec` client is a run still
   starting up; nothing driving it at all is stopped, however recently it
-  wrote.
+  wrote. A stalled run also says what is coming for it: the stall watchdog's
+  timeout out of `run.env`, as a countdown, as "due", or - past a poll of it -
+  as the observation that no watchdog is left to kill it.
 * **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
   PolyChord maximizes, while a real `total_rms_jy` is ~0.008. A run whose
   imager is broken - a missing checkpoint mount, an OOM-killed worker - is
@@ -259,6 +261,12 @@ HISTORY_EMPTY = "\u00b7"
 # ordinary jitter does not register either.
 STALL_GAP_FACTOR = 10.0
 MIN_STALL_GAP_SECONDS = 2.0
+
+# `_ns_stall_watchdog` in scripts/lib/progress-bar.sh polls every
+# NS_STALL_POLL_SECONDS (60 by default), so its kill lands up to one poll after
+# the timeout is reached. Only past that is a run that is still stalled
+# evidence that no watchdog is left, rather than one about to act.
+STALL_WATCHDOG_POLL_SECONDS = 60.0
 
 # Resolution of a restarts.log stamp: progress-bar.sh writes it with `date -u
 # +%Y-%m-%dT%H:%M:%SZ`, so it is truncated to whole seconds and names an
@@ -1447,8 +1455,34 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             "- the imager broke part-way through, and the search is now feeding on it"
         )
     if status == "stalled":
+        # What happens next, not just what has stopped. `_ns_stall_watchdog`
+        # is the only thing that acts on a run that is alive and landing
+        # nothing, and until run.env recorded its timeout nothing here could
+        # say when - so a stalled run read as a dead end when it was minutes
+        # from healing itself, and a run whose watchdog was gone read exactly
+        # the same. Silent for runs from before that was recorded: guessing
+        # the default would be a promise the run never made.
+        timeout = _setting(run_env, "NS_STALL_TIMEOUT")
+        due = ""
+        if timeout == 0:
+            due = ("; --stall-timeout 0 turned the stall watchdog off, "
+                   "so nothing will end this")
+        elif timeout and idle is not None:
+            # The watchdog polls rather than sleeping to the deadline, so its
+            # kill lands inside one poll of the timeout and not on it. A
+            # countdown that has just run out is due; only a run still stalled
+            # past that window is one no watchdog is left to kill, which is
+            # the case where waiting is the wrong thing to do.
+            if idle < timeout:
+                due = ("; the stall watchdog kills and restarts it in "
+                       f"{format_hms(timeout - idle)}")
+            elif idle <= timeout + STALL_WATCHDOG_POLL_SECONDS:
+                due = f"; the {timeout}s stall watchdog is due to kill and restart it"
+            else:
+                due = f"; past its {timeout}s stall watchdog, which has not killed it"
         warnings.append(
-            f"no evaluation has landed in {idle:.0f}s while {len(ranks)} ranks are still running"
+            f"no evaluation has landed in {idle:.0f}s while {len(ranks)} ranks "
+            f"are still running" + due
         )
     if status == "stopped":
         # What the log said, because "why" is the question a stopped run raises
@@ -2966,6 +3000,51 @@ def self_check() -> None:
             # while something is still running.
             assert describe(live, [], 5.0)["status"] == "stopped"
             assert describe(live, ranks, 5.0)["status"] == "stalled"
+
+            # A stalled run says what is going to happen to it. Its
+            # evaluations are ~38s old, so a 7200s watchdog is still nearly two
+            # hours from acting - which is the difference between "wait" and
+            # "go and look".
+            def stall_warning(env: str) -> str:
+                (live / "run.env").write_text(env)
+                found = [w for w in describe(live, ranks, 5.0)["warnings"]
+                         if "no evaluation has landed" in w]
+                assert len(found) == 1, found
+                return found[0]
+
+            base = "NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\nNS_NLIVE=4\n"
+            waiting = stall_warning(base + "NS_STALL_TIMEOUT=7200\n")
+            assert "stall watchdog kills and restarts it in 1:5" in waiting, waiting
+            # 0 is the setting's opposite and must not read as "any moment now".
+            off = stall_warning(base + "NS_STALL_TIMEOUT=0\n")
+            assert "turned the stall watchdog off" in off, off
+            assert "kills and restarts" not in off, off
+            # A run recorded before run.env carried the timeout: silent rather
+            # than promising the default the run may never have had.
+            silent = stall_warning(base)
+            assert "watchdog" not in silent, silent
+            # Inside one poll of the deadline the kill has not landed yet and
+            # the countdown has already run out, so neither of the other two
+            # sentences is true - and a negative countdown would be the one
+            # printed.
+            imminent = stall_warning(base + "NS_STALL_TIMEOUT=10\n")
+            assert "the 10s stall watchdog is due to kill and restart it" in imminent, imminent
+            assert "-" not in imminent.split("landed")[1], imminent
+            (live / "run.env").write_text(base)
+
+            # Still stalled long past the timeout is the opposite message: the
+            # watchdog polls once a minute, so a run an hour past its own is
+            # one nothing is left to kill - the case where waiting is wrong.
+            hung = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260102T000100Z"
+            write_eval(hung, 1, now - 4000)
+            (hung / "run.env").write_text(base + "NS_STALL_TIMEOUT=120\n")
+            hung_ranks = [dict(ranks[0], pid=200, args=(
+                f"python3 polychord_r2d2.py --output-dir {hung.resolve()}"))]
+            abandoned = describe(hung, hung_ranks, 5.0)
+            assert abandoned["status"] == "stalled", abandoned["status"]
+            stuck = [w for w in abandoned["warnings"] if "no evaluation has landed" in w]
+            assert "past its 120s stall watchdog, which has not killed it" in stuck[0], stuck
+            shutil.rmtree(hung)
             # The same with the shipped 600s window, which is the case that
             # mattered: this fixture's evaluations were written a second ago,
             # so a run SIGKILLed just now sits well inside it. Counting a
