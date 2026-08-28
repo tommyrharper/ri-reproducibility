@@ -307,6 +307,7 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   progress  1287 evaluations, 15 in flight
   activity  last evaluation 0:00:02 ago, 27.3/min over 0:47:06
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 0:07:29 slice
+  imaging   25.4s per evaluation, ranks 100% busy  (last 50: 12.3s, 6% busy)
   sampler   logZ = -0.044 +/- 0.012, 24 likelihood calls per dead point
   forecast  ~38% done, ~454 dead points total, ~4h54m left
   ranks     16 ranks of 16, 7 busy-waiting
@@ -395,15 +396,14 @@ What each line is reading, and why it is worth a line:
   evaluation, which is what the idle thresholds cover; the two look redundant
   and are complementary.
 
-  Two things not to conclude from a falling rate. It does not mean the
-  evaluations got harder: on that run per-evaluation cost was *falling* at the
-  same time, because the search was converging on cheaper parameters. And
-  whether it means stragglers is answered by the spread of
-  `metrics.json` `timing.image_container_seconds`, not by the rate - a fat
-  tail is one slow evaluation gating a batch, while a tight distribution (that
-  run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means the missing wall
-  clock is going somewhere other than the likelihood, into sampler overhead,
-  contention or synchronisation. The two want different responses.
+  Do not conclude from a falling rate that the evaluations got harder -
+  **imaging** below is what answers that, and on this run it answered *no*.
+  Whether a falling rate means stragglers is a third question, answered by the
+  *spread* of `metrics.json` `timing.image_container_seconds` rather than its
+  median: a fat tail is one slow evaluation gating a batch, while a tight
+  distribution (that run: min 11.6s, p50 21.2s, p90 30.4s, max 33.9s) means
+  the missing wall clock is going into sampler overhead, contention or
+  synchronisation. The three want different responses.
 - **history** - the same throughput binned into twenty equal slices of the
   run's own life, scaled to its own peak. The two rates above are the only
   numbers here that change over time, and as numbers they cannot show the
@@ -414,6 +414,30 @@ What each line is reading, and why it is worth a line:
   nothing landed is marked `·` rather than drawn as merely slow. Binned over
   first-to-last evaluation, never up to now, for the partial-window reason
   above; how long ago the last one landed is **activity**'s job.
+- **imaging** - what one evaluation costs the imager, and how much of the
+  run's hardware that cost is being spread over. The arrival rate in
+  **activity** cannot tell a slower imager from idle ranks: both read as fewer
+  evaluations a minute. `metrics.json` carries the imager's own wall clock, and
+  this scan already reads every one of those files in full, so the median costs
+  a regex over a string already in memory and no extra I/O.
+  Beside it, that median divided by the median gap between evaluations, as a
+  percentage of the ranks the run was given: 25.4s of imaging per 1.5s of wall
+  clock is sixteen ranks kept busy, which is all sixteen. It is the only place
+  in the report where memory a run is *holding but not using* shows up as such.
+  Both are shown over the last 50 evaluations too when either has moved
+  materially - which is how the live R2D2 search's 5-fold slowdown was
+  diagnosed: 25.4s at 100% over its life against 12.3s at 6% over its last 50,
+  so the imager had got twice as *fast* while fifteen of its sixteen ranks -
+  and the ~44GB they hold - went idle waiting on the sampler.
+  Clamped at 100%: the cost median and the gap median are independent
+  statistics over sets that only mostly coincide, so a fully loaded run reads
+  either side of full and the raw ratio would print "23 of 16".
+  Reported, never warned on. Every WSClean run on this host ends its last 50
+  evaluations near 23% simply by shutting down, and the live R2D2 run's own
+  twenty slices ranged 4.4 to 23.1 effective ranks with no fault - there is no
+  threshold here that would not mostly fire on ordinary phases. Withheld
+  entirely below the same one-second span floor as the rate, where the gap
+  median is zero and the ratio is a division by noise.
 - **sampler** - PolyChord's own running total, out of `chains/*.stats`, which
   it rewrites at every checkpoint. Every other line here is operational; this
   is the number the search exists to produce, and `logZ` moving is the only

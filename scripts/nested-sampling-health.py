@@ -33,6 +33,12 @@ Four things it checks, each one a way a run has actually gone wrong here:
   recovered from a step down that did not - the two the medians report
   identically on the way past each other.
 
+* **Where the time goes.** A falling evaluation rate is either a slower imager
+  or idle ranks, and the rate alone cannot tell them apart. `imaging` reports
+  the imager's own wall clock per evaluation and, against the gaps between
+  them, how much of the run's hardware that cost is actually keeping busy - the
+  only place here where memory a run holds but is not using is visible.
+
 * **Cost, again, in memory and cores.** Memory is what caps a run here, so
   what the run holds is reported next to what the host has left - over every
   process carrying the run directory, because a rank is ~10MB and the imager
@@ -98,6 +104,12 @@ ERROR_LINE = re.compile(r"Traceback|Error|Exception|FATAL", re.IGNORECASE)
 # it. Matched as text because the alternative is parsing thousands of files to
 # read one number out of each.
 FAILURE_OBJECTIVE_MARKER = '"objective": 100.0'
+
+# The imager's own wall clock for one evaluation, out of the metrics.json this
+# scan already reads in full - so it costs a regex over a string in memory and
+# no extra I/O. Pulled out by pattern rather than json.loads for the same
+# reason the failure marker is: 5,000 files a run, and only one number wanted.
+WALL_SECONDS_PATTERN = re.compile(r'"wall_seconds":\s*([0-9.eE+-]+)')
 
 # Long enough that no legitimate evaluation reaches it: the slowest measured
 # here is ~33s of R2D2 imaging, and common.py's own ceilings (10s for a
@@ -411,7 +423,7 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     # (when it landed, whether it failed, where it is), kept together so that
     # "how the run is going now" can be asked of failures as well as of pace,
     # and so the newest few can be measured for size without a second glob.
-    records: list[tuple[float, bool, Path]] = []
+    records: list[tuple[float, bool, Path, float | None]] = []
     wedged_lines = 0
     for entry in evaluations.glob("eval-*"):
         if not entry.is_dir():
@@ -419,19 +431,21 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         directories += 1
         metrics = entry / "metrics.json"
         try:
-            records.append((metrics.stat().st_mtime,
-                            FAILURE_OBJECTIVE_MARKER in metrics.read_text(),
-                            entry))
+            when, text = metrics.stat().st_mtime, metrics.read_text()
         except OSError:
             pass  # in flight, or a leftover the next run will sweep
+        else:
+            cost = WALL_SECONDS_PATTERN.search(text)
+            records.append((when, FAILURE_OBJECTIVE_MARKER in text, entry,
+                            float(cost.group(1)) if cost else None))
         try:
             wedged_lines += len((entry / "meqserver-wedged.log").read_text().splitlines())
         except OSError:
             pass
     records.sort()
-    times = [when for when, _, _ in records]
-    failed = sum(1 for _, bad, _ in records if bad)
-    recent_failed = (sum(1 for _, bad, _ in records[-RATE_WINDOW:] if bad)
+    times = [when for when, _, _, _ in records]
+    failed = sum(1 for _, bad, _, _ in records if bad)
+    recent_failed = (sum(1 for _, bad, _, _ in records[-RATE_WINDOW:] if bad)
                      if len(records) >= RATE_WINDOW else None)
     gaps = [b - a for a, b in zip(times, times[1:])]
     threshold = MIN_STALL_GAP_SECONDS
@@ -475,6 +489,38 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         recent_rate = 60 / recent if recent > 0 else None
         slowdown = recent / overall if overall > 0 else None
 
+    # What one evaluation costs the imager, against how fast evaluations are
+    # arriving. The arrival rate alone cannot separate "the imager got slower"
+    # from "the ranks are idle": both read as a smaller rate. The imager's own
+    # wall clock separates them, and their ratio - imaging seconds per
+    # inter-arrival second - is how many ranks the run is actually keeping
+    # busy, which is the number that says whether the memory it is holding is
+    # being used.
+    #
+    # Medians throughout, and paired with the gap medians over the same window,
+    # because evaluation cost genuinely varies with the parameters drawn and a
+    # nested-sampling run concentrates: the live R2D2 search here ran at a
+    # 25.4s median over its life and 12.2s over its last 50, with no fault.
+    def _cost(rows: list) -> float | None:
+        seen = [w for _, _, _, w in rows if w is not None]
+        return statistics.median(seen) if seen else None
+
+    #
+    # Gated on the same span floor as the rate, and for the same reason: a run
+    # killed inside its opening parallel batch has every evaluation landing in
+    # the same millisecond, so the gap median is zero or near it and the ratio
+    # is a division by noise rather than an occupancy.
+    cost, recent_cost = _cost(records), None
+    busy_ranks, recent_busy_ranks = None, None
+    trustworthy = span >= MIN_RATE_SPAN_SECONDS
+    if cost is not None and trustworthy and gaps and statistics.median(gaps) > 0:
+        busy_ranks = cost / statistics.median(gaps)
+    if trustworthy and len(gaps) >= 2 * RATE_WINDOW:
+        recent_cost = _cost(records[-RATE_WINDOW:])
+        window = statistics.median(gaps[-RATE_WINDOW:])
+        if recent_cost is not None and window > 0:
+            recent_busy_ranks = recent_cost / window
+
     # Spread over the run's life rather than taken from its tail. An
     # evaluation's size follows its parameters, and a nested-sampling run
     # concentrates on a shrinking region, so the newest evaluations drift away
@@ -483,7 +529,7 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     # Strided rather than random so the number does not move between two
     # readings of an unchanged run.
     stride = max(1, len(records) // DISK_SAMPLE)
-    sample = [where for _, _, where in records[::stride]]
+    sample = [where for _, _, where, _ in records[::stride]]
     per_evaluation = (statistics.mean(_dir_bytes(where) for where in sample)
                       if sample else None)
     rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
@@ -497,6 +543,10 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "recent_failed": recent_failed,
         "evals_per_minute": rate,
         "recent_evals_per_minute": recent_rate,
+        "seconds_per_evaluation": cost,
+        "recent_seconds_per_evaluation": recent_cost,
+        "busy_ranks": busy_ranks,
+        "recent_busy_ranks": recent_busy_ranks,
         "bytes_per_evaluation": per_evaluation,
         "disk_bytes": per_evaluation * len(times) if per_evaluation else None,
         "disk_bytes_per_hour": (per_evaluation * rate * 60
@@ -1091,6 +1141,32 @@ def render(run: dict[str, object]) -> None:
                       (f"{past['bar']}  {past['low_per_minute']:.0f}-"
                        f"{past['high_per_minute']:.0f}/min per "
                        f"{format_hms(float(past['bucket_seconds']))} slice")))
+    # What an evaluation costs and how much of the run's hardware that cost is
+    # spread over. `activity` reports arrival rate, which confounds a slower
+    # imager with idle ranks; this line separates them, and the occupancy is
+    # the only place in the report where memory the run is holding but not
+    # using shows up as such.
+    cost = run["seconds_per_evaluation"]
+    if cost is not None:
+        # As a percentage of the ranks the run was given, clamped: the imaging
+        # median and the inter-arrival median are independent statistics over
+        # sets that only mostly coincide, so a fully loaded run reads a few
+        # percent either side of 100 and the raw ratio would print "23 of 16".
+        procs = settings.get("NS_MPI_PROCS") or (str(run["ranks"]) or "")
+        def _busy(value: object) -> str:
+            if value is None or not str(procs).isdigit() or int(procs) <= 0:
+                return ""
+            return f", ranks {min(float(value) / int(procs), 1.0):.0%} busy"
+        recent_cost = run["recent_seconds_per_evaluation"]
+        changed = ""
+        if recent_cost is not None and (
+                not (1 / RATE_DIVERGENCE_FACTOR < float(recent_cost) / cost
+                     < RATE_DIVERGENCE_FACTOR)
+                or _busy(run["recent_busy_ranks"]) != _busy(run["busy_ranks"])):
+            changed = (f"  (last {RATE_WINDOW}: {float(recent_cost):.1f}s"
+                       f"{_busy(run['recent_busy_ranks']).replace(' ranks', '')})")
+        lines.append(("imaging", f"{float(cost):.1f}s per evaluation"
+                                 + _busy(run["busy_ranks"]) + changed))
     # What the search has actually found, and what each dead point cost it.
     # Every other line here is operational; this one is the result, and the
     # calls-per-dead-point is the sampler's own efficiency - the thing an
@@ -1282,11 +1358,14 @@ def self_check() -> None:
     now = time.time()
 
     def write_eval(run: Path, index: int, mtime: float, objective: float = 0.008,
-                   wedges: int = 0) -> None:
+                   wedges: int = 0, wall_seconds: float | None = None) -> None:
         eval_dir = run / "evaluations" / f"eval-{index:04d}-abc"
         eval_dir.mkdir(parents=True)
         metrics = eval_dir / "metrics.json"
-        metrics.write_text(json.dumps({"eval_id": index, "objective": objective}, indent=2))
+        body: dict[str, object] = {"eval_id": index, "objective": objective}
+        if wall_seconds is not None:
+            body["metrics"] = {"wall_seconds": wall_seconds}
+        metrics.write_text(json.dumps(body, indent=2))
         os.utime(metrics, (mtime, mtime))
         if wedges:
             (eval_dir / "meqserver-wedged.log").write_text(
@@ -1648,6 +1727,58 @@ def self_check() -> None:
             # and recovers is a phase, and warning on it would teach the reader
             # to ignore the warnings that mean something.
             assert not any("throughput" in w for w in report["warnings"]), report
+            # The imager never changed - 12s an evaluation from first to last -
+            # so the 12-fold drop in arrivals is idle ranks, and the occupancy
+            # is what says so: 12 of 12 ranks kept busy over the run's life,
+            # one of them over its last 50. Reported, not warned on, because
+            # every wsclean run on this host ends its last 50 near 23% simply
+            # by shutting down.
+
+            # The same collapse seen from the imager's side, which is where the
+            # two explanations for a falling arrival rate come apart. Eight
+            # ranks; 150 evaluations 2s apart costing the imager 20s each, then
+            # 60 evaluations 10s apart costing 5s each - so the imager got four
+            # times *faster* while arrivals got five times slower, and the only
+            # reading that fits is ranks going idle. This is the live R2D2
+            # search's real shape (25.4s at full occupancy over its life, 12.3s
+            # at 6% over its last 50), not an invented one.
+            idle = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T025900Z"
+            (idle / "chains").mkdir(parents=True)
+            (idle / "chains" / "r2d2_vlaa.resume").write_text("")
+            (idle / "run.env").write_text("NS_MPI_PROCS=8\n")
+            stamp = now - (150 * 2 + 60 * 10) - 5
+            for i in range(150):
+                stamp += 2
+                # One 1s outlier, so the cost is a median and not whatever the
+                # first or the cheapest evaluation happened to be.
+                write_eval(idle, i + 1, stamp, wall_seconds=1.0 if i == 0 else 20.0)
+            for i in range(60):
+                stamp += 10
+                write_eval(idle, 151 + i, stamp, wall_seconds=5.0)
+            serial = describe(idle, [], DEFAULT_STALE_SECONDS)
+            assert float(serial["seconds_per_evaluation"]) == 20.0, serial
+            assert float(serial["recent_seconds_per_evaluation"]) == 5.0, serial
+            assert abs(float(serial["busy_ranks"]) - 10) < 0.1, serial
+            assert abs(float(serial["recent_busy_ranks"]) - 0.5) < 0.05, serial
+            # 20s of imaging per 2s of wall clock is 125% of 8 ranks: the cost
+            # median and the gap median are independent statistics over sets
+            # that only mostly coincide, so a fully loaded run reads either
+            # side of full and the printed figure is clamped where the raw one
+            # is not.
+            occupancy = io_capture(serial)
+            assert "20.0s per evaluation, ranks 100% busy" in occupancy, occupancy
+            assert "(last 50: 5.0s, 6% busy)" in occupancy, occupancy
+
+            # A run whose evaluations all landed in the same millisecond has no
+            # occupancy to report, for the same reason it has no rate: the gap
+            # median is zero and the ratio would be a division by noise.
+            burst = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T025800Z"
+            (burst / "chains").mkdir(parents=True)
+            for i in range(100):
+                write_eval(burst, i + 1, now - 3600 + i * 0.005, wall_seconds=13.0)
+            flat = describe(burst, [], DEFAULT_STALE_SECONDS)
+            assert flat["busy_ranks"] is None, flat
+            assert "% busy" not in io_capture(flat), io_capture(flat)
             rendered = io_capture(report)
             assert "5.0/min over the last 50" in rendered, rendered
             # The same collapse as a shape: the healthy phase fills the early
