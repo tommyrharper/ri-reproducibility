@@ -71,6 +71,16 @@ check(
     plan("search", "wsclean", "--stall-timeout", "0")[0],
 )
 
+# --synchronous is the only boolean here, and the scripts test it the shell
+# way, so it has to arrive as 1/0 rather than Python's True/False.
+check(
+    "search --synchronous/--no-synchronous become 1/0",
+    ({"NS_SYNCHRONOUS": "1"}, {"NS_SYNCHRONOUS": "0"}),
+    (plan("search", "wsclean", "--synchronous")[0],
+     plan("search", "wsclean", "--no-synchronous")[0]),
+)
+
+
 # ...and a flag that was not given contributes nothing, so an environment
 # variable exported by hand survives and defaults.toml still fills the rest.
 check(

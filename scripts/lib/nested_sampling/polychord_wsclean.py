@@ -377,6 +377,7 @@ def main() -> None:
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
+    settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # PolyChord's own checkpointing, on so that an interrupted run is not a
     # wasted one. It was off, which was survivable when a run was 100s of toy
     # evaluations and is not once a run is hours long: any interruption - the
@@ -438,6 +439,10 @@ def main() -> None:
                 "max_ndead": args.max_ndead,
                 "seed": args.seed,
                 "mpi_procs": mpi_procs,
+                # Which MPI scheduling this run used, because it changes how
+                # much of the worker-time budget the profiling block can
+                # account for and a run's numbers are unreadable without it.
+                "synchronous": settings.synchronous,
             },
             "wsclean_fixed_hyperparameters": {
                 "niter": DEFAULT_WSCLEAN_NITER,

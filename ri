@@ -46,6 +46,7 @@ SEARCH_ENV = (
     ("seed", "NS_SEED"),
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
+    ("synchronous", "NS_SYNCHRONOUS"),
     ("retries", "NS_RETRIES"),
     ("stall_timeout", "NS_STALL_TIMEOUT"),
     ("omp_threads", "R2D2_OMP_THREADS"),
@@ -60,7 +61,10 @@ def env_from(args, pairs):
     caller exported by hand survives, and defaults.toml supplies the rest.
     """
     return {
-        var: str(getattr(args, dest))
+        # bool renders as "1"/"0", not "True"/"False": these become shell
+        # environment variables, and the scripts test them the shell way.
+        var: ("1" if getattr(args, dest) else "0") if isinstance(getattr(args, dest), bool)
+        else str(getattr(args, dest))
         for dest, var in pairs
         if getattr(args, dest) is not None
     }
@@ -335,6 +339,11 @@ def build_parser():
                              "--metric=-snr, to search the worst corner [NS_METRIC]")
     search.add_argument("--mpi-procs", type=int,
                         help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
+    search.add_argument("--synchronous", action=argparse.BooleanOptionalAction,
+                        help="make every rank wait for the slowest one each sampling "
+                             "round. Off by default: it costs ~30%% of the wall clock "
+                             "here and buys nothing this search needs "
+                             "[NS_SYNCHRONOUS], see docs/nested-sampling-throughput.md")
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
     search.add_argument("--retries", type=int, metavar="N",

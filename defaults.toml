@@ -45,6 +45,17 @@ NS_MAX_NDEAD = 12
 # repeated exactly. `./ri resume` reads run.env, so a resume keeps its seed.
 NS_METRIC = "total_rms_jy"
 
+# PolyChord's MPI scheduling. 1 is pypolychord's own default: the sampler
+# hands every rank a slice-sampling chain, then blocks until the slowest one
+# comes back, so a round costs the slowest chain and every other rank idles
+# out the difference. Chain length here is stochastic and an evaluation is
+# seconds to tens of seconds, so that difference is most of the run: a 15-rank
+# WSClean search measured 64% rank utilisation at 1 and 92% at 0, for ~30%
+# less wall clock per dead point. 0 reseeds each rank the moment it reports
+# back. See docs/nested-sampling-throughput.md for the measurement and for
+# what the asynchronous mode gives up.
+NS_SYNCHRONOUS = 0
+
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
 # scored no evaluations is never retried, and one that ran longer than
