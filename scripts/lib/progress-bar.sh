@@ -136,17 +136,44 @@ run_with_progress() {
 # alternative is re-launching the pool into a container whose old workers may
 # not all have exited yet, and two readers on one FIFO split the messages
 # between them.
+#
+# `retries` bounds a crash loop, not the lifetime of a long search, so an
+# attempt that ran for NS_RETRY_RESET_SECONDS before dying hands the budget
+# back. Without that the counter only ever climbed: a multi-day R2D2 search
+# that healed itself twice on day one was then out of retries for the rest of
+# the week, and the third unrelated OOM kill - hours of imaging later - ended
+# it exactly the way not retrying at all would have. What the budget is
+# actually for is the fault that reappears as soon as the run is restarted,
+# and that one reappears in minutes. Half an hour is ~70x the ~25s a single
+# R2D2 evaluation takes and ~150x the 12.1s a restart itself costs, so an
+# attempt that clears it plainly got past whatever killed the last one.
+# Resetting too eagerly is the safe direction: every retry still has to have
+# scored evaluations, so the worst case is a run that grinds forward slowly
+# rather than one that spins.
 run_with_retries() {
   local retries="$1" output_dir="$2"
   shift
-  local attempt=0 status=0 before after
+  local reset_after="${NS_RETRY_RESET_SECONDS:-1800}"
+  local attempt=0 status=0 before after started
   while :; do
     before="$(_ns_completed_evals "${output_dir}")"
     status=0
+    started="$(date +%s)"
     run_with_progress "$@" || status=$?
     [ "${status}" -eq 0 ] && return 0
     after="$(_ns_completed_evals "${output_dir}")"
+    # Before the budget check, so the attempt that earned the reset is the one
+    # that gets to use it.
+    if [ "$(($(date +%s) - started))" -ge "${reset_after}" ]; then
+      attempt=0
+    fi
     if [ "${attempt}" -ge "${retries}" ]; then
+      if [ "${retries}" -gt 0 ]; then
+        _ns_retry_say "${output_dir}" \
+          "not retrying: ${retries} of ${retries} restarts used and this attempt" \
+          "(exit ${status}) died inside ${reset_after}s, so the fault is still there." \
+          "Why it stopped is above; ./ri resume ${output_dir##*/} tries again anyway."
+      fi
       break
     fi
     if [ "${after}" -le "${before}" ]; then
@@ -857,6 +884,63 @@ self_check() {
   run_with_retries 2 "${once_dir}" -1 2 -- sh -c 'echo b >>"$0"/attempts' "${once_dir}" \
     >/dev/null 2>&1 || { echo "FAIL: success returned nonzero"; exit 1; }
   [ "$(_ns_count_lines "${once_dir}/attempts")" = "2" ] || { echo "FAIL: success re-ran"; exit 1; }
+
+  # The retry budget is for a crash loop, not for the run's lifetime: an
+  # attempt that ran a long time before dying hands it back, so a multi-day
+  # search is not out of restarts for the rest of the week because it healed
+  # itself twice on day one.
+  #
+  # One fixture, run twice, so the only difference between the two is the
+  # reset. It fails three times and then succeeds, against a budget of 1:
+  # with the reset off that is 2 attempts and exit 5, with it on 4 attempts
+  # and exit 0. The reset is forced by setting the window to 0 rather than by
+  # making the fixture slow - these attempts take milliseconds, and a fixture
+  # that had to outlive a real window would put minutes into the self-check.
+  local reset_dir="${tmp}/reset"
+  mkdir -p "${reset_dir}/chains"
+  # shellcheck disable=SC2016
+  local flaky='n=$(ls "$0"/evaluations 2>/dev/null | wc -l);
+    mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
+    echo a >>"$0"/attempts;
+    [ "$(wc -l <"$0"/attempts)" -ge 4 ] && exit 0; exit 5'
+  status=0
+  run_with_retries 1 "${reset_dir}" -1 2 -- sh -c "${flaky}" "${reset_dir}" \
+    >/dev/null 2>&1 || status=$?
+  [ "${status}" = "5" ] || { echo "FAIL: quick crash loop exit ${status}, want 5"; exit 1; }
+  [ "$(_ns_count_lines "${reset_dir}/attempts")" = "2" ] || {
+    echo "FAIL: crash loop ran $(_ns_count_lines "${reset_dir}/attempts") attempts, want 1 + 1 retry"
+    exit 1
+  }
+  # And it says why it gave up. run.log is the only artifact recording that,
+  # and "the run just stopped" with nothing about the exhausted budget is the
+  # report this whole path exists to avoid.
+  grep -q "not retrying: 1 of 1 restarts used" "${reset_dir}/run.log" || {
+    echo "FAIL: exhausted retry budget not explained in run.log"; exit 1
+  }
+
+  local long_dir="${tmp}/reset-long"
+  mkdir -p "${long_dir}/chains"
+  status=0
+  # Set and unset rather than prefixed onto the call: an assignment prefixing
+  # a shell function can outlive it, which would silently disable the reset
+  # window for every case below.
+  NS_RETRY_RESET_SECONDS=0
+  run_with_retries 1 "${long_dir}" -1 2 -- sh -c "${flaky}" "${long_dir}" \
+    >/dev/null 2>&1 || status=$?
+  [ "${status}" = "0" ] || { echo "FAIL: long-lived attempts exit ${status}, want 0"; exit 1; }
+  [ "$(_ns_count_lines "${long_dir}/attempts")" = "4" ] || {
+    echo "FAIL: reset gave $(_ns_count_lines "${long_dir}/attempts") attempts, want 4"; exit 1
+  }
+  # ...and the reset never turns "no retries" into one: 0 is still 0.
+  local never_dir="${tmp}/reset-never"
+  mkdir -p "${never_dir}/chains"
+  status=0
+  run_with_retries 0 "${never_dir}" -1 2 -- sh -c "${flaky}" "${never_dir}" \
+    >/dev/null 2>&1 || status=$?
+  unset NS_RETRY_RESET_SECONDS
+  [ "$(_ns_count_lines "${never_dir}/attempts")" = "1" ] || {
+    echo "FAIL: retries=0 retried under the reset"; exit 1
+  }
 
   # _ns_stall_watchdog: a run that is alive but landing nothing is killed so
   # the retry loop can act on it, and one that keeps scoring is left alone.

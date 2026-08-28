@@ -203,7 +203,7 @@ Sampler defaults live in `defaults.toml` at the repository root, loaded by
 | `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget that terminates the run | `12` |
 | `--seed` | `NS_SEED` | PolyChord random seed | `41` |
 | `--metric` | `NS_METRIC` | Objective: `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
-| `--retries` | `NS_RETRIES` | Times a run that dies after scoring evaluations restarts itself from its checkpoint; `0` disables - see "A run that dies restarts itself" | `2` |
+| `--retries` | `NS_RETRIES` | Times a run that dies after scoring evaluations restarts itself from its checkpoint, counting only failures that come straight back (`NS_RETRY_RESET_SECONDS`, 1800, hands the budget back); `0` disables - see "A run that dies restarts itself" | `2` |
 | `--stall-timeout` | `NS_STALL_TIMEOUT` | Seconds with no evaluation finishing before a run is killed as hung, so `--retries` can restart it; `0` disables - see "A run that hangs instead of dying" | `7200` |
 
 #### Leave these alone
@@ -804,6 +804,23 @@ Two things to know about a restarted run:
   `./ri health` shows the count and the latest one. It is reported, not warned
   on - the run is fine right now - but whatever killed it once will do it
   again, so the line is worth reading.
+
+**The budget is for a crash loop, not for the run's lifetime.** An attempt
+that ran for `NS_RETRY_RESET_SECONDS` (1800) before dying hands the retry
+budget back, so the count is of failures that keep coming straight back rather
+than of restarts ever made. Without that the counter only climbed: a
+multi-day R2D2 search that healed itself twice on day one was out of retries
+for the rest of the week, and the third unrelated OOM kill - hours of imaging
+later - ended it exactly the way `--retries 0` would have. Half an hour is
+~70x a single R2D2 evaluation and ~150x the 12.1s a restart itself costs, so
+an attempt that clears it plainly got past whatever killed the last one.
+Resetting too eagerly is the safe direction, because a retry still has to have
+scored evaluations: the worst case is a run that grinds forward slowly, not
+one that spins.
+
+When the budget is gone the run says so in `run.log` - `not retrying: 2 of 2
+restarts used and this attempt (exit 137) died inside 1800s` - rather than
+just stopping. `./ri health` reads that log tail back for a stopped run.
 
 Set `--retries 0` to get the old behaviour, where the first failure ends the
 run.

@@ -37,8 +37,10 @@ NS_METRIC = "total_rms_jy"
 
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
-# added no dead points is never retried - see run_with_retries in
-# scripts/lib/progress-bar.sh.
+# scored no evaluations is never retried, and one that ran longer than
+# NS_RETRY_RESET_SECONDS (1800) before dying hands the budget back, so this
+# bounds a crash loop rather than the lifetime of a multi-day search - see
+# run_with_retries in scripts/lib/progress-bar.sh.
 NS_RETRIES = 2
 
 # Seconds a run may go without finishing a single evaluation before it is

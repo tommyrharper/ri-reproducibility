@@ -326,7 +326,8 @@ def build_parser():
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
     search.add_argument("--retries", type=int, metavar="N",
                         help="times a search that died after scoring evaluations "
-                             "restarts itself from its checkpoint; 0 disables "
+                             "restarts itself from its checkpoint, counting only "
+                             "failures that come straight back; 0 disables "
                              "[NS_RETRIES]")
     search.add_argument("--stall-timeout", type=int, metavar="SECONDS",
                         help="seconds without a finished evaluation before a search is "
