@@ -222,7 +222,8 @@ and the report, which globs for `summary.json`, will not show it at all.
 Every command that takes a run - `resume`, `health`, `profile`, `merge`,
 `plot gui` - takes either a path or the bare name `./ri runs` prints, so the
 name can be copied straight out of that table. A path of the same name in the
-working directory still wins.
+working directory still wins. `health` also takes the name of a run another
+checkout started while it is running, because it reports those too.
 
 ## Is the run that is going still worth going?
 

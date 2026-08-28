@@ -1828,12 +1828,23 @@ def default_directories(processes: list[dict[str, object]] | None = None) -> lis
 
 def resolve(name: str | None,
             processes: list[dict[str, object]] | None = None) -> Path:
-    """A run directory from a path or a bare run name."""
+    """A run directory from a path or a bare run name.
+
+    A bare name is looked for in this checkout first and then among the runs
+    live anywhere on this host, because the default report has been host-wide
+    since it started finding runs in the process list: it prints a foreign
+    run's bare name in its headline, and a name this report prints has to be
+    one it accepts back. This checkout first so a local run always wins its
+    own name; the stamp makes a genuine collision vanishingly unlikely anyway.
+    """
     if name:
         candidate = Path(name)
         if not candidate.is_dir():
             candidate = NESTED_SAMPLING_DIR / name
         if not candidate.is_dir():
+            for run in live_run_directories(processes or []):
+                if run.name == name:
+                    return run
             raise SystemExit(f"No such run: {name}")
         return candidate
     return default_directories(processes)[0]
@@ -1843,7 +1854,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("run", nargs="?", metavar="RUN",
-                        help="run directory or its name (default: every run "
+                        help="run directory, or the name this report prints - "
+                             "including a run another checkout started, while "
+                             "it is still running (default: every run "
                              "still running anywhere on this host, whichever "
                              "checkout started it, else this checkout's "
                              "newest run)")
@@ -2980,6 +2993,27 @@ def self_check() -> None:
                 assert "\n  path " not in io_capture(here), io_capture(here)
                 there = io_capture({**here, "path": str(foreign)})
                 assert f"\n  path      {foreign}\n" in there, there
+                # ...and that bare name resolves back. The headline names a
+                # foreign run by its name alone, and `./ri health <that name>`
+                # used to answer "No such run" for the run `./ri health` had
+                # printed one line above.
+                assert resolve(foreign.name, abroad) == foreign
+                # Exactly that name: a prefix of it is not a match, and a name
+                # nothing is running is still an error rather than a guess.
+                for miss in (foreign.name[:-1], foreign.name):
+                    try:
+                        resolve(miss, abroad if miss == foreign.name[:-1] else ranks)
+                    except SystemExit:
+                        pass
+                    else:
+                        assert False, f"resolved {miss!r} with nothing to match"
+                # A run in this checkout wins its own name over a live foreign
+                # namesake: the local one is the one the caller can see.
+                twin = [dict(ranks[0], pid=780,
+                             args=f"python3 polychord_r2d2.py "
+                                  f"--output-dir {Path(other_checkout) / live.name}")]
+                (Path(other_checkout) / live.name).mkdir()
+                assert resolve(live.name, twin) == live
             # mpirun and the host-side `docker exec` carry --output-dir too and
             # are not ranks: counting them would work here but would resurrect
             # a run whose ranks have all gone while its client is still exiting.

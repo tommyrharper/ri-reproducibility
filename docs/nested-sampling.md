@@ -385,7 +385,11 @@ are found in the host process list rather than by globbing this checkout's
 `results/nested-sampling/`, so a run started from another worktree is reported
 too, named by a `path` line - from a worktree the report used to answer "why is
 there no memory left" with that worktree's newest finished smoke run while the
-48GB search that owned the machine stayed off the page. `--all` covers every run
+48GB search that owned the machine stayed off the page. That `path` line's
+headline still names the run by name alone, and `./ri health <that name>`
+accepts it: a bare name is looked for in this checkout first and then among
+whatever is running on the host, so every name this report prints is one it
+takes back. `--all` covers every run
 on disk under this checkout and `--json` is the machine-readable form. It reads files and runs one `ps` and one `docker
 ps`, plus a one second CPU sample when a run has live ranks - nothing is
 started and nothing is imaged, so a run in progress does not notice it. Exit

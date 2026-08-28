@@ -415,7 +415,9 @@ def build_parser():
         ),
     )
     health.add_argument("run", nargs="?", metavar="RUN",
-                        help="run directory or its name (default: every run "
+                        help="run directory, or the name this report prints - "
+                             "including a run another checkout started, while "
+                             "it is still running (default: every run "
                              "still running anywhere on this host, whichever "
                              "checkout started it, else this checkout's "
                              "newest run)")
