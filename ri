@@ -361,6 +361,11 @@ def build_parser():
             "a run without one stopped early - and the HTML report, which globs\n"
             "for summary.json, does not show it at all.\n"
             "\n"
+            "A run that is still going has no summary.json either, so it is\n"
+            "told apart from a stopped one by its processes and shown as\n"
+            "running - it is offered to ./ri health, never to ./ri resume,\n"
+            "which would start a second job over its own checkpoint.\n"
+            "\n"
             "Anything unfinished is listed again at the end with the ./ri resume\n"
             "line that continues it."
         ),
@@ -409,7 +414,9 @@ def build_parser():
             "already finished. The run directory records the settings it was\n"
             "started with, so no flags are needed and none can be misremembered.\n"
             "\n"
-            "./ri runs lists what there is to resume."
+            "./ri runs lists what there is to resume. A run that is still\n"
+            "going is refused: a second job over its checkpoint and FIFO\n"
+            "directories would corrupt both."
         ),
     )
     resume.add_argument("run", metavar="RUN",

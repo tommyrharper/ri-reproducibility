@@ -695,8 +695,12 @@ without one stopped early. `./ri runs` is the list:
 ```console
 $ ./ri runs
 RUN                        ALGORITHM  STATUS      EVALS
+r2d2-vlaa-20260828T2054Z   r2d2       running     6882
 r2d2-vlaa-20260827T1015Z   r2d2       resumable   659
 wsclean-vlaa-20260827T09Z  wsclean    complete    1706
+
+1 run still going. Check on it with:
+  ./ri health r2d2-vlaa-20260828T2054Z
 
 1 run stopped before finishing.
 Continue where it left off, keeping every evaluation already done:
@@ -710,10 +714,30 @@ silently become a different search. PolyChord's own checkpointing supplies the
 live points and the evaluations already on disk are adopted, so their ids
 carry on and no point is paid for twice.
 
-`STATUS` is `complete` when `summary.json` is there, `resumable` when it is
-not but a PolyChord `.resume` file is, and `incomplete` when a run stopped
-before it checkpointed anything. `./ri runs --incomplete` lists only the ones
-needing attention, and `--json` is the machine-readable form.
+`STATUS` is `complete` when `summary.json` is there, `running` when the run
+still has a process driving it, `resumable` when neither but a PolyChord
+`.resume` file is there, and `incomplete` when a run stopped before it
+checkpointed anything. `./ri runs --incomplete` lists only the ones needing
+attention, and `--json` is the machine-readable form.
+
+A live run is indistinguishable on disk from one that stopped - same missing
+`summary.json`, same checkpoint - so liveness is read from the process table,
+the way `./ri health` picks the run to report on. Before that, `./ri runs`
+called the live search `resumable` and printed `./ri resume` for it, which is
+an instruction to start a second MPI job over the live one's own checkpoint and
+FIFO directories. `./ri resume` refuses that outright:
+
+```console
+$ ./ri resume r2d2-vlaa-20260828T2054Z
+FATAL: r2d2-vlaa-20260828T2054Z is still running, so there is nothing to resume.
+       A second job over the same checkpoint would corrupt both.
+       Watch it instead:  ./ri health r2d2-vlaa-20260828T2054Z
+```
+
+The refusal lives in `./ri resume` rather than in each place that suggests one,
+because the HTML report can still offer it: that report is a snapshot, and a
+liveness check baked into a static page would be stale by the time anyone read
+it. Guarding the action covers every route to it.
 
 The HTML report lists unfinished runs at the top of its index for the same
 reason, because they have no page of their own: a run that stops does not

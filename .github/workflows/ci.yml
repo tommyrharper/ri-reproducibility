@@ -61,6 +61,7 @@ jobs:
           bash scripts/lib/rank-budget.sh --self-check
           bash scripts/lib/start-sidecars.sh --self-check
           bash scripts/lib/run-config.sh --self-check
+          bash scripts/resume-nested-sampling-run.sh --self-check
           bash scripts/lib/progress-bar.sh
           uv run --no-project python3 scripts/nested-sampling-runs.py
         env:
