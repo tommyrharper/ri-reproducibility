@@ -8,10 +8,10 @@ one breaks.
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
-  stage     sampling, 113 dead points as of 8m18s ago, next at 163+
-  at risk   184 evaluations scored since that checkpoint, 8m18s of imaging a restart would redo
+  stage     sampling, 173 dead points as of 1h14m ago, next past ~223
+  at risk   184 evaluations scored since that checkpoint, 1h14m of imaging a restart would redo
   progress  1287 evaluations, 15 in flight
-  activity  last evaluation 2s ago, 27.3/min over 47m06s
+  activity  last evaluation 2s ago, 22.2/min over 7h36m (7.7/min over the last 29m50s)
   history   █▆▆▇▇▇█▆▂▆█▆█▄█▆█▅█▇  5-34/min per 7m29s slice
   imaging   25.4s per evaluation, ranks 66% busy  (last 50: 12.3s, 6% busy)
   occupancy ▇▆▆▇▇▂▆▆▇▆▆▆▇▆█▆▇▂▁▆  6%-88% of 16 ranks busy per 7m29s slice
@@ -103,11 +103,22 @@ drawing initial live points.
 The dead-point count never appears without its age, because PolyChord writes
 the checkpoint only every ~`nlive` points and the count cannot move between
 writes. A count that has not changed for an hour is ordinary, and the interval
-grows as a run goes on (one 16-rank R2D2 search: 31 minutes to its first
-checkpoint, 72 more to its second). `next at 163+` rather than `~163` because
-`nlive` is a floor on the interval, not an estimate: measured gaps ran 22-36
-dead points at `--nlive 20` and 51-92 at `--nlive 50`, never under. `next at`
-appears only while the run is going.
+varies a lot: one 16-rank R2D2 search checkpointed at 31, 103, 170, 305, 455
+and 592 minutes. The first is short because startup counts toward it; the rest
+are not a property to extrapolate from, because the interval is a *consequence*
+of two things that both move - how fast evaluations land, and how many each
+dead point costs. Between the third and fourth both moved at once (throughput
+down ~30%, calls per dead point up 43%) and neither alone explains the
+doubling; the next two steps went the other way. **Consecutive intervals can
+differ by 2x with nothing wrong, in either direction.**
+
+`next past ~223` rather than `next at`, because `nlive` is the cadence
+PolyChord checkpoints on, not the size of the jump: six writes on one
+`nlive=50` run moved the count by 57, 56, 60, 57, 56, 56 - never below, never
+far above 60. A floor, not a band fitted to those; a short series cannot carry
+one, which is the over-reading this line exists to prevent. It is the only
+claim here that has never needed revising, and every one that has was a trend.
+Shown only while the run is going.
 
 **at risk** - what standing behind that checkpoint would cost: evaluations
 scored since it, and their imaging time. A restart or `./ri resume` picks up at
@@ -124,9 +135,24 @@ flight. That number should sit near `NS_MPI_PROCS`; pinned there while the
 count does not move is every rank stuck at once. On a run with no ranks left
 they are *abandoned* instead.
 
-**activity** - the overall rate, and the rate over the last 50 evaluations when
-the two diverge. Both are evaluations over elapsed time, which is the only way
-to read one against the other. A run can collapse to a fraction of its
+**activity** - the overall rate, and the rate over the most recent tenth of the
+run when the two diverge. Both are evaluations over the time they took, which
+is the only way to read one against the other; the recent one used to be
+`60 / median(recent gaps)`, a different quantity, reading 33.3/min against the
+18.2 an independent thirty-minute window put it at.
+
+The window is bounded on both axes, because a run varies on both. In
+evaluations it is a share of the run, since a fixed count covers a wildly
+different span depending on pace - fifty is two minutes at 25/min and ten at
+5/min, so it grows exactly when the run slows. In time it is capped at half an
+hour, since a share grows without limit: seven and a half hours in, a tenth had
+reached 62 minutes and a real half-hour slowdown diluted against the recovered
+half hour before it and did not show. The floor outranks the cap - a run too
+slow to fit fifty evaluations into half an hour is better served by a longer
+window. It is labelled by the span it covers rather than a count, because with
+a proportional window the span is what the reader needs.
+
+A run can collapse to a fraction of its
 throughput without ever going quiet enough to look stalled: on a live 16-rank
 R2D2 search, 25/min fell to 5/min for ten minutes while evaluations kept
 landing every 20-30s. Neither rate is warned on - that same run recovered to
@@ -142,9 +168,11 @@ second apart: parallel ranks land their opening batch together, so a run killed
 inside it measures mtime granularity rather than throughput. The same floor
 silences **history**.
 
-A falling rate does not mean the evaluations got harder - **imaging** answers
-that. Whether it means stragglers is a third question, answered by the *spread*
-of `metrics.json` `timing.image_container_seconds`: a fat tail is one slow
+Two things not to conclude from a falling rate. It does not mean the
+evaluations got harder: on that run per-evaluation cost was *falling* at the
+same time, because the search was converging on cheaper parameters. And whether
+it means stragglers is answered by the *spread* of `metrics.json`
+`timing.image_container_seconds`, not by the rate: a fat tail is one slow
 evaluation gating a batch, a tight distribution means the wall clock is going
 into sampler overhead or synchronisation.
 

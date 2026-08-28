@@ -122,55 +122,33 @@ run_with_progress() {
 # Usage: run_with_retries <retries> <output_dir> <max_ndead> <nlive> -- cmd args...
 #
 # The recovery half of the above: PolyChord checkpoints continuously, so a run
-# that dies at hour three already has everything needed to carry on from where
-# it stopped - what it did not have was anything to start it again. A dead
-# worker (WORKER_DIED in common.py), a wedged meqserver that escaped the
-# in-worker watchdog, an OOM kill: each of those ends a multi-day search that
-# is then simply gone until a human notices and types `./ri resume`.
+# that dies at hour three already has what it needs to carry on - what it
+# lacked was anything to start it again. docs/robustness.md has the whole
+# story; four things that decide the code here:
 #
 # Retried only while the failed attempt made forward progress, measured in
-# completed evaluations. That is the whole guard against spinning: a code bug
-# every rank hits deterministically, a bad parameter space, a missing image -
-# all fail before a single evaluation is scored, so they stop immediately
-# rather than failing three times as slowly. Something that killed a run which
-# was working is the only thing that gets another go.
+# completed evaluations. That is the guard against spinning - a deterministic
+# code bug, a bad parameter space or a missing image all fail before scoring
+# anything, so they stop at once rather than failing three times as slowly.
 #
-# Evaluations rather than the dead points this used to count, because
-# PolyChord writes chains/ only every `nlive` dead points: a crash inside that
-# interval - up to seventy minutes of imaging on the 16-rank R2D2 search, and
-# every crash before the first checkpoint of a fresh run - leaves the
-# dead-point count at exactly the number the attempt started from, so the
-# guard fired on runs that had been working for an hour and called them
-# deterministic. Reproduced with a real search killed at 31 scored
-# evaluations and 0 dead points: it refused to retry. Nor is that work lost
-# by retrying - the retry adopts the finished evaluations and serves those
-# points from its cache (adopt_completed_evaluations in common.py).
+# Evaluations, not the dead points this used to count: PolyChord writes chains/
+# only every `nlive` dead points, so a crash inside that interval leaves the
+# count at exactly what the attempt started from. A real search killed at 31
+# scored evaluations and 0 dead points refused to retry.
 #
-# The retry reuses the sidecar containers this run already started, but not
-# their pooled workers: those exit on EOF when the dying ranks close their end
-# of the FIFOs. Each rank then waits out `_connect_shell_started_worker`'s
-# 10s deadline in common.py and starts its own worker inside the same sidecar -
-# still one long-lived worker per rank, so the cost is that one-off wait and
-# not a per-evaluation penalty. Measured on a real killed WSClean search: 216
-# evaluations/min over the 53 before the kill against 219/min over the 34
-# after, with a 12.1s gap across the restart. Deliberate at that price - the
-# alternative is re-launching the pool into a container whose old workers may
-# not all have exited yet, and two readers on one FIFO split the messages
-# between them.
+# A retry reuses the sidecar containers but not their pooled workers, which
+# exit on EOF when the dying ranks close the FIFOs; each rank waits out
+# `_connect_shell_started_worker`'s 10s deadline and starts its own inside the
+# same sidecar. One-off wait, not a per-evaluation penalty: 216 evaluations/min
+# before a real kill against 219/min after, with a 12.1s gap. Re-launching the
+# pool would put two readers on one FIFO, splitting the messages.
 #
 # `retries` bounds a crash loop, not the lifetime of a long search, so an
-# attempt that ran for NS_RETRY_RESET_SECONDS before dying hands the budget
-# back. Without that the counter only ever climbed: a multi-day R2D2 search
-# that healed itself twice on day one was then out of retries for the rest of
-# the week, and the third unrelated OOM kill - hours of imaging later - ended
-# it exactly the way not retrying at all would have. What the budget is
-# actually for is the fault that reappears as soon as the run is restarted,
-# and that one reappears in minutes. Half an hour is ~70x the ~25s a single
-# R2D2 evaluation takes and ~150x the 12.1s a restart itself costs, so an
-# attempt that clears it plainly got past whatever killed the last one.
-# Resetting too eagerly is the safe direction: every retry still has to have
-# scored evaluations, so the worst case is a run that grinds forward slowly
-# rather than one that spins.
+# attempt that ran NS_RETRY_RESET_SECONDS before dying hands the budget back -
+# otherwise a search that healed itself twice on day one is out of retries for
+# the rest of the week. Half an hour is ~70x one R2D2 evaluation and ~150x the
+# 12.1s a restart costs. Resetting too eagerly is the safe direction, since a
+# retry still has to have scored evaluations.
 run_with_retries() {
   local retries="$1" output_dir="$2"
   shift
@@ -206,33 +184,26 @@ run_with_retries() {
     from_where="PolyChord's checkpoint"
     if [ "${after}" -le "${before}" ]; then
       # An attempt that scores nothing is normally deterministic and retrying
-      # it only fails slower - except for the one input a restart can change:
-      # PolyChord's checkpoint. A rank killed part-way through writing
-      # `chains/*.resume` leaves a truncated file, and reading one aborts in
-      # Fortran before evaluation 1, so the guard below fires, no restart is
-      # ever tried, and every later `./ri resume` dies in the same place. The
-      # search is then permanently stuck with all of its scored evaluations
-      # sitting unreachable on disk - the same shape as the unreadable
-      # metrics.json in common.py, and reproduced the same way, by truncating
-      # a real 44KB `.resume` and resuming.
+      # only fails slower - except for the one input a restart can change:
+      # PolyChord's checkpoint. A truncated `chains/*.resume` aborts in Fortran
+      # before evaluation 1, so the guard below fires, no restart is tried, and
+      # every later `./ri resume` dies in the same place with every scored
+      # evaluation unreachable on disk.
       #
-      # Moving it aside is the whole fix: `polychord_*.py` sets `read_resume`
-      # off that file's existence, so the next attempt starts the sampler from
-      # scratch and `adopt_completed_evaluations` replays every evaluation
-      # already scored out of the point cache without imaging any of them.
-      # Renamed rather than deleted, because a checkpoint the run could not
-      # read is still the only record of where the sampler had reached.
+      # Moving it aside is the fix: `polychord_*.py` sets `read_resume` off
+      # that file's existence, so the next attempt starts the sampler from
+      # scratch and `adopt_completed_evaluations` replays what was scored out
+      # of the point cache without imaging it. Renamed rather than deleted -
+      # a checkpoint the run could not read is still the only record of where
+      # the sampler reached.
       #
-      # Only on evidence that the checkpoint is what broke - a gfortran
-      # runtime error naming PolyChord's read_write.F90, in the output of the
-      # attempt that just failed rather than anywhere in run.log, which
-      # accumulates across attempts. A missing image or a bad parameter space
-      # also scores nothing, and throwing away a good checkpoint for one of
-      # those would cost a long search its position for no reason. Not capped
-      # to one recovery per run: a full disk tears every checkpoint it writes,
-      # and the retry budget above - which an attempt that ran for
-      # NS_RETRY_RESET_SECONDS hands back - is already what bounds a fault
-      # that keeps coming straight back.
+      # Only on evidence that the checkpoint is what broke: a gfortran error
+      # naming read_write.F90 in *this attempt's* output, not anywhere in
+      # run.log, which accumulates across attempts. A missing image scores
+      # nothing too, and a good checkpoint thrown away costs a long search its
+      # position. Not capped per run - a full disk tears every checkpoint it
+      # writes, and the retry budget already bounds a fault that keeps coming
+      # straight back.
       if _ns_attempt_output "${output_dir}" "${log_before}" \
            | grep -q 'read_write\.F90' \
         && _ns_quarantine_checkpoint "${output_dir}"; then
@@ -399,26 +370,21 @@ _ns_stop_watchdog() {
 # Usage: _ns_stall_watchdog <output_dir> <timeout seconds>
 #
 # The failure run_with_retries cannot see: a run that hangs instead of dying.
-# PolyChord calls the likelihood from Fortran, so one rank stuck in a
-# collective leaves every other rank waiting forever - every core busy,
-# nothing landing, and no exit status for the retry loop to act on. The
-# in-worker timeouts in common.py only cover a worker that was asked for a
-# reply; a deadlock between the ranks themselves is asked nothing.
+# PolyChord calls the likelihood from Fortran, so one stuck rank leaves every
+# other waiting forever - every core busy, nothing landing, no exit status. The
+# in-worker timeouts only cover a worker that was *asked* for a reply.
 #
-# So this watches the one thing that is true of every healthy run and false of
-# every hung one - evaluations finishing - and turns a hang into the crash the
-# retry machinery already handles. The kill is by command line rather than by
-# the pid run_with_progress holds, because that pid is the `docker exec`
-# client and the ranks are children of containerd-shim, not of it: killing the
-# client leaves the run running.
+# So this watches the one thing true of every healthy run and false of every
+# hung one - evaluations finishing - and turns a hang into the crash the retry
+# machinery already handles. The kill is by command line, not by the pid
+# run_with_progress holds: that pid is the `docker exec` client and the ranks
+# are children of containerd-shim, so killing it leaves the run going.
 #
-# The timeout has to clear IMAGING_REPLY_TIMEOUT (3600s in common.py), which
-# is how long a single evaluation is already allowed to take before its worker
-# is declared dead - anything shorter would kill runs that machinery is still
-# working on. Twice that by default, against a measured worst case of 23.5s
-# between evaluations over 6.3 hours of a live 16-rank R2D2 search. This is
-# the backstop for when nobody is watching; `./ri health` says the same thing
-# in seconds to somebody who is.
+# The timeout has to clear IMAGING_REPLY_TIMEOUT (3600s), which is how long one
+# evaluation may already take before its worker is declared dead. Twice that by
+# default, against a measured worst gap of 23.5s over 6.3 hours of a live
+# 16-rank R2D2 search. The backstop for when nobody is watching; `./ri health`
+# answers the same question in seconds for somebody who is.
 _ns_stall_watchdog() {
   local output_dir="$1" timeout="$2" poll="${NS_STALL_POLL_SECONDS:-60}"
   local last quiet=0 now

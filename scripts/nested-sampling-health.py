@@ -2,133 +2,47 @@
 """Say whether a nested-sampling run is healthy, stalled, stopped - or worthless.
 
 `./ri runs` answers "did this run finish?". This answers the question you have
-while one is still going: is it actually making progress, and is the progress
-worth anything? Both are needed, and neither is visible from the run directory
-without knowing what to look at.
+while one is still going: is it making progress, and is the progress worth
+anything? What every line reads and why is docs/run-health.md; this is what the
+report is *for*, which is the part that decides what belongs in it at all.
 
-Four things it checks, each one a way a run has actually gone wrong here:
+Six ways a run here has actually gone wrong, none of them visible from the run
+directory without knowing what to look at:
 
-* **Progress.** `evaluations/eval-*/metrics.json` is written only when an
-  evaluation succeeds, so its count is the progress, its newest mtime is the
-  last sign of life, and the directories without one are the evaluations in
-  flight (which should sit near `NS_MPI_PROCS`).
+* **Progress.** `eval-*/metrics.json` exists only for an evaluation that
+  succeeded, so its count is the progress and the directories without one are
+  in flight (which should sit near `NS_MPI_PROCS`).
 * **Liveness.** A run that stopped and a run that finished both stop writing,
-  so a mtime on its own means nothing in either direction. The order matters:
-  a *whole* `summary.json` is finished; ranks running is healthy, or stalled
-  once the mtime goes stale; no ranks but a live `docker exec` client is a run
-  still starting up; nothing driving it at all is stopped, however recently it
-  wrote. Half a `summary.json` is a run nothing can report on, merge or
-  profile, so it is stopped too, with the `./ri resume` that rewrites it. A stalled run also says what is coming for it: the stall watchdog's
-  timeout out of `run.env`, as a countdown, as "due", or - past a poll of it -
-  as the observation that no watchdog is left to kill it.
+  so an mtime alone means nothing. The order is the point: a *whole*
+  `summary.json` is finished, ranks running is healthy or stalled, a live
+  `docker exec` client with no ranks is still starting, nothing driving it is
+  stopped however recently it wrote.
 * **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
-  PolyChord maximizes, while a real `total_rms_jy` is ~0.008. A run whose
-  imager is broken - a missing checkpoint mount, an OOM-killed worker - is
-  therefore a run happily concentrating its live points on its own failures. It
-  looks perfectly healthy by every other measure and is worth nothing. Asked of
-  the last `RATE_WINDOW` evaluations as well as of the whole run, because an
-  imager that breaks part-way through a long one stays under any whole-run
-  ratio for hours.
+  PolyChord maximizes against a real `total_rms_jy` of ~0.008, so a run whose
+  imager is broken concentrates its live points on its own failures and looks
+  perfectly healthy by every other measure. Asked of the last `RATE_WINDOW`
+  evaluations too, because a break part-way through a long run stays under any
+  whole-run ratio for hours.
 * **Cost.** Gaps between evaluations, and `meqserver-wedged.log`, put a number
   on the MeqTrees deadlock the watchdogs in `simulate_point_source_ms.py`
-  absorb (docs/nested-sampling.md, "When MeqTrees stops answering").
+  absorb (docs/robustness.md, "When MeqTrees stops answering").
+* **Downtime.** `restarts.log` records every stop and start, self-healed or
+  typed, and those gaps come out of the span every rate here is measured over.
+  A resumed WSClean run did 64 evaluations in 17s of work either side of a
+  4h16m stop; over wall clock that reads 0.2/min and 0% occupancy. `history`
+  and `occupancy` stay on wall clock, because a stop is part of the shape they
+  exist to show.
+* **Shape and where the time goes.** Every other number is one moment.
+  `history` and `occupancy` bin throughput and imager duty cycle over the run's
+  life, which is what separates a dip that recovered from a step down that did
+  not, and hardware earning its keep all along from hardware busy at the moment
+  it was asked. `forecast` supplies the denominator a `--max-ndead -1` search
+  has nowhere else, and `at risk` the work a restart would redo.
 
-* **Downtime.** `restarts.log` records every time the run stopped and started
-  again - by healing itself, or because someone typed `./ri resume` - and the
-  gaps those stamps land in come out of the span every rate here is measured
-  over. A resumed WSClean run did 64 evaluations in 17 seconds of work either
-  side of a 4h16m stop; over wall clock that reads `0.2/min`, 0% occupancy and
-  a stall costing 100% of the run. `history` and `occupancy` stay on wall clock
-  on purpose, because a stop is part of the shape they exist to show. The same
-  file answers what is *left* of the self-healing: `run_with_retries` stops
-  after `NS_RETRIES`, so a live run that has already spent them is one crash
-  from sitting there until someone types `./ri resume`, and the `restarts` line
-  says so while it is still running.
-
-* **Shape.** Every number above is one moment. `history` is the run's
-  throughput binned over its own life, which is what separates a dip that
-  recovered from a step down that did not - the two the medians report
-  identically on the way past each other.
-
-* **Where the time goes.** A falling evaluation rate is either a slower imager
-  or idle ranks, and the rate alone cannot tell them apart. `imaging` reports
-  the imager's own wall clock per evaluation and, against the wall clock the
-  run has spent, how much of its hardware that cost is actually keeping busy -
-  the only place here where memory a run holds but is not using is visible.
-  `occupancy` is that same duty cycle binned over the run's life, which is what
-  separates hardware that has been earning its keep all along from hardware
-  that happens to be busy at the moment it was asked.
-
-* **Cost, again, in memory and cores.** Memory is what caps a run here, so
-  what the run holds is reported next to what the host has left - over every
-  process carrying the run directory, because a rank is ~10MB and the imager
-  worker behind it is ~3.3GB, and next to what the kernel has pushed out to
-  swap, which RSS excludes: a squeezed run reads as holding less memory than
-  it does while a worker that is mostly on disk has to read itself back before
-  it can image, which shows up as slow evaluations and never as a failure.
-  Whether it is being read back is a separate question from whether it is out
-  there, and only the kernel can answer it: `pressure` is the fraction of the
-  last minute and the last five that tasks here spent stalled on memory and on
-  I/O, and it is what decides whether pages on disk are reported as a cost or
-  merely reported.
-  `memory` is the same cost measured by the run itself rather than sampled off
-  the host: `peak_memory_bytes` out of each evaluation's metrics, multiplied
-  out over the ranks. That is the standing estimate
-  `scripts/lib/rank-budget.sh` sizes every run from, so this is the only place
-  it gets checked against the images actually in use - and it survives the run,
-  which the process table does not.
-
-* **Supervision.** SIGKILLing a run script does not stop the run: the ranks are
-  children of `containerd-shim`, so they keep imaging and every number above
-  stays healthy. What dies with the shell is `run_with_retries` - the run has
-  silently lost the ability to restart itself from its own checkpoint, and
-  nothing else here can see that. Found through the `docker exec` client's
-  parent, so it costs nothing extra.
-
-* **Cost, again, on disk.** The one resource nothing here reserves, checks or
-  frees, and the only one that only ever grows: an evaluation directory keeps
-  its measurement set and the imager's output, ~1.7MB, and nothing deletes it.
-  A live R2D2 run writes ~2.6GB/hour, so the run's own rate against the free
-  space is the only warning available before it ends on ENOSPC - weighed
-  against how much longer the run needs (`forecast`, or its own age when it is
-  too young to have one), since space running out after the search ends is not
-  a problem the run has.
-
-* **How far through.** `chains/*.stats` carries the evidence the search has
-  actually accumulated and what each dead point cost in likelihood calls, and
-  with the live points beside it that gives the one thing a `--max-ndead -1`
-  run has nowhere else: a denominator. `forecast` turns the prior volume still
-  to be compressed into dead points left, hours left, and the clock time those
-  hours end at - carrying the count forward across PolyChord's checkpoint
-  interval, which otherwise freezes it for two hours at a time on a 16-rank
-  R2D2 search.
-
-* **What a restart would cost.** The other half of that checkpoint interval:
-  everything scored since the checkpoint is work a restart or a `./ri resume`
-  has to do again. Measured rather than assumed - a killed WSClean search and
-  an uninterrupted control from the same seed shared every evaluation before
-  the kill and none of the 146 after the resume, because a resume re-seeds and
-  then skips ahead, so the point cache cannot answer for the stretch it is
-  redoing. Four hours of it on the live R2D2 search here, and nothing else in
-  the report could see it.
-
-With no argument it reports every run with ranks on this *host*, found in the
+With no argument it reports every run being driven on this *host*, found in the
 process list rather than by globbing this checkout - several worktrees share
-this machine, and from one of them the biggest consumer of the host block below
-is usually a run whose directory this checkout has no path to. Such a run is
-named by a `path` line.
-
-Plus the host: memory, swap in use, load average against the core count, free
-disk, and sidecar containers whose run is gone. Load is the only CPU reading
-here that covers work this project did not start - a run's own `resources` line
-says how many cores it keeps busy, and until it is read against the host's
-total there is no answer to "my run got slower and every number looks fine".
-
-A killed run leaves its `ri-ns-sidecar-*` containers holding ~3.4GB
-per R2D2 rank. The next run frees those itself before it sizes itself, so this
-is here to explain where the host's memory went, not as a chore. A container is
-only counted once its run has stopped, not merely once the shell that launched
-it has: an orphaned run keeps imaging inside its containers.
+this machine, and the biggest consumer of the host block is often a run this
+checkout has no path to. Such a run is named by a `path` line.
 
 Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
 when a run has live processes; nothing started, nothing imaged, so it costs a
@@ -142,10 +56,9 @@ Usage:
   uv run scripts/nested-sampling-health.py --json
 
 Exit status is 0 when nothing needs attention and 1 when something does, so it
-can gate a script; the headline says the same thing in words, as a warning
-count next to the run's status, and in colour on a terminal - the headline and
-the WARNING label only, so the two things worth scanning for are the two things
-that stand out. Piped, redirected or under NO_COLOR the output is unchanged.
+can gate a script; the headline says the same in words and in colour, and only
+the headline and the WARNING label are coloured. Piped, redirected or under
+NO_COLOR the output is unchanged.
 """
 
 from __future__ import annotations
@@ -822,19 +735,16 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # from the count-over-span beside it: 33.3/min against 18.2 at one instant
     # where an independent thirty-minute window said 17.0.
     #
-    # Both ends of the window are completed evaluations, never "the last N
-    # minutes" - a clock window is partial, so it reads low by however much has
-    # not elapsed, which at the moment of sampling is indistinguishable from a
-    # slowdown. One partial five-minute bucket read 23.8/min against a 91-165
-    # baseline, then finished at 164, the highest of the run.
+    # Both ends are completed evaluations, never "the last N minutes": a clock
+    # window is partial, so it reads low by however much has not elapsed, which
+    # is indistinguishable from a slowdown. One partial five-minute bucket read
+    # 23.8/min against a 91-165 baseline, then finished at 164.
     #
     # Bounded on both axes because a run varies on both. In evaluations, a
-    # share of the run: a fixed fifty is two minutes at 25/min and ten at
-    # 5/min, so it grows exactly when the run slows (last-fifty swung 4.9,
-    # 31.5, 37.6 where a tenth gave 28.1, 37.6, 33.4). In time, capped, because
-    # a share grows without limit: seven and a half hours in a tenth reached 62
-    # minutes, and a real half-hour slowdown to a third of the run's pace
-    # diluted to 1.36x and did not show.
+    # share of the run - a fixed fifty is two minutes at 25/min and ten at
+    # 5/min, so it grows exactly when the run slows. In time, capped, because a
+    # share grows without limit: seven and a half hours in, a tenth reached 62
+    # minutes and a real half-hour slowdown diluted to 1.36x and did not show.
     #
     # None of it sees a stall beginning after the last completed evaluation;
     # last_activity_seconds and the idle clauses in describe() cover that. The
@@ -1474,18 +1384,12 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # search's startup, minutes of sixteen workers loading their models,
     # headlined STOPPED and offered `./ri resume` on a run that was fine.
     #
-    # And it is the *only* answer. A recent evaluation used to count as well,
-    # which is the same mistake pointing the other way: a run with no ranks
-    # and no client that wrote a second ago has not started, it has just died,
-    # and calling that STARTING gave a search killed mid-flight ten silent
-    # minutes - no warning, exit 0 - before the mtime went stale enough for
-    # the report to notice. Caught by the resume scenario in
-    # scripts/test_self_heal.sh, on a real search SIGKILLed with no retries
-    # left. What the mtime clause was covering is the gap between
-    # `run_with_retries` attempts, and the client covers all but the ~1s of it
-    # before the next `docker exec` is issued; a blink of STOPPED there is a
-    # true statement about that instant, where the old rule was a false
-    # all-clear over a run that was never coming back.
+    # And it is the *only* answer. A recent evaluation used to count too, which
+    # is the same mistake pointing the other way: a run with no ranks and no
+    # client that wrote a second ago has not started, it has just died, and
+    # calling that STARTING gave a search killed mid-flight ten silent minutes
+    # at exit 0. What that clause covered is the gap between attempts, and the
+    # client covers all but the ~1s before the next `docker exec` is issued.
     if complete:
         status = "finished"
     elif ranks:
@@ -1648,13 +1552,11 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"{scan['stall_fraction']:.0%} of running time lost to gaps over "
             f"{scan['stall_threshold_seconds']:.0f}s"
         )
-    # Pages on disk are a warning only while something is waiting on them.
-    # `memory_stall_pct` is the kernel's own answer to that (MEMORY_STALL_PERCENT);
-    # None means the host cannot be asked, where the old unconditional warning
-    # is still the best available reading. The swapped total stays on the
-    # `resources` line either way, so the fact is never hidden - what is
-    # withheld is the claim that it is costing evaluation time, which on the
-    # run this was written for it was not.
+    # Pages on disk are a warning only while something is waiting on them, and
+    # `memory_stall_pct` is the kernel's own answer to that; None means the host
+    # cannot be asked, where the unconditional warning is the best reading left.
+    # The swapped total stays on the `resources` line either way - what is
+    # withheld is the claim that it is costing evaluation time.
     if paged_out and (memory_stall_pct is None or memory_stall_pct >= MEMORY_STALL_PERCENT):
         worst = max(paged_out, key=lambda p: swapped.get(int(p["pid"]), 0))
         one = len(paged_out) == 1
@@ -1810,17 +1712,11 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
         # CPU figure here: no sample interval, so a report over finished runs
         # still costs nothing.
         #
-        # Reported over three windows rather than one because the trend is the
-        # readable part - 19 / 18 / 16 against 20 cores is a host filling up,
-        # the same shape the pressure line below shows for memory.
-        #
-        # Never warned on. This box is deliberately run at every core busy: the
-        # live 16-rank R2D2 search here sits at load 16-17 on 20 cores, against
-        # its own `resources` line's 16.0 cores busy, with nothing wrong. A
-        # 16-rank run is one `--mpi-procs` away from load 20 on a healthy day,
-        # so any "load against cores" rule fires on the runs this host is for.
-        # Same reason cpu pressure is not read at all, and the same treatment
-        # as swap in use above - shown, not judged.
+        # Three windows because the trend is the readable part: 19 / 18 / 16
+        # against 20 cores is a host filling up. Never warned on - this box is
+        # deliberately run at every core busy, so a 16-rank search sits at load
+        # 16-17 of 20 with nothing wrong and any "load against cores" rule would
+        # fire on the runs it is for. Same reason cpu pressure is not read.
         "load_average": load_average(),
         "sidecars": containers,
         "leaked_sidecars": leaked,
@@ -2291,10 +2187,9 @@ def started_at(run_dir: Path) -> str:
 # refuses it ("has no run.env"), so the report was advising a command that
 # cannot work.
 #
-# `run.env` is written milliseconds after the run directory is claimed
-# (write_run_config, scripts/lib/run-config.sh) and before anything can go
-# wrong, so any run started since it existed has one however early it died.
-# The rest are for the runs on this host that predate it, and for the
+# `run.env` is written milliseconds after the run directory is claimed and
+# before anything can go wrong, so any run started since it existed has one
+# however early it died. The rest are for runs that predate it, and for the
 # summary-only directories `./ri merge` writes.
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 

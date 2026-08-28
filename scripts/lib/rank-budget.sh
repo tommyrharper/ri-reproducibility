@@ -2,39 +2,28 @@
 # Clamp a run's rank count to the memory the host can actually give it.
 #
 # Rank count, not NS_NLIVE, is what costs memory: every rank keeps one warm
-# worker holding its own copy of the imaging stack. Measured on a 20-CPU,
-# 62GB host, holding NS_NLIVE fixed at 12 and varying only the rank count:
-# 4 ranks 13.5GB, 12 ranks 40.6GB - 3.4GB per R2D2 rank, dead linear. So
-# NS_NLIVE can be raised for search quality without touching memory, and
-# NS_MPI_PROCS is the knob that has to fit in RAM.
+# worker holding its own copy of the imaging stack. Measured on this 20-CPU,
+# 62GB host with NS_NLIVE fixed: 4 ranks 13.5GB, 12 ranks 40.6GB - 3.4GB per
+# R2D2 rank, dead linear. So raise NS_NLIVE freely; NS_MPI_PROCS is the knob
+# that has to fit in RAM.
 #
-# Nothing here used to check that. NS_MPI_PROCS defaulted to
-# `min(NS_NLIVE, host CPUs)`, which on this host is 20 ranks - 68GB, more
-# than the box has. The failure is silent rather than loud: the host OOM
-# killer takes an imaging worker, the rank's `readline()` on the reply FIFO
-# returns empty, and common.py records the evaluation with FAILURE_OBJECTIVE
-# (100.0). PolyChord maximizes the objective, and a real `total_rms_jy` is
-# ~0.008, so an OOM kill scores as the best point the search has ever seen
-# and it concentrates live points there. A run that ran out of memory
-# reports "R2D2 fails catastrophically in this corner of the parameter
-# space", which is exactly the conclusion this repo exists to draw. Worse,
-# the dead worker is dropped from the cache, so the next evaluation starts a
-# fresh one - another ~3.4GB - while already out of memory.
+# The failure it prevents is silent, not loud. The OOM killer takes an imaging
+# worker, the rank's `readline()` on the reply FIFO returns empty, and
+# common.py scores FAILURE_OBJECTIVE (100.0) - which PolyChord maximizes,
+# against a real `total_rms_jy` of ~0.008. A run that ran out of memory reports
+# "R2D2 fails catastrophically in this corner of the parameter space", which is
+# exactly the conclusion this repo exists to draw. Worse, the dead worker is
+# dropped from the cache and the next evaluation starts a fresh ~3.4GB one
+# while already out of memory.
 #
-# Several agent sessions share this host and each run sizes itself from
-# `nproc` alone, so the common way to hit that wall is two sessions starting
-# runs, not one oversized run. MemAvailable covers a run that starts while
-# another is already warm. It does not cover two runs sizing themselves in
-# the same second, before either has allocated anything, so a run also
-# reserves what it is about to take.
-#
-# Reservations are files named by the reserving PID, holding "<expiry> <MB>".
-# A reader skips entries whose PID is gone or whose expiry has passed, so
-# there is no release path to get wrong - a run killed with SIGKILL leaves an
-# entry that the next reader prunes. They expire because a reservation only
-# has to cover the gap between deciding a rank count and the workers actually
-# allocating; after that MemAvailable is the truth and still counting the
-# reservation would double-count it.
+# Several sessions share this host, so the common way to hit the wall is two
+# runs sizing themselves in the same second, before either has allocated
+# anything - MemAvailable cannot see that, so a run also reserves what it is
+# about to take. Reservations are files named by the reserving PID holding
+# "<expiry> <MB>"; a reader skips entries whose PID is gone or whose expiry has
+# passed, so there is no release path to get wrong. They expire because a
+# reservation only has to cover the gap between deciding a rank count and the
+# workers actually allocating.
 #
 # Source this, then:
 #

@@ -2,18 +2,16 @@
 # Start the long-lived containers a run `docker exec`s into, and export
 # NS_SIDECARS.
 #
-# The ranks only ever `docker exec`, and separate `docker exec` processes are
-# already isolated, so one container per image serves the whole run. Letting
-# each rank start its own on first use meant 16 concurrent `docker run`s on the
-# default 8 ranks, measured at 1.3s against 0.36s for a single one, all of it in
-# front of the first evaluation.
+# Separate `docker exec` processes are already isolated, so one container per
+# image serves the whole run. Letting each rank start its own meant 16
+# concurrent `docker run`s on the default 8 ranks - 1.3s against 0.36s for a
+# single one, all of it in front of the first evaluation.
 #
-# `--network none`: no sidecar needs networking, and docker's default bridge
-# setup costs ~0.2s per container under rootless Docker; "none" still gives the
-# loopback interface meqserver and MPI want. `--shm-size 512m`: the simulate
-# builds its working MS and its cached makems skeletons in /dev/shm, and
-# docker's 64MB default is only ~3x the largest cache this parameter space
-# fills.
+# `--network none`: no sidecar needs networking, and the default bridge setup
+# costs ~0.2s per container under rootless Docker, while "none" still gives the
+# loopback meqserver and MPI want. `--shm-size 512m`: the simulate builds its
+# working MS and cached makems skeletons in /dev/shm, and docker's 64MB default
+# is only ~3x the largest cache this parameter space fills.
 #
 # Source this, then either
 #
@@ -26,20 +24,16 @@
 #   ...other setup...
 #   sidecar_wait                                         # before the first exec
 #
-# Everything after `--` replaces the container's default `sleep infinity`. That
-# is how the meqtrees sidecar starts its simulate workers: a `docker exec` can
-# only be issued once `docker run` has returned, and the container's own command
-# starts ~0.1s earlier than that, on work whose whole value is head start.
-#
-# `sidecar_launch` returns immediately and leaves the container's name in
-# SIDECAR_NAME. Requires REPO_ROOT. Every container started is removed by an
+# Everything after `--` replaces the container's default `sleep infinity`, which
+# is how the meqtrees sidecar starts its simulate workers ~0.1s before a
+# `docker exec` could be issued. `sidecar_launch` returns immediately and leaves
+# the name in SIDECAR_NAME. Requires REPO_ROOT. Every container is removed by an
 # EXIT trap.
 #
-# There is deliberately no warm-up hook here. A fresh container's first Python
-# process used to cost ~0.8s more than the next one, which this file paid for
-# with a throwaway `docker exec` before `sidecar_wait` returned; that cost was
-# the interpreter byte-compiling modules the image shipped without a valid
-# .pyc, and the images now compile them at build time instead.
+# No warm-up hook here on purpose: a fresh container's first Python process used
+# to cost ~0.8s more than the next, paid for with a throwaway `docker exec`, and
+# that was the interpreter byte-compiling modules shipped without a valid .pyc.
+# The images compile them at build time instead.
 SIDECAR_NAMES=()
 _SIDECAR_PIDS=()
 _SIDECAR_COMMANDS=()

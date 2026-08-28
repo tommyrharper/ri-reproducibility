@@ -1,56 +1,22 @@
 #!/usr/bin/env bash
 # End-to-end check that a search which is killed mid-flight heals itself.
 #
-# The one robustness property this repo depends on most: a multi-day R2D2 search
+# The robustness property this repo depends on most: a multi-day R2D2 search
 # that loses its ranks at hour three has to come back on its own, because
-# nothing else notices for hours. `run_with_retries` in scripts/lib/progress-bar.sh
-# implements it and its own --self-check covers the decision with fixtures, but
-# nothing joined the fixtures to a real search - and the two bugs found there so
-# far (the retry predicate reading a checkpoint-frozen counter, the stall
-# accounting refusing to excuse a run's own restart) were both invisible to a
-# fixture and obvious to a real kill. So: start a real search, break it, and
-# assert it finishes anyway.
+# nothing else notices for hours. `run_with_retries` implements it and its own
+# --self-check covers the decision with fixtures - but every bug found in this
+# machinery so far was invisible to a fixture and obvious to a real kill. So:
+# start a real search, break it, and assert it finishes anyway.
 #
-# Six ways of breaking it, because they recover through different machinery.
-# A SIGKILL is the crash `run_with_retries` was written for - the run exits and
-# the loop sees a status. A frozen rank is the failure it cannot see: PolyChord
-# calls the likelihood from Fortran, so one rank that stops answering leaves
-# every other rank in a collective forever, with no exit for anything to act
-# on. `_ns_stall_watchdog` in scripts/lib/progress-bar.sh is what turns the
-# second into the first, and SIGSTOP on one rank reproduces it exactly. The
-# third is the one that does not heal: a run killed with its retry budget
-# already spent, which is where `./ri health` stops reporting and starts
-# telling a human to type `./ri resume`. That advice is the last line of
-# defence for a multi-day search - both of `./ri health`'s warnings about a run
-# nothing is driving end on it, and so does every message `run_with_retries`
-# gives up with - and nothing joined it to a real interrupted run either.
-#
-# The fourth is the only one that is supposed to cost nothing: a worker killed
-# while its rank was between evaluations, which is what the host's OOM killer
-# does to the biggest process on a box several searches share. That death is
-# meant to be absorbed inside the evaluation - dropped, retried against a fresh
-# worker, WORKER_DIED only if that fails too - so the assertion is that the run
-# finishes with no restart at all. It did not: the pipe to a worker that died
-# while idle is already broken when the next request is written, and the
-# BrokenPipeError unwound out of the likelihood into MPI_Abort, ending the run
-# and spending a restart on every one.
-#
-# The fifth breaks the run from underneath rather than inside: one of the
-# containers the ranks `docker exec` into is removed, which the OOM killer, a
-# daemon restart or a stray `docker rm` all do. The containers are started once,
-# in front of the retry loop, so this used to be the one failure retrying could
-# not fix - every later attempt exec'd into a name that no longer existed,
-# scored nothing, and the run stopped for looking deterministic. Measured: the
-# search died at exit 1 with no summary.json. `sidecar_restore` in
-# scripts/lib/start-sidecars.sh starts the missing container again, under the
-# same name, before each retry.
-#
-# The sixth is the checkpoint itself: a rank killed part-way through writing
-# `chains/*.resume` leaves a truncated file, which PolyChord aborts on before
-# evaluation 1, so the run scored nothing, the anti-spin guard refused to
-# restart it, and every later `./ri resume` died in the identical place. Broken
-# by truncating the file rather than by another kill, and on the run scenario
-# five just finished, because nothing about it needs a live search.
+# Six breaks, because they recover through different machinery. Each is
+# explained where it is performed below; docs/robustness.md has the whole
+# story. In short: a SIGKILL is the crash the retry loop was written for; a
+# SIGSTOPped rank is the hang it cannot see, which the stall watchdog turns
+# into a crash; a kill with the retry budget spent is the one that does *not*
+# heal, and has to hand a human a `./ri resume` that works; killed workers are
+# supposed to cost nothing at all; a removed sidecar container needs
+# `sidecar_restore` before a retry has anywhere to land; and a truncated
+# checkpoint has to be moved aside rather than read again forever.
 #
 # ~5 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
 # the report never see. WSClean rather than R2D2 because it reaches its first

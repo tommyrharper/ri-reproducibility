@@ -238,7 +238,7 @@ checkout started while it is running, because it reports those too.
 wall clock lost to stalls, and how many evaluations scored
 `FAILURE_OBJECTIVE` - which PolyChord maximizes, so a run whose imager is
 broken looks like a run finding spectacular failures. Exits 1 when something
-needs attention. Details: docs/nested-sampling.md.
+needs attention. Details: docs/run-health.md.
 
 ## Reports
 
@@ -379,6 +379,8 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `results/` -> `/results` | Run output, smoke-test output, nested-sampling runs |
 | `reports/manifests/` | One JSON manifest per recorded run |
 | `docs/nested-sampling.md` | Nested-sampling design, metrics, output files |
+| `docs/run-health.md` | `./ri health`: every line of the report and what warns |
+| `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
