@@ -1009,7 +1009,7 @@ self_check() {
   # Single quotes deliberately: $0 is the directory argument passed to the
   # child `sh` below, not this shell's own name.
   # shellcheck disable=SC2016
-  local progressing='n=$(ls "$0"/evaluations 2>/dev/null | wc -l);
+  local progressing='n=$(ls "$0"/evaluations 2>/dev/null | wc -l | tr -d " ");
     mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
     echo a >>"$0"/attempts; exit 5'
   status=0
@@ -1179,7 +1179,7 @@ self_check() {
   local resize_dir="${tmp}/resize"
   mkdir -p "${resize_dir}/chains"
   # shellcheck disable=SC2016  # $0 and $* are the child `sh`'s, not ours
-  local recording='n=$(ls "$0"/evaluations 2>/dev/null | wc -l);
+  local recording='n=$(ls "$0"/evaluations 2>/dev/null | wc -l | tr -d " ");
     mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
     echo "$*" >>"$0"/attempts; exit 5'
   status=0
@@ -1288,7 +1288,7 @@ self_check() {
   local reset_dir="${tmp}/reset"
   mkdir -p "${reset_dir}/chains"
   # shellcheck disable=SC2016
-  local flaky='n=$(ls "$0"/evaluations 2>/dev/null | wc -l);
+  local flaky='n=$(ls "$0"/evaluations 2>/dev/null | wc -l | tr -d " ");
     mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
     echo a >>"$0"/attempts;
     [ "$(wc -l <"$0"/attempts)" -ge 4 ] && exit 0; exit 5'
