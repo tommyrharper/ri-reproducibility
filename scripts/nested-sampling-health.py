@@ -661,9 +661,25 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
               and not any(start - RESTART_STAMP_SECONDS <= t <= start + gap for t in downtime)]
     span = times[-1] - times[0] if len(times) > 1 else 0.0
 
-    # How the run is going now against how it has gone, as a ratio of median
-    # gaps. Medians, so one long gap cannot manufacture a collapse and a run
-    # that is genuinely half its old speed cannot hide behind a fast tail.
+    # How the run is going now against how it has gone, as a ratio of mean
+    # gaps - which is to say, of throughput, because evaluations over elapsed
+    # time (`rate` below) *is* the mean gap inverted.
+    #
+    # The mean and not the median, even though the median is the more robust
+    # statistic, because this number is printed beside `rate` and has to be
+    # the same measurement to be read against it. The median gap is shorter
+    # than the mean whenever a run stalls at all - the same trap `_duty` below
+    # documents - so a median-gap rate reads systematically high: on the live
+    # 16-rank R2D2 search the two spellings of "overall" were 38.2/min (median
+    # gap) against 22.6/min (elapsed), and the report could print "22.6/min
+    # over 7:54:22 (22.5/min over the last 50)" at the moment the median ratio
+    # declared a 1.7x change. The robustness the median was there for costs
+    # nothing to give up here: walking both gates over every moment of that
+    # run, the mean ratio crosses RATE_DIVERGENCE_FACTOR in 9.1% of 10,720
+    # sampled moments against the median ratio's 10.2%, and over a 1,051-moment
+    # WSClean run neither fires at all. Quieter, not noisier - a single long
+    # gap moves a 50-sample mean by a fiftieth of itself, and the stalls this
+    # workload actually produces are tens of seconds, not thousands.
     #
     # Gaps rather than "evaluations in the last N minutes", which is the
     # obvious simplification and is wrong: the most recent window is always
@@ -683,8 +699,8 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # complementary; do not drop either.
     recent_rate, slowdown = None, None
     if len(gaps) >= 2 * RATE_WINDOW:
-        recent = statistics.median(gaps[-RATE_WINDOW:])
-        overall = statistics.median(gaps)
+        recent = statistics.mean(gaps[-RATE_WINDOW:])
+        overall = statistics.mean(gaps)
         recent_rate = 60 / recent if recent > 0 else None
         slowdown = recent / overall if overall > 0 else None
 
@@ -2427,8 +2443,13 @@ def self_check() -> None:
             for i in range(200):          # the healthy phase, one a second
                 stamp += 1
                 write_eval(collapsed, i + 1, stamp)
-            for i in range(60):           # ...and the collapse, one per 12s
-                stamp += 12
+            # ...and the collapse, averaging one per 12s but arriving in a
+            # skewed 8,8,8,24 cycle, so that the mean and the median of the
+            # same window are 12s and 8s. A tail of identical gaps cannot tell
+            # the two statistics apart, and telling them apart is the whole
+            # point of the assertions below.
+            for i in range(60):
+                stamp += 24 if i % 4 == 3 else 8
                 write_eval(collapsed, 201 + i, stamp)
             collapsed_ranks = [dict(r, args=str(r["args"]).replace(str(live.resolve()),
                                                                    str(collapsed.resolve())))
@@ -2438,18 +2459,25 @@ def self_check() -> None:
             # timeout - which is exactly why the rate had to be measured.
             assert report["status"] == "healthy", report
             assert float(report["last_activity_seconds"]) < SPIN_IDLE_SECONDS, report
-            assert abs(float(report["slowdown_factor"]) - 12) < 1, report
             assert abs(float(report["recent_evals_per_minute"]) - 5) < 0.5, report
+            # 260 evaluations over 919s is 17.0/min, and the last 50 arrive at
+            # 5/min: a 3.4-fold drop. The gate that decides whether both
+            # numbers are printed has to be the ratio of exactly those two
+            # numbers, or the report announces a change of one size and shows
+            # one of another - measuring the recent rate off median gaps and
+            # the overall off elapsed time put 12 here while the rendered pair
+            # read 3.4.
+            assert abs(float(report["slowdown_factor"]) - 3.4) < 0.1, report
+            # To within the fencepost - `rate` divides by the span while the
+            # gate divides by the mean of the N-1 gaps inside it - and nowhere
+            # near the 3.5-fold disagreement the old spelling produced.
+            assert abs(float(report["evals_per_minute"])
+                       / float(report["recent_evals_per_minute"])
+                       / float(report["slowdown_factor"]) - 1) < 0.02, report
             # Measured and shown, never warned on: a run that halves its pace
             # and recovers is a phase, and warning on it would teach the reader
             # to ignore the warnings that mean something.
             assert not any("throughput" in w for w in report["warnings"]), report
-            # The imager never changed - 12s an evaluation from first to last -
-            # so the 12-fold drop in arrivals is idle ranks, and the occupancy
-            # is what says so: 12 of 12 ranks kept busy over the run's life,
-            # one of them over its last 50. Reported, not warned on, because
-            # every wsclean run on this host ends its last 50 near 23% simply
-            # by shutting down.
 
             # The same collapse seen from the imager's side, which is where the
             # two explanations for a falling arrival rate come apart. Eight
@@ -2555,10 +2583,12 @@ def self_check() -> None:
             assert flat["busy_ranks"] is None, flat
             assert "% busy" not in io_capture(flat), io_capture(flat)
             rendered = io_capture(report)
-            assert "5.0/min over the last 50" in rendered, rendered
+            # The pair as a reader sees it: 17.0 against 4.9 is the same
+            # 3.4-fold drop `slowdown_factor` gated on, in the same units.
+            assert "17.0/min over 0:15:19 (4.9/min over the last 50)" in rendered, rendered
             # The same collapse as a shape: the healthy phase fills the early
             # slices to the peak and the collapse empties the late ones, which
-            # is the difference the two medians cannot show.
+            # is the difference two numbers cannot show.
             past = report["history"]
             assert past is not None, report
             assert past["bar"][0] == HISTORY_LEVELS[-1], past

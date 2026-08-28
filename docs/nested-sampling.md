@@ -432,8 +432,20 @@ What each line is reading, and why it is worth a line:
   stuck at once. On a run with no ranks left they are counted as *abandoned*
   instead - what the ranks were holding when it died, not work still going.
 - **activity** - the overall rate, and the rate over the last 50 evaluations
-  when the two have diverged. A run can collapse to a fraction of its own
-  throughput without ever going quiet long enough to look stalled, and that
+  when the two have diverged. Both are evaluations over elapsed time, which is
+  the only way to read one against the other: the recent one used to be taken
+  from the *median* gap of that window while the overall one is the count over
+  the span, and the median gap is shorter than the mean whenever a run stalls
+  at all. On the live 16-rank R2D2 search that gap-median rate read 26.8/min
+  against an overall 22.5/min - a speedup - at a moment the divergence gate had
+  fired on a slowdown, and against a recent occupancy (25% of 16 ranks at 17.8s
+  an evaluation) that independently says 14/min. Measured the same way as the
+  overall, it reads 14.2/min. Nothing was lost by dropping the median's
+  robustness: walking both gates over every moment of that run, the mean ratio
+  crosses the 2x threshold in 9.1% of 10,720 sampled moments against the median
+  ratio's 10.2%, and over a 1,051-moment WSClean run neither fires at all.
+  A run can collapse to a fraction of its own throughput without ever going
+  quiet long enough to look stalled, and that
   state passes every other check here: on a live 16-rank R2D2 search, 25/min
   fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
   Both numbers are shown and **neither is warned on**, because the same run
@@ -471,7 +483,7 @@ What each line is reading, and why it is worth a line:
   *shape*: a dip that recovered and a step down that did not read identically
   on the way past each other. The collapse-and-recovery described above -
   bins of 104, 23, 26, 93 against a 104-165 baseline - is an obvious V here
-  and an ordinary-looking slowdown from the medians alone. A slice where
+  and an ordinary-looking slowdown from the two rates alone. A slice where
   nothing landed is marked `·` rather than drawn as merely slow. Binned over
   first-to-last evaluation, never up to now, for the partial-window reason
   above; how long ago the last one landed is **activity**'s job.
