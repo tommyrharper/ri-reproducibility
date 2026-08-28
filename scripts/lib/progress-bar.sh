@@ -52,6 +52,15 @@ run_with_progress() {
   local start
   start="$(date +%s)"
 
+  # Started here rather than in run_with_retries so it covers the run however
+  # it is watched: the pinned-bar loop below only exists on a TTY, and a
+  # multi-day search is exactly the thing somebody starts under nohup.
+  local watchdog_pid=""
+  if [ "${NS_STALL_TIMEOUT:-0}" -gt 0 ]; then
+    _ns_stall_watchdog "${output_dir}" "${NS_STALL_TIMEOUT}" &
+    watchdog_pid=$!
+  fi
+
   if [ -t 1 ] && _ns_pin_setup; then
     _ns_add_trap '_ns_pin_teardown' EXIT
     _ns_add_trap '_ns_pin_teardown' INT
@@ -74,6 +83,10 @@ run_with_progress() {
 
   local status=0
   wait "${pid}" || status=$?
+  if [ -n "${watchdog_pid}" ]; then
+    kill "${watchdog_pid}" 2>/dev/null || true
+    wait "${watchdog_pid}" 2>/dev/null || true
+  fi
   # The command's last writer is now closed, so tee sees EOF. Waited for so
   # the function leaves no child behind and the file is known to be complete
   # before the caller reads it. In practice tee always drains first and the
@@ -174,6 +187,63 @@ _ns_retry_say() {
 # inflated by the handful of directories a crash leaves half-written.
 _ns_completed_evals() {
   find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
+}
+
+# A pgrep -f regex matching exactly the host-visible processes driving the run
+# in `$1`: the ranks, and the `mpirun` and `docker exec` that wrap them - each
+# spells the run out as `--output-dir <dir>` in its own command line, and the
+# container's processes are visible in host `ps`. Anchored on the end of the
+# directory so a run whose name is a prefix of another is not caught. Sidecar
+# workers name their run by `--fifo-dir` instead and are correctly excluded:
+# they outlive a killed run until the next one reaps them.
+ns_run_process_pattern() {
+  printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
+}
+
+# Usage: _ns_stall_watchdog <output_dir> <timeout seconds>
+#
+# The failure run_with_retries cannot see: a run that hangs instead of dying.
+# PolyChord calls the likelihood from Fortran, so one rank stuck in a
+# collective leaves every other rank waiting forever - every core busy,
+# nothing landing, and no exit status for the retry loop to act on. The
+# in-worker timeouts in common.py only cover a worker that was asked for a
+# reply; a deadlock between the ranks themselves is asked nothing.
+#
+# So this watches the one thing that is true of every healthy run and false of
+# every hung one - evaluations finishing - and turns a hang into the crash the
+# retry machinery already handles. The kill is by command line rather than by
+# the pid run_with_progress holds, because that pid is the `docker exec`
+# client and the ranks are children of containerd-shim, not of it: killing the
+# client leaves the run running.
+#
+# The timeout has to clear IMAGING_REPLY_TIMEOUT (3600s in common.py), which
+# is how long a single evaluation is already allowed to take before its worker
+# is declared dead - anything shorter would kill runs that machinery is still
+# working on. Twice that by default, against a measured worst case of 23.5s
+# between evaluations over 6.3 hours of a live 16-rank R2D2 search. This is
+# the backstop for when nobody is watching; `./ri health` says the same thing
+# in seconds to somebody who is.
+_ns_stall_watchdog() {
+  local output_dir="$1" timeout="$2" poll="${NS_STALL_POLL_SECONDS:-60}"
+  local last quiet=0 now
+  last="$(_ns_completed_evals "${output_dir}")"
+  while sleep "${poll}"; do
+    now="$(_ns_completed_evals "${output_dir}")"
+    if [ "${now}" != "${last}" ]; then
+      last="${now}"
+      quiet=0
+      continue
+    fi
+    quiet=$((quiet + poll))
+    if [ "${quiet}" -ge "${timeout}" ]; then
+      _ns_retry_say "${output_dir}" \
+        "no evaluation has finished in ${quiet}s (${now} scored, still counting)." \
+        "A run that is alive but landing nothing is hung, not slow - killing it" \
+        "so it can restart from PolyChord's checkpoint."
+      pkill -9 -f "$(ns_run_process_pattern "${output_dir}")" || true
+      return 0
+    fi
+  done
 }
 
 # Appends a command to whatever trap is already registered for a signal
@@ -787,6 +857,108 @@ self_check() {
   run_with_retries 2 "${once_dir}" -1 2 -- sh -c 'echo b >>"$0"/attempts' "${once_dir}" \
     >/dev/null 2>&1 || { echo "FAIL: success returned nonzero"; exit 1; }
   [ "$(_ns_count_lines "${once_dir}/attempts")" = "2" ] || { echo "FAIL: success re-ran"; exit 1; }
+
+  # _ns_stall_watchdog: a run that is alive but landing nothing is killed so
+  # the retry loop can act on it, and one that keeps scoring is left alone.
+  #
+  # Both fixtures are real processes spelling their run the way a rank does
+  # (`polychord_*.py ... --output-dir <dir>`), because the kill is by command
+  # line - a fixture with any other argv would be "killed" by a watchdog that
+  # matches nothing, and pass.
+  cat >"${tmp}/polychord_stall.py" <<'PY'
+import os, sys, time
+run = sys.argv[sys.argv.index("--output-dir") + 1]
+evals = os.path.join(run, "evaluations")
+os.makedirs(evals, exist_ok=True)
+banked = os.path.join(evals, "eval-%d" % len(os.listdir(evals)))
+os.makedirs(banked)
+open(os.path.join(banked, "metrics.json"), "w").write("{}")
+with open(os.path.join(run, "attempts"), "a") as fh:
+    fh.write("a\n")
+if os.environ.get("STALL_FIXTURE_HANGS"):
+    # Bounded, so a watchdog that never fires ends this check with a failure
+    # rather than with a hang - the same fault it exists to catch.
+    time.sleep(25)
+else:
+    # Slower than the poll interval and faster than the timeout, for longer
+    # than the timeout: each poll window that sees no change must be forgiven
+    # by the next evaluation rather than added to the last one.
+    for i in range(8):
+        time.sleep(1.5)
+        step = os.path.join(evals, "eval-live-%d" % i)
+        os.makedirs(step)
+        open(os.path.join(step, "metrics.json"), "w").write("{}")
+PY
+  # Exported, not just set: the NS_STALL_TIMEOUT=0 case below runs in its own
+  # bash, and a plain assignment would leave it reading the unset default
+  # there - which is the same "off" it is trying to prove, so the check would
+  # pass whatever the guard did.
+  export NS_STALL_TIMEOUT=2 NS_STALL_POLL_SECONDS=1
+
+  # Scored one evaluation, then hung. Killed, and retried because it had
+  # banked work - the whole point of turning a hang into an exit.
+  local hung_dir="${tmp}/hung" hung_start hung_elapsed
+  mkdir -p "${hung_dir}/chains"
+  hung_start="$(date +%s)"
+  status=0
+  STALL_FIXTURE_HANGS=1 run_with_retries 1 "${hung_dir}" -1 2 -- \
+    python3 "${tmp}/polychord_stall.py" --output-dir "${hung_dir}" >/dev/null 2>&1 || status=$?
+  hung_elapsed=$(($(date +%s) - hung_start))
+  [ "${status}" != "0" ] || { echo "FAIL: a hung run exited 0"; exit 1; }
+  [ "${hung_elapsed}" -lt 60 ] || { echo "FAIL: hung run took ${hung_elapsed}s to be killed"; exit 1; }
+  [ "$(_ns_count_lines "${hung_dir}/attempts")" = "2" ] || {
+    echo "FAIL: hung run ran $(_ns_count_lines "${hung_dir}/attempts") attempts, want 1 + 1 retry"
+    exit 1
+  }
+  grep -q 'no evaluation has finished' "${hung_dir}/run.log" || {
+    echo "FAIL: run.log does not say why the run was killed"; exit 1
+  }
+
+  # The false positive that would be worse than the bug: a run whose gaps are
+  # each shorter than the timeout but which, added together, run well past it.
+  local live_dir="${tmp}/live"
+  mkdir -p "${live_dir}/chains"
+  run_with_progress "${live_dir}" -1 2 -- \
+    python3 "${tmp}/polychord_stall.py" --output-dir "${live_dir}" >/dev/null 2>&1 || {
+    echo "FAIL: a run that kept scoring evaluations was killed"; exit 1
+  }
+  # And the watchdog is reaped with it: a leaked one would kill the *next*
+  # attempt into the same directory, turning one retry into an endless loop.
+  sleep 3
+  grep -q 'no evaluation has finished' "${live_dir}/run.log" && {
+    echo "FAIL: watchdog outlived the run it was watching"; exit 1
+  }
+
+  # 0 is off, which is what every caller that does not set it gets.
+  local off_dir="${tmp}/off"
+  mkdir -p "${off_dir}/chains"
+  export NS_STALL_TIMEOUT=0
+  # $0 is deliberately not this file's path: sourcing it with $0 set to it
+  # makes the `BASH_SOURCE == $0` guard at the bottom true, and the sub-shell
+  # re-runs this whole self-check instead of the one line it was asked for -
+  # which then hits the 8s timeout and "passes" whatever the guard does.
+  # shellcheck disable=SC2016  # $1..$3 are the sub-shell's, not ours
+  STALL_FIXTURE_HANGS=1 timeout 8 bash -c '
+    . "$1"; run_with_progress "$2" -1 2 -- python3 "$3" --output-dir "$2"' \
+    watchdog-off "${BASH_SOURCE[0]}" "${off_dir}" "${tmp}/polychord_stall.py" \
+    >/dev/null 2>&1
+  status=$?
+  [ "${status}" = "124" ] || {
+    echo "FAIL: NS_STALL_TIMEOUT=0 still killed the run (exit ${status}, want 124)"; exit 1
+  }
+  pkill -9 -f "$(ns_run_process_pattern "${off_dir}")" 2>/dev/null || true
+  unset NS_STALL_TIMEOUT NS_STALL_POLL_SECONDS
+
+  # The pattern the kill and the resume guard share: a rank of this run, and
+  # not a run whose directory name this one is a prefix of.
+  echo "polychord_r2d2.py --output-dir ${hung_dir} --nlive 50" \
+    | grep -Eq "$(ns_run_process_pattern "${hung_dir}")" || {
+    echo "FAIL: a rank of the run is not matched"; exit 1
+  }
+  echo "polychord_r2d2.py --output-dir ${hung_dir}-other --nlive 50" \
+    | grep -Eq "$(ns_run_process_pattern "${hung_dir}")" && {
+    echo "FAIL: a neighbouring run is matched"; exit 1
+  }
 
   rm -rf "${tmp}"
   echo "progress-bar self-check passed"

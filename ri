@@ -47,6 +47,7 @@ SEARCH_ENV = (
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
     ("retries", "NS_RETRIES"),
+    ("stall_timeout", "NS_STALL_TIMEOUT"),
     ("omp_threads", "R2D2_OMP_THREADS"),
     ("output_dir", "OUTPUT_DIR"),
 )
@@ -269,8 +270,9 @@ def build_parser():
                     "no rebuild is needed to check a change - but a run executes "
                     "the copy baked into the image, so rebuild before starting "
                     "one. All but the self-heal check start no search; that one "
-                    "runs a ~40 second throwaway WSClean search, kills it, and "
-                    "checks it recovers on its own.")
+                    "runs two ~45 second throwaway WSClean searches, kills one and "
+                    "freezes a rank of the other, and checks both recover on "
+                    "their own.")
     self_check.add_argument("target", nargs="?", default="all",
         choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "self-heal"),
         help="which set of checks to run (default: all)")
@@ -326,6 +328,10 @@ def build_parser():
                         help="times a search that died after scoring evaluations "
                              "restarts itself from its checkpoint; 0 disables "
                              "[NS_RETRIES]")
+    search.add_argument("--stall-timeout", type=int, metavar="SECONDS",
+                        help="seconds without a finished evaluation before a search is "
+                             "killed as hung, so --retries can restart it from its "
+                             "checkpoint; 0 disables [NS_STALL_TIMEOUT]")
     search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")
     search.add_argument("--enable-param", action="append", metavar="NAME",
                         help="search this parameter_space dimension even if defaults.toml "

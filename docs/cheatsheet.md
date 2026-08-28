@@ -66,11 +66,11 @@ a run executes the baked copy, so rebuild before starting one. They start no
 search and write nothing into `results/`, so they are safe alongside a run.
 
 ```bash
-./ri self-check            # host-side checks, all three images, then the self-heal kill
+./ri self-check            # host-side checks, all three images, then the self-heal kills
 ./ri self-check simulate   # MeqTrees: skeleton cache, forest reuse, deadlock recovery
 ./ri self-check wsclean    # the WSClean sampler's checks
 ./ri self-check r2d2       # the R2D2 sampler's checks
-./ri self-check self-heal  # kill a real search, check it restarts itself (~40s)
+./ri self-check self-heal  # kill and hang real searches, check they restart themselves (~90s)
 ```
 
 ## Shells into an image

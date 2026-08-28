@@ -12,9 +12,10 @@
 # libraries - no rebuild needed to check a change. A run executes the copy baked
 # into the image instead, so rebuild before running one.
 #
-# All but the last of these start no search. The self-heal check does - a ~40
-# second, ~0.6GB WSClean search that it kills and watches recover - because the
-# thing it checks only exists in a real run. It is safe alongside another run:
+# All but the last of these start no search. The self-heal check does - two ~45
+# second, ~0.6GB WSClean searches, one killed and one hung by freezing a rank,
+# both watched until they recover - because the thing it checks only exists in
+# a real run. It is safe alongside another run:
 # 3 ranks at ~200MB, sized and refused by scripts/lib/rank-budget.sh like any
 # other, on a throwaway directory the report and `./ri runs` never see.
 set -euo pipefail
@@ -74,7 +75,7 @@ fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "self-heal" ]]; then
   echo
-  echo "=== self-healing (a real search, killed) ==="
+  echo "=== self-healing (real searches, killed and hung) ==="
   # Host-side, unlike the checks above: what is under test - run_with_retries in
   # scripts/lib/progress-bar.sh and `./ri health` - runs on the host from the
   # working tree. The search it drives executes the copy baked into the images.

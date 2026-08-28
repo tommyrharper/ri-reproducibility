@@ -62,6 +62,14 @@ check(
     plan("search", "wsclean", "--retries", "0")[0],
 )
 
+# Same falsy-zero hazard, same reason: 0 turns the stall watchdog off, which
+# is the setting somebody reaches for when it is misfiring on their run.
+check(
+    "search --stall-timeout 0 reaches the run script",
+    {"NS_STALL_TIMEOUT": "0"},
+    plan("search", "wsclean", "--stall-timeout", "0")[0],
+)
+
 # ...and a flag that was not given contributes nothing, so an environment
 # variable exported by hand survives and defaults.toml still fills the rest.
 check(

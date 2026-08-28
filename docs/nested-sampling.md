@@ -196,6 +196,7 @@ Sampler defaults live in `defaults.toml` at the repository root, loaded by
 | `--seed` | `NS_SEED` | PolyChord random seed | `41` |
 | `--metric` | `NS_METRIC` | Objective: `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
 | `--retries` | `NS_RETRIES` | Times a run that dies after scoring evaluations restarts itself from its checkpoint; `0` disables - see "A run that dies restarts itself" | `2` |
+| `--stall-timeout` | `NS_STALL_TIMEOUT` | Seconds with no evaluation finishing before a run is killed as hung, so `--retries` can restart it; `0` disables - see "A run that hangs instead of dying" | `7200` |
 
 #### Leave these alone
 
@@ -777,6 +778,39 @@ Two things to know about a restarted run:
 Set `--retries 0` to get the old behaviour, where the first failure ends the
 run.
 
+#### A run that hangs instead of dying
+
+`run_with_retries` can only act on a run that *exits*, and the worst failure
+here does not. PolyChord calls the likelihood from Fortran, so a single rank
+that stops answering leaves every other rank blocked in a collective that never
+completes: every core busy, nothing landing, no exit status, and `./ri health`
+correctly reporting a live run. The in-worker timeouts in `common.py` only
+cover a worker that was *asked* for a reply; a deadlock between the ranks
+themselves is asked nothing.
+
+`_ns_stall_watchdog` in `scripts/lib/progress-bar.sh` is the backstop. It
+watches the one thing true of every healthy run and false of every hung one -
+evaluations finishing - and after `--stall-timeout` seconds with none, writes
+the reason into `run.log` and kills the run, which turns the hang into the
+crash `run_with_retries` already handles. It runs whether or not there is a
+terminal, because a multi-day search is exactly the thing somebody starts
+under `nohup`.
+
+The kill is by command line rather than by the pid the run script holds: that
+pid is the `docker exec` client, and the ranks are children of
+`containerd-shim`, not of it, so killing the client leaves the run running.
+`ns_run_process_pattern` builds the pattern, anchored on the run's own
+`--output-dir` so a search somebody else is running on the host is untouched -
+the same pattern `./ri resume` uses to refuse a run that is still going.
+
+**The default is 7200s, and it is deliberately far above anything legitimate.**
+`IMAGING_REPLY_TIMEOUT` in `common.py` already lets a single evaluation take an
+hour before its worker is declared dead, so anything shorter would kill runs
+that machinery is still working on. Against that, the widest gap between
+evaluations measured over 6.3 hours of a live 16-rank R2D2 search was 23.5s.
+This is the backstop for when nobody is watching; `./ri health` answers the
+same question in seconds for somebody who is. `--stall-timeout 0` disables it.
+
 A restart adopts what the previous attempt evaluated **whether or not
 PolyChord left a checkpoint behind**, and that distinction is load-bearing.
 PolyChord writes `<file_root>.resume` at its first checkpoint, so an attempt
@@ -798,18 +832,26 @@ on stderr and every finished evaluation still on disk, which `run_with_retries`
 can act on, instead of hanging it.
 
 `./ri self-check self-heal` is the end-to-end check of all of the above, and
-it is part of `./ri self-check`: it starts a real WSClean search on a throwaway
-directory, `SIGKILL`s the sampler once it has scored 8 evaluations - fewer than
-`--nlive`, so the kill lands before any checkpoint, which is the regime that
-was broken - and then asserts that the run restarts itself, records the kill in
+it is part of `./ri self-check`. It starts a real WSClean search on a throwaway
+directory and breaks it twice, in the two ways that recover through different
+machinery:
+
+- **`SIGKILL` once it has scored 8 evaluations** - fewer than `--nlive`, so the
+  kill lands before any checkpoint, which is the regime that was broken.
+- **`SIGSTOP` on one rank of a second search**, which is the hang above: the
+  job is fully alive and simply not progressing, so only the stall watchdog can
+  notice. Run with `--stall-timeout 20` and a 2s poll so it costs a minute
+  rather than two hours; the code path is the shipped one.
+
+Both then assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes
 `summary.json`, and comes out of `./ri health` with no warning and exit 0. The
 wait for recovery is bounded, because the failure it is most likely to catch is
-a hang rather than an exit. ~40 seconds and ~0.6GB, so it is
-safe to run beside another search. Fixtures cannot stand in for it - both bugs
-found in this machinery so far (the retry reading a checkpoint-frozen counter,
-the stall accounting refusing to excuse a run's own restart) passed the
-fixtures and failed a real kill.
+a hang rather than an exit. ~90 seconds and ~0.6GB, so it is safe to run beside
+another search. Fixtures cannot stand in for it - every bug found in this
+machinery so far (the retry reading a checkpoint-frozen counter, the stall
+accounting refusing to excuse a run's own restart, the restart colliding with
+its own evaluation directories) passed the fixtures and failed a real kill.
 
 ### Finding and resuming a run that stopped
 

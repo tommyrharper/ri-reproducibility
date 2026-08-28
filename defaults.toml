@@ -41,6 +41,15 @@ NS_METRIC = "total_rms_jy"
 # scripts/lib/progress-bar.sh.
 NS_RETRIES = 2
 
+# Seconds a run may go without finishing a single evaluation before it is
+# killed so that NS_RETRIES can restart it from PolyChord's checkpoint. The
+# backstop for a hang rather than a crash: run_with_retries only sees a run
+# that exits, and a rank deadlocked in an MPI collective never does. 0
+# disables it. Must stay clear of IMAGING_REPLY_TIMEOUT (3600s, common.py),
+# which is how long one evaluation is already allowed to take - see
+# _ns_stall_watchdog in scripts/lib/progress-bar.sh.
+NS_STALL_TIMEOUT = 7200
+
 # The parameter space the sampler searches, read by `load_parameter_space()`
 # in scripts/lib/nested_sampling/common.py. The order is the order of
 # PolyChord's unit cube, so reordering it invalidates existing chains,
