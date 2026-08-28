@@ -409,7 +409,7 @@ says nothing:
 | `FINISHED` | `summary.json` is there. |
 | `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
 | `STARTING` | No ranks yet, but the run is being driven: its `docker exec` client is alive. An R2D2 search spends minutes here while sixteen workers load their models. |
-| `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it. |
+| `STOPPED` | No ranks and no client - however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if it never wrote one; the warning says which. |
 | `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
 
 A directory with none of `run.env`, `run.log`, `summary.json`, `evaluations/`
@@ -1208,15 +1208,27 @@ $ ./ri runs
 RUN                        ALGORITHM  STATUS      EVALS
 r2d2-vlaa-20260828T2054Z   r2d2       running     6882
 r2d2-vlaa-20260827T1015Z   r2d2       resumable   659
+r2d2-vlaa-20260827T0932Z   r2d2       incomplete  0
 wsclean-vlaa-20260827T09Z  wsclean    complete    1706
 
 1 run still going. Check on it with:
   ./ri health r2d2-vlaa-20260828T2054Z
 
-1 run stopped before finishing.
+2 runs stopped before finishing.
 Continue where it left off, keeping every evaluation already done:
   ./ri resume r2d2-vlaa-20260827T1015Z
+No checkpoint, so the sampler starts over, reusing the evaluations already scored:
+  ./ri resume r2d2-vlaa-20260827T0932Z
 ```
+
+`EVALS` counts the evaluations that were *scored*, the same number
+`./ri health` calls `progress`. An evaluation directory with no `metrics.json`
+holds nothing - the run died between creating it and answering for that point
+- and `adopt_completed_evaluations` deletes it on resume. Counting directories
+instead made three runs here that died during startup, every rank having
+created its first directory and none having finished it, advertise 7, 7 and 15
+evaluations under a footer promising to keep every one, when what survives is
+zero.
 
 `./ri resume <run>` continues it in place. No flags: each run records what it
 was started with (`run.env`, written at startup, holding the values actually
@@ -1251,6 +1263,14 @@ still has a process driving it, `resumable` when neither but a PolyChord
 `.resume` file is there, and `incomplete` when a run stopped before it
 checkpointed anything. `./ri runs --incomplete` lists only the ones needing
 attention, and `--json` is the machine-readable form.
+
+`./ri resume` is the right command for both of the last two, which is why the
+footer above prints one sentence for each rather than one for both: only a
+`resumable` run continues from where it stopped. An `incomplete` one has no
+live points on disk, so the sampler starts over - the evaluations it did score
+are still reused, out of the point cache, and the rest are deleted. `./ri
+health`'s `stopped before finishing` warning makes the same split, off the
+same `.resume` file that decides its `stage` line.
 
 A live run is indistinguishable on disk from one that stopped - same missing
 `summary.json`, same checkpoint - so liveness is read from the process table,

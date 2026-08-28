@@ -96,7 +96,15 @@ RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
-    evaluations = len(list((run_dir / "evaluations").glob("eval-*")))
+    # Scored evaluations, not evaluation directories: a directory with no
+    # metrics.json holds nothing (the run died between creating it and scoring
+    # it) and `adopt_completed_evaluations` in scripts/lib/nested_sampling/
+    # common.py deletes it on resume. Counting directories made three runs that
+    # died during startup advertise 7, 7 and 15 evaluations under a footer
+    # promising to keep every one, when the number that survives is zero - and
+    # disagreed with `./ri health`, which has always counted the scored ones.
+    # Costs 0.15s against 0.04s on the largest run here (17,760 evaluations).
+    evaluations = len(list((run_dir / "evaluations").glob("eval-*/metrics.json")))
     complete = (run_dir / "summary.json").exists()
     # PolyChord's checkpoint. A completed run keeps its resume file too, so
     # this only distinguishes "can be continued" among the incomplete ones.
@@ -175,9 +183,21 @@ def main(argv: list[str] | None = None) -> int:
         count = len(unfinished)
         print()
         print(f"{count} run{'' if count == 1 else 's'} stopped before finishing.")
-        print("Continue where it left off, keeping every evaluation already done:")
-        for run in unfinished:
-            print(f"  ./ri resume {run['name']}")
+        # Split by whether PolyChord left a checkpoint. `./ri resume` is the
+        # right command either way, but only a `resumable` run continues from
+        # where it stopped; an `incomplete` one has no live points on disk, so
+        # the sampler starts over and the single promise this footer used to
+        # make for both was false for half of them.
+        for status, lead in (
+            ("resumable", "Continue where it left off, keeping every evaluation already done:"),
+            ("incomplete", "No checkpoint, so the sampler starts over, "
+                           "reusing the evaluations already scored:"),
+        ):
+            group = [r for r in unfinished if r["status"] == status]
+            if group:
+                print(lead)
+                for run in group:
+                    print(f"  ./ri resume {run['name']}")
     return 0
 
 
@@ -192,13 +212,23 @@ def self_check() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             NESTED_SAMPLING_DIR = Path(tmp)
 
+            def score(eval_dir: Path) -> None:
+                """What a rank writes once it has an answer for that point."""
+                eval_dir.mkdir(parents=True)
+                (eval_dir / "metrics.json").write_text("{}")
+
             done = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T000000Z"
-            (done / "evaluations" / "eval-0001-a").mkdir(parents=True)
+            score(done / "evaluations" / "eval-0001-a")
             (done / "summary.json").write_text("{}")
 
             stopped = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260102T000000Z"
-            (stopped / "evaluations" / "eval-0001-b").mkdir(parents=True)
-            (stopped / "evaluations" / "eval-0002-c").mkdir(parents=True)
+            score(stopped / "evaluations" / "eval-0001-b")
+            score(stopped / "evaluations" / "eval-0002-c")
+            # In flight when the run stopped: no metrics.json, so it holds
+            # nothing and the resumed run deletes it. Counting it would
+            # overstate what resuming keeps, which is what the directory count
+            # this replaced did.
+            (stopped / "evaluations" / "eval-0003-d").mkdir()
             (stopped / "chains").mkdir()
             (stopped / "chains" / "wsclean_vlaa.resume").write_text("")
             (stopped / "run.env").write_text(
@@ -210,7 +240,7 @@ def self_check() -> None:
             # A finished run keeps its resume file, so completeness must be
             # decided by summary.json and not by the checkpoint.
             assert runs[stopped.name]["status"] == "resumable", runs[stopped.name]
-            assert runs[stopped.name]["evaluations"] == 2
+            assert runs[stopped.name]["evaluations"] == 2, runs[stopped.name]
             assert runs[stopped.name]["algorithm"] == "wsclean"
             # Quoted settings survive the round trip out of run.env.
             assert runs[stopped.name]["settings"]["NS_METRIC"] == "total_rms_jy - snr"
@@ -224,7 +254,14 @@ def self_check() -> None:
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
             bare.mkdir()
             (bare / "run.env").write_text("NS_ALGORITHM=r2d2\n")
-            assert {r["name"]: r for r in find_runs(running=set())}[bare.name]["status"] == "incomplete"
+            # The shape three real runs on this host have: every rank created
+            # its first evaluation directory and the run died before any of
+            # them was scored. It has nothing, and must not advertise 7.
+            for rank in range(7):
+                (bare / "evaluations" / f"eval-0001-{rank}").mkdir(parents=True)
+            bare_run = {r["name"]: r for r in find_runs(running=set())}[bare.name]
+            assert bare_run["status"] == "incomplete", bare_run
+            assert bare_run["evaluations"] == 0, bare_run
 
             # A directory with none of those is not a run, and listing it as
             # `incomplete` paired it with a `./ri resume` that refuses it for
@@ -301,6 +338,26 @@ def self_check() -> None:
             assert f"./ri resume {stopped.name}" not in text, text
             assert "1 run stopped before finishing." in text, text
             assert f"./ri resume {bare.name}" in text, text
+            # The only unfinished run here has no checkpoint, so the promise
+            # to continue where it left off must not be the one printed.
+            assert "starts over" in text, text
+            assert "Continue where it left off" not in text, text
+
+            # Nothing running: now one unfinished run has a checkpoint and one
+            # does not, and each has to be listed under the sentence that is
+            # true of it. `./ri resume` is right for both, which is exactly
+            # why one shared line went unquestioned.
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert main([]) == 0
+            text = out.getvalue()
+            continue_at, over_at = (text.index("Continue where it left off"),
+                                    text.index("starts over"))
+            assert continue_at < text.index(f"./ri resume {stopped.name}") < over_at, text
+            assert over_at < text.index(f"./ri resume {bare.name}"), text
+            # And the run that died before scoring anything reports 0, not the
+            # 7 directories its ranks left behind.
+            assert f"{bare.name:<29}  r2d2       incomplete  0" in text, text
     finally:
         NESTED_SAMPLING_DIR = saved
     print("nested-sampling-runs self-check passed")

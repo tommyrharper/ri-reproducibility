@@ -1369,6 +1369,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         status = "starting"
     else:
         status = "stopped"
+    run_stage = stage(run_dir)
 
     # Only for a run that is still going: a stopped run's remaining dead
     # points are not remaining, they are lost, and its hours-left would be
@@ -1427,9 +1428,19 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             copies = int(tail["occurrences"])
             ending = (f'; run.log ends "{tail["line"]}"'
                       + (f" (x{copies} ranks)" if copies > 1 else ""))
+        # `stage` is "sampling" exactly when PolyChord left a .resume file, so
+        # it is also the answer to what `./ri resume` will do: without one
+        # there are no live points on disk and the sampler starts over, and
+        # calling that "continue it" overstated what three runs on this host
+        # had (they died during startup with nothing scored). The evaluations
+        # that were scored are still reused - they go into the point cache.
         warnings.append(
-            f"stopped before finishing{ending}; continue it with "
-            f"./ri resume {resume_target(run_dir)}"
+            f"stopped before finishing{ending}; "
+            + (f"continue it with ./ri resume {resume_target(run_dir)}"
+               if run_stage == "sampling" else
+               "it has no checkpoint, so the sampler starts over - "
+               f"./ri resume {resume_target(run_dir)} reuses the evaluations "
+               "already scored and drops the rest")
         )
     # A run whose shell was killed keeps going and keeps looking healthy - the
     # one thing it has lost is invisible in every other number here, and only
@@ -1539,7 +1550,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "path": str(run_dir),
         "algorithm": run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0],
         "status": status,
-        "stage": stage(run_dir),
+        "stage": run_stage,
         "settings": run_env,
         "ranks": len(ranks),
         "supervised": watched,
@@ -2857,7 +2868,25 @@ def self_check() -> None:
 
             # A run from before run.log existed still gets the resume line.
             (live / "run.log").unlink()
-            assert any("./ri resume" in w for w in describe(live, [], 5.0)["warnings"])
+            resumable = describe(live, [], 5.0)["warnings"]
+            assert any("./ri resume" in w for w in resumable), resumable
+            assert any("continue it with" in w for w in resumable), resumable
+
+            # The same run without PolyChord's checkpoint. `./ri resume` is
+            # still the command, but it starts the sampler over rather than
+            # continuing - which is what three runs on this host that died
+            # during startup have, and "continue it" was a promise about work
+            # that is not on disk.
+            (live / "chains" / "r2d2_vlaa.resume").rename(live / "chains" / "held")
+            fresh = describe(live, [], 5.0)
+            assert fresh["stage"] != "sampling", fresh["stage"]
+            restart = [w for w in fresh["warnings"] if "./ri resume" in w]
+            assert len(restart) == 1, fresh["warnings"]
+            assert "no checkpoint, so the sampler starts over" in restart[0], restart[0]
+            assert "continue it with" not in restart[0], restart[0]
+            (live / "chains" / "held").rename(live / "chains" / "r2d2_vlaa.resume")
+            assert any("continue it with" in w
+                       for w in describe(live, [], 5.0)["warnings"])
 
             # A run that crashed and restarted itself is still healthy, but
             # the restarts must be visible: whatever killed it once will do it
