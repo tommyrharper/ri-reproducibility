@@ -2386,7 +2386,12 @@ def self_check() -> None:
                         for i in range(wedges)))
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
+        # Resolved, because everything that matches a run to a process here
+        # goes through `run_dir.resolve()` - so a temp root reached by symlink
+        # would give every fixture two spellings and match neither. macOS puts
+        # every temporary directory behind /var -> /private/var.
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = str(Path(raw_tmp).resolve())
             NESTED_SAMPLING_DIR = Path(tmp)
 
             # The real `ps`, because its output format is what this parses
@@ -3200,7 +3205,8 @@ def self_check() -> None:
             (fresh / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\n")
             fresh_client = [dict(exec_client[0],
                                  args=f"/usr/bin/docker exec c mpirun python3 "
-                                      f"polychord_r2d2.py --output-dir {fresh}")]
+                                      f"polychord_r2d2.py --output-dir "
+                                      f"{fresh.resolve()}")]
             assert describe(fresh, fresh_client + launcher, 5.0)["status"] == "starting"
             # Without the client it is a run that never got going, which is
             # the one that wants resuming.
@@ -3959,7 +3965,8 @@ def self_check() -> None:
             # repository.
             # Its own temporary directory, not a subdirectory of this one:
             # anything under NESTED_SAMPLING_DIR is a run to every glob here.
-            with tempfile.TemporaryDirectory() as other_checkout:
+            with tempfile.TemporaryDirectory() as raw_other:
+                other_checkout = str(Path(raw_other).resolve())
                 foreign = Path(other_checkout) / "r2d2-vlaa-20260105T000000Z"
                 foreign.mkdir()
                 abroad = [dict(ranks[0], pid=778,
@@ -4008,18 +4015,20 @@ def self_check() -> None:
                 # run" for every run outside this checkout. The path is what
                 # both commands take.
                 assert resume_target(live) == live.name, resume_target(live)
-                assert resume_target(foreign) == str(foreign), resume_target(foreign)
+                assert resume_target(foreign) == str(foreign.resolve()), \
+                    resume_target(foreign)
                 stopped_abroad = describe(foreign, [], DEFAULT_STALE_SECONDS)
                 assert stopped_abroad["status"] == "stopped", stopped_abroad
-                assert f"./ri resume {foreign}" in stopped_abroad["warnings"][0], \
+                assert f"./ri resume {foreign.resolve()}" in stopped_abroad["warnings"][0], \
                     stopped_abroad["warnings"]
                 # The orphaned-launcher warning offers one too: the same
                 # processes as the local orphan case above, pointed abroad.
-                away = [dict(q, args=str(q["args"]).replace(str(live), str(foreign)))
+                away = [dict(q, args=str(q["args"]).replace(str(live.resolve()),
+                                                            str(foreign.resolve())))
                         for q in [r for r in not_ranks if r["pid"] != 89] + ranks]
                 orphan_abroad = describe(foreign, away, DEFAULT_STALE_SECONDS)
                 assert orphan_abroad["supervised"] is False, orphan_abroad
-                assert f"./ri resume {foreign} after it does" \
+                assert f"./ri resume {foreign.resolve()} after it does" \
                     in orphan_abroad["warnings"][0], orphan_abroad["warnings"]
             # mpirun and the host-side `docker exec` carry --output-dir too and
             # are not ranks, but they do count: a run that has started and has

@@ -62,9 +62,13 @@ def resolve_run_dir(raw: str) -> Path:
     # `./ri health` and `./ri resume` open. A real path of that name wins.
     if not path.exists() and (NESTED_SAMPLING_DIR / raw).is_dir():
         return NESTED_SAMPLING_DIR / raw
+    # Resolved whether or not it was absolute, like resolve_run() in
+    # profile-nested-sampling-run.py: an absolute path through a symlink is a
+    # different string for the same directory, which is every temp path on
+    # macOS (/var -> /private/var).
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    return path
+        path = Path.cwd() / path
+    return path.resolve()
 
 
 def relative_to_repo_root(run_dir: Path) -> str:
