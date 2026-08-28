@@ -12,8 +12,11 @@
 # libraries - no rebuild needed to check a change. A run executes the copy baked
 # into the image instead, so rebuild before running one.
 #
-# Nothing here starts a search or writes into results/, so it is safe to run
-# while someone else's run is in progress.
+# All but the last of these start no search. The self-heal check does - a ~40
+# second, ~0.6GB WSClean search that it kills and watches recover - because the
+# thing it checks only exists in a real run. It is safe alongside another run:
+# 3 ranks at ~200MB, sized and refused by scripts/lib/rank-budget.sh like any
+# other, on a throwaway directory the report and `./ri runs` never see.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -67,6 +70,15 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2" ]]; then
   echo "=== r2d2 sampler (${POLYCHORD_IMAGE}) ==="
   docker_run -e POLYCHORD_R2D2_SELF_CHECK=1 --entrypoint python3 \
     "${POLYCHORD_IMAGE}" -u "$(nested_sampling polychord_r2d2.py)"
+fi
+
+if [[ "${TARGET}" == "all" || "${TARGET}" == "self-heal" ]]; then
+  echo
+  echo "=== self-healing (a real search, killed) ==="
+  # Host-side, unlike the checks above: what is under test - run_with_retries in
+  # scripts/lib/progress-bar.sh and `./ri health` - runs on the host from the
+  # working tree. The search it drives executes the copy baked into the images.
+  bash "${REPO_ROOT}/scripts/test_self_heal.sh"
 fi
 
 echo

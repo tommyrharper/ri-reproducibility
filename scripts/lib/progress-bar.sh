@@ -114,11 +114,15 @@ run_with_progress() {
 #
 # The retry reuses the sidecar containers this run already started, but not
 # their pooled workers: those exit on EOF when the dying ranks close their end
-# of the FIFOs, so the retry falls back to a rank-started worker per
-# evaluation (see _connect_shell_started_worker in common.py) and runs at the
-# pre-pool speed, ~0.45s per evaluation slower. Deliberate - a recovered run
-# that is slower beats a dead one, and restarting it by hand gets the warm
-# path back.
+# of the FIFOs. Each rank then waits out `_connect_shell_started_worker`'s
+# 10s deadline in common.py and starts its own worker inside the same sidecar -
+# still one long-lived worker per rank, so the cost is that one-off wait and
+# not a per-evaluation penalty. Measured on a real killed WSClean search: 216
+# evaluations/min over the 53 before the kill against 219/min over the 34
+# after, with a 12.1s gap across the restart. Deliberate at that price - the
+# alternative is re-launching the pool into a container whose old workers may
+# not all have exited yet, and two readers on one FIFO split the messages
+# between them.
 run_with_retries() {
   local retries="$1" output_dir="$2"
   shift

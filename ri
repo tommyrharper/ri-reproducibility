@@ -268,9 +268,11 @@ def build_parser():
                     "and so cannot run in CI. The working tree is what runs, so "
                     "no rebuild is needed to check a change - but a run executes "
                     "the copy baked into the image, so rebuild before starting "
-                    "one. Starts no search and writes nothing into results/.")
+                    "one. All but the self-heal check start no search; that one "
+                    "runs a ~40 second throwaway WSClean search, kills it, and "
+                    "checks it recovers on its own.")
     self_check.add_argument("target", nargs="?", default="all",
-        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2"),
+        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "self-heal"),
         help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",
@@ -321,7 +323,7 @@ def build_parser():
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
     search.add_argument("--retries", type=int, metavar="N",
-                        help="times a search that died with dead points already banked "
+                        help="times a search that died after scoring evaluations "
                              "restarts itself from its checkpoint; 0 disables "
                              "[NS_RETRIES]")
     search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")

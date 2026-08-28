@@ -195,7 +195,7 @@ Sampler defaults live in `defaults.toml` at the repository root, loaded by
 | `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget that terminates the run | `12` |
 | `--seed` | `NS_SEED` | PolyChord random seed | `41` |
 | `--metric` | `NS_METRIC` | Objective: `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
-| `--retries` | `NS_RETRIES` | Times a run that dies with dead points already banked restarts itself from its checkpoint; `0` disables - see "A run that dies restarts itself" | `2` |
+| `--retries` | `NS_RETRIES` | Times a run that dies after scoring evaluations restarts itself from its checkpoint; `0` disables - see "A run that dies restarts itself" | `2` |
 
 #### Leave these alone
 
@@ -661,8 +661,7 @@ What each line is reading, and why it is worth a line:
   when there were any, and never warned on: the crash was survived and the run
   is healthy now, so warning would make `./ri health` exit nonzero for a run
   that is fine. It is still the line to read first on a run that looks slower
-  than it should - a restarted run runs on rank-started workers rather than
-  the pooled ones. See "A run that dies restarts itself".
+  than it should. See "A run that dies restarts itself".
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real
@@ -761,11 +760,15 @@ the run died, and does not count - the next attempt deletes it.
 Two things to know about a restarted run:
 
 - It reuses the sidecar containers but not their pooled workers, which exited
-  on EOF when the dying ranks closed the FIFOs. The retry falls back to a
-  rank-started worker per evaluation (`_connect_shell_started_worker` in
-  `common.py`), roughly 0.45s per evaluation slower. Deliberate: a slower
-  recovered run beats a dead one, and starting it again by hand gets the warm
-  path back.
+  on EOF when the dying ranks closed the FIFOs. Each rank waits out
+  `_connect_shell_started_worker`'s 10s deadline in `common.py` and then starts
+  its own worker inside the same sidecar - still one long-lived worker per
+  rank, so the price is that one-off wait and not a per-evaluation penalty. A
+  real killed WSClean search scored 216 evaluations/min over the 53 before the
+  kill and 219/min over the 34 after, with a 12.1s gap across the restart.
+  Deliberate at that price: re-launching the pool would mean a second reader on
+  a FIFO whose old worker may not have exited yet, and two readers split the
+  messages between them.
 - Each restart appends a line to `restarts.log` in the run directory, and
   `./ri health` shows the count and the latest one. It is reported, not warned
   on - the run is fine right now - but whatever killed it once will do it
@@ -773,6 +776,40 @@ Two things to know about a restarted run:
 
 Set `--retries 0` to get the old behaviour, where the first failure ends the
 run.
+
+A restart adopts what the previous attempt evaluated **whether or not
+PolyChord left a checkpoint behind**, and that distinction is load-bearing.
+PolyChord writes `<file_root>.resume` at its first checkpoint, so an attempt
+killed before that leaves evaluations on disk and no resume file. Adoption used
+to be conditional on the resume file, so such a restart began at eval id 1 on
+top of the previous attempt's directories, which `simulate_measurement_set`
+creates with `exist_ok=False`. One rank died on `FileExistsError`; PolyChord
+calls the likelihood from Fortran, so that traceback unwound one rank and left
+every other one waiting forever in a collective that never completed - a
+16-core R2D2 restart that burned every core, landed nothing, and never exited
+for `run_with_retries` to give up on. Re-sampling from scratch costs nothing
+either way: PolyChord redraws the same points from the same seed and the
+adopted cache answers them without imaging.
+
+The same hang is now closed at its source as well: the likelihood aborts the
+whole job (`abort_run`, i.e. `MPI_Abort`) on **any** exception it does not
+expect, not only on `WorkerDied`. A bug in a rank ends the run with the reason
+on stderr and every finished evaluation still on disk, which `run_with_retries`
+can act on, instead of hanging it.
+
+`./ri self-check self-heal` is the end-to-end check of all of the above, and
+it is part of `./ri self-check`: it starts a real WSClean search on a throwaway
+directory, `SIGKILL`s the sampler once it has scored 8 evaluations - fewer than
+`--nlive`, so the kill lands before any checkpoint, which is the regime that
+was broken - and then asserts that the run restarts itself, records the kill in
+`restarts.log`, keeps the evaluations the first attempt scored, writes
+`summary.json`, and comes out of `./ri health` with no warning and exit 0. The
+wait for recovery is bounded, because the failure it is most likely to catch is
+a hang rather than an exit. ~40 seconds and ~0.6GB, so it is
+safe to run beside another search. Fixtures cannot stand in for it - both bugs
+found in this machinery so far (the retry reading a checkpoint-frozen counter,
+the stall accounting refusing to excuse a run's own restart) passed the
+fixtures and failed a real kill.
 
 ### Finding and resuming a run that stopped
 

@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -497,6 +498,14 @@ def main() -> None:
                 # No honest likelihood exists for an evaluation the host never
                 # ran, and any value invented here would steer the sampler.
                 abort_run(str(exc))
+            except (Exception, SystemExit):
+                # Anything else is a bug in this file, and a bug here used to
+                # hang the job rather than end it. PolyChord calls the
+                # likelihood from Fortran, so the traceback unwinds this rank
+                # only and every other rank waits forever in a collective that
+                # never completes: every core busy, nothing landing, and
+                # run_with_retries never even reached because nothing exited.
+                abort_run(traceback.format_exc())
             cache[key] = record
             evaluations.append(record)
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
@@ -518,13 +527,25 @@ def main() -> None:
     resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
-    if settings.read_resume:
-        # Adopt what the interrupted attempt already evaluated, so eval ids
-        # carry on rather than restarting at 1 and colliding with its
-        # directories, and so a repeated point is served from the cache
-        # instead of being recomputed.
-        done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
-        print(f"resuming from {resume_path}, {done} evaluations already done", flush=True)
+    # Adopt what an earlier attempt already evaluated, so eval ids carry on
+    # rather than restarting at 1 and colliding with its directories, and so a
+    # repeated point is served from the cache instead of being recomputed.
+    #
+    # Not conditional on the resume file, because the two conditions are not
+    # the same one: PolyChord writes `.resume` at its first checkpoint, so an
+    # attempt killed before that - up to seventy minutes of R2D2 imaging, and
+    # every kill on a short run - leaves evaluations on disk and no resume
+    # file. Adopting only when resuming meant that restart began at eval id 1
+    # on top of the previous attempt's directories, which
+    # simulate_measurement_set creates with `exist_ok=False`: one rank died on
+    # FileExistsError and the rest hung forever in a collective that never
+    # completed. Sampling from scratch is cheap here anyway - PolyChord redraws
+    # the same points from the same seed and the cache answers without imaging.
+    done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
+    if done:
+        where = (f"resuming from {resume_path}" if settings.read_resume
+                 else "no checkpoint to resume from, re-sampling from the cache")
+        print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
