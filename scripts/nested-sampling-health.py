@@ -15,8 +15,8 @@ directory without knowing what to look at:
 * **Liveness.** A run that stopped and a run that finished both stop writing,
   so an mtime alone means nothing. The order is the point: a *whole*
   `summary.json` is finished, ranks running is healthy or stalled, a live
-  `docker exec` client with no ranks is still starting, nothing driving it is
-  stopped however recently it wrote.
+  `docker exec` client with no ranks is starting (or restarting, if it already
+  has progress), nothing driving it is stopped however recently it wrote.
 * **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
   PolyChord maximizes against a real `total_rms_jy` of ~0.008, so a run whose
   imager is broken concentrates its live points on its own failures and looks
@@ -1468,22 +1468,28 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # calling that STARTING gave a search killed mid-flight ten silent minutes
     # at exit 0. What that clause covered is the gap between attempts, and the
     # client covers all but the ~1s before the next `docker exec` is issued.
+    run_stage = stage(run_dir)
     if complete:
         status = "finished"
     elif ranks:
         status = "stalled" if idle is not None and idle > stale_seconds else "healthy"
     elif watched is not None:
-        status = "starting"
+        # A run whose ranks vanished mid-search and whose client is already
+        # back is a self-heal restart, not a fresh start - `run_stage` is
+        # "starting up" only before anything has touched `chains/` at all, so
+        # a run with a live point file or a checkpoint already has the
+        # progress a first-time STARTING would wrongly promise is not there
+        # yet.
+        status = "starting" if run_stage == "starting up" else "restarting"
     else:
         status = "stopped"
-    run_stage = stage(run_dir)
 
     # Only for a run that is still going: a stopped run's remaining dead
     # points are not remaining, they are lost, and its hours-left would be
     # counted off a rate that stopped.
     stats = sampler_stats(run_dir)
     forecast = None
-    if status in ("healthy", "stalled", "starting"):
+    if status in ("healthy", "stalled", "starting", "restarting"):
         forecast = evidence_forecast(
             run_dir, stats, _setting(run_env, "NS_NLIVE"),
             _setting(run_env, "NS_MAX_NDEAD"),
@@ -1656,7 +1662,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     space = free_bytes(run_dir)
     per_hour = scan["disk_bytes_per_hour"]
     disk_hours = None
-    if space is not None and per_hour and status in ("healthy", "starting", "stalled"):
+    if space is not None and per_hour \
+            and status in ("healthy", "starting", "restarting", "stalled"):
         disk_hours = space[0] / float(per_hour)
         # Against how much longer this run needs, not against a fixed number of
         # hours: space running out after the search is over is not a problem
@@ -1715,7 +1722,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         # reason it stopped when the reason is in its run.log.
         "restart_budget": (restart_budget(run_dir, _setting(run_env, "NS_RETRIES"),
                                           restarted, time.time())
-                           if status in ("healthy", "stalled", "starting") else None),
+                           if status in ("healthy", "stalled", "starting", "restarting") else None),
         "warnings": warnings,
         **scan,
     }
@@ -1812,7 +1819,7 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
 # these hard to see.
 GREEN, YELLOW, RED, CYAN = "32", "33", "31", "36"
 STATUS_COLORS = {"healthy": GREEN, "finished": GREEN, "starting": CYAN,
-                 "stalled": RED, "stopped": RED}
+                 "restarting": CYAN, "stalled": RED, "stopped": RED}
 
 
 def use_color() -> bool:
@@ -1907,9 +1914,9 @@ def render(run: dict[str, object]) -> None:
         if headline == "healthy":
             headline = "running"
         headline += f" - {len(warnings)} warning{'' if len(warnings) == 1 else 's'}"
-        # Amber for anything warning that is not already red: FINISHED and
-        # STARTING carry warnings too, and a green headline over a warning is
-        # the exact miscue the rename above exists to avoid.
+        # Amber for anything warning that is not already red: FINISHED,
+        # STARTING and RESTARTING carry warnings too, and a green headline
+        # over a warning is the exact miscue the rename above exists to avoid.
         if color != RED:
             color = YELLOW
     print(f"{run['name']}  {run['algorithm']}  {paint(headline.upper(), color)}")
@@ -1934,7 +1941,7 @@ def render(run: dict[str, object]) -> None:
     # again, and promising a next value would make it read as work still to
     # come.
     next_update = ""
-    if run["status"] in ("healthy", "stalled", "starting") \
+    if run["status"] in ("healthy", "stalled", "starting", "restarting") \
             and settings.get("NS_NLIVE", "").isdigit() \
             and run["checkpoint_age_seconds"] is not None:
         next_update = f", next past ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
@@ -2700,6 +2707,8 @@ def self_check() -> None:
                 assert f"\033[1;{GREEN}mHEALTHY\033[0m" in io_capture(report)
                 assert f"\033[1;{CYAN}mSTARTING\033[0m" in io_capture(
                     {**report, "status": "starting"})
+                assert f"\033[1;{CYAN}mRESTARTING\033[0m" in io_capture(
+                    {**report, "status": "restarting"})
                 # Already red stays red rather than being softened to amber...
                 assert f"\033[1;{RED}mSTALLED - 1 WARNING\033[0m" in io_capture(
                     {**report, "status": "stalled", "warnings": ["a"]})
@@ -3291,19 +3300,20 @@ def self_check() -> None:
             assert just_died["status"] == "stopped", just_died
             assert any("./ri resume" in w for w in just_died["warnings"]), just_died
             # ...and no ranks *yet* is neither. A live `docker exec` client is
-            # the run saying it has started: an R2D2 search spends minutes
-            # there while its workers load their models, and every second of
-            # that used to headline STOPPED and offer `./ri resume` on a run
-            # that was fine. The mtimes here are already past stale_seconds,
-            # so only the client can tell the two apart.
+            # the run saying it has started, and every second of that used to
+            # headline STOPPED and offer `./ri resume` on a run that was fine.
+            # The mtimes here are already past stale_seconds, so only the
+            # client can tell the two apart. `live` already has evaluations
+            # and a checkpoint (RESTARTING, a self-heal mid-search); a run
+            # with nothing of its own written yet is a genuine first start
+            # (STARTING) and the case the whole rule exists for.
             exec_client = [p for p in not_ranks if p["pid"] == 91]
             launcher = [p for p in not_ranks if p["pid"] == 89]
-            starting = describe(live, exec_client + launcher, 5.0)
-            assert starting["status"] == "starting", starting
-            assert not any("./ri resume" in w for w in starting["warnings"]), starting
-            assert io_capture(starting).splitlines()[0].endswith("  STARTING"), starting
-            # A run with nothing of its own written yet is the same answer, and
-            # the case the whole rule exists for.
+            restarting = describe(live, exec_client + launcher, 5.0)
+            assert restarting["status"] == "restarting", restarting
+            assert not any("./ri resume" in w for w in restarting["warnings"]), restarting
+            assert io_capture(restarting).splitlines()[0].endswith("  RESTARTING"), \
+                restarting
             fresh = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260106T000000Z"
             fresh.mkdir()
             (fresh / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\n")
@@ -3311,7 +3321,11 @@ def self_check() -> None:
                                  args=f"/usr/bin/docker exec c mpirun python3 "
                                       f"polychord_r2d2.py --output-dir "
                                       f"{fresh.resolve()}")]
-            assert describe(fresh, fresh_client + launcher, 5.0)["status"] == "starting"
+            # An R2D2 search spends minutes here while its workers load their
+            # models, with no chains/ of its own yet - the STARTING case.
+            starting = describe(fresh, fresh_client + launcher, 5.0)
+            assert starting["status"] == "starting", starting
+            assert io_capture(starting).splitlines()[0].endswith("  STARTING"), starting
             # Without the client it is a run that never got going, which is
             # the one that wants resuming.
             dead_start = describe(fresh, launcher, 5.0)
@@ -4168,8 +4182,8 @@ def self_check() -> None:
             # default report is what makes another session's "12GB available"
             # have no owner. The cost is that a run whose ranks have all gone
             # is listed for as long as its client takes to exit, where it
-            # headlines STARTING rather than STOPPED - sub-second, against
-            # minutes of a healthy run being invisible.
+            # headlines STARTING or RESTARTING rather than STOPPED -
+            # sub-second, against minutes of a healthy run being invisible.
             assert default_directories(not_ranks) == [live], \
                 default_directories(not_ranks)
             # The sidecar workers still do not count: they outlive a killed run

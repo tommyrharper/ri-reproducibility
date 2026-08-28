@@ -72,7 +72,8 @@ stop writing:
 |---|---|
 | `FINISHED` | A whole `summary.json` is there. |
 | `STALLED` | Ranks running, but no evaluation in `--stale-seconds` (default 600). The warning says how long until the stall watchdog restarts the run, or that `--stall-timeout 0` turned it off, or that no watchdog is left. |
-| `STARTING` | No ranks yet, but a `docker exec` client is alive. An R2D2 search spends minutes here loading models. |
+| `STARTING` | No ranks yet, but a `docker exec` client is alive, and nothing is in `chains/` yet - a genuine first start. An R2D2 search spends minutes here loading models. |
+| `RESTARTING` | The same, but `chains/` already has a live-point file or a checkpoint - a self-heal restart mid-search, not a first start. |
 | `STOPPED` | No ranks and no client, however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if there is none; the warning says which. A half-written `summary.json` lands here too, with a warning saying so. |
 | `HEALTHY` | Ranks running, evaluations landing, nothing warned about. |
 
@@ -98,7 +99,7 @@ point, so it stands down to `RUNNING` when there is something to say. No suffix
 and no host warning is exactly exit 0.
 
 On a terminal the headline and `WARNING` labels are coloured - green for
-`HEALTHY`/`FINISHED`, cyan for `STARTING`, amber for warnings, red for
+`HEALTHY`/`FINISHED`, cyan for `STARTING`/`RESTARTING`, amber for warnings, red for
 `STALLED`/`STOPPED` - and nothing else is. Piped, redirected or under
 [`NO_COLOR`](https://no-color.org) the output is byte-identical.
 
