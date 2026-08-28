@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "target",
         nargs="?",
         default=None,
-        help="Run directory, chains/ directory, or PolyChord file root. "
+        help="Run directory, run name, chains/ directory, or PolyChord file root. "
         "Default: most recent completed results/nested-sampling/*/ ",
     )
     return parser.parse_args()
@@ -83,6 +83,10 @@ def latest_run_dir() -> Path:
 
 def resolve_target(target: Path) -> Path:
     target = target.expanduser()
+    # The bare run name `./ri runs` prints, as well as a path - the same door
+    # `./ri health` and `./ri resume` open. A real path of that name wins.
+    if not target.exists() and (NESTED_SAMPLING_DIR / target).is_dir():
+        return NESTED_SAMPLING_DIR / target
     if not target.is_absolute():
         target = (Path.cwd() / target).resolve()
     else:

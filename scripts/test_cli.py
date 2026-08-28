@@ -15,6 +15,7 @@ import importlib.machinery
 import importlib.util
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -279,6 +280,49 @@ for path in command_paths(ri.build_parser()):
     )
     label = " ".join(["./ri", *path, "--help"])
     check(f"{label} renders", (0, True), (result.returncode, bool(result.stdout)))
+
+# The name in the first column of `./ri runs` is what a reader copies, and it
+# has to work in every command that takes a run. `health` and `resume` resolve
+# it in the shell/Python they dispatch to; these three each own a resolver, and
+# each one used to accept only a path - `./ri profile <name>` answered "no
+# summary.json found at <cwd>/<name>". Checked here rather than three new
+# self-checks because "every run-taking command takes the name" is a property
+# of the front door, not of any one script.
+def load_script(name):
+    path = REPO_ROOT / "scripts" / name
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    module = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+with tempfile.TemporaryDirectory() as runs_dir:
+    # Pointed at a temporary directory rather than the real one: a fixture run
+    # under results/nested-sampling/ is a run to every glob in this repo.
+    named = Path(runs_dir) / "wsclean-vlaa-20260101T000000Z"
+    named.mkdir()
+    elsewhere = Path(runs_dir) / "elsewhere"
+    elsewhere.mkdir()
+    for script, resolver in (("profile-nested-sampling-run.py", "resolve_run"),
+                             ("merge-nested-sampling-runs.py", "resolve_run_dir"),
+                             ("anesthetic-gui.py", "resolve_target")):
+        module = load_script(script)
+        module.NESTED_SAMPLING_DIR = Path(runs_dir)
+        # Each resolver is fed what its own argparse hands it - a str for two
+        # of them, a Path for the GUI's - rather than a normalised type.
+        resolve = getattr(module, resolver)
+        wants_path = script == "anesthetic-gui.py"
+
+        def resolved(raw):
+            return resolve(Path(raw) if wants_path else raw)
+
+        check(f"{script} resolves a bare run name", named, resolved(named.name))
+        # A real path of that name still wins, so nothing that worked stops.
+        check(f"{script} keeps a path that exists", elsewhere.resolve(),
+              resolved(str(elsewhere)))
+        check(f"{script} leaves an unknown path alone", Path("/tmp/ri-no-such-run"),
+              resolved("/tmp/ri-no-such-run"))
 
 if failures:
     print(f"{len(failures)} check(s) failed", file=sys.stderr)

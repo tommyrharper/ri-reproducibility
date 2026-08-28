@@ -40,9 +40,18 @@ docker_run() {
 
 nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 
+# Through uv, like every other host-side entry point in `ri`, and pinned the
+# way scripts/lib/defaults.sh pins it: test_self_checks.py imports common.py,
+# which needs tomllib to read defaults.toml. A host whose `python3` predates
+# 3.11 - Ubuntu 22.04's 3.10 is one - took the whole of `./ri self-check` down
+# on that import, self-heal check included, so the only check that starts a
+# real search was unreachable through its own documented front door.
+# --no-project because these two need nothing from pyproject.toml.
+host_python() { uv run --no-project --python ">=3.11" python "$@"; }
+
 echo "=== host-side checks ==="
-python3 "${REPO_ROOT}/scripts/test_watchdogs.py"
-python3 "${REPO_ROOT}/scripts/test_self_checks.py"
+host_python "${REPO_ROOT}/scripts/test_watchdogs.py"
+host_python "${REPO_ROOT}/scripts/test_self_checks.py"
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "simulate" ]]; then
   echo

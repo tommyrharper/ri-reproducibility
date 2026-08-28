@@ -44,7 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "runs",
         nargs="*",
-        help="Run directories to merge (>= 2). Omit to discover all compatible groups.",
+        help="Run directories or names to merge (>= 2). "
+        "Omit to discover all compatible groups.",
     )
     parser.add_argument(
         "--out",
@@ -57,6 +58,10 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_run_dir(raw: str) -> Path:
     path = Path(raw).expanduser()
+    # The bare run name `./ri runs` prints, as well as a path - the same door
+    # `./ri health` and `./ri resume` open. A real path of that name wins.
+    if not path.exists() and (NESTED_SAMPLING_DIR / raw).is_dir():
+        return NESTED_SAMPLING_DIR / raw
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
     return path
