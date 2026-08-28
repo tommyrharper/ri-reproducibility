@@ -363,8 +363,8 @@ What each line is reading, and why it is worth a line:
   without one are the evaluations in flight. That number should sit near
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
   stuck at once.
-- **activity** - the overall rate, and the rate over the last 50 evaluations
-  when the two have diverged. A run can collapse to a fraction of its own
+- **activity** - the overall rate, and the rate over the most recent tenth of
+  the run when the two have diverged. A run can collapse to a fraction of its own
   throughput without ever going quiet long enough to look stalled, and that
   state passes every other check here: on a live 16-rank R2D2 search, 25/min
   fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
@@ -373,16 +373,26 @@ What each line is reading, and why it is worth a line:
   23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
   grounds for telling anyone to act.
 
-  Both rates are medians of the gaps between evaluations, not counts in a
-  window, and that is deliberate: the most recent window is always partial, so
-  it reads low by whatever fraction of it has not elapsed. On this run,
-  mid-window, the partial bucket said 23.8/min against a 91-165 per five
-  minutes baseline - a collapse, apparently - while the gaps said 52.5/min and
-  the bucket finished at 164, the highest of the run. A gap cannot be measured
-  until both of its ends exist, so there is no partial window to misread. The
-  one thing gaps cannot see is a stall that began *after* the last completed
-  evaluation, which is what the idle thresholds cover; the two look redundant
-  and are complementary.
+  Both are evaluations divided by the time they took, so the two can be
+  compared. Two things about how that window is drawn, each of which was got
+  wrong first:
+
+  Its ends are both completed evaluations, never "the last N minutes". The
+  most recent clock window is always partial and so reads low by whatever
+  fraction of it has not elapsed yet, which at the moment of sampling is
+  indistinguishable from a slowdown - on this run, mid-window, a partial
+  five-minute bucket said 23.8/min against a 91-165 baseline, apparently a
+  collapse, and then finished at 164, the highest of the run. The one thing
+  this cannot see is a stall beginning *after* the last completed evaluation,
+  which is what the idle thresholds cover; the two look redundant and are
+  complementary.
+
+  And it is a share of the run rather than a fixed count of evaluations,
+  because a fixed count covers a wildly different span depending on pace -
+  fifty evaluations is two minutes at 25/min and ten at 5/min, so the window
+  grows exactly when the run slows. The last fifty on this run swung
+  4.9 -> 31.5 -> 37.6 across forty minutes where a tenth of the run gave
+  28.1 -> 37.6 -> 33.4 over the same samples.
 
   Two things not to conclude from a falling rate. It does not mean the
   evaluations got harder: on that run per-evaluation cost was *falling* at the

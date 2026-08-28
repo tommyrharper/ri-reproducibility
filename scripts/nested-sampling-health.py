@@ -84,14 +84,17 @@ DEFAULT_STALE_SECONDS = 600.0
 # something well inside a minute.
 SPIN_IDLE_SECONDS = 60.0
 
-# Evaluations in the "how is it going now" window, and how far it has to
-# diverge from the run's own median before both numbers are worth printing
-# rather than one. Doubled rather than half again, because a healthy run's own
-# pace is noisier than it looks: five minute bins over 107 minutes of one
-# ranged 91-165 with no fault present. Walking that run's history, this fires
-# at 269 sampled moments in 15% of them at 1.5x and 5% at 2.0x, and the knee is
-# where the ordinary swing stops and the one real event starts.
+# The "how is it going now" window - a tenth of the run, never fewer than this
+# many evaluations - and how far it has to diverge from the run's overall pace
+# before both numbers are worth printing rather than one.
+#
+# Doubled rather than half again, because a healthy run's own pace is noisier
+# than it looks: five minute bins over 107 minutes of one ranged 91-165 with no
+# fault present. Walking that run's history at 269 sampled moments, the display
+# fires in 15% of them at 1.5x and 5% at 2.0x, and the knee is where the
+# ordinary swing stops and the real events start.
 RATE_WINDOW = 50
+RATE_WINDOW_DIVISOR = 10
 RATE_DIVERGENCE_FACTOR = 2.0
 
 # A gap between consecutive evaluations counts as a stall when it is this many
@@ -292,12 +295,34 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     # yet. last_activity_seconds is exactly that interval, and the idle clauses
     # in describe() are what cover the hole. The two look redundant and are
     # complementary; do not drop either.
+    # Both rates the same way: evaluations divided by the time they took. The
+    # recent one used to be 60 / median(recent gaps), which is a different
+    # quantity from the overall count-over-span it sits next to - a median
+    # ignores the long tail, so during a phased run it reads roughly double.
+    # Measured at one instant on a live search: 33.3/min from the median
+    # against 18.2/min from the count, where an independent thirty-minute
+    # window said 17.0. Printing those two side by side invited exactly the
+    # comparison they could not support.
+    #
+    # A share of the run rather than a fixed count, because a fixed one covers
+    # a wildly different span depending on pace - fifty evaluations is two
+    # minutes at 25/min and ten at 5/min, so the window grows precisely when
+    # the run slows and the reading whipsaws. The last fifty here swung
+    # 4.9 -> 31.5 -> 37.6 over forty minutes; a tenth of the run gave
+    # 28.1 -> 37.6 -> 33.4 across the same samples. Both ends of the window are
+    # completed evaluations, so this stays immune to the partial-window problem
+    # above.
     recent_rate, slowdown = None, None
-    if len(gaps) >= 2 * RATE_WINDOW:
-        recent = statistics.median(gaps[-RATE_WINDOW:])
-        overall = statistics.median(gaps)
-        recent_rate = 60 / recent if recent > 0 else None
-        slowdown = recent / overall if overall > 0 else None
+    window = max(RATE_WINDOW, len(times) // RATE_WINDOW_DIVISOR)
+    if len(times) >= 2 * window:
+        recent_times = times[-window:]
+        recent_span = recent_times[-1] - recent_times[0]
+        overall_rate = len(times) * 60 / span if span > 0 else None
+        if recent_span > 0 and overall_rate:
+            recent_rate = len(recent_times) * 60 / recent_span
+            slowdown = overall_rate / recent_rate if recent_rate > 0 else None
+    else:
+        recent_span = None
 
     return {
         "completed": len(times),
@@ -307,6 +332,7 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
         "span_seconds": span,
         "evals_per_minute": len(times) * 60 / span if span > 0 else None,
         "recent_evals_per_minute": recent_rate,
+        "recent_span_seconds": recent_span,
         "slowdown_factor": slowdown,
         "stall_threshold_seconds": threshold,
         "stall_count": len(stalls),
@@ -654,8 +680,11 @@ def render(run: dict[str, object]) -> None:
                         if rate else "")
                      # Only when the run has changed pace materially, in either
                      # direction: the two numbers agreeing says nothing.
+                     # In its own units of time, not "the last N evaluations":
+                     # the window is a share of the run, so how long it covers
+                     # is the thing the reader needs and the count is not.
                      + (f" ({run['recent_evals_per_minute']:.1f}/min over the last "
-                        f"{RATE_WINDOW})"
+                        f"{format_hms(float(run['recent_span_seconds']))})"
                         if slowdown is not None and (
                             float(slowdown) > RATE_DIVERGENCE_FACTOR
                             or float(slowdown) < 1 / RATE_DIVERGENCE_FACTOR) else "")),
@@ -965,14 +994,23 @@ def self_check() -> None:
             # timeout - which is exactly why the rate had to be measured.
             assert report["status"] == "healthy", report
             assert float(report["last_activity_seconds"]) < SPIN_IDLE_SECONDS, report
-            assert abs(float(report["slowdown_factor"]) - 12) < 1, report
-            assert abs(float(report["recent_evals_per_minute"]) - 5) < 0.5, report
+            # Both rates are evaluations over the time they took, so they can
+            # be divided: 60 a minute over the fast phase, 5 over the collapse,
+            # and 17 overall because the fast phase is most of the run. A
+            # median-of-gaps recent rate would read 5 against an overall of 60
+            # and call this a twelvefold collapse.
+            assert abs(float(report["recent_evals_per_minute"]) - 5.1) < 0.2, report
+            assert abs(float(report["evals_per_minute"]) - 17.0) < 0.2, report
+            assert abs(float(report["slowdown_factor"]) - 3.3) < 0.2, report
+            # The window reports the time it covers, not a count: 50 twelve
+            # second evaluations is very nearly ten minutes.
+            assert abs(float(report["recent_span_seconds"]) - 588) < 2, report
             # Measured and shown, never warned on: a run that halves its pace
             # and recovers is a phase, and warning on it would teach the reader
             # to ignore the warnings that mean something.
             assert not any("throughput" in w for w in report["warnings"]), report
             rendered = io_capture(report)
-            assert "5.0/min over the last 50" in rendered, rendered
+            assert "5.1/min over the last 0:09:48" in rendered, rendered
             # A run holding its pace prints one rate, not two.
             steady = describe(live, ranks, DEFAULT_STALE_SECONDS, working)
             assert "over the last" not in io_capture(steady), io_capture(steady)
