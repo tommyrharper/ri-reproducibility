@@ -397,7 +397,8 @@ def build_parser():
             "\n"
             "Reads files, runs one ps and one docker ps, and samples CPU\n"
             "for a second when a run is live, so it costs a busy\n"
-            "host nothing. Exits 1 when something needs attention."
+            "host nothing. Exits 1 when something needs attention, and\n"
+            "says so on the run's headline as a warning count."
         ),
     )
     health.add_argument("run", nargs="?", metavar="RUN",

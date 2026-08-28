@@ -365,7 +365,25 @@ says nothing:
 | `STALLED` | Ranks are still running, but no evaluation has landed in `--stale-seconds` (default 600). |
 | `STARTING` | No ranks yet, but something was written recently. |
 | `STOPPED` | No ranks and nothing recent. `./ri resume <run>` continues it. |
-| `HEALTHY` | Ranks running and evaluations landing. |
+| `HEALTHY` | Ranks running and evaluations landing, and nothing warned about. |
+
+**The headline carries the warning count**, because it is the whole report for
+a reader who does not get to the bottom of it - and because under `--all` it is
+the only line worth scanning:
+
+```console
+$ ./ri health --all
+wsclean-vlaa-20260828T022337Z  wsclean  FINISHED
+wsclean-vlaa-20260828T022151Z  wsclean  STOPPED - 1 WARNING
+r2d2-vlaa-20260827T205418Z  r2d2  RUNNING - 1 WARNING
+```
+
+`HEALTHY` is the only status word that is a claim about the run rather than a
+point in its lifecycle, so it is the one that steps aside when there is
+something to say: a run holding a worker that is 98% paged out headlined
+`HEALTHY` one line above the warning naming it, while exiting 1. The other
+words already say trouble and only gain the count. No suffix on any run and no
+host warning is exactly exit 0.
 
 What each line is reading, and why it is worth a line:
 

@@ -87,7 +87,8 @@ Usage:
   uv run scripts/nested-sampling-health.py --json
 
 Exit status is 0 when nothing needs attention and 1 when something does, so it
-can gate a script.
+can gate a script; the headline says the same thing in words, as a warning
+count next to the run's status.
 """
 
 from __future__ import annotations
@@ -1342,7 +1343,21 @@ def format_hours(hours: float) -> str:
 
 
 def render(run: dict[str, object]) -> None:
-    print(f"{run['name']}  {run['algorithm']}  {str(run['status']).upper()}")
+    # The headline is the whole report for anyone who does not read to the
+    # bottom, so it never says HEALTHY over a body that is warning - which is
+    # what a run holding a paged-out worker printed, one word above the warning
+    # naming it and with an exit status of 1. `healthy` is the only status word
+    # that is a claim about the run rather than a point in its lifecycle, so it
+    # is the one that steps aside; the others (STALLED, STOPPED) already say
+    # trouble and only gain the count. That count is the exit status made
+    # visible: no suffix on any run and no host warning is exactly exit 0.
+    warnings = list(run["warnings"])
+    headline = str(run["status"])
+    if warnings:
+        if headline == "healthy":
+            headline = "running"
+        headline += f" - {len(warnings)} warning{'' if len(warnings) == 1 else 's'}"
+    print(f"{run['name']}  {run['algorithm']}  {headline.upper()}")
     settings = run["settings"]
     assert isinstance(settings, dict)
     ranks = f"{run['ranks']} ranks"
@@ -1805,6 +1820,20 @@ def self_check() -> None:
             assert report["dead_points"] == 3, report
             assert report["ranks"] == 4 and report["failed"] == 0, report
             assert report["warnings"] == [], report
+            # The headline is the exit status in words. Clean run: HEALTHY and
+            # nothing else. The same run with warnings must not still headline
+            # HEALTHY - that is what it did over the paged-out-worker warning,
+            # one word above the warning itself and with exit 1.
+            assert aged.splitlines()[0].endswith("  HEALTHY"), aged
+            warned = io_capture({**report, "warnings": ["a"]})
+            assert warned.splitlines()[0].endswith("  RUNNING - 1 WARNING"), warned
+            assert "HEALTHY" not in warned, warned
+            plural = io_capture({**report, "warnings": ["a", "b"]})
+            assert plural.splitlines()[0].endswith("  RUNNING - 2 WARNINGS"), plural
+            # A status word that already says trouble keeps it and only gains
+            # the count, so STALLED never becomes RUNNING.
+            stalled = io_capture({**report, "status": "stalled", "warnings": ["a"]})
+            assert stalled.splitlines()[0].endswith("  STALLED - 1 WARNING"), stalled
             # The imager worker is 3.3GB of the run and none of its ranks:
             # 4 ranks at 10MB, mpirun and docker exec at 5MB each, worker 3300.
             assert report["processes"] == 7, report
