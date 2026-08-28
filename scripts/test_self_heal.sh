@@ -338,10 +338,11 @@ grep -qF "WARNING: ignoring unreadable ${corrupt_record}" "${RESUME_OUT}.log" \
 [ -e "${corrupt_record%/metrics.json}" ] \
   && fail "the half-written record's directory survived the resume, so the sampler collides with it when it proposes that point again"
 
-# Continued, not restarted. The count the resume script prints is evaluation
-# *directories*, which is the completed ones plus any that were in flight when
-# the kill landed, so it can only be >= what completed - a resume that ignored
-# the previous attempt would print 0 and re-image everything.
+# Continued, not restarted. The count the resume script prints is the scored
+# evaluations - the same `eval-*/metrics.json` rule `completed_evals` uses -
+# read after the kill, so it can only be >= what was counted before it. A
+# resume that ignored the previous attempt would print 0 and re-image
+# everything.
 adopted="$(grep -o '[0-9]\+ evaluations already done' "${RESUME_OUT}.log" | head -1 | cut -d' ' -f1)"
 if [ -z "${adopted}" ] || [ "${adopted}" -lt "${resume_before}" ]; then
   fail "./ri resume started from '${adopted:-nothing}' rather than the ${resume_before} evaluations already on disk; see ${RESUME_OUT}.log"

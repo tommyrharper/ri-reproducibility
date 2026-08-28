@@ -1289,6 +1289,20 @@ used), so a resume cannot silently become a different search. PolyChord's own
 checkpointing supplies the live points and the evaluations already on disk are
 adopted, so their ids carry on and no point is paid for twice.
 
+It builds the images the run needs first, exactly as `./ri search` does, and
+for the same reason: a run executes the code baked into them - `polychord`
+copies the whole of `scripts/lib/nested_sampling`, `meqtrees` three of its
+scripts plus `defaults.toml` - so a resume against a stale image silently
+continues on whatever was baked last time. That is backwards for the case a
+resume is most often typed in: something killed the run, the fix went into the
+working tree, and `./ri health` printed `./ri resume`. Reproduced by marking
+`polychord_wsclean.py` and resuming a killed search - the mark never ran, and
+after the build it ran on every rank. The builds cost ~0.05s each when nothing
+changed (`build.sh` compares an inputs hash held in an image label), and they
+go in front of the rank clamp below so that clamp reads the memory left after
+them. `./ri resume <run> --no-build` skips them, for a working tree that has
+moved on and must not reach a run already in flight.
+
 The one setting a resume does not replay verbatim is the rank count. What
 `run.env` holds there is the memory guard's own output from when the run
 started, not a number anyone chose, and on a shared host the memory that was
@@ -1300,6 +1314,10 @@ $ ./ri resume wsclean-vlaa-20260828T0221Z
 NOTE: wsclean ranks 3 -> 1 (4400MB available, 0MB reserved by other runs, 200MB per rank)
 Resuming wsclean-vlaa-20260828T0221Z (wsclean, 31 evaluations already done, 1 rank)
 ```
+
+That count is scored evaluations - `eval-*/metrics.json`, the same number
+`./ri runs` and `./ri health` report - because the directories without a
+record are the ones `adopt_completed_evaluations` deletes on the way in.
 
 Clamping down is free: the checkpoint carries live points, not ranks, and the
 run above finished normally after dropping from 3 ranks to 1. Without it a

@@ -164,11 +164,22 @@ check(
 )
 
 # No flags: resuming reads the settings back out of the run directory, so the
-# run name is the only thing that has to travel.
+# run name is the only thing that has to travel. The image builds a resume does
+# are the resume script's own, because only run.env knows which images the run
+# needs - so nothing but the run name is on this command line either.
 check(
     "resume passes the run through and nothing else",
     ({}, [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
     plan("resume", "r2d2-vlaa-20260827T101500Z"),
+)
+
+# ...and the one way to stop it rebuilding, for a working tree that has moved
+# on since the run started.
+check(
+    "resume --no-build reaches the script as an environment override",
+    ({"NS_NO_BUILD": "1"},
+     [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
+    plan("resume", "r2d2-vlaa-20260827T101500Z", "--no-build"),
 )
 
 check(

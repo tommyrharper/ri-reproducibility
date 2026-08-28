@@ -123,6 +123,39 @@ if [ "${1:-}" = "--self-check" ]; then
     exit 1
   fi
 
+  # What a resume says it is continuing, and what it builds first. Its own
+  # run directory, so the restarts.log assertions above are not disturbed.
+  COUNT_RUN="${TMP}/wsclean-counted"
+  mkdir -p "${COUNT_RUN}/evaluations/eval-0001-a" \
+           "${COUNT_RUN}/evaluations/eval-0002-b" \
+           "${COUNT_RUN}/evaluations/eval-0003-c"
+  printf 'NS_ALGORITHM=wsclean\nNS_MPI_PROCS=1\n' >"${COUNT_RUN}/run.env"
+  # Two scored, one killed before it wrote a record - which the resume throws
+  # away (adopt_completed_evaluations), so it must not be counted as done.
+  echo '{}' >"${COUNT_RUN}/evaluations/eval-0001-a/metrics.json"
+  echo '{}' >"${COUNT_RUN}/evaluations/eval-0002-b/metrics.json"
+
+  OUT="$(NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
+  case "${OUT}" in
+    *"(wsclean, 2 evaluations already done, 1 rank)"*) ;;
+    *) echo "FAIL: resume must count scored evaluations, got: ${OUT}"; exit 1 ;;
+  esac
+  # The three images this algorithm's ranks execute, built before the run
+  # script is reached - the docker stub above makes each build a no-op, so
+  # what is checked is that build.sh was asked for the right set.
+  for want in wsclean meqtrees polychord; do
+    case "${OUT}" in
+      *"ri-reproducibility/${want}"*) ;;
+      *) echo "FAIL: a resume must build ${want}, got: ${OUT}"; exit 1 ;;
+    esac
+  done
+
+  OUT="$(NS_NO_BUILD=1 NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
+  case "${OUT}" in
+    *"ri-reproducibility/"*)
+      echo "FAIL: --no-build must skip the builds, got: ${OUT}"; exit 1 ;;
+  esac
+
   echo "resume-nested-sampling-run self-check passed"
   exit 0
 fi
@@ -176,14 +209,36 @@ export OUTPUT_DIR="${RUN_DIR}"
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"
-        MB_PER_RANK="${NS_R2D2_MB_PER_RANK}" ;;
+        MB_PER_RANK="${NS_R2D2_MB_PER_RANK}"
+        IMAGES="r2d2 meqtrees polychord" ;;
   wsclean) RUN_SCRIPT="scripts/run-nested-sampling.sh"
-        MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK}" ;;
+        MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK}"
+        IMAGES="wsclean meqtrees polychord" ;;
   *)
     echo "FATAL: ${RUN_DIR}/run.env has an unknown NS_ALGORITHM=${NS_ALGORITHM}" >&2
     exit 1
     ;;
 esac
+
+# The same builds `./ri search` does, for the same reason and at the same
+# cost. A run executes the code baked into its images - `polychord` copies
+# the whole of scripts/lib/nested_sampling, `meqtrees` three of its scripts
+# and defaults.toml - so without this a resume runs whatever was baked
+# whenever those images were last built, silently. That is exactly backwards
+# for the case a resume is most often typed in: something killed the run, the
+# bug was fixed in the working tree, and `./ri health` said `./ri resume`.
+# Reproduced by marking polychord_wsclean.py and resuming: the mark never ran.
+#
+# Free when nothing changed - build.sh compares an inputs hash held in a
+# label and skips, ~0.05s per image - and the builds go before the rank clamp
+# below so the memory that clamp reads is the memory left after them.
+# NS_NO_BUILD=1 (`./ri resume --no-build`) is the way out for a working tree
+# that has moved on and must not reach a run already in flight.
+if [ -z "${NS_NO_BUILD:-}" ]; then
+  for image in ${IMAGES}; do
+    scripts/build.sh "${image}"
+  done
+fi
 
 # The rank count in run.env is what the memory clamp handed the run when it
 # started, not a number anyone chose, so replaying it verbatim is the one
@@ -209,9 +264,16 @@ fi
 # find over a directory that is not there fails the pipeline, which took the
 # whole script down with exit 1 and not a word printed - and a run that died
 # before its first evaluation is exactly the one someone resumes.
+# Scored evaluations, not eval-* directories: a metrics.json is what an
+# evaluation leaves behind when it succeeds, and adopt_completed_evaluations
+# deletes the directories without one on the way in - so counting directories
+# credited this resume with work it is about to throw away (three startup
+# deaths here advertised 7, 7 and 15). Same rule as `./ri runs`' EVALS column
+# and `./ri health`'s progress line, so the three now agree.
 DONE=0
 if [ -d "${RUN_DIR}/evaluations" ]; then
-  DONE="$(find "${RUN_DIR}/evaluations" -maxdepth 1 -name 'eval-*' | wc -l | tr -d ' ')"
+  DONE="$(find "${RUN_DIR}/evaluations" -mindepth 2 -maxdepth 2 -name 'metrics.json' \
+    | wc -l | tr -d ' ')"
 fi
 if [ "${NS_MPI_PROCS:-}" = 1 ]; then RANKS="1 rank"; else RANKS="${NS_MPI_PROCS:-?} ranks"; fi
 # Into the same file run_with_retries writes its restarts to, in the same

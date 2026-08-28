@@ -133,7 +133,10 @@ def do_health(args):
 
 
 def do_resume(args):
-    return {}, [["scripts/resume-nested-sampling-run.sh", args.run]]
+    # The build is the resume script's own, because only run.env knows which
+    # images this run needs - unlike ./ri search, where the imager is a flag.
+    env = {"NS_NO_BUILD": "1"} if args.no_build else {}
+    return env, [["scripts/resume-nested-sampling-run.sh", args.run]]
 
 
 def do_report(args):
@@ -441,11 +444,19 @@ def build_parser():
             "\n"
             "./ri runs lists what there is to resume. A run that is still\n"
             "going is refused: a second job over its checkpoint and FIFO\n"
-            "directories would corrupt both."
+            "directories would corrupt both.\n"
+            "\n"
+            "The images the run needs are built first, exactly as ./ri search\n"
+            "does - a run executes the code baked into them, so without it a\n"
+            "resume silently continues on whatever was baked last time. Free\n"
+            "when nothing changed; --no-build skips it."
         ),
     )
     resume.add_argument("run", metavar="RUN",
                         help="run directory, or its name under results/nested-sampling/")
+    resume.add_argument("--no-build", action="store_true",
+                        help="skip the image builds this resume would do first, so the "
+                             "run continues on the code already baked into them")
 
     # Results
     report = add("report", do_report, "build the HTML run report",
