@@ -61,6 +61,13 @@ Four things it checks, each one a way a run has actually gone wrong here:
   it gets checked against the images actually in use - and it survives the run,
   which the process table does not.
 
+* **Supervision.** SIGKILLing a run script does not stop the run: the ranks are
+  children of `containerd-shim`, so they keep imaging and every number above
+  stays healthy. What dies with the shell is `run_with_retries` - the run has
+  silently lost the ability to restart itself from its own checkpoint, and
+  nothing else here can see that. Found through the `docker exec` client's
+  parent, so it costs nothing extra.
+
 * **Cost, again, on disk.** The one resource nothing here reserves, checks or
   frees, and the only one that only ever grows: an evaluation directory keeps
   its measurement set and the imager's output, ~1.7MB, and nothing deletes it.
@@ -130,6 +137,17 @@ NESTED_SAMPLING_DIR = Path("results/nested-sampling")
 # exec` both carry the whole rank command line in their own arguments, and
 # counting those as ranks puts the count two over `NS_MPI_PROCS`.
 RANK_COMMAND = re.compile(r"\S*python[\d.]*\s+\S*polychord_\w+\.py\b")
+
+# The host-side half of a running search: `run_with_progress` starts the ranks
+# as `docker exec ... mpirun ...` and the client stays a child of the run
+# script for the life of the run, which is what makes the run script findable
+# from the run's own processes.
+DOCKER_EXEC_CLIENT = re.compile(r"\bdocker\s+exec\b")
+
+# The shell that supervises a run: scripts/run-nested-sampling.sh and
+# -r2d2.sh, however they were spelled on the command line. `./ri resume` execs
+# into the same script, so a resumed run looks identical.
+RUN_SCRIPT_COMMAND = re.compile(r"run-nested-sampling[\w-]*\.sh\b")
 
 # What counts as the line worth quoting out of run.log. Deliberately broad: the
 # useful line is whichever one names the failure, and this only has to beat
@@ -1070,6 +1088,34 @@ def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dic
             and int(p["pid"]) not in mine]
 
 
+def supervised(owned: list[dict[str, object]],
+               processes: list[dict[str, object]]) -> bool | None:
+    """Whether the shell that started this run is still watching it.
+
+    SIGKILLing a run script does not stop the run: the ranks are children of
+    `containerd-shim`, so they, the `docker exec` client and the stall
+    watchdog all survive reparented to init and evaluations keep landing. What
+    dies with the shell is `run_with_retries` - so an orphaned run looks
+    perfectly healthy right up until the first crash it can no longer restart
+    from, and its sidecars keep their ~33.7GB when it finally stops.
+
+    Found through the `docker exec` client rather than by hunting for the
+    shell: the client is the run's only host-side process that carries both
+    the run directory (so `run_processes` already has it) and the run script's
+    pid. The parent is checked by *what it is*, not for being pid 1, because a
+    reparented orphan lands on whatever subreaper the session has.
+
+    None when there is no client to ask - a stopped run, or one whose ranks
+    were started some other way.
+    """
+    clients = [p for p in owned if DOCKER_EXEC_CLIENT.search(str(p["args"]))]
+    if not clients:
+        return None
+    alive = {int(p["pid"]): str(p["args"]) for p in processes if p["alive"]}
+    return any(RUN_SCRIPT_COMMAND.search(alive.get(int(c.get("ppid", 0) or 0), ""))
+               for c in clients)
+
+
 def own_process_tree(processes: list[dict[str, object]]) -> set[int]:
     """This tool's own pids: itself and everything that started it.
 
@@ -1182,6 +1228,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
                            checkpoint_time)
     owned = run_processes(run_dir, processes)
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
+    watched = supervised(owned, processes)
     spinning = spinning_ranks(ranks, busy or {})
     # RSS, so shared pages are counted once per process holding them. The
     # imager workers are separate containers with separate model copies, so on
@@ -1279,6 +1326,15 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
                       + (f" (x{copies} ranks)" if copies > 1 else ""))
         warnings.append(
             f"stopped before finishing{ending}; continue it with ./ri resume {run_dir.name}"
+        )
+    # A run whose shell was killed keeps going and keeps looking healthy - the
+    # one thing it has lost is invisible in every other number here, and only
+    # shows up as the crash it never came back from.
+    if watched is False:
+        warnings.append(
+            "the shell that started this run is gone - the ranks are still going, "
+            "but nothing is left to restart them if they die (./ri resume "
+            f"{run_dir.name} after they do) or to remove the sidecars when they stop"
         )
     # All but one, because rank 0 is PolyChord's administrator and does nothing
     # else - and only once evaluations have stopped landing, which is the
@@ -1382,6 +1438,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "stage": stage(run_dir),
         "settings": run_env,
         "ranks": len(ranks),
+        "supervised": watched,
         "ranks_spinning": spinning,
         "processes": len(owned),
         "resident_mb": resident_mb,
@@ -2012,6 +2069,26 @@ def self_check() -> None:
                         "args": f"python3 r2d2_serve.py --fifo-dir {marker}/.r2d2-workers"}
             assert run_processes(named, self_named + [stranger]) == [stranger]
 
+            # A run whose shell was SIGKILLed keeps going - the ranks are
+            # children of containerd-shim - and loses only the thing no other
+            # number here can see: `run_with_retries`. The parent is matched
+            # on being a run script rather than on being pid 1, because a
+            # reparented orphan lands on whatever subreaper the session has.
+            client = {"pid": -8, "ppid": -9, "alive": True, "elapsed_seconds": 1.0,
+                      "cpu_seconds": 1.0, "rss_mb": 5,
+                      "args": f"/usr/bin/docker exec c mpirun python3 "
+                              f"polychord_wsclean.py --output-dir {marker}"}
+            shell = {"pid": -9, "ppid": 1, "alive": True, "elapsed_seconds": 1.0,
+                     "cpu_seconds": 1.0, "rss_mb": 5,
+                     "args": "bash scripts/run-nested-sampling.sh"}
+            assert supervised([client], [client, shell]) is True
+            assert supervised([client], [client]) is False
+            assert supervised([client], [client, {**shell, "alive": False}]) is False
+            assert supervised([client], [client, {**shell, "args": "systemd --user"}]) is False
+            # Nothing to ask of a run with no client: a stopped run has none,
+            # and answering False there would warn about every finished run.
+            assert supervised([stranger], [stranger, shell]) is None
+
             # `[[dd-]hh:]mm:ss` in every form ps prints it.
             assert _clock_seconds("00:12") == 12
             assert _clock_seconds("01:02:03") == 3723
@@ -2039,10 +2116,17 @@ def self_check() -> None:
                 {"pid": 90, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 1.0,
                  "rss_mb": 5,
                  "args": f"mpirun -np 4 python3 polychord_r2d2.py --output-dir {live.resolve()}"},
-                {"pid": 91, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 1.0,
-                 "rss_mb": 5,
+                {"pid": 91, "ppid": 89, "alive": True, "elapsed_seconds": 100.0,
+                 "cpu_seconds": 1.0, "rss_mb": 5,
                  "args": f"/usr/bin/docker exec c mpirun python3 polychord_r2d2.py "
                          f"--output-dir {live.resolve()}"},
+                # The shell supervising the run. It carries no run directory,
+                # so it is none of the run's memory - it is here because a run
+                # whose shell has died is a warning, and this fixture is the
+                # healthy case.
+                {"pid": 89, "ppid": 1, "alive": True, "elapsed_seconds": 100.0,
+                 "cpu_seconds": 1.0, "rss_mb": 5,
+                 "args": "bash scripts/run-nested-sampling-r2d2.sh"},
                 # The sidecar's imager worker: not a rank, and where all of the
                 # run's memory is. Named by --fifo-dir rather than
                 # --output-dir, which is why the footprint is taken over
@@ -2083,6 +2167,14 @@ def self_check() -> None:
             # the count, so STALLED never becomes RUNNING.
             stalled = io_capture({**report, "status": "stalled", "warnings": ["a"]})
             assert stalled.splitlines()[0].endswith("  STALLED - 1 WARNING"), stalled
+            # ...and the same run with its shell killed: still healthy by
+            # every measurement, warning about the one thing it has lost.
+            orphaned = describe(live, [p for p in not_ranks if p["pid"] != 89] + ranks,
+                                DEFAULT_STALE_SECONDS)
+            assert orphaned["status"] == "healthy" and orphaned["supervised"] is False
+            assert len(orphaned["warnings"]) == 1, orphaned["warnings"]
+            assert "./ri resume r2d2-vlaa-20260101T000000Z" in orphaned["warnings"][0]
+
             # The imager worker is 3.3GB of the run and none of its ranks:
             # 4 ranks at 10MB, mpirun and docker exec at 5MB each, worker 3300.
             assert report["processes"] == 7, report

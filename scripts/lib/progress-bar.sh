@@ -66,6 +66,20 @@ run_with_progress() {
   if [ "${NS_STALL_TIMEOUT:-0}" -gt 0 ]; then
     _ns_stall_watchdog "${output_dir}" "${NS_STALL_TIMEOUT}" &
     watchdog_pid=$!
+    # On a signal as well as on the normal path below. The watchdog is a
+    # forked subshell, so Ctrl-C or a SIGTERM to the run script used to leave
+    # it polling a directory nobody writes to any more for the rest of
+    # NS_STALL_TIMEOUT - two hours by default. Two were found orphaned on this
+    # host, `bash run-nested-sampling.sh` with a `sleep` child, against run
+    # directories that had already been deleted. Nothing can be done about
+    # SIGKILL, which is what `./ri health` warns about instead.
+    #
+    # EXIT alone, no INT/TERM: bash installs its own handlers for the fatal
+    # signals once any EXIT trap is set, so the trap runs on the way out of a
+    # signal too - checked by dropping the INT/TERM pair and watching the
+    # self-check below still pass.
+    _NS_WATCHDOG_PID="${watchdog_pid}"
+    _ns_add_trap '_ns_stop_watchdog' EXIT
   fi
 
   if [ -t 1 ] && _ns_pin_setup; then
@@ -90,8 +104,8 @@ run_with_progress() {
 
   local status=0
   wait "${pid}" || status=$?
+  _ns_stop_watchdog
   if [ -n "${watchdog_pid}" ]; then
-    kill "${watchdog_pid}" 2>/dev/null || true
     wait "${watchdog_pid}" 2>/dev/null || true
   fi
   # The command's last writer is now closed, so tee sees EOF. Waited for so
@@ -287,6 +301,16 @@ _ns_retry_say() {
 # inflated by the handful of directories a crash leaves half-written.
 _ns_completed_evals() {
   find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Stops the watchdog run_with_progress started, from the normal path and from
+# its EXIT trap alike. The pid is cleared rather than left to be re-killed, so
+# that a trap firing minutes later cannot signal whatever has since been given
+# that pid.
+_ns_stop_watchdog() {
+  [ -n "${_NS_WATCHDOG_PID:-}" ] || return 0
+  kill "${_NS_WATCHDOG_PID}" 2>/dev/null || true
+  _NS_WATCHDOG_PID=""
 }
 
 # Usage: _ns_stall_watchdog <output_dir> <timeout seconds>
@@ -1156,6 +1180,51 @@ PY
   grep -q 'no evaluation has finished' "${live_dir}/run.log" && {
     echo "FAIL: watchdog outlived the run it was watching"; exit 1
   }
+
+  # The other way a watchdog outlives its run: a signal rather than an exit.
+  # It is a forked subshell, so without a trap Ctrl-C or a SIGTERM to the run
+  # script left it polling for the rest of NS_STALL_TIMEOUT - two hours by
+  # default, and two were found orphaned on this host against run directories
+  # that had already been deleted.
+  local term_dir="${tmp}/term" watchdog
+  mkdir -p "${term_dir}/chains"
+  export NS_STALL_TIMEOUT=600 NS_STALL_POLL_SECONDS=1
+  # Marked through $0 so the watchdog, which inherits the whole command line
+  # from the fork, is countable; $0 is deliberately not this file's path, for
+  # the reason spelled out in the NS_STALL_TIMEOUT=0 case below.
+  # shellcheck disable=SC2016  # $1..$3 are the sub-shell's, not ours
+  STALL_FIXTURE_HANGS=1 bash -c '
+    . "$1"; run_with_progress "$2" -1 2 -- python3 "$3" --output-dir "$2"' \
+    ns-watchdog-signal "${BASH_SOURCE[0]}" "${term_dir}" "${tmp}/polychord_stall.py" \
+    >/dev/null 2>&1 &
+  local term_pid=$!
+  sleep 3
+  # The watchdog by pid, not by a count: without the traps the signal kills the
+  # run shell outright and leaves the watchdog behind, so "one process left"
+  # is what both the fix and the bug produce. Found as the run shell's own
+  # child rather than by the marker alone, so that any other process on the
+  # host carrying the same string - the shell that started this check, for one
+  # - cannot be mistaken for it.
+  watchdog="$(pgrep -P "${term_pid}" -f ns-watchdog-signal | head -1)"
+  [ -n "${watchdog}" ] || {
+    echo "FAIL: no stall watchdog was started to leak"
+    kill -9 "${term_pid}" 2>/dev/null || true
+    exit 1
+  }
+  kill -TERM "${term_pid}" 2>/dev/null || true
+  # The fixture is left running on purpose: killing it would end the run
+  # through the normal path, which stops the watchdog whatever the traps do.
+  sleep 2
+  kill -0 "${watchdog}" 2>/dev/null && {
+    kill -9 "${watchdog}" "${term_pid}" 2>/dev/null || true
+    pkill -9 -f "$(ns_run_process_pattern "${term_dir}")" 2>/dev/null || true
+    echo "FAIL: SIGTERM left the stall watchdog running"; exit 1
+  }
+  # Only the fixture, so the run shell ends by itself: SIGKILLing a background
+  # job makes the shell print its own "Killed" notification over the output.
+  pkill -9 -f "$(ns_run_process_pattern "${term_dir}")" 2>/dev/null || true
+  wait "${term_pid}" 2>/dev/null || true
+  unset NS_STALL_TIMEOUT NS_STALL_POLL_SECONDS
 
   # 0 is off, which is what every caller that does not set it gets.
   local off_dir="${tmp}/off"

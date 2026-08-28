@@ -761,6 +761,20 @@ What each line is reading, and why it is worth a line:
   is healthy now, so warning would make `./ri health` exit nonzero for a run
   that is fine. It is still the line to read first on a run that looks slower
   than it should. See "A run that dies restarts itself".
+- **supervision** - a warning, and only a warning, when the shell that started
+  the run is gone. SIGKILLing a run script does not stop the run: the ranks are
+  children of `containerd-shim`, so they keep imaging, evaluations keep
+  landing, and every other line here stays healthy. What dies with the shell is
+  `run_with_retries` - so the run has quietly lost the restart-from-checkpoint
+  above, and will simply end at the first crash it would have survived, leaving
+  its sidecars holding ~3.4GB per R2D2 rank. Nothing else on disk or in the
+  process table shows this. Found through the run's `docker exec` client, whose
+  parent is the run script; the parent is checked for *being* a run script
+  rather than for being pid 1, because a reparented orphan lands on whatever
+  subreaper the session has. `./ri resume <run>` is the answer once the ranks
+  do stop. The narrower case - a killed shell leaving the *stall watchdog*
+  behind - is fixed rather than reported: `run_with_progress` stops it from an
+  EXIT trap, so only SIGKILL can leak one.
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real
