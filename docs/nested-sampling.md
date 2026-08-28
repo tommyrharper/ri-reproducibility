@@ -351,32 +351,25 @@ What each line is reading, and why it is worth a line:
   displayed twice, not two witnesses. Nothing in this report decides anything
   from the count, and printing its age plus where it will next land is what
   stops a reader doing so either. An age of an hour or more is ordinary rather
-  than alarming, and it varies a lot. One 16-rank R2D2 search checkpointed at
-  31, 103, 170 and 305 minutes - intervals of 31, 72, 67 and 134. The first is
-  short because the run's startup counts toward it; the rest are not a
-  property of PolyChord to be extrapolated from, because the interval is a
-  *consequence* of two things that both move: how fast evaluations are
-  landing, and how many of them each dead point costs. On that run both moved
-  at once between the third and fourth checkpoints - throughput fell about 30%
-  while the likelihood calls per dead point rose 43% (29.0, 30.7, then 43.8) -
-  and neither alone explains the doubling. So consecutive intervals can differ
-  by 2x with nothing wrong, and a longer one is not by itself a sign of
-  anything.
-
-  Nor is a shorter one, which is the case worth stating because it is the one
-  a reader will doubt. The next two intervals on that run went 134 to 150 with
-  cost flat, so throughput alone lengthened it, and then 150 to 137 while cost
-  rose a further 39%, so throughput alone shortened it against a rising cost.
-  Three consecutive steps, each from a different combination of the two, and
-  no ordering between the interval and the cost.
+  than alarming, and the interval varies a lot: one 16-rank R2D2 search
+  checkpointed at 31, 103, 170, 305, 455 and 592 minutes. The first interval
+  is short because the run's startup counts toward it; the rest are not a
+  property of PolyChord to extrapolate from, because the interval is a
+  *consequence* of two things that both move - how fast evaluations land, and
+  how many of them each dead point costs. Between the third checkpoint and the
+  fourth both moved at once, throughput down about 30% and likelihood calls
+  per dead point up 43% (29.0, 30.7, then 43.8), and neither alone explains
+  the doubling. The next two steps went the other way: 134 minutes to 150 with
+  cost flat, then 150 to 137 while cost rose a further 39%. Consecutive
+  intervals can differ by 2x with nothing wrong, in either direction.
 - **progress** - `evaluations/eval-*/metrics.json` is written only when an
   evaluation succeeds, so its count is the progress and the directories
   without one are the evaluations in flight. That number should sit near
   `NS_MPI_PROCS`; pinned there while the count does not move is every rank
   stuck at once.
 - **activity** - the overall rate, and the rate over the most recent tenth of
-  the run when the two have diverged. A run can collapse to a fraction of its own
-  throughput without ever going quiet long enough to look stalled, and that
+  the run when the two have diverged. A run can collapse to a fraction of its
+  own throughput without ever going quiet long enough to look stalled, and that
   state passes every other check here: on a live 16-rank R2D2 search, 25/min
   fell to 5/min for ten minutes while evaluations kept landing every 20-30s.
   Both numbers are shown and **neither is warned on**, because the same run
@@ -385,30 +378,26 @@ What each line is reading, and why it is worth a line:
   grounds for telling anyone to act.
 
   Both are evaluations divided by the time they took, so the two can be
-  compared. Two things about how that window is drawn, each of which was got
-  wrong first:
+  compared. Two things about how that window is drawn, each got wrong first.
 
-  Its ends are both completed evaluations, never "the last N minutes". The
-  most recent clock window is always partial and so reads low by whatever
-  fraction of it has not elapsed yet, which at the moment of sampling is
-  indistinguishable from a slowdown - on this run, mid-window, a partial
-  five-minute bucket said 23.8/min against a 91-165 baseline, apparently a
-  collapse, and then finished at 164, the highest of the run. The one thing
-  this cannot see is a stall beginning *after* the last completed evaluation,
-  which is what the idle thresholds cover; the two look redundant and are
-  complementary.
+  Its ends are both completed evaluations, never "the last N minutes" - a
+  clock window is always partial, so it reads low by whatever fraction has not
+  elapsed, which at the moment of sampling is indistinguishable from a
+  slowdown: a partial five-minute bucket on this run said 23.8/min against a
+  91-165 baseline, apparently a collapse, and finished at 164, the highest of
+  the run. What it cannot see is a stall beginning *after* the last completed
+  evaluation, which is what the idle thresholds cover; the two look redundant
+  and are complementary.
 
-  And it is bounded on both axes, because a run varies on both. In
-  evaluations it is a share of the run rather than a fixed count, since a
-  fixed count covers a wildly different span depending on pace - fifty
-  evaluations is two minutes at 25/min and ten at 5/min, so the window grows
-  exactly when the run slows. The last fifty on this run swung
-  4.9 -> 31.5 -> 37.6 across forty minutes where a tenth gave
-  28.1 -> 37.6 -> 33.4 over the same samples. In time it is capped at half an
-  hour, since a share of the run grows without limit as the run does: seven
-  and a half hours in, a tenth had reached 62 minutes, and a real half-hour
-  slowdown to a third of the run's pace diluted against the recovered half
-  hour before it and did not show at all.
+  And it is bounded on both axes, because a run varies on both. In evaluations
+  it is a share of the run, since a fixed count covers a wildly different span
+  depending on pace - fifty evaluations is two minutes at 25/min and ten at
+  5/min, so the window grows exactly when the run slows (the last fifty here
+  swung 4.9, 31.5, 37.6 where a tenth gave 28.1, 37.6, 33.4 over the same
+  samples). In time it is capped at half an hour, since a share of the run
+  grows without limit: seven and a half hours in, a tenth had reached 62
+  minutes, and a real half-hour slowdown to a third of the run's pace diluted
+  against the recovered half hour before it and did not show at all.
 
   Two things not to conclude from a falling rate. It does not mean the
   evaluations got harder: on that run per-evaluation cost was *falling* at the

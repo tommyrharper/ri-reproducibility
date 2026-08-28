@@ -85,14 +85,12 @@ DEFAULT_STALE_SECONDS = 600.0
 SPIN_IDLE_SECONDS = 60.0
 
 # The "how is it going now" window - a tenth of the run, never fewer than this
-# many evaluations - and how far it has to diverge from the run's overall pace
-# before both numbers are worth printing rather than one.
-#
-# Doubled rather than half again, because a healthy run's own pace is noisier
-# than it looks: five minute bins over 107 minutes of one ranged 91-165 with no
-# fault present. Walking that run's history at 269 sampled moments, the display
-# fires in 15% of them at 1.5x and 5% at 2.0x, and the knee is where the
-# ordinary swing stops and the real events start.
+# many evaluations, never longer than the cap - and how far it must diverge
+# from the run's overall pace before both numbers are worth printing.
+# Doubled rather than half again because a healthy run's pace is noisier than
+# it looks: five-minute bins over 107 fault-free minutes ranged 91-165. Across
+# 269 sampled moments of that run the display fires in 15% at 1.5x and 5% at
+# 2.0x, the knee where ordinary swing stops and real events start.
 RATE_WINDOW = 50
 RATE_WINDOW_DIVISOR = 10
 RATE_WINDOW_MAX_SECONDS = 1800.0
@@ -276,60 +274,35 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     stalls = [g for g in gaps if g > threshold]
     span = times[-1] - times[0] if len(times) > 1 else 0.0
 
-    # How the run is going now against how it has gone, as a ratio of median
-    # gaps. Medians, so one long gap cannot manufacture a collapse and a run
-    # that is genuinely half its old speed cannot hide behind a fast tail.
+    # How the run is going now against how it has gone. Both rates are
+    # evaluations divided by the time they took, so the two can be divided.
+    # The recent one used to be 60 / median(recent gaps), a different quantity
+    # from the count-over-span beside it: 33.3/min against 18.2 at one instant
+    # where an independent thirty-minute window said 17.0.
     #
-    # Gaps rather than "evaluations in the last N minutes", which is the
-    # obvious simplification and is wrong: the most recent window is always
-    # partial, so it reads low by exactly the fraction of it that has not
-    # elapsed yet, and at the moment of sampling that is indistinguishable from
-    # a real slowdown. Measured on a live run mid-window - 23.8/min from the
-    # partial bucket against a 91-165 per five minutes baseline, which looks
-    # like a collapse starting, where the gaps said 52.5/min and the bucket
-    # went on to finish at 164, the highest of the run. An inter-arrival gap
-    # cannot be measured until both ends exist, so there is no partial window
-    # to misread.
+    # Both ends of the window are completed evaluations, never "the last N
+    # minutes" - a clock window is partial, so it reads low by however much has
+    # not elapsed, which at the moment of sampling is indistinguishable from a
+    # slowdown. One partial five-minute bucket read 23.8/min against a 91-165
+    # baseline, then finished at 164, the highest of the run.
     #
-    # The one thing gaps cannot see is a stall that began after the last
-    # completed evaluation, because that open-ended interval has no far end
-    # yet. last_activity_seconds is exactly that interval, and the idle clauses
-    # in describe() are what cover the hole. The two look redundant and are
-    # complementary; do not drop either.
-    # Both rates the same way: evaluations divided by the time they took. The
-    # recent one used to be 60 / median(recent gaps), which is a different
-    # quantity from the overall count-over-span it sits next to - a median
-    # ignores the long tail, so during a phased run it reads roughly double.
-    # Measured at one instant on a live search: 33.3/min from the median
-    # against 18.2/min from the count, where an independent thirty-minute
-    # window said 17.0. Printing those two side by side invited exactly the
-    # comparison they could not support.
+    # Bounded on both axes because a run varies on both. In evaluations, a
+    # share of the run: a fixed fifty is two minutes at 25/min and ten at
+    # 5/min, so it grows exactly when the run slows (last-fifty swung 4.9,
+    # 31.5, 37.6 where a tenth gave 28.1, 37.6, 33.4). In time, capped, because
+    # a share grows without limit: seven and a half hours in a tenth reached 62
+    # minutes, and a real half-hour slowdown to a third of the run's pace
+    # diluted to 1.36x and did not show.
     #
-    # The window is bounded on both axes, because a run varies on both and
-    # fixing only one leaves the other free to drift:
-    #
-    # In evaluations, a share of the run rather than a fixed count. A fixed
-    # count covers a wildly different span depending on pace - fifty is two
-    # minutes at 25/min and ten at 5/min, so it grows precisely when the run
-    # slows and the reading whipsaws. The last fifty on one run swung
-    # 4.9 -> 31.5 -> 37.6 over forty minutes where a tenth gave
-    # 28.1 -> 37.6 -> 33.4 across the same samples.
-    #
-    # In time, capped, because a share of the run grows without limit as the
-    # run does. Seven and a half hours into that same search a tenth had
-    # reached 62 minutes, and a genuine half-hour slowdown to 7.2/min - a third
-    # of the run's own pace - diluted against the recovered half hour before it
-    # to 1.36x and did not show at all. "Recent" has to keep meaning recent.
-    #
-    # Both ends are still completed evaluations, so this stays immune to the
-    # partial-window problem above.
+    # None of it sees a stall beginning after the last completed evaluation;
+    # last_activity_seconds and the idle clauses in describe() cover that. The
+    # two look redundant and are complementary; do not drop either.
     recent_rate, slowdown = None, None
     window = max(RATE_WINDOW, len(times) // RATE_WINDOW_DIVISOR)
     if len(times) >= 2 * window:
         recent_times = times[-window:]
-        # Trimmed to the cap, but never below the floor: a run slow enough that
-        # fifty evaluations do not fit in the cap still gets a sample, just a
-        # longer one than the cap asks for.
+        # Capped, but never below the floor: a run too slow to fit fifty
+        # evaluations inside the cap still gets a sample, just a longer one.
         cutoff = times[-1] - RATE_WINDOW_MAX_SECONDS
         capped = [t for t in recent_times if t >= cutoff]
         if len(capped) >= RATE_WINDOW:
@@ -672,16 +645,12 @@ def render(run: dict[str, object]) -> None:
     idle = run["last_activity_seconds"]
     rate = run["evals_per_minute"]
     slowdown = run["slowdown_factor"]
-    # Where the count will next move to, so a reader who comes back has
+    # Where the count will next move past, so a reader coming back has
     # something to compare against rather than a number that looks stuck.
-    #
-    # "past", because nlive is the cadence PolyChord checkpoints on and not the
-    # size of the jump: six consecutive writes on one nlive=50 run moved the
-    # count by 57, 56, 60, 57, 56 and 56. Stated as a floor rather than fitted
-    # to those - the interval between those same writes varied by 2x over the
-    # same series, so anything tighter than a bound invites the over-reading of
-    # a short series that this whole line exists to prevent. A bound is also
-    # the only claim in this file that has never needed revising.
+    # "past" because nlive is the cadence PolyChord checkpoints on, not the
+    # size of the jump: six writes on one nlive=50 run moved the count by 57,
+    # 56, 60, 57, 56, 56. A floor, not a band fitted to those - a short series
+    # cannot carry one, which is the over-reading this line exists to prevent.
     next_update = ""
     if settings.get("NS_NLIVE", "").isdigit() and run["checkpoint_age_seconds"] is not None:
         next_update = f", next past ~{int(run['dead_points']) + int(settings['NS_NLIVE'])}"
@@ -698,11 +667,10 @@ def render(run: dict[str, object]) -> None:
                      f"last evaluation {format_hms(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_hms(float(run['span_seconds']))}"
                         if rate else "")
-                     # Only when the run has changed pace materially, in either
-                     # direction: the two numbers agreeing says nothing.
-                     # In its own units of time, not "the last N evaluations":
-                     # the window is a share of the run, so how long it covers
-                     # is the thing the reader needs and the count is not.
+                     # Only when pace has changed materially, either
+                     # direction: two agreeing numbers say nothing. Labelled in
+                     # time, not evaluations - the window is a share of the
+                     # run, so its span is what the reader needs.
                      + (f" ({run['recent_evals_per_minute']:.1f}/min over the last "
                         f"{format_hms(float(run['recent_span_seconds']))})"
                         if slowdown is not None and (
@@ -882,10 +850,9 @@ def self_check() -> None:
             assert 590 < float(report["checkpoint_age_seconds"]) < 620, report
             aged = io_capture(report)
             assert "3 dead points as of 0:10:0" in aged, aged
-            # ...and where it will next move past, so a reader coming back
-            # has something to compare against. nlive is 4 in this fixture, and
-            # the bound is a floor: PolyChord checkpoints every nlive points
-            # but the count overshoots, by 57, 56 and 60 on one nlive=50 run.
+            # ...and where it next moves past. nlive is 4 here, and the
+            # bound is a floor: the count overshoots nlive, by 57, 56 and 60
+            # on one nlive=50 run.
             assert "next past ~7" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
@@ -1014,11 +981,10 @@ def self_check() -> None:
             # timeout - which is exactly why the rate had to be measured.
             assert report["status"] == "healthy", report
             assert float(report["last_activity_seconds"]) < SPIN_IDLE_SECONDS, report
-            # Both rates are evaluations over the time they took, so they can
-            # be divided: 60 a minute over the fast phase, 5 over the collapse,
-            # and 17 overall because the fast phase is most of the run. A
-            # median-of-gaps recent rate would read 5 against an overall of 60
-            # and call this a twelvefold collapse.
+            # Both rates are evaluations over the time they took, so they
+            # divide: 60/min over the fast phase, 5 over the collapse, 17
+            # overall since the fast phase is most of the run. Median-of-gaps
+            # would read 5 against 60 and call it a twelvefold collapse.
             assert abs(float(report["recent_evals_per_minute"]) - 5.1) < 0.2, report
             assert abs(float(report["evals_per_minute"]) - 17.0) < 0.2, report
             assert abs(float(report["slowdown_factor"]) - 3.3) < 0.2, report
