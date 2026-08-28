@@ -337,6 +337,20 @@ resume_after="$(completed_evals "${RESUME_OUT}")"
 [ "${resume_after}" -ge "${resume_before}" ] \
   || fail "the resume lost work: ${resume_before} evaluations before the kill, ${resume_after} after"
 
+# The stop between the kill and the resume is downtime, and every rate `./ri
+# health` prints is measured over the time the run was running - so the resume
+# has to have recorded itself in restarts.log, and the report has to say a
+# human continued this run rather than counting it as a self-healed restart.
+grep -q 'Z resumed at [0-9]\+ evaluations$' "${RESUME_OUT}/restarts.log" 2>/dev/null \
+  || fail "./ri resume left no record of the downtime: $(cat "${RESUME_OUT}/restarts.log" 2>/dev/null)"
+resumed_report="$("${REPO_ROOT}/ri" health "${RESUME_OUT}" 2>&1 || true)"
+grep -q '^  resumes   1 manual resume,' <<<"${resumed_report}" \
+  || fail "./ri health does not report the manual resume:
+${resumed_report}"
+grep -q 'self-healed restart' <<<"${resumed_report}" \
+  && fail "./ri health called a resume someone typed a self-healed restart:
+${resumed_report}"
+
 # And now it is finished, so the advice stops: resuming a second time is a
 # no-op rather than a second job over the same chains.
 again="$("${REPO_ROOT}/ri" resume "${RESUME_OUT}" 2>&1)" \

@@ -30,6 +30,14 @@ Four things it checks, each one a way a run has actually gone wrong here:
   on the MeqTrees deadlock the watchdogs in `simulate_point_source_ms.py`
   absorb (docs/nested-sampling.md, "When MeqTrees stops answering").
 
+* **Downtime.** `restarts.log` records every time the run stopped and started
+  again - by healing itself, or because someone typed `./ri resume` - and the
+  gaps those stamps land in come out of the span every rate here is measured
+  over. A resumed WSClean run did 64 evaluations in 17 seconds of work either
+  side of a 4h16m stop; over wall clock that reads `0.2/min`, 0% occupancy and
+  a stall costing 100% of the run. `history` and `occupancy` stay on wall clock
+  on purpose, because a stop is part of the shape they exist to show.
+
 * **Shape.** Every number above is one moment. `history` is the run's
   throughput binned over its own life, which is what separates a dip that
   recovered from a step down that did not - the two the medians report
@@ -706,10 +714,29 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # Measured on the self-healed wsclean run above: gap start ...45.09,
     # restart stamp ...45, no overlap, warning fired anyway.
     downtime = restart_times(run_dir)
-    stalls = [gap for start, gap in zip(times, gaps)
-              if gap > threshold
-              and not any(start - RESTART_STAMP_SECONDS <= t <= start + gap for t in downtime)]
-    span = times[-1] - times[0] if len(times) > 1 else 0.0
+    # One flag per gap: this one is the run not running, and every rate here is
+    # measured over time the run was actually going. Wall clock was the wrong
+    # denominator for exactly the runs this project's self-healing produces - a
+    # resumed wsclean run here did 64 evaluations in 18 seconds of work either
+    # side of a 4h15m stop, and the report called that "0.2/min" against a true
+    # 213/min, and forecast the remainder off it. Same gaps the stall
+    # accounting already skips over, so the two cannot disagree about what
+    # downtime is.
+    explained = [gap > threshold
+                 and any(start - RESTART_STAMP_SECONDS <= t <= start + gap for t in downtime)
+                 for start, gap in zip(times, gaps)]
+    stalls = [gap for gap, skip in zip(gaps, explained)
+              if gap > threshold and not skip]
+    down_seconds = sum(gap for gap, skip in zip(gaps, explained) if skip)
+
+    def _elapsed(lo: int) -> float:
+        """Seconds the run was running, from records[lo] to the last one."""
+        if len(times) - lo < 2:
+            return 0.0
+        return (times[-1] - times[lo]
+                - sum(gap for gap, skip in zip(gaps[lo:], explained[lo:]) if skip))
+
+    span = _elapsed(0)
 
     # How the run is going now against how it has gone, as a ratio of mean
     # gaps - which is to say, of throughput, because evaluations over elapsed
@@ -747,10 +774,16 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # yet. last_activity_seconds is exactly that interval, and the idle clauses
     # in describe() are what cover the hole. The two look redundant and are
     # complementary; do not drop either.
+    #
+    # Written through `_elapsed` rather than as a mean of gaps because the two
+    # are the same number - the mean gap over a window *is* its elapsed time
+    # divided by its gap count - and only `_elapsed` drops a restart's or a
+    # resume's downtime. A resume lands inside the last RATE_WINDOW gaps
+    # exactly when someone is watching the run it continued.
     recent_rate, slowdown = None, None
     if len(gaps) >= 2 * RATE_WINDOW:
-        recent = statistics.mean(gaps[-RATE_WINDOW:])
-        overall = statistics.mean(gaps)
+        recent = _elapsed(len(gaps) - RATE_WINDOW) / RATE_WINDOW
+        overall = span / len(gaps)
         recent_rate = 60 / recent if recent > 0 else None
         slowdown = recent / overall if overall > 0 else None
 
@@ -780,11 +813,11 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # killed inside its opening parallel batch has every evaluation landing in
     # the same millisecond, so the elapsed time is mtime granularity and the
     # ratio is a division by noise rather than an occupancy.
-    def _duty(rows: list[Evaluation]) -> float | None:
-        if len(rows) < 2:
-            return None
-        elapsed = rows[-1].when - rows[0].when
-        if elapsed < MIN_RATE_SPAN_SECONDS:
+    #
+    # `elapsed` comes from `_elapsed` for the same reason the rates do: the
+    # hours a resumed run spent stopped are not hours its ranks were idle.
+    def _duty(rows: list[Evaluation], elapsed: float) -> float | None:
+        if len(rows) < 2 or elapsed < MIN_RATE_SPAN_SECONDS:
             return None
         return sum(r.wall_seconds for r in rows if r.wall_seconds is not None) / elapsed
 
@@ -795,11 +828,14 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # reacts to and what a rank has to be budgeted for.
     peak_memory = _median(records, "peak_memory_bytes")
     recent_peak_memory = None
-    busy_ranks, recent_busy_ranks = _duty(records), None
+    busy_ranks, recent_busy_ranks = _duty(records, span), None
     if span >= MIN_RATE_SPAN_SECONDS and len(gaps) >= 2 * RATE_WINDOW:
         recent_cost = _median(records[-RATE_WINDOW:], "wall_seconds")
         recent_peak_memory = _median(records[-RATE_WINDOW:], "peak_memory_bytes")
-        recent_busy_ranks = _duty(records[-RATE_WINDOW:])
+        # +1: RATE_WINDOW records span RATE_WINDOW - 1 gaps, one fewer than the
+        # rate above measures over.
+        recent_busy_ranks = _duty(records[-RATE_WINDOW:],
+                                  _elapsed(len(gaps) + 1 - RATE_WINDOW))
 
     # Spread over the run's life rather than taken from its tail. An
     # evaluation's size follows its parameters, and a nested-sampling run
@@ -822,6 +858,7 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
         "failed": failed,
         "last_activity_seconds": time.time() - times[-1] if times else None,
         "span_seconds": span,
+        "downtime_seconds": down_seconds,
         "recent_failed": recent_failed,
         "evals_per_minute": rate,
         "recent_evals_per_minute": recent_rate,
@@ -1711,6 +1748,12 @@ def render(run: dict[str, object]) -> None:
                      f"last evaluation {format_hms(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_hms(float(run['span_seconds']))}"
                         if rate else "")
+                     # The span is running time, not age, so a run that was
+                     # ever stopped has to say where the difference went -
+                     # otherwise "over 0:00:18" on a run four hours old reads
+                     # as a report of the wrong run.
+                     + (f" + {format_hms(float(run['downtime_seconds']))} stopped"
+                        if rate and float(run["downtime_seconds"] or 0) >= 1 else "")
                      # Only when the run has changed pace materially, in either
                      # direction: the two numbers agreeing says nothing.
                      + (f" ({run['recent_evals_per_minute']:.1f}/min over the last "
@@ -1858,12 +1901,19 @@ def render(run: dict[str, object]) -> None:
     # line saying so. Reported, not warned on - the crash was survived, and a
     # warning here would make `./ri health` exit nonzero for a run that is
     # currently fine.
-    if run["restarts"]:
-        restarted = list(run["restarts"])
-        plural = "" if len(restarted) == 1 else "s"
-        lines.append(("restarts",
-                      f"{len(restarted)} self-healed restart{plural}, "
-                      f"last {restarted[-1]}"))
+    #
+    # Split, because restarts.log holds two different events and calling them
+    # one number is a lie in both directions: a `./ri resume` someone typed is
+    # not the run healing itself, and a run that healed itself twice and was
+    # then continued by hand should say so as two facts.
+    events = list(run["restarts"])
+    healed = [e for e in events if " resumed " not in e]
+    resumed = [e for e in events if " resumed " in e]
+    for label, kind, these in (("restarts", "self-healed restart", healed),
+                               ("resumes", "manual resume", resumed)):
+        if these:
+            lines.append((label, f"{len(these)} {kind}{'' if len(these) == 1 else 's'}, "
+                                 f"last {these[-1]}"))
     lines += [
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE"
                      + (f" ({run['recent_failed']} of the last {RATE_WINDOW})"
@@ -3075,6 +3125,29 @@ def self_check() -> None:
             assert healed["stall_count"] == 0, healed
             assert healed["stall_seconds"] == 0, healed
             assert not any("of wall clock lost" in w for w in healed["warnings"]), healed
+            # And the same gap is out of every rate as well, not only out of
+            # the stall count: the run was not running, so those seconds are
+            # not seconds it was slow for. 29s of wall clock either side of a
+            # 20s stop is 9s of work, and 11 evaluations over it.
+            assert abs(float(healed["downtime_seconds"]) - 20) < 0.1, healed
+            assert abs(float(healed["span_seconds"]) - 9) < 0.1, healed
+            assert abs(float(healed["evals_per_minute"]) - 11 * 60 / 9) < 1, healed
+            assert (f" + {format_hms(float(healed['downtime_seconds']))} stopped"
+                    in io_capture(healed)), io_capture(healed)
+            # A `./ri resume` writes the same stamp to the same file with
+            # "resumed" in place of "exit", so the downtime accounting is
+            # identical and only the line the report prints differs - calling
+            # a resume someone typed a self-healed restart is a lie about what
+            # the run did.
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 20))
+            (stalled / "restarts.log").write_text(
+                f"{stamp} resumed at 10 evaluations\n")
+            by_hand = describe(stalled, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(by_hand["downtime_seconds"]) - 20) < 0.1, by_hand
+            assert by_hand["stall_count"] == 0, by_hand
+            printed = io_capture(by_hand)
+            assert f"resumes   1 manual resume, last {stamp} resumed at 10" in printed, printed
+            assert "self-healed" not in printed, printed
             # And a restart outside the gap excuses nothing - otherwise any
             # restarts.log at all would silence the check for the rest of the run.
             _restart_at(stalled, now - 5)

@@ -94,6 +94,17 @@ if [ "${1:-}" = "--self-check" ]; then
     *) echo "FAIL: resume must re-clamp the recorded rank count, got: ${OUT}"; exit 1 ;;
   esac
 
+  # The hours between the run stopping and someone typing this are downtime,
+  # and `./ri health` measures every rate over the time a run was running - so
+  # a resume has to leave the same record run_with_retries leaves, in the same
+  # file and the same stamp format, or a resumed run's throughput and forecast
+  # are divided by the night it spent stopped.
+  if ! grep -q '^20.*Z resumed at 0 evaluations$' "${SHORT_RUN}/restarts.log"; then
+    echo "FAIL: a resume must record its downtime, got:" \
+      "$(cat "${SHORT_RUN}/restarts.log" 2>/dev/null)"
+    exit 1
+  fi
+
   # Not even one rank fits: stops here, rather than at evaluation 1 with the
   # OOM killer scoring the run's best points.
   if OUT="$(NS_AVAILABLE_MB=1 bash "$0" "${SHORT_RUN}" 2>&1)"; then
@@ -104,6 +115,13 @@ if [ "${1:-}" = "--self-check" ]; then
     *"not enough free memory"*) ;;
     *) echo "FAIL: the refusal must say why, got: ${OUT}"; exit 1 ;;
   esac
+  # ...and a refused resume is not downtime, because nothing stopped and
+  # nothing started. Only a resume that reaches the run script writes a line.
+  if [ "$(wc -l <"${SHORT_RUN}/restarts.log" | tr -d ' ')" != 1 ]; then
+    echo "FAIL: a refused resume must record nothing, got:" \
+      "$(cat "${SHORT_RUN}/restarts.log")"
+    exit 1
+  fi
 
   echo "resume-nested-sampling-run self-check passed"
   exit 0
@@ -196,6 +214,16 @@ if [ -d "${RUN_DIR}/evaluations" ]; then
   DONE="$(find "${RUN_DIR}/evaluations" -maxdepth 1 -name 'eval-*' | wc -l | tr -d ' ')"
 fi
 if [ "${NS_MPI_PROCS:-}" = 1 ]; then RANKS="1 rank"; else RANKS="${NS_MPI_PROCS:-?} ranks"; fi
+# Into the same file run_with_retries writes its restarts to, in the same
+# format (UTC stamp first), because the gap between the last evaluation of the
+# old attempt and the first of this one is downtime for the identical reason:
+# the run was not running. `./ri health` measures every rate over time the run
+# was actually going, and without this line a resume after a night stopped read
+# as a night of near-zero throughput - and forecast the remainder off it.
+# "resumed" rather than "exit" is what tells the report a human continued this
+# run instead of it healing itself.
+printf '%s resumed at %s evaluations\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DONE}" >>"${RUN_DIR}/restarts.log"
 echo "Resuming ${RUN_DIR##*/} (${NS_ALGORITHM}, ${DONE} evaluations already done," \
   "${RANKS})"
 exec "${RUN_SCRIPT}"

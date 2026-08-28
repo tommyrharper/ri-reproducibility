@@ -489,6 +489,21 @@ What each line is reading, and why it is worth a line:
   then recovered to 37/min with nothing done to it - five minute bins of 104,
   23, 26, 93 against a 104-165 baseline. One dip and one recovery is not
   grounds for telling anyone to act.
+  Both rates, and the occupancy in **imaging**, are measured over the time the
+  run was *running*, not over its age. Downtime - the gap around a self-healed
+  restart or a `./ri resume`, identified from `restarts.log` exactly as
+  **stalls** already identified it - comes out of the span, and the activity
+  line names what it took out: `213.6/min over 0:00:17 + 4:16:10 stopped`. Wall
+  clock was the wrong denominator for precisely the runs this project's
+  self-healing produces. A resumed WSClean run here did its 64 evaluations in
+  17 seconds of work either side of a 4h16m stop, and the report called that
+  `0.2/min over 4:16:28`, put its occupancy at 0% of 1 rank, warned that 100%
+  of its wall clock was lost to gaps, and would have forecast the remainder off
+  that rate had it not already finished. **history** and **occupancy** are the
+  exception and stay on wall clock, because the stop is a real feature of the
+  run's shape and their whole job is to show it - a `·` run of empty buckets is
+  what a stop looks like there.
+
   Neither rate is shown at all when the run's first and last evaluation are
   under a second apart: parallel ranks land their opening batch together, so a
   run killed inside it has a span that measures mtime granularity rather than
@@ -779,6 +794,14 @@ What each line is reading, and why it is worth a line:
   is healthy now, so warning would make `./ri health` exit nonzero for a run
   that is fine. It is still the line to read first on a run that looks slower
   than it should. See "A run that dies restarts itself".
+- **resumes** - the same file, the same stamp, and the other half of what is in
+  it: a `./ri resume` someone typed, written by
+  `scripts/resume-nested-sampling-run.sh` as `<stamp> resumed at N evaluations`
+  where a self-healed restart writes `<stamp> exit N after M evaluations`. Its
+  own line rather than one count of both, because a run that healed itself and
+  a run a human continued did different things and only the first says "this
+  will happen again". Both are downtime, which is what the record is for - see
+  **activity**.
 - **supervision** - a warning, and only a warning, when the shell that started
   the run is gone. SIGKILLing a run script does not stop the run: the ranks are
   children of `containerd-shim`, so they keep imaging, evaluations keep
@@ -823,7 +846,11 @@ What each line is reading, and why it is worth a line:
   are fractional and the crash lands in the same second as the last evaluation
   that survived it - so the stamp reads just *before* the gap it explains, and
   a self-healed run was warned about for having healed itself (gap start
-  `...45.09` against a `...45` stamp, missed by 90ms).
+  `...45.09` against a `...45` stamp, missed by 90ms). The percentage is of the
+  time the run was running, for the same reason: downtime is not wall clock the
+  run was slow for. `./ri resume` writes its own line to the same file so this
+  covers it too - before that it did not, and a resumed run's stop read as one
+  enormous stall (`1 gaps over 3s, 15371s = 99.9% of wall clock`).
 - **host** - free memory against the headroom `scripts/lib/rank-budget.sh`
   keeps, free disk on the filesystem holding `results/` (nothing reserves it,
   so this is the denominator the per-run projection above divides), and
@@ -1578,8 +1605,12 @@ This is the only artifact that records *why* a run stopped - a traceback out
 of the PolyChord container reaches nowhere else. `./ri health` quotes its last
 line for a stopped run.
 
-One line per time the run died and restarted itself from its checkpoint, when
-that happened at all (see "A run that dies restarts itself"):
+One line per time the run stopped and started again, when that happened at all
+- `<stamp> exit N after M evaluations` for a restart it made itself (see "A run
+that dies restarts itself"), `<stamp> resumed at N evaluations` for a `./ri
+resume` someone typed. Both because `./ri health` reads this file to know which
+gaps between evaluations were the run not running, and takes them out of every
+rate it prints:
 
 ```text
 restarts.log
