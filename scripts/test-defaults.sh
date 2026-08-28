@@ -70,7 +70,19 @@ check "defaults.toml supplies the project values" \
   "ri-reproducibility/wsclean:v3.7" "$(load WSCLEAN_IMAGE)"
 
 check "the environment overrides defaults.toml" \
-  "7" "$(load NS_SEED NS_SEED=7)"
+  "7" "$(load NS_NLIVE NS_NLIVE=7)"
+
+check "the environment overrides the generated seed" \
+  "41" "$(load NS_SEED NS_SEED=41)"
+
+# The seed is the one default a rerun must not inherit: two searches sharing
+# it explore the same points in the same order. Compared across two loads
+# rather than against a value, because the point is that there is no value.
+check "the seed is different on every load" \
+  "different" "$([ "$(load NS_SEED)" = "$(load NS_SEED)" ] && echo same || echo different)"
+
+check "the generated seed is exported, so the run scripts see it" \
+  "ok" "$([ -n "$(load env:NS_SEED)" ] && echo ok)"
 
 check "{REPO_ROOT} is expanded" \
   "${REPO_ROOT}/results" "$(load RESULTS_DIR)"

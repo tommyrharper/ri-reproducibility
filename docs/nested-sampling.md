@@ -219,7 +219,7 @@ Sampler defaults live in `defaults.toml` at the repository root, loaded by
 | `--nlive` | `NS_NLIVE` | Number of PolyChord live points | `8` |
 | `--num-repeats` | `NS_NUM_REPEATS` | How much PolyChord explores inside the likelihood constraint before generating a replacement live point | `2` |
 | `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget that terminates the run | `12` |
-| `--seed` | `NS_SEED` | PolyChord random seed | `41` |
+| `--seed` | `NS_SEED` | PolyChord random seed. Randomised per run, so two searches explore different points; set it to repeat one exactly. The value used is in the run's `run.env` and `summary.json`, and `./ri resume` reuses it | random |
 | `--metric` | `NS_METRIC` | Objective: `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
 | `--retries` | `NS_RETRIES` | Times a run that dies after scoring evaluations restarts itself from its checkpoint, counting only failures that come straight back (`NS_RETRY_RESET_SECONDS`, 1800, hands the budget back); `0` disables - see [robustness.md](robustness.md) | `2` |
 | `--stall-timeout` | `NS_STALL_TIMEOUT` | Seconds with no evaluation finishing before a run is killed as hung, so `--retries` can restart it; `0` disables - see "A run that hangs instead of dying" | `7200` |

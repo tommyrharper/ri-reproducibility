@@ -37,7 +37,12 @@ RESULTS_DIR = "{REPO_ROOT}/results"
 NS_NLIVE = 8
 NS_NUM_REPEATS = 2
 NS_MAX_NDEAD = 12
-NS_SEED = 41
+# NS_SEED is deliberately absent: a committed seed makes every search on
+# every host explore the same points in the same order, so a second search
+# only re-derives the first one's failure modes. It is randomised per run in
+# scripts/lib/defaults.sh instead, recorded in the run's run.env and
+# summary.json, and still overridable with `--seed` when one run has to be
+# repeated exactly. `./ri resume` reads run.env, so a resume keeps its seed.
 NS_METRIC = "total_rms_jy"
 
 # How many times a search that died with work already banked restarts itself

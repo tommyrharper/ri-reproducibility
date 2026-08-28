@@ -125,7 +125,7 @@ run. A flag beats an exported variable, and both beat `defaults.toml`.
 | `--nlive` | `NS_NLIVE` | PolyChord live points | `8` |
 | `--num-repeats` | `NS_NUM_REPEATS` | Exploration per replacement live point | `2` |
 | `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget, terminates the run | `12` |
-| `--seed` | `NS_SEED` | PolyChord seed | `41` |
+| `--seed` | `NS_SEED` | PolyChord seed, random per run; set it to repeat a run | random |
 | `--metric` | `NS_METRIC` | Objective, see below | `total_rms_jy` |
 
 #### Leave these alone

@@ -2831,8 +2831,11 @@ def self_check() -> None:
             # The same wait as a clock time, so nobody has to add four hours to
             # `date` by hand. Matched as a shape rather than against a second
             # call to format_clock, which would disagree with the rendered one
-            # across a minute boundary.
-            assert re.search(r"~4h11m left \(~\d\d:\d\d\)", shown), shown
+            # across a minute boundary. The day name is optional because this
+            # fixture is anchored to the real clock: run after ~19:49 local,
+            # four hours from now is tomorrow and format_clock says so - which
+            # used to fail this check for a few hours every evening.
+            assert re.search(r"~4h11m left \(~(?:[A-Z][a-z]{2} )?\d\d:\d\d\)", shown), shown
             # Wednesday noon, in a week with no daylight-saving transition
             # anywhere, so the arithmetic is the same in every timezone CI and
             # this host run in.
