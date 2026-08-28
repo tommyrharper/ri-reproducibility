@@ -364,11 +364,12 @@ r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY
   memory    3.3GB peak imager memory, 53.2GB across 16 ranks
   disk      7.5GB written, +2.6GB/hour, 93h of space left at that rate
   failures  0 scored FAILURE_OBJECTIVE, 0 meqserver wedges recovered
-  stalls    8 gaps over 13s, 154s = 5.5% of wall clock
+  stalls    8 gaps over 13s, 154s = 5.5% of running time
 
 host
   memory    8.9GB available of 62.6GB, 4GB reserved as headroom
   swap      5.1GB of 32.0GB used
+  load      16.7 / 17.0 / 17.3 against 20 cores (1m / 5m / 15m)
   pressure  memory 0.0% / 0.0%, io 0.0% / 0.0% of wall clock stalled (1m / 5m)
   disk      233GB free of 436GB
   sidecars  3 running, 0 leaked
@@ -726,6 +727,23 @@ What each line is reading, and why it is worth a line:
   The host block reports swap in use but never warns on it: swap that is in
   use may have been paged out days ago and cost nothing since. Whose pages
   those are is the actionable question, and that is the per-run warning.
+- **load** - `/proc/loadavg` over one, five and fifteen minutes, printed
+  against the host's core count. The only CPU reading in the report that
+  covers work this project did not start: **resources** above says how many
+  cores a run is keeping busy, and until that is read against the host's total
+  there is no answer on the page to "my run got slower and every other number
+  looks fine" when the cause is another session's build or a second search.
+  Three windows rather than one because the trend is the readable part - 19 /
+  18 / 16 against 20 cores is a host filling up, the same shape **pressure**
+  shows for memory. Free to read, with no sample interval, so a report over
+  finished runs still costs nothing.
+
+  Reported and never warned on, like swap above. This host is deliberately run
+  at every core busy: the live 16-rank R2D2 search here sits at load 16-17 on
+  20 cores against its own 16.0 cores busy, and one more `--mpi-procs` puts a
+  healthy run at 20, so any "load against cores" rule would fire on exactly
+  the runs this machine is for. It is the same reason cpu PSI is not read at
+  all.
 - **memory** - the same cost measured by the run itself instead of sampled off
   the host: the median `peak_memory_bytes` its evaluations recorded, and that
   multiplied out over `NS_MPI_PROCS`, because what the host has to hold is

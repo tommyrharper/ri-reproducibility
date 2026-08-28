@@ -102,8 +102,13 @@ this machine, and from one of them the biggest consumer of the host block below
 is usually a run whose directory this checkout has no path to. Such a run is
 named by a `path` line.
 
-Plus the host: memory, swap in use, free disk, and sidecar containers whose run
-is gone. A killed run leaves its `ri-ns-sidecar-*` containers holding ~3.4GB
+Plus the host: memory, swap in use, load average against the core count, free
+disk, and sidecar containers whose run is gone. Load is the only CPU reading
+here that covers work this project did not start - a run's own `resources` line
+says how many cores it keeps busy, and until it is read against the host's
+total there is no answer to "my run got slower and every number looks fine".
+
+A killed run leaves its `ri-ns-sidecar-*` containers holding ~3.4GB
 per R2D2 rank. The next run frees those itself before it sizes itself, so this
 is here to explain where the host's memory went, not as a chore. A container is
 only counted once its run has stopped, not merely once the shell that launched
@@ -418,6 +423,23 @@ def meminfo_mb(key: str) -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def load_average() -> tuple[float, float, float] | None:
+    """Runnable-plus-uninterruptible tasks averaged over 1, 5 and 15 minutes.
+
+    The one number here that sees load this project did not start, and free to
+    read - no sample interval, unlike cpu_busy_fractions. Read against the core
+    count it is returned beside: on Linux it counts tasks waiting on disk as
+    well as on CPU, which is the reading wanted on a host whose runs page.
+
+    None where the platform has no such thing; getloadavg is documented to
+    raise rather than return a placeholder.
+    """
+    try:
+        return os.getloadavg()
+    except (OSError, AttributeError):
+        return None
 
 
 def pressure(resource: str) -> dict[str, float] | None:
@@ -1451,7 +1473,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # number exists to catch cost 23-27% before the watchdogs absorbed it.
     if float(scan["stall_fraction"]) > 0.10:
         warnings.append(
-            f"{scan['stall_fraction']:.0%} of wall clock lost to gaps over "
+            f"{scan['stall_fraction']:.0%} of running time lost to gaps over "
             f"{scan['stall_threshold_seconds']:.0f}s"
         )
     # Pages on disk are a warning only while something is waiting on them.
@@ -1601,6 +1623,27 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
         "disk_free_bytes": space[0] if space is not None else None,
         "disk_total_bytes": space[1] if space is not None else None,
         "cores": os.cpu_count(),
+        # The only host-wide CPU reading here, and the only one anywhere in the
+        # report that covers work this project did not start. A run's own
+        # `resources` line says how many cores *it* is keeping busy; nothing
+        # said whether the other cores were free, so "my run got slower and
+        # every number here looks fine" had no answer when the cause was
+        # another session's build or a second search. Free, unlike every other
+        # CPU figure here: no sample interval, so a report over finished runs
+        # still costs nothing.
+        #
+        # Reported over three windows rather than one because the trend is the
+        # readable part - 19 / 18 / 16 against 20 cores is a host filling up,
+        # the same shape the pressure line below shows for memory.
+        #
+        # Never warned on. This box is deliberately run at every core busy: the
+        # live 16-rank R2D2 search here sits at load 16-17 on 20 cores, against
+        # its own `resources` line's 16.0 cores busy, with nothing wrong. A
+        # 16-rank run is one `--mpi-procs` away from load 20 on a healthy day,
+        # so any "load against cores" rule fires on the runs this host is for.
+        # Same reason cpu pressure is not read at all, and the same treatment
+        # as swap in use above - shown, not judged.
+        "load_average": load_average(),
         "sidecars": containers,
         "leaked_sidecars": leaked,
         "warnings": warnings,
@@ -1921,7 +1964,7 @@ def render(run: dict[str, object]) -> None:
                      + f", {run['meqserver_wedges']} meqserver wedges recovered"),
         ("stalls", (f"{run['stall_count']} gaps over "
                     f"{run['stall_threshold_seconds']:.0f}s, {run['stall_seconds']:.0f}s = "
-                    f"{run['stall_fraction']:.1%} of wall clock")),
+                    f"{run['stall_fraction']:.1%} of running time")),
     ]
     for label, value in lines:
         print(f"  {label:<9} {value}")
@@ -1941,6 +1984,15 @@ def render_host(host: dict[str, object]) -> None:
     if swap_total and host["swap_used_mb"] is not None:
         print(f"  {'swap':<9} {int(host['swap_used_mb']) / 1024:.1f}GB of "
               f"{int(swap_total) / 1024:.1f}GB used")
+    # Beside the pressure line because the two are read the same way - a short
+    # window against a longer one - and above it because this is the coarse
+    # "is the host full" reading the finer ones qualify.
+    load = host["load_average"]
+    if load is not None:
+        cores = host["cores"]
+        print(f"  {'load':<9} " + " / ".join(f"{v:.1f}" for v in load)
+              + (f" against {cores} cores" if cores else "")
+              + " (1m / 5m / 15m)")
     # Omitted rather than printed as "unknown" where the kernel has no PSI:
     # every other line here works on macOS and this is the one that does not,
     # so a permanent "unknown" would be the only thing a mac user ever read.
@@ -3108,7 +3160,13 @@ def self_check() -> None:
             assert abs(float(report["stall_seconds"]) - 20) < 0.1, report
             assert abs(float(report["stall_fraction"]) - 20 / 29) < 0.01, report
             assert report["meqserver_wedges"] == 1, report
-            assert any("of wall clock lost" in w for w in report["warnings"]), report
+            assert any("of running time lost" in w for w in report["warnings"]), report
+            # Both spellings of the fraction name the same denominator. The
+            # line said "of wall clock" while the number was already over the
+            # run's running time, which is a 900x mislabel on exactly the
+            # resumed runs the running-time span exists for.
+            assert "stalls    1 gaps over 10s, 20s = 69.0% of running time" \
+                in io_capture(report), io_capture(report)
 
             # The same hole, now explained: a restart landing inside it means
             # the run was down, not stalled, and the `restarts` line already
@@ -3124,7 +3182,7 @@ def self_check() -> None:
             healed = describe(stalled, [], DEFAULT_STALE_SECONDS)
             assert healed["stall_count"] == 0, healed
             assert healed["stall_seconds"] == 0, healed
-            assert not any("of wall clock lost" in w for w in healed["warnings"]), healed
+            assert not any("of running time lost" in w for w in healed["warnings"]), healed
             # And the same gap is out of every rate as well, not only out of
             # the stall count: the run was not running, so those seconds are
             # not seconds it was slow for. 29s of wall clock either side of a
@@ -3148,6 +3206,30 @@ def self_check() -> None:
             printed = io_capture(by_hand)
             assert f"resumes   1 manual resume, last {stamp} resumed at 10" in printed, printed
             assert "self-healed" not in printed, printed
+            # A run with both kinds of hole is the only fixture that can tell
+            # the two denominators apart, and the one the printed line was
+            # wrong about: 15s of real stall inside 47s of wall clock is 32%,
+            # inside the 27s the run was actually running it is 56%, and the
+            # line called the second number the first. The two holes are kept
+            # apart because one stamp explains any gap it touches, and the
+            # window opens a second early - a real stall starting where a
+            # restart ended is excused by it, deliberately.
+            both = NESTED_SAMPLING_DIR / "wsclean-vlaa-20260103T002000Z"
+            (both / "chains").mkdir(parents=True)
+            for i in range(10):
+                write_eval(both, i + 1, now - 100 + i)
+            write_eval(both, 11, now - 71)
+            write_eval(both, 12, now - 68)
+            write_eval(both, 13, now - 53)
+            _restart_at(both, now - 71)
+            mixed = describe(both, [], DEFAULT_STALE_SECONDS)
+            assert abs(float(mixed["downtime_seconds"]) - 20) < 0.1, mixed
+            assert abs(float(mixed["span_seconds"]) - 27) < 0.1, mixed
+            assert mixed["stall_count"] == 1, mixed
+            assert abs(float(mixed["stall_seconds"]) - 15) < 0.1, mixed
+            assert abs(float(mixed["stall_fraction"]) - 15 / 27) < 0.01, mixed
+            assert "15s = 55.6% of running time" in io_capture(mixed), io_capture(mixed)
+
             # And a restart outside the gap excuses nothing - otherwise any
             # restarts.log at all would silence the check for the rest of the run.
             _restart_at(stalled, now - 5)
@@ -3291,6 +3373,33 @@ def self_check() -> None:
                 render_host(dict(host, memory_pressure=None, io_pressure=None,
                                  memory_stall_percent=None))
             assert "pressure" not in rendered_host.getvalue(), rendered_host.getvalue()
+
+            # Load, the only host-wide CPU reading in the report and the only
+            # one that sees work this project did not start. Rendered against
+            # the core count so "19.2" is readable without knowing the box, and
+            # never warned on: this host runs at every core busy by design.
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(dict(host, load_average=(19.24, 17.8, 16.05), cores=20))
+            assert "load      19.2 / 17.8 / 16.1 against 20 cores (1m / 5m / 15m)" \
+                in rendered_host.getvalue(), rendered_host.getvalue()
+            assert not any("load" in w for w in host["warnings"]), host
+            # No core count still leaves three readable numbers.
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(dict(host, load_average=(1.0, 2.0, 3.0), cores=None))
+            assert "load      1.0 / 2.0 / 3.0 (1m / 5m / 15m)" \
+                in rendered_host.getvalue(), rendered_host.getvalue()
+            # Dropped, not printed as "unknown", where the platform has none -
+            # the same treatment the pressure line gets for the same reason.
+            rendered_host = io.StringIO()
+            with contextlib.redirect_stdout(rendered_host):
+                render_host(dict(host, load_average=None))
+            assert "\n  load" not in rendered_host.getvalue(), rendered_host.getvalue()
+            live_load = load_average()
+            assert live_load is not None and len(live_load) == 3, live_load
+            assert all(v >= 0.0 for v in live_load), live_load
+            assert host_report([])["load_average"] is not None
 
             original_pressure = pressure
             try:
