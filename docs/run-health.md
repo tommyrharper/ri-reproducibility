@@ -5,6 +5,10 @@ have while one is still going. See [nested-sampling.md](nested-sampling.md) for
 how to start a run, and [robustness.md](robustness.md) for what happens when
 one breaks.
 
+`./ri tui` is this report on a timer: the same text, re-run every 5 seconds,
+next to the run table and a form that starts a search. Everything below is
+what it shows.
+
 ```console
 $ ./ri health
 r2d2-vlaa-20260827T205418Z  r2d2  HEALTHY

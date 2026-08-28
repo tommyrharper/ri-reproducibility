@@ -226,6 +226,25 @@ name can be copied straight out of that table. A path of the same name in the
 working directory still wins. `health` also takes the name of a run another
 checkout started while it is running, because it reports those too.
 
+## All of that from one screen
+
+```bash
+./ri tui                   # run table, live health, and a form that starts a search
+```
+
+A terminal interface over the three commands above: the table is `./ri runs`,
+`enter` shows `./ri health` for the selected run and re-runs it every 5
+seconds, `l` swaps that for the tail of the run's `run.log`, `a` narrows the
+table to what is running, and `n` opens a form that starts a search. Keys are
+listed along the bottom of every screen.
+
+A search started there is detached, so quitting the interface leaves it going,
+and its output until the run directory exists goes to
+`results/tui-search-<UTC>.log`.
+
+Needs Go on the host; nothing else in this repo does. The source is `tui/`,
+and `go -C tui test ./...` checks it.
+
 ## Is the run that is going still worth going?
 
 ```bash
