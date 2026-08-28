@@ -67,14 +67,46 @@ func parseRuns(out []byte) ([]Run, error) {
 // searchArgs turns the new-run form into ./ri search arguments. An empty field
 // is left out entirely, so the run falls through to the environment and then to
 // defaults.toml exactly as it would from the shell.
-func searchArgs(imager string, fields []field) []string {
-	args := []string{"search", imager}
+//
+// outputDir is named here rather than left to the search, because the table has
+// to show the run the moment it is launched: the search builds its images and
+// checks the memory budget before it claims a directory, so `./ri runs` cannot
+// see the run for a while. A name known up front is what the pending row - and
+// the health pane behind it - are drawn from.
+func searchArgs(imager string, fields []field, outputDir string) []string {
+	args := []string{"search", imager, "--output-dir", outputDir}
 	for _, f := range fields {
 		if value := strings.TrimSpace(f.value()); value != "" {
 			args = append(args, "--"+f.flag, value)
 		}
 	}
 	return args
+}
+
+// claimRunDir creates the directory the next search will run in, named the way
+// ns_claim_run_dir would have named it, and returns it relative to the repo -
+// the form `./ri runs` reports, so the pending row and the real one agree.
+//
+// A bare Mkdir is the claim, exactly as in scripts/lib/run-config.sh: two
+// searches started in the same second must not share a directory, and now that
+// the name is chosen here rather than there, that guard has to be here too.
+func (r ri) claimRunDir(imager string) (string, error) {
+	parent := filepath.Join(r.root, "results", "nested-sampling")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	for i := 0; i < 10; i++ {
+		name := imager + "-vlaa-" + time.Now().UTC().Format("20060102T150405Z")
+		err := os.Mkdir(filepath.Join(parent, name), 0o755)
+		if err == nil {
+			return filepath.Join("results", "nested-sampling", name), nil
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+		time.Sleep(time.Second)
+	}
+	return "", fmt.Errorf("no free run directory under %s", parent)
 }
 
 type ri struct{ root string }
@@ -107,9 +139,8 @@ func (r ri) run(args ...string) (string, error) {
 // closing the terminal, does not take the run with it. The run's own run.log
 // only exists once the run directory is claimed, so the build output and any
 // early failure land here instead.
-func (r ri) launch(args []string) (string, error) {
-	log := filepath.Join(r.root, "results",
-		"tui-search-"+time.Now().UTC().Format("20060102T150405Z")+".log")
+func (r ri) launch(runDir string, args []string) (string, error) {
+	log := filepath.Join(r.root, "results", "tui-"+filepath.Base(runDir)+".log")
 	f, err := os.Create(log)
 	if err != nil {
 		return "", err

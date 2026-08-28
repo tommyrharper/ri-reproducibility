@@ -239,9 +239,12 @@ re-runs it every 5 seconds, `l` swaps that for the tail of the run's `run.log`,
 `a` narrows the table to what is running, and `n` opens a form that starts a
 search. Keys are listed along the bottom of every screen.
 
-A search started there is detached, so quitting the interface leaves it going,
-and its output until the run directory exists goes to
-`results/tui-search-<UTC>.log`.
+A search started there is detached, so quitting the interface leaves it going.
+It joins the table as `starting` the moment it is launched - the search builds
+its images before it claims a run directory, so `./ri runs` cannot see it for a
+while - and `enter` on it shows the output of that build, in
+`results/tui-<run>.log`, which is where anything that goes wrong before the run
+directory exists is said. `l` swaps to `./ri health` from there too.
 
 Needs Go on the host; nothing else in this repo does. The source is `tui/`,
 and `go -C tui test ./...` checks it.
