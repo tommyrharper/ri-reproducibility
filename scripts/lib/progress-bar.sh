@@ -83,6 +83,77 @@ run_with_progress() {
   return "${status}"
 }
 
+# Usage: run_with_retries <retries> <output_dir> <max_ndead> <nlive> -- cmd args...
+#
+# The recovery half of the above: PolyChord checkpoints continuously, so a run
+# that dies at hour three already has everything needed to carry on from where
+# it stopped - what it did not have was anything to start it again. A dead
+# worker (WORKER_DIED in common.py), a wedged meqserver that escaped the
+# in-worker watchdog, an OOM kill: each of those ends a multi-day search that
+# is then simply gone until a human notices and types `./ri resume`.
+#
+# Retried only while the failed attempt made forward progress, measured in
+# dead points. That is the whole guard against spinning: a code bug every rank
+# hits deterministically, a bad parameter space, a missing image - all fail
+# before the first dead point of the attempt, so they stop immediately rather
+# than failing three times as slowly. Something that killed a run which was
+# working is the only thing that gets another go.
+#
+# The retry reuses the sidecar containers this run already started, but not
+# their pooled workers: those exit on EOF when the dying ranks close their end
+# of the FIFOs, so the retry falls back to a rank-started worker per
+# evaluation (see _connect_shell_started_worker in common.py) and runs at the
+# pre-pool speed, ~0.45s per evaluation slower. Deliberate - a recovered run
+# that is slower beats a dead one, and restarting it by hand gets the warm
+# path back.
+run_with_retries() {
+  local retries="$1" output_dir="$2"
+  shift
+  local attempt=0 status=0 before after
+  while :; do
+    before="$(_ns_ndead "${output_dir}")"
+    status=0
+    run_with_progress "$@" || status=$?
+    [ "${status}" -eq 0 ] && return 0
+    after="$(_ns_ndead "${output_dir}")"
+    if [ "${attempt}" -ge "${retries}" ]; then
+      break
+    fi
+    if [ "${after}" -le "${before}" ]; then
+      _ns_retry_say "${output_dir}" \
+        "not retrying: the attempt that just failed (exit ${status}) added no dead points," \
+        "so another one fails the same way. Why it stopped is above;" \
+        "./ri resume ${output_dir##*/} tries again anyway."
+      break
+    fi
+    attempt=$((attempt + 1))
+    # An index of the restarts, next to run.log which holds the tracebacks
+    # themselves. Its own file because `./ri health` wants the count of a run
+    # that has been going for a day, and run.log by then is megabytes of
+    # PolyChord feedback with the restart lines scattered through it.
+    printf '%s exit %s after %s dead points\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${status}" "${after}" \
+      >>"${output_dir}/restarts.log"
+    _ns_retry_say "${output_dir}" \
+      "attempt failed (exit ${status}) at ${after} dead points; resuming from PolyChord's" \
+      "checkpoint - retry ${attempt} of ${retries}. Why it stopped is above."
+  done
+  return "${status}"
+}
+
+# Both to the terminal and into run.log, because run.log is the only artifact
+# that records why a run stopped and a restart is part of that story - `./ri
+# health` reads these lines back to say a live run has healed itself.
+_ns_retry_say() {
+  local output_dir="$1"
+  shift
+  echo "run_with_retries: $*" | tee -a "${output_dir}/run.log" >&2
+}
+
+_ns_ndead() {
+  _ns_count_lines "$(_ns_dead_birth_file "$1/chains")"
+}
+
 # Appends a command to whatever trap is already registered for a signal
 # instead of replacing it - start-sidecars.sh's cleanup trap on EXIT/INT/TERM
 # must keep running (a leftover R2D2 sidecar holds ~33.7GB), so ours must not
@@ -464,6 +535,58 @@ self_check() {
   }
   # And the pipe it went through is not left behind in the run directory.
   [ ! -e "${run_dir}/.run.log.fifo" ] || { echo "FAIL: fifo left behind"; exit 1; }
+
+  # run_with_retries: a failure that banked dead points gets another go, a
+  # failure that banked none does not, and the exit status still travels.
+  #
+  # The command counts its own attempts through a file and appends a dead
+  # point each time, which is what a checkpointing run does - so "retried"
+  # and "made progress" are the same fixture.
+  local retry_dir="${tmp}/retry"
+  mkdir -p "${retry_dir}/chains"
+  # Single quotes deliberately: $0 is the directory argument passed to the
+  # child `sh` below, not this shell's own name.
+  # shellcheck disable=SC2016
+  local progressing='echo x >>"$0"/chains/r_dead-birth.txt; echo a >>"$0"/attempts; exit 5'
+  status=0
+  run_with_retries 2 "${retry_dir}" -1 2 -- sh -c "${progressing}" "${retry_dir}" \
+    >/dev/null 2>&1 || status=$?
+  [ "${status}" = "5" ] || { echo "FAIL: retried exit status ${status}, want 5"; exit 1; }
+  [ "$(_ns_count_lines "${retry_dir}/attempts")" = "3" ] || {
+    echo "FAIL: attempts $(_ns_count_lines "${retry_dir}/attempts"), want 1 + 2 retries"; exit 1
+  }
+  # ./ri health counts its restarts from this file, one line per retry.
+  [ "$(_ns_count_lines "${retry_dir}/restarts.log")" = "2" ] || {
+    echo "FAIL: restarts.log has $(_ns_count_lines "${retry_dir}/restarts.log") lines, want 2"
+    exit 1
+  }
+
+  # Same command, no dead points: a deterministic failure must stop after one
+  # attempt rather than fail three times as slowly.
+  local stuck_dir="${tmp}/stuck"
+  mkdir -p "${stuck_dir}/chains"
+  status=0
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${stuck_dir}" -1 2 -- sh -c 'echo a >>"$0"/attempts; exit 5' \
+    "${stuck_dir}" >/dev/null 2>&1 || status=$?
+  [ "${status}" = "5" ] || { echo "FAIL: stuck exit status ${status}, want 5"; exit 1; }
+  [ "$(_ns_count_lines "${stuck_dir}/attempts")" = "1" ] || {
+    echo "FAIL: no-progress failure retried $(_ns_count_lines "${stuck_dir}/attempts") times"; exit 1
+  }
+  [ ! -e "${stuck_dir}/restarts.log" ] || { echo "FAIL: restart logged without a retry"; exit 1; }
+
+  # 0 retries is the old behaviour exactly, and a command that succeeds runs
+  # once and returns 0.
+  local once_dir="${tmp}/once"
+  mkdir -p "${once_dir}/chains"
+  # shellcheck disable=SC2016
+  run_with_retries 0 "${once_dir}" -1 2 -- sh -c 'echo a >>"$0"/attempts; exit 5' \
+    "${once_dir}" >/dev/null 2>&1 || status=$?
+  [ "$(_ns_count_lines "${once_dir}/attempts")" = "1" ] || { echo "FAIL: retries=0 retried"; exit 1; }
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${once_dir}" -1 2 -- sh -c 'echo b >>"$0"/attempts' "${once_dir}" \
+    >/dev/null 2>&1 || { echo "FAIL: success returned nonzero"; exit 1; }
+  [ "$(_ns_count_lines "${once_dir}/attempts")" = "2" ] || { echo "FAIL: success re-ran"; exit 1; }
 
   rm -rf "${tmp}"
   echo "progress-bar self-check passed"

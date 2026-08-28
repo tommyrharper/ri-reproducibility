@@ -54,6 +54,14 @@ check(
     plan("search", "wsclean", "--nlive", "8", "--metric=-snr", "--mpi-procs", "1")[0],
 )
 
+# --retries 0 is the flag most likely to be dropped by env_from(), because 0 is
+# falsy and turning off the self-restart has to reach the run script.
+check(
+    "search --retries 0 reaches the run script",
+    {"NS_RETRIES": "0"},
+    plan("search", "wsclean", "--retries", "0")[0],
+)
+
 # ...and a flag that was not given contributes nothing, so an environment
 # variable exported by hand survives and defaults.toml still fills the rest.
 check(

@@ -35,6 +35,12 @@ NS_MAX_NDEAD = 12
 NS_SEED = 41
 NS_METRIC = "total_rms_jy"
 
+# How many times a search that died with work already banked restarts itself
+# from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
+# added no dead points is never retried - see run_with_retries in
+# scripts/lib/progress-bar.sh.
+NS_RETRIES = 2
+
 # The parameter space the sampler searches, read by `load_parameter_space()`
 # in scripts/lib/nested_sampling/common.py. The order is the order of
 # PolyChord's unit cube, so reordering it invalidates existing chains,

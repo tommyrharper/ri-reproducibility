@@ -502,6 +502,23 @@ def evaluation_scan(run_dir: Path) -> dict[str, object]:
     }
 
 
+def restarts(run_dir: Path) -> list[str]:
+    """The times this run died and started itself again from its checkpoint.
+
+    Written by run_with_retries in scripts/lib/progress-bar.sh, one line per
+    restart. Its own file rather than a grep of run.log because that file is
+    megabytes of PolyChord feedback after a day, and this is a handful of
+    lines - a self-healed run is still worth saying out loud, since the thing
+    that killed it once will do it again.
+    """
+    try:
+        return [line for line in
+                (run_dir / "restarts.log").read_text(errors="replace").splitlines()
+                if line.strip()]
+    except OSError:
+        return []
+
+
 def log_tail(run_dir: Path) -> dict[str, object] | None:
     """What the run last said, and how many ranks said it.
 
@@ -789,6 +806,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     cores_busy = sum((busy or {}).get(int(p["pid"]), 0.0) for p in owned)
     dead, checkpoint_age = dead_points(run_dir)
     tail = log_tail(run_dir)
+    restarted = restarts(run_dir)
     idle = scan["last_activity_seconds"]
     complete = (run_dir / "summary.json").exists()
 
@@ -931,6 +949,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
         "sampler": stats,
         "forecast": forecast,
         "log_tail": tail,
+        "restarts": restarted,
         "warnings": warnings,
         **scan,
     }
@@ -1098,6 +1117,16 @@ def render(run: dict[str, object]) -> None:
                       + (f", +{format_gb(float(per_hour))}/hour" if per_hour else "")
                       + (f", {float(remaining):.0f}h of space left at that rate"
                          if remaining is not None else "")))
+    # Only when there were any: a run that has never crashed should not carry a
+    # line saying so. Reported, not warned on - the crash was survived, and a
+    # warning here would make `./ri health` exit nonzero for a run that is
+    # currently fine.
+    if run["restarts"]:
+        restarted = list(run["restarts"])
+        plural = "" if len(restarted) == 1 else "s"
+        lines.append(("restarts",
+                      f"{len(restarted)} self-healed restart{plural}, "
+                      f"last {restarted[-1]}"))
     lines += [
         ("failures", f"{run['failed']} scored FAILURE_OBJECTIVE"
                      + (f" ({run['recent_failed']} of the last {RATE_WINDOW})"
@@ -1486,6 +1515,24 @@ def self_check() -> None:
             # A run from before run.log existed still gets the resume line.
             (live / "run.log").unlink()
             assert any("./ri resume" in w for w in describe(live, [], 5.0)["warnings"])
+
+            # A run that crashed and restarted itself is still healthy, but
+            # the restarts must be visible: whatever killed it once will do it
+            # again, and nothing else on disk records that it happened.
+            assert "restarts" not in io_capture(describe(live, ranks, 5.0))
+            (live / "restarts.log").write_text(
+                "2026-08-28T09:00:00Z exit 1 after 40 dead points\n"
+                "2026-08-28T11:00:00Z exit 1 after 91 dead points\n"
+            )
+            healed = describe(live, ranks, 5.0)
+            assert len(healed["restarts"]) == 2, healed["restarts"]
+            # Reported, never warned on - a self-healed run is fine right now,
+            # and warning would make `./ri health` exit nonzero for one.
+            assert not any("restart" in w for w in healed["warnings"]), healed["warnings"]
+            shown = io_capture(healed)
+            assert ("restarts  2 self-healed restarts, last 2026-08-28T11:00:00Z "
+                    "exit 1 after 91 dead points") in shown, shown
+            (live / "restarts.log").unlink()
 
             # Same run, same files, no ranks: a stale mtime is only a stall
             # while something is still running.

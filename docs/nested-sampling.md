@@ -174,6 +174,7 @@ Sampler defaults live in `defaults.toml` at the repository root, loaded by
 | `--max-ndead` | `NS_MAX_NDEAD` | Dead-point budget that terminates the run | `12` |
 | `--seed` | `NS_SEED` | PolyChord random seed | `41` |
 | `--metric` | `NS_METRIC` | Objective: `badness`, a bare metric name, or an expression over metric names - see "Choosing the objective" below | `total_rms_jy` |
+| `--retries` | `NS_RETRIES` | Times a run that dies with dead points already banked restarts itself from its checkpoint; `0` disables - see "A run that dies restarts itself" | `2` |
 
 #### Leave these alone
 
@@ -491,6 +492,13 @@ What each line is reading, and why it is worth a line:
   life rather than taken from its tail because evaluation size follows the
   parameters and a nested-sampling run concentrates: the newest 20 read
   1.45MB where the same run averaged 1.68MB.
+- **restarts** - how many times the run died and started itself again from its
+  checkpoint, and when the last one was, read from `restarts.log`. Shown only
+  when there were any, and never warned on: the crash was survived and the run
+  is healthy now, so warning would make `./ri health` exit nonzero for a run
+  that is fine. It is still the line to read first on a run that looks slower
+  than it should - a restarted run runs on rank-started workers rather than
+  the pooled ones. See "A run that dies restarts itself".
 - **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
   `meqserver-wedged.log` lines. **This is the one that a run can pass every
   other check and still fail.** PolyChord maximizes, and a real
@@ -543,6 +551,42 @@ What each line is reading, and why it is worth a line:
   luck on one evaluation, and those want opposite responses. For a run that
   stopped without a traceback it falls back to the last non-empty line, which
   is PolyChord's own last word on where it got to.
+
+### A run that dies restarts itself
+
+PolyChord checkpoints continuously, so a run that dies at hour three already
+holds everything it needs to carry on. What it did not have was anything to
+start it again: a worker that stopped answering (`WORKER_DIED`), a meqserver
+that wedged past the in-worker watchdog, an OOM kill - each one ended a
+multi-day search that then sat dead until someone noticed.
+
+`run_with_retries` in `scripts/lib/progress-bar.sh` wraps the run and restarts
+it in place, up to `--retries` times (default 2). The restart is an ordinary
+resume: same `OUTPUT_DIR`, PolyChord reads its own `.resume` file and the
+evaluations already on disk are adopted, exactly as `./ri resume` does.
+
+**It only retries an attempt that made forward progress**, measured in dead
+points added. That guard is what stops it spinning: a code bug every rank hits
+deterministically, a missing image, a bad parameter space - all of those fail
+before the attempt's first dead point, so they stop immediately instead of
+failing three times as slowly. Only something that killed a run which was
+working gets another go.
+
+Two things to know about a restarted run:
+
+- It reuses the sidecar containers but not their pooled workers, which exited
+  on EOF when the dying ranks closed the FIFOs. The retry falls back to a
+  rank-started worker per evaluation (`_connect_shell_started_worker` in
+  `common.py`), roughly 0.45s per evaluation slower. Deliberate: a slower
+  recovered run beats a dead one, and starting it again by hand gets the warm
+  path back.
+- Each restart appends a line to `restarts.log` in the run directory, and
+  `./ri health` shows the count and the latest one. It is reported, not warned
+  on - the run is fine right now - but whatever killed it once will do it
+  again, so the line is worth reading.
+
+Set `--retries 0` to get the old behaviour, where the first failure ends the
+run.
 
 ### Finding and resuming a run that stopped
 
@@ -959,6 +1003,13 @@ run.log
 This is the only artifact that records *why* a run stopped - a traceback out
 of the PolyChord container reaches nowhere else. `./ri health` quotes its last
 line for a stopped run.
+
+One line per time the run died and restarted itself from its checkpoint, when
+that happened at all (see "A run that dies restarts itself"):
+
+```text
+restarts.log
+```
 
 View completed runs (settings, evidence, per-evaluation metrics and
 reconstructions) in the nested-sampling HTML report:
