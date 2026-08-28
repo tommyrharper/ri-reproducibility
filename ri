@@ -333,7 +333,10 @@ def build_parser():
                         help="seconds without a finished evaluation before a search is "
                              "killed as hung, so --retries can restart it from its "
                              "checkpoint; 0 disables [NS_STALL_TIMEOUT]")
-    search.add_argument("--output-dir", help="run directory [OUTPUT_DIR]")
+    search.add_argument(
+        "--output-dir",
+        help="run directory, which must be inside the repository - the containers see nothing else [OUTPUT_DIR]",
+    )
     search.add_argument("--enable-param", action="append", metavar="NAME",
                         help="search this parameter_space dimension even if defaults.toml "
                              "has it disabled; repeatable [NS_ENABLE_PARAMS]")

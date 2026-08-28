@@ -1512,9 +1512,9 @@ def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWork
     a live point at once, so all of it used to land on the wall clock in front
     of evaluation one. The run scripts make one warm worker per rank the
     sidecar's own startup command instead, and this connects to it. Falling back
-    to a rank-started worker is what happens when there is no pool - an
-    OUTPUT_DIR outside the bind mount, so the FIFOs are not visible in both
-    containers.
+    to a rank-started worker is what happens when there is no pool - no
+    NS_SIMULATE_FIFO_DIR at all, or a pool this rank has already abandoned
+    because its worker died.
     """
     fifo_dir = os.environ.get(fifo_dir_var)
     if not fifo_dir or _FIFO_POOL_ABANDONED:

@@ -66,6 +66,11 @@ fi
 if [ -n "${OUTPUT_DIR:-}" ]; then
   ns_refuse_live_run "${OUTPUT_DIR}"
   mkdir -p "${OUTPUT_DIR}"
+  # Absolute and `..`-free from here on, so that the containment test below is
+  # a string comparison and so that run.env, run.log and the health report all
+  # name the run the same way whatever the caller typed.
+  OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
+  ns_refuse_unmounted_run "${OUTPUT_DIR}"
 else
   OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" r2d2-vlaa-)"
 fi
@@ -74,8 +79,7 @@ fi
 write_run_config "${OUTPUT_DIR}" r2d2
 # The workers are reached over FIFOs, so these have to sit on the bind mount the
 # rank's container and the sidecars both see - REPO_ROOT, which OUTPUT_DIR is
-# under by default. Point OUTPUT_DIR outside the repo and the ranks simply fall
-# back to starting their own workers.
+# always under, because ns_refuse_unmounted_run above is what makes that true.
 SIMULATE_FIFO_DIR="${OUTPUT_DIR}/.simulate-workers"
 R2D2_FIFO_DIR="${OUTPUT_DIR}/.r2d2-workers"
 rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"

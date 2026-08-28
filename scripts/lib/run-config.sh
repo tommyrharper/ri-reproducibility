@@ -93,6 +93,41 @@ ns_refuse_live_run() {
   exit 1
 }
 
+# A run directory the containers cannot see is not a run directory. Every
+# container is started with one bind mount, `-v ${REPO_ROOT}:${REPO_ROOT}`
+# (scripts/lib/start-sidecars.sh), so a `--output-dir` outside the repo exists
+# on the host - which is where run.env and the FIFOs land - and separately,
+# emptily, inside each container, which is where PolyChord's chains and the
+# evaluation directories land. Measured on a real `--output-dir /tmp/...`
+# search: the ranks lost their warm worker pool, fell back to rank-started
+# workers, and evaluation 1 died with `FileNotFoundError: .../evaluations/
+# eval-0001-*/simulate.stdout.log` - two minutes of container startup spent to
+# fail on a path that could have been checked in front of it.
+#
+# The test is on the path as spelled, because the mount is the path as spelled:
+# the container sees a path iff it is under REPO_ROOT, whatever either side
+# resolves to. Callers pass an absolute path with `..` already collapsed.
+#
+#   ns_refuse_unmounted_run <output-dir>
+
+ns_refuse_unmounted_run() {
+  case "$1/" in
+    "${REPO_ROOT}/"*) return 0 ;;
+  esac
+  # `mkdir -p` created it a moment ago only so the path could be resolved, so
+  # unmake it - `-p` for the parents that came with it. rmdir stops at the
+  # first directory with anything in it, so a run directory that already
+  # existed, and every parent that is not ours, survives.
+  rmdir -p "$1" 2>/dev/null || true
+  echo "FATAL: $1" >&2
+  echo "       is outside the repository, which is the only directory the run's" >&2
+  echo "       containers can see, so the chains, evaluations and imager logs" >&2
+  echo "       written there would stay inside the containers and be lost." >&2
+  echo "       Repository:  ${REPO_ROOT}" >&2
+  echo "       Use a directory under it - the default is results/nested-sampling/." >&2
+  exit 1
+}
+
 # `bash scripts/lib/run-config.sh --self-check` - that what is written can be
 # sourced back to the same values, including a metric that needs quoting.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
@@ -167,6 +202,32 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   esac
   kill "${_fake}" 2>/dev/null || true
   wait "${_fake}" 2>/dev/null || true
+
+  # A `--output-dir` the containers cannot see is refused before anything is
+  # started, and one under REPO_ROOT is not.
+  REPO_ROOT="${_dir}/repo"
+  mkdir -p "${REPO_ROOT}/results/nested-sampling/keep-me"
+  ( ns_refuse_unmounted_run "${REPO_ROOT}/results/nested-sampling/keep-me" ) ||
+    { echo "FAIL: a run directory under REPO_ROOT must be allowed"; exit 1; }
+  [ -d "${REPO_ROOT}/results/nested-sampling/keep-me" ] ||
+    { echo "FAIL: an allowed run directory must not be removed"; exit 1; }
+  # Not a prefix match on the repo's own name: /repo-elsewhere is outside /repo.
+  _outside="${_dir}/repo-elsewhere/run"
+  mkdir -p "${_outside}"
+  if _out="$( ns_refuse_unmounted_run "${_outside}" 2>&1 )"; then
+    echo "FAIL: a run directory outside REPO_ROOT must be refused, got: ${_out}"; exit 1
+  fi
+  case "${_out}" in
+    *"outside the repository"*"${REPO_ROOT}"*) ;;
+    *) echo "FAIL: the refusal must name the repository it is outside of, got: ${_out}"; exit 1 ;;
+  esac
+  # The directory the run script created a moment ago to resolve the path is
+  # cleaned up, and only while it is empty.
+  [ ! -d "${_outside}" ] || { echo "FAIL: the empty refused directory must be removed"; exit 1; }
+  mkdir -p "${_outside}/evaluations"
+  ( ns_refuse_unmounted_run "${_outside}" 2>/dev/null ) && :
+  [ -d "${_outside}/evaluations" ] ||
+    { echo "FAIL: a refused directory with contents must be left alone"; exit 1; }
 
   rm -rf "${_dir}"
   echo "run-config self-check passed"

@@ -111,6 +111,17 @@ was still imaging. Liveness is the host's process list (`ns_run_is_live` in
 `scripts/lib/progress-bar.sh`), which is the only thing `mkdir -p` cannot
 see.
 
+It also has to be inside the repository. Every container the run starts is
+given one bind mount, `-v $REPO_ROOT:$REPO_ROOT`, so a run directory outside
+it exists twice over: on the host, holding `run.env` and the FIFOs, and
+emptily inside each container, where PolyChord's chains and the evaluation
+directories are actually written. Measured on a real `--output-dir /tmp/...`
+search, that cost two minutes of container startup and then died on
+evaluation 1 with `FileNotFoundError: .../eval-0001-*/simulate.stdout.log`;
+`ns_refuse_unmounted_run` in `scripts/lib/run-config.sh` now refuses it in
+0.1s instead. The path is resolved to an absolute one first, so a relative
+`--output-dir` still works and the run names itself the same way everywhere.
+
 Useful overrides:
 
 ```bash
@@ -223,7 +234,7 @@ pinned run directory.
 |---|---|---|---|
 | `--mpi-procs` | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` is serial | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` (`sysctl -n hw.ncpu` on macOS, which has no `nproc`), then clamped to what free memory holds - see "Rank count is the memory budget" |
 | `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1, from the rank count before the memory clamp |
-| `--output-dir` | `OUTPUT_DIR` | Run directory | `results/nested-sampling/<algo>-vlaa-<UTC>` |
+| `--output-dir` | `OUTPUT_DIR` | Run directory; must be inside the repository, and not one a job is still in | `results/nested-sampling/<algo>-vlaa-<UTC>` |
 
 ### Rank count is the memory budget
 
