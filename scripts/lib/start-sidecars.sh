@@ -68,6 +68,18 @@ sidecar_launch() {
   done
   name="ri-ns-sidecar-$$-${#SIDECAR_NAMES[@]}"
   SIDECAR_NAME="${name}"
+  # Which run owns this container, for the leak rule in rank-budget.sh. The pid
+  # in the name is this shell's, and this shell can die while the run it
+  # started carries on - the ranks are children of containerd-shim, not of it -
+  # so the pid alone called a live run's containers abandoned and offered them
+  # up to `docker rm --force`. OUTPUT_DIR is read from the caller's scope
+  # because both run scripts have it by the time they source this file, the
+  # same way REPO_ROOT is read below; a caller without one (the self-check)
+  # simply gets no label and falls back to the pid rule.
+  local -a label=()
+  if [ -n "${OUTPUT_DIR:-}" ]; then
+    label=(--label "ri.run-dir=${OUTPUT_DIR}")
+  fi
   # macOS ships bash 3.2, where expanding an empty array under `set -u` is an
   # "unbound variable" error rather than nothing - so a sidecar with no extra
   # docker arguments, which is most of them, could not start there at all. The
@@ -78,6 +90,7 @@ sidecar_launch() {
     entrypoint_args=("${command[@]:1}")
   fi
   docker run --detach --rm --name "${name}" \
+    ${label[@]+"${label[@]}"} \
     --network none \
     --shm-size 512m \
     --platform "${platform}" \
@@ -139,6 +152,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   }
   grep -q -- "--entrypoint sh img:c -c echo hi sh /some/dir" "${_log}"
   [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1","img:c":"ri-ns-sidecar-'"$$"'-2"}' ]
+  # No OUTPUT_DIR above, so no label - the pid rule in rank-budget.sh is still
+  # the whole story for a caller that has no run directory.
+  grep -q -- 'ri.run-dir' "${_log}" && { echo "FAIL: labelled with no OUTPUT_DIR"; exit 1; }
+  # With one, every container carries it: that label is what stops the reaper
+  # in rank-budget.sh from removing the containers of a run whose launcher
+  # shell was killed but whose ranks are still going.
+  : >"${_log}"
+  OUTPUT_DIR=/some/run sidecar_launch linux/amd64 img:d
+  sidecar_wait
+  grep -q -- '--label ri.run-dir=/some/run' "${_log}"
   rm -f "${_log}"
   echo "start-sidecars self-check passed"
 fi

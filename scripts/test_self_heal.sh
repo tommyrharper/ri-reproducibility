@@ -197,9 +197,19 @@ grep -q "exit 137" "${HUNG_OUT}/restarts.log" 2>/dev/null \
 hung_after="$(completed_evals "${HUNG_OUT}")"
 [ "${hung_after}" -ge "${hung_before}" ] \
   || fail "stall restart lost work: ${hung_before} evaluations before, ${hung_after} after"
-health="$("${REPO_ROOT}/ri" health "${HUNG_OUT}" 2>&1)" && health_status=0 || health_status=$?
-[ "${health_status}" -eq 0 ] || fail "./ri health warns about a run that healed itself (exit ${health_status}):
-${health}"
+# The run's own headline, not the exit status: that is 1 for a host warning
+# too, and the host is shared. This check failed on "3 sidecar container(s)
+# outlived the run that started them" naming the containers of the search that
+# had just finished one line above - `_sidecar_remove` backgrounds its
+# `docker rm --force`, so for ~0.4s after a run exits its containers are
+# running with a launcher pid that is already gone. Another session's leaked
+# sidecar, or a host low on memory, failed it just as easily. What this check
+# is about is whether the *run* looks healthy after healing itself.
+health="$("${REPO_ROOT}/ri" health "${HUNG_OUT}" 2>&1)" || true
+case "$(printf '%s\n' "${health}" | head -1)" in
+  *WARNING*) fail "./ri health warns about a run that healed itself:
+${health}" ;;
+esac
 
 PASSED=1
 echo "self-heal: hung at ${hung_before} evaluations, recovered and finished at ${hung_after}"

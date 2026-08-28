@@ -799,7 +799,18 @@ What each line is reading, and why it is worth a line:
   `scripts/lib/rank-budget.sh` runs before the run reads free memory, so the
   memory a dead run is sitting on is freed rather than sized around. The
   launcher's pid is in the container name, and pid reuse can only make it skip
-  a container, never take a live one.
+  a container, never take a live one. The pid is not the whole rule: a run
+  script killed with SIGKILL leaves the *search* going - the ranks are children
+  of `containerd-shim`, not of the shell - so on the pid alone a live 16-rank
+  search's three containers read as leaked, and both this warning's `docker rm
+  -f` line and `ns_reap_leaked_sidecars` would have killed it. Each container
+  therefore carries a `ri.run-dir` label naming the run that started it
+  (`sidecar_launch` in `scripts/lib/start-sidecars.sh`), and a container whose
+  labelled run still has processes - the same `ns_run_is_live` check `./ri
+  resume` and `./ri search --output-dir` refuse on - is never leaked whatever
+  its pid says. Containers started before the label existed have none and fall
+  back to the pid, as do the per-rank fallback containers `common.py` starts,
+  which belong to a rank rather than to a run.
 
 - **why it stopped** - a stopped run's warning quotes its `run.log`, which is
   where the run's own output is kept. Everything else on disk says *that* a
@@ -973,7 +984,11 @@ machinery:
 
 Both then assert that the run restarts itself, records the kill in
 `restarts.log`, keeps the evaluations the first attempt scored, writes
-`summary.json`, and comes out of `./ri health` with no warning and exit 0. The
+`summary.json`, and comes out of `./ri health` with nothing on its own
+headline. Its headline rather than the exit status, which is 1 for a host
+warning too: this host is shared, and the check failed on the just-finished
+search's own containers, still running for the ~0.4s `_sidecar_remove` takes to
+remove them in the background after their launcher pid is gone. The
 wait for recovery is bounded, because the failure it is most likely to catch is
 a hang rather than an exit. ~90 seconds and ~0.6GB, so it is safe to run beside
 another search. Fixtures cannot stand in for it - every bug found in this

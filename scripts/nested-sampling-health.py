@@ -87,7 +87,9 @@ named by a `path` line.
 Plus the host: memory, swap in use, free disk, and sidecar containers whose run
 is gone. A killed run leaves its `ri-ns-sidecar-*` containers holding ~3.4GB
 per R2D2 rank. The next run frees those itself before it sizes itself, so this
-is here to explain where the host's memory went, not as a chore.
+is here to explain where the host's memory went, not as a chore. A container is
+only counted once its run has stopped, not merely once the shell that launched
+it has: an orphaned run keeps imaging inside its containers.
 
 Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
 when a run has live processes; nothing started, nothing imaged, so it costs a
@@ -336,22 +338,38 @@ def sidecar_containers() -> list[dict[str, object]] | None:
     `ri-ns-sidecar-<rank pid>-<uuid8>` from common.py's own fallback path; both
     carry the pid of whatever started them in the same position, which is what
     makes a leak detectable.
+
+    The pid is not enough on its own, so start-sidecars.sh also labels each
+    container with the run it belongs to. A run script killed with SIGKILL
+    leaves the search itself going - the ranks are children of
+    containerd-shim, not of the shell - and the pid rule then called that live
+    search's containers abandoned and printed the `docker rm -f` line that
+    would have killed it. Containers started before the label existed have
+    none, and fall back to the pid.
     """
     try:
         out = subprocess.run(
-            ["docker", "ps", "--filter", "name=ri-ns-sidecar", "--format", "{{.Names}}\t{{.Image}}"],
+            ["docker", "ps", "--filter", "name=ri-ns-sidecar",
+             "--format", '{{.Names}}\t{{.Image}}\t{{.Label "ri.run-dir"}}'],
             capture_output=True, text=True, check=True, timeout=20,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
+    return _parse_sidecars(out)
+
+
+def _parse_sidecars(out: str) -> list[dict[str, object]]:
+    """Split from the docker call so the tab layout can be checked without one."""
     containers = []
     for line in out.splitlines():
-        name, _, image = line.partition("\t")
+        name, _, rest = line.partition("\t")
+        image, _, run_dir = rest.partition("\t")
         if not name:
             continue
         parts = name.split("-")
         owner = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
-        containers.append({"name": name, "image": image, "owner_pid": owner})
+        containers.append({"name": name, "image": image, "owner_pid": owner,
+                           "run_dir": run_dir or None})
     return containers
 
 
@@ -1389,8 +1407,14 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
     containers = sidecar_containers()
     leaked = []
     if containers is not None:
+        # A container whose labelled run still has ranks is in use however dead
+        # its launcher pid is - that is the orphaned run, and the whole reason
+        # the label exists. `live_run_directories` is the same set the default
+        # report is built from, so the two can never disagree.
+        running = {str(d) for d in live_run_directories(processes)}
         leaked = [c for c in containers
-                  if c["owner_pid"] is not None and c["owner_pid"] not in alive]
+                  if c["owner_pid"] is not None and c["owner_pid"] not in alive
+                  and str(c.get("run_dir") or "") not in running]
     warnings = []
     if leaked:
         warnings.append(
@@ -1870,6 +1894,7 @@ def main(argv: list[str] | None = None) -> int:
 def self_check() -> None:
     import contextlib
     import io
+    import shutil
     import tempfile
 
     def io_capture(report: dict[str, object]) -> str:
@@ -2771,6 +2796,17 @@ def self_check() -> None:
             assert fast_report["stall_threshold_seconds"] == MIN_STALL_GAP_SECONDS
             assert fast_report["stall_count"] == 0, fast_report
 
+            # The three columns docker is asked for, in order. An unlabelled
+            # container (started before the label existed) keeps None rather
+            # than borrowing the image as its run directory.
+            assert _parse_sidecars(
+                "ri-ns-sidecar-7-0\timg:a\t/runs/one\nri-ns-sidecar-8-0\timg:b\t\n") == [
+                {"name": "ri-ns-sidecar-7-0", "image": "img:a", "owner_pid": 7,
+                 "run_dir": "/runs/one"},
+                {"name": "ri-ns-sidecar-8-0", "image": "img:b", "owner_pid": 8,
+                 "run_dir": None},
+            ]
+
             # A sidecar whose launcher is gone is memory nobody will free.
             processes = [{"pid": 4242, "alive": True, "elapsed_seconds": 1.0,
                           "cpu_seconds": 0.0, "rss_mb": 0, "args": "sh"}]
@@ -2778,6 +2814,7 @@ def self_check() -> None:
             leaked = {"name": "ri-ns-sidecar-9999-0", "image": "i", "owner_pid": 9999}
             global sidecar_containers
             original = sidecar_containers
+            orphan_home = tempfile.mkdtemp()
             try:
                 sidecar_containers = lambda: [live_container, leaked]  # noqa: E731
                 host = host_report(processes)
@@ -2788,8 +2825,31 @@ def self_check() -> None:
                 assert host_report(zombie)["leaked_sidecars"] == [live_container, leaked]
                 sidecar_containers = lambda: None  # noqa: E731
                 assert host_report(processes)["leaked_sidecars"] == []
+
+                # The orphaned run: the shell that launched the containers was
+                # killed, so the pid is gone, but its ranks are still imaging
+                # inside them. Naming these is what would have had somebody
+                # `docker rm -f` a live 16-rank search - the label is what
+                # keeps them off the list.
+                # Outside NESTED_SAMPLING_DIR: every glob there treats a
+                # subdirectory as a run, which silently reorders the
+                # newest-run assertions below.
+                orphan_run = Path(orphan_home) / "wsclean-vlaa-20260104T010000Z"
+                orphan_run.mkdir()
+                orphaned = {"name": "ri-ns-sidecar-9999-0", "image": "i",
+                            "owner_pid": 9999, "run_dir": str(orphan_run)}
+                rank = {"pid": 5151, "alive": True, "elapsed_seconds": 1.0,
+                        "cpu_seconds": 0.0, "rss_mb": 0,
+                        "args": f"python3 /opt/ri-nested-sampling/polychord_wsclean.py "
+                                f"--output-dir {orphan_run}"}
+                sidecar_containers = lambda: [orphaned]  # noqa: E731
+                assert host_report(processes + [rank])["leaked_sidecars"] == []
+                # The same container once its ranks are gone is debris again -
+                # the label exempts a run that is running, not a run that ran.
+                assert host_report(processes)["leaked_sidecars"] == [orphaned]
             finally:
                 sidecar_containers = original
+                shutil.rmtree(orphan_home, ignore_errors=True)
 
             # Host swap, against the real /proc/meminfo: reported and never
             # warned on, because swap in use may date from days ago and cost

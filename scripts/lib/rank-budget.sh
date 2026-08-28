@@ -152,27 +152,81 @@ _ns_unlock() {
   fi
 }
 
+# A pgrep -f regex matching exactly the host-visible processes driving the run
+# in `$1`: the ranks, and the `mpirun` and `docker exec` that wrap them - each
+# spells the run out as `--output-dir <dir>` in its own command line, and the
+# container's processes are visible in host `ps`. Anchored on the end of the
+# directory so a run whose name is a prefix of another is not caught. Sidecar
+# workers name their run by `--fifo-dir` instead and are correctly excluded:
+# they outlive a killed run until the next one reaps them.
+ns_run_process_pattern() {
+  printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
+}
+
+# Whether a job is still driving the run in `$1`, by that same pattern. Both
+# live in this file, the lowest layer every run script and the retry loop
+# already source, because the leaked-sidecar rule below needs them and this
+# file is what progress-bar.sh sources rather than the other way round.
+# Every caller has to agree on what "still running" means: `./ri resume`
+# refuses one, and so must a `./ri search --output-dir` naming it - a second
+# MPI job over the same checkpoint and the same FIFO directories corrupts both,
+# and the new job's first act is to `rm -rf` the FIFOs the live ranks are
+# reading.
+#
+# Both spellings of the path, because a run reached through a symlinked
+# directory was launched with whichever one its own caller used. The directory
+# need not exist: a `--output-dir` that is about to be created is not live.
+ns_run_is_live() {
+  local dir="$1" real
+  pgrep -f "$(ns_run_process_pattern "${dir}")" >/dev/null 2>&1 && return 0
+  [ -d "${dir}" ] || return 1
+  real="$(cd "${dir}" && pwd -P)"
+  [ "${real}" = "${dir}" ] && return 1
+  pgrep -f "$(ns_run_process_pattern "${real}")" >/dev/null 2>&1
+}
+
 # A run killed with SIGKILL leaves its `ri-ns-sidecar-*` containers running,
 # each holding ~3.4GB of warm imaging worker that nothing will ever free. That
-# is the same shape of debris as a stale reservation above, and the fix is the
-# same rule: the launcher's pid is in the container name, so a name whose pid
-# is gone is memory nobody owns. Until now `./ri health` only named them and
+# is the same shape of debris as a stale reservation above, and the rule starts
+# the same way: the launcher's pid is in the container name, so a name whose
+# pid is gone is a candidate. Until now `./ri health` only named them and
 # the FATAL below only suggested looking, which meant the next run was sized
 # against - or refused for - memory a dead run was sitting on.
 #
-# Split from the docker call so the pid rule can be checked without a daemon.
+# The pid alone is not enough, which is what the `ri.run-dir` label is for. A
+# run script killed with SIGKILL leaves the run itself going - the ranks are
+# children of containerd-shim, not of the shell - so its containers have a dead
+# launcher pid and a live search inside them. Reaping those kills the search,
+# and `./ri health` was handing out the `docker rm -f` line for them. So a
+# container whose labelled run still has processes is never dead, whatever its
+# pid says; the pid rule is the fallback for a container started before the
+# label existed, and for common.py's per-rank fallback containers, which have
+# no run directory to name.
+#
+# The label exempts by run, so a container genuinely leaked by an earlier
+# attempt at a run that is live again would be exempted too. It cannot survive
+# to be: this function runs from ns_budget_ranks, before the new attempt's
+# ranks exist, so the run is not live at the moment the question is asked.
+#
+# Reads `<name><TAB><run dir>` so the rule can be checked without a daemon.
 # Names are `ri-ns-sidecar-<launcher pid>-<n>` (start-sidecars.sh) and
 # `ri-ns-sidecar-<rank pid>-<uuid8>` (common.py's fallback); the pid is in the
 # same position in both. Pid reuse only ever makes this skip a container, never
 # take a live one, which is the direction to be wrong in.
 _ns_dead_sidecar_names() {
-  local name pid
-  while read -r name; do
+  local line name run_dir pid
+  while IFS= read -r line; do
+    name="${line%%$'\t'*}"
+    run_dir=""
+    [ "${line}" = "${name}" ] || run_dir="${line#*$'\t'}"
     pid="${name#ri-ns-sidecar-}"
     pid="${pid%%-*}"
     case "${pid}" in
       '' | *[!0-9]*) continue ;;
     esac
+    if [ -n "${run_dir}" ] && ns_run_is_live "${run_dir}"; then
+      continue
+    fi
     kill -0 "${pid}" 2>/dev/null || printf '%s\n' "${name}"
   done
 }
@@ -180,7 +234,8 @@ _ns_dead_sidecar_names() {
 ns_reap_leaked_sidecars() {
   local dead
   command -v docker >/dev/null 2>&1 || return 0
-  dead="$(docker ps --filter name=ri-ns-sidecar --format '{{.Names}}' 2>/dev/null \
+  dead="$(docker ps --filter name=ri-ns-sidecar \
+      --format '{{.Names}}\t{{.Label "ri.run-dir"}}' 2>/dev/null \
     | _ns_dead_sidecar_names)"
   [ -n "${dead}" ] || return 0
   # Said out loud: this is another run's wreckage being removed, and a silent
@@ -373,6 +428,38 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   # Anything that is not that name shape is left alone rather than guessed at.
   [ -z "$(printf 'ri-ns-sidecar-notapid-0\nsomething-else\n' | _ns_dead_sidecar_names)" ]
   [ -z "$(printf '' | _ns_dead_sidecar_names)" ]
+
+  # The orphaned run: launcher pid gone, `ri.run-dir` label naming a run that
+  # still has ranks. Reaping these is what killed the search - so the label
+  # wins over the pid. A real process with the real command line, because this
+  # is what pgrep has to see, spelled the way a rank spells it.
+  _orphan_dir="$(mktemp -d)"
+  _orphan_run="${_orphan_dir}/wsclean-vlaa-20260101T000001Z"
+  mkdir -p "${_orphan_run}"
+  # Labelled but not live yet: nothing is running, so the pid still decides.
+  [ "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}" | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-0" ]
+  printf 'import time\ntime.sleep(30)\n' >"${_orphan_dir}/polychord_wsclean.py"
+  python3 "${_orphan_dir}/polychord_wsclean.py" --output-dir "${_orphan_run}" --nlive 50 &
+  _orphan_pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    ns_run_is_live "${_orphan_run}" && break
+    sleep 0.2
+  done
+  ns_run_is_live "${_orphan_run}" \
+    || { echo "FAIL: a live rank on this run must be seen"; kill "${_orphan_pid}"; exit 1; }
+  [ -z "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}" | _ns_dead_sidecar_names)" ] \
+    || { echo "FAIL: a live run's sidecar was offered up for removal"
+         kill "${_orphan_pid}"; exit 1; }
+  # A label naming a *different* run that is not live still reaps, so the
+  # label cannot become a blanket exemption.
+  [ "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}-other" | _ns_dead_sidecar_names)" \
+    = "ri-ns-sidecar-999999-0" ] \
+    || { echo "FAIL: a dead run's labelled sidecar must still be reaped"
+         kill "${_orphan_pid}"; exit 1; }
+  kill "${_orphan_pid}" 2>/dev/null || true
+  wait "${_orphan_pid}" 2>/dev/null || true
+  rm -rf "${_orphan_dir}"
 
   # An explicit rank count is obeyed, and warned about when it will not fit.
   ns_budget_warn_if_over 8 3400 r2d2 2>/dev/null
