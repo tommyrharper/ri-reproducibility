@@ -206,11 +206,15 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
         status = "running"
     else:
         status = "resumable" if resumable else "incomplete"
+    started = started_at(run_dir)
     return {
         "name": run_dir.name,
         "path": str(run_dir),
-        "started": datetime.fromtimestamp(
-            started_at(run_dir), timezone.utc).isoformat(),
+        "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+        # The rendered form travels with the machine-readable one so that the
+        # TUI, which draws this listing, shows what this listing shows without
+        # a second implementation of it in Go to drift from this one.
+        "started_label": format_started(started),
         "algorithm": algorithm,
         "status": status,
         "evaluations": evaluations,
@@ -262,12 +266,11 @@ def main(argv: list[str] | None = None) -> int:
     evals = max(len("EVALS"), *(len(str(r["evaluations"])) for r in runs))
     print(f"{'RUN'.ljust(width)}  {'ALGORITHM':<9}  {'STATUS':<10}  "
           f"{'EVALS':>{evals}}  STARTED")
-    now = time.time()
     for run in runs:
         print(
             f"{str(run['name']).ljust(width)}  {str(run['algorithm']):<9}  "
             f"{str(run['status']):<10}  {run['evaluations']:>{evals}}  "
-            f"{format_started(started_at(Path(str(run['path']))), now)}"
+            f"{run['started_label']}"
         )
 
     if live:
@@ -365,6 +368,11 @@ def self_check() -> None:
             order = [r["name"] for r in find_runs(running=set())]
             assert order == [bare.name, stopped.name, done.name], order
             assert bare_run["started"] == "2026-01-03T00:00:00+00:00", bare_run
+            # tui/ draws its `started` column from this string rather than
+            # rendering the timestamp itself, so dropping it would empty that
+            # column rather than fail anywhere.
+            assert bare_run["started_label"] == format_started(
+                started_at(bare)), bare_run
             # A directory not named for a time still sorts and dates by
             # something real, so one hand-named run cannot land it at the
             # bottom for ever.

@@ -13,7 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+
 	"strings"
 	"syscall"
 	"time"
@@ -36,33 +36,31 @@ func repoRoot(dir string) (string, error) {
 }
 
 // Run is one entry of ./ri runs --json. Fields it does not use are dropped.
+//
+// StartedLabel is that listing's own rendering of when the run started
+// ("today 18:38 (2h ago)"), taken rather than recomputed here: the age moves,
+// so a second implementation would not just drift, it would drift visibly
+// against the same numbers on the same screen.
 type Run struct {
-	Name        string            `json:"name"`
-	Path        string            `json:"path"`
-	Algorithm   string            `json:"algorithm"`
-	Status      string            `json:"status"`
-	Evaluations int               `json:"evaluations"`
-	Settings    map[string]string `json:"settings"`
+	Name         string            `json:"name"`
+	Path         string            `json:"path"`
+	Algorithm    string            `json:"algorithm"`
+	Status       string            `json:"status"`
+	Evaluations  int               `json:"evaluations"`
+	StartedLabel string            `json:"started_label"`
+	Settings     map[string]string `json:"settings"`
 }
 
-// statusRank puts the runs worth looking at first: what is going now, then what
-// could be resumed, then the finished ones - newest first within each group,
-// which is the order ./ri runs already lists them in.
-var statusRank = map[string]int{"running": 0, "resumable": 1, "incomplete": 2, "complete": 3}
-
-func rank(status string) int {
-	if r, ok := statusRank[status]; ok {
-		return r
-	}
-	return len(statusRank)
-}
-
+// parseRuns keeps ./ri runs' order, which is newest first. Re-sorting to put
+// the live runs at the top read well until a search was started: the new run
+// is the one being looked for, and it was below every older run still going.
+// `a` narrows the table to what is running, which is the question that
+// ordering was answering.
 func parseRuns(out []byte) ([]Run, error) {
 	var runs []Run
 	if err := json.Unmarshal(out, &runs); err != nil {
 		return nil, err
 	}
-	sort.SliceStable(runs, func(i, j int) bool { return rank(runs[i].Status) < rank(runs[j].Status) })
 	return runs, nil
 }
 
