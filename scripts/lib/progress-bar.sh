@@ -526,7 +526,10 @@ _ns_now_us() {
 _ns_backoff_interval() {
   local started="$1" floor="${2:-1}" cap="${3:-30}" now cost
   now="$(_ns_now_us)"
-  [ -n "${started}" ] && [ -n "${now}" ] || { echo "${floor}"; return; }
+  if [ -z "${started}" ] || [ -z "${now}" ]; then
+    echo "${floor}"
+    return
+  fi
   # Clamped in arithmetic rather than with `[ ] &&`, which is an AND-list that
   # returns non-zero whenever the bound does not bite - and this file is
   # sourced into a script running under `set -e`.

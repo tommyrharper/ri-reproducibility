@@ -163,7 +163,8 @@ documented `-DTARGET_CPU` CMake option, and it defaults to `x86-64-v3` -
 AVX2 and FMA, which is every x86-64 CPU since about 2013. That is one
 fixed binary, so two hosts still image bit-identically, and it is worth
 ~10% of a search's throughput over the plain x86-64 baseline (see
-[docs/nested-sampling-throughput.md](docs/nested-sampling-throughput.md)).
+[docs/nested-sampling-speed.md](docs/nested-sampling-speed.md), the index for
+everything that has been done to a search's speed).
 Set `WSCLEAN_TARGET_CPU=` (empty) to get that baseline back on a CPU
 older than that; a build for a non-x86 architecture falls back to it on
 its own, because the compiler there rejects the default target.

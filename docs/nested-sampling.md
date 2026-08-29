@@ -641,7 +641,9 @@ Both views show, per stage: the total, the mean per evaluation, the share of the
 run's worker-time budget, and the evaluation count. Durations are rendered in
 whatever unit carries their digits (`33ms`, `1.44s`, `39m 15s`, `1h 00m 45s`).
 
-See [nested-sampling-profiling.md](nested-sampling-profiling.md) for what each
+See [nested-sampling-speed.md](nested-sampling-speed.md) for everything that has
+been done to make an evaluation cheaper, and
+[nested-sampling-profiling.md](nested-sampling-profiling.md) for what each
 field means and for every measured (and rejected) optimisation behind the
 current run scripts and images.
 
