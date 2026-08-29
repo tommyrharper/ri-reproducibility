@@ -24,6 +24,7 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 | `image_container_seconds` | Wall time for the imaging round trip: a `docker run` for WSClean, one request to this rank's R2D2 worker for R2D2 |
 | `image_binary_seconds` | WSClean only: the imaging child's own elapsed time, from `wait4()` in the rank's `wsclean-zygote` (before 29 August 2026, from `/usr/bin/time -v`, quantised to 10ms - see [the zygote doc](nested-sampling-wsclean-zygote.md)) |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
+| `started_epoch`, `ended_epoch` | Wall-clock epochs the evaluation began and finished at, stamped by `mark_evaluation_start()` and `write_evaluation_record()`. Not a stage: they are the interval the stages sat inside, and they are what separates the time spent in PolyChord from the time spent idle below |
 
 `image_container_overhead_seconds` (container round trip minus binary time) is
 only available for WSClean, because only its path reports the two separately;
@@ -42,6 +43,11 @@ summed across every evaluation, plus:
   emitted only for serial runs where `NS_MPI_PROCS=1`; at higher MPI process
   counts, ranks run likelihood evaluations concurrently, so summed
   worker-seconds cannot be subtracted from rank-0 elapsed wall time.
+- `busy_worker_seconds` and `busy_wall_seconds` - the evaluation intervals
+  summed, and the same intervals unioned: worker-seconds spent inside a
+  likelihood evaluation, and the wall clock over which *any* evaluation was in
+  flight. `evaluation_busy_seconds()` computes both, clamping to the segment
+  this wall clock covers so a resumed run's adopted records cannot count twice.
 
 ## Running the profiler
 
@@ -72,14 +78,24 @@ not carry:
   evaluations that recorded it, so "39m 15s of imaging" also reads as "53.5s an
   image".
 - **A single share denominator that works at any MPI process count** - the run's
-  *worker-time budget*, `total_wall_seconds x mpi_procs`. Every top-level stage
-  plus the unaccounted remainder is a share of that, so the breakdown always
-  comes to 100% of what the whole process spent. At `NS_MPI_PROCS=1` the budget
-  is just the wall clock and the remainder is exactly
-  `polychord_overhead_seconds`; above 1 the remainder also absorbs the time
-  ranks sat idle waiting on the sampler, which is why it is labelled
-  "unaccounted (PolyChord sampling + idle)" rather than attributed to PolyChord
-  outright.
+  *worker-time budget*, `total_wall_seconds x mpi_procs`. Every top-level row is
+  a share of that, so the breakdown always comes to 100% of what the whole
+  process spent. At `NS_MPI_PROCS=1` the budget is just the wall clock.
+- **The run in two halves, split at `evaluating (sum of the above)`.** Above
+  that line is what happened inside a likelihood evaluation: the timed stages,
+  and the harness Python around them. Below it is the time no evaluation was
+  running in - which used to print as one row, "unaccounted (PolyChord sampling
+  + idle)", named after everything that could be in it, because it was a
+  subtraction rather than a measurement. The evaluation intervals measure it:
+
+  | Row | What it is | What moves it |
+  |---|---|---|
+  | harness (Python around the stages) | Worker-seconds inside an evaluation but outside its timed stages: this repo's own Python between the subprocess calls. A stage in all but name, so it sits with them | Harness code only |
+  | PolyChord (no evaluation in flight) | Wall clock during which no rank was inside an evaluation, charged to every worker because not one of them could spend it. PolyChord's own sampling and `chains/` I/O, plus the run's start-up and shutdown | Nothing on the harness side. [PolyChord costs microseconds a call at every `nlive`](nested-sampling-throughput.md#polychord-itself-costs-microseconds-a-call-at-every-nlive), so on a run of any length this is the per-run constant, not the sampler |
+  | idle (waiting on other workers) | What is left once PolyChord is taken out: workers waiting while other workers were still evaluating, i.e. load imbalance, since an evaluation's cost varies with the point drawn | `--mpi-procs` against `--nlive` - a bigger run keeps more evaluations in flight, which is why [utilisation rises with run size](nested-sampling-throughput.md#a-bigger-run-is-a-more-efficient-run) |
+
+  A run written before the epochs were recorded has no intervals to split, and
+  keeps the single combined row under `accounted (sum of stages above)`.
 - **Stage labels naming the actual imager** - "wsclean container" or "r2d2
   container", taken from the summary's `algorithm`.
 
@@ -93,10 +109,11 @@ are the report's `wall clock` column (omitted at `mpi_procs == 1`, where it
 would repeat the worker-time column) and they add up to the run's end-to-end
 wall time. `render_profiling()` in `scripts/lib/generate_report.py` spells the
 arithmetic out in one line under the chart -
-`accounted + unaccounted = worker-time / workers = wall clock` - and charts it
-as one lane per worker: each lane spans the run's wall clock and carries the
-same stage proportions, so a single lane reads as the wall clock and the lanes
-stacked together read as the worker-time budget. The lanes are the average
+`evaluating + PolyChord + idle = worker-time / workers = wall clock` - and
+charts it as one lane per worker: each lane spans the run's wall clock and
+carries the same proportions, so a single lane reads as the wall clock and the
+lanes stacked together read as the worker-time budget. The chart colours the
+imaging stages and greys the two rows that are not imaging. The lanes are the average
 worker, not per-rank measurements, which the run summary does not record.
 
 ## What a real bounded run showed
@@ -128,6 +145,26 @@ skeleton) and ~0.10s of `wsclean`, which is now well over half the run.
 The rest is one-off startup - the simulate worker, meqserver and the one TDL
 compile, now started concurrently before the sampler runs rather than serially
 inside the first evaluation - plus PolyChord's own sampling and bookkeeping.
+
+### What the two halves show
+
+A 4-rank (3 workers) `--nlive 10 --max-ndead 40` run, 370 evaluations over
+7.14s of wall clock - 21.4s of worker-time - profiles as:
+
+| Row | Total | Per eval | Share |
+|---|---:|---:|---:|
+| WSClean container (total) | 17.7s | 48ms | 82.5% |
+| MeqTrees simulate | 2.10s | 6ms | 9.8% |
+| Metrics computation | 305ms | 1ms | 1.4% |
+| harness (Python around the stages) | 53ms | 143us | 0.2% |
+| **evaluating (sum of the above)** | **20.1s** | **54ms** | **94.0%** |
+| PolyChord (no evaluation in flight) | 58ms | | 0.3% |
+| idle (waiting on other workers) | 1.22s | | 5.7% |
+
+Which is the answer the split exists to give: the time outside an evaluation
+is not the sampler. PolyChord and this harness together are 0.5% of the run,
+and 92% of what is not imaging is three workers waiting on each other - the
+one part of it that `--mpi-procs` and `--nlive` move.
 
 `wsclean` itself is at its floor for this problem size: it self-reports
 0.035s inversion + 0.023s prediction + 0.008s deconvolution per evaluation

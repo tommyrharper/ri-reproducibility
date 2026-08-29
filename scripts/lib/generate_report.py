@@ -27,7 +27,6 @@ NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
 
 from common import (  # noqa: E402
-    PROFILING_VIEW_NOTE,
     format_duration,
     format_share,
     profiling_breakdown,
@@ -1012,7 +1011,13 @@ PROFILING_STAGE_COLOURS = {
     "convert": "var(--series-2)",
     "image_container": "var(--series-3)",
     "metrics": "var(--series-4)",
+    "polychord": "var(--series-5)",
     "unaccounted": "var(--series-5)",
+    # Grey, and deliberately not a sixth categorical hue: these two are the run
+    # not imaging. The eye should read the coloured slices as the science and
+    # the grey as everything spent getting between them.
+    "harness": "color-mix(in srgb, CanvasText 45%, transparent)",
+    "idle": "color-mix(in srgb, CanvasText 18%, transparent)",
 }
 
 
@@ -1133,25 +1138,22 @@ def render_profiling(summary):
         )
         for r in breakdown["rows"]
     )
-    accounted = breakdown["accounted_seconds"]
     body += row(
-        "accounted (sum of stages above)",
-        accounted,
-        breakdown["accounted_share"],
-        accounted / evals if evals else None,
+        breakdown["subtotal_label"],
+        breakdown["subtotal_seconds"],
+        breakdown["subtotal_share"],
+        breakdown["subtotal_per_eval_seconds"],
         emphasis=True,
     )
-    body += row(
-        breakdown["unaccounted_label"],
-        breakdown["unaccounted_seconds"],
-        breakdown["unaccounted_share"],
-        emphasis=True,
-    )
+    # Below the sum: the time no evaluation was running in. PolyChord is
+    # measured, idle is what is left over once it has been taken out.
+    for remainder in breakdown["remainder_rows"]:
+        body += row(remainder["label"], remainder["seconds"], remainder["share"])
     # The row the whole table exists to land on: divided across the workers, the
-    # stages above come to the end-to-end wall clock on the run header.
+    # rows above come to the end-to-end wall clock on the run header.
     wall_seconds = (budget / workers) if budget else 0.0
     body += row(
-        "end-to-end (accounted + unaccounted)",
+        breakdown["total_label"],
         budget,
         1.0 if budget else None,
         emphasis=True,
@@ -1159,16 +1161,9 @@ def render_profiling(summary):
 
     segments = [
         (r["label"], r["seconds"], r["share"], PROFILING_STAGE_COLOURS.get(r["key"], "var(--series-1)"))
-        for r in breakdown["rows"]
-        if not r["is_sub"] and r["share"]
+        for r in [*breakdown["rows"], *breakdown["remainder_rows"]]
+        if not r.get("is_sub") and r["share"]
     ]
-    if breakdown["unaccounted_share"]:
-        segments.append((
-            breakdown["unaccounted_label"],
-            breakdown["unaccounted_seconds"],
-            breakdown["unaccounted_share"],
-            PROFILING_STAGE_COLOURS["unaccounted"],
-        ))
 
     heading = " · ".join([
         f"{workers} worker{'s' if workers != 1 else ''}"
@@ -1180,10 +1175,7 @@ def render_profiling(summary):
     # Spelled out left to right so the arithmetic behind the run header's wall
     # clock is readable without doing any of it yourself; the term it lands on
     # is the one the header shows, so that term carries the emphasis.
-    terms = [
-        f"{format_duration(accounted)} accounted",
-        f"+ {format_duration(breakdown['unaccounted_seconds'])} unaccounted",
-    ]
+    terms = list(breakdown["equation_terms"])
     if mpi_procs != 1:
         terms.append(f"= {format_duration(budget)} of worker-time")
         terms.append(f"÷ {workers} workers")
@@ -1208,7 +1200,7 @@ def render_profiling(summary):
           <tbody>{body}</tbody>
         </table>
       </div>
-      <p class="purpose">{html.escape(PROFILING_VIEW_NOTE)}</p>
+      <p class="purpose">{html.escape(breakdown["note"])}</p>
     </details>
     """
 
@@ -2691,6 +2683,31 @@ def _self_check_profiling():
     assert (
         "5.00s accounted + 5.00s unaccounted <strong>= 10.0s end-to-end wall clock</strong>"
     ) in single, single
+    # Records carrying their wall-clock intervals: PolyChord and idle are rows
+    # and chart segments of their own rather than one "unaccounted" bucket, and
+    # the harness joins the stages above the sum. See profiling_breakdown() for
+    # the arithmetic behind these numbers.
+    split = render_profiling({"algorithm": "wsclean", "profiling": {
+        "mpi_procs": 3, "total_wall_seconds": 10.0,
+        "stage_totals_seconds": {"simulate": 5.5},
+        "stage_eval_counts": {"simulate_seconds": 2},
+        "accounted_worker_seconds": 5.5,
+        "busy_worker_seconds": 6.0, "busy_wall_seconds": 4.0,
+    }})
+    assert "unaccounted" not in split, split
+    assert 'class="profile-stage-sub"' not in split, split
+    assert "PolyChord (no evaluation in flight)</td><td class=\"num\">12.0s</td>" in split, split
+    assert "idle (waiting on other workers)</td><td class=\"num\">2.00s</td>" in split, split
+    assert "harness (Python around the stages)</td><td class=\"num\">500ms</td>" in split, split
+    assert "evaluating (sum of the above)" in split, split
+    assert (
+        "6.00s evaluating + 12.0s PolyChord + 2.00s idle = 20.0s of worker-time ÷ 2 workers"
+        " <strong>= 10.0s end-to-end wall clock</strong>"
+    ) in split, split
+    # One segment per top-level row, in both lanes, adding to the whole budget.
+    assert split.count('class="profile-seg"') == 4 * 2, split
+    shares = [float(s) for s in re.findall(r"--seg-share: ([\d.]+)", split)]
+    assert abs(sum(shares) / 2 - 1.0) < 1e-6, shares
     # No profiling block: nothing rendered.
     assert render_profiling({}) == ""
     # A profiling block with nothing in it must not divide by zero.

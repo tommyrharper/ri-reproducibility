@@ -31,6 +31,7 @@ from common import (
     convert_ms_to_mat,
     load_evaluations_from_dir,
     load_parameter_space,
+    mark_evaluation_start,
     mpi_rank,
     params_key,
     prewarm,
@@ -130,6 +131,9 @@ def evaluate(
     eval_id: int,
     objective_from_metrics: Callable[[dict[str, float]], float],
 ) -> dict[str, Any]:
+    # Opens the wall-clock interval write_evaluation_record() closes, which is
+    # what lets the profiler tell PolyChord's time from idle time.
+    mark_evaluation_start()
     sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
     simulate_seconds = time.perf_counter() - sim_start
@@ -595,7 +599,7 @@ def main() -> None:
 
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
-    run_start = time.monotonic()
+    run_start, run_started_epoch = time.monotonic(), time.time()
     pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start
     # Collective, so every rank calls it before rank 0 goes on alone.
@@ -636,7 +640,7 @@ def main() -> None:
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
-            "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs),
+            "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
         summary_path = output_dir / "summary.json"
