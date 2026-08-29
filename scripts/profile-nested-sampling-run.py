@@ -18,12 +18,17 @@ Usage:
   uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC>
   uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC>/summary.json
   uv run scripts/profile-nested-sampling-run.py <run-dir> --json
+  uv run scripts/profile-nested-sampling-run.py <run-dir> --phases
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
+import datetime
 import json
+import re
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -145,11 +150,112 @@ def print_report(summary: dict[str, Any]) -> None:
     print(f"note: {PROFILING_VIEW_NOTE}")
 
 
+
+
+# --- inside one wsclean process ------------------------------------------
+#
+# `wsclean -log-time` stamps every output line, so a run's own
+# wsclean.stdout.log files are a phase timeline at production concurrency with
+# no rig and no instrumentation (polychord_wsclean.py passes the flag; it costs
+# nothing measurable). A line's stamp is written when the line *starts*, so the
+# work a line announces sits in the gap between it and the next line - and the
+# gaps are bucketed by (line, next line) rather than by line alone, because
+# "Loading data in memory..." appears once per gridding pass and means something
+# different each time. See docs/nested-sampling-phase-profile.md.
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
+_STAMP = re.compile(
+    r"^(\d{4})-(\w{3})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{6}) ?(.*)$")
+
+
+def _phase_label(text: str) -> str:
+    """Collapse the parts of a log line that differ between evaluations."""
+    text = re.sub(r"/\S+", "<path>", text)
+    return re.sub(r"[-+]?\d[\d.eE+-]*", "N", text)[:64]
+
+
+def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[float]]]:
+    """(logs read, mean logged milliseconds, gap milliseconds by phase)."""
+    gaps: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
+    logged: list[float] = []
+    for path in log_paths:
+        rows = []
+        for line in path.read_text(errors="replace").splitlines():
+            stamp = _STAMP.match(line)
+            if stamp:
+                *parts, text = stamp.groups()
+                year, month, day, hour, minute, second, micro = parts
+                rows.append((datetime.datetime(
+                    int(year), _MONTHS[month], int(day), int(hour), int(minute),
+                    int(second), int(micro)).timestamp(), text))
+        if len(rows) < 2:
+            continue
+        logged.append((rows[-1][0] - rows[0][0]) * 1000.0)
+        for (start, text), (end, following) in zip(rows, rows[1:]):
+            gaps[(_phase_label(text), _phase_label(following))].append((end - start) * 1000.0)
+    return len(logged), (statistics.mean(logged) if logged else 0.0), gaps
+
+
+def print_phases(run_dir: Path, top: int) -> None:
+    logs = sorted(run_dir.glob("evaluations/*/wsclean.stdout.log"))
+    if not logs:
+        raise SystemExit(f"no evaluations/*/wsclean.stdout.log under {run_dir}")
+    count, logged_ms, gaps = phase_gaps(logs)
+    if not count:
+        raise SystemExit(
+            f"{len(logs)} wsclean logs under {run_dir} carry no timestamps - the "
+            "run predates `-log-time` being passed by default, so there is no "
+            "timeline in them to read."
+        )
+    print(f"{count} wsclean logs, {logged_ms:.1f} ms of logged work per evaluation")
+    print()
+    print(f"{'ms/eval':>8} {'share':>7} {'n/eval':>7} {'ms each':>8}  phase (log line -> next log line)")
+    print("-" * 110)
+    for (before, after), values in sorted(gaps.items(), key=lambda kv: -sum(kv[1]))[:top]:
+        total = sum(values) / count
+        print(f"{total:8.2f} {total / logged_ms:6.1%} {len(values) / count:7.2f} "
+              f"{statistics.mean(values):8.3f}  {before[:52]} -> {after[:40]}")
+
+
+def self_check() -> None:
+    """A two-line timeline is enough to pin the gap arithmetic and the labels."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        log = Path(raw) / "wsclean.stdout.log"
+        log.write_text(
+            "2026-Aug-29 10:19:02.100000 Gridding 1404 rows...\n"
+            "2026-Aug-29 10:19:02.105500 Gridded visibility count: 4140\n"
+            "not a timestamped line\n"
+            "2026-Aug-29 10:19:02.107500 Opening reordered part 0 for /a/b/sim.ms\n"
+        )
+        count, logged, gaps = phase_gaps([log])
+    assert count == 1, count
+    assert abs(logged - 7.5) < 1e-3, logged
+    assert abs(gaps[("Gridding N rows...", "Gridded visibility count: N")][0] - 5.5) < 1e-3, gaps
+    assert ("Gridded visibility count: N", "Opening reordered part N for <path>") in gaps, gaps
+    print("OK: wsclean phase timeline")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("run", help="Run directory, run name, or summary.json path")
+    parser.add_argument("run", nargs="?", help="Run directory, run name, or summary.json path")
     parser.add_argument("--json", action="store_true", help="Print the raw profiling dict as JSON instead of a table")
+    parser.add_argument("--phases", action="store_true",
+                        help="Break the wsclean binary down by phase, from every evaluation's own -log-time timeline")
+    parser.add_argument("--top", type=int, default=25, help="Phases to print, largest first")
+    parser.add_argument("--self-check", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.self_check:
+        self_check()
+        return
+    if not args.run:
+        parser.error("the following arguments are required: run")
+    if args.phases:
+        run_dir = resolve_run(args.run)
+        print_phases(run_dir.parent if run_dir.is_file() else run_dir, args.top)
+        return
 
     summary = load_summary(resolve_run(args.run))
     if args.json:

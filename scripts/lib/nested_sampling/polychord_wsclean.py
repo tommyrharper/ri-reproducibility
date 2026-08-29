@@ -143,6 +143,14 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
+        # Every output line carries a microsecond timestamp, which makes each
+        # evaluation's wsclean.stdout.log a phase timeline at production
+        # concurrency with no rig and no instrumentation - that is what
+        # `./ri profile <run> --phases` reads. Measured at +0.9% against a
+        # 1.8%-resolution null pair on a 63-Measurement-Set replay, i.e. free,
+        # and ~1 KB on a 400 KB evaluation. See
+        # docs/nested-sampling-phase-profile.md.
+        "-log-time",
         str(ms_path),
     ]
     # No `docker stats` polling loop here, and no `/usr/bin/time -v` either:

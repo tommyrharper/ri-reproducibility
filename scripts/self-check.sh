@@ -53,6 +53,7 @@ nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 host_python() { uv run --no-project --python ">=3.11" python "$@"; }
 
 echo "=== host-side checks ==="
+host_python "${REPO_ROOT}/scripts/profile-nested-sampling-run.py" --self-check
 host_python "${REPO_ROOT}/scripts/test_watchdogs.py"
 host_python "${REPO_ROOT}/scripts/test_self_checks.py"
 

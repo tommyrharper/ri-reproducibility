@@ -177,14 +177,17 @@ it writes.
 ### What is left
 
 The zygote forks a process that has done static initialisation and nothing
-else, so every child still pays casacore's *lazy* initialisation - measures
-tables, unit maps - on first use. In the `-log-time` timeline that is the
-~11 ms between the process's first log line and `=== IMAGING TABLE ===`, none
-of which depends on the Measurement Set. A zygote that imaged one throwaway
-Measurement Set before serving would fork children that had already paid it.
-That is the next thing to measure here; it was not attempted, because it trades
-the property that makes this change safe - the parent has run no WSClean code -
-for ~7% of an evaluation.
+else, so every child still pays casacore's *lazy* initialisation on first use.
+This page originally read the ~11 ms between a child's first log line and
+`=== IMAGING TABLE ===` as that cost and put a parent-side warm-up at ~7% of an
+evaluation. Measured since, the process-global part of it is **0.94 ms** - most
+of those 11 ms is per-Measurement-Set work a child would pay anyway, and the
+expensive lazy initialisation casacore does have (34 ms for a process's first
+`MDirection` conversion) is never triggered in this configuration. A warm-up is
+therefore worth ~1% of an evaluation, below what any rig here resolves, and it
+would still trade away the property that makes this change safe - the parent has
+run no WSClean code. The avenue is closed;
+[the phase profile](nested-sampling-phase-profile.md) has the numbers.
 
 ## Reproducing it
 

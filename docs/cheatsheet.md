@@ -305,11 +305,18 @@ stops it.
 
 ```bash
 ./ri profile results/nested-sampling/<run> [--json]
+./ri profile results/nested-sampling/<run> --phases   # inside the wsclean binary
 uv run scripts/profile-nested-sampling-run.py results/nested-sampling/<run> [--json]
 ```
 
 Every run is profiled automatically; the same breakdown appears in that run's
 HTML report page. Field meanings: `docs/nested-sampling-profiling.md`.
+
+`--phases` goes a level down, into the `wsclean` binary itself: every evaluation
+runs with `-log-time`, so its `wsclean.stdout.log` is a microsecond phase
+timeline and the flag aggregates all of them. What it reads on the current tree,
+and what is and is not left to win there:
+`docs/nested-sampling-phase-profile.md`.
 
 ## Merging runs
 
@@ -417,7 +424,8 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/nested-sampling-clean-loop.md` | The 69% of an evaluation that is WSClean's clean loop, and the one lever that moves it: `-mgain` sets how deep each minor loop goes, so `-niter 100` buys ~6.5 major cycles at 0.8 and ~4.7 at 0.9, worth +20% evaluations per second over three interleaved pairs of real searches - with the 600-Measurement-Set replay table, the re-scored metric differences that make it result-preserving for `total_rms_jy` (1e-7 median) but not for `peak_flux_abs_error_jy` or `sigma_res`, and why it is left at 0.8 |
 | `docs/nested-sampling-ms-open.md` | The largest per-evaluation item outside the gridding arithmetic: WSClean re-opens the parent Measurement Set 15.7 times an evaluation and casacore attaches every subtable on each open, so the simulator deletes the six nothing reads - +14.9% evaluations per second for the first five and another -3.2% on the `wsclean` binary for `FEED`, bit-identical images - with the `-log-time` phase timeline that found it, the replay tables and their nulls, why the drop cannot move into the cached skeleton, the screen showing every other subtable kills WSClean and its columns cannot be stripped either, the refreshed per-evaluation budget, and what a kept MS is no longer |
 | `docs/nested-sampling-wsclean-patches.md` | The local patches `docker/wsclean/patches/` applies to the pinned WSClean tree, why the directory exists, and what each one is worth. 0001 caches the reordered provider's antenna names: WSClean re-opened the parent Measurement Set once per gridding and degridding pass purely to read the `ANTENNA` table, and caching it is +10.5% evaluations per second end to end, -13.1% on the `wsclean` binary, 790 FITS data blocks identical - with the `-log-time` before/after, the three-arm replay and its null, the swapped simultaneous-search pairs and their null, and why a replay corpus on ext4 overstates an MS-open win against a `sim.ms` on tmpfs |
-| `docs/nested-sampling-wsclean-zygote.md` | Why 27ms of every 163ms `wsclean` process runs before `main()` does - casacore's static initialisers across 73 shared objects, priced per library with `LD_PRELOAD` - and the `wsclean-zygote` fork server that pays it once per rank instead: +8.4% evaluations per second end to end over eight simultaneous swapped pairs, 200 FITS data blocks identical, with the `exec`-to-first-log-line measurement that found it, why `image_binary_seconds` and peak RSS now come from `wait4()` rather than a forked `/usr/bin/time`, why the parent must stay single-threaded, and the ~11ms of casacore *lazy* init a warmed-up zygote could still recover |
+| `docs/nested-sampling-wsclean-zygote.md` | Why 27ms of every 163ms `wsclean` process runs before `main()` does - casacore's static initialisers across 73 shared objects, priced per library with `LD_PRELOAD` - and the `wsclean-zygote` fork server that pays it once per rank instead: +8.4% evaluations per second end to end over eight simultaneous swapped pairs, 200 FITS data blocks identical, with the `exec`-to-first-log-line measurement that found it, why `image_binary_seconds` and peak RSS now come from `wait4()` rather than a forked `/usr/bin/time`, why the parent must stay single-threaded, and why the parent-warm-up follow-up is closed (0.94ms, not the ~11ms it was estimated at) |
+| `docs/nested-sampling-phase-profile.md` | Where a post-zygote evaluation's 191ms goes, refreshed on a 5312-evaluation search: 84% is the `wsclean` binary, and inside it 48% is ducc0's gridding and degridding passes, 10% deconvolution, 6.7% *fitting the Gaussian beam to the PSF* (the largest item that is not imaging arithmetic, and one every evaluation pays twice because the theoretical beam under-estimates the fitted one), 21% metadata and I/O. `-log-time` is now passed by default - measured free against a 1.8%-resolution null pair - so `./ri profile <run> --phases` reads that table off any run with no rig. Also closes two avenues with numbers: pre-warming the zygote parent (0.94ms) and WSClean's remaining parent-MS opens (0.51ms each over a plain `Table`) |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 
