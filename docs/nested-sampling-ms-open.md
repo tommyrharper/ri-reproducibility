@@ -6,6 +6,11 @@ on every one of those opens. Deleting the six subtables nothing downstream
 reads is worth +14.9% evaluations per second end to end for the first five and
 another -3.2% on the `wsclean` binary for `FEED`, with bit-identical images.**
 
+> **Follow-up.** This page closes the avenue from the *simulator's* side. The
+> re-opens themselves were then removed on WSClean's side - it was re-opening
+> the parent MS on every pass only to read the `ANTENNA` table - see
+> [local WSClean patches](nested-sampling-wsclean-patches.md).
+
 This is the largest single item outside the gridding arithmetic itself, and it
 was invisible to every previous decomposition because WSClean's own phase line
 (`Inversion:, prediction:, deconvolution:`) does not count it -

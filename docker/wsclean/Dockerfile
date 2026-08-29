@@ -118,6 +118,13 @@ RUN mkdir -p /opt/casacore-data \
 # `./ri build wsclean --native` recompiled casacore too - ~20 minutes of a
 # ~40-minute rebuild, for a flag casacore is not built with.
 ARG WSCLEAN_TARGET_CPU
+
+# Local performance patches, applied to the pinned upstream tree before the
+# build. `git apply` fails the build loudly if a version bump makes one stale,
+# which is the point: a silently dropped patch would be a silent slowdown. See
+# docs/nested-sampling-wsclean-patches.md for what each one is and what it is
+# worth.
+COPY docker/wsclean/patches /usr/src/wsclean-patches
 # PORTABLE=ON forbids TARGET_CPU and drops -march entirely, so cmake's two
 # options are derived from the one build arg. The target is offered to the
 # compiler before it is passed to cmake because WSClean's SetTargetCPU.cmake
@@ -126,6 +133,7 @@ ARG WSCLEAN_TARGET_CPU
 # working; a typo shows up in the build log rather than as a silent slow binary.
 RUN git clone --recurse-submodules --branch ${WSCLEAN_GIT_TAG} --depth 1 \
         --shallow-submodules ${WSCLEAN_GIT_URL} /usr/src/wsclean \
+    && git -C /usr/src/wsclean apply --verbose /usr/src/wsclean-patches/*.patch \
     && mkdir -p /usr/src/wsclean/build \
     && cd /usr/src/wsclean/build \
     && if [ -n "${WSCLEAN_TARGET_CPU}" ] \
