@@ -650,7 +650,7 @@ current run scripts and images.
 Each likelihood evaluation:
 
 ```text
-evaluations/eval-*/sim.ms
+evaluations/eval-*/sim.ms          (deleted once the evaluation is scored)
 evaluations/eval-*/simulation.json
 evaluations/eval-*/wsclean/recon-image.fits
 evaluations/eval-*/wsclean/recon-dirty.fits
@@ -663,15 +663,26 @@ evaluations/eval-*/metrics.json
 Each likelihood evaluation:
 
 ```text
-evaluations/eval-*/sim.ms
+evaluations/eval-*/sim.ms          (deleted once the evaluation is scored)
 evaluations/eval-*/simulation.json
-evaluations/eval-*/r2d2_data.mat
+evaluations/eval-*/r2d2_data.mat   (deleted once the evaluation is scored)
 evaluations/eval-*/r2d2_config.yaml
 evaluations/eval-*/r2d2/r2d2_data/R2D2_model_image.fits
 evaluations/eval-*/r2d2/r2d2_data/dirty_normalised.fits
 evaluations/eval-*/r2d2/r2d2_data/R2D2_residual_dirty_image.fits
 evaluations/eval-*/metrics.json
 ```
+
+The Measurement Set and the `.mat` derived from it are intermediates: nothing
+outside the evaluation reads them, they are 1.5MB of a 1.44MB mean evaluation
+directory, and a run at ~45 evaluations a second writes ~65MB/s of them. They
+are deleted as the evaluation's `metrics.json` is written, which takes an
+evaluation directory to ~0.43MB and is what lets a big run finish on a disk
+that holds one. An evaluation that *failed* keeps everything - a failure is
+what this project is searching for - and `./ri search --keep-measurement-sets`
+keeps them for every evaluation, which the replay benchmarks in
+[nested-sampling-throughput.md](nested-sampling-throughput.md) need. Either
+way the record's `params` (`noise_seed` included) reproduce the MS exactly.
 
 ### Run summary and reports
 

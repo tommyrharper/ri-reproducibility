@@ -310,9 +310,11 @@ exact argv of every evaluation's `wsclean`, so 200 of them can be fed to *N*
 `sh` processes inside one sidecar container. That reproduces the run's
 concurrency and its per-rank `-j 1` without PolyChord, an MPI layer or a
 stochastic evaluation count in the way, and it is repeatable to about 1%,
-which the end-to-end evals/s is not. Keep a run's `evaluations/` directory
-alive to do it - `./ri search` writes one `sim.ms` per evaluation and they are
-the input.
+which the end-to-end evals/s is not. The input is each evaluation's `sim.ms`,
+which a search deletes as it scores the evaluation, so the run being replayed
+has to have been started with `./ri search --keep-measurement-sets` (see
+[the disk footprint section](#the-disk-footprint-is-what-caps-a-big-run-not-the-clock))
+and to have kept its `evaluations/` directory.
 
 `wsclean` prints its own accounting. Over 400 evaluations of one run:
 
@@ -839,3 +841,72 @@ linearly in `num_repeats`, and `num_repeats = 10` at 5 dimensions is 2 per
 dimension, well under PolyChord's own `5 x ndims` guidance. A statistically
 respectable `--num-repeats 25` is 2.5x the evaluations at the same `--nlive`,
 and nothing in the harness will absorb that.
+
+## The disk footprint is what caps a big run, not the clock
+
+Every section above is about evaluations per second. This one is about the
+other way a big run fails to finish.
+
+A WSClean evaluation directory held a mean **1.44MB** (109 evaluations of a
+default search), and the Measurement Set was almost all of it:
+
+| | one evaluation |
+|---|---:|
+| `sim.ms` | 1.50MB |
+| five `wsclean/recon-*.fits` | 0.38MB |
+| `VLAA_ANT`, logs, `metrics.json`, `simulation.json` | 0.06MB |
+| **mean over 109 evaluations** | **1.44MB** |
+
+(The mean is under the sum because `sim.ms` shrinks with `channel_count` and
+`observation_minutes`.) At the ~45-52 evaluations a second the rest of this
+document is about, that is **~65MB/s**, and it is never freed: 202GB of free
+space is **~140k evaluations**. The runs this repo is aiming at are larger than
+that on their own - `--nlive 500 --num-repeats 25` is 500/50 x 25/10 = 25 times
+a default `--nlive 50` run's ~11k evaluations, so ~270k evaluations and ~390GB.
+The disk fills about half way through and the run ends there, having spent
+every hour of imaging it did on a result nobody can read.
+
+Nothing outside an evaluation reads its Measurement Set. `./ri profile`,
+`./ri health`, `./ri report`, `merge` and the resume path all read
+`metrics.json`; the report renders the FITS images; `summary.json` records
+every argv. So a search now deletes `sim.ms` (and, on the R2D2 side, the
+`r2d2_data.mat` derived from it) as it writes the evaluation's
+`metrics.json` - `prune_evaluation_artefacts()` in `common.py`, which is the
+one funnel both imagers' `evaluate()` return through. Measured on the same
+default search: **1.44MB -> 0.43MB per evaluation, 3.4x**.
+
+Two things it deliberately does not do:
+
+- **A failed evaluation keeps everything.** A failure is what this project
+  exists to find, and its inputs are the first thing anyone will want.
+- **The images stay.** They are the evidence, they are 0.38MB against the MS's
+  1.50MB, and the report renders them.
+
+The MS is reproducible from the record either way: `params` carries the
+`noise_seed`, so re-running the recorded `simulate` argv rebuilds it byte for
+byte. `./ri search --keep-measurement-sets` (`NS_KEEP_MEASUREMENT_SETS=1`)
+keeps them for every evaluation, which is what the replay benchmarks earlier
+in this document need. Both that flag and `--synchronous` are now written to
+the run's `run.env`, so `./ri resume` no longer silently changes either one
+part-way through a run.
+
+### It costs no throughput
+
+Three interleaved A/B pairs, `--nlive 25 --num-repeats 10 --mpi-procs 20`,
+same images, a throwaway warm-up arm first (see the burst-clock section):
+
+| seed | keeping the MS | pruning it |
+|---|---:|---:|
+| 4242 | 50.94 evals/s | 52.28 evals/s |
+| 7 | 52.62 | 51.71 |
+| 99 | 52.13 | 50.96 |
+| **mean** | **51.90** | **51.65** |
+
+-0.5%, against a within-arm spread of +/-1.7% - noise, and in both directions.
+That is what the budget predicts: `shutil.rmtree` of one `sim.ms` (81 files) is
+a median **0.52ms** against a ~336ms evaluation, or 0.15%, and iteration 3
+already established that this host is not I/O-bound (the whole `evaluations/`
+directory on `/dev/shm` moved replay throughput by under 1%).
+
+So this is not a speed change and is not offered as one. It is the change that
+lets a run long enough to need the speed actually reach its end.

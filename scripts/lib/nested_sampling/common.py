@@ -1565,7 +1565,93 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     partial.replace(path)
 
 
+# Intermediate artefacts a scored evaluation no longer needs, relative to its
+# evaluation directory. The Measurement Set dominates an evaluation directory
+# (1.5MB of the 1.44MB mean, against 0.39MB of FITS), so a run's disk footprint
+# is really its MS count: at ~45 evaluations a second a search writes ~65MB/s
+# and fills a 200GB disk after ~140k evaluations - well short of the nlive-500,
+# num_repeats-25 runs this repo is aiming at. Nothing outside the evaluation
+# reads them: the images, the metrics and every recorded argv stay, and the MS
+# is reproducible from the record's params (`noise_seed` included) if one is
+# ever wanted back. Set NS_KEEP_MEASUREMENT_SETS=1 to keep them - the replay
+# benchmarks in docs/nested-sampling-throughput.md need it.
+PRUNED_ARTEFACTS = (("sim.ms", "measurement_set"), ("VLAA_ANT", None), ("r2d2_data.mat", "mat"))
+
+
+def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
+    """Drop a scored evaluation's Measurement Set, and the paths naming it.
+
+    Only for an evaluation that produced a score. A failed one keeps
+    everything: a failure is what this project is searching for, and its
+    inputs are the first thing anyone will want.
+    """
+    import shutil
+
+    if "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0":
+        return
+    for name, path_key in PRUNED_ARTEFACTS:
+        target = eval_dir / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+        if path_key:
+            record.get("paths", {}).pop(path_key, None)
+
+
+def self_check_evaluation_pruning() -> None:
+    import tempfile
+
+    def evaluation(root: Path, name: str) -> Path:
+        eval_dir = root / name
+        (eval_dir / "sim.ms" / "table.f0").parent.mkdir(parents=True)
+        (eval_dir / "sim.ms" / "table.f0").write_text("data")
+        (eval_dir / "VLAA_ANT").mkdir()
+        (eval_dir / "r2d2_data.mat").write_text("mat")
+        (eval_dir / "wsclean").mkdir()
+        (eval_dir / "wsclean" / "recon-image.fits").write_text("image")
+        return eval_dir
+
+    def record_for(eval_dir: Path, **extra: Any) -> dict[str, Any]:
+        paths = {"eval_dir": str(eval_dir), "measurement_set": str(eval_dir / "sim.ms"),
+                 "mat": str(eval_dir / "r2d2_data.mat"), "image": str(eval_dir / "wsclean" / "recon-image.fits")}
+        return {"eval_id": 1, "params": {"a": 1}, "objective": 0.5, "paths": paths, **extra}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        scored = evaluation(root, "eval-0001-scored")
+        written = write_evaluation_record(scored, record_for(scored))
+        assert not (scored / "sim.ms").exists() and not (scored / "VLAA_ANT").exists()
+        assert not (scored / "r2d2_data.mat").exists()
+        # The evidence a failure-mode search exists to produce is never pruned.
+        assert (scored / "wsclean" / "recon-image.fits").exists()
+        # A record must not name a file this just deleted.
+        assert "measurement_set" not in written["paths"] and "mat" not in written["paths"]
+        assert written["paths"]["image"].endswith("recon-image.fits")
+        assert json.loads((scored / "metrics.json").read_text())["paths"] == written["paths"]
+
+        # A failed evaluation keeps its inputs: that is the case worth looking at.
+        failed = evaluation(root, "eval-0002-failed")
+        write_evaluation_record(failed, record_for(failed, error="wsclean failed with exit 1"))
+        assert (failed / "sim.ms").exists() and (failed / "r2d2_data.mat").exists()
+
+        saved = os.environ.get("NS_KEEP_MEASUREMENT_SETS")
+        os.environ["NS_KEEP_MEASUREMENT_SETS"] = "1"
+        try:
+            kept = evaluation(root, "eval-0003-kept")
+            written = write_evaluation_record(kept, record_for(kept))
+            assert (kept / "sim.ms").exists() and (kept / "VLAA_ANT").exists()
+            assert written["paths"]["measurement_set"].endswith("sim.ms")
+        finally:
+            if saved is None:
+                del os.environ["NS_KEEP_MEASUREMENT_SETS"]
+            else:
+                os.environ["NS_KEEP_MEASUREMENT_SETS"] = saved
+    print("evaluation artefact pruning self-check passed")
+
+
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
+    prune_evaluation_artefacts(eval_dir, record)
     write_json_atomic(eval_dir / "metrics.json", record)
     return record
 

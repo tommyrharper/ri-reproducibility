@@ -47,6 +47,7 @@ SEARCH_ENV = (
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
     ("synchronous", "NS_SYNCHRONOUS"),
+    ("keep_measurement_sets", "NS_KEEP_MEASUREMENT_SETS"),
     ("retries", "NS_RETRIES"),
     ("stall_timeout", "NS_STALL_TIMEOUT"),
     ("omp_threads", "R2D2_OMP_THREADS"),
@@ -350,6 +351,11 @@ def build_parser():
                              "round. Off by default: it costs ~30%% of the wall clock "
                              "here and buys nothing this search needs "
                              "[NS_SYNCHRONOUS], see docs/nested-sampling-throughput.md")
+    search.add_argument("--keep-measurement-sets", action=argparse.BooleanOptionalAction,
+                        help="keep each evaluation's sim.ms instead of deleting it once "
+                             "the evaluation is scored. Off by default: the MS is most of "
+                             "a run's ~1.4MB per evaluation and nothing reads it afterwards "
+                             "[NS_KEEP_MEASUREMENT_SETS], see docs/nested-sampling-throughput.md")
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
     search.add_argument("--retries", type=int, metavar="N",

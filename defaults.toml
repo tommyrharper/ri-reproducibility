@@ -56,6 +56,16 @@ NS_METRIC = "total_rms_jy"
 # what the asynchronous mode gives up.
 NS_SYNCHRONOUS = 0
 
+# Keep each evaluation's Measurement Set after the evaluation is scored. Off,
+# because the MS is 1.5MB of the 1.44MB mean evaluation directory and nothing
+# outside the evaluation reads it: at ~45 evaluations a second a search writes
+# ~65MB/s of them and fills a 200GB disk after ~140k evaluations, which is less
+# than one nlive-500, num_repeats-25 run. The images, metrics and recorded argv
+# are kept either way, a failed evaluation keeps everything, and the MS is
+# reproducible from the record's params. 1 keeps them, which the replay
+# benchmarks in docs/nested-sampling-throughput.md need.
+NS_KEEP_MEASUREMENT_SETS = 0
+
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
 # scored no evaluations is never retried, and one that ran longer than

@@ -3062,8 +3062,10 @@ def self_check() -> None:
             assert live_loglikelihoods(live) == []
             assert describe(live, ranks, DEFAULT_STALE_SECONDS)["forecast"] is None
 
-            # Disk: the one resource nothing here reserves, frees or prunes,
-            # and the only one whose exhaustion ends a run outright.
+            # Disk: the resource whose exhaustion ends a run outright, and
+            # the one this cannot reserve. A search prunes each evaluation's
+            # Measurement Set as it scores it, which cut the rate ~3.4x and
+            # did not remove the need to forecast it.
             bulky = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T000200Z"
             (bulky / "evaluations").mkdir(parents=True)
             (bulky / "run.env").write_text("NS_ALGORITHM=r2d2\n")

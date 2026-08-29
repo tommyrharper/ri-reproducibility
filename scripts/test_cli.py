@@ -71,13 +71,21 @@ check(
     plan("search", "wsclean", "--stall-timeout", "0")[0],
 )
 
-# --synchronous is the only boolean here, and the scripts test it the shell
-# way, so it has to arrive as 1/0 rather than Python's True/False.
+# The booleans here reach shell scripts that test them the shell way, so they
+# have to arrive as 1/0 rather than Python's True/False.
 check(
     "search --synchronous/--no-synchronous become 1/0",
     ({"NS_SYNCHRONOUS": "1"}, {"NS_SYNCHRONOUS": "0"}),
     (plan("search", "wsclean", "--synchronous")[0],
      plan("search", "wsclean", "--no-synchronous")[0]),
+)
+
+
+check(
+    "search --keep-measurement-sets/--no-... become 1/0",
+    ({"NS_KEEP_MEASUREMENT_SETS": "1"}, {"NS_KEEP_MEASUREMENT_SETS": "0"}),
+    (plan("search", "wsclean", "--keep-measurement-sets")[0],
+     plan("search", "wsclean", "--no-keep-measurement-sets")[0]),
 )
 
 
