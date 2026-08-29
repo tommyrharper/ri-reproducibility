@@ -652,7 +652,6 @@ current run scripts and images.
 Each likelihood evaluation:
 
 ```text
-evaluations/eval-*/sim.ms          (deleted once the evaluation is scored)
 evaluations/eval-*/simulation.json
 evaluations/eval-*/wsclean/recon-image.fits
 evaluations/eval-*/wsclean/recon-dirty.fits
@@ -665,7 +664,6 @@ evaluations/eval-*/metrics.json
 Each likelihood evaluation:
 
 ```text
-evaluations/eval-*/sim.ms          (deleted once the evaluation is scored)
 evaluations/eval-*/simulation.json
 evaluations/eval-*/r2d2_data.mat   (deleted once the evaluation is scored)
 evaluations/eval-*/r2d2_config.yaml
@@ -675,14 +673,20 @@ evaluations/eval-*/r2d2/r2d2_data/R2D2_residual_dirty_image.fits
 evaluations/eval-*/metrics.json
 ```
 
-The Measurement Set and the `.mat` derived from it are intermediates: nothing
-outside the evaluation reads them, they are 1.5MB of a 1.44MB mean evaluation
-directory, and a run at ~45 evaluations a second writes ~65MB/s of them. They
-are deleted as the evaluation's `metrics.json` is written, which takes an
-evaluation directory to ~0.43MB and is what lets a big run finish on a disk
-that holds one. An evaluation that *failed* keeps everything - a failure is
-what this project is searching for - and `./ri search --keep-measurement-sets`
-keeps them for every evaluation, which the replay benchmarks in
+`sim.ms` is not in either listing because a scored evaluation never writes one
+to disk at all: the simulator builds it in a tmpfs directory shared by every
+container (`NS_SCRATCH_DIR`, see
+[nested-sampling-throughput.md](nested-sampling-throughput.md)), the imager
+reads it there, and it is deleted as the evaluation's `metrics.json` is
+written - along with the `makems.cfg` and `makems.log` that used to sit beside
+it. The `.mat` R2D2 derives from it is written in the evaluation directory and
+deleted at the same moment. Nothing outside the evaluation reads either one,
+and together they were 1.5MB of a 1.44MB mean evaluation directory, so dropping
+them takes it to ~0.43MB and is what lets a big run finish on a disk that holds
+one. An evaluation that *failed* keeps everything, moved back beside its record
+out of the scratch directory - a failure is what this project is searching for
+- and `./ri search --keep-measurement-sets` does the same for every evaluation,
+which the replay benchmarks in
 [nested-sampling-throughput.md](nested-sampling-throughput.md) need. Either
 way the record's `params` (`noise_seed` included) reproduce the MS exactly.
 

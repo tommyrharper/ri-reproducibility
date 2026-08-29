@@ -1396,3 +1396,92 @@ that is the whole of it.
   `nproc`, which brings it to ~9 minutes on this 20-thread host. It is
   deliberately outside `inputs_hash`: it changes how long the build takes, not
   what it produces.
+
+## The Measurement Set never reaches the disk any more
+
+The simulator builds its Measurement Set in `/dev/shm` and then moved the
+finished tables onto the bind mount, because each container's `/dev/shm` is
+private and the imager runs in a different one. For a WSClean search that copy
+existed only so a second container could open a file that the next few hundred
+milliseconds delete again.
+
+`NS_SCRATCH_DIR` removes it. `scripts/lib/start-sidecars.sh` creates one host
+tmpfs directory per run (`/dev/shm/ri-ns-scratch-<pid>`) and bind-mounts it into
+all three containers at its own path, exactly as `$REPO_ROOT` already is; the
+rank puts the evaluation's MS in `<scratch>/<eval dir name>/` rather than in the
+evaluation directory (`evaluation_scratch_dir()` in `common.py`), the imager
+reads it there, and `prune_evaluation_artefacts()` deletes it as `metrics.json`
+is written. Only the evaluations in flight are ever present, so the directory
+holds ~1.5MB per rank, not per evaluation, and the run's `EXIT`/`INT`/`TERM`
+trap removes it. An evaluation that *failed*, and every evaluation under
+`--keep-measurement-sets`, has its scratch contents moved back beside its
+record first - the scratch is RAM and goes away with the run, and a failure's
+inputs are the whole point of this search. With `NS_SCRATCH_DIR` unset (a
+self-check, a host with no writable `/dev/shm`) everything behaves exactly as
+before.
+
+### The isolated rig said 5.1ms; the search says 1.2ms
+
+Nineteen concurrent simulate processes, 60 evaluations each, median over the 19
+workers, three interleaved pairs, first arm discarded for the burst clock:
+
+| destination | simulate total | `move sim.ms` | skeleton | fill |
+|---|---|---|---|---|
+| bind mount (ext4) | 14.3 / 14.2 / 14.3 ms | 4.66 / 4.67 / 4.72 ms | 4.26 / 4.17 / 4.20 ms | 3.35 / 3.60 / 3.43 ms |
+| shared tmpfs | 9.10 / 9.16 / 11.3 ms | 0.01 ms | 4.15 / 4.19 / 5.04 ms | 3.49 / 3.58 / 4.23 ms |
+
+Same-filesystem, the move is a `rename()`; cross-device it is a 66-file
+copytree. So the rig puts the copy at 5.1ms, 36% of the simulate stage.
+
+Three interleaved end-to-end pairs (`--nlive 25 --num-repeats 10 --mpi-procs
+20`, seed 4242, `sim`/`bin` are the summary's per-evaluation stage means):
+
+| pair | scratch on ext4 | scratch on tmpfs |
+|---|---|---|
+| 1 | sim 24.97 ms, bin 269.1 ms, 58.00 evals/s | sim 23.35 ms, bin 260.4 ms, 60.02 evals/s |
+| 2 | sim 24.73 ms, bin 264.0 ms, 59.29 evals/s | sim 23.65 ms, bin 262.9 ms, 59.02 evals/s |
+| 3 | sim 24.82 ms, bin 263.4 ms, 60.47 evals/s | sim 24.04 ms, bin 269.5 ms, 60.49 evals/s |
+
+The simulate column moves by -1.6/-1.1/-0.8 ms, consistent in sign and size;
+the evals/s column does not move at all, because 1.2ms is 0.4% of a 327ms
+evaluation and the run-to-run swing in evaluation count is 10%.
+
+**The rig over-stated the copy by 4x, and the reason generalises.** The rig ran
+the copy on all 19 workers at once; a real search has the simulate stage at 25ms
+of a ~330ms evaluation, so only one or two ranks are ever copying, and the copy
+runs uncontended at its ~2.3ms serial cost instead of its 5.1ms all-workers
+cost. An isolated rig that saturates every worker with one stage measures that
+stage's *contended* cost, and is only the right number for a stage whose duty
+cycle in the real run is near 1. (This is the opposite correction to the one
+[the constant-columns section](#the-two-constant-columns-are-gone) records,
+where the rig *under*-stated a win because the real run's contention is with
+`wsclean` rather than with 18 copies of the stage under test. Both say the same
+thing: match the rig's mix of work to the run's, or expect the number to be
+wrong in whichever direction the mismatch points.)
+
+What is worth having anyway is what the change deletes rather than what it
+saves: a run at 60 evaluations/s no longer creates 66 files and ~840KB of
+Measurement Set per evaluation on the disk (~50MB/s) only to unlink them, and
+`makems.cfg`/`makems.log` leave the evaluation directory with them.
+
+## `image_container_overhead` is mostly GNU `time`'s clock resolution
+
+`image_binary_seconds` comes from GNU `time -v`'s own "Elapsed (wall clock)
+time", which prints centiseconds. On a ~270ms `wsclean` call that is a 10ms
+quantum, and `image_container_overhead` - the profiler's
+`image_container_seconds - image_binary_seconds` - is the residue. Over the
+6133 evaluations of a default search its distribution is
+
+| min | p10 | p25 | median | p75 | p90 | p99 |
+|---|---|---|---|---|---|---|
+| 1.07 ms | 3.06 | 5.12 | 8.00 | 10.63 | 13.13 | 20.02 ms |
+
+- a 10ms-wide spread sitting on a ~1ms floor, which is the real cost: the
+`sh` fork and the `/usr/bin/time` exec inside the already-running sidecar.
+There is no `docker exec` in it (one long-lived `sh` per rank serves the whole
+run, see `sidecar_shell()`), and there is nothing here to reclaim. Averaged
+over thousands of evaluations the quantisation is a constant bias, so an A/B on
+the `image_binary` column is sound - which is what
+[the AVX2 section](#the-avx2-build-stopped-being-opt-in) relied on - but the
+~7ms "overhead" line in the per-stage table is a rounding artefact, and the
+`wsclean` binary is correspondingly ~5ms dearer than that table says.

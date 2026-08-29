@@ -727,6 +727,10 @@ def sidecar_container(image: str, platform: str, extra_args: list[str] | None = 
     """
     if image not in _SIDECAR_CONTAINERS:
         repo_root = os.environ.get("REPO_ROOT", os.getcwd())
+        # The shared MS scratch tmpfs, when the run script made one; see
+        # evaluation_scratch_dir().
+        scratch = os.environ.get("NS_SCRATCH_DIR", "")
+        scratch_mount = ["-v", f"{scratch}:{scratch}"] if scratch else []
         name = f"ri-ns-sidecar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         subprocess.run(
             [
@@ -741,6 +745,7 @@ def sidecar_container(image: str, platform: str, extra_args: list[str] | None = 
                 "--shm-size", "512m",
                 "--platform", platform,
                 "-v", f"{repo_root}:{repo_root}",
+                *scratch_mount,
                 *(extra_args or []),
                 "--entrypoint", "sleep", image, "infinity",
             ],
@@ -1076,6 +1081,13 @@ def read_gnu_time_wall_seconds(time_path: Path) -> float | None:
     This is the binary's actual run time inside the container, separate from
     docker create/start/teardown overhead measured around the whole `docker
     run` invocation.
+
+    GNU time prints centiseconds, so this is quantised to 10ms - 3.7% of a
+    ~270ms wsclean call, and most of the ~8ms `image_container_overhead` the
+    profiler reports, which is a rounding residue and not a cost anything can
+    remove. Averaged over thousands of evaluations the quantisation is a
+    constant bias, so an A/B on this column is still sound; a single
+    evaluation's split is not. See docs/nested-sampling-throughput.md.
     """
     if not time_path.is_file():
         return None
@@ -1595,16 +1607,47 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 PRUNED_ARTEFACTS = (("sim.ms", "measurement_set"), ("VLAA_ANT", None), ("r2d2_data.mat", "mat"))
 
 
+def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
+    """Where this evaluation builds its Measurement Set, or None for `eval_dir`.
+
+    The simulator assembles the MS in the meqtrees container's own /dev/shm,
+    which no other container can see, so it used to copy the finished tables
+    onto the bind mount purely so the wsclean sidecar could open them - 5.1ms of
+    a 14.3ms simulate at 19 concurrent workers, for a file the next few hundred
+    milliseconds delete again. `NS_SCRATCH_DIR` is a host tmpfs directory
+    bind-mounted into every container at the same path (see
+    scripts/lib/start-sidecars.sh), so the MS is written once, imaged where it
+    lies and deleted there. Unset - a self-check, a host with no writable
+    /dev/shm - it is built in the evaluation directory exactly as before.
+    """
+    root = os.environ.get("NS_SCRATCH_DIR", "")
+    return Path(root) / eval_dir.name if root else None
+
+
 def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
     """Drop a scored evaluation's Measurement Set, and the paths naming it.
 
     Only for an evaluation that produced a score. A failed one keeps
     everything: a failure is what this project is searching for, and its
-    inputs are the first thing anyone will want.
+    inputs are the first thing anyone will want - so anything it left in the
+    scratch directory is moved back beside its record first, since the scratch
+    directory is RAM and goes away with the run.
     """
     import shutil
 
-    if "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0":
+    keeping = "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is not None and scratch.is_dir():
+        if keeping:
+            for produced in scratch.iterdir():
+                destination = eval_dir / produced.name
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                shutil.move(str(produced), destination)
+            if (eval_dir / "sim.ms").exists() and "measurement_set" in record.get("paths", {}):
+                record["paths"]["measurement_set"] = str(eval_dir / "sim.ms")
+        shutil.rmtree(scratch, ignore_errors=True)
+    if keeping:
         return
     for name, path_key in PRUNED_ARTEFACTS:
         target = eval_dir / name
@@ -1664,6 +1707,33 @@ def self_check_evaluation_pruning() -> None:
                 del os.environ["NS_KEEP_MEASUREMENT_SETS"]
             else:
                 os.environ["NS_KEEP_MEASUREMENT_SETS"] = saved
+
+        # With a scratch directory the MS is built outside the evaluation, so a
+        # scored one has nothing to delete and a failed one has to have its
+        # inputs moved back beside its record before the scratch goes away.
+        os.environ["NS_SCRATCH_DIR"] = str(root / "scratch")
+        try:
+            for name, extra in (("eval-0004-scored", {}), ("eval-0005-failed", {"error": "wsclean failed"})):
+                eval_dir = root / name
+                eval_dir.mkdir()
+                scratch = evaluation_scratch_dir(eval_dir)
+                assert scratch == root / "scratch" / name, scratch
+                (scratch / "sim.ms").mkdir(parents=True)
+                (scratch / "sim.ms" / "table.f0").write_text("data")
+                (scratch / "VLAA_ANT").mkdir()
+                record = {"eval_id": 1, "params": {"a": 1}, "objective": 0.5,
+                          "paths": {"eval_dir": str(eval_dir), "measurement_set": str(scratch / "sim.ms")}, **extra}
+                written = write_evaluation_record(eval_dir, record)
+                assert not scratch.exists(), f"{name} left its scratch behind"
+                if extra:
+                    assert (eval_dir / "sim.ms" / "table.f0").read_text() == "data"
+                    assert (eval_dir / "VLAA_ANT").is_dir()
+                    assert written["paths"]["measurement_set"] == str(eval_dir / "sim.ms")
+                else:
+                    assert not (eval_dir / "sim.ms").exists()
+                    assert "measurement_set" not in written["paths"]
+        finally:
+            del os.environ["NS_SCRATCH_DIR"]
     print("evaluation artefact pruning self-check passed")
 
 
@@ -1986,7 +2056,16 @@ def simulate_measurement_set(
     platform: str,
 ) -> tuple[Path, list[str], subprocess.CalledProcessError | None]:
     eval_dir.mkdir(parents=True, exist_ok=False)
-    ms_path = eval_dir / "sim.ms"
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is not None:
+        # A restart that re-runs an evaluation whose scratch survived would hit
+        # require_clean_output() in the simulator; the run owns this directory,
+        # so clearing it is safe and normally costs an ENOENT.
+        import shutil
+
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+    ms_path = (scratch or eval_dir) / "sim.ms"
     sim_stdout = eval_dir / "simulate.stdout.log"
     sim_stderr = eval_dir / "simulate.stderr.log"
     sim_cmd = [
