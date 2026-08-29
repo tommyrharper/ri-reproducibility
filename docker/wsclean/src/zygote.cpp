@@ -28,6 +28,8 @@
 #include <aocommon/checkblas.h>
 #include <aocommon/logger.h>
 
+#include <fftw3.h>
+
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -114,6 +116,48 @@ void Redirect(const std::string& path, int fd, int flags) {
   _exit(status);
 }
 
+// FFTW builds a per-transform-size plan the first time it is asked for one, and
+// wsclean asks 63 times per evaluation while never keeping one: schaapcommon's
+// Convolve() creates and destroys four 1-D plans on every call (radler runs one
+// per major cycle) and its Resampler constructor creates two 2-D ones per
+// gridding and degridding pass. Counted with an LD_PRELOAD shim over the
+// fftwf_plan_* entry points, that is 6.3ms of a ~56ms serial process, of which
+// 4.4ms is the once-per-size build and 1.9ms the repeats.
+//
+// The once-per-size half is process-global state a forked child inherits, so
+// the parent pays it here and no evaluation pays it again. Sizes, for this
+// search's fixed `-size 128 128` and its baseline-derived `-scale`:
+//   128  the image itself
+//   142  radler's deconvolution convolution, even(ceil(1.1 x 128))
+//   156  the padded image
+//   108  the gridder's chosen inversion size ("using optimal: 108 x 108" in
+//        every one of a 6641-evaluation run's logs)
+// A size that stops being used costs this warm-up and nothing else; one that
+// starts being used is simply not warmed, so this can only lose the speedup,
+// never a result. See docs/nested-sampling-fftw-planner.md.
+void WarmFftwPlanner() {
+  for (const int n : {108, 128, 142, 156}) {
+    fftwf_destroy_plan(fftwf_plan_dft_r2c_1d(n, nullptr, nullptr, FFTW_ESTIMATE));
+    fftwf_destroy_plan(
+        fftwf_plan_dft_1d(n, nullptr, nullptr, FFTW_FORWARD, FFTW_ESTIMATE));
+    fftwf_destroy_plan(
+        fftwf_plan_dft_1d(n, nullptr, nullptr, FFTW_BACKWARD, FFTW_ESTIMATE));
+    fftwf_destroy_plan(fftwf_plan_dft_c2r_1d(n, nullptr, nullptr, FFTW_ESTIMATE));
+
+    // Resampler plans against fftw-allocated buffers, and FFTW keys what it
+    // learns on their alignment, so the warm-up has to allocate too.
+    float* image = fftwf_alloc_real(static_cast<size_t>(n) * n);
+    fftwf_complex* spectrum =
+        fftwf_alloc_complex(static_cast<size_t>(n) * (n / 2 + 1));
+    fftwf_destroy_plan(
+        fftwf_plan_dft_r2c_2d(n, n, image, spectrum, FFTW_ESTIMATE));
+    fftwf_destroy_plan(
+        fftwf_plan_dft_c2r_2d(n, n, spectrum, image, FFTW_ESTIMATE));
+    fftwf_free(spectrum);
+    fftwf_free(image);
+  }
+}
+
 double MonotonicSeconds() {
   timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -125,6 +169,7 @@ double MonotonicSeconds() {
 int main() {
   check_openblas_multithreading();
   RefuseIfThreaded();
+  WarmFftwPlanner();
 
   for (std::string line; std::getline(std::cin, line);) {
     const std::vector<std::string> fields = SplitTabs(line);

@@ -186,8 +186,15 @@ expensive lazy initialisation casacore does have (34 ms for a process's first
 `MDirection` conversion) is never triggered in this configuration. A warm-up is
 therefore worth ~1% of an evaluation, below what any rig here resolves, and it
 would still trade away the property that makes this change safe - the parent has
-run no WSClean code. The avenue is closed;
+run no WSClean code. The avenue is closed for *casacore*;
 [the phase profile](nested-sampling-phase-profile.md) has the numbers.
+
+The parent is not idle any more, though. Process-global state that is worth
+pre-paying does exist - it is FFTW's, not casacore's: 4.4 ms an evaluation of
+transform-plan building that a warmed parent hands to every child, which is what
+`WarmFftwPlanner()` does and
+[the FFTW planner doc](nested-sampling-fftw-planner.md) measures. It keeps the
+property above: building an FFT plan runs no WSClean code.
 
 ## Reproducing it
 

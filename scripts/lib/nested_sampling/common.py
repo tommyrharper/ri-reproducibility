@@ -231,6 +231,9 @@ DEFAULT_WSCLEAN_MGAIN = 0.8
 # `data_3c353.mat` example, not of these runs, and was never written into the
 # config - so R2D2 has always run at 1.5.)
 DEFAULT_IMAGE_DIM = 128
+# Changing it also stales docker/wsclean/src/zygote.cpp's FFTW warm-up, whose
+# four transform sizes are derived from this one (docs/nested-sampling-fftw-planner.md).
+# A stale list costs the speedup, never a result.
 DEFAULT_SUPER_RESOLUTION = 1.5
 
 # `source_offset_fraction` geometry (docs/parameter-space-proposal.md, section 1).
