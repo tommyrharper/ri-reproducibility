@@ -41,6 +41,7 @@ os.environ.setdefault("REPO_ROOT", str(REPO_ROOT))
 # are listed because they cost nothing and become real coverage in the image.
 HOST_RUNNABLE = {
     "common": (
+        "self_check_backfilled_intervals",
         "self_check_evaluation_pruning",
         "self_check_parameter_space",
         "self_check_parameter_toggle",

@@ -24,7 +24,7 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 | `image_container_seconds` | Wall time for the imaging round trip: a `docker run` for WSClean, one request to this rank's R2D2 worker for R2D2 |
 | `image_binary_seconds` | WSClean only: the imaging child's own elapsed time, from `wait4()` in the rank's `wsclean-zygote` (before 29 August 2026, from `/usr/bin/time -v`, quantised to 10ms - see [the zygote doc](nested-sampling-wsclean-zygote.md)) |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
-| `started_epoch`, `ended_epoch` | Wall-clock epochs the evaluation began and finished at, stamped by `mark_evaluation_start()` and `write_evaluation_record()`. Not a stage: they are the interval the stages sat inside, and they are what separates the time spent in PolyChord from the time spent idle below |
+| `started_epoch`, `ended_epoch` | Wall-clock epochs the evaluation began and finished at, stamped by `mark_evaluation_start()` and `write_evaluation_record()`. Not a stage: they are the interval the stages sat inside, and they are what separates the time spent in PolyChord from the time spent idle below. A run that predates them has them reconstructed at read time from the mtime of this file - see `backfill_busy_seconds()` |
 
 `image_container_overhead_seconds` (container round trip minus binary time) is
 only available for WSClean, because only its path reports the two separately;
@@ -97,8 +97,29 @@ not carry:
   | PolyChord (no evaluation in flight) | Wall clock during which no rank was inside an evaluation, charged to every worker because not one of them could spend it. PolyChord's own sampling and `chains/` I/O, plus the run's start-up and shutdown | Nothing on the harness side. [PolyChord costs microseconds a call at every `nlive`](nested-sampling-throughput.md#polychord-itself-costs-microseconds-a-call-at-every-nlive), so on a run of any length this is the per-run constant, not the sampler |
   | idle (waiting on other workers) | What is left once PolyChord is taken out: workers waiting while other workers were still evaluating, i.e. load imbalance, since an evaluation's cost varies with the point drawn | `--mpi-procs` against `--nlive` - a bigger run keeps more evaluations in flight, which is why [utilisation rises with run size](nested-sampling-throughput.md#a-bigger-run-is-a-more-efficient-run) |
 
-  A run written before the epochs were recorded has no intervals to split, and
-  keeps the single combined row under `accounted (sum of stages above)`.
+  A run archived before the epochs were stamped is split anyway, from its own
+  file mtimes - see below - and keeps the single combined row only when even
+  that is not available.
+- **The intervals of a run that never stamped any**, from
+  `backfill_busy_seconds()`. Each evaluation's `metrics.json` is written once,
+  at the end of that evaluation, so its mtime is the interval's end and the
+  stage totals on the record are its length. Against a run carrying both, the
+  reconstruction is within 0.5% of the stamped numbers. It is refused - leaving
+  the combined row, and a note saying why - in the two cases where it would
+  invent a timeline rather than read one:
+
+  - **A record whose evaluation directory has gone.** The time of an evaluation
+    nobody can see would be charged to PolyChord, which is worse than not
+    splitting at all.
+  - **mtimes that cannot be a timeline.** Directories restored from a backup,
+    or rewritten in a batch, all carry the time of that copy. The giveaway is
+    arithmetic: worker-seconds of imaging that will not fit in the wall clock
+    the mtimes claim they happened in (`busy_wall x workers < busy_worker`).
+    Five of this repo's earliest runs are refused on exactly that.
+
+  A reconstructed interval is the timed stages and nothing else, so those runs
+  carry no `harness` row - what the subtraction would leave is float noise, and
+  it goes to idle with the rest of what was never measured.
 - **Stage labels naming the actual imager** - "wsclean container" or "r2d2
   container", taken from the summary's `algorithm`.
 

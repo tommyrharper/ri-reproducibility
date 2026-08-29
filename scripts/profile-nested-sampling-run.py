@@ -39,6 +39,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_sampling"))
 
 from common import (  # noqa: E402
+    backfill_busy_seconds,
     format_duration,
     format_share,
     profiling_breakdown,
@@ -95,7 +96,9 @@ def print_report(summary: dict[str, Any]) -> None:
             "predating profiler instrumentation; re-run it to get one."
         )
 
-    breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
+    # backfill_busy_seconds first: a run archived before the evaluation epochs
+    # existed still has them, in the mtimes of its own metrics.json files.
+    breakdown = profiling_breakdown(backfill_busy_seconds(summary), summary.get("algorithm"))
     mpi_procs = breakdown["mpi_procs"]
     workers = breakdown["worker_procs"]
     budget = breakdown["worker_seconds_budget"]

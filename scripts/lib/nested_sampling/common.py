@@ -1158,6 +1158,16 @@ PROFILING_STAGE_FIELDS = (
     "metrics_seconds",
 )
 
+# The stages an evaluation is made of, which is not every field above:
+# image_binary_seconds is the imaging *inside* image_container_seconds, and
+# adding it would count that time twice.
+ACCOUNTED_STAGE_FIELDS = (
+    "simulate_seconds",
+    "convert_seconds",
+    "image_container_seconds",
+    "metrics_seconds",
+)
+
 
 def evaluation_busy_seconds(
     evaluations: list[dict[str, Any]],
@@ -1200,6 +1210,54 @@ def evaluation_busy_seconds(
     return sum(finish - begin for begin, finish in spans), union
 
 
+def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
+    """The evaluation intervals of a run that finished before they were stamped.
+
+    Reading them is what splits a profile's remainder into PolyChord and idle,
+    and a run archived before `started_epoch`/`ended_epoch` existed would
+    otherwise be stuck for good with the one bucket named after both. It is not
+    stuck: each evaluation's own `metrics.json` is written once, at the end of
+    that evaluation, so its mtime is the interval's end, and the stage totals
+    already on the record are its length. Measured against a run that carries
+    both, the two numbers this returns are within 0.5% of the stamped ones.
+
+    Returns the run's `profiling` block unchanged when the intervals are
+    already on it, when a record's evaluation directory has gone (the time of
+    an evaluation nobody can see would be charged to PolyChord, which is worse
+    than not splitting), or when the mtimes cannot be a timeline at all -
+    directories restored from a backup or copied by a merge all carry the time
+    of the copy, and the giveaway is worker-seconds of imaging that will not
+    fit in the wall clock they are supposed to have happened in.
+    """
+    profiling = summary.get("profiling") or {}
+    total_wall = profiling.get("total_wall_seconds")
+    if profiling.get("busy_worker_seconds") is not None or not total_wall:
+        return profiling
+
+    spans = []
+    for record in summary.get("evaluations") or []:
+        timing = record.get("timing") or {}
+        length = sum(float(timing.get(field) or 0.0) for field in ACCOUNTED_STAGE_FIELDS)
+        if not length:
+            continue
+        eval_dir = (record.get("paths") or {}).get("eval_dir")
+        try:
+            ended = (Path(eval_dir) / "metrics.json").stat().st_mtime
+        except (OSError, TypeError):
+            return profiling
+        spans.append({"timing": {"started_epoch": ended - length, "ended_epoch": ended}})
+    if not spans:
+        return profiling
+
+    end = max(span["timing"]["ended_epoch"] for span in spans)
+    busy_worker, busy_wall = evaluation_busy_seconds(
+        spans, (end - float(total_wall), end))
+    if busy_wall * worker_procs(int(profiling.get("mpi_procs") or 1)) < busy_worker:
+        return profiling
+    return {**profiling, "busy_worker_seconds": busy_worker,
+            "busy_wall_seconds": busy_wall, "busy_seconds_reconstructed": True}
+
+
 def summarize_profiling(
     evaluations: list[dict[str, Any]],
     total_wall_seconds: float,
@@ -1237,12 +1295,7 @@ def summarize_profiling(
     image_container_total = totals["image_container_seconds"]
     counts["image_container_overhead_seconds"] = image_container_overhead_count
 
-    accounted = (
-        totals["simulate_seconds"]
-        + totals["convert_seconds"]
-        + totals["image_container_seconds"]
-        + totals["metrics_seconds"]
-    )
+    accounted = sum(totals[field] for field in ACCOUNTED_STAGE_FIELDS)
     polychord_overhead = total_wall_seconds - accounted if mpi_procs == 1 else None
 
     # The run segment this wall clock covers. Its start is the caller's when it
@@ -1366,6 +1419,14 @@ PROFILING_SPLIT_NOTE = (
 )
 
 
+PROFILING_UNSPLIT_NOTE = (
+    " The remainder is one row here because this run's records carry no "
+    "evaluation intervals - it finished before those were stamped, and the "
+    "mtimes of its own metrics.json files are not a usable timeline either - so "
+    "what of it was PolyChord and what was idle cannot be recovered."
+)
+
+
 def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None) -> dict[str, Any]:
     """Rows and denominators for the per-stage timing view.
 
@@ -1435,15 +1496,22 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
         # this repo's own Python between the subprocess calls. A stage in all
         # but name, so it joins them above the sum rather than below it.
         harness = max(0.0, min(float(busy_worker), denominator) - accounted)
-        rows.append({
-            "key": "harness",
-            "label": HARNESS_LABEL,
-            "seconds": harness,
-            "evals": evals,
-            "per_eval_seconds": harness / evals if evals else None,
-            "share": share(harness),
-            "is_sub": False,
-        })
+        if profiling.get("busy_seconds_reconstructed"):
+            # A reconstructed interval is the stages themselves, so there is no
+            # harness time in it to show. What the subtraction leaves is the
+            # float noise of having gone round the addition twice, and it
+            # belongs in idle with everything else that was never measured.
+            harness = 0.0
+        if harness > 0.0:
+            rows.append({
+                "key": "harness",
+                "label": HARNESS_LABEL,
+                "seconds": harness,
+                "evals": evals,
+                "per_eval_seconds": harness / evals if evals else None,
+                "share": share(harness),
+                "is_sub": False,
+            })
         evaluating = accounted + harness
         # Wall clock during which no rank was inside an evaluation, charged to
         # every worker because not one of them could spend it. Capped by what
@@ -1468,7 +1536,7 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
         remainder = [] if unaccounted is None else [
             {"key": "unaccounted", "label": UNACCOUNTED_LABEL, "seconds": unaccounted}]
         subtotal_label, subtotal = "accounted (sum of stages above)", accounted
-        note = PROFILING_VIEW_NOTE
+        note = PROFILING_VIEW_NOTE + PROFILING_UNSPLIT_NOTE
         total_label = "end-to-end (accounted + unaccounted)"
         terms = [f"{format_duration(accounted)} accounted",
                  f"+ {format_duration(unaccounted)} unaccounted"]
@@ -2920,6 +2988,79 @@ def self_check_image_pixel_size() -> None:
     print("image pixel size self-check passed")
 
 
+def self_check_backfilled_intervals() -> None:
+    """A run archived before the epochs existed still splits, or says why not."""
+    import os
+    import tempfile
+
+    def run_dir(root: Path, ends: list[float], length: float = 1.0) -> dict[str, Any]:
+        """A summary whose evaluations are on disk with the given end times."""
+        evaluations = []
+        for index, end in enumerate(ends):
+            eval_dir = root / f"eval-{index:04d}-abc"
+            eval_dir.mkdir()
+            record = eval_dir / "metrics.json"
+            record.write_text("{}")
+            os.utime(record, (end, end))
+            evaluations.append({
+                "paths": {"eval_dir": str(eval_dir)},
+                "timing": {"image_container_seconds": length},
+            })
+        return {
+            "evaluations": evaluations,
+            "profiling": {
+                "mpi_procs": 3, "total_wall_seconds": 10.0,
+                "stage_totals_seconds": {"image_container": length * len(ends)},
+                "stage_eval_counts": {"image_container_seconds": len(ends)},
+                "accounted_worker_seconds": length * len(ends),
+            },
+        }
+
+    # Two workers, four one-second evaluations in the last four seconds of a
+    # ten-second run: 4s of the 20s budget inside an evaluation, 6s of wall
+    # clock with nothing in flight (12s across the two workers), and the 4s
+    # left over is one worker waiting for the other.
+    with tempfile.TemporaryDirectory() as raw:
+        summary = run_dir(Path(raw), [1006.0, 1007.0, 1009.0, 1010.0])
+        filled = backfill_busy_seconds(summary)
+        assert abs(filled["busy_worker_seconds"] - 4.0) < 1e-6, filled
+        assert abs(filled["busy_wall_seconds"] - 4.0) < 1e-6, filled
+        split = profiling_breakdown(filled)
+        assert [(row["key"], round(row["seconds"], 3)) for row in split["remainder_rows"]] == [
+            ("polychord", 12.0), ("idle", 4.0)], split["remainder_rows"]
+        # Reconstructed intervals are the stages themselves, so the harness row
+        # - which would be nothing but the float noise of the subtraction -
+        # is not among them.
+        assert "harness" not in [row["key"] for row in split["rows"]], split["rows"]
+        assert PROFILING_UNSPLIT_NOTE not in split["note"]
+
+    # Directories copied or restored all carry the time of the copy, and no
+    # timeline can be read out of them: four worker-seconds of imaging cannot
+    # fit in the 0.01s of wall clock these mtimes claim. Left unsplit.
+    with tempfile.TemporaryDirectory() as raw:
+        summary = run_dir(Path(raw), [1010.0, 1010.0, 1010.005, 1010.01])
+        filled = backfill_busy_seconds(summary)
+        assert "busy_worker_seconds" not in filled, filled
+        unsplit = profiling_breakdown(filled)
+        assert [row["label"] for row in unsplit["remainder_rows"]] == [UNACCOUNTED_LABEL]
+        assert PROFILING_UNSPLIT_NOTE in unsplit["note"]
+
+    # An evaluation whose directory has gone: its time would be charged to
+    # PolyChord, which is worse than not splitting at all.
+    with tempfile.TemporaryDirectory() as raw:
+        summary = run_dir(Path(raw), [1006.0, 1007.0, 1009.0, 1010.0])
+        (Path(summary["evaluations"][0]["paths"]["eval_dir"]) / "metrics.json").unlink()
+        assert "busy_worker_seconds" not in backfill_busy_seconds(summary)
+
+    # A run that stamped its own intervals is never second-guessed.
+    with tempfile.TemporaryDirectory() as raw:
+        summary = run_dir(Path(raw), [1010.0, 1010.0, 1010.0, 1010.0])
+        summary["profiling"]["busy_worker_seconds"] = 4.0
+        summary["profiling"]["busy_wall_seconds"] = 2.0
+        assert backfill_busy_seconds(summary)["busy_wall_seconds"] == 2.0
+    print("backfilled evaluation intervals self-check passed")
+
+
 def self_check_profiling() -> None:
     evaluations = [
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
@@ -3039,6 +3180,8 @@ def self_check_profiling() -> None:
     anchored = profiling_breakdown(summarize_profiling(timed[:2], total_wall_seconds=4.0, mpi_procs=3))
     assert abs(anchored["busy_wall_seconds"] - 4.0) < 1e-9, anchored["busy_wall_seconds"]
     assert anchored["remainder_rows"][0]["seconds"] == 0.0
+
+    self_check_backfilled_intervals()
 
     # A run with no timings at all still renders rather than dividing by zero.
     degenerate = profiling_breakdown({"mpi_procs": 1, "total_wall_seconds": 0.0, "stage_totals_seconds": {}})
