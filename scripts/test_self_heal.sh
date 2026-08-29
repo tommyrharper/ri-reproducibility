@@ -387,8 +387,19 @@ worker_sidecar="$(docker ps --filter "label=ri.run-dir=${WORKER_OUT}" \
 echo "self-heal: killing every wsclean worker in ${worker_sidecar} at ${worker_before} evaluations"
 # /proc rather than pkill: the wsclean image ships no procps. `$$` is this
 # `sh`, which is itself named sh and would otherwise kill itself first.
+# `wsclean-zygote` as well as `sh`: since the fork server landed
+# (docs/nested-sampling-wsclean-zygote.md) the imaging worker is a zygote and
+# not a shell, so matching only `sh` quietly made this check kill nothing.
 docker exec "${worker_sidecar}" sh -c \
-  'for d in /proc/[0-9]*; do p="${d#/proc/}"; [ "$(cat "${d}/comm" 2>/dev/null)" = sh ] && [ "${p}" != "$$" ] && kill -9 "${p}"; done; true' \
+  'killed=0
+   for d in /proc/[0-9]*; do
+     p="${d#/proc/}"
+     comm="$(cat "${d}/comm" 2>/dev/null)"
+     case "${comm}" in sh|wsclean-zygote) ;; *) continue ;; esac
+     [ "${p}" != "$$" ] || continue
+     kill -9 "${p}" && killed=$((killed+1))
+   done
+   [ "${killed}" -gt 0 ] || { echo "no workers to kill" >&2; exit 1; }' \
   || fail "could not kill the workers in ${worker_sidecar}"
 
 wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \

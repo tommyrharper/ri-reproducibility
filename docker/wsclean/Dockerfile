@@ -125,6 +125,10 @@ ARG WSCLEAN_TARGET_CPU
 # docs/nested-sampling-wsclean-patches.md for what each one is and what it is
 # worth.
 COPY docker/wsclean/patches /usr/src/wsclean-patches
+# Source this repo adds to the tree rather than patches into it: a whole new
+# file is easier to read and to keep building than the same file expressed as a
+# diff, so 0002 only teaches CMake the target exists.
+COPY docker/wsclean/src /usr/src/wsclean-src
 # PORTABLE=ON forbids TARGET_CPU and drops -march entirely, so cmake's two
 # options are derived from the one build arg. The target is offered to the
 # compiler before it is passed to cmake because WSClean's SetTargetCPU.cmake
@@ -134,6 +138,7 @@ COPY docker/wsclean/patches /usr/src/wsclean-patches
 RUN git clone --recurse-submodules --branch ${WSCLEAN_GIT_TAG} --depth 1 \
         --shallow-submodules ${WSCLEAN_GIT_URL} /usr/src/wsclean \
     && git -C /usr/src/wsclean apply --verbose /usr/src/wsclean-patches/*.patch \
+    && cp /usr/src/wsclean-src/*.cpp /usr/src/wsclean/main/ \
     && mkdir -p /usr/src/wsclean/build \
     && cd /usr/src/wsclean/build \
     && if [ -n "${WSCLEAN_TARGET_CPU}" ] \

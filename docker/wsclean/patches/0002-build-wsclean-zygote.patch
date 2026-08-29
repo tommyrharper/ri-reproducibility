@@ -1,0 +1,22 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 72dfe39..d656d44 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -502,6 +502,9 @@ target_link_libraries(wsclean-shared PUBLIC schaapcommon)
+ add_executable(wsclean main/main.cpp)
+ target_link_libraries(wsclean wsclean-lib)
+ 
++add_executable(wsclean-zygote main/zygote.cpp)
++target_link_libraries(wsclean-zygote wsclean-lib)
++
+ if(MPI_FOUND)
+   add_executable(wsclean-mp distributed/wsclean-mp.cpp distributed/worker.cpp)
+   target_link_libraries(wsclean-mp wsclean-lib)
+@@ -517,6 +520,7 @@ add_executable(
+ target_link_libraries(wspredictionexample ${EXTERNAL_LIBRARIES})
+ 
+ install(TARGETS wsclean DESTINATION bin)
++install(TARGETS wsclean-zygote DESTINATION bin)
+ install(
+   TARGETS wsclean-shared
+   LIBRARY DESTINATION lib

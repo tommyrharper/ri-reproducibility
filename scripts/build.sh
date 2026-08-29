@@ -72,7 +72,7 @@ build_image() {
 build_wsclean() {
   build_image ri-reproducibility/wsclean:v3.7 \
     "$(inputs_hash "${PLATFORM} TARGET_CPU=${WSCLEAN_TARGET_CPU}" \
-      docker/wsclean/Dockerfile docker/wsclean/patches)" \
+      docker/wsclean/Dockerfile docker/wsclean/patches docker/wsclean/src)" \
     -f docker/wsclean/Dockerfile \
     --build-arg BUILD_JOBS="${BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}" \
     --build-arg WSCLEAN_TARGET_CPU="${WSCLEAN_TARGET_CPU}"

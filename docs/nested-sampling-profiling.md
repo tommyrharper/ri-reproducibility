@@ -22,12 +22,12 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 | `simulate_seconds` | Wall time for the MeqTrees `docker run` that produces `sim.ms` (container start + RIME simulation, not split further) |
 | `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion in the rank's simulate worker |
 | `image_container_seconds` | Wall time for the imaging round trip: a `docker run` for WSClean, one request to this rank's R2D2 worker for R2D2 |
-| `image_binary_seconds` | WSClean only: the binary's own elapsed time from `/usr/bin/time -v` inside the container, i.e. excluding docker create/start/teardown |
+| `image_binary_seconds` | WSClean only: the imaging child's own elapsed time, from `wait4()` in the rank's `wsclean-zygote` (before 29 August 2026, from `/usr/bin/time -v`, quantised to 10ms - see [the zygote doc](nested-sampling-wsclean-zygote.md)) |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
 
 `image_container_overhead_seconds` (container round trip minus binary time) is
-only available for WSClean, because only its image installs GNU `time`; R2D2
-and MeqTrees report only the round-trip time as one blob.
+only available for WSClean, because only its path reports the two separately;
+R2D2 and MeqTrees report only the round-trip time as one blob.
 
 `summary.json` also gets a run-level `profiling` block: each field above
 summed across every evaluation, plus:

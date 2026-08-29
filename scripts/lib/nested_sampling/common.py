@@ -603,6 +603,9 @@ class DockerRunResult:
     returncode: int
     wall_seconds: float
     peak_memory_bytes: int
+    # The command's own wall clock, as distinct from what this rank waited.
+    # Only zygote_run() can tell them apart; sidecar_run() leaves it at 0.
+    binary_seconds: float = 0.0
 
 
 def r2d2_thread_count() -> int:
@@ -819,31 +822,40 @@ def sidecar_command(image: str, prefix: list[str] | None = None) -> list[str]:
     return [*(prefix or []), *_IMAGE_ENTRYPOINTS[image]]
 
 
-_SIDECAR_SHELLS: dict[str, subprocess.Popen] = {}
+_SIDECAR_WORKERS: dict[tuple[str, str], subprocess.Popen] = {}
 
 
-def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
-    """This rank's long-lived `sh` inside the sidecar, one `docker exec` per run.
+def sidecar_worker(image: str, platform: str, argv: list[str]) -> subprocess.Popen:
+    """This rank's long-lived `argv` inside the sidecar, one `docker exec` per run.
 
     `docker exec` costs ~0.033s on this host - a third of the `wsclean` binary's
-    own ~0.107s - and every evaluation paid it again. One `sh` reading command
+    own ~0.107s - and every evaluation paid it again. One process reading request
     lines from its stdin pays it once per rank; a request costs a pipe write and
     a `read`.
+
+    Two shapes use this: `sh`, which runs an arbitrary command line, and
+    `wsclean-zygote`, which forks an already-initialised wsclean per request
+    (see docs/nested-sampling-wsclean-zygote.md).
     """
-    if image not in _SIDECAR_SHELLS:
-        shell = subprocess.Popen(
-            # Not sidecar_exec(): this one deliberately bypasses the image
-            # ENTRYPOINT, and each request cd's to its own evaluation directory.
-            ["docker", "exec", "--interactive", sidecar_container(image, platform), "sh"],
+    key = (image, argv[0])
+    if key not in _SIDECAR_WORKERS:
+        worker = subprocess.Popen(
+            # Not sidecar_exec(): these deliberately bypass the image ENTRYPOINT,
+            # and each request names its own evaluation directory.
+            ["docker", "exec", "--interactive", sidecar_container(image, platform), *argv],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
         )
         # The container itself is torn down by sidecar_container()'s own atexit
         # hook, which is registered first and so runs last.
-        atexit.register(shell.terminate)
-        _SIDECAR_SHELLS[image] = shell
-    return _SIDECAR_SHELLS[image]
+        atexit.register(worker.terminate)
+        _SIDECAR_WORKERS[key] = worker
+    return _SIDECAR_WORKERS[key]
+
+
+def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
+    return sidecar_worker(image, platform, ["sh"])
 
 
 def sidecar_run(
@@ -874,7 +886,7 @@ def sidecar_run(
         if not worker_send(shell.stdin, request):
             # The shell died between evaluations, so the request never left
             # this rank; the next attempt opens a fresh `docker exec`.
-            _SIDECAR_SHELLS.pop(image, None)
+            _SIDECAR_WORKERS.pop((image, "sh"), None)
             continue
         reply = worker_reply(shell.stdout, SHELL_REPLY_TIMEOUT)
         if reply:
@@ -887,12 +899,68 @@ def sidecar_run(
             # leaks per timeout; give the shell an `echo $$` handshake at
             # startup if that ever costs more than the retry does.
             shell.kill()
-        _SIDECAR_SHELLS.pop(image, None)
+        _SIDECAR_WORKERS.pop((image, "sh"), None)
     wall_seconds = time.perf_counter() - started
     stderr_path.write_text(
         f"FATAL: {image} sidecar shell gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
     return DockerRunResult(returncode=WORKER_DIED, wall_seconds=wall_seconds, peak_memory_bytes=0)
+
+
+ZYGOTE_COMMAND = "wsclean-zygote"
+
+
+def zygote_run(
+    image: str,
+    platform: str,
+    workdir: Path,
+    argv: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> DockerRunResult:
+    """Image with this rank's wsclean fork server; the retry shape of sidecar_run.
+
+    ~27ms of every ~163ms `wsclean` process at production concurrency runs
+    before main() does - casacore's static initialisers across 73 shared
+    objects - and the search starts ~70 of them a second. `wsclean-zygote` pays
+    that once per rank and forks a child per request, so this asks it for an
+    image instead of asking `sh` to start a fresh `wsclean`. It also reports the
+    child's own wall clock and peak RSS out of wait4(), which is what
+    `/usr/bin/time -v` used to be forked per evaluation to write to a file.
+
+    The request is tab separated, so nothing in it may contain a tab or a
+    newline. Every field is a path this repo built or a WSClean flag, so that is
+    a bug rather than an input to sanitise - hence the assertion.
+    """
+    fields = [str(workdir), str(stdout_path), str(stderr_path), *argv]
+    assert not any("\t" in field or "\n" in field for field in fields), fields
+    request = "\t".join(fields) + "\n"
+    started = time.perf_counter()
+    for attempt in worker_attempts():
+        zygote = sidecar_worker(image, platform, [ZYGOTE_COMMAND])
+        if not worker_send(zygote.stdin, request):
+            _SIDECAR_WORKERS.pop((image, ZYGOTE_COMMAND), None)
+            continue
+        reply = worker_reply(zygote.stdout, SHELL_REPLY_TIMEOUT)
+        if reply:
+            code, binary_seconds, peak_memory_bytes = reply.split("\t")
+            return DockerRunResult(
+                returncode=int(code),
+                wall_seconds=time.perf_counter() - started,
+                peak_memory_bytes=int(peak_memory_bytes),
+                binary_seconds=float(binary_seconds),
+            )
+        if reply is None:
+            zygote.kill()
+        _SIDECAR_WORKERS.pop((image, ZYGOTE_COMMAND), None)
+    stderr_path.write_text(
+        f"FATAL: {image} {ZYGOTE_COMMAND} gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
+    )
+    return DockerRunResult(
+        returncode=WORKER_DIED,
+        wall_seconds=time.perf_counter() - started,
+        peak_memory_bytes=0,
+    )
 
 
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
@@ -1074,51 +1142,6 @@ def compute_image_metrics(
         residual_dirty, _ = load_fits_2d(residual_dirty_path)
         metrics["sigma_res"] = sigma_res(residual_dirty, dirty)
     return metrics
-
-
-def read_gnu_time_peak_memory(time_path: Path) -> int:
-    if not time_path.is_file():
-        return 0
-    for line in time_path.read_text(errors="replace").splitlines():
-        if line.strip().startswith("Maximum resident set size (kbytes):"):
-            _, value = line.rsplit(":", 1)
-            return int(value.strip()) * 1024
-    return 0
-
-
-def read_gnu_time_wall_seconds(time_path: Path) -> float | None:
-    """Parse GNU time -v's own elapsed wall clock, in [h:]mm:ss(.cc) form.
-
-    This is the binary's actual run time inside the container, separate from
-    docker create/start/teardown overhead measured around the whole `docker
-    run` invocation.
-
-    GNU time prints centiseconds, so this is quantised to 10ms - 3.7% of a
-    ~270ms wsclean call, and most of the ~8ms `image_container_overhead` the
-    profiler reports, which is a rounding residue and not a cost anything can
-    remove. Averaged over thousands of evaluations the quantisation is a
-    constant bias, so an A/B on this column is still sound; a single
-    evaluation's split is not. See docs/nested-sampling-throughput.md.
-    """
-    if not time_path.is_file():
-        return None
-    for line in time_path.read_text(errors="replace").splitlines():
-        line = line.strip()
-        if not line.startswith("Elapsed (wall clock) time"):
-            continue
-        # Label itself contains colons (e.g. "(h:mm:ss or m:ss): 1:02.50"), so
-        # split on the literal "): " marker instead of the last colon.
-        _, _, value = line.partition("): ")
-        parts = value.strip().split(":")
-        try:
-            parts = [float(p) for p in parts]
-        except ValueError:
-            return None
-        seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60.0 + part
-        return seconds
-    return None
 
 
 PROFILING_STAGE_FIELDS = (
@@ -2711,19 +2734,6 @@ def self_check_image_pixel_size() -> None:
 
 
 def self_check_profiling() -> None:
-    import tempfile
-
-    gnu_time_text = (
-        "\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:02.50\n"
-        "\tMaximum resident set size (kbytes): 4096\n"
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        time_path = Path(tmp) / "time.txt"
-        time_path.write_text(gnu_time_text)
-        assert abs(read_gnu_time_wall_seconds(time_path) - 62.5) < 1e-9
-        assert read_gnu_time_peak_memory(time_path) == 4096 * 1024
-        assert read_gnu_time_wall_seconds(Path(tmp) / "missing.txt") is None
-
     evaluations = [
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},

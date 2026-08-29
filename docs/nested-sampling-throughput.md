@@ -1498,9 +1498,18 @@ quantum, and `image_container_overhead` - the profiler's
 - a 10ms-wide spread sitting on a ~1ms floor, which is the real cost: the
 `sh` fork and the `/usr/bin/time` exec inside the already-running sidecar.
 There is no `docker exec` in it (one long-lived `sh` per rank serves the whole
-run, see `sidecar_shell()`), and there is nothing here to reclaim. Averaged
+run, see `sidecar_worker()`), and there is nothing here to reclaim. Averaged
 over thousands of evaluations the quantisation is a constant bias, so an A/B on
 the `image_binary` column is sound - which is what
 [the AVX2 section](#the-avx2-build-stopped-being-opt-in) relied on - but the
 ~7ms "overhead" line in the per-stage table is a rounding artefact, and the
 `wsclean` binary is correspondingly ~5ms dearer than that table says.
+
+**This stopped being true for runs after 29 August 2026.** The WSClean fork
+server ([the zygote doc](nested-sampling-wsclean-zygote.md)) reports the child's
+wall clock out of `wait4()`'s rusage, so `image_binary_seconds` is no longer
+quantised and `/usr/bin/time` is no longer forked at all;
+`image_container_overhead` now reads ~1.9ms an evaluation and is a real cost -
+the pipe round trip to the rank's zygote. The paragraph above is what an
+archived run's numbers mean, and the ~5ms correction is what to apply before
+comparing one against a run made since.

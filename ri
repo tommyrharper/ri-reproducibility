@@ -298,8 +298,8 @@ def build_parser():
                     "freezes a rank of the other, and checks both recover on "
                     "their own.")
     self_check.add_argument("target", nargs="?", default="all",
-        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "report",
-                 "self-heal"),
+        choices=("all", "simulate", "r2d2-serve", "zygote", "wsclean", "r2d2",
+                 "report", "self-heal"),
         help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",

@@ -71,6 +71,14 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2-serve" ]]; then
   docker_run --entrypoint python3 "${R2D2_IMAGE}" -u "$(nested_sampling r2d2_serve.py)" --self-check
 fi
 
+if [[ "${TARGET}" == "all" || "${TARGET}" == "zygote" ]]; then
+  echo
+  echo "=== wsclean fork server (${WSCLEAN_IMAGE}) ==="
+  # In the WSClean image rather than the sampler's, because what is under test
+  # is the `wsclean-zygote` binary this repo adds to it.
+  docker_run --entrypoint python3 "${WSCLEAN_IMAGE}" -u "${REPO_ROOT}/scripts/test_zygote.py"
+fi
+
 if [[ "${TARGET}" == "all" || "${TARGET}" == "wsclean" ]]; then
   echo
   echo "=== wsclean sampler (${POLYCHORD_IMAGE}) ==="

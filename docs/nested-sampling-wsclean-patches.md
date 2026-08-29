@@ -37,7 +37,13 @@ true. The patch directory is part of the `ri.build-inputs` hash in
 Each patch is upstream-shaped - it should be something WSClean would take -
 rather than a change to what WSClean computes. Both properties matter: a patch
 that alters results makes every archived run incomparable, and a patch upstream
-would reject is one this repo carries forever.
+would reject is one this repo carries forever. 0002 is the one exception to the
+first half and is called out as such below.
+
+`docker/wsclean/src/*.cpp` is the companion directory: source this repo *adds*
+to the tree, copied in by the same Dockerfile line, so a new file does not have
+to be written as a diff. It is hashed into `ri.build-inputs` alongside the
+patches.
 
 ## 0001: cache the reordered provider's antenna names
 
@@ -163,3 +169,20 @@ this host (see the false-positive rate of sequential arms in
 Note that `NS_MAX_NDEAD` defaults to 12 in `defaults.toml` - a smoke-test
 value. A benchmark run that forgets `--max-ndead` finishes in four seconds and
 measures the process start of ten MPI ranks.
+
+## 0002: build `wsclean-zygote`
+
+Two `CMakeLists.txt` hunks - an `add_executable`/`target_link_libraries` pair
+and an `install` line - for `main/zygote.cpp`, which
+`docker/wsclean/src/zygote.cpp` supplies. The binary is a fork server: it links
+the same `wsclean-lib`, runs the static initialisers once, and forks an
+already-initialised child per imaging request, which is worth +8.4%
+evaluations per second end to end with bit-identical images. What it is, why
+27ms of every `wsclean` process runs before `main()` does, and the measurements
+are in [the zygote doc](nested-sampling-wsclean-zygote.md).
+
+This is the patch that is not upstream-shaped: WSClean has no reason to ship a
+fork server, and the code it builds is this repo's rather than a change to
+WSClean's. It keeps the property that actually protects the archive - it alters
+nothing WSClean computes - and it is deliberately as small as a patch can be,
+so that a `WSCLEAN_GIT_TAG` bump has almost no surface to break against.

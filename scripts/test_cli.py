@@ -261,6 +261,12 @@ check(
 )
 
 check(
+    "self-check reaches the wsclean fork server's own set",
+    [["scripts/self-check.sh", "zygote"]],
+    plan("self-check", "zygote")[1],
+)
+
+check(
     "smoke with no target runs both imagers",
     [["scripts/smoke-test-wsclean.sh"], ["scripts/smoke-test-r2d2.sh"]],
     plan("smoke")[1],
