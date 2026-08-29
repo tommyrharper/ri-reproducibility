@@ -449,8 +449,15 @@ this flag is not a free 5%.
 
 ## What does work: build WSClean for the CPU it runs on
 
-`docker/wsclean/Dockerfile` takes `WSCLEAN_PORTABLE`, which is WSClean's own
-`-DPORTABLE` CMake option, and defaults it to `ON` - a binary that runs on any
+> **Superseded.** The default is no longer the plain x86-64 baseline this
+> section measured against: it is `x86-64-v3`, which is AVX2 and FMA on a
+> named target rather than the build machine's. See
+> [the AVX2 build stopped being opt-in](#the-avx2-build-stopped-being-opt-in).
+> The `--native` figures below are still what `--native` is worth *over the
+> baseline*; over today's default it is a few percent.
+
+`docker/wsclean/Dockerfile` took `WSCLEAN_PORTABLE`, which is WSClean's own
+`-DPORTABLE` CMake option, and defaulted it to `ON` - a binary that runs on any
 x86-64, so no AVX2, no FMA. WSClean's gridder is the one place that costs the
 most.
 
@@ -1295,3 +1302,97 @@ Two honest caveats:
 The 600s cap is what keeps the message it prints honest: `quiet` accumulates in
 whole polls, so a poll longer than a tenth of `NS_STALL_TIMEOUT` would start
 reporting a stall length noticeably past the timeout it fired on.
+
+## The AVX2 build stopped being opt-in
+
+[What does work: build WSClean for the CPU it runs on](#what-does-work-build-wsclean-for-the-cpu-it-runs-on)
+above measured `-DPORTABLE=OFF` - WSClean compiled with `-march=native` - at
++19.8% serial and +6.5% at matched concurrency, then left it behind
+`./ri search wsclean --native` because such a binary dies with SIGILL on any
+other CPU and the image tag is shared with every other worktree on the host.
+So the default build shipped without AVX2 or FMA, and every search this repo
+has ever run paid for that.
+
+That was a false choice. WSClean's `SetTargetCPU.cmake` takes `-DTARGET_CPU=`
+alongside `-DPORTABLE=OFF`, documented for exactly this - "building containers
+for a different platform" - and `x86-64-v3` is a *named* target, not the build
+machine's: AVX2, FMA, BMI1/2, on every x86-64 CPU since Haswell (2013) and
+Zen (2017). One fixed binary, so two hosts still image bit-identically, which
+is more than `native` could say.
+
+`WSCLEAN_TARGET_CPU` is now the one knob over the gridder's instruction set
+and it defaults to `x86-64-v3`. `--native` sets it to `native`; setting it
+empty gets the old plain-x86-64 baseline back.
+
+### What it is worth
+
+Replaying 378 recorded evaluations of one `--nlive 25 --num-repeats 10` search
+(the harness from
+[where the evaluation's time actually goes](#where-the-evaluations-time-actually-goes),
+eight passes over the corpus per arm so each arm is ~40s and clear of
+[the first four seconds](#the-first-four-seconds-of-any-measurement-lie-by-20)),
+interleaved, behind a throwaway warm-up arm:
+
+| | baseline | `x86-64-v3` | |
+|---|---:|---:|---:|
+| 1 worker | 8.65 / 8.55 evals/s | 9.96 / 10.08 evals/s | **+15.1% / +18.0%** |
+| 19 workers | 72.8 / 71.6 / 71.6 evals/s | 77.9 / 78.1 / 77.8 evals/s | **+7.1% / +9.1% / +8.6%** |
+
+End to end - `./ri search wsclean --nlive 25 --num-repeats 10 --max-ndead -1`,
+default 20 ranks, three seeds, the two images alternating with `--no-build`:
+
+| seed | evals/s baseline | evals/s `x86-64-v3` | | `wsclean` binary |
+|---:|---:|---:|---:|---:|
+| 4242 | 54.8 | 59.3 | +8.2% | 290.3ms -> 267.4ms (-7.9%) |
+| 7 | 52.3 | 58.0 | +10.8% | 304.3ms -> 275.7ms (-9.4%) |
+| 99 | 56.3 | 57.4 | +2.0% | 303.3ms -> 275.5ms (-9.2%) |
+
+The `wsclean` binary column is the one to trust - it is a mean over ~6500
+evaluations rather than one wall clock - and it is -9.2% at all three seeds
+where the end-to-end column spans +2% to +11%, which is the same run-to-run
+throughput noise
+[the sampler's own variance](#throughput-falls-through-a-run-and-it-is-the-sampler-doing-it)
+has produced throughout. Plan with the replay's +8.6% at matched concurrency.
+
+That is nearly all of what `--native` was worth (+19.8% serial, +6.5% at 20
+workers on its own corpus). `--native` still exists and is still a little
+faster, but it is now a few percent on top of a good default rather than the
+only way to get AVX2.
+
+### What it costs: eleven float32 ULPs at the peak pixel
+
+Recomputing every metric from both builds' FITS over the same 378 evaluations
+(same Measurement Sets, so any difference is the arithmetic):
+
+| metric | max relative difference |
+|---|---:|
+| `total_rms_jy` (the default objective) | 4.9e-7 |
+| `relative_l2_error` | 4.9e-7 |
+| `peak_jy_per_beam` | 3.6e-7 |
+| `snr` | 1.8e-5 |
+| `off_source_rms_jy` | 1.8e-5 |
+| `sigma_res` | 6.9e-3 |
+| `peak_flux_abs_error_jy` | 9.1e-2 |
+
+The objective moves in its seventh decimal, four orders of magnitude below the
+gridder's own 1e-4 accuracy setting. The two large-looking rows are both
+ratios of near-zero quantities and neither is a surprise:
+`peak_flux_abs_error_jy` is `|peak - 1.0|` at 1.31e-6 against 1.19e-6 Jy, i.e.
+about eleven float32 ULPs of a 1.0 Jy peak, and `sigma_res` amplifies rounding
+~600x for the reason
+[the constant-columns section](#what-it-costs-the-objective-moves-in-its-seventh-decimal)
+already records. FMA contraction changes the order of a float32 summation;
+that is the whole of it.
+
+### Two things this changed on the way
+
+- **The CPU target no longer rebuilds casacore.** `ARG WSCLEAN_TARGET_CPU` is
+  declared immediately above the WSClean step rather than with the other args
+  at the top of the build stage, because an `ARG` instruction is itself a cache
+  key for every layer below it - so flipping the flag used to recompile
+  casacore, which is not built with it.
+- **`make -j` follows `nproc`.** The Dockerfile's `BUILD_JOBS` default of 4 put
+  a from-scratch WSClean image at ~40 minutes; `scripts/build.sh` now passes
+  `nproc`, which brings it to ~9 minutes on this 20-thread host. It is
+  deliberately outside `inputs_hash`: it changes how long the build takes, not
+  what it produces.

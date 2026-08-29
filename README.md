@@ -158,18 +158,24 @@ directly (not `docker compose build`) so build args stay explicit.
 Re-running a build whose inputs have not changed skips `docker build` outright
 (~0.08s rather than ~2s of cache-walking); `FORCE_BUILD=1` overrides that.
 
-**Portable vs. host-optimized WSClean**: `WSCLEAN_PORTABLE=ON` (default)
-builds a binary that runs on any CPU of the build architecture, per
-WSClean's own documented `-DPORTABLE` CMake option. `./ri build wsclean
---native` (`WSCLEAN_PORTABLE=OFF`) rebuilds the same
-`ri-reproducibility/wsclean:v3.7` tag for the building machine's exact
-instruction set - measurably faster (see
-[docs/nested-sampling-throughput.md](docs/nested-sampling-throughput.md)),
-but it will die with an illegal-instruction error anywhere else, and it
-changes WSClean's timings, so do not mix the two within one search.
-Because it is the same tag, the next build without `--native` puts the
-portable binary back: to search with it, pass `./ri search wsclean
---native`, which carries the flag into the build the search does first.
+**Which CPU WSClean is built for**: `WSCLEAN_TARGET_CPU` is WSClean's own
+documented `-DTARGET_CPU` CMake option, and it defaults to `x86-64-v3` -
+AVX2 and FMA, which is every x86-64 CPU since about 2013. That is one
+fixed binary, so two hosts still image bit-identically, and it is worth
+~10% of a search's throughput over the plain x86-64 baseline (see
+[docs/nested-sampling-throughput.md](docs/nested-sampling-throughput.md)).
+Set `WSCLEAN_TARGET_CPU=` (empty) to get that baseline back on a CPU
+older than that; a build for a non-x86 architecture falls back to it on
+its own, because the compiler there rejects the default target.
+
+`./ri build wsclean --native` (`WSCLEAN_TARGET_CPU=native`) rebuilds the
+same `ri-reproducibility/wsclean:v3.7` tag for the building machine's
+exact instruction set: a little faster again, but it will die with an
+illegal-instruction error anywhere else, and it changes WSClean's
+timings, so do not mix builds within one search. Because it is the same
+tag, the next build without `--native` puts the default one back: to
+search with it, pass `./ri search wsclean --native`, which carries the
+flag into the build the search does first.
 
 ### Does the imager under test actually run?
 
@@ -377,10 +383,12 @@ build.
   from-source dependency, since WSClean does not use it. Both gotchas
   were found by running the build, not by reading docs - see
   `docker/wsclean/Dockerfile` comments.
-- **WSClean illegal-instruction error**: you are almost certainly running
-  a `WSCLEAN_PORTABLE=OFF` ("native") image built on a different CPU than
-  the one running it. Rebuild with `PORTABLE=ON`, or rebuild `native` on
-  the actual target machine - see section 5.
+- **WSClean illegal-instruction error**: either a
+  `WSCLEAN_TARGET_CPU=native` image built on a different CPU than the one
+  running it, or the default `x86-64-v3` image on a CPU older than about
+  2013 (no AVX2). Rebuild with `WSCLEAN_TARGET_CPU=` for the plain
+  x86-64 baseline, or rebuild `native` on the actual target machine - see
+  section 5.
 - **Incorrect mounted-file ownership**: containers here run as `root` by
   default (no non-root `USER` is created in either imager Dockerfile,
   since neither upstream build system expects one). Files written into

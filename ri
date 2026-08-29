@@ -79,7 +79,7 @@ def uv(script, *args):
 
 
 def do_build(args):
-    env = {"WSCLEAN_PORTABLE": "OFF"} if args.native else {}
+    env = {"WSCLEAN_TARGET_CPU": "native"} if args.native else {}
     return env, [["scripts/build.sh", args.target]]
 
 
@@ -105,7 +105,7 @@ def do_search(args):
         # The search builds its images first, and build.sh reads this, so
         # without it here a search would rebuild the portable WSClean over any
         # native one `./ri build wsclean --native` had left under the tag.
-        env["WSCLEAN_PORTABLE"] = "OFF"
+        env["WSCLEAN_TARGET_CPU"] = "native"
     if args.enable_param:
         env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
     if args.disable_param:
@@ -280,9 +280,10 @@ def build_parser():
     build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES),
                        help="which image to build (default: all)")
     build.add_argument("--native", action="store_true",
-                       help="WSClean tuned for this exact CPU (WSCLEAN_PORTABLE=OFF); "
-                            "faster but not portable. Reuses the same image tag, so the "
-                            "next build without it puts the portable one back - pass "
+                       help="WSClean tuned for this exact CPU (WSCLEAN_TARGET_CPU=native) "
+                            "rather than the default AVX2 baseline; a little faster and "
+                            "SIGILLs anywhere else. Reuses the same image tag, so the "
+                            "next build without it puts the default one back - pass "
                             "--native to ./ri search too")
 
     self_check = add("self-check", do_self_check, "run the checks that need the images",
@@ -380,10 +381,9 @@ def build_parser():
                              "is given to both [NS_DISABLE_PARAMS]. ./ri params lists names "
                              "and current state")
     search.add_argument("--native", action="store_true",
-                        help="build WSClean for this exact CPU (WSCLEAN_PORTABLE=OFF): "
-                             "6-10%% more evaluations per second at the default rank "
-                             "count, and the binary then runs nowhere else, see "
-                             "docs/nested-sampling-throughput.md")
+                        help="build WSClean for this exact CPU (WSCLEAN_TARGET_CPU=native) "
+                             "rather than the default AVX2 baseline; the binary then runs "
+                             "nowhere else, see docs/nested-sampling-throughput.md")
     search.add_argument("--no-build", action="store_true",
                         help="skip the image builds this search would do first")
 

@@ -268,20 +268,20 @@ check(
 
 check(
     "--native builds the host-optimized WSClean",
-    ({"WSCLEAN_PORTABLE": "OFF"}, [["scripts/build.sh", "wsclean"]]),
+    ({"WSCLEAN_TARGET_CPU": "native"}, [["scripts/build.sh", "wsclean"]]),
     plan("build", "wsclean", "--native"),
 )
 
 check(
     "search --native keeps its own build host-optimized",
-    "OFF",
-    plan("search", "wsclean", "--native")[0]["WSCLEAN_PORTABLE"],
+    "native",
+    plan("search", "wsclean", "--native")[0]["WSCLEAN_TARGET_CPU"],
 )
 
 check(
-    "search without --native leaves WSCLEAN_PORTABLE alone",
+    "search without --native leaves WSCLEAN_TARGET_CPU alone",
     False,
-    "WSCLEAN_PORTABLE" in plan("search", "wsclean")[0],
+    "WSCLEAN_TARGET_CPU" in plan("search", "wsclean")[0],
 )
 
 check(

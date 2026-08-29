@@ -39,13 +39,14 @@ output under a pinned base image, a moved upstream git ref).
 so a `compileall` or a `--self-check` does not force a rebuild.
 
 ```bash
-# CPU-native WSClean, ~6% more evaluations/s on THIS machine (same v3.7 tag,
-# so the next plain build puts the portable binary back)
-./ri build wsclean --native      # WSCLEAN_PORTABLE=OFF scripts/build.sh wsclean
+# WSClean is built for x86-64-v3 (AVX2+FMA) by default. --native goes one step
+# further, to THIS machine only (same v3.7 tag, so the next plain build puts the
+# default binary back); WSCLEAN_TARGET_CPU= goes back to the plain x86-64 baseline
+./ri build wsclean --native      # WSCLEAN_TARGET_CPU=native scripts/build.sh wsclean
 ./ri search wsclean --native     # ...and carry it into the search's own build
 ```
 
-Never report the default `PORTABLE=ON` build as optimized-WSClean performance.
+Never report a `WSCLEAN_TARGET_CPU=` build as this repo's WSClean performance.
 
 After editing `scripts/lib/nested_sampling/*`, rebuild **both** `polychord` and
 `meqtrees` - they bake those files in at build time and otherwise run stale code.
@@ -408,7 +409,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/run-health.md` | `./ri health`: every line of the report and what warns |
 | `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
-| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, why the concurrency wall is the all-core clock rather than memory bandwidth, and what does and does not make an evaluation cheaper (asynchronous MPI, `--native` WSClean, the phase-centre predict, and the two constant `WEIGHT`/`SIGMA` columns the simulator no longer writes); and why a run's disk footprint, its rank memory and its own polling loops, not its clock, are what cap a big one; and the `nlive` scan showing utilisation *rises* with run size (93.9% at `--nlive 25`, 98.3% at `--nlive 200`) because the unaccounted time is a ~6s per-run constant |
+| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, why the concurrency wall is the all-core clock rather than memory bandwidth, and what does and does not make an evaluation cheaper (asynchronous MPI, the `x86-64-v3` WSClean build and `--native` on top of it, the phase-centre predict, and the two constant `WEIGHT`/`SIGMA` columns the simulator no longer writes); and why a run's disk footprint, its rank memory and its own polling loops, not its clock, are what cap a big one; and the `nlive` scan showing utilisation *rises* with run size (93.9% at `--nlive 25`, 98.3% at `--nlive 200`) because the unaccounted time is a ~6s per-run constant |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 
@@ -418,8 +419,10 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
   derived from `uname -m`. Setting it cross-builds under slow QEMU emulation.
 - `torch.cuda.is_available() == False` is correct; the images are CPU-only.
 - `exec format error` means something forced the non-host architecture.
-- WSClean illegal-instruction: a `PORTABLE=OFF` image built on a different CPU.
+- WSClean illegal-instruction: a `--native` image on another CPU, or the
+  default `x86-64-v3` one on a pre-2013 CPU (`WSCLEAN_TARGET_CPU=` fixes it).
 - Root-owned files in `results/` on Linux: `sudo chown -R $(id -u):$(id -g) results/`.
-- OOM during the casacore build: raise Docker memory, or `--build-arg BUILD_JOBS=1`.
+- OOM during the casacore build: raise Docker memory, or `BUILD_JOBS=1 ./ri build wsclean`
+  (it otherwise compiles at `nproc`).
 - Docker Desktop on macOS numbers are not representative of native Linux
   (VM CPU/memory limits, virtualized bind-mount I/O, no GPU passthrough).
