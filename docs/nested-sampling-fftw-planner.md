@@ -160,14 +160,13 @@ header carries a `DATE` stamp): **400 of 400 identical.**
 
 ## What is left
 
-The 1.81 ms of repeat plan builds. `Convolve()` destroys its four plans at the
-bottom of every call and `Resampler` destroys its two in its destructor, so the
-63 builds could be 12 - the remaining cost is FFTW's planner walking its solver
-table and taking its lock, ~0.03-0.045 ms a call. Removing it needs a
-`schaapcommon` patch holding the plans in a static cache, in the shape
-`docker/wsclean/patches/0003` uses for casacore tables (and with the same
-static-destruction-order care). That is ~3% of the binary and it is the next
-thing on this avenue.
+Nothing - the 1.81 ms of repeat plan builds named here has since been taken.
+`docker/wsclean/patches/0004` is the `schaapcommon` plan cache this section
+called for, in exactly the shape `0003` uses for casacore tables and with the
+same static-destruction-order care: 64 plan builds an evaluation down to 12,
+worth -2.7% on the binary in an interleaved replay and -3.2% over four
+simultaneous swapped searches, with bit-identical images. See
+[the gridder-floor doc](nested-sampling-gridder-floor.md).
 
 Not worth pursuing on this page:
 

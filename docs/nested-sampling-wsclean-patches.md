@@ -202,3 +202,22 @@ load-bearing details of the cache and the measurements are in
 Upstream-shaped: it changes nothing WSClean computes, and it is the same shape
 as 0001 one level up - cache what does not change for the life of a process
 instead of re-deriving it.
+
+## 0004: cache the FFTW transform plans
+
+`CachedPlan1D()` and `CachedPlan2D()` in
+`external/schaapcommon/src/math/convolution.cc` - a `std::map` from transform
+shape to plan behind a mutex - replacing the four plans
+`schaapcommon::math::Convolve()` built and destroyed on every call and the two
+`Resampler` built and destroyed per instance. That is 64 plan builds an
+evaluation down to 12 and 64 destroys down to 0, worth -2.7% on the `wsclean`
+binary in an interleaved replay and -3.2% over four simultaneous swapped
+searches, with bit-identical images. Why the plans are safe to share, why the
+cache is leaked, and the measurements are in
+[the gridder-floor doc](nested-sampling-gridder-floor.md).
+
+The first patch here that touches the `schaapcommon` submodule rather than
+WSClean itself, so its paths are `external/schaapcommon/...` and it is the one
+most likely to need regenerating against a `WSCLEAN_GIT_TAG` bump. Otherwise
+the same shape as 0001 and 0003: cache what does not change for the life of a
+process.
