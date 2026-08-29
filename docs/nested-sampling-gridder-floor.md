@@ -154,6 +154,29 @@ without this number. Same family as `-wgridder-accuracy 1e-2`
 ([the evaluation-budget doc](nested-sampling-evaluation-budget.md), +13.8%),
 but a much better rate: 2x the accuracy loss for 2x the speedup.
 
+### It cannot be taken on part of a run either
+
+The obvious way to have both is a per-evaluation rule: skip w-gridding on the
+evaluations where ducc0's own accuracy standard says it is free, and pay for it
+on the rest. The criterion is the phase above, `2*pi*wmax*max|n-1|`, against the
+`eps=1e-4` the gridder is held to; everything it needs is already in every
+evaluation's log (`w=[min:max] lambdas`, `using optimal: N x N`) and its
+`-scale`.
+
+Over all 5962 evaluations of a `--nlive 600` search, that phase runs from
+1.5e-4 at the smallest to 1.4e-1 at the largest, with a median of 1.2e-3.
+**Not one is below 1e-4**, and the floor is not close to it. The relation is
+structural rather than an accident of the seed - `-scale` is set from each
+observation's own `max_proj_baseline_lambda` at `DEFAULT_SUPER_RESOLUTION`, so
+the phase reduces to roughly `2*pi*36*(wmax/maxuvw)/maxuvw` and only the
+longest-baseline corner approaches the epsilon, which is also where
+`wmax/maxuvw` is largest. See
+[the run-scaling page](nested-sampling-run-scaling.md) for the percentile table
+and how to recompute it from any archived run's logs.
+
+So the -29% stays exactly what it is above: a decision about accuracy, with no
+lossless subset of it available.
+
 ## 0004: the plans schaapcommon keeps rebuilding
 
 [The FFTW-planner doc](nested-sampling-fftw-planner.md) closed with 1.81 ms an

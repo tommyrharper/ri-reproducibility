@@ -52,6 +52,12 @@ the `wsclean` binary's first and last log line:
 logged_ms = 100.4 + 5.64 us x visibilities        (n = 34368, 19 workers)
 ```
 
+Refitted on the current tree it reads `70.7 + 4.58 us x visibilities` - patches
+0003-0005, the zygote's cfitsio and casacore warm-up and `-data-column DATA`
+have taken 30% off the constant and 19% off the rate since. The shape below is
+unchanged; the numbers in it are the ones this run had. See
+[the run-scaling page](nested-sampling-run-scaling.md).
+
 The deciles it comes from, median logged ms at median visibility count:
 
 | vis | 2457 | 4914 | 7020 | 8424 | 10530 | 12285 | 14742 | 17199 | 19656 | 24570 |
