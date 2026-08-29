@@ -102,8 +102,10 @@ that is thrown away, then a ~52x52 one. Each fit is GSL's `lmsder` over
 `width*height` residuals with three parameters, and each residual is an
 `std::exp`.
 
-No result-preserving lever was found here. The first fit cannot be skipped -
-its output is what sizes the second box and seeds its estimate - and every
+No result-preserving lever was found here. The exact retry condition, and why
+no value of `-beam-fitting-size` avoids the second fit, is in
+[the cost-model doc](nested-sampling-cost-model.md). The first fit cannot be
+skipped - its output is what sizes the second box and seeds its estimate - and every
 knob that changes the box (`-beam-fitting-size`, `-circular-beam`,
 `-no-fit-beam`, `-beam-size`) changes the fitted beam, hence the restored image,
 hence every metric. It is recorded here because it is 6.7% of an evaluation

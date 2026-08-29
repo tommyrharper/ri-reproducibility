@@ -143,6 +143,15 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
+        # Without this WSClean opens the whole parent measurement set once,
+        # before it has opened anything else, only to ask whether there is a
+        # CORRECTED_DATA column (Settings::determineDataColumn). There never
+        # is - self_check_dropped_subtables() asserts it - and naming the
+        # column is -1.0% on the wsclean binary over 800 paired replays
+        # against a 0.1%-resolution null, with 1000 FITS data blocks
+        # bit-identical. See docs/nested-sampling-cost-model.md.
+        "-data-column",
+        "DATA",
         # Every output line carries a microsecond timestamp, which makes each
         # evaluation's wsclean.stdout.log a phase timeline at production
         # concurrency with no rig and no instrumentation - that is what

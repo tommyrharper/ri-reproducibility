@@ -989,7 +989,16 @@ def self_check_dropped_subtables() -> None:
             with table(str(ms), readonly=True, ack=False) as opened:
                 keywords = opened.getkeywords()
                 rows = opened.nrows()
+                columns = opened.colnames()
             assert rows, f"{ms} came out empty"
+            # polychord_wsclean.py passes `-data-column DATA` rather than let
+            # WSClean open the whole measurement set to decide - which is only
+            # the same answer while the simulator writes no CORRECTED_DATA.
+            assert "DATA" in columns, f"{ms} has no DATA column"
+            assert "CORRECTED_DATA" not in columns, (
+                f"{ms} has a CORRECTED_DATA column, so WSClean would image that "
+                "one - drop the `-data-column DATA` in polychord_wsclean.py"
+            )
             for name in UNUSED_SUBTABLES:
                 assert name not in keywords, f"{name} is still a keyword of {ms}"
                 assert not (ms / name).exists(), f"{name} is still on disk in {ms}"

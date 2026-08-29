@@ -306,6 +306,7 @@ stops it.
 ```bash
 ./ri profile results/nested-sampling/<run> [--json]
 ./ri profile results/nested-sampling/<run> --phases   # inside the wsclean binary
+./ri profile results/nested-sampling/<run> --over-time  # evals/s against wall clock
 uv run scripts/profile-nested-sampling-run.py results/nested-sampling/<run> [--json]
 ```
 
@@ -317,6 +318,12 @@ runs with `-log-time`, so its `wsclean.stdout.log` is a microsecond phase
 timeline and the flag aggregates all of them. What it reads on the current tree,
 and what is and is not left to win there:
 `docs/nested-sampling-phase-profile.md`.
+
+`--over-time` answers the other question: why the run got slower. It prints
+evaluations/second against wall clock beside the visibility count that sets it,
+because an evaluation costs a constant plus a rate times its visibilities and
+the sampler walks towards the most of them -
+`docs/nested-sampling-cost-model.md`.
 
 ## Merging runs
 
@@ -426,6 +433,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/nested-sampling-wsclean-patches.md` | The local patches `docker/wsclean/patches/` applies to the pinned WSClean tree, why the directory exists, and what each one is worth. 0001 caches the reordered provider's antenna names: WSClean re-opened the parent Measurement Set once per gridding and degridding pass purely to read the `ANTENNA` table, and caching it is +10.5% evaluations per second end to end, -13.1% on the `wsclean` binary, 790 FITS data blocks identical - with the `-log-time` before/after, the three-arm replay and its null, the swapped simultaneous-search pairs and their null, and why a replay corpus on ext4 overstates an MS-open win against a `sim.ms` on tmpfs |
 | `docs/nested-sampling-wsclean-zygote.md` | Why 27ms of every 163ms `wsclean` process runs before `main()` does - casacore's static initialisers across 73 shared objects, priced per library with `LD_PRELOAD` - and the `wsclean-zygote` fork server that pays it once per rank instead: +8.4% evaluations per second end to end over eight simultaneous swapped pairs, 200 FITS data blocks identical, with the `exec`-to-first-log-line measurement that found it, why `image_binary_seconds` and peak RSS now come from `wait4()` rather than a forked `/usr/bin/time`, why the parent must stay single-threaded, and why the parent-warm-up follow-up is closed (0.94ms, not the ~11ms it was estimated at) |
 | `docs/nested-sampling-phase-profile.md` | Where a post-zygote evaluation's 191ms goes, refreshed on a 5312-evaluation search: 84% is the `wsclean` binary, and inside it 48% is ducc0's gridding and degridding passes, 10% deconvolution, 6.7% *fitting the Gaussian beam to the PSF* (the largest item that is not imaging arithmetic, and one every evaluation pays twice because the theoretical beam under-estimates the fitted one), 21% metadata and I/O. `-log-time` is now passed by default - measured free against a 1.8%-resolution null pair - so `./ri profile <run> --phases` reads that table off any run with no rig. Also closes two avenues with numbers: pre-warming the zygote parent (0.94ms) and WSClean's remaining parent-MS opens (0.51ms each over a plain `Table`) |
+| `docs/nested-sampling-cost-model.md` | Why a run's throughput falls as it goes, and what it costs: an evaluation is `100.4 ms + 5.64 us x visibilities` at production concurrency, and nested sampling compresses towards the long-observation, many-channel corner, so evaluations/second drops 15% over six minutes with nothing degrading (`./ri profile <run> --over-time`). Sets the priority for future work - the *fixed* half shrinks in share as a run goes deeper, so pass-count levers (`-mgain`) matter more than metadata ones. Ships `-data-column DATA` (-1.0% on the `wsclean` binary against a 0.1%-resolution null, 1000 FITS data blocks identical) and closes `-gridder tuned-wgridder`, `-gridder wtowers` and the beam fit's retry (which triggers iff fitted > 1.25x theoretical, independent of `-beam-fitting-size`) |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 

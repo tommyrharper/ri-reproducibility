@@ -303,6 +303,12 @@ check(
 )
 
 check(
+    "profile --over-time reaches the profiler",
+    [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--over-time"]],
+    plan("profile", "results/x", "--over-time")[1],
+)
+
+check(
     "nested plot subcommands dispatch",
     [["uv", "run", "scripts/anesthetic-gui.py", "results/x"]],
     plan("plot", "gui", "results/x")[1],
