@@ -652,6 +652,12 @@ the extra workers are landing on E-cores (lower IPC at any clock) and on
 hyperthread siblings, and both of those are the same core getting less done per
 cycle, not a shared bus running out.
 
+> **Correction.** The all-core clock below is not a property of the silicon:
+> it is what a 65W package power limit buys at that worker count, and the
+> part's own rated turbo power is 117W. Of the 1.59x, ~1.30x is the power
+> limit and is recoverable with one sysfs write. See
+> [docs/nested-sampling-power-limit.md](nested-sampling-power-limit.md).
+
 So of the 2.21x an evaluation inflates between 1 and 19 workers, **1.59x is
 the all-core clock** (4714 MHz down to 2958 MHz - stock behaviour for an
 i5-13500, whose single-core turbo is 4.8GHz and whose all-core sustained clock
@@ -671,6 +677,11 @@ Two things follow for the bigger runs:
   particular CPU's hybrid topology and power budget.
 
 ## The first four seconds of any measurement lie by 20%
+
+> **Correction.** The effect and the rule below both hold, but the cause is
+> not the clock "settling": it is the package dropping from its 117W short-term
+> power limit to its 65W long-term one once the 8-second averaging window
+> fills. See [docs/nested-sampling-power-limit.md](nested-sampling-power-limit.md).
 
 The all-core clock does not settle instantly. Sampling `/proc/cpuinfo` across
 a 19-worker replay:
