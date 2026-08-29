@@ -43,6 +43,12 @@ write_run_config() {
     # half way through.
     printf 'NS_SYNCHRONOUS=%q\n' "${NS_SYNCHRONOUS}"
     printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
+    # WSClean-only, and for the same reason as the two above: `--mgain 0.9` is
+    # ~20% of a run's throughput and part of what its evaluations were scored
+    # under, so a resume that dropped it would change both half way through.
+    if [ "${algorithm}" = wsclean ]; then
+      printf 'NS_WSCLEAN_MGAIN=%q\n' "${NS_WSCLEAN_MGAIN}"
+    fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
     fi
@@ -214,7 +220,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
     NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
+    NS_WSCLEAN_MGAIN=0.9 \
     write_run_config "${_dir}" wsclean
+  grep -qx 'NS_WSCLEAN_MGAIN=0.9' "${_dir}/run.env" || {
+    echo "FAIL: --mgain not recorded in run.env"; exit 1
+  }
   # 0 turns the watchdog off and must be written as 0, not dropped: an absent
   # key reads as the default, which is the setting's opposite.
   grep -qx 'NS_STALL_TIMEOUT=0' "${_dir}/run.env" || {

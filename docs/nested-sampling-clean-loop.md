@@ -12,10 +12,13 @@ evaluations.
 It is **not shipped**. `-mgain` is part of the experiment definition all 45
 archived runs were scored under, and it is not free for every metric (see
 [the caveat](#the-catch-it-is-only-result-preserving-for-total_rms_jy)).
-Taking it is a one-character edit of `DEFAULT_WSCLEAN_MGAIN` in
-`scripts/lib/nested_sampling/common.py`, followed by
-`scripts/build.sh polychord`; every run's `summary.json` records the value it
-ran under in `wsclean_fixed_hyperparameters.mgain`.
+Taking it is `./ri search wsclean --mgain 0.9` (`NS_WSCLEAN_MGAIN`), which
+needs no rebuild and is carried through a resume by the run's `run.env`; every
+run's `summary.json` records the value it ran under in
+`wsclean_fixed_hyperparameters.mgain`. `DEFAULT_WSCLEAN_MGAIN` in
+`scripts/lib/nested_sampling/common.py` is what the flag defaults to, and
+moving *that* (plus `scripts/build.sh polychord`) is how the default itself
+would change.
 
 ## Why the clean loop costs what it does
 
@@ -131,11 +134,21 @@ decision and it costs throughput rather than buying it.
 
 ## Rig
 
-`docker tag` a baseline image aside, edit the constant, `scripts/build.sh
-polychord`, tag the result, `git checkout` the file and rebuild - then run the
-two searches alternately with `POLYCHORD_IMAGE=<tag> ./ri search wsclean
---no-build`. Image tags are shared across worktrees, so tag both arms
-explicitly rather than trusting `:lite` to still be what you built.
+Since `-mgain` became a flag this needs no second image at all: run the two
+searches **simultaneously** with `--mgain 0.8` and `--mgain 0.9` and read the
+grid/predict pass counts out of `./ri profile <run> --phases`. That is the
+measurement in
+[the floor doc](nested-sampling-evaluation-floor.md#mgain-measured-again-as-a-flag)
+- 8.52 + 6.52 passes against 6.73 + 4.73, i.e. 6.5 major cycles down to 4.7 -
+and the pass counts are a far better arm-to-arm signal than evals/s, because
+the faster arm finishes first and then has the host to itself.
+
+The original rig, for a change that *is* baked into the image: `docker tag` a
+baseline image aside, edit the constant, `scripts/build.sh polychord`, tag the
+result, `git checkout` the file and rebuild - then run the two searches
+alternately with `POLYCHORD_IMAGE=<tag> ./ri search wsclean --no-build`. Image
+tags are shared across worktrees, so tag both arms explicitly rather than
+trusting `:lite` to still be what you built.
 
 For the replay arms, the corpus comes from one search with
 `--keep-measurement-sets` (2070 evaluations, 3.5 GB) and the arms are built by

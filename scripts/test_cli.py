@@ -55,6 +55,15 @@ check(
     plan("search", "wsclean", "--nlive", "8", "--metric=-snr", "--mpi-procs", "1")[0],
 )
 
+# --mgain is the only float flag here, and it has to arrive as WSClean would
+# print it rather than as Python's repr, because common.py renders it into the
+# argv with %g and every run records what it used.
+check(
+    "search --mgain reaches the run script",
+    {"NS_WSCLEAN_MGAIN": "0.9"},
+    plan("search", "wsclean", "--mgain", "0.9")[0],
+)
+
 # --retries 0 is the flag most likely to be dropped by env_from(), because 0 is
 # falsy and turning off the self-restart has to reach the run script.
 check(

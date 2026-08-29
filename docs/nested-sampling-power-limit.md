@@ -10,6 +10,10 @@ power limit**, and that limit - not thermals, not memory bandwidth, not the
 scheduler - is what sets the all-core clock the workers run at. Lifting it is
 worth about **+26% evaluations per second**, it is a single write to a sysfs
 file, and it needs root, which is why this is written down rather than shipped.
+Docker is not a way around that here: this host runs **rootless** Docker, so a
+`docker run --privileged -v /sys:/hostsys` container's `root` is the same
+unprivileged host user and reading `energy_uj` from it already returns
+`Permission denied`.
 
 Everything below was measured on the current tree (`--nlive 25 --num-repeats
 10 --max-ndead -1 --mpi-procs 20`, i.e. 19 workers), 29 August 2026.

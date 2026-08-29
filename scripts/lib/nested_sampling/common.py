@@ -211,10 +211,13 @@ DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 # an evaluation pays for. 0.8 costs ~6.5 major cycles; 0.9 costs ~4.7 and is
 # worth ~20% more evaluations per second for a change in the default
 # `total_rms_jy` objective of 1e-7 (median) to 1e-4 (worst of 600).
-# It is left at 0.8 because it is part of the experiment definition every
-# archived run was scored under - see docs/nested-sampling-clean-loop.md before
-# changing it.
-DEFAULT_WSCLEAN_MGAIN = 0.8
+# The default stays 0.8 because it is part of the experiment definition every
+# archived run was scored under; `./ri search --mgain 0.9` (NS_WSCLEAN_MGAIN)
+# is how a run that wants the throughput instead asks for it, and every run
+# records what it used in its summary. See docs/nested-sampling-clean-loop.md
+# for the science cost and docs/nested-sampling-evaluation-floor.md for why
+# this is now the largest lever left.
+DEFAULT_WSCLEAN_MGAIN = float(os.environ.get("NS_WSCLEAN_MGAIN") or 0.8)
 
 # Image geometry, shared by both imagers so that they reconstruct the same sky.
 # R2D2 derives its cell size from the data it is given rather than taking one

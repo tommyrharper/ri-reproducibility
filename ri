@@ -46,6 +46,7 @@ SEARCH_ENV = (
     ("seed", "NS_SEED"),
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
+    ("mgain", "NS_WSCLEAN_MGAIN"),
     ("synchronous", "NS_SYNCHRONOUS"),
     ("keep_measurement_sets", "NS_KEEP_MEASUREMENT_SETS"),
     ("retries", "NS_RETRIES"),
@@ -351,6 +352,14 @@ def build_parser():
                              "--metric=-snr, to search the worst corner [NS_METRIC]")
     search.add_argument("--mpi-procs", type=int,
                         help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
+    search.add_argument("--mgain", type=float,
+                        help="WSClean major-cycle gain, the largest throughput lever "
+                             "left: it sets how many of an evaluation's ~15 gridding "
+                             "and degridding passes are paid for. 0.9 is ~20%% more "
+                             "evaluations per second than the 0.8 default, and moves "
+                             "the default total_rms_jy objective by 1e-7 (median) but "
+                             "not peak_flux_abs_error_jy or sigma_res "
+                             "[NS_WSCLEAN_MGAIN], see docs/nested-sampling-clean-loop.md")
     search.add_argument("--synchronous", action=argparse.BooleanOptionalAction,
                         help="make every rank wait for the slowest one each sampling "
                              "round. Off by default: it costs ~30%% of the wall clock "
