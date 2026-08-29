@@ -1431,6 +1431,14 @@ inputs are the whole point of this search. With `NS_SCRATCH_DIR` unset (a
 self-check, a host with no writable `/dev/shm`) everything behaves exactly as
 before.
 
+> **Correction (iteration 14).** This removed the copy onto the disk but left a
+> copy between two pieces of RAM: the simulator still assembled the MS on the
+> container's *private* `/dev/shm`, which is a different mount from the shared
+> scratch, so the closing `shutil.move` was still a whole-MS cross-device copy -
+> 1.60ms serial, 6.5ms in a real search. It now assembles in the destination
+> directory; see
+> [docs/nested-sampling-io-placement.md](nested-sampling-io-placement.md).
+
 ### The isolated rig said 5.1ms; the search says 1.2ms
 
 Nineteen concurrent simulate processes, 60 evaluations each, median over the 19

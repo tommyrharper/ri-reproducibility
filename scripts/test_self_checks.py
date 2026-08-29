@@ -85,6 +85,7 @@ IMAGE_ONLY = {
         "self_check_noise_weighting",
         "self_check_phase_centre_predict",
         "self_check_predict_timeout_recovery",
+        "self_check_scratch_root",
         "self_check_serve_fifo",
         "self_check_serve_reply_stream",
         "self_check_skeleton_cache",

@@ -48,6 +48,24 @@ SPEED_OF_LIGHT = 299792458.0
 SCRATCH_ROOT = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
 
+def scratch_root_for(destination: Path) -> str | None:
+    """Where to assemble a Measurement Set that is bound for `destination`.
+
+    SCRATCH_ROOT is this container's own /dev/shm, which docker gives it as a
+    private tmpfs - a different mount from the run's shared scratch
+    (`NS_SCRATCH_DIR`, bind-mounted into every container by
+    scripts/lib/start-sidecars.sh). So for a destination already inside that
+    shared tmpfs, simulate()'s closing `shutil.move` was a cross-device copy of
+    the whole MS - 1.60ms against 0.01ms for the rename it becomes when the two
+    are the same mount. Assembling it in the destination directory is as fast to
+    write (both are RAM) and makes the move free.
+    """
+    shared = os.environ.get("NS_SCRATCH_DIR", "")
+    if shared and destination.is_relative_to(shared):
+        return str(destination)
+    return SCRATCH_ROOT
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-ms", required=True, help="Measurement Set path to create")
@@ -607,7 +625,7 @@ def simulate(args: argparse.Namespace) -> None:
     final_ms.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = Path(args.metadata_json) if args.metadata_json else final_ms.parent / "simulation.json"
 
-    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+    with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
         cfg = write_makems_config(args, scratch_ms)
         make_ms_skeleton(cfg, scratch_ms, args)
@@ -743,6 +761,34 @@ def serve(fifo_base: str | None = None) -> None:
                 returncode = exc.code if isinstance(exc.code, int) else 1
         replies.write(json.dumps({"returncode": returncode}) + "\n")
         replies.flush()
+
+
+def self_check_scratch_root() -> None:
+    """A destination inside the run's shared tmpfs is assembled in place.
+
+    Getting this wrong is silent - the MS still arrives, it is just copied
+    across two tmpfs mounts on the way (1.60ms an evaluation) instead of
+    renamed (0.01ms).
+    """
+    was = os.environ.get("NS_SCRATCH_DIR")
+    with tempfile.TemporaryDirectory() as shared:
+        try:
+            os.environ["NS_SCRATCH_DIR"] = shared
+            inside = Path(shared) / "eval-0001-abc"
+            assert scratch_root_for(inside) == str(inside), scratch_root_for(inside)
+            outside = Path(shared).parent / "not-the-scratch" / "eval-0001-abc"
+            assert scratch_root_for(outside) == SCRATCH_ROOT, scratch_root_for(outside)
+            # No shared scratch at all (a self-check, a host with no writable
+            # /dev/shm): the container's own /dev/shm, exactly as before.
+            del os.environ["NS_SCRATCH_DIR"]
+            assert scratch_root_for(inside) == SCRATCH_ROOT
+        finally:
+            # Restored, not dropped: the checks after this one run in the same
+            # process, and in a sidecar the run really does set it.
+            os.environ.pop("NS_SCRATCH_DIR", None)
+            if was is not None:
+                os.environ["NS_SCRATCH_DIR"] = was
+    print("OK: scratch_root_for assembles in place inside NS_SCRATCH_DIR")
 
 
 def self_check_skeleton_cache() -> None:
@@ -1145,6 +1191,7 @@ if __name__ == "__main__":
             # argument set, so they are dispatched before argparse.
             serve(sys.argv[3] if sys.argv[2:3] == ["--fifo"] else None)
         elif sys.argv[1:] == ["--self-check"]:
+            self_check_scratch_root()
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
             self_check_forest_reuse()

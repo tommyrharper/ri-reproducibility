@@ -103,9 +103,14 @@ sidecar_launch() {
   if [ "${#command[@]}" -gt 1 ]; then
     entrypoint_args=("${command[@]:1}")
   fi
-  local -a scratch_mount=()
+  local -a scratch_args=()
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
-    scratch_mount=(-v "${NS_SCRATCH_DIR}:${NS_SCRATCH_DIR}")
+    # The path is also in the environment, not just on the argv the rank sends:
+    # the simulator assembles its Measurement Set in the destination directory
+    # when that is already this tmpfs, so that its closing move is a rename
+    # rather than a copy off the container's own /dev/shm - see
+    # scratch_root_for() in simulate_point_source_ms.py.
+    scratch_args=(-v "${NS_SCRATCH_DIR}:${NS_SCRATCH_DIR}" -e "NS_SCRATCH_DIR=${NS_SCRATCH_DIR}")
   fi
   local -a run=(
     docker run --detach --rm --name "${name}"
@@ -114,7 +119,7 @@ sidecar_launch() {
     --shm-size 512m
     --platform "${platform}"
     -v "${REPO_ROOT}:${REPO_ROOT}"
-    ${scratch_mount[@]+"${scratch_mount[@]}"}
+    ${scratch_args[@]+"${scratch_args[@]}"}
     ${args[@]+"${args[@]}"}
     --entrypoint "${command[0]}" "${image}" ${entrypoint_args[@]+"${entrypoint_args[@]}"}
   )
@@ -220,6 +225,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   if [ -n "${NS_SCRATCH_DIR}" ]; then
     [ "$(grep -c -- "-v ${NS_SCRATCH_DIR}:${NS_SCRATCH_DIR}" "${_log}")" = 3 ] \
       || { echo "FAIL: the scratch mount did not reach all three containers"; exit 1; }
+    # And its path in the environment, which is how the simulator knows the
+    # destination is a tmpfs it can assemble in - see scratch_root_for().
+    [ "$(grep -c -- "-e NS_SCRATCH_DIR=${NS_SCRATCH_DIR}" "${_log}")" = 3 ] \
+      || { echo "FAIL: NS_SCRATCH_DIR did not reach all three containers"; exit 1; }
   fi
   [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1","img:c":"ri-ns-sidecar-'"$$"'-2"}' ]
   # No OUTPUT_DIR above, so no label - the pid rule in rank-budget.sh is still
