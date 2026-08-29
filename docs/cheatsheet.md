@@ -233,14 +233,16 @@ checkout started while it is running, because it reports those too.
 ## All of that from one screen
 
 ```bash
-./ri tui                   # run table, live health, and a form that starts a search
+./ri tui                   # run table, live health, the profile, and a form that starts a search
 ```
 
 A terminal interface over the three commands above: the table is `./ri runs`,
 in its order (newest run at the top, whichever imager it belongs to) and with
 its `started` column, `enter` shows `./ri health` for the selected run and
-re-runs it every 5 seconds, `l` swaps that for the tail of the run's `run.log`,
-`a` narrows the table to what is running, and `n` opens a form that starts a
+re-runs it every 5 seconds, `l` loops from there to the tail of the run's
+`run.log` and then to `./ri profile` - where the run's time went, paused,
+because a profile only exists once the run has finished - and back again. `a`
+narrows the table to what is running, and `n` opens a form that starts a
 search. Keys are listed along the bottom of every screen.
 
 A search started there is detached, so quitting the interface leaves it going.
@@ -248,7 +250,7 @@ It joins the table as `starting` the moment it is launched - the search builds
 its images before it claims a run directory, so `./ri runs` cannot see it for a
 while - and `enter` on it shows the output of that build, in
 `results/tui-<run>.log`, which is where anything that goes wrong before the run
-directory exists is said. `l` swaps to `./ri health` from there too.
+directory exists is said. `l` loops on to `./ri health` from there too.
 
 Needs Go on the host; nothing else in this repo does. The source is `tui/`,
 and `go -C tui test ./...` checks it.

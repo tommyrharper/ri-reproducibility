@@ -2,7 +2,8 @@
 // which are going, how healthy they are, and start another one.
 //
 // Started with `./ri tui`. Three screens, and nothing else: the run table, a
-// pane that re-runs ./ri health on a timer, and a form that launches a search.
+// pane that re-runs ./ri health, its log or its profile on a timer, and a form
+// that launches a search.
 package main
 
 import (
@@ -41,6 +42,21 @@ const (
 	screenForm
 )
 
+// The sides of a run the pane can show, in the order `l` loops through them:
+// is it progressing, what is it saying, and where did its time go.
+type pane int
+
+const (
+	paneHealth pane = iota
+	paneLog
+	paneProfile
+	paneCount
+)
+
+var paneNames = [paneCount]string{"health", "log", "profile"}
+
+func (p pane) next() pane { return (p + 1) % paneCount }
+
 type runsMsg struct {
 	runs []Run
 	err  error
@@ -75,13 +91,13 @@ type model struct {
 	logTitle string
 	// What the log pane re-runs on a refresh. Set when the pane is opened.
 	reload func(ri) (string, error)
-	// The run the log pane is showing, and which of its two sides: 'l' swaps
-	// the health report for the log and back, esc goes to the table, and enter
-	// there comes back here - which is the whole navigation.
-	logRun     Run
-	showingLog bool
-	paused     bool
-	refreshed  time.Time
+	// The run the log pane is showing, and which of its sides: 'l' loops
+	// through them, esc goes to the table, and enter there comes back here -
+	// which is the whole navigation.
+	logRun    Run
+	pane      pane
+	paused    bool
+	refreshed time.Time
 
 	imager   int
 	fields   []field
@@ -180,6 +196,17 @@ func health(run string) func(ri) (string, error) {
 	}
 }
 
+// profile is the per-stage timing table for a run: where its time went, and
+// how much of it was not an evaluation at all. Errors and all, for the same
+// reason health takes them - a run still going has no summary.json yet, and
+// ./ri profile says so better than this program could.
+func profile(run string) func(ri) (string, error) {
+	return func(r ri) (string, error) {
+		out, _ := r.run("profile", run)
+		return out, nil
+	}
+}
+
 func runLog(path string) func(ri) (string, error) {
 	return func(r ri) (string, error) {
 		return tail(filepath.Join(r.root, path, "run.log"), 200_000)
@@ -197,18 +224,28 @@ func (m *model) openLog(title string, load func(ri) (string, error)) tea.Cmd {
 	return loadLog(m.ri, load)
 }
 
-// showRun opens the log pane on one of a run's two sides: the health report,
-// or the log it is writing. Everything that opens the pane goes through here,
-// so `l` toggles the same two views the table's enter arrives on.
-func (m *model) showRun(run Run, showHealth bool) tea.Cmd {
-	m.logRun, m.showingLog = run, !showHealth
-	if showHealth {
-		return m.openLog(run.Name, health(run.Name))
+// showRun opens the pane on one of a run's sides: the health report, the log
+// it is writing, or where its time went. Everything that opens the pane goes
+// through here, so `l` loops through the same views the table's enter arrives
+// on.
+func (m *model) showRun(run Run, p pane) tea.Cmd {
+	m.logRun, m.pane = run, p
+	switch p {
+	case paneLog:
+		if log := m.launchLogFor(run.Name); log != "" {
+			return m.openLog(run.Name+" launch", launchLog(log))
+		}
+		return m.openLog(run.Name+" run.log", runLog(run.Path))
+	case paneProfile:
+		cmd := m.openLog(run.Name+" profile", profile(run.Name))
+		// Opened paused, unlike the other two: a profile is written when the
+		// run ends, so there is nothing for a timer to pick up, and re-reading
+		// a summary.json that grows to megabytes every five seconds would cost
+		// the host more than the run it is watching. `r` and `p` still work.
+		m.paused = true
+		return cmd
 	}
-	if log := m.launchLogFor(run.Name); log != "" {
-		return m.openLog(run.Name+" launch", launchLog(log))
-	}
-	return m.openLog(run.Name+" run.log", runLog(run.Path))
+	return m.openLog(run.Name, health(run.Name))
 }
 
 func (m model) selected() (Run, bool) {
@@ -326,7 +363,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// terminal, and the line most likely to run over is the warning that
 		// says what to do about the run.
 		m.view.SetContent(lipgloss.NewStyle().Width(m.view.Width).Render(msg.body))
-		if atBottom {
+		// A health report and a log are both read from their end, and both
+		// grow, so the pane follows them. A profile is a fixed table whose
+		// first line is the biggest stage - following it would open every
+		// profile on its footnote.
+		if atBottom && m.pane != paneProfile {
 			m.view.GotoBottom()
 		}
 		m.refreshed = msg.at
@@ -382,7 +423,11 @@ func (m model) updateRuns(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// A run that has not claimed its directory yet has nothing for
 		// ./ri health to report on, and everything to say in its log. The
 		// command is bound first because showRun sets up the model it returns.
-		cmd := m.showRun(run, run.Status != "starting")
+		openOn := paneHealth
+		if run.Status == "starting" {
+			openOn = paneLog
+		}
+		cmd := m.showRun(run, openOn)
 		return m, cmd
 	}
 	var cmd tea.Cmd
@@ -401,7 +446,7 @@ func (m model) updateLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.paused = !m.paused
 		return m, nil
 	case "l":
-		cmd := m.showRun(m.logRun, m.showingLog)
+		cmd := m.showRun(m.logRun, m.pane.next())
 		return m, cmd
 	}
 	var cmd tea.Cmd
@@ -460,7 +505,7 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.err, m.notice = "", "launched "+run.Name
 		m.setRows()
 		m.table.SetCursor(0)
-		cmd := m.showRun(run, false)
+		cmd := m.showRun(run, paneLog)
 		return m, cmd
 	}
 	if m.focused == 0 {
@@ -513,7 +558,7 @@ func (m model) logView() string {
 	if !m.refreshed.IsZero() {
 		state += ", read " + m.refreshed.Format("15:04:05")
 	}
-	help := "esc runs  ·  l " + map[bool]string{true: "health", false: "log"}[m.showingLog] +
+	help := "esc runs  ·  l " + paneNames[m.pane.next()] +
 		"  ·  r refresh  ·  p pause  ·  ↑/↓ scroll"
 	return strings.Join([]string{
 		titleStyle.Render(m.logTitle) + helpStyle.Render("  "+state),

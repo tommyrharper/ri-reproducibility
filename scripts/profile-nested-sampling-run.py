@@ -65,6 +65,15 @@ def resolve_run(raw: str) -> Path:
 def load_summary(target: Path) -> dict[str, Any]:
     summary_path = target / "summary.json" if target.is_dir() else target
     if not summary_path.is_file():
+        if target.is_dir():
+            # The common case now that `./ri tui` loops through this view:
+            # a run that is still going has nothing to profile yet, and saying
+            # which command does watch a live run is more use than a path.
+            raise SystemExit(
+                f"{target.name} has not written a summary.json yet - a run writes "
+                f"one when it finishes.\n./ri health {target.name} is the view of a "
+                "run still going."
+            )
         raise SystemExit(f"no summary.json found at {summary_path}")
     try:
         return json.loads(summary_path.read_text())
@@ -313,6 +322,18 @@ def self_check() -> None:
     assert len(timeline) == 1, timeline
     assert abs(timeline[0][1] - 7.5) < 1e-3, timeline
     assert timeline[0][2] == 4140, timeline
+
+    # A live run has no summary.json, and `./ri tui` now shows what this says.
+    with tempfile.TemporaryDirectory() as raw:
+        live = Path(raw) / "wsclean-vlaa-20260101T000000Z"
+        live.mkdir()
+        try:
+            load_summary(live)
+        except SystemExit as exit_message:
+            assert "has not written a summary.json yet" in str(exit_message), exit_message
+            assert "./ri health wsclean-vlaa-20260101T000000Z" in str(exit_message), exit_message
+        else:
+            raise AssertionError("a run directory with no summary.json must not load")
     print("OK: wsclean phase timeline")
 
 
