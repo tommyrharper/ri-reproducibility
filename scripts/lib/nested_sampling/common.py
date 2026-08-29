@@ -205,6 +205,17 @@ def abort_run(message: str) -> None:
 DEFAULT_WSCLEAN_NITER = 100
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
+# The major-cycle gain, and by a wide margin the most expensive number in this
+# file: it sets how deep each minor loop goes, hence how many major cycles the
+# `DEFAULT_WSCLEAN_NITER` budget is spread over, hence how many gridding passes
+# an evaluation pays for. 0.8 costs ~6.5 major cycles; 0.9 costs ~4.7 and is
+# worth ~20% more evaluations per second for a change in the default
+# `total_rms_jy` objective of 1e-7 (median) to 1e-4 (worst of 600).
+# It is left at 0.8 because it is part of the experiment definition every
+# archived run was scored under - see docs/nested-sampling-clean-loop.md before
+# changing it.
+DEFAULT_WSCLEAN_MGAIN = 0.8
+
 # Image geometry, shared by both imagers so that they reconstruct the same sky.
 # R2D2 derives its cell size from the data it is given rather than taking one
 # (src/utils/io.py in the pinned upstream commit), so WSClean has to apply the

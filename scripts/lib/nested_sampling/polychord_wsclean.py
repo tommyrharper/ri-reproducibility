@@ -18,6 +18,7 @@ from common import (
     DEFAULT_IMAGE_DIM,
     DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
+    DEFAULT_WSCLEAN_MGAIN,
     DEFAULT_WSCLEAN_NITER,
     FAILURE_OBJECTIVE,
     WORKER_DIED,
@@ -134,7 +135,7 @@ def evaluate(
         "-niter",
         str(DEFAULT_WSCLEAN_NITER),
         "-mgain",
-        "0.8",
+        f"{DEFAULT_WSCLEAN_MGAIN:g}",
         "-auto-threshold",
         f"{DEFAULT_WSCLEAN_AUTO_THRESHOLD:.6f}",
         "-weight",
@@ -451,6 +452,7 @@ def main() -> None:
             },
             "wsclean_fixed_hyperparameters": {
                 "niter": DEFAULT_WSCLEAN_NITER,
+                "mgain": DEFAULT_WSCLEAN_MGAIN,
                 "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
                 "image_dim": DEFAULT_IMAGE_DIM,
                 # `-scale` is derived per evaluation from this and the sampled

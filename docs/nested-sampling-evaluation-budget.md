@@ -7,7 +7,9 @@ inversion, and 6% is everything this repo writes** - so there is nothing left
 in the harness, and the remaining lines are WSClean's or the host's. Nor is
 there a WSClean flag that recovers any of it:
 [every result-preserving knob has now been measured](#what-the-remaining-wsclean-flags-are-worth)
-and the one with headroom buys it out of the gridder's accuracy.
+and the one with headroom buys it out of the gridder's accuracy. The one knob
+that *does* move the 69% is `-mgain`, which is not result-preserving and has
+its own doc: [the clean loop](nested-sampling-clean-loop.md).
 
 This is the per-evaluation companion to
 [the throughput doc](nested-sampling-throughput.md) (which is about how the
