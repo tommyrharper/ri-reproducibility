@@ -147,7 +147,7 @@ func TestTailKeepsWholeLinesFromTheEnd(t *testing.T) {
 	}
 }
 
-// The loop the interface exists for: into a run, between its two views, back
+// The loop the interface exists for: into a run, around its three views, back
 // out to the table, and in again. The commands returned would shell out to
 // ./ri, so they are dropped - what is checked here is where each key lands.
 func TestWatchingARunLoopsBackToTheTable(t *testing.T) {
@@ -170,20 +170,31 @@ func TestWatchingARunLoopsBackToTheTable(t *testing.T) {
 	for round := 0; round < 2; round++ {
 		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		m = next.(model)
-		if m.screen != screenLog || m.showingLog {
-			t.Fatalf("round %d: enter did not open the health report (screen %v, log %v)",
-				round, m.screen, m.showingLog)
+		if m.screen != screenLog || m.pane != paneHealth {
+			t.Fatalf("round %d: enter did not open the health report (screen %v, pane %v)",
+				round, m.screen, m.pane)
 		}
 		if m.logRun.Name != m.runs[0].Name {
 			t.Fatalf("round %d: log pane is showing %q", round, m.logRun.Name)
 		}
+		// `l` all the way around: health, log, profile, and back to health.
+		for _, want := range []pane{paneLog, paneProfile, paneHealth} {
+			press("l")
+			if m.pane != want {
+				t.Fatalf("round %d: l landed on %v, wanted %v", round, m.pane, want)
+			}
+		}
+		// The profile is a finished-run report, so it opens paused; the two
+		// live views must not stay that way behind it.
 		press("l")
-		if !m.showingLog {
-			t.Fatalf("round %d: l did not swap the health report for the log", round)
+		press("l")
+		if m.pane != paneProfile || !m.paused {
+			t.Fatalf("round %d: the profile pane did not open paused (pane %v, paused %v)",
+				round, m.pane, m.paused)
 		}
 		press("l")
-		if m.showingLog {
-			t.Fatalf("round %d: l did not swap back to the health report", round)
+		if m.pane != paneHealth || m.paused {
+			t.Fatalf("round %d: the health pane stayed paused behind the profile", round)
 		}
 		escape()
 		if m.screen != screenRuns {
