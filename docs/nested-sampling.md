@@ -683,7 +683,10 @@ it. The `.mat` R2D2 derives from it is written in the evaluation directory and
 deleted at the same moment. Nothing outside the evaluation reads either one,
 and together they were 1.5MB of a 1.44MB mean evaluation directory, so dropping
 them takes it to ~0.43MB and is what lets a big run finish on a disk that holds
-one. An evaluation that *failed* keeps everything, moved back beside its record
+one. The same pruning list also drops WSClean's `dirty`, `residual`, `model`
+and `psf` images once the metrics have been read out of them, for a further
+3.94x to ~0.10MB - see
+[nested-sampling-disk-footprint.md](nested-sampling-disk-footprint.md). An evaluation that *failed* keeps everything, moved back beside its record
 out of the scratch directory - a failure is what this project is searching for
 - and `./ri search --keep-measurement-sets` does the same for every evaluation,
 which the replay benchmarks in

@@ -56,14 +56,17 @@ NS_METRIC = "total_rms_jy"
 # what the asynchronous mode gives up.
 NS_SYNCHRONOUS = 0
 
-# Keep each evaluation's Measurement Set after the evaluation is scored. Off,
-# because the MS is 1.5MB of the 1.44MB mean evaluation directory and nothing
-# outside the evaluation reads it: at ~45 evaluations a second a search writes
-# ~65MB/s of them and fills a 200GB disk after ~140k evaluations, which is less
-# than one nlive-500, num_repeats-25 run. The images, metrics and recorded argv
-# are kept either way, a failed evaluation keeps everything, and the MS is
-# reproducible from the record's params. 1 keeps them, which the replay
-# benchmarks in docs/nested-sampling-throughput.md need.
+# Keep every intermediate artefact of a scored evaluation - its Measurement Set
+# and the four WSClean images the metrics have already been read out of (dirty,
+# residual, model, psf). Off, because disk is what caps a run's size and those
+# artefacts are 96% of it: the MS was 1.5MB of a 1.44MB mean evaluation
+# directory and the four images are 293KB of the 394KB that was left. Nothing
+# outside the evaluation reads any of them, the restored image, the metrics and
+# every recorded argv are kept either way, a failed evaluation keeps
+# everything, and both the MS and the images are reproducible from the record.
+# 1 keeps them, which the replay benchmarks in
+# docs/nested-sampling-throughput.md need. See
+# docs/nested-sampling-disk-footprint.md.
 NS_KEEP_MEASUREMENT_SETS = 0
 
 # How many times a search that died with work already banked restarts itself

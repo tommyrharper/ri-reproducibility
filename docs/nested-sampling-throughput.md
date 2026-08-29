@@ -997,7 +997,10 @@ every argv. So a search now deletes `sim.ms` (and, on the R2D2 side, the
 `r2d2_data.mat` derived from it) as it writes the evaluation's
 `metrics.json` - `prune_evaluation_artefacts()` in `common.py`, which is the
 one funnel both imagers' `evaluate()` return through. Measured on the same
-default search: **1.44MB -> 0.43MB per evaluation, 3.4x**.
+default search: **1.44MB -> 0.43MB per evaluation, 3.4x**. The four WSClean
+images with no reader after the metrics have been computed were later added to
+the same list, for a further 3.94x to **0.0999MB** - see
+[nested-sampling-disk-footprint.md](nested-sampling-disk-footprint.md).
 
 Two things it deliberately does not do:
 
@@ -1240,10 +1243,14 @@ The practical consequences:
 Which makes the target run concretely affordable. At `--nlive 500` the ratio
 extrapolates to ~7.8, so ~3,900 dead points; `--num-repeats 25` is 2.5x the
 20.1 evaluations per dead point, so ~50; that is **~196,000 evaluations**, or
-about **65-90 minutes** at 50-53 evals/s and **~78GB** at the 0.40MB an
+about **65-90 minutes** at 50-53 evals/s and **~20GB** at the 0.0999MB an
 evaluation directory now costs. Both fit this host. The earlier estimate on
 this page of 270,000 evaluations and 390GB predates the sub-linear `ndead`
-measurement and the [`sim.ms` pruning](#the-disk-footprint-is-what-caps-a-big-run-not-the-clock).
+measurement and the [`sim.ms` pruning](#the-disk-footprint-is-what-caps-a-big-run-not-the-clock),
+and the ~78GB it was corrected to predates the four intermediate FITS being
+pruned as well - see
+[nested-sampling-disk-footprint.md](nested-sampling-disk-footprint.md), which
+is where the disk ceiling is now tracked.
 
 ### The harness does not decay as the evaluations pile up
 

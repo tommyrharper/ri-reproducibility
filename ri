@@ -357,11 +357,15 @@ def build_parser():
                              "here and buys nothing this search needs "
                              "[NS_SYNCHRONOUS], see docs/nested-sampling-throughput.md")
     search.add_argument("--keep-measurement-sets", action=argparse.BooleanOptionalAction,
-                        help="keep each evaluation's sim.ms instead of deleting it once "
-                             "the evaluation is scored. Off by default: the MS is most of "
-                             "a run's ~1.4MB per evaluation and nothing reads it afterwards. "
-                             "What it keeps is missing six subtables the MSv2 specification "
-                             "calls required, so CASA will not open it "
+                        help="keep every intermediate artefact of a scored evaluation - "
+                             "its sim.ms and WSClean's dirty, residual, model and psf "
+                             "images - instead of deleting them once it is scored. Off by "
+                             "default: nothing reads any of them afterwards, and disk is "
+                             "what caps a run's size - they took an evaluation "
+                             "directory from 0.10MB to 1.44MB "
+                             "(docs/nested-sampling-disk-footprint.md). The sim.ms it keeps "
+                             "is missing six subtables the MSv2 specification calls "
+                             "required, so CASA will not open it "
                              "[NS_KEEP_MEASUREMENT_SETS], see docs/nested-sampling-ms-open.md")
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")

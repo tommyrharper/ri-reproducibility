@@ -1632,16 +1632,28 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
 
 # Intermediate artefacts a scored evaluation no longer needs, relative to its
-# evaluation directory. The Measurement Set dominates an evaluation directory
-# (1.5MB of the 1.44MB mean, against 0.39MB of FITS), so a run's disk footprint
-# is really its MS count: at ~45 evaluations a second a search writes ~65MB/s
-# and fills a 200GB disk after ~140k evaluations - well short of the nlive-500,
-# num_repeats-25 runs this repo is aiming at. Nothing outside the evaluation
-# reads them: the images, the metrics and every recorded argv stay, and the MS
-# is reproducible from the record's params (`noise_seed` included) if one is
-# ever wanted back. Set NS_KEEP_MEASUREMENT_SETS=1 to keep them - the replay
-# benchmarks in docs/nested-sampling-throughput.md need it.
-PRUNED_ARTEFACTS = (("sim.ms", "measurement_set"), ("VLAA_ANT", None), ("r2d2_data.mat", "mat"))
+# evaluation directory. Nothing outside the evaluation reads any of them, and
+# each is reproducible from the record: the Measurement Set from the params
+# (`noise_seed` included), the four intermediate images by replaying the
+# recorded `wsclean` argv. What survives is the restored image, the metrics and
+# every recorded argv. Set NS_KEEP_MEASUREMENT_SETS=1 to keep the lot - the
+# replay benchmarks in docs/nested-sampling-throughput.md need the MS.
+#
+# Disk, not CPU, is what caps the run sizes this repo is aiming at, and both
+# groups below are load-bearing for that - see
+# docs/nested-sampling-disk-footprint.md. The MS was 1.5MB of a 1.44MB mean
+# evaluation; with it gone the five 128x128 FITS were 368KB of 394KB, of which
+# WSClean's model and psf have never had a reader at all and its dirty and
+# residual are read once, by compute_image_metrics(), before this runs.
+PRUNED_ARTEFACTS = (
+    ("sim.ms", "measurement_set"),
+    ("VLAA_ANT", None),
+    ("r2d2_data.mat", "mat"),
+    ("wsclean/recon-dirty.fits", "dirty"),
+    ("wsclean/recon-residual.fits", "residual"),
+    ("wsclean/recon-model.fits", None),
+    ("wsclean/recon-psf.fits", None),
+)
 
 
 def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
@@ -1662,7 +1674,7 @@ def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
 
 
 def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
-    """Drop a scored evaluation's Measurement Set, and the paths naming it.
+    """Drop a scored evaluation's intermediate artefacts, and the paths naming them.
 
     Only for an evaluation that produced a score. A failed one keeps
     everything: a failure is what this project is searching for, and its
@@ -1706,12 +1718,15 @@ def self_check_evaluation_pruning() -> None:
         (eval_dir / "VLAA_ANT").mkdir()
         (eval_dir / "r2d2_data.mat").write_text("mat")
         (eval_dir / "wsclean").mkdir()
-        (eval_dir / "wsclean" / "recon-image.fits").write_text("image")
+        for image in ("image", "dirty", "residual", "model", "psf"):
+            (eval_dir / "wsclean" / f"recon-{image}.fits").write_text(image)
         return eval_dir
 
     def record_for(eval_dir: Path, **extra: Any) -> dict[str, Any]:
         paths = {"eval_dir": str(eval_dir), "measurement_set": str(eval_dir / "sim.ms"),
-                 "mat": str(eval_dir / "r2d2_data.mat"), "image": str(eval_dir / "wsclean" / "recon-image.fits")}
+                 "mat": str(eval_dir / "r2d2_data.mat"), "image": str(eval_dir / "wsclean" / "recon-image.fits"),
+                 "dirty": str(eval_dir / "wsclean" / "recon-dirty.fits"),
+                 "residual": str(eval_dir / "wsclean" / "recon-residual.fits")}
         return {"eval_id": 1, "params": {"a": 1}, "objective": 0.5, "paths": paths, **extra}
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1722,8 +1737,12 @@ def self_check_evaluation_pruning() -> None:
         assert not (scored / "r2d2_data.mat").exists()
         # The evidence a failure-mode search exists to produce is never pruned.
         assert (scored / "wsclean" / "recon-image.fits").exists()
+        # The four images the metrics have already been computed from are.
+        for image in ("dirty", "residual", "model", "psf"):
+            assert not (scored / "wsclean" / f"recon-{image}.fits").exists(), image
         # A record must not name a file this just deleted.
         assert "measurement_set" not in written["paths"] and "mat" not in written["paths"]
+        assert "dirty" not in written["paths"] and "residual" not in written["paths"]
         assert written["paths"]["image"].endswith("recon-image.fits")
         assert json.loads((scored / "metrics.json").read_text())["paths"] == written["paths"]
 
@@ -1731,6 +1750,7 @@ def self_check_evaluation_pruning() -> None:
         failed = evaluation(root, "eval-0002-failed")
         write_evaluation_record(failed, record_for(failed, error="wsclean failed with exit 1"))
         assert (failed / "sim.ms").exists() and (failed / "r2d2_data.mat").exists()
+        assert (failed / "wsclean" / "recon-residual.fits").exists()
 
         saved = os.environ.get("NS_KEEP_MEASUREMENT_SETS")
         os.environ["NS_KEEP_MEASUREMENT_SETS"] = "1"
@@ -1738,6 +1758,7 @@ def self_check_evaluation_pruning() -> None:
             kept = evaluation(root, "eval-0003-kept")
             written = write_evaluation_record(kept, record_for(kept))
             assert (kept / "sim.ms").exists() and (kept / "VLAA_ANT").exists()
+            assert (kept / "wsclean" / "recon-psf.fits").exists()
             assert written["paths"]["measurement_set"].endswith("sim.ms")
         finally:
             if saved is None:
