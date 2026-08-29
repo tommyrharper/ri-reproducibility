@@ -325,6 +325,11 @@ because an evaluation costs a constant plus a rate times its visibilities and
 the sampler walks towards the most of them -
 `docs/nested-sampling-cost-model.md`.
 
+`--phases` reports each bucket's *mean*, which is right for "where did the run's
+seconds go" and wrong for "what should I work on": several buckets are
+heavy-tailed. `docs/nested-sampling-simulate-stage.md` has the same table on
+per-evaluation medians, and which rows it reorders.
+
 ## Merging runs
 
 Post-processing only. Sources must match on `algorithm`, `vla_config`,
@@ -434,6 +439,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/nested-sampling-wsclean-zygote.md` | Why 27ms of every 163ms `wsclean` process runs before `main()` does - casacore's static initialisers across 73 shared objects, priced per library with `LD_PRELOAD` - and the `wsclean-zygote` fork server that pays it once per rank instead: +8.4% evaluations per second end to end over eight simultaneous swapped pairs, 200 FITS data blocks identical, with the `exec`-to-first-log-line measurement that found it, why `image_binary_seconds` and peak RSS now come from `wait4()` rather than a forked `/usr/bin/time`, why the parent must stay single-threaded, and why the parent-warm-up follow-up is closed (0.94ms, not the ~11ms it was estimated at) |
 | `docs/nested-sampling-phase-profile.md` | Where a post-zygote evaluation's 191ms goes, refreshed on a 5312-evaluation search: 84% is the `wsclean` binary, and inside it 48% is ducc0's gridding and degridding passes, 10% deconvolution, 6.7% *fitting the Gaussian beam to the PSF* (the largest item that is not imaging arithmetic, and one every evaluation pays twice because the theoretical beam under-estimates the fitted one), 21% metadata and I/O. `-log-time` is now passed by default - measured free against a 1.8%-resolution null pair - so `./ri profile <run> --phases` reads that table off any run with no rig. Also closes two avenues with numbers: pre-warming the zygote parent (0.94ms) and WSClean's remaining parent-MS opens (0.51ms each over a plain `Table`) |
 | `docs/nested-sampling-cost-model.md` | Why a run's throughput falls as it goes, and what it costs: an evaluation is `100.4 ms + 5.64 us x visibilities` at production concurrency, and nested sampling compresses towards the long-observation, many-channel corner, so evaluations/second drops 15% over six minutes with nothing degrading (`./ri profile <run> --over-time`). Sets the priority for future work - the *fixed* half shrinks in share as a run goes deeper, so pass-count levers (`-mgain`) matter more than metadata ones. Ships `-data-column DATA` (-1.0% on the `wsclean` binary against a 0.1%-resolution null, 1000 FITS data blocks identical) and closes `-gridder tuned-wgridder`, `-gridder wtowers` and the beam fit's retry (which triggers iff fitted > 1.25x theoretical, independent of `-beam-fitting-size`) |
+| `docs/nested-sampling-simulate-stage.md` | The MeqTrees stage: 8.4% of a run's worker time, a fifth of it work with no consumer - a DATA column read back only for its shape, a second open of the same table only for its correlation count, six subtables copied out of the skeleton cache only to be deleted, and three whole copies of DATA allocated to add noise. Removing all four is -20% on the stage over two swapped pairs of simultaneous searches (15.1ms -> 12.1ms an evaluation, ~1.7% end to end) with a bit-identical Measurement Set. Also: why the phase table has to be read on medians (the beam fit is 10.6ms on the mean and 6.25ms on the median), that there is no ducc0 warm-up for the zygote parent to inherit, and that WSClean's two parent-MS opens before the imaging table are now the largest non-arithmetic item at 8.8% of an evaluation |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 

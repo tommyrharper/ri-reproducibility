@@ -222,15 +222,26 @@ def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_wi
         spw.putcol("TOTAL_BANDWIDTH", np.array([n_chan * channel_width_hz]))
 
 
-def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace) -> None:
-    """run_makems(), reusing a cached run for configs that differ only in frequency."""
+def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune_unused: bool = False) -> None:
+    """run_makems(), reusing a cached run for configs that differ only in frequency.
+
+    `prune_unused` skips copying the subtables fill_point_source_visibilities()
+    is going to delete anyway (UNUSED_SUBTABLES): 27 of the cached skeleton's
+    66 files and 0.50ms of the 1.56ms copy. Only a caller that will not ask
+    MeqTrees for a predict may set it - casacore opens the MS as a
+    MeasurementSet there and refuses one that is missing a required subtable -
+    which is why it is an explicit argument rather than read off `args`:
+    warm_forest() and self_check_phase_centre_predict() both predict a source
+    that is *at* the phase centre, so the source position does not decide it.
+    """
     key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
     cached = skeleton_dir() / hashlib.sha256(key.encode()).hexdigest()[:32]
     if not cached.exists():
         run_makems(output_ms)
         publish_skeleton(output_ms, cached)
         return
-    shutil.copytree(cached, output_ms, symlinks=True)
+    ignore = shutil.ignore_patterns(*UNUSED_SUBTABLES) if prune_unused else None
+    shutil.copytree(cached, output_ms, symlinks=True, ignore=ignore)
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
     (output_ms.parent / "makems.log").write_text(f"reused a cached makems skeleton for:\n{key}\n")
 
@@ -535,11 +546,19 @@ def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
 # unpolarised point-source simulation depends on, so they are dropped once the
 # visibilities are written - not in the cached skeleton, because casacore
 # refuses to open an MS that is missing any of them and the MeqTrees predict
-# needs it opened that way. Worth -13.8% on the wsclean binary and +14.9%
+# needs it opened that way. An evaluation that runs no predict never copies them
+# out of the skeleton at all (make_ms_skeleton()'s `prune_unused`); the delete
+# below is what covers the one that does, and stays unconditional because it
+# already tolerates them being absent. Worth -13.8% on the wsclean binary and +14.9%
 # evaluations per second for the first five, and FEED another ~3%, with
 # bit-identical images; see docs/nested-sampling-ms-open.md. The six that
 # stay were each tried and each kills WSClean, so this list is complete.
 UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
+
+
+def meqtrees_predict_needed(args: argparse.Namespace) -> bool:
+    """Whether this source needs the meqserver - see phase_centre_visibility()."""
+    return bool(args.source_l_arcsec or args.source_m_arcsec)
 
 
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -557,30 +576,46 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
 
     # ponytail: this simulator supports one unpolarized point source; full Stokes
     # models and multi-source dynamic-range stress cases are a follow-up ceiling.
-    corr_sel, n_corr = determine_corr_selection(output_ms)
     # A source at the phase centre predicts a constant, so the meqserver is
     # not asked for it - see phase_centre_visibility().
-    model = phase_centre_visibility(args.source_flux_jy, n_corr) if not (l_rad or m_rad) else None
-    if model is None:
+    predicted = meqtrees_predict_needed(args)
+    if predicted:
+        corr_sel, n_corr = determine_corr_selection(output_ms)
         run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
 
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
-        data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
+        if predicted:
+            data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
+            _, n_chan, data_n_corr = data.shape
+            if data_n_corr != n_corr:
+                raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
+        else:
+            # Every value in DATA is about to be overwritten with the same
+            # constant, so the skeleton's zeros are not read back: only the
+            # shape is wanted, and one row of it costs 0.05ms against 0.38ms
+            # for the whole column. determine_corr_selection()'s separate open
+            # of the same table goes with it (another 0.43ms) - its correlation
+            # count comes from this probe, and its `corr_sel` string is only
+            # ever handed to a predict this path does not run.
+            _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
+            data = np.empty((ms.nrows(), n_chan, n_corr), dtype=np.complex64)
+            data[:] = phase_centre_visibility(args.source_flux_jy, n_corr)
         uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
-        n_rows, n_chan, data_n_corr = data.shape
         if n_chan != len(freqs_hz):
             raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
-        if data_n_corr != n_corr:
-            raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
-        if model is not None:
-            # The predict MeqTrees was not asked for; see phase_centre_visibility().
-            data[:] = model
 
         if noise_sigma_jy:
             per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
-            noise = rng.normal(0.0, per_component_sigma, data.shape) + 1j * rng.normal(0.0, per_component_sigma, data.shape)
-            data = data + noise.astype(np.complex64)
+            # Added in place to the two float32 halves rather than built as a
+            # complex128 array and added out of place. Rounding each component
+            # to float32 before the add is what the old `.astype(np.complex64)`
+            # did, so the column is bit-identical for a given seed - it just
+            # stops allocating three more copies of DATA to get there (0.69ms
+            # an evaluation). The two draws stay separate calls in this order
+            # because that, not the arithmetic, is what fixes the stream.
+            data.real += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
+            data.imag += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
 
         ms.putcol("DATA", data)
         for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -650,7 +685,7 @@ def simulate(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
         cfg = write_makems_config(args, scratch_ms)
-        make_ms_skeleton(cfg, scratch_ms, args)
+        make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
         metadata = fill_point_source_visibilities(args, scratch_ms)
         metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
@@ -990,7 +1025,15 @@ def self_check_dropped_subtables() -> None:
                 keywords = opened.getkeywords()
                 rows = opened.nrows()
                 columns = opened.colnames()
+                data = np.asarray(opened.getcol("DATA"))
             assert rows, f"{ms} came out empty"
+            # The phase-centre path fills an uninitialised array from a one-row
+            # shape probe rather than reading DATA back, so a wrong shape or a
+            # missed fill would leave whatever malloc returned in the column.
+            assert data.shape[:2] == (rows, 2), f"{ms} DATA is {data.shape}, not ({rows}, 2, ...)"
+            if not (l_arcsec or m_arcsec):
+                assert abs(complex(data[..., 0].mean()) - 1.0) < 0.05, \
+                    f"{ms} DATA does not average the 1 Jy source: {data[..., 0].mean()}"
             # polychord_wsclean.py passes `-data-column DATA` rather than let
             # WSClean open the whole measurement set to decide - which is only
             # the same answer while the simulator writes no CORRECTED_DATA.
