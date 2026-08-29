@@ -221,3 +221,21 @@ WSClean itself, so its paths are `external/schaapcommon/...` and it is the one
 most likely to need regenerating against a `WSCLEAN_GIT_TAG` bump. Otherwise
 the same shape as 0001 and 0003: cache what does not change for the life of a
 process.
+
+## 0005: read the Measurement Set in row blocks
+
+One forward-only block of rows in `msproviders/rowproviders/msrowprovider.cpp`,
+replacing the thirteen per-row casacore column reads `MSRowProvider::NextRow()`
+and `DirectMSRowProvider::ReadData()` made between them - four of which
+re-read a value `NextRow()` had just thrown away - and the whole extra pass
+over `TIME` that `Initialize()` made for a timestep count only
+baseline-dependent averaging ever asks for. That is 29484 column reads an
+evaluation down to 27 `getColumnRange()` calls, worth -48% of the reorder
+phase, -2.2% on the `wsclean` binary in an interleaved replay and -4.1% over
+four simultaneous swapped searches, with bit-identical images. The per-column
+cost table, the single-row fallback for sets whose rows differ in shape, and
+the measurements are in [the row-block doc](nested-sampling-row-blocks.md).
+
+Upstream-shaped, and the first patch here that is not a cache of something
+process-global: it changes nothing WSClean computes, only how many times it
+asks casacore for the same bytes.

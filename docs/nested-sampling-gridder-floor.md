@@ -237,10 +237,9 @@ The ranking that comes out of the median table above, for whoever is next:
   and both are accuracy or pass-count trades: `do_wgridding` (-29%, 2.3e-5),
   `-wgridder-accuracy` (+13.8% at 1e-2), `-mgain`
   ([the clean-loop doc](nested-sampling-clean-loop.md), +20% at 0.9).
-- **The reorder, 5.4%.** Row-at-a-time casacore column reads in
-  `ReorderedMsProvider::PartitionMs`, ~2800 rows an evaluation for ~630 KB of
-  visibilities. Not looked at yet; `-no-reorder` costs 36% so the reorder
-  itself is wanted, but reading whole columns instead of rows might not be.
+- **The reorder, 5.4%.** Taken - the row-at-a-time casacore column reads are
+  now blocked, worth -48% of the phase and -4.1% on the `wsclean` binary. See
+  [the row-block doc](nested-sampling-row-blocks.md).
 - **Process start to the imaging table, 4.9%,** and the **beam fit, 4.4%,**
   are both closed - see
   [the shared-MS-open doc](nested-sampling-shared-ms-open.md) and
