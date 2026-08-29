@@ -205,6 +205,20 @@ def abort_run(message: str) -> None:
 DEFAULT_WSCLEAN_NITER = 100
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
+# The major-cycle gain, and by a wide margin the most expensive number in this
+# file: it sets how deep each minor loop goes, hence how many major cycles the
+# `DEFAULT_WSCLEAN_NITER` budget is spread over, hence how many gridding passes
+# an evaluation pays for. 0.8 costs ~6.5 major cycles; 0.9 costs ~4.7 and is
+# worth ~20% more evaluations per second for a change in the default
+# `total_rms_jy` objective of 1e-7 (median) to 1e-4 (worst of 600).
+# The default stays 0.8 because it is part of the experiment definition every
+# archived run was scored under; `./ri search --mgain 0.9` (NS_WSCLEAN_MGAIN)
+# is how a run that wants the throughput instead asks for it, and every run
+# records what it used in its summary. See docs/nested-sampling-clean-loop.md
+# for the science cost and docs/nested-sampling-evaluation-floor.md for why
+# this is now the largest lever left.
+DEFAULT_WSCLEAN_MGAIN = float(os.environ.get("NS_WSCLEAN_MGAIN") or 0.8)
+
 # Image geometry, shared by both imagers so that they reconstruct the same sky.
 # R2D2 derives its cell size from the data it is given rather than taking one
 # (src/utils/io.py in the pinned upstream commit), so WSClean has to apply the
@@ -220,6 +234,9 @@ DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 # `data_3c353.mat` example, not of these runs, and was never written into the
 # config - so R2D2 has always run at 1.5.)
 DEFAULT_IMAGE_DIM = 128
+# Changing it also stales docker/wsclean/src/zygote.cpp's FFTW warm-up, whose
+# four transform sizes are derived from this one (docs/nested-sampling-fftw-planner.md).
+# A stale list costs the speedup, never a result.
 DEFAULT_SUPER_RESOLUTION = 1.5
 
 # `source_offset_fraction` geometry (docs/parameter-space-proposal.md, section 1).
@@ -592,6 +609,9 @@ class DockerRunResult:
     returncode: int
     wall_seconds: float
     peak_memory_bytes: int
+    # The command's own wall clock, as distinct from what this rank waited.
+    # Only zygote_run() can tell them apart; sidecar_run() leaves it at 0.
+    binary_seconds: float = 0.0
 
 
 def r2d2_thread_count() -> int:
@@ -727,6 +747,10 @@ def sidecar_container(image: str, platform: str, extra_args: list[str] | None = 
     """
     if image not in _SIDECAR_CONTAINERS:
         repo_root = os.environ.get("REPO_ROOT", os.getcwd())
+        # The shared MS scratch tmpfs, when the run script made one; see
+        # evaluation_scratch_dir().
+        scratch = os.environ.get("NS_SCRATCH_DIR", "")
+        scratch_mount = ["-v", f"{scratch}:{scratch}"] if scratch else []
         name = f"ri-ns-sidecar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         subprocess.run(
             [
@@ -741,6 +765,7 @@ def sidecar_container(image: str, platform: str, extra_args: list[str] | None = 
                 "--shm-size", "512m",
                 "--platform", platform,
                 "-v", f"{repo_root}:{repo_root}",
+                *scratch_mount,
                 *(extra_args or []),
                 "--entrypoint", "sleep", image, "infinity",
             ],
@@ -803,31 +828,40 @@ def sidecar_command(image: str, prefix: list[str] | None = None) -> list[str]:
     return [*(prefix or []), *_IMAGE_ENTRYPOINTS[image]]
 
 
-_SIDECAR_SHELLS: dict[str, subprocess.Popen] = {}
+_SIDECAR_WORKERS: dict[tuple[str, str], subprocess.Popen] = {}
 
 
-def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
-    """This rank's long-lived `sh` inside the sidecar, one `docker exec` per run.
+def sidecar_worker(image: str, platform: str, argv: list[str]) -> subprocess.Popen:
+    """This rank's long-lived `argv` inside the sidecar, one `docker exec` per run.
 
     `docker exec` costs ~0.033s on this host - a third of the `wsclean` binary's
-    own ~0.107s - and every evaluation paid it again. One `sh` reading command
+    own ~0.107s - and every evaluation paid it again. One process reading request
     lines from its stdin pays it once per rank; a request costs a pipe write and
     a `read`.
+
+    Two shapes use this: `sh`, which runs an arbitrary command line, and
+    `wsclean-zygote`, which forks an already-initialised wsclean per request
+    (see docs/nested-sampling-wsclean-zygote.md).
     """
-    if image not in _SIDECAR_SHELLS:
-        shell = subprocess.Popen(
-            # Not sidecar_exec(): this one deliberately bypasses the image
-            # ENTRYPOINT, and each request cd's to its own evaluation directory.
-            ["docker", "exec", "--interactive", sidecar_container(image, platform), "sh"],
+    key = (image, argv[0])
+    if key not in _SIDECAR_WORKERS:
+        worker = subprocess.Popen(
+            # Not sidecar_exec(): these deliberately bypass the image ENTRYPOINT,
+            # and each request names its own evaluation directory.
+            ["docker", "exec", "--interactive", sidecar_container(image, platform), *argv],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
         )
         # The container itself is torn down by sidecar_container()'s own atexit
         # hook, which is registered first and so runs last.
-        atexit.register(shell.terminate)
-        _SIDECAR_SHELLS[image] = shell
-    return _SIDECAR_SHELLS[image]
+        atexit.register(worker.terminate)
+        _SIDECAR_WORKERS[key] = worker
+    return _SIDECAR_WORKERS[key]
+
+
+def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
+    return sidecar_worker(image, platform, ["sh"])
 
 
 def sidecar_run(
@@ -858,7 +892,7 @@ def sidecar_run(
         if not worker_send(shell.stdin, request):
             # The shell died between evaluations, so the request never left
             # this rank; the next attempt opens a fresh `docker exec`.
-            _SIDECAR_SHELLS.pop(image, None)
+            _SIDECAR_WORKERS.pop((image, "sh"), None)
             continue
         reply = worker_reply(shell.stdout, SHELL_REPLY_TIMEOUT)
         if reply:
@@ -871,12 +905,68 @@ def sidecar_run(
             # leaks per timeout; give the shell an `echo $$` handshake at
             # startup if that ever costs more than the retry does.
             shell.kill()
-        _SIDECAR_SHELLS.pop(image, None)
+        _SIDECAR_WORKERS.pop((image, "sh"), None)
     wall_seconds = time.perf_counter() - started
     stderr_path.write_text(
         f"FATAL: {image} sidecar shell gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
     return DockerRunResult(returncode=WORKER_DIED, wall_seconds=wall_seconds, peak_memory_bytes=0)
+
+
+ZYGOTE_COMMAND = "wsclean-zygote"
+
+
+def zygote_run(
+    image: str,
+    platform: str,
+    workdir: Path,
+    argv: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> DockerRunResult:
+    """Image with this rank's wsclean fork server; the retry shape of sidecar_run.
+
+    ~27ms of every ~163ms `wsclean` process at production concurrency runs
+    before main() does - casacore's static initialisers across 73 shared
+    objects - and the search starts ~70 of them a second. `wsclean-zygote` pays
+    that once per rank and forks a child per request, so this asks it for an
+    image instead of asking `sh` to start a fresh `wsclean`. It also reports the
+    child's own wall clock and peak RSS out of wait4(), which is what
+    `/usr/bin/time -v` used to be forked per evaluation to write to a file.
+
+    The request is tab separated, so nothing in it may contain a tab or a
+    newline. Every field is a path this repo built or a WSClean flag, so that is
+    a bug rather than an input to sanitise - hence the assertion.
+    """
+    fields = [str(workdir), str(stdout_path), str(stderr_path), *argv]
+    assert not any("\t" in field or "\n" in field for field in fields), fields
+    request = "\t".join(fields) + "\n"
+    started = time.perf_counter()
+    for attempt in worker_attempts():
+        zygote = sidecar_worker(image, platform, [ZYGOTE_COMMAND])
+        if not worker_send(zygote.stdin, request):
+            _SIDECAR_WORKERS.pop((image, ZYGOTE_COMMAND), None)
+            continue
+        reply = worker_reply(zygote.stdout, SHELL_REPLY_TIMEOUT)
+        if reply:
+            code, binary_seconds, peak_memory_bytes = reply.split("\t")
+            return DockerRunResult(
+                returncode=int(code),
+                wall_seconds=time.perf_counter() - started,
+                peak_memory_bytes=int(peak_memory_bytes),
+                binary_seconds=float(binary_seconds),
+            )
+        if reply is None:
+            zygote.kill()
+        _SIDECAR_WORKERS.pop((image, ZYGOTE_COMMAND), None)
+    stderr_path.write_text(
+        f"FATAL: {image} {ZYGOTE_COMMAND} gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
+    )
+    return DockerRunResult(
+        returncode=WORKER_DIED,
+        wall_seconds=time.perf_counter() - started,
+        peak_memory_bytes=0,
+    )
 
 
 def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
@@ -1060,44 +1150,6 @@ def compute_image_metrics(
     return metrics
 
 
-def read_gnu_time_peak_memory(time_path: Path) -> int:
-    if not time_path.is_file():
-        return 0
-    for line in time_path.read_text(errors="replace").splitlines():
-        if line.strip().startswith("Maximum resident set size (kbytes):"):
-            _, value = line.rsplit(":", 1)
-            return int(value.strip()) * 1024
-    return 0
-
-
-def read_gnu_time_wall_seconds(time_path: Path) -> float | None:
-    """Parse GNU time -v's own elapsed wall clock, in [h:]mm:ss(.cc) form.
-
-    This is the binary's actual run time inside the container, separate from
-    docker create/start/teardown overhead measured around the whole `docker
-    run` invocation.
-    """
-    if not time_path.is_file():
-        return None
-    for line in time_path.read_text(errors="replace").splitlines():
-        line = line.strip()
-        if not line.startswith("Elapsed (wall clock) time"):
-            continue
-        # Label itself contains colons (e.g. "(h:mm:ss or m:ss): 1:02.50"), so
-        # split on the literal "): " marker instead of the last colon.
-        _, _, value = line.partition("): ")
-        parts = value.strip().split(":")
-        try:
-            parts = [float(p) for p in parts]
-        except ValueError:
-            return None
-        seconds = 0.0
-        for part in parts:
-            seconds = seconds * 60.0 + part
-        return seconds
-    return None
-
-
 PROFILING_STAGE_FIELDS = (
     "simulate_seconds",
     "convert_seconds",
@@ -1226,9 +1278,10 @@ UNACCOUNTED_LABEL = "unaccounted (PolyChord sampling + idle)"
 
 PROFILING_VIEW_NOTE = (
     "stage totals are summed worker-seconds across every evaluation; shares are "
-    "of the run's worker-time budget (wall clock x mpi_procs), so the top-level "
+    "of the run's worker-time budget (wall clock x workers, and rank 0 is the "
+    "administrator rather than a worker), so the top-level "
     "stages plus the unaccounted remainder come to 100%. Dividing a worker-second "
-    "total by mpi_procs gives what that stage cost in wall clock, since the workers "
+    "total by the worker count gives what that stage cost in wall clock, since they "
     "spend it side by side, and those wall-clock figures add up to the run's "
     "end-to-end wall time."
 )
@@ -1239,11 +1292,13 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
 
     Shared by the HTML report and scripts/profile-nested-sampling-run.py so the
     two cannot drift apart. Every share is a fraction of the run's total
-    worker-time budget - wall clock x mpi_procs - so the top-level stages plus
+    worker-time budget - wall clock x workers - so the top-level stages plus
     the unaccounted remainder add up to 100% of what the whole process spent.
-    That holds for serial and MPI runs alike: at mpi_procs == 1 the budget is
-    just the wall clock and the remainder is PolyChord's own sampling, while at
-    mpi_procs > 1 the remainder also absorbs the time workers sat idle.
+    The worker count is `worker_procs(mpi_procs)`, not the rank count - rank 0
+    administrates. That holds for serial and MPI runs alike: at mpi_procs == 1
+    the budget is just the wall clock and the remainder is PolyChord's own
+    sampling, while at mpi_procs > 1 the remainder also absorbs the time
+    workers sat idle.
     """
     imager = algorithm or "image"
     mpi_procs = int(profiling.get("mpi_procs") or 1)
@@ -1256,7 +1311,8 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
         accounted = profiling.get("accounted_seconds")
     accounted = float(accounted or 0.0)
 
-    budget = None if total_wall is None else total_wall * mpi_procs
+    workers = worker_procs(mpi_procs)
+    budget = None if total_wall is None else total_wall * workers
     # A budget below what the stages already accounted for would push shares
     # over 100%; an oversubscribed host or a clock jump can produce one, so fall
     # back to the accounted total and keep the breakdown adding up.
@@ -1289,6 +1345,7 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
     return {
         "imager": imager,
         "mpi_procs": mpi_procs,
+        "worker_procs": workers,
         "evals": max((row["evals"] for row in rows), default=0),
         "total_wall_seconds": total_wall,
         "worker_seconds_budget": denominator,
@@ -1367,6 +1424,19 @@ def mpi_rank() -> int:
         return 0
 
 
+def worker_procs(mpi_procs: int) -> int:
+    """How many of a job's ranks actually evaluate a likelihood.
+
+    Not all of them: PolyChord's rank 0 is the administrator, and
+    `nested_sampling.F90` sizes its worker arrays `nprocs-1`. A run of N ranks
+    therefore has a worker-time budget of `wall x (N-1)`, not `wall x N`, and
+    using N understated rank utilisation by a factor (N-1)/N - 7% at 15 ranks -
+    which reads as idle time that no scheduling change can ever recover. A
+    serial run has no administrator: rank 0 is the worker.
+    """
+    return mpi_procs - 1 if mpi_procs > 1 else 1
+
+
 def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
     """One evaluation's metrics.json, or None if it is not a readable record.
 
@@ -1402,8 +1472,7 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
 
 def adopt_completed_evaluations(
     evaluations_dir: Path,
-    evaluations: list[dict[str, Any]],
-    cache: dict[str, dict[str, Any]],
+    cache: dict[str, float],
 ) -> int:
     """Take an interrupted run's finished evaluations into this run's state.
 
@@ -1412,6 +1481,15 @@ def adopt_completed_evaluations(
     repeated point. With it the ids carry on and a point evaluated before is
     served from the cache instead of being paid for twice - which is the whole
     reason to resume rather than start again.
+
+    Only the objective is kept, not the record it came from, because only the
+    objective is ever read back: the likelihood returns `cache[key]`, and the
+    summary re-reads every record from disk at the end of the run. Keeping the
+    records made a resume scale into the host's memory instead of its disk -
+    120,000 adopted evaluations cost 1.37GB of resident memory here, and *every
+    rank* runs this, so a 20-rank resume of the nlive-500 run this repo is
+    aiming at wanted 62GB for the caches alone on a 62GB host. Objectives cost
+    ~50MB at that size. See docs/nested-sampling-throughput.md.
 
     The evaluations that were still in flight when the run stopped are thrown
     away. An evaluation directory with no readable metrics.json holds nothing
@@ -1424,6 +1502,7 @@ def adopt_completed_evaluations(
     """
     import shutil
 
+    adopted = 0
     for eval_dir in sorted(evaluations_dir.glob("eval-*")):
         if not eval_dir.is_dir():
             continue
@@ -1433,9 +1512,9 @@ def adopt_completed_evaluations(
             # removing the same directories at the same moment.
             shutil.rmtree(eval_dir, ignore_errors=True)
             continue
-        evaluations.append(record)
-        cache[params_key(record["params"])] = record
-    return len(evaluations)
+        cache[params_key(record["params"])] = float(record["objective"])
+        adopted += 1
+    return adopted
 
 
 def self_check_resume_adoption() -> None:
@@ -1448,15 +1527,17 @@ def self_check_resume_adoption() -> None:
         eval_dir.mkdir()
         write_evaluation_record(eval_dir, {"eval_id": 1, "params": params, "objective": 0.5})
 
-        evaluations: list[dict[str, Any]] = []
-        cache: dict[str, dict[str, Any]] = {}
-        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        cache: dict[str, float] = {}
+        adopted = adopt_completed_evaluations(evaluations_dir, cache)
+        assert adopted == 1
         # Keyed the way the likelihood keys it, or the resumed run would
         # recompute the point and collide with its own directory.
         assert params_key(params) in cache
-        assert cache[params_key(params)]["objective"] == 0.5
+        # The objective alone, not the record: the likelihood returns this
+        # value directly and nothing else reads an adopted evaluation.
+        assert cache[params_key(params)] == 0.5
         # The next eval id continues rather than restarting at 1.
-        assert len(evaluations) + 1 == 2
+        assert adopted + 1 == 2
 
     with tempfile.TemporaryDirectory() as tmp:
         # An evaluation that was in flight when the run stopped has a
@@ -1472,9 +1553,8 @@ def self_check_resume_adoption() -> None:
         in_flight.mkdir()
         (in_flight / "sim.ms").write_text("half a measurement set")
 
-        evaluations = []
         cache = {}
-        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert adopt_completed_evaluations(evaluations_dir, cache) == 1
         assert finished.exists()
         assert not in_flight.exists()
 
@@ -1494,12 +1574,11 @@ def self_check_resume_adoption() -> None:
         half.mkdir()
         (half / "metrics.json").write_text('{\n  "eval_id": 3,\n  "para')
 
-        evaluations = []
         cache = {}
         assert load_evaluations_from_dir(evaluations_dir) == [
             {"eval_id": 1, "params": {"a": 1}, "objective": 0.5}
         ]
-        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert adopt_completed_evaluations(evaluations_dir, cache) == 1
         assert good.exists()
         # Removed, not merely skipped: simulate_measurement_set() creates the
         # directory with exist_ok=False, so a kept one crashes the run this is
@@ -1521,9 +1600,8 @@ def self_check_resume_adoption() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
-        evaluations = []
         cache = {}
-        assert adopt_completed_evaluations(Path(tmp), evaluations, cache) == 0
+        assert adopt_completed_evaluations(Path(tmp), cache) == 0
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
@@ -1541,13 +1619,187 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     summary.json finished - unrepairable. summary.json is the bigger window by
     far: it carries every evaluation of the run, so an R2D2 search spends
     seconds inside this call, not microseconds.
+
+    Streamed into the file rather than serialised to a string first, because
+    the string is the peak: a 270,000-evaluation summary.json is 1.3GB, and
+    json.dumps() holds all of it alongside the records it was built from
+    (2.6GB of peak RSS measured against 0 for the streaming form). It costs
+    ~7s more on a summary that size and ~22us on a metrics.json, both of which
+    are free next to a 336ms evaluation.
     """
     partial = path.with_name(path.name + ".partial")
-    partial.write_text(json.dumps(payload, indent=2) + "\n")
+    with partial.open("w") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
     partial.replace(path)
 
 
+# Intermediate artefacts a scored evaluation no longer needs, relative to its
+# evaluation directory. Nothing outside the evaluation reads any of them, and
+# each is reproducible from the record: the Measurement Set from the params
+# (`noise_seed` included), the four intermediate images by replaying the
+# recorded `wsclean` argv. What survives is the restored image, the metrics and
+# every recorded argv. Set NS_KEEP_MEASUREMENT_SETS=1 to keep the lot - the
+# replay benchmarks in docs/nested-sampling-throughput.md need the MS.
+#
+# Disk, not CPU, is what caps the run sizes this repo is aiming at, and both
+# groups below are load-bearing for that - see
+# docs/nested-sampling-disk-footprint.md. The MS was 1.5MB of a 1.44MB mean
+# evaluation; with it gone the five 128x128 FITS were 368KB of 394KB, of which
+# WSClean's model and psf have never had a reader at all and its dirty and
+# residual are read once, by compute_image_metrics(), before this runs.
+PRUNED_ARTEFACTS = (
+    ("sim.ms", "measurement_set"),
+    ("VLAA_ANT", None),
+    ("r2d2_data.mat", "mat"),
+    ("wsclean/recon-dirty.fits", "dirty"),
+    ("wsclean/recon-residual.fits", "residual"),
+    ("wsclean/recon-model.fits", None),
+    ("wsclean/recon-psf.fits", None),
+)
+
+
+def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
+    """Where this evaluation builds its Measurement Set, or None for `eval_dir`.
+
+    The simulator assembles the MS in the meqtrees container's own /dev/shm,
+    which no other container can see, so it used to copy the finished tables
+    onto the bind mount purely so the wsclean sidecar could open them - 5.1ms of
+    a 14.3ms simulate at 19 concurrent workers, for a file the next few hundred
+    milliseconds delete again. `NS_SCRATCH_DIR` is a host tmpfs directory
+    bind-mounted into every container at the same path (see
+    scripts/lib/start-sidecars.sh), so the MS is written once, imaged where it
+    lies and deleted there. Unset - a self-check, a host with no writable
+    /dev/shm - it is built in the evaluation directory exactly as before.
+    """
+    root = os.environ.get("NS_SCRATCH_DIR", "")
+    return Path(root) / eval_dir.name if root else None
+
+
+def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
+    """Drop a scored evaluation's intermediate artefacts, and the paths naming them.
+
+    Only for an evaluation that produced a score. A failed one keeps
+    everything: a failure is what this project is searching for, and its
+    inputs are the first thing anyone will want - so anything it left in the
+    scratch directory is moved back beside its record first, since the scratch
+    directory is RAM and goes away with the run.
+    """
+    import shutil
+
+    keeping = "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is not None and scratch.is_dir():
+        if keeping:
+            for produced in scratch.iterdir():
+                destination = eval_dir / produced.name
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                shutil.move(str(produced), destination)
+            if (eval_dir / "sim.ms").exists() and "measurement_set" in record.get("paths", {}):
+                record["paths"]["measurement_set"] = str(eval_dir / "sim.ms")
+        shutil.rmtree(scratch, ignore_errors=True)
+    if keeping:
+        return
+    for name, path_key in PRUNED_ARTEFACTS:
+        target = eval_dir / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+        if path_key:
+            record.get("paths", {}).pop(path_key, None)
+
+
+def self_check_evaluation_pruning() -> None:
+    import tempfile
+
+    def evaluation(root: Path, name: str) -> Path:
+        eval_dir = root / name
+        (eval_dir / "sim.ms" / "table.f0").parent.mkdir(parents=True)
+        (eval_dir / "sim.ms" / "table.f0").write_text("data")
+        (eval_dir / "VLAA_ANT").mkdir()
+        (eval_dir / "r2d2_data.mat").write_text("mat")
+        (eval_dir / "wsclean").mkdir()
+        for image in ("image", "dirty", "residual", "model", "psf"):
+            (eval_dir / "wsclean" / f"recon-{image}.fits").write_text(image)
+        return eval_dir
+
+    def record_for(eval_dir: Path, **extra: Any) -> dict[str, Any]:
+        paths = {"eval_dir": str(eval_dir), "measurement_set": str(eval_dir / "sim.ms"),
+                 "mat": str(eval_dir / "r2d2_data.mat"), "image": str(eval_dir / "wsclean" / "recon-image.fits"),
+                 "dirty": str(eval_dir / "wsclean" / "recon-dirty.fits"),
+                 "residual": str(eval_dir / "wsclean" / "recon-residual.fits")}
+        return {"eval_id": 1, "params": {"a": 1}, "objective": 0.5, "paths": paths, **extra}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        scored = evaluation(root, "eval-0001-scored")
+        written = write_evaluation_record(scored, record_for(scored))
+        assert not (scored / "sim.ms").exists() and not (scored / "VLAA_ANT").exists()
+        assert not (scored / "r2d2_data.mat").exists()
+        # The evidence a failure-mode search exists to produce is never pruned.
+        assert (scored / "wsclean" / "recon-image.fits").exists()
+        # The four images the metrics have already been computed from are.
+        for image in ("dirty", "residual", "model", "psf"):
+            assert not (scored / "wsclean" / f"recon-{image}.fits").exists(), image
+        # A record must not name a file this just deleted.
+        assert "measurement_set" not in written["paths"] and "mat" not in written["paths"]
+        assert "dirty" not in written["paths"] and "residual" not in written["paths"]
+        assert written["paths"]["image"].endswith("recon-image.fits")
+        assert json.loads((scored / "metrics.json").read_text())["paths"] == written["paths"]
+
+        # A failed evaluation keeps its inputs: that is the case worth looking at.
+        failed = evaluation(root, "eval-0002-failed")
+        write_evaluation_record(failed, record_for(failed, error="wsclean failed with exit 1"))
+        assert (failed / "sim.ms").exists() and (failed / "r2d2_data.mat").exists()
+        assert (failed / "wsclean" / "recon-residual.fits").exists()
+
+        saved = os.environ.get("NS_KEEP_MEASUREMENT_SETS")
+        os.environ["NS_KEEP_MEASUREMENT_SETS"] = "1"
+        try:
+            kept = evaluation(root, "eval-0003-kept")
+            written = write_evaluation_record(kept, record_for(kept))
+            assert (kept / "sim.ms").exists() and (kept / "VLAA_ANT").exists()
+            assert (kept / "wsclean" / "recon-psf.fits").exists()
+            assert written["paths"]["measurement_set"].endswith("sim.ms")
+        finally:
+            if saved is None:
+                del os.environ["NS_KEEP_MEASUREMENT_SETS"]
+            else:
+                os.environ["NS_KEEP_MEASUREMENT_SETS"] = saved
+
+        # With a scratch directory the MS is built outside the evaluation, so a
+        # scored one has nothing to delete and a failed one has to have its
+        # inputs moved back beside its record before the scratch goes away.
+        os.environ["NS_SCRATCH_DIR"] = str(root / "scratch")
+        try:
+            for name, extra in (("eval-0004-scored", {}), ("eval-0005-failed", {"error": "wsclean failed"})):
+                eval_dir = root / name
+                eval_dir.mkdir()
+                scratch = evaluation_scratch_dir(eval_dir)
+                assert scratch == root / "scratch" / name, scratch
+                (scratch / "sim.ms").mkdir(parents=True)
+                (scratch / "sim.ms" / "table.f0").write_text("data")
+                (scratch / "VLAA_ANT").mkdir()
+                record = {"eval_id": 1, "params": {"a": 1}, "objective": 0.5,
+                          "paths": {"eval_dir": str(eval_dir), "measurement_set": str(scratch / "sim.ms")}, **extra}
+                written = write_evaluation_record(eval_dir, record)
+                assert not scratch.exists(), f"{name} left its scratch behind"
+                if extra:
+                    assert (eval_dir / "sim.ms" / "table.f0").read_text() == "data"
+                    assert (eval_dir / "VLAA_ANT").is_dir()
+                    assert written["paths"]["measurement_set"] == str(eval_dir / "sim.ms")
+                else:
+                    assert not (eval_dir / "sim.ms").exists()
+                    assert "measurement_set" not in written["paths"]
+        finally:
+            del os.environ["NS_SCRATCH_DIR"]
+    print("evaluation artefact pruning self-check passed")
+
+
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
+    prune_evaluation_artefacts(eval_dir, record)
     write_json_atomic(eval_dir / "metrics.json", record)
     return record
 
@@ -1865,7 +2117,16 @@ def simulate_measurement_set(
     platform: str,
 ) -> tuple[Path, list[str], subprocess.CalledProcessError | None]:
     eval_dir.mkdir(parents=True, exist_ok=False)
-    ms_path = eval_dir / "sim.ms"
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is not None:
+        # A restart that re-runs an evaluation whose scratch survived would hit
+        # require_clean_output() in the simulator; the run owns this directory,
+        # so clearing it is safe and normally costs an ENOENT.
+        import shutil
+
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+    ms_path = (scratch or eval_dir) / "sim.ms"
     sim_stdout = eval_dir / "simulate.stdout.log"
     sim_stderr = eval_dir / "simulate.stderr.log"
     sim_cmd = [
@@ -2500,19 +2761,6 @@ def self_check_image_pixel_size() -> None:
 
 
 def self_check_profiling() -> None:
-    import tempfile
-
-    gnu_time_text = (
-        "\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:02.50\n"
-        "\tMaximum resident set size (kbytes): 4096\n"
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        time_path = Path(tmp) / "time.txt"
-        time_path.write_text(gnu_time_text)
-        assert abs(read_gnu_time_wall_seconds(time_path) - 62.5) < 1e-9
-        assert read_gnu_time_peak_memory(time_path) == 4096 * 1024
-        assert read_gnu_time_wall_seconds(Path(tmp) / "missing.txt") is None
-
     evaluations = [
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 5.0, "image_binary_seconds": 3.0, "metrics_seconds": 0.5}},
@@ -2536,7 +2784,7 @@ def self_check_profiling() -> None:
     assert empty_profiling["accounted_worker_seconds"] == 0.0
     assert empty_profiling["polychord_overhead_seconds"] == 5.0
 
-    mpi_profiling = summarize_profiling(evaluations, total_wall_seconds=5.0, mpi_procs=4)
+    mpi_profiling = summarize_profiling(evaluations, total_wall_seconds=10.0, mpi_procs=4)
     assert mpi_profiling["accounted_worker_seconds"] == 19.5
     assert mpi_profiling["accounted_seconds"] is None
     assert mpi_profiling["polychord_overhead_seconds"] is None
@@ -2556,6 +2804,7 @@ def self_check_profiling() -> None:
 
     # Serial run: budget is the wall clock, so stages + unaccounted make 100%.
     serial = profiling_breakdown(profiling, algorithm="wsclean")
+    assert serial["worker_procs"] == 1
     assert serial["worker_seconds_budget"] == 25.0
     assert serial["evals"] == 3
     labels = [row["label"] for row in serial["rows"]]
@@ -2569,11 +2818,15 @@ def self_check_profiling() -> None:
     top_level = sum(row["share"] for row in serial["rows"] if not row["is_sub"])
     assert abs(top_level + serial["unaccounted_share"] - 1.0) < 1e-9
 
-    # MPI run: budget is wall clock x workers, and idle time lands in unaccounted.
+    # MPI run: the budget is wall clock x *workers*, and 4 ranks are 3 workers
+    # plus the administrator - counting rank 0 would invent 5s of idle time
+    # that no rank could ever have spent imaging.
+    assert (worker_procs(1), worker_procs(2), worker_procs(15)) == (1, 1, 14)
     mpi = profiling_breakdown(mpi_profiling, algorithm="r2d2")
-    assert mpi["worker_seconds_budget"] == 20.0
-    assert abs(mpi["accounted_share"] - 0.975) < 1e-9
-    assert abs(mpi["unaccounted_seconds"] - 0.5) < 1e-9
+    assert mpi["worker_procs"] == 3
+    assert mpi["worker_seconds_budget"] == 30.0  # not 40.0: rank 0 is not a worker
+    assert abs(mpi["accounted_share"] - 0.65) < 1e-9
+    assert abs(mpi["unaccounted_seconds"] - 10.5) < 1e-9
     assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
 
     # Accounted time above the nominal budget must not push shares over 100%.

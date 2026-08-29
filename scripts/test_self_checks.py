@@ -41,6 +41,7 @@ os.environ.setdefault("REPO_ROOT", str(REPO_ROOT))
 # are listed because they cost nothing and become real coverage in the image.
 HOST_RUNNABLE = {
     "common": (
+        "self_check_evaluation_pruning",
         "self_check_parameter_space",
         "self_check_parameter_toggle",
         "self_check_profiling",
@@ -81,7 +82,11 @@ IMAGE_ONLY = {
     "simulate_point_source_ms": (
         "self_check_forest_reuse",
         "self_check_meqserver_restart",
+        "self_check_dropped_subtables",
+        "self_check_noise_weighting",
+        "self_check_phase_centre_predict",
         "self_check_predict_timeout_recovery",
+        "self_check_scratch_root",
         "self_check_serve_fifo",
         "self_check_serve_reply_stream",
         "self_check_skeleton_cache",

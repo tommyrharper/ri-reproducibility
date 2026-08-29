@@ -36,6 +36,19 @@ write_run_config() {
     # was typed for. It is also the only thing that can tell `./ri health` when
     # a stalled run is due to be killed and restarted.
     printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
+    # Same reason, and the same bug twice over: both of these are properties
+    # of the run rather than of the launching shell, and a resume that dropped
+    # them would change the run's MPI scheduling - or start keeping the
+    # Measurement Sets a nearly-full disk was the reason for deleting -
+    # half way through.
+    printf 'NS_SYNCHRONOUS=%q\n' "${NS_SYNCHRONOUS}"
+    printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
+    # WSClean-only, and for the same reason as the two above: `--mgain 0.9` is
+    # ~20% of a run's throughput and part of what its evaluations were scored
+    # under, so a resume that dropped it would change both half way through.
+    if [ "${algorithm}" = wsclean ]; then
+      printf 'NS_WSCLEAN_MGAIN=%q\n' "${NS_WSCLEAN_MGAIN}"
+    fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
     fi
@@ -182,7 +195,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   _dir="$(mktemp -d)"
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=2 \
     NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 \
-    NS_STALL_TIMEOUT=3600 \
+    NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 \
     write_run_config "${_dir}" r2d2
   # A subshell, so the sourced values cannot leak into the checks below it.
   (
@@ -198,16 +211,27 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     # Not the 7200s default: a resume replays this file, so a watchdog the
     # caller retuned has to survive it.
     [ "${NS_STALL_TIMEOUT}" = 3600 ]
+    # Same: a run resumed after `--synchronous` or `--keep-measurement-sets`
+    # must not switch behaviour part-way through.
+    [ "${NS_SYNCHRONOUS}" = 1 ]
+    [ "${NS_KEEP_MEASUREMENT_SETS}" = 1 ]
   )
   # WSClean has no thread setting, and must not write an empty one.
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
-    NS_STALL_TIMEOUT=0 \
+    NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
+    NS_WSCLEAN_MGAIN=0.9 \
     write_run_config "${_dir}" wsclean
+  grep -qx 'NS_WSCLEAN_MGAIN=0.9' "${_dir}/run.env" || {
+    echo "FAIL: --mgain not recorded in run.env"; exit 1
+  }
   # 0 turns the watchdog off and must be written as 0, not dropped: an absent
   # key reads as the default, which is the setting's opposite.
   grep -qx 'NS_STALL_TIMEOUT=0' "${_dir}/run.env" || {
     echo "FAIL: --stall-timeout 0 not recorded in run.env"; exit 1
+  }
+  grep -qx 'NS_KEEP_MEASUREMENT_SETS=0' "${_dir}/run.env" || {
+    echo "FAIL: NS_KEEP_MEASUREMENT_SETS=0 not recorded in run.env"; exit 1
   }
   grep -q R2D2_OMP_THREADS "${_dir}/run.env" && {
     echo "FAIL: empty R2D2_OMP_THREADS written for wsclean"; exit 1

@@ -39,12 +39,38 @@ _SIDECAR_PIDS=()
 _SIDECAR_COMMANDS=()
 _SIDECAR_JSON=""
 
+# One host tmpfs directory, bind-mounted into every container below at its own
+# path, for the Measurement Set each evaluation builds and deletes again. Each
+# container's own /dev/shm is private to it, so the simulator had to copy the
+# finished MS onto the (disk-backed) bind mount purely so the wsclean sidecar
+# could open it; here it is written, imaged and deleted without ever leaving
+# RAM. Only the evaluations in flight are ever present - each is deleted as its
+# metrics.json is written (evaluation_scratch_dir() in
+# scripts/lib/nested_sampling/common.py) - so this holds ~1.5MB per rank, not
+# per evaluation. Left unset where there is no host /dev/shm to put it in
+# (Docker Desktop's VM), and every reader then falls back to the old behaviour.
+if [ -z "${NS_SCRATCH_DIR:-}" ] && [ -w /dev/shm ]; then
+  NS_SCRATCH_DIR="/dev/shm/ri-ns-scratch-$$"
+  mkdir -p "${NS_SCRATCH_DIR}"
+fi
+export NS_SCRATCH_DIR="${NS_SCRATCH_DIR:-}"
+
 # Backgrounded: `docker rm --force` of the three containers costs ~0.4s, and
 # waiting for it is 8% of the run's wall clock spent after every result is
 # already on disk. The orphaned `docker rm` outlives this shell and finishes.
 _sidecar_remove() {
   if [ "${#SIDECAR_NAMES[@]}" -gt 0 ]; then
     docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 &
+  fi
+  if [ -n "${NS_SCRATCH_DIR:-}" ]; then
+    # A run that restarted after a kill leaves the killed attempt's in-flight
+    # evaluation directories here, and the containers created them as root, so
+    # this removes what it can and leaks the rest
+    # (docs/nested-sampling-io-placement.md has the root-container cleanup).
+    # `|| true` because this is the last command of an EXIT trap: a failed
+    # `rm` became the exit status of a search that had already written its
+    # summary.json, which is what `./ri self-check self-heal` caught.
+    rm -rf "${NS_SCRATCH_DIR}" 2>/dev/null || true
   fi
 }
 
@@ -84,6 +110,15 @@ sidecar_launch() {
   if [ "${#command[@]}" -gt 1 ]; then
     entrypoint_args=("${command[@]:1}")
   fi
+  local -a scratch_args=()
+  if [ -n "${NS_SCRATCH_DIR:-}" ]; then
+    # The path is also in the environment, not just on the argv the rank sends:
+    # the simulator assembles its Measurement Set in the destination directory
+    # when that is already this tmpfs, so that its closing move is a rename
+    # rather than a copy off the container's own /dev/shm - see
+    # scratch_root_for() in simulate_point_source_ms.py.
+    scratch_args=(-v "${NS_SCRATCH_DIR}:${NS_SCRATCH_DIR}" -e "NS_SCRATCH_DIR=${NS_SCRATCH_DIR}")
+  fi
   local -a run=(
     docker run --detach --rm --name "${name}"
     ${label[@]+"${label[@]}"}
@@ -91,6 +126,7 @@ sidecar_launch() {
     --shm-size 512m
     --platform "${platform}"
     -v "${REPO_ROOT}:${REPO_ROOT}"
+    ${scratch_args[@]+"${scratch_args[@]}"}
     ${args[@]+"${args[@]}"}
     --entrypoint "${command[0]}" "${image}" ${entrypoint_args[@]+"${entrypoint_args[@]}"}
   )
@@ -191,6 +227,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     echo "FAIL: img:a's -v flag leaked into img:b"; exit 1
   }
   grep -q -- "--entrypoint sh img:c -c echo hi sh /some/dir" "${_log}"
+  # Every container gets the MS scratch tmpfs at its own path, or the simulate
+  # writes an MS the imager's container cannot open.
+  if [ -n "${NS_SCRATCH_DIR}" ]; then
+    [ "$(grep -c -- "-v ${NS_SCRATCH_DIR}:${NS_SCRATCH_DIR}" "${_log}")" = 3 ] \
+      || { echo "FAIL: the scratch mount did not reach all three containers"; exit 1; }
+    # And its path in the environment, which is how the simulator knows the
+    # destination is a tmpfs it can assemble in - see scratch_root_for().
+    [ "$(grep -c -- "-e NS_SCRATCH_DIR=${NS_SCRATCH_DIR}" "${_log}")" = 3 ] \
+      || { echo "FAIL: NS_SCRATCH_DIR did not reach all three containers"; exit 1; }
+  fi
   [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1","img:c":"ri-ns-sidecar-'"$$"'-2"}' ]
   # No OUTPUT_DIR above, so no label - the pid rule in rank-budget.sh is still
   # the whole story for a caller that has no run directory.

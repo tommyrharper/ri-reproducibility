@@ -1,0 +1,330 @@
+diff --git a/msproviders/rowproviders/directmsrowprovider.cpp b/msproviders/rowproviders/directmsrowprovider.cpp
+index 363aa1e..8a78086 100644
+--- a/msproviders/rowproviders/directmsrowprovider.cpp
++++ b/msproviders/rowproviders/directmsrowprovider.cpp
+@@ -12,13 +12,12 @@ void DirectMSRowProvider::ReadData(MSRowProvider::DataArray& data,
+   v = _currentUVWArray(1);
+   w = _currentUVWArray(2);
+   dataDescId = _currentDataDescId;
+-  MsColumns& columns = Columns();
+-  columns.data.get(_currentRow, data, true);
+-  columns.flag.get(_currentRow, flags, true);
+-  antenna1 = columns.antenna_1(_currentRow);
+-  antenna2 = columns.antenna_2(_currentRow);
+-  fieldId = columns.field_id(_currentRow);
+-  time = columns.time(_currentRow);
++  getCurrentData(data);
++  getCurrentFlags(flags);
++  antenna1 = _currentAntenna1;
++  antenna2 = _currentAntenna2;
++  fieldId = _currentFieldId;
++  time = _currentTime;
+ 
+   getCurrentWeights(weights, data.shape());
+ }
+diff --git a/msproviders/rowproviders/msrowprovider.cpp b/msproviders/rowproviders/msrowprovider.cpp
+index 5e9f8f1..e40baec 100644
+--- a/msproviders/rowproviders/msrowprovider.cpp
++++ b/msproviders/rowproviders/msrowprovider.cpp
+@@ -4,12 +4,41 @@
+ 
+ #include <aocommon/throwruntimeerror.h>
+ 
++#include <casacore/casa/Arrays/Slicer.h>
+ #include <casacore/ms/MeasurementSets/MeasurementSet.h>
+ 
++#include <algorithm>
++
+ using schaapcommon::reordering::MSSelection;
+ 
+ namespace wsclean {
+ 
++namespace {
++
++/** Copy row @p index out of a block of rows read by fillBlock(). */
++template <typename T>
++void CopyRowFromBlock(const casacore::Array<T>& block, size_t index,
++                      casacore::Array<T>& row) {
++  const casacore::IPosition shape = block.shape().getFirst(block.ndim() - 1);
++  if (!row.shape().isEqual(shape)) row.resize(shape);
++  const size_t n = shape.product();
++  std::copy_n(block.data() + n * index, n, row.data());
++}
++
++/**
++ * Number of rows to read per block. Large enough that casacore's per-call
++ * overhead stops mattering, small enough that a wide set does not turn one
++ * block into hundreds of megabytes.
++ */
++size_t BlockRowCount(size_t row_elements) {
++  constexpr size_t kMaxBlockValues = 4 * 1024 * 1024;
++  constexpr size_t kMaxBlockRows = 1024;
++  return std::clamp<size_t>(kMaxBlockValues / std::max<size_t>(row_elements, 1),
++                            1, kMaxBlockRows);
++}
++
++}  // namespace
++
+ MSRowProvider::MSRowProvider(
+     const string& msPath, const MSSelection& selection,
+     const std::map<size_t, size_t>& selectedDataDescIds,
+@@ -50,30 +79,107 @@ void MSRowProvider::Initialize() {
+         Ms(), casacore::MS::columnName(casacore::MSMainEnums::WEIGHT)));
+   }
+ 
+-  // Determine last timestep
+   _startTimestep = Selection().HasInterval() ? Selection().IntervalStart() : 0;
+-  size_t timestep = _startTimestep;
+-  double time = columns.time(BeginRow());
+-  for (size_t row = BeginRow(); row != EndRow(); ++row) {
+-    if (time != columns.time(row)) {
+-      ++timestep;
+-      time = columns.time(row);
+-    }
+-  }
+-  _endTimestep = timestep;
+-
+   _currentRow = BeginRow();
+   _currentTimestep = _startTimestep;
+-  _currentTime = columns.time(_currentRow);
+-  _currentUVWArray = columns.uvw(_currentRow);
+-  _currentDataDescId = columns.data_description_id(_currentRow);
++  _currentUVWArray.resize(3);
++  if (BeginRow() == EndRow()) return;
++
++  _blockRows = BlockRowCount(columns.data.shape(BeginRow()).product());
++  ensureBlock(_currentRow);
++  _currentTime = _blockTime[0];
++  CopyRowFromBlock(_blockUvw, 0, _currentUVWArray);
++  _currentDataDescId = _blockDataDescId[0];
++  _currentAntenna1 = _blockAntenna1[0];
++  _currentAntenna2 = _blockAntenna2[0];
++  _currentFieldId = _blockFieldId[0];
+ 
+   // If this row is not selected, it is necessary to continue to the first
+   // selected row.
+-  const int a1 = columns.antenna_1(_currentRow);
+-  const int a2 = columns.antenna_2(_currentRow);
+-  const int fieldId = columns.field_id(_currentRow);
+-  if (!isCurrentRowSelected(fieldId, a1, a2)) MSRowProvider::NextRow();
++  if (!isCurrentRowSelected(_currentFieldId, _currentAntenna1,
++                            _currentAntenna2))
++    MSRowProvider::NextRow();
++}
++
++size_t MSRowProvider::EndTimestep() {
++  // Only baseline-dependent averaging asks for this, and answering it means
++  // walking the whole TIME column, so it is not computed until it is wanted.
++  if (!_endTimestep) {
++    const casacore::Vector<double> times = Columns().time.getColumnRange(
++        casacore::Slicer(casacore::IPosition(1, BeginRow()),
++                         casacore::IPosition(1, EndRow() - BeginRow())));
++    size_t timestep = _startTimestep;
++    double time = times[0];
++    for (double t : times) {
++      if (time != t) {
++        ++timestep;
++        time = t;
++      }
++    }
++    _endTimestep = timestep;
++  }
++  return *_endTimestep;
++}
++
++void MSRowProvider::fillBlock(size_t row) {
++  MsColumns& columns = Columns();
++  size_t rows = std::min(_blockRows, EndRow() - row);
++  const casacore::Slicer range(casacore::IPosition(1, row),
++                               casacore::IPosition(1, rows));
++  if (rows > 1) {
++    try {
++      columns.time.getColumnRange(range, _blockTime, true);
++      columns.antenna_1.getColumnRange(range, _blockAntenna1, true);
++      columns.antenna_2.getColumnRange(range, _blockAntenna2, true);
++      columns.field_id.getColumnRange(range, _blockFieldId, true);
++      columns.data_description_id.getColumnRange(range, _blockDataDescId, true);
++      columns.uvw.getColumnRange(range, _blockUvw, true);
++    } catch (const std::exception&) {
++      // Rows of differing shape; fall back to upstream's one row at a time.
++      _blockRows = 1;
++      rows = 1;
++    }
++  }
++  if (rows == 1) {
++    const casacore::Slicer one(casacore::IPosition(1, row),
++                               casacore::IPosition(1, 1));
++    columns.time.getColumnRange(one, _blockTime, true);
++    columns.antenna_1.getColumnRange(one, _blockAntenna1, true);
++    columns.antenna_2.getColumnRange(one, _blockAntenna2, true);
++    columns.field_id.getColumnRange(one, _blockFieldId, true);
++    columns.data_description_id.getColumnRange(one, _blockDataDescId, true);
++    columns.uvw.getColumnRange(one, _blockUvw, true);
++  }
++  _blockBegin = row;
++  _blockEnd = row + rows;
++  _blockHasVisibilities = false;
++}
++
++void MSRowProvider::fillBlockVisibilities(size_t row, size_t rows) {
++  MsColumns& columns = Columns();
++  const casacore::Slicer range(casacore::IPosition(1, row),
++                               casacore::IPosition(1, rows));
++  columns.data.getColumnRange(range, _blockData, true);
++  columns.flag.getColumnRange(range, _blockFlag, true);
++  if (_msHasWeights)
++    _weightSpectrumColumn->getColumnRange(range, _blockWeights, true);
++  else
++    _weightScalarColumn->getColumnRange(range, _blockWeights, true);
++  _blockHasVisibilities = true;
++}
++
++void MSRowProvider::getCurrentData(DataArray& data) {
++  ensureBlock(_currentRow);
++  if (!_blockHasVisibilities)
++    fillBlockVisibilities(_blockBegin, _blockEnd - _blockBegin);
++  CopyRowFromBlock(_blockData, _currentRow - _blockBegin, data);
++}
++
++void MSRowProvider::getCurrentFlags(FlagArray& flags) {
++  ensureBlock(_currentRow);
++  if (!_blockHasVisibilities)
++    fillBlockVisibilities(_blockBegin, _blockEnd - _blockBegin);
++  CopyRowFromBlock(_blockFlag, _currentRow - _blockBegin, flags);
+ }
+ 
+ void MSRowProvider::NextRow() {
+@@ -83,18 +189,20 @@ void MSRowProvider::NextRow() {
+     if (_currentRow == EndRow()) {
+       break;
+     } else {
+-      MsColumns& columns = Columns();
+-      const int a1 = columns.antenna_1(_currentRow);
+-      const int a2 = columns.antenna_2(_currentRow);
+-      const int fieldId = columns.field_id(_currentRow);
+-      _currentDataDescId = columns.data_description_id(_currentRow);
+-
+-      if (_currentTime != columns.time(_currentRow)) {
++      ensureBlock(_currentRow);
++      const size_t index = _currentRow - _blockBegin;
++      _currentAntenna1 = _blockAntenna1[index];
++      _currentAntenna2 = _blockAntenna2[index];
++      _currentFieldId = _blockFieldId[index];
++      _currentDataDescId = _blockDataDescId[index];
++
++      if (_currentTime != _blockTime[index]) {
+         ++_currentTimestep;
+-        _currentTime = columns.time(_currentRow);
++        _currentTime = _blockTime[index];
+       }
+-      _currentUVWArray = columns.uvw(_currentRow);
+-      isRowSelected = isCurrentRowSelected(fieldId, a1, a2);
++      CopyRowFromBlock(_blockUvw, index, _currentUVWArray);
++      isRowSelected = isCurrentRowSelected(_currentFieldId, _currentAntenna1,
++                                           _currentAntenna2);
+     }
+   } while (!isRowSelected);
+ }
+@@ -110,10 +218,14 @@ bool MSRowProvider::isCurrentRowSelected(int fieldId, int a1, int a2) const {
+ 
+ void MSRowProvider::getCurrentWeights(WeightArray& weights,
+                                       const casacore::IPosition& shape) {
++  ensureBlock(_currentRow);
++  if (!_blockHasVisibilities)
++    fillBlockVisibilities(_blockBegin, _blockEnd - _blockBegin);
+   if (_msHasWeights)
+-    _weightSpectrumColumn->get(_currentRow, weights, true);
++    CopyRowFromBlock(_blockWeights, _currentRow - _blockBegin, weights);
+   else {
+-    _weightScalarColumn->get(_currentRow, _scratchWeightScalarArray, true);
++    CopyRowFromBlock(_blockWeights, _currentRow - _blockBegin,
++                     _scratchWeightScalarArray);
+     weights.resize(shape);
+     ExpandScalarWeights(_scratchWeightScalarArray, weights);
+   }
+diff --git a/msproviders/rowproviders/msrowprovider.h b/msproviders/rowproviders/msrowprovider.h
+index d75da9a..90ded15 100644
+--- a/msproviders/rowproviders/msrowprovider.h
++++ b/msproviders/rowproviders/msrowprovider.h
+@@ -10,6 +10,7 @@
+ #include <cstring>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ namespace wsclean {
+@@ -39,7 +40,7 @@ class MSRowProvider : public MsRowProviderBase {
+   void OutputStatistics() const override {}
+ 
+   size_t StartTimestep() const { return _startTimestep; }
+-  size_t EndTimestep() const { return _endTimestep; }
++  size_t EndTimestep();
+ 
+   size_t CurrentProgress() const final { return _currentRow - BeginRow(); }
+ 
+@@ -57,9 +58,20 @@ class MSRowProvider : public MsRowProviderBase {
+ 
+   bool isCurrentRowSelected(int fieldId, int a1, int a2) const;
+ 
++  /**
++   * Copy the data and flags of @ref _currentRow out of the row block.
++   * @{
++   */
++  void getCurrentData(DataArray& data);
++  void getCurrentFlags(FlagArray& flags);
++  /** @} */
++
+   size_t _currentRow;
+   size_t _currentTimestep;
+   double _currentTime;
++  int _currentAntenna1 = 0;
++  int _currentAntenna2 = 0;
++  int _currentFieldId = 0;
+   casacore::Vector<double> _currentUVWArray;
+   size_t _currentDataDescId;
+ 
+@@ -69,9 +81,42 @@ class MSRowProvider : public MsRowProviderBase {
+   bool _requireModel;
+   casacore::Array<float> _scratchWeightScalarArray;
+ 
+-  size_t _startTimestep, _endTimestep;
++  size_t _startTimestep;
++  std::optional<size_t> _endTimestep;
+ 
+   void Initialize();
++
++  /**
++   * Read a block of rows starting at @p row into the members below.
++   *
++   * Asking casacore for one row of a column re-enters the storage manager for
++   * every value, which on a measurement set's tiled columns costs about ten
++   * times what reading the same rows in one call does. The row providers walk
++   * the selected rows forwards exactly once, so a single forward-only block is
++   * all the caching that needs to exist. A set whose rows do not all have the
++   * same shape cannot be read in blocks at all; the first failure drops
++   * _blockRows to one, which is upstream's row-at-a-time behaviour.
++   * @{
++   */
++  void fillBlock(size_t row);
++  void fillBlockVisibilities(size_t row, size_t rows);
++  void ensureBlock(size_t row) {
++    if (row < _blockBegin || row >= _blockEnd) fillBlock(row);
++  }
++  size_t _blockRows = 1;
++  size_t _blockBegin = 0;
++  size_t _blockEnd = 0;
++  bool _blockHasVisibilities = false;
++  casacore::Vector<double> _blockTime;
++  casacore::Vector<int> _blockAntenna1;
++  casacore::Vector<int> _blockAntenna2;
++  casacore::Vector<int> _blockFieldId;
++  casacore::Vector<int> _blockDataDescId;
++  casacore::Array<double> _blockUvw;
++  casacore::Array<casacore::Complex> _blockData;
++  casacore::Array<bool> _blockFlag;
++  casacore::Array<float> _blockWeights;
++  /** @} */
+ };
+ 
+ }  // namespace wsclean

@@ -1,0 +1,33 @@
+diff --git a/msproviders/reorderedmsprovider.cpp b/msproviders/reorderedmsprovider.cpp
+index 9f08290..fdb7d73 100644
+--- a/msproviders/reorderedmsprovider.cpp
++++ b/msproviders/reorderedmsprovider.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <fstream>
+ #include <map>
++#include <mutex>
+ #include <set>
+ #include <sstream>
+ #include <memory>
+@@ -499,7 +500,19 @@ ObservationInfo ReorderedMsProvider::GetObservationInfo() {
+ }
+ 
+ std::vector<std::string> ReorderedMsProvider::GetAntennaNames() {
+-  return wsclean::GetAntennaNames(MS()->antenna());
++  // MsProviderCollection::InitializeMeasurementSet() asks for the antenna names
++  // once per gridding and degridding pass, and a fresh ReorderedMsProvider is
++  // constructed for each of those passes. Every ask therefore opens the parent
++  // measurement set again, which makes casacore attach all of its subtables -
++  // ~2 ms here, and on small images that is a quarter of the run. The ANTENNA
++  // table cannot change while wsclean holds the reordered data, so read it once
++  // per measurement set and hand out copies.
++  static std::mutex cache_mutex;
++  static std::map<std::string, std::vector<std::string>> cache;
++  const std::lock_guard<std::mutex> lock(cache_mutex);
++  const auto [iterator, inserted] = cache.try_emplace(handle_.data_->ms_path_.data());
++  if (inserted) iterator->second = wsclean::GetAntennaNames(MS()->antenna());
++  return iterator->second;
+ }
+ 
+ }  // namespace wsclean

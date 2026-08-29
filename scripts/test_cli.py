@@ -55,6 +55,15 @@ check(
     plan("search", "wsclean", "--nlive", "8", "--metric=-snr", "--mpi-procs", "1")[0],
 )
 
+# --mgain is the only float flag here, and it has to arrive as WSClean would
+# print it rather than as Python's repr, because common.py renders it into the
+# argv with %g and every run records what it used.
+check(
+    "search --mgain reaches the run script",
+    {"NS_WSCLEAN_MGAIN": "0.9"},
+    plan("search", "wsclean", "--mgain", "0.9")[0],
+)
+
 # --retries 0 is the flag most likely to be dropped by env_from(), because 0 is
 # falsy and turning off the self-restart has to reach the run script.
 check(
@@ -70,6 +79,24 @@ check(
     {"NS_STALL_TIMEOUT": "0"},
     plan("search", "wsclean", "--stall-timeout", "0")[0],
 )
+
+# The booleans here reach shell scripts that test them the shell way, so they
+# have to arrive as 1/0 rather than Python's True/False.
+check(
+    "search --synchronous/--no-synchronous become 1/0",
+    ({"NS_SYNCHRONOUS": "1"}, {"NS_SYNCHRONOUS": "0"}),
+    (plan("search", "wsclean", "--synchronous")[0],
+     plan("search", "wsclean", "--no-synchronous")[0]),
+)
+
+
+check(
+    "search --keep-measurement-sets/--no-... become 1/0",
+    ({"NS_KEEP_MEASUREMENT_SETS": "1"}, {"NS_KEEP_MEASUREMENT_SETS": "0"}),
+    (plan("search", "wsclean", "--keep-measurement-sets")[0],
+     plan("search", "wsclean", "--no-keep-measurement-sets")[0]),
+)
+
 
 # ...and a flag that was not given contributes nothing, so an environment
 # variable exported by hand survives and defaults.toml still fills the rest.
@@ -243,6 +270,12 @@ check(
 )
 
 check(
+    "self-check reaches the wsclean fork server's own set",
+    [["scripts/self-check.sh", "zygote"]],
+    plan("self-check", "zygote")[1],
+)
+
+check(
     "smoke with no target runs both imagers",
     [["scripts/smoke-test-wsclean.sh"], ["scripts/smoke-test-r2d2.sh"]],
     plan("smoke")[1],
@@ -250,14 +283,38 @@ check(
 
 check(
     "--native builds the host-optimized WSClean",
-    ({"WSCLEAN_PORTABLE": "OFF"}, [["scripts/build.sh", "wsclean"]]),
+    ({"WSCLEAN_TARGET_CPU": "native"}, [["scripts/build.sh", "wsclean"]]),
     plan("build", "wsclean", "--native"),
+)
+
+check(
+    "search --native keeps its own build host-optimized",
+    "native",
+    plan("search", "wsclean", "--native")[0]["WSCLEAN_TARGET_CPU"],
+)
+
+check(
+    "search without --native leaves WSCLEAN_TARGET_CPU alone",
+    False,
+    "WSCLEAN_TARGET_CPU" in plan("search", "wsclean")[0],
 )
 
 check(
     "host-side analysis goes through uv",
     [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--json"]],
     plan("profile", "results/x", "--json")[1],
+)
+
+check(
+    "profile --phases reaches the profiler",
+    [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--phases"]],
+    plan("profile", "results/x", "--phases")[1],
+)
+
+check(
+    "profile --over-time reaches the profiler",
+    [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--over-time"]],
+    plan("profile", "results/x", "--over-time")[1],
 )
 
 check(

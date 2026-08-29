@@ -1,0 +1,193 @@
+diff --git a/external/schaapcommon/include/schaapcommon/math/convolution.h b/external/schaapcommon/include/schaapcommon/math/convolution.h
+index d88add1..35033e2 100644
+--- a/external/schaapcommon/include/schaapcommon/math/convolution.h
++++ b/external/schaapcommon/include/schaapcommon/math/convolution.h
+@@ -6,6 +6,8 @@
+ 
+ #include <cstring>
+ 
++#include <fftw3.h>
++
+ namespace schaapcommon::math {
+ 
+ /**
+@@ -13,6 +15,12 @@ namespace schaapcommon::math {
+  */
+ void MakeFftwfPlannerThreadSafe();
+ 
++/**
++ * A process-wide 2D FFTW plan, built on first use and never destroyed. See the
++ * comment on the definition in convolution.cc for why sharing is safe.
++ */
++fftwf_plan CachedPlan2D(bool r2c, size_t height, size_t width);
++
+ /**
+  * Convolve an image with a smaller kernel. No preparation of either image is
+  * needed.
+diff --git a/external/schaapcommon/src/math/convolution.cc b/external/schaapcommon/src/math/convolution.cc
+index 2a6e027..65c84b8 100644
+--- a/external/schaapcommon/src/math/convolution.cc
++++ b/external/schaapcommon/src/math/convolution.cc
+@@ -4,7 +4,10 @@
+ #include "convolution.h"
+ 
+ #include <complex>
++#include <map>
++#include <mutex>
+ #include <stdexcept>
++#include <utility>
+ 
+ #include <aocommon/uvector.h>
+ #include <aocommon/staticfor.h>
+@@ -19,6 +22,77 @@ namespace schaapcommon::math {
+ 
+ void MakeFftwfPlannerThreadSafe() { fftwf_make_planner_thread_safe(); }
+ 
++namespace {
++// Convolve() below used to build its four transform plans and destroy them
++// again on every call, and Resampler does the same with its two per instance.
++// A wsclean evaluation calls them 63 times at twelve distinct (kind, size)
++// pairs, and asking FFTW for a plan it has already built still costs ~0.035 ms
++// of solver-table walking under the planner lock. These plans are pure: they
++// are built with FFTW_ESTIMATE over null (that is, default-aligned) pointers
++// and executed with the new-array interface, so nothing about them depends on
++// the call that made them and one instance per size can serve every call.
++//
++// The cache is deliberately leaked. FFTW's own planner state is a static too,
++// and destroying a plan after that has gone is undefined - the same
++// static-destruction-order trap the shared-Measurement-Set patch documents.
++//
++// See docs/nested-sampling-fftw-planner.md in the ri-reproducibility repo.
++enum class PlanKind { kR2C1D, kC2C1DForward, kC2C1DBackward, kC2R1D };
++
++std::mutex& PlanCacheMutex() {
++  static std::mutex& mutex = *new std::mutex();
++  return mutex;
++}
++}  // namespace
++
++fftwf_plan CachedPlan1D(int kind, size_t n) {
++  using Key = std::pair<int, size_t>;
++  static std::map<Key, fftwf_plan>& cache = *new std::map<Key, fftwf_plan>();
++  const std::lock_guard<std::mutex> lock(PlanCacheMutex());
++  fftwf_plan& plan = cache[Key(kind, n)];
++  if (!plan) {
++    switch (static_cast<PlanKind>(kind)) {
++      case PlanKind::kR2C1D:
++        plan = fftwf_plan_dft_r2c_1d(n, nullptr, nullptr, FFTW_ESTIMATE);
++        break;
++      case PlanKind::kC2C1DForward:
++        plan = fftwf_plan_dft_1d(n, nullptr, nullptr, FFTW_FORWARD,
++                                 FFTW_ESTIMATE);
++        break;
++      case PlanKind::kC2C1DBackward:
++        plan = fftwf_plan_dft_1d(n, nullptr, nullptr, FFTW_BACKWARD,
++                                 FFTW_ESTIMATE);
++        break;
++      case PlanKind::kC2R1D:
++        plan = fftwf_plan_dft_c2r_1d(n, nullptr, nullptr, FFTW_ESTIMATE);
++        break;
++    }
++  }
++  return plan;
++}
++
++fftwf_plan CachedPlan2D(bool r2c, size_t height, size_t width) {
++  using Key = std::pair<bool, std::pair<size_t, size_t>>;
++  static std::map<Key, fftwf_plan>& cache = *new std::map<Key, fftwf_plan>();
++  const std::lock_guard<std::mutex> lock(PlanCacheMutex());
++  fftwf_plan& plan = cache[Key(r2c, std::make_pair(height, width))];
++  if (!plan) {
++    // FFTW_ESTIMATE does not read the arrays, but plan for the alignment the
++    // callers use, which is what fftwf_malloc gives.
++    float* real_data =
++        reinterpret_cast<float*>(fftwf_malloc(width * height * sizeof(float)));
++    fftwf_complex* complex_data = reinterpret_cast<fftwf_complex*>(
++        fftwf_malloc(width * height * sizeof(fftwf_complex)));
++    plan = r2c ? fftwf_plan_dft_r2c_2d(height, width, real_data, complex_data,
++                                       FFTW_ESTIMATE)
++               : fftwf_plan_dft_c2r_2d(height, width, complex_data, real_data,
++                                       FFTW_ESTIMATE);
++    fftwf_free(complex_data);
++    fftwf_free(real_data);
++  }
++  return plan;
++}
++
+ void ResizeAndConvolve(float* image, size_t image_width, size_t image_height,
+                        const float* kernel, size_t kernel_size) {
+   aocommon::UVector<float> scaled_kernel(image_width * image_height, 0.0);
+@@ -125,13 +199,13 @@ void Convolve(float* image, const float* kernel, size_t image_width,
+   fftwf_complex* fft_kernel_data = fftwf_alloc_complex(complex_size);
+ 
+   fftwf_plan plan_r2c =
+-      fftwf_plan_dft_r2c_1d(image_width, nullptr, nullptr, FFTW_ESTIMATE);
+-  fftwf_plan plan_c2c_forward = fftwf_plan_dft_1d(
+-      image_height, nullptr, nullptr, FFTW_FORWARD, FFTW_ESTIMATE);
+-  fftwf_plan plan_c2c_backward = fftwf_plan_dft_1d(
+-      image_height, nullptr, nullptr, FFTW_BACKWARD, FFTW_ESTIMATE);
++      CachedPlan1D(static_cast<int>(PlanKind::kR2C1D), image_width);
++  fftwf_plan plan_c2c_forward =
++      CachedPlan1D(static_cast<int>(PlanKind::kC2C1DForward), image_height);
++  fftwf_plan plan_c2c_backward =
++      CachedPlan1D(static_cast<int>(PlanKind::kC2C1DBackward), image_height);
+   fftwf_plan plan_c2r =
+-      fftwf_plan_dft_c2r_1d(image_width, nullptr, nullptr, FFTW_ESTIMATE);
++      CachedPlan1D(static_cast<int>(PlanKind::kC2R1D), image_width);
+ 
+   aocommon::StaticFor<size_t> loop;
+ 
+@@ -159,11 +233,6 @@ void Convolve(float* image, const float* kernel, size_t image_width,
+   fftwf_free(fft_image_data);
+   fftwf_free(fft_kernel_data);
+   fftwf_free(temp_data);
+-
+-  fftwf_destroy_plan(plan_r2c);
+-  fftwf_destroy_plan(plan_c2c_forward);
+-  fftwf_destroy_plan(plan_c2c_backward);
+-  fftwf_destroy_plan(plan_c2r);
+ }
+ 
+ }  // namespace schaapcommon::math
+diff --git a/external/schaapcommon/src/math/resampler.cc b/external/schaapcommon/src/math/resampler.cc
+index f57dc0d..4acf054 100644
+--- a/external/schaapcommon/src/math/resampler.cc
++++ b/external/schaapcommon/src/math/resampler.cc
+@@ -2,6 +2,8 @@
+ 
+ #include <complex>
+ 
++#include "convolution.h"
++
+ using aocommon::WindowFunction;
+ namespace schaapcommon::math {
+ 
+@@ -18,23 +20,13 @@ Resampler::Resampler(size_t input_width, size_t input_height,
+       tukey_inset_size_(0.0),
+       correct_window_(false),
+       tasks_(cpu_count) {
+-  float* input_data = reinterpret_cast<float*>(
+-      fftwf_malloc(fft_width_ * fft_height_ * sizeof(float)));
+-  fftwf_complex* fft_data = reinterpret_cast<fftwf_complex*>(
+-      fftwf_malloc(fft_width_ * fft_height_ * sizeof(fftwf_complex)));
+-  in_to_f_plan_ = fftwf_plan_dft_r2c_2d(input_height_, input_width_, input_data,
+-                                        fft_data, FFTW_ESTIMATE);
+-  f_to_out_plan_ = fftwf_plan_dft_c2r_2d(output_height_, output_width_,
+-                                         fft_data, input_data, FFTW_ESTIMATE);
+-  fftwf_free(fft_data);
+-  fftwf_free(input_data);
++  // Shared with every other Resampler of the same shape in this process; see
++  // the comment on CachedPlan2D in convolution.cc.
++  in_to_f_plan_ = CachedPlan2D(true, input_height_, input_width_);
++  f_to_out_plan_ = CachedPlan2D(false, output_height_, output_width_);
+ }
+ 
+-Resampler::~Resampler() {
+-  Finish();
+-  fftwf_destroy_plan(in_to_f_plan_);
+-  fftwf_destroy_plan(f_to_out_plan_);
+-}
++Resampler::~Resampler() { Finish(); }
+ 
+ void Resampler::RunThread() {
+   Task task;

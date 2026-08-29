@@ -25,7 +25,16 @@ positions are not hand-rolled in this repo. Visibilities for that skeleton are
 predicted by an actual MeqTrees/Meow point-source RIME run
 (`scripts/lib/nested_sampling/point_source_forest.py`, driven through
 `meqtree-pipeliner.py`), not a hand-rolled formula; thermal noise is added on
-top of that clean MeqTrees prediction.
+top of that clean prediction.
+
+The exception is a source at the phase centre, where Meow applies no K-Jones
+and the predict is a constant - the source flux on the parallel hands, on
+every baseline, timeslot and channel. That case is written directly instead of
+paying a meqserver round trip for it; see "the simulate stage spends 13-22ms
+predicting a constant" in [nested-sampling-throughput.md](nested-sampling-throughput.md),
+and `./ri self-check simulate` for the check that the two agree exactly. With
+`source_offset_fraction` enabled (it is off by default) MeqTrees does the
+predict as before.
 
 ## Run it
 
@@ -533,7 +542,9 @@ metadata:
 |---|---|
 | `u`, `v` | UV coordinates in wavelengths, flattened across rows and channels |
 | `y` | Complex visibilities for correlation index 0 (parallel-hand Stokes I) |
-| `nW` | `sqrt(WEIGHT)` from the MS (sqrt of inverse variance) |
+| `nW` | `sqrt(WEIGHT)` from the MS, divided by `--noise-sigma-jy` |
+
+The simulator leaves `WEIGHT` at makems' 1.0 rather than writing `1/sigma^2` into every row - it is one number for the whole MS, and writing it was a third of the simulate stage. `polychord_r2d2.py` passes the sigma from the evaluation's `simulation.json` (`noise.complex_sigma_jy`) as `--noise-sigma-jy`, so `nW` comes out exactly where the column used to put it. The default of 1.0 takes `WEIGHT` at face value, which is what a Measurement Set carrying real weights wants.
 
 Imaging weights are generated inside R2D2 when `data_weighting: True` in the
 per-evaluation YAML config. The converter does not replicate the bundled
@@ -630,7 +641,9 @@ Both views show, per stage: the total, the mean per evaluation, the share of the
 run's worker-time budget, and the evaluation count. Durations are rendered in
 whatever unit carries their digits (`33ms`, `1.44s`, `39m 15s`, `1h 00m 45s`).
 
-See [nested-sampling-profiling.md](nested-sampling-profiling.md) for what each
+See [nested-sampling-speed.md](nested-sampling-speed.md) for everything that has
+been done to make an evaluation cheaper, and
+[nested-sampling-profiling.md](nested-sampling-profiling.md) for what each
 field means and for every measured (and rejected) optimisation behind the
 current run scripts and images.
 
@@ -641,7 +654,6 @@ current run scripts and images.
 Each likelihood evaluation:
 
 ```text
-evaluations/eval-*/sim.ms
 evaluations/eval-*/simulation.json
 evaluations/eval-*/wsclean/recon-image.fits
 evaluations/eval-*/wsclean/recon-dirty.fits
@@ -654,15 +666,34 @@ evaluations/eval-*/metrics.json
 Each likelihood evaluation:
 
 ```text
-evaluations/eval-*/sim.ms
 evaluations/eval-*/simulation.json
-evaluations/eval-*/r2d2_data.mat
+evaluations/eval-*/r2d2_data.mat   (deleted once the evaluation is scored)
 evaluations/eval-*/r2d2_config.yaml
 evaluations/eval-*/r2d2/r2d2_data/R2D2_model_image.fits
 evaluations/eval-*/r2d2/r2d2_data/dirty_normalised.fits
 evaluations/eval-*/r2d2/r2d2_data/R2D2_residual_dirty_image.fits
 evaluations/eval-*/metrics.json
 ```
+
+`sim.ms` is not in either listing because a scored evaluation never writes one
+to disk at all: the simulator builds it in a tmpfs directory shared by every
+container (`NS_SCRATCH_DIR`, see
+[nested-sampling-throughput.md](nested-sampling-throughput.md)), the imager
+reads it there, and it is deleted as the evaluation's `metrics.json` is
+written - along with the `makems.cfg` and `makems.log` that used to sit beside
+it. The `.mat` R2D2 derives from it is written in the evaluation directory and
+deleted at the same moment. Nothing outside the evaluation reads either one,
+and together they were 1.5MB of a 1.44MB mean evaluation directory, so dropping
+them takes it to ~0.43MB and is what lets a big run finish on a disk that holds
+one. The same pruning list also drops WSClean's `dirty`, `residual`, `model`
+and `psf` images once the metrics have been read out of them, for a further
+3.94x to ~0.10MB - see
+[nested-sampling-disk-footprint.md](nested-sampling-disk-footprint.md). An evaluation that *failed* keeps everything, moved back beside its record
+out of the scratch directory - a failure is what this project is searching for
+- and `./ri search --keep-measurement-sets` does the same for every evaluation,
+which the replay benchmarks in
+[nested-sampling-throughput.md](nested-sampling-throughput.md) need. Either
+way the record's `params` (`noise_seed` included) reproduce the MS exactly.
 
 ### Run summary and reports
 

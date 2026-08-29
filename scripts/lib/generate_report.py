@@ -1093,6 +1093,9 @@ def render_profiling(summary):
 
     breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
     mpi_procs = breakdown["mpi_procs"]
+    # Not the rank count: PolyChord's rank 0 administrates and never evaluates a
+    # likelihood, so it has no worker-seconds to spend. See worker_procs().
+    workers = breakdown["worker_procs"]
     budget = breakdown["worker_seconds_budget"]
     evals = breakdown["evals"]
 
@@ -1103,7 +1106,7 @@ def render_profiling(summary):
     def row(label, seconds, share, per_eval=None, evals_count="", indent=False, emphasis=False):
         # A missing stage total leaves the cell blank rather than dropping it,
         # which would shift every later cell into the wrong column.
-        wall = [format_duration(seconds / mpi_procs) if seconds is not None else ""] if show_wall else []
+        wall = [format_duration(seconds / workers) if seconds is not None else ""] if show_wall else []
         # format_share can return "<0.1%", so every cell goes through escaping.
         cells = [html.escape(text) for text in (
             label,
@@ -1146,7 +1149,7 @@ def render_profiling(summary):
     )
     # The row the whole table exists to land on: divided across the workers, the
     # stages above come to the end-to-end wall clock on the run header.
-    wall_seconds = (budget / mpi_procs) if budget else 0.0
+    wall_seconds = (budget / workers) if budget else 0.0
     body += row(
         "end-to-end (accounted + unaccounted)",
         budget,
@@ -1168,9 +1171,10 @@ def render_profiling(summary):
         ))
 
     heading = " · ".join([
-        f"{mpi_procs} worker{'s' if mpi_procs != 1 else ''}",
+        f"{workers} worker{'s' if workers != 1 else ''}"
+        + (f" + administrator" if workers != mpi_procs else ""),
         f"wall clock {format_duration(breakdown['total_wall_seconds'])}",
-        f"worker-time {format_duration(budget)} ({mpi_procs} × wall clock)",
+        f"worker-time {format_duration(budget)} ({workers} × wall clock)",
         f"{evals} evaluations",
     ])
     # Spelled out left to right so the arithmetic behind the run header's wall
@@ -1182,7 +1186,7 @@ def render_profiling(summary):
     ]
     if mpi_procs != 1:
         terms.append(f"= {format_duration(budget)} of worker-time")
-        terms.append(f"÷ {mpi_procs} workers")
+        terms.append(f"÷ {workers} workers")
     equation = " ".join(html.escape(term) for term in terms)
     equation += (
         f' <strong>= {html.escape(format_duration(wall_seconds))}'
@@ -1193,7 +1197,7 @@ def render_profiling(summary):
     <details>
       <summary>Profiling (where the run's time went)</summary>
       <p class="purpose">{html.escape(heading)}</p>
-      {render_profiling_lanes(segments, mpi_procs, wall_seconds)}
+      {render_profiling_lanes(segments, workers, wall_seconds)}
       <p class="profile-equation">{equation}</p>
       <div class="eval-table-wrap">
         <table class="eval-table">
@@ -2633,7 +2637,8 @@ log(Z)       =   0.145917983191460E+001 +/-   0.309608121862379E-001
 
 def _self_check_profiling():
     # MPI run: shares are of the worker-time budget, null stages are dropped,
-    # and the imaging rows are named after the run's algorithm.
+    # and the imaging rows are named after the run's algorithm. 8 ranks are 7
+    # workers - rank 0 administrates - so the budget is 7 x the wall clock.
     html_out = render_profiling({"algorithm": "r2d2", "profiling": {
         "mpi_procs": 8, "total_wall_seconds": 455.58,
         "stage_totals_seconds": {
@@ -2650,25 +2655,25 @@ def _self_check_profiling():
     assert "39m 15s" in html_out and "53.5s" in html_out, html_out
     # A share that rounds to nothing still renders as escaped text, not as a tag.
     assert "&lt;0.1%" in html_out and "<0.1%" not in html_out, html_out
-    assert "8 workers" in html_out and "1h 00m 45s" in html_out, html_out
+    assert "7 workers + administrator" in html_out and "53m 09s" in html_out, html_out
     assert "convert" not in html_out, html_out
     # Every top-level stage plus the unaccounted remainder is charted, adds to
     # 100%, and is repeated once per worker lane.
-    assert html_out.count('class="profile-bar"') == 8, html_out
-    assert html_out.count('class="profile-seg"') == 4 * 8, html_out
+    assert html_out.count('class="profile-bar"') == 7, html_out
+    assert html_out.count('class="profile-seg"') == 4 * 7, html_out
     assert "unaccounted (PolyChord sampling + idle)" in html_out, html_out
     shares = [float(s) for s in re.findall(r"--seg-share: ([\d.]+)", html_out)]
-    assert abs(sum(shares) / 8 - 1.0) < 1e-6, shares
+    assert abs(sum(shares) / 7 - 1.0) < 1e-6, shares
     # The parallelisation arithmetic is spelled out and lands on the wall clock
     # the run header shows, and the table carries the wall-clock column that
     # turns each stage's worker-seconds into its cost in wall time.
     assert (
-        "39m 49s accounted + 20m 55s unaccounted = 1h 00m 45s of worker-time ÷ 8 workers"
+        "39m 49s accounted + 13m 20s unaccounted = 53m 09s of worker-time ÷ 7 workers"
         " <strong>= 7m 36s end-to-end wall clock</strong>"
     ) in html_out, html_out
-    assert "8 of them running side by side" in html_out, html_out
+    assert "7 of them running side by side" in html_out, html_out
     assert ">wall clock</th>" in html_out, html_out
-    assert "4m 54s" in html_out, html_out  # r2d2's 39m 15s of worker-time, in wall clock
+    assert "5m 36s" in html_out, html_out  # r2d2's 39m 15s of worker-time, in wall clock
     assert "end-to-end (accounted + unaccounted)" in html_out, html_out
     # Serial run: the budget is just the wall clock, so shares are of wall time.
     single = render_profiling({"algorithm": "wsclean", "profiling": {

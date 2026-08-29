@@ -22,12 +22,12 @@ evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
 | `simulate_seconds` | Wall time for the MeqTrees `docker run` that produces `sim.ms` (container start + RIME simulation, not split further) |
 | `convert_seconds` | R2D2 only: wall time for the MS -> `.mat` conversion in the rank's simulate worker |
 | `image_container_seconds` | Wall time for the imaging round trip: a `docker run` for WSClean, one request to this rank's R2D2 worker for R2D2 |
-| `image_binary_seconds` | WSClean only: the binary's own elapsed time from `/usr/bin/time -v` inside the container, i.e. excluding docker create/start/teardown |
+| `image_binary_seconds` | WSClean only: the imaging child's own elapsed time, from `wait4()` in the rank's `wsclean-zygote` (before 29 August 2026, from `/usr/bin/time -v`, quantised to 10ms - see [the zygote doc](nested-sampling-wsclean-zygote.md)) |
 | `metrics_seconds` | Wall time for `compute_image_metrics()` (FITS read + numpy) |
 
 `image_container_overhead_seconds` (container round trip minus binary time) is
-only available for WSClean, because only its image installs GNU `time`; R2D2
-and MeqTrees report only the round-trip time as one blob.
+only available for WSClean, because only its path reports the two separately;
+R2D2 and MeqTrees report only the round-trip time as one blob.
 
 `summary.json` also gets a run-level `profiling` block: each field above
 summed across every evaluation, plus:
@@ -165,6 +165,8 @@ order than a threaded one; that also makes it reproducible across hosts with
 different CPU counts, which it previously was not.
 
 ### `WEIGHT`/`SIGMA` are written with one TaQL `UPDATE`, not `putcol`
+
+> **Superseded.** The `UPDATE` this section arrived at is gone - the pair is no longer written per evaluation at all. See "The two constant columns are gone" in [nested-sampling-throughput.md](nested-sampling-throughput.md). The storage-manager measurements below still stand and are why nothing cheaper was available while the write had to happen.
 
 `putcol` on these two columns was 42ms of the 81ms simulate - more than the
 RIME predict. Both are *variable-shaped* array columns in the `ISMData`
@@ -457,7 +459,10 @@ moves the finished directory contents to the real output path in one go. The
 whole MS is ~1MB, so the copy out is ~2ms, and every artifact a run used to
 leave in the evaluation directory (including `makems.log`,
 `meqtree-pipeliner.log` and `point_source_forest.tdlconf`) still lands there -
-verified by `find`-diffing evaluation directories before and after.
+verified by `find`-diffing evaluation directories before and after. The two
+MeqTrees files are absent from an evaluation of a source at the phase centre,
+which no longer runs a predict at all (see
+[nested-sampling-throughput.md](nested-sampling-throughput.md)).
 
 Measured per-simulate cost dropped from 1.12s to 0.55s standalone, and on the
 profiled run from 23.7s to 13.3s of simulate (27.5s to 16.9s total, -38%) with

@@ -18,10 +18,12 @@ from common import (
     DEFAULT_IMAGE_DIM,
     DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
+    DEFAULT_WSCLEAN_MGAIN,
     DEFAULT_WSCLEAN_NITER,
     FAILURE_OBJECTIVE,
     WORKER_DIED,
     WorkerDied,
+    ZYGOTE_COMMAND,
     abort_run,
     adopt_completed_evaluations,
     cube_like_from_theta,
@@ -35,8 +37,6 @@ from common import (
     params_key,
     prewarm,
     prior_vector,
-    read_gnu_time_peak_memory,
-    read_gnu_time_wall_seconds,
     resolve_metric,
     self_check_fits_reader,
     self_check_image_pixel_size,
@@ -51,8 +51,8 @@ from common import (
     self_check_worker_pool_connect,
     self_check_worker_timeout,
     sidecar_command,
-    sidecar_run,
-    sidecar_shell,
+    sidecar_worker,
+    zygote_run,
     simulate_measurement_set,
     simulate_worker,
     stable_seed,
@@ -119,9 +119,8 @@ def evaluate(
     wsclean_dir.mkdir()
     wsclean_stdout = eval_dir / "wsclean.stdout.log"
     wsclean_stderr = eval_dir / "wsclean.stderr.log"
-    wsclean_time = wsclean_dir / "time.txt"
     wsclean_cmd = [
-        *sidecar_command(args.wsclean_image, prefix=["/usr/bin/time", "-v", "-o", str(wsclean_time)]),
+        *sidecar_command(args.wsclean_image),
         "-name",
         str(wsclean_dir / "recon"),
         "-temp-dir",
@@ -134,7 +133,7 @@ def evaluate(
         "-niter",
         str(DEFAULT_WSCLEAN_NITER),
         "-mgain",
-        "0.8",
+        f"{DEFAULT_WSCLEAN_MGAIN:g}",
         "-auto-threshold",
         f"{DEFAULT_WSCLEAN_AUTO_THRESHOLD:.6f}",
         "-weight",
@@ -144,16 +143,35 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
+        # Without this WSClean opens the whole parent measurement set once,
+        # before it has opened anything else, only to ask whether there is a
+        # CORRECTED_DATA column (Settings::determineDataColumn). There never
+        # is - self_check_dropped_subtables() asserts it - and naming the
+        # column is -1.0% on the wsclean binary over 800 paired replays
+        # against a 0.1%-resolution null, with 1000 FITS data blocks
+        # bit-identical. See docs/nested-sampling-cost-model.md.
+        "-data-column",
+        "DATA",
+        # Every output line carries a microsecond timestamp, which makes each
+        # evaluation's wsclean.stdout.log a phase timeline at production
+        # concurrency with no rig and no instrumentation - that is what
+        # `./ri profile <run> --phases` reads. Measured at +0.9% against a
+        # 1.8%-resolution null pair on a 63-Measurement-Set replay, i.e. free,
+        # and ~1 KB on a 400 KB evaluation. See
+        # docs/nested-sampling-phase-profile.md.
+        "-log-time",
         str(ms_path),
     ]
-    # No `docker stats` polling loop here: GNU `time -v` inside the container
-    # reports an exact peak RSS, where the 0.2s-interval stats sampler both
-    # missed short peaks and delayed noticing the process had exited.
-    run_result = sidecar_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
-    peak_memory_bytes = read_gnu_time_peak_memory(wsclean_time)
-    image_binary_seconds = read_gnu_time_wall_seconds(wsclean_time)
+    # No `docker stats` polling loop here, and no `/usr/bin/time -v` either:
+    # the zygote's own wait4() reports an exact peak RSS and the child's wall
+    # clock, where the 0.2s-interval stats sampler both missed short peaks and
+    # delayed noticing the process had exited, and GNU `time` cost a fork+exec
+    # per evaluation to answer in centiseconds.
+    run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
+    peak_memory_bytes = run_result.peak_memory_bytes
+    image_binary_seconds = run_result.binary_seconds
     if run_result.returncode == WORKER_DIED:
-        raise WorkerDied(f"wsclean sidecar shell died on evaluation {eval_id} ({eval_dir})")
+        raise WorkerDied(f"wsclean {ZYGOTE_COMMAND} died on evaluation {eval_id} ({eval_dir})")
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -216,7 +234,6 @@ def evaluate(
             "image": str(image_path),
             "dirty": str(dirty_path),
             "residual": str(residual_dirty_path),
-            "time": str(wsclean_time),
         },
         "commands": {
             "simulate": sim_cmd,
@@ -237,7 +254,7 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_sidecar_run = globals()["sidecar_run"]
+    original_zygote_run = globals()["zygote_run"]
     original_simulate = globals()["simulate_measurement_set"]
     original_sidecar_command = globals()["sidecar_command"]
 
@@ -280,17 +297,19 @@ def self_check_failure_record_persistence() -> None:
             image: str,
             platform: str,
             workdir: Path,
-            cmd: list[str],
+            argv: list[str],
             stdout_path: Path,
             stderr_path: Path,
         ) -> argparse.Namespace:
-            return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
+            return argparse.Namespace(
+                returncode=0, wall_seconds=2.0, peak_memory_bytes=4096, binary_seconds=1.5
+            )
 
         def failing_metrics(*args: Any, **kwargs: Any) -> dict[str, float]:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["sidecar_run"] = successful_wsclean
+        globals()["zygote_run"] = successful_wsclean
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -303,7 +322,7 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["sidecar_run"] = original_sidecar_run
+        globals()["zygote_run"] = original_zygote_run
         globals()["simulate_measurement_set"] = original_simulate
         globals()["sidecar_command"] = original_sidecar_command
 
@@ -313,7 +332,7 @@ def main() -> None:
 
     def warm_wsclean() -> None:
         sidecar_command(args.wsclean_image)
-        sidecar_shell(args.wsclean_image, args.platform)
+        sidecar_worker(args.wsclean_image, args.platform, [ZYGOTE_COMMAND])
 
     # Before `import pypolychord`, so the rank's sidecar attachments come up
     # while the sampler is still loading. Joined just below, right before the
@@ -333,14 +352,19 @@ def main() -> None:
     evaluations_dir.mkdir(exist_ok=True)
     (output_dir / "parameter-space.json").write_text(json.dumps(load_parameter_space(), indent=2) + "\n")
 
-    cache: dict[str, dict[str, Any]] = {}
-    evaluations: list[dict[str, Any]] = []
+    # key -> objective, not key -> record: nothing reads the record back (the
+    # summary re-reads them all from disk below) and holding them is what made
+    # a resume of a big run cost gigabytes on every rank. `scored` is the eval
+    # id counter the list length used to supply.
+    cache: dict[str, float] = {}
+    scored = 0
 
     def prior(cube: np.ndarray) -> np.ndarray:
         params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
+        nonlocal scored
         # ponytail: theta values are rounded back to the documented parameter
         # space here; a later science run should keep integer/discrete handling
         # in one sampler-aware transform instead of this bridge.
@@ -349,7 +373,8 @@ def main() -> None:
         params["noise_seed"] = stable_seed(args.seed, key)
         key = params_key(params)
         if key not in cache:
-            eval_id = len(evaluations) + 1
+            scored += 1
+            eval_id = scored
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
             try:
                 record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
@@ -365,10 +390,9 @@ def main() -> None:
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
                 abort_run(traceback.format_exc())
-            cache[key] = record
-            evaluations.append(record)
+            cache[key] = float(record["objective"])
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
-        return float(cache[key]["objective"]), []
+        return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
     settings.base_dir = str(output_dir / "chains")
@@ -377,6 +401,7 @@ def main() -> None:
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
+    settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # PolyChord's own checkpointing, on so that an interrupted run is not a
     # wasted one. It was off, which was survivable when a run was 100s of toy
     # evaluations and is not once a run is hours long: any interruption - the
@@ -407,7 +432,7 @@ def main() -> None:
     # checkpoint, so the stream no longer lines up with the points on disk and
     # the cache answers none of the stretch being redone - which is what
     # `./ri health`'s `at risk` line puts a number on.
-    done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
+    done = scored = adopt_completed_evaluations(evaluations_dir, cache)
     if done:
         where = (f"resuming from {resume_path}" if settings.read_resume
                  else "no checkpoint to resume from, re-sampling from the cache")
@@ -438,9 +463,14 @@ def main() -> None:
                 "max_ndead": args.max_ndead,
                 "seed": args.seed,
                 "mpi_procs": mpi_procs,
+                # Which MPI scheduling this run used, because it changes how
+                # much of the worker-time budget the profiling block can
+                # account for and a run's numbers are unreadable without it.
+                "synchronous": settings.synchronous,
             },
             "wsclean_fixed_hyperparameters": {
                 "niter": DEFAULT_WSCLEAN_NITER,
+                "mgain": DEFAULT_WSCLEAN_MGAIN,
                 "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
                 "image_dim": DEFAULT_IMAGE_DIM,
                 # `-scale` is derived per evaluation from this and the sampled

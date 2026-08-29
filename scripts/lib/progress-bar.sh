@@ -86,18 +86,22 @@ run_with_progress() {
     _ns_add_trap '_ns_pin_teardown' EXIT
     _ns_add_trap '_ns_pin_teardown' INT
     _ns_add_trap '_ns_pin_teardown' TERM
+    local drawn
     while kill -0 "${pid}" 2>/dev/null; do
+      drawn="$(_ns_now_us)"
       _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
-      sleep 1
+      sleep "$(_ns_backoff_interval "${drawn}")"
     done
     _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
     _ns_pin_teardown
   elif [ -t 1 ]; then
     # No usable terminal control (e.g. tput/TERM missing): fall back to a
     # plain redrawn line instead of a pinned one.
+    local drawn
     while kill -0 "${pid}" 2>/dev/null; do
+      drawn="$(_ns_now_us)"
       printf '\r%s' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
-      sleep 1
+      sleep "$(_ns_backoff_interval "${drawn}")"
     done
     printf '\r%s\n' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
   fi
@@ -386,25 +390,40 @@ _ns_stop_watchdog() {
 # 16-rank R2D2 search. The backstop for when nobody is watching; `./ri health`
 # answers the same question in seconds for somebody who is.
 _ns_stall_watchdog() {
-  local output_dir="$1" timeout="$2" poll="${NS_STALL_POLL_SECONDS:-60}"
-  local last quiet=0 now
+  local output_dir="$1" timeout="$2" floor="${NS_STALL_POLL_SECONDS:-60}"
+  local last quiet=0 now poll scanned
+  poll="${floor}"
   last="$(_ns_completed_evals "${output_dir}")"
   while sleep "${poll}"; do
+    scanned="$(_ns_now_us)"
     now="$(_ns_completed_evals "${output_dir}")"
     if [ "${now}" != "${last}" ]; then
       last="${now}"
       quiet=0
-      continue
+    else
+      quiet=$((quiet + poll))
+      if [ "${quiet}" -ge "${timeout}" ]; then
+        _ns_retry_say "${output_dir}" \
+          "no evaluation has finished in ${quiet}s (${now} scored, still counting)." \
+          "A run that is alive but landing nothing is hung, not slow - killing it" \
+          "so it can restart from PolyChord's checkpoint."
+        pkill -9 -f "$(ns_run_process_pattern "${output_dir}")" || true
+        return 0
+      fi
     fi
-    quiet=$((quiet + poll))
-    if [ "${quiet}" -ge "${timeout}" ]; then
-      _ns_retry_say "${output_dir}" \
-        "no evaluation has finished in ${quiet}s (${now} scored, still counting)." \
-        "A run that is alive but landing nothing is hung, not slow - killing it" \
-        "so it can restart from PolyChord's checkpoint."
-      pkill -9 -f "$(ns_run_process_pattern "${output_dir}")" || true
-      return 0
-    fi
+    # `_ns_completed_evals` walks every evaluation *directory*, not just
+    # `evaluations/`, so it costs several times the status line's pass and
+    # grows the same way: 0.28s at the 34,682 evaluations of an --nlive 200
+    # search here on an idle host, and ~2.4x that on the loaded one a watchdog
+    # actually runs on, so of order 5s a poll at the 270,000 an
+    # --nlive 500 --num-repeats 25 search reaches, and rising with the run.
+    # Backing the poll off to nine times the scan's own cost bounds it at ~10%
+    # of one core at any run size; below ~450,000 evaluations the 60s floor
+    # still wins and the cadence is exactly what it was. The 600s cap keeps the
+    # quiet time this reports inside a tenth of the 7200s default timeout, and
+    # the floor is the caller's poll, so an NS_STALL_POLL_SECONDS set to go
+    # with a short timeout still holds.
+    poll="$(_ns_backoff_interval "${scanned}" "${floor}" 600)"
   done
 }
 
@@ -479,10 +498,57 @@ _ns_truncate_pad() {
   printf '%-*.*s' "${width}" "${width}" "${text}"
 }
 
+# Microseconds since the epoch, or nothing at all where the shell cannot say.
+# EPOCHREALTIME is bash 5 and CI runs this file's self-check on macOS, whose
+# /bin/bash is 3.2; the one caller treats "cannot say" as "do not adapt". The
+# separator is matched as a class because it follows the locale.
+_ns_now_us() {
+  local t="${EPOCHREALTIME:-}"
+  printf '%s' "${t/[.,]/}"
+}
+
+# Usage: _ns_backoff_interval <_ns_now_us when the poll started> [floor] [cap]
+#
+# How long to sleep before repeating a poll whose own cost is O(evaluations).
+# Both loops in this file walk `evaluations/` - the status line for its counts,
+# the stall watchdog for its "has anything landed" - so a fixed cadence gets
+# more expensive the longer the run goes. The bar's two passes measure 0.37s
+# and 0.35s at the 270,000 evaluations an --nlive 500 --num-repeats 25 search
+# reaches on this host, so at a fixed `sleep 1` it spent 44% of a core - 2.2%
+# of the machine - counting the run rather than advancing it, and rising.
+#
+# Sleeping nine times the poll's own cost holds the loop to ~10% of one core at
+# any run size, which is the point: the cost stops scaling with the run instead
+# of merely being smaller. The floor keeps the old cadence for every run whose
+# poll is cheap (a draw under ~0.11s still redraws once a second, exactly as it
+# did), and the cap stops a pathological poll from looking dead.
+# See docs/nested-sampling-throughput.md.
+_ns_backoff_interval() {
+  local started="$1" floor="${2:-1}" cap="${3:-30}" now cost
+  now="$(_ns_now_us)"
+  if [ -z "${started}" ] || [ -z "${now}" ]; then
+    echo "${floor}"
+    return
+  fi
+  # Clamped in arithmetic rather than with `[ ] &&`, which is an AND-list that
+  # returns non-zero whenever the bound does not bite - and this file is
+  # sourced into a script running under `set -e`.
+  cost=$(((now - started) * 9 / 1000000))
+  cost=$((cost > cap ? cap : cost))
+  echo "$((cost < floor ? floor : cost))"
+}
+
 # "<evaluations> <of those, landed after `reference` was written>". `find`
 # rather than the glob loop this replaced, which cost 283ms of every
-# one-second redraw on a live 7,200-evaluation run - one find answering both
-# questions costs ~100ms, so the second count is free and the bar got cheaper.
+# one-second redraw on a live 7,200-evaluation run against ~100ms for one
+# find pass here.
+#
+# Two passes, though, not the one the comment here used to claim: POSIX find
+# has no way to mark which entries matched `-newer`, and `-printf '%T@'` -
+# which would answer both questions in one walk - is GNU-only, while CI runs
+# this file's self-check on macOS as well. Both passes are O(evaluations), so
+# what bounds their cost on a long run is `_ns_backoff_interval` above, not
+# this function.
 _ns_count_evals() {
   local dir="$1" reference="${2:-}" total since=0
   total="$(find "${dir}" -maxdepth 1 -name 'eval-*' 2>/dev/null | wc -l | tr -d ' ')"
@@ -783,6 +849,39 @@ self_check() {
   }
   [ "$(_ns_count_evals "${tmp}/evaluations" "${tmp}/chains/absent")" = "4 0" ] || {
     echo "FAIL: missing reference must not split"; exit 1
+  }
+
+  # The redraw backs off with the cost of the draw, so the bar cannot grow
+  # into a share of the machine on a long run. A shell that cannot time itself
+  # keeps the one-second cadence.
+  local now_us
+  now_us="$(_ns_now_us)"
+  if [ -n "${now_us}" ]; then
+    [ "$(_ns_backoff_interval "$((now_us - 40000))")" = "1" ] || {
+      echo "FAIL: a 40ms draw must keep the one-second cadence"; exit 1
+    }
+    [ "$(_ns_backoff_interval "$((now_us - 720000))")" = "6" ] || {
+      echo "FAIL: a 720ms draw must back off: $(_ns_backoff_interval "$((now_us - 720000))")"; exit 1
+    }
+    [ "$(_ns_backoff_interval "$((now_us - 60000000))")" = "30" ] || {
+      echo "FAIL: the back-off must be capped"; exit 1
+    }
+    # The stall watchdog's poll is the same back-off with the caller's own
+    # floor and a cap sized to the timeout rather than to a human's patience.
+    [ "$(_ns_backoff_interval "$((now_us - 200000))" 60 600)" = "60" ] || {
+      echo "FAIL: a cheap scan must keep the watchdog's poll floor"; exit 1
+    }
+    [ "$(_ns_backoff_interval "$((now_us - 20000000))" 60 600)" = "180" ] || {
+      echo "FAIL: an expensive scan must back the watchdog off: $(_ns_backoff_interval "$((now_us - 20000000))" 60 600)"
+      exit 1
+    }
+    [ "$(_ns_backoff_interval "$((now_us - 600000000))" 60 600)" = "600" ] || {
+      echo "FAIL: the watchdog's back-off must be capped"; exit 1
+    }
+  fi
+  [ "$(_ns_backoff_interval "")" = "1" ] || { echo "FAIL: no clock means no back-off"; exit 1; }
+  [ "$(_ns_backoff_interval "" 60 600)" = "60" ] || {
+    echo "FAIL: no clock means the caller's floor"; exit 1
   }
 
   # Carrying the frozen dead-point count across the checkpoint interval: 100

@@ -4,21 +4,26 @@
 # the exact tag/commit and README.md for why casacore is also built from
 # source rather than taken from Debian packages.
 #
-# Build (portable, works on any linux/arm64 CPU):
-#   docker build --platform linux/arm64 -f docker/wsclean/Dockerfile \
-#     --build-arg WSCLEAN_PORTABLE=ON -t ri-reproducibility/wsclean .
+# WSCLEAN_TARGET_CPU is the one knob over the instruction set the gridder is
+# compiled for; it is WSClean's own `-DTARGET_CPU` (see README.md "Which CPU
+# WSClean is built for"):
 #
-# Build (host-optimized, runs on THIS machine's CPU only - see README.md
-# "Portable vs. host-optimized WSClean"):
+#   x86-64-v3   the default: AVX2 + FMA, i.e. every x86-64 CPU since ~2013.
+#               One fixed binary, so two hosts still image bit-identically.
+#   native      this exact CPU, and SIGILL on any other (`./ri build wsclean
+#               --native`).
+#   (empty)     the plain x86-64 baseline, ~10% slower - and what a non-x86
+#               build falls back to, since the default names an x86 target.
+#
 #   docker build --platform linux/arm64 -f docker/wsclean/Dockerfile \
-#     --build-arg WSCLEAN_PORTABLE=OFF -t ri-reproducibility/wsclean:native .
+#     --build-arg WSCLEAN_TARGET_CPU= -t ri-reproducibility/wsclean .
 
 ARG WSCLEAN_GIT_URL=https://gitlab.com/aroffringa/wsclean.git
 ARG WSCLEAN_GIT_TAG=v3.7
 ARG CASACORE_GIT_URL=https://github.com/casacore/casacore.git
 ARG CASACORE_GIT_TAG=v3.8.1
 ARG CASACORE_MEASURES_URL=ftp://ftp.astron.nl/outgoing/Measures/WSRT_Measures.ztar
-ARG WSCLEAN_PORTABLE=ON
+ARG WSCLEAN_TARGET_CPU=x86-64-v3
 ARG BUILD_JOBS=4
 
 ##############################################################################
@@ -31,7 +36,6 @@ ARG CASACORE_GIT_TAG
 ARG CASACORE_MEASURES_URL
 ARG WSCLEAN_GIT_URL
 ARG WSCLEAN_GIT_TAG
-ARG WSCLEAN_PORTABLE
 ARG BUILD_JOBS
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -109,15 +113,47 @@ RUN mkdir -p /opt/casacore-data \
     && rm /tmp/WSRT_Measures.ztar
 
 # --- WSClean, built from source (pinned) -------------------------------
+# Declared here and not with the others at the top of the stage: an `ARG`
+# instruction is itself a cache key for every layer below it, so up there a
+# `./ri build wsclean --native` recompiled casacore too - ~20 minutes of a
+# ~40-minute rebuild, for a flag casacore is not built with.
+ARG WSCLEAN_TARGET_CPU
+
+# Local performance patches, applied to the pinned upstream tree before the
+# build. `git apply` fails the build loudly if a version bump makes one stale,
+# which is the point: a silently dropped patch would be a silent slowdown. See
+# docs/nested-sampling-wsclean-patches.md for what each one is and what it is
+# worth.
+COPY docker/wsclean/patches /usr/src/wsclean-patches
+# Source this repo adds to the tree rather than patches into it: a whole new
+# file is easier to read and to keep building than the same file expressed as a
+# diff, so 0002 only teaches CMake the target exists.
+COPY docker/wsclean/src /usr/src/wsclean-src
+# PORTABLE=ON forbids TARGET_CPU and drops -march entirely, so cmake's two
+# options are derived from the one build arg. The target is offered to the
+# compiler before it is passed to cmake because WSClean's SetTargetCPU.cmake
+# makes an unsupported one a FATAL_ERROR - which is what an x86 target name is
+# on an arm64 build of this same Dockerfile. Falling back keeps that build
+# working; a typo shows up in the build log rather than as a silent slow binary.
 RUN git clone --recurse-submodules --branch ${WSCLEAN_GIT_TAG} --depth 1 \
         --shallow-submodules ${WSCLEAN_GIT_URL} /usr/src/wsclean \
+    && git -C /usr/src/wsclean apply --verbose /usr/src/wsclean-patches/*.patch \
+    && cp /usr/src/wsclean-src/*.cpp /usr/src/wsclean/main/ \
     && mkdir -p /usr/src/wsclean/build \
     && cd /usr/src/wsclean/build \
+    && if [ -n "${WSCLEAN_TARGET_CPU}" ] \
+        && echo 'int main(){}' | g++ -march="${WSCLEAN_TARGET_CPU}" -x c++ - -o /dev/null 2>/dev/null; then \
+         echo "==> building WSClean for -march=${WSCLEAN_TARGET_CPU}"; \
+         set -- -DPORTABLE=OFF -DTARGET_CPU="${WSCLEAN_TARGET_CPU}"; \
+       else \
+         echo "==> building portable WSClean (no -march; requested '${WSCLEAN_TARGET_CPU}')"; \
+         set -- -DPORTABLE=ON; \
+       fi \
     && cmake .. \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/wsclean \
         -DCMAKE_PREFIX_PATH=/opt/casacore \
-        -DPORTABLE=${WSCLEAN_PORTABLE} \
+        "$@" \
     && make -j${BUILD_JOBS} \
     && make install \
     && rm -rf /usr/src/wsclean

@@ -148,11 +148,32 @@ def evaluate(
             "timing": {"simulate_seconds": simulate_seconds},
         })
 
+    # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
+    # have to be told the cell size it used. Same figure WSClean is handed as
+    # `-scale`, from the same recorded baseline, so the two score the same sky
+    # - see image_pixel_size_arcsec() in common.py. Read here rather than after
+    # the convert because the convert needs this file's noise sigma too.
+    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    if "max_proj_baseline_lambda" not in simulation["observation"]:
+        raise SystemExit(
+            "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
+            "rebuild the meqtrees image (scripts/build.sh meqtrees), it bakes in a stale simulator"
+        )
+    scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
+
     mat_path = eval_dir / "r2d2_data.mat"
     # ms_to_r2d2_mat.py argv for the simulate worker that just wrote this MS (see
     # convert_ms_to_mat): its own `docker exec` cost ~0.15s, of which only ~0.01s
     # was the conversion and the rest a fresh interpreter and its imports.
-    convert_cmd = ["--ms-path", str(ms_path), "--mat-path", str(mat_path)]
+    #
+    # The noise sigma travels here rather than in the MS's WEIGHT column: it is
+    # one number for the whole MS, and writing it to every row was 31% of the
+    # simulate stage (see fill_point_source_visibilities).
+    convert_cmd = [
+        "--ms-path", str(ms_path),
+        "--mat-path", str(mat_path),
+        "--noise-sigma-jy", repr(float(simulation["noise"]["complex_sigma_jy"])),
+    ]
     convert_start = time.perf_counter()
     convert_returncode = convert_ms_to_mat(convert_cmd, eval_dir, args.meqtrees_image, args.platform)
     convert_seconds = time.perf_counter() - convert_start
@@ -208,18 +229,6 @@ def evaluate(
                 "image_container_seconds": run_result.wall_seconds,
             },
         })
-
-    # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
-    # have to be told the cell size it used. Same figure WSClean is handed as
-    # `-scale`, from the same recorded baseline, so the two score the same sky
-    # - see image_pixel_size_arcsec() in common.py.
-    simulation = json.loads((eval_dir / "simulation.json").read_text())
-    if "max_proj_baseline_lambda" not in simulation["observation"]:
-        raise SystemExit(
-            "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
-            "rebuild the meqtrees image (scripts/build.sh meqtrees), it bakes in a stale simulator"
-        )
-    scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
     image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
     dirty_path = r2d2_dir / "r2d2_data" / "dirty_normalised.fits"
@@ -328,6 +337,16 @@ def self_check_worker_death_is_not_scored() -> None:
         platform: str,
     ) -> tuple[Path, list[str], None]:
         eval_dir.mkdir(parents=True, exist_ok=False)
+        # A real simulate always leaves this, and evaluate() reads it before the
+        # convert for the cell size and the noise sigma; a stub without one
+        # takes the run out on FileNotFoundError before reaching what is being
+        # checked here.
+        (eval_dir / "simulation.json").write_text(
+            json.dumps({
+                "observation": {"max_proj_baseline_lambda": 1.0e5},
+                "noise": {"complex_sigma_jy": 0.01},
+            })
+        )
         return eval_dir / "sim.ms", ["simulate"], None
 
     def imaging(returncode: int) -> Callable[..., Any]:
@@ -420,9 +439,13 @@ def self_check_failure_record_persistence() -> None:
         ) -> tuple[Path, list[str], None]:
             eval_dir.mkdir(parents=True, exist_ok=False)
             # A real simulate always leaves this behind, and evaluate() reads it
-            # for the cell size R2D2's images carry no header for.
+            # for the cell size R2D2's images carry no header for and for the
+            # noise sigma the .mat convert needs.
             (eval_dir / "simulation.json").write_text(
-                json.dumps({"observation": {"max_proj_baseline_lambda": 1.0e5}})
+                json.dumps({
+                    "observation": {"max_proj_baseline_lambda": 1.0e5},
+                    "noise": {"complex_sigma_jy": 0.01},
+                })
             )
             return eval_dir / "sim.ms", ["simulate"], None
 
@@ -486,20 +509,26 @@ def main() -> None:
     evaluations_dir.mkdir(exist_ok=True)
     (output_dir / "parameter-space.json").write_text(json.dumps(load_parameter_space(), indent=2) + "\n")
 
-    cache: dict[str, dict[str, Any]] = {}
-    evaluations: list[dict[str, Any]] = []
+    # key -> objective, not key -> record: nothing reads the record back (the
+    # summary re-reads them all from disk below) and holding them is what made
+    # a resume of a big run cost gigabytes on every rank. `scored` is the eval
+    # id counter the list length used to supply.
+    cache: dict[str, float] = {}
+    scored = 0
 
     def prior(cube: np.ndarray) -> np.ndarray:
         params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
+        nonlocal scored
         params = cube_to_params(cube_like_from_theta(theta))
         key = params_key(params)
         params["noise_seed"] = stable_seed(args.seed, key)
         key = params_key(params)
         if key not in cache:
-            eval_id = len(evaluations) + 1
+            scored += 1
+            eval_id = scored
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
             try:
                 record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
@@ -515,10 +544,9 @@ def main() -> None:
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
                 abort_run(traceback.format_exc())
-            cache[key] = record
-            evaluations.append(record)
+            cache[key] = float(record["objective"])
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
-        return float(cache[key]["objective"]), []
+        return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
     settings.base_dir = str(output_dir / "chains")
@@ -527,6 +555,7 @@ def main() -> None:
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
+    settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # PolyChord's own checkpointing, on so that an interrupted run is not a
     # wasted one. It was off, which was survivable when a run was 100s of toy
     # evaluations and is not once a run is hours long: any interruption - the
@@ -557,7 +586,7 @@ def main() -> None:
     # checkpoint, so the stream no longer lines up with the points on disk and
     # the cache answers none of the stretch being redone - which is what
     # `./ri health`'s `at risk` line puts a number on.
-    done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
+    done = scored = adopt_completed_evaluations(evaluations_dir, cache)
     if done:
         where = (f"resuming from {resume_path}" if settings.read_resume
                  else "no checkpoint to resume from, re-sampling from the cache")
@@ -588,6 +617,10 @@ def main() -> None:
                 "max_ndead": args.max_ndead,
                 "seed": args.seed,
                 "mpi_procs": mpi_procs,
+                # Which MPI scheduling this run used, because it changes how
+                # much of the worker-time budget the profiling block can
+                # account for and a run's numbers are unreadable without it.
+                "synchronous": settings.synchronous,
             },
             "r2d2_fixed_hyperparameters": {
                 "im_dim_x": DEFAULT_IMAGE_DIM,

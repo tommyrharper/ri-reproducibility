@@ -100,10 +100,15 @@ SEARCH_PID=$!
 
 # Killing before the first evaluation would be a different test - that case is
 # the anti-spin guard, and progress-bar.sh's own self-check covers it.
-for _ in $(seq 1 120); do
+# Polled every 0.05s rather than every second: a 3-rank search runs at ~25
+# evaluations a second, so a one-second tick overshot the 8 this wants and
+# landed past PolyChord's first checkpoint at 20 - the drift the assertion
+# below is there to catch. Throughput only goes up, so poll finer than the
+# window is wide.
+for _ in $(seq 1 2400); do
   [ "$(completed_evals "${OUT}")" -ge "${KILL_AFTER_EVALS}" ] && break
   kill -0 "${SEARCH_PID}" 2>/dev/null || fail "search exited before scoring ${KILL_AFTER_EVALS} evaluations; see ${OUT}.log"
-  sleep 1
+  sleep 0.05
 done
 before="$(completed_evals "${OUT}")"
 [ "${before}" -ge "${KILL_AFTER_EVALS}" ] || fail "only ${before} evaluations after 120s; see ${OUT}.log"
@@ -382,8 +387,19 @@ worker_sidecar="$(docker ps --filter "label=ri.run-dir=${WORKER_OUT}" \
 echo "self-heal: killing every wsclean worker in ${worker_sidecar} at ${worker_before} evaluations"
 # /proc rather than pkill: the wsclean image ships no procps. `$$` is this
 # `sh`, which is itself named sh and would otherwise kill itself first.
+# `wsclean-zygote` as well as `sh`: since the fork server landed
+# (docs/nested-sampling-wsclean-zygote.md) the imaging worker is a zygote and
+# not a shell, so matching only `sh` quietly made this check kill nothing.
 docker exec "${worker_sidecar}" sh -c \
-  'for d in /proc/[0-9]*; do p="${d#/proc/}"; [ "$(cat "${d}/comm" 2>/dev/null)" = sh ] && [ "${p}" != "$$" ] && kill -9 "${p}"; done; true' \
+  'killed=0
+   for d in /proc/[0-9]*; do
+     p="${d#/proc/}"
+     comm="$(cat "${d}/comm" 2>/dev/null)"
+     case "${comm}" in sh|wsclean-zygote) ;; *) continue ;; esac
+     [ "${p}" != "$$" ] || continue
+     kill -9 "${p}" && killed=$((killed+1))
+   done
+   [ "${killed}" -gt 0 ] || { echo "no workers to kill" >&2; exit 1; }' \
   || fail "could not kill the workers in ${worker_sidecar}"
 
 wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \

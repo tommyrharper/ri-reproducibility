@@ -4,8 +4,9 @@
 The MS skeleton and VLA.A antenna table come from makems' bundled VLA-A
 example (shipped by the `makems` KERN package). Visibilities are predicted by
 an actual MeqTrees/Meow point-source RIME run (see point_source_forest.py),
-driven non-interactively through meqtree-pipeliner.py; thermal noise is then
-added on top of that clean MeqTrees prediction.
+driven non-interactively through meqtree-pipeliner.py - except for a source at
+the phase centre, whose predict is a constant that phase_centre_visibility()
+writes directly. Thermal noise is then added on top of the clean prediction.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -26,7 +28,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from casacore.tables import table, taql
+from casacore.tables import table
 
 
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
@@ -44,6 +46,24 @@ SPEED_OF_LIGHT = 299792458.0
 # ponytail: Docker gives /dev/shm 64MB by default, which is ~30x this run's
 # largest MS; raise --shm-size on the sidecar if the parameter space grows.
 SCRATCH_ROOT = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
+
+
+def scratch_root_for(destination: Path) -> str | None:
+    """Where to assemble a Measurement Set that is bound for `destination`.
+
+    SCRATCH_ROOT is this container's own /dev/shm, which docker gives it as a
+    private tmpfs - a different mount from the run's shared scratch
+    (`NS_SCRATCH_DIR`, bind-mounted into every container by
+    scripts/lib/start-sidecars.sh). So for a destination already inside that
+    shared tmpfs, simulate()'s closing `shutil.move` was a cross-device copy of
+    the whole MS - 1.60ms against 0.01ms for the rename it becomes when the two
+    are the same mount. Assembling it in the destination directory is as fast to
+    write (both are RAM) and makes the move free.
+    """
+    shared = os.environ.get("NS_SCRATCH_DIR", "")
+    if shared and destination.is_relative_to(shared):
+        return str(destination)
+    return SCRATCH_ROOT
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -202,15 +222,26 @@ def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_wi
         spw.putcol("TOTAL_BANDWIDTH", np.array([n_chan * channel_width_hz]))
 
 
-def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace) -> None:
-    """run_makems(), reusing a cached run for configs that differ only in frequency."""
+def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune_unused: bool = False) -> None:
+    """run_makems(), reusing a cached run for configs that differ only in frequency.
+
+    `prune_unused` skips copying the subtables fill_point_source_visibilities()
+    is going to delete anyway (UNUSED_SUBTABLES): 27 of the cached skeleton's
+    66 files and 0.50ms of the 1.56ms copy. Only a caller that will not ask
+    MeqTrees for a predict may set it - casacore opens the MS as a
+    MeasurementSet there and refuses one that is missing a required subtable -
+    which is why it is an explicit argument rather than read off `args`:
+    warm_forest() and self_check_phase_centre_predict() both predict a source
+    that is *at* the phase centre, so the source position does not decide it.
+    """
     key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
     cached = skeleton_dir() / hashlib.sha256(key.encode()).hexdigest()[:32]
     if not cached.exists():
         run_makems(output_ms)
         publish_skeleton(output_ms, cached)
         return
-    shutil.copytree(cached, output_ms, symlinks=True)
+    ignore = shutil.ignore_patterns(*UNUSED_SUBTABLES) if prune_unused else None
+    shutil.copytree(cached, output_ms, symlinks=True, ignore=ignore)
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
     (output_ms.parent / "makems.log").write_text(f"reused a cached makems skeleton for:\n{key}\n")
 
@@ -489,6 +520,47 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
     return errors
 
 
+def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
+    """What MeqTrees predicts for a Stokes-I point source at the phase centre.
+
+    point_source_forest.py hands Meow the phase-centre Direction itself at zero
+    offset, so no K-Jones is applied and the brightness matrix reaches the sinks
+    unchanged: XX = YY = I on every baseline, timeslot and channel, with the
+    cross-hands zero. Nothing in it depends on the data, which is why a predict
+    costs the same 13ms whether the Measurement Set has 1000 visibilities or
+    28000 - it is the meqserver round trip and the MS open, not the arithmetic.
+    That was ~15% of a run's worker time spent producing this constant, so at
+    the phase centre it is written directly and MeqTrees is only asked for the
+    offset source it is actually needed for. self_check_phase_centre_predict()
+    is the guard that the two agree exactly.
+    """
+    model = np.zeros(n_corr, dtype=np.complex64)
+    model[0] = model[-1] = source_flux_jy
+    return model
+
+
+# makems writes the full MSv2 subtable set, and casacore attaches every subtable
+# on every open of the parent table - which WSClean does once per gridding and
+# degridding pass, ~16 times an evaluation, at ~0.21ms a subtable per open.
+# These six are empty (FLAG_CMD, HISTORY) or carry nothing a single-field
+# unpolarised point-source simulation depends on, so they are dropped once the
+# visibilities are written - not in the cached skeleton, because casacore
+# refuses to open an MS that is missing any of them and the MeqTrees predict
+# needs it opened that way. An evaluation that runs no predict never copies them
+# out of the skeleton at all (make_ms_skeleton()'s `prune_unused`); the delete
+# below is what covers the one that does, and stays unconditional because it
+# already tolerates them being absent. Worth -13.8% on the wsclean binary and +14.9%
+# evaluations per second for the first five, and FEED another ~3%, with
+# bit-identical images; see docs/nested-sampling-ms-open.md. The six that
+# stay were each tried and each kills WSClean, so this list is complete.
+UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
+
+
+def meqtrees_predict_needed(args: argparse.Namespace) -> bool:
+    """Whether this source needs the meqserver - see phase_centre_visibility()."""
+    return bool(args.source_l_arcsec or args.source_m_arcsec)
+
+
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
@@ -504,23 +576,46 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
 
     # ponytail: this simulator supports one unpolarized point source; full Stokes
     # models and multi-source dynamic-range stress cases are a follow-up ceiling.
-    corr_sel, n_corr = determine_corr_selection(output_ms)
-    run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
+    # A source at the phase centre predicts a constant, so the meqserver is
+    # not asked for it - see phase_centre_visibility().
+    predicted = meqtrees_predict_needed(args)
+    if predicted:
+        corr_sel, n_corr = determine_corr_selection(output_ms)
+        run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
 
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
-        data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
+        if predicted:
+            data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
+            _, n_chan, data_n_corr = data.shape
+            if data_n_corr != n_corr:
+                raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
+        else:
+            # Every value in DATA is about to be overwritten with the same
+            # constant, so the skeleton's zeros are not read back: only the
+            # shape is wanted, and one row of it costs 0.05ms against 0.38ms
+            # for the whole column. determine_corr_selection()'s separate open
+            # of the same table goes with it (another 0.43ms) - its correlation
+            # count comes from this probe, and its `corr_sel` string is only
+            # ever handed to a predict this path does not run.
+            _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
+            data = np.empty((ms.nrows(), n_chan, n_corr), dtype=np.complex64)
+            data[:] = phase_centre_visibility(args.source_flux_jy, n_corr)
         uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
-        n_rows, n_chan, data_n_corr = data.shape
         if n_chan != len(freqs_hz):
             raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
-        if data_n_corr != n_corr:
-            raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
 
         if noise_sigma_jy:
             per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
-            noise = rng.normal(0.0, per_component_sigma, data.shape) + 1j * rng.normal(0.0, per_component_sigma, data.shape)
-            data = data + noise.astype(np.complex64)
+            # Added in place to the two float32 halves rather than built as a
+            # complex128 array and added out of place. Rounding each component
+            # to float32 before the add is what the old `.astype(np.complex64)`
+            # did, so the column is bit-identical for a given seed - it just
+            # stops allocating three more copies of DATA to get there (0.69ms
+            # an evaluation). The two draws stay separate calls in this order
+            # because that, not the arithmetic, is what fixes the stream.
+            data.real += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
+            data.imag += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
 
         ms.putcol("DATA", data)
         for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -528,17 +623,23 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
                 ms.putcol(optional_col, data)
         if "FLAG" in ms.colnames():
             ms.putcol("FLAG", np.zeros(ms.getcol("FLAG").shape, dtype=bool))
-        # WEIGHT and SIGMA are variable-shaped IncrementalStMan columns in a
-        # makems MS, and python-casacore's putcol on those is quadratic in rows:
-        # 1755 rows cost 43ms for the pair, against 8ms for a putcell row loop
-        # and 3ms for this TaQL UPDATE, which is the same row loop in C++.
-        # They cannot be moved to a cheaper storage manager - removecols refuses
-        # to break up the ISM group makems put them in with 15 other columns.
-        if "WEIGHT" in ms.colnames():
-            taql(
-                "UPDATE $ms SET WEIGHT=%r, SIGMA=%r"
-                % (1.0 / (noise_sigma_jy * noise_sigma_jy), noise_sigma_jy)
-            )
+        # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
+        # noise is one sigma for every row and channel, so the pair carried a
+        # single number written to every row - and they are variable-shaped
+        # IncrementalStMan columns, the slowest thing in the whole stage to
+        # write (a TaQL UPDATE, the cheapest of the three ways tried, was 31% of
+        # it). The number itself is in this evaluation's simulation.json as
+        # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
+        # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
+        # weight of 1.0 images identically to a uniform 1/sigma^2.
+
+        attached = ms.getkeywords()
+        for unused in UNUSED_SUBTABLES:
+            if unused in attached:
+                ms.removekeyword(unused)
+    # After the close, so casacore is never holding a table whose files are gone.
+    for unused in UNUSED_SUBTABLES:
+        shutil.rmtree(output_ms / unused, ignore_errors=True)
 
     # The longest projected baseline in wavelengths, which is what both imagers
     # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
@@ -581,10 +682,10 @@ def simulate(args: argparse.Namespace) -> None:
     final_ms.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = Path(args.metadata_json) if args.metadata_json else final_ms.parent / "simulation.json"
 
-    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+    with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
         cfg = write_makems_config(args, scratch_ms)
-        make_ms_skeleton(cfg, scratch_ms, args)
+        make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
         metadata = fill_point_source_visibilities(args, scratch_ms)
         metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
@@ -719,6 +820,34 @@ def serve(fifo_base: str | None = None) -> None:
         replies.flush()
 
 
+def self_check_scratch_root() -> None:
+    """A destination inside the run's shared tmpfs is assembled in place.
+
+    Getting this wrong is silent - the MS still arrives, it is just copied
+    across two tmpfs mounts on the way (1.60ms an evaluation) instead of
+    renamed (0.01ms).
+    """
+    was = os.environ.get("NS_SCRATCH_DIR")
+    with tempfile.TemporaryDirectory() as shared:
+        try:
+            os.environ["NS_SCRATCH_DIR"] = shared
+            inside = Path(shared) / "eval-0001-abc"
+            assert scratch_root_for(inside) == str(inside), scratch_root_for(inside)
+            outside = Path(shared).parent / "not-the-scratch" / "eval-0001-abc"
+            assert scratch_root_for(outside) == SCRATCH_ROOT, scratch_root_for(outside)
+            # No shared scratch at all (a self-check, a host with no writable
+            # /dev/shm): the container's own /dev/shm, exactly as before.
+            del os.environ["NS_SCRATCH_DIR"]
+            assert scratch_root_for(inside) == SCRATCH_ROOT
+        finally:
+            # Restored, not dropped: the checks after this one run in the same
+            # process, and in a sidecar the run really does set it.
+            os.environ.pop("NS_SCRATCH_DIR", None)
+            if was is not None:
+                os.environ["NS_SCRATCH_DIR"] = was
+    print("OK: scratch_root_for assembles in place inside NS_SCRATCH_DIR")
+
+
 def self_check_skeleton_cache() -> None:
     """A patched cache hit must reproduce a fresh makems run column for column."""
 
@@ -805,6 +934,121 @@ def self_check_forest_reuse() -> None:
             assert np.array_equal(values, expected), f"DATA differs after a forest reuse at {shape}"
     _FOREST.clear()
     print("forest reuse self-check passed")
+
+
+def self_check_phase_centre_predict() -> None:
+    """The constant phase_centre_visibility() writes must be what MeqTrees predicts."""
+    cases = ((1, 0.3, 5.4e10, 2.0e6, 1.0), (8, 20.0, 5.4e7, 0.1e6, 1.0), (5, 7.3, 1.4e9, 1.1e6, 2.5))
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        for index, (n_chan, minutes, start_hz, width_hz, flux) in enumerate(cases):
+            ms = Path(scratch) / f"phase-centre-{index}" / "sim.ms"
+            built = parse_args([
+                "--output-ms", str(ms), "--observation-minutes", str(minutes),
+                "--channel-count", str(n_chan), "--start-frequency-hz", repr(start_hz),
+                "--channel-width-hz", repr(width_hz), "--dynamic-range", "300",
+                "--source-flux-jy", repr(flux),
+            ])
+            make_ms_skeleton(write_makems_config(built, ms), ms, built)
+            corr_sel, n_corr = determine_corr_selection(ms)
+            run_meqtrees_predict(ms, corr_sel, flux, 0.0, 0.0)
+            with table(str(ms), readonly=True, ack=False) as opened:
+                predicted = np.asarray(opened.getcol("DATA"))
+            expected = np.broadcast_to(phase_centre_visibility(flux, n_corr), predicted.shape)
+            assert np.array_equal(predicted, expected), \
+                f"MeqTrees predicts more than the phase-centre constant at {(n_chan, minutes, start_hz, width_hz, flux)}"
+    _FOREST.clear()
+    print("phase-centre predict self-check passed")
+
+
+def self_check_noise_weighting() -> None:
+    """R2D2's nW must be what the dropped `UPDATE ... SET WEIGHT` would have given.
+
+    The simulator no longer writes 1/sigma^2 to every row (it was 31% of the
+    stage); ms_to_r2d2_mat.py divides by the sigma from simulation.json instead.
+    That is only equivalent while makems leaves WEIGHT at exactly 1.0, so this
+    asserts both halves: the column is untouched, and nW comes out elementwise
+    equal to the old sqrt(WEIGHT) over a 1/sigma^2 column.
+    """
+    from ms_to_r2d2_mat import ms_to_r2d2_mat
+    from scipy.io import loadmat
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        for index, dynamic_range in enumerate((10.0, 1.0e6)):
+            ms = Path(scratch) / f"weights-{index}" / "sim.ms"
+            metadata_path = ms.parent / "simulation.json"
+            # simulate() prints the whole metadata document, which is the
+            # contract its callers rely on and only noise here.
+            with contextlib.redirect_stdout(io.StringIO()):
+                simulate(parse_args([
+                    "--output-ms", str(ms), "--metadata-json", str(metadata_path),
+                    "--observation-minutes", "4.0", "--channel-count", "2",
+                    "--start-frequency-hz", "1.0e9", "--channel-width-hz", "1.0e6",
+                    "--source-flux-jy", "1.0", "--dynamic-range", repr(dynamic_range),
+                    "--seed", "42",
+                ]))
+            with table(str(ms), readonly=True, ack=False) as opened:
+                weight = np.asarray(opened.getcol("WEIGHT"), dtype=np.float64)
+            assert np.array_equal(weight, np.ones_like(weight)), \
+                f"makems no longer leaves WEIGHT at 1.0 (dynamic range {dynamic_range})"
+            sigma = json.loads(metadata_path.read_text())["noise"]["complex_sigma_jy"]
+            mat = ms.parent / "r2d2_data.mat"
+            ms_to_r2d2_mat(ms, mat, noise_sigma_jy=sigma)
+            nW = np.asarray(loadmat(str(mat))["nW"], dtype=np.float64)
+            expected = np.sqrt(1.0 / (sigma * sigma))
+            assert np.allclose(nW, expected, rtol=0.0, atol=0.0), \
+                f"nW is {nW.min()}..{nW.max()}, not the {expected} the WEIGHT column used to carry"
+    print("noise weighting self-check passed")
+
+
+def self_check_dropped_subtables() -> None:
+    """UNUSED_SUBTABLES must be gone from a finished MS, on both predict paths.
+
+    The offset case is the one that matters: casacore will not open an MS that
+    is missing a required subtable, so the drop has to happen after the MeqTrees
+    predict rather than in the cached skeleton, and this is the guard on that
+    ordering.
+    """
+    kept = ("ANTENNA", "DATA_DESCRIPTION", "FIELD", "OBSERVATION",
+            "POLARIZATION", "SPECTRAL_WINDOW")
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        for index, (l_arcsec, m_arcsec) in enumerate(((0.0, 0.0), (5.0, 3.0))):
+            ms = Path(scratch) / f"subtables-{index}" / "sim.ms"
+            with contextlib.redirect_stdout(io.StringIO()):
+                simulate(parse_args([
+                    "--output-ms", str(ms), "--observation-minutes", "4.0",
+                    "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+                    "--channel-width-hz", "1.0e6", "--source-flux-jy", "1.0",
+                    "--source-l-arcsec", repr(l_arcsec), "--source-m-arcsec", repr(m_arcsec),
+                    "--dynamic-range", "300", "--seed", "42",
+                ]))
+            with table(str(ms), readonly=True, ack=False) as opened:
+                keywords = opened.getkeywords()
+                rows = opened.nrows()
+                columns = opened.colnames()
+                data = np.asarray(opened.getcol("DATA"))
+            assert rows, f"{ms} came out empty"
+            # The phase-centre path fills an uninitialised array from a one-row
+            # shape probe rather than reading DATA back, so a wrong shape or a
+            # missed fill would leave whatever malloc returned in the column.
+            assert data.shape[:2] == (rows, 2), f"{ms} DATA is {data.shape}, not ({rows}, 2, ...)"
+            if not (l_arcsec or m_arcsec):
+                assert abs(complex(data[..., 0].mean()) - 1.0) < 0.05, \
+                    f"{ms} DATA does not average the 1 Jy source: {data[..., 0].mean()}"
+            # polychord_wsclean.py passes `-data-column DATA` rather than let
+            # WSClean open the whole measurement set to decide - which is only
+            # the same answer while the simulator writes no CORRECTED_DATA.
+            assert "DATA" in columns, f"{ms} has no DATA column"
+            assert "CORRECTED_DATA" not in columns, (
+                f"{ms} has a CORRECTED_DATA column, so WSClean would image that "
+                "one - drop the `-data-column DATA` in polychord_wsclean.py"
+            )
+            for name in UNUSED_SUBTABLES:
+                assert name not in keywords, f"{name} is still a keyword of {ms}"
+                assert not (ms / name).exists(), f"{name} is still on disk in {ms}"
+            for name in kept:
+                assert name in keywords and (ms / name).is_dir(), f"{name} went missing from {ms}"
+    _FOREST.clear()
+    print("dropped subtable self-check passed")
 
 
 def self_check_meqserver_restart() -> None:
@@ -962,10 +1206,14 @@ def self_check_wedge_kills_worker() -> None:
             text=True,
         )
         request = {
+            # Offset, so the request actually reaches the meqserver: a source at
+            # the phase centre never asks it for anything (see
+            # phase_centre_visibility()) and a wedged worker would answer it.
             "argv": [
                 "--output-ms", str(ms), "--observation-minutes", "4.0",
                 "--channel-count", "2", "--start-frequency-hz", "1.0e9",
                 "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+                "--source-l-arcsec", "0.5",
             ],
             "stdout": str(Path(scratch) / "out.log"),
             "stderr": str(Path(scratch) / "err.log"),
@@ -1051,9 +1299,13 @@ if __name__ == "__main__":
             # argument set, so they are dispatched before argparse.
             serve(sys.argv[3] if sys.argv[2:3] == ["--fifo"] else None)
         elif sys.argv[1:] == ["--self-check"]:
+            self_check_scratch_root()
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
             self_check_forest_reuse()
+            self_check_phase_centre_predict()
+            self_check_noise_weighting()
+            self_check_dropped_subtables()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()
             self_check_wedge_kills_worker()

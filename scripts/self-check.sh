@@ -53,6 +53,7 @@ nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 host_python() { uv run --no-project --python ">=3.11" python "$@"; }
 
 echo "=== host-side checks ==="
+host_python "${REPO_ROOT}/scripts/profile-nested-sampling-run.py" --self-check
 host_python "${REPO_ROOT}/scripts/test_watchdogs.py"
 host_python "${REPO_ROOT}/scripts/test_self_checks.py"
 
@@ -69,6 +70,14 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2-serve" ]]; then
   # what a run would run. Its numpy and measurement-operator checks skip
   # themselves outside this image, which is what they do in CI.
   docker_run --entrypoint python3 "${R2D2_IMAGE}" -u "$(nested_sampling r2d2_serve.py)" --self-check
+fi
+
+if [[ "${TARGET}" == "all" || "${TARGET}" == "zygote" ]]; then
+  echo
+  echo "=== wsclean fork server (${WSCLEAN_IMAGE}) ==="
+  # In the WSClean image rather than the sampler's, because what is under test
+  # is the `wsclean-zygote` binary this repo adds to it.
+  docker_run --entrypoint python3 "${WSCLEAN_IMAGE}" -u "${REPO_ROOT}/scripts/test_zygote.py"
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "wsclean" ]]; then

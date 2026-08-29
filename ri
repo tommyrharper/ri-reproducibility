@@ -46,6 +46,9 @@ SEARCH_ENV = (
     ("seed", "NS_SEED"),
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
+    ("mgain", "NS_WSCLEAN_MGAIN"),
+    ("synchronous", "NS_SYNCHRONOUS"),
+    ("keep_measurement_sets", "NS_KEEP_MEASUREMENT_SETS"),
     ("retries", "NS_RETRIES"),
     ("stall_timeout", "NS_STALL_TIMEOUT"),
     ("omp_threads", "R2D2_OMP_THREADS"),
@@ -60,7 +63,10 @@ def env_from(args, pairs):
     caller exported by hand survives, and defaults.toml supplies the rest.
     """
     return {
-        var: str(getattr(args, dest))
+        # bool renders as "1"/"0", not "True"/"False": these become shell
+        # environment variables, and the scripts test them the shell way.
+        var: ("1" if getattr(args, dest) else "0") if isinstance(getattr(args, dest), bool)
+        else str(getattr(args, dest))
         for dest, var in pairs
         if getattr(args, dest) is not None
     }
@@ -74,7 +80,7 @@ def uv(script, *args):
 
 
 def do_build(args):
-    env = {"WSCLEAN_PORTABLE": "OFF"} if args.native else {}
+    env = {"WSCLEAN_TARGET_CPU": "native"} if args.native else {}
     return env, [["scripts/build.sh", args.target]]
 
 
@@ -96,6 +102,11 @@ def do_shell(args):
 
 def do_search(args):
     env = env_from(args, SEARCH_ENV)
+    if args.native:
+        # The search builds its images first, and build.sh reads this, so
+        # without it here a search would rebuild the portable WSClean over any
+        # native one `./ri build wsclean --native` had left under the tag.
+        env["WSCLEAN_TARGET_CPU"] = "native"
     if args.enable_param:
         env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
     if args.disable_param:
@@ -165,7 +176,11 @@ def do_serve(args):
 
 def do_profile(args):
     return {}, [uv("scripts/profile-nested-sampling-run.py", args.run,
-                   *(["--json"] if args.json else []))]
+                   *(["--json"] if args.json else []),
+                   *(["--phases"] if args.phases else []),
+                   *(["--over-time"] if args.over_time else []),
+                   *(["--top", str(args.top)] if args.top else []),
+                   *(["--buckets", str(args.buckets)] if args.buckets else []))]
 
 
 def do_merge(args):
@@ -270,9 +285,11 @@ def build_parser():
     build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES),
                        help="which image to build (default: all)")
     build.add_argument("--native", action="store_true",
-                       help="WSClean tuned for this exact CPU (tags :native, "
-                            "WSCLEAN_PORTABLE=OFF); faster but not portable, and "
-                            "not comparable with a portable build")
+                       help="WSClean tuned for this exact CPU (WSCLEAN_TARGET_CPU=native) "
+                            "rather than the default AVX2 baseline; a little faster and "
+                            "SIGILLs anywhere else. Reuses the same image tag, so the "
+                            "next build without it puts the default one back - pass "
+                            "--native to ./ri search too")
 
     self_check = add("self-check", do_self_check, "run the checks that need the images",
         description="Runs the host-side checks, then each module's own "
@@ -286,8 +303,8 @@ def build_parser():
                     "freezes a rank of the other, and checks both recover on "
                     "their own.")
     self_check.add_argument("target", nargs="?", default="all",
-        choices=("all", "simulate", "r2d2-serve", "wsclean", "r2d2", "report",
-                 "self-heal"),
+        choices=("all", "simulate", "r2d2-serve", "zygote", "wsclean", "r2d2",
+                 "report", "self-heal"),
         help="which set of checks to run (default: all)")
 
     smoke = add("smoke", do_smoke, "check the imagers actually image",
@@ -335,6 +352,30 @@ def build_parser():
                              "--metric=-snr, to search the worst corner [NS_METRIC]")
     search.add_argument("--mpi-procs", type=int,
                         help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
+    search.add_argument("--mgain", type=float,
+                        help="WSClean major-cycle gain, the largest throughput lever "
+                             "left: it sets how many of an evaluation's ~15 gridding "
+                             "and degridding passes are paid for. 0.9 is ~20%% more "
+                             "evaluations per second than the 0.8 default, and moves "
+                             "the default total_rms_jy objective by 1e-7 (median) but "
+                             "not peak_flux_abs_error_jy or sigma_res "
+                             "[NS_WSCLEAN_MGAIN], see docs/nested-sampling-clean-loop.md")
+    search.add_argument("--synchronous", action=argparse.BooleanOptionalAction,
+                        help="make every rank wait for the slowest one each sampling "
+                             "round. Off by default: it costs ~30%% of the wall clock "
+                             "here and buys nothing this search needs "
+                             "[NS_SYNCHRONOUS], see docs/nested-sampling-throughput.md")
+    search.add_argument("--keep-measurement-sets", action=argparse.BooleanOptionalAction,
+                        help="keep every intermediate artefact of a scored evaluation - "
+                             "its sim.ms and WSClean's dirty, residual, model and psf "
+                             "images - instead of deleting them once it is scored. Off by "
+                             "default: nothing reads any of them afterwards, and disk is "
+                             "what caps a run's size - they took an evaluation "
+                             "directory from 0.10MB to 1.44MB "
+                             "(docs/nested-sampling-disk-footprint.md). The sim.ms it keeps "
+                             "is missing six subtables the MSv2 specification calls "
+                             "required, so CASA will not open it "
+                             "[NS_KEEP_MEASUREMENT_SETS], see docs/nested-sampling-ms-open.md")
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
     search.add_argument("--retries", type=int, metavar="N",
@@ -358,6 +399,10 @@ def build_parser():
                              "of searching it; repeatable, and --enable-param wins if a name "
                              "is given to both [NS_DISABLE_PARAMS]. ./ri params lists names "
                              "and current state")
+    search.add_argument("--native", action="store_true",
+                        help="build WSClean for this exact CPU (WSCLEAN_TARGET_CPU=native) "
+                             "rather than the default AVX2 baseline; the binary then runs "
+                             "nowhere else, see docs/nested-sampling-throughput.md")
     search.add_argument("--no-build", action="store_true",
                         help="skip the image builds this search would do first")
 
@@ -526,6 +571,14 @@ def build_parser():
                               "docs/nested-sampling-profiling.md.")
     profile.add_argument("run", metavar="RUN", help="run directory or summary.json")
     profile.add_argument("--json", action="store_true", help="raw JSON instead of a table")
+    profile.add_argument("--phases", action="store_true",
+                         help="break the wsclean binary down by phase, from every evaluation's "
+                              "own -log-time timeline, see docs/nested-sampling-phase-profile.md")
+    profile.add_argument("--over-time", action="store_true",
+                         help="evaluations/second against wall clock, beside the visibility count "
+                              "that sets it, see docs/nested-sampling-cost-model.md")
+    profile.add_argument("--top", type=int, help="with --phases: phases to print, largest first")
+    profile.add_argument("--buckets", type=int, help="with --over-time: wall-clock buckets to print")
 
     merge = add("merge", do_merge, "merge compatible runs into one",
                 description="Post-processing only. Sources must agree on imager, "

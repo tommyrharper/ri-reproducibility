@@ -592,17 +592,26 @@ def summary_is_complete(run_dir: Path) -> bool:
     Not finished, then; a stopped run, which is the one status that prints the
     `./ri resume` that repairs it (from the point cache, imaging nothing).
 
-    Tested by the last byte rather than by parsing, because this runs over
+    Tested by the last line rather than by parsing, because this runs over
     every run in the results directory and a finished R2D2 search's summary
     carries all of its evaluations - tens of MB to parse for a question the
-    tail answers in one seek. json.dumps ends every complete write with `}`.
+    tail answers in one seek.
+
+    The last line, not the last byte: write_json_atomic() writes with
+    `indent=2`, so the only `}` that ever starts a line is the outermost one,
+    while a cut anywhere inside the evaluations array lands after an *indented*
+    `}` about as often as not. "Ends with a closing brace" therefore called
+    roughly half of all torn summaries finished - including the one
+    scripts/test_self_heal.sh tears. (`{}`, which json.dumps writes on one
+    line, is the one complete file whose last line is not a bare brace.)
     Runs written since write_json_atomic() cannot produce a torn one.
     """
     try:
         with open(run_dir / "summary.json", "rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 64))
-            return f.read().decode("utf-8", "replace").rstrip().endswith("}")
+            tail = f.read().decode("utf-8", "replace").rstrip()
+            return tail.rpartition("\n")[2] in ("}", "{}")
     except OSError:
         return False
 
@@ -3062,8 +3071,10 @@ def self_check() -> None:
             assert live_loglikelihoods(live) == []
             assert describe(live, ranks, DEFAULT_STALE_SECONDS)["forecast"] is None
 
-            # Disk: the one resource nothing here reserves, frees or prunes,
-            # and the only one whose exhaustion ends a run outright.
+            # Disk: the resource whose exhaustion ends a run outright, and
+            # the one this cannot reserve. A search prunes each evaluation's
+            # Measurement Set as it scores it, which cut the rate ~3.4x and
+            # did not remove the need to forecast it.
             bulky = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260101T000200Z"
             (bulky / "evaluations").mkdir(parents=True)
             (bulky / "run.env").write_text("NS_ALGORITHM=r2d2\n")
@@ -3463,12 +3474,17 @@ def self_check() -> None:
             # rewrites it. The same fixture as the finished case, with only
             # the bytes of its summary changed, so nothing but the
             # completeness test can be what moves it.
-            (live / "summary.json").write_text('{\n  "evaluations": [\n    {\n      "eval')
-            torn = describe(live, [], 5.0)
-            assert torn["status"] == "stopped", torn
-            assert torn["stage"] != "finished", torn["stage"]
-            assert any("summary.json is half written" in w and "./ri resume" in w
-                       for w in torn["warnings"]), torn["warnings"]
+            # Both shapes a real tear takes: cut mid-token, and cut right
+            # after an evaluation's own closing brace - the common one, and the
+            # one an "ends with }" test called finished.
+            for half in ('{\n  "evaluations": [\n    {\n      "eval',
+                         '{\n  "evaluations": [\n    {\n      "eval_id": 1\n    }'):
+                (live / "summary.json").write_text(half)
+                torn = describe(live, [], 5.0)
+                assert torn["status"] == "stopped", torn
+                assert torn["stage"] != "finished", torn["stage"]
+                assert any("summary.json is half written" in w and "./ri resume" in w
+                           for w in torn["warnings"]), torn["warnings"]
             # ...and a whole one is still a finished run, with nothing said.
             (live / "summary.json").write_text("{}")
             assert describe(live, [], 5.0)["warnings"] == []

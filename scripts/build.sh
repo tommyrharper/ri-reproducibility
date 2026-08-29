@@ -11,7 +11,10 @@ cd "${REPO_ROOT}"
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 TARGET="${1:-all}"
-WSCLEAN_PORTABLE="${WSCLEAN_PORTABLE:-ON}"
+# The instruction set WSClean's gridder is compiled for; see the header of
+# docker/wsclean/Dockerfile for the three values that mean something. Empty is
+# meaningful (the plain x86-64 baseline), so `-` rather than `:-`.
+WSCLEAN_TARGET_CPU="${WSCLEAN_TARGET_CPU-x86-64-v3}"
 
 # A `docker build` whose every step is CACHED is not free: buildkit still
 # resolves the `docker/dockerfile:1` frontend and the base image metadata over
@@ -62,11 +65,17 @@ build_image() {
     -t "${image}" "$@" .
 }
 
+# BUILD_JOBS is `make -j` for the casacore and WSClean source builds, ~40
+# minutes of compiling at the Dockerfile's default of 4, so it follows `nproc`
+# unless the caller sets it (a build that OOMs wants it lower). Deliberately
+# not in inputs_hash: it changes how long the build takes, not what it makes.
 build_wsclean() {
   build_image ri-reproducibility/wsclean:v3.7 \
-    "$(inputs_hash "${PLATFORM} PORTABLE=${WSCLEAN_PORTABLE}" docker/wsclean/Dockerfile)" \
+    "$(inputs_hash "${PLATFORM} TARGET_CPU=${WSCLEAN_TARGET_CPU}" \
+      docker/wsclean/Dockerfile docker/wsclean/patches docker/wsclean/src)" \
     -f docker/wsclean/Dockerfile \
-    --build-arg WSCLEAN_PORTABLE="${WSCLEAN_PORTABLE}"
+    --build-arg BUILD_JOBS="${BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}" \
+    --build-arg WSCLEAN_TARGET_CPU="${WSCLEAN_TARGET_CPU}"
 }
 
 build_r2d2() {
