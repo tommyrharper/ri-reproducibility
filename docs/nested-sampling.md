@@ -542,7 +542,9 @@ metadata:
 |---|---|
 | `u`, `v` | UV coordinates in wavelengths, flattened across rows and channels |
 | `y` | Complex visibilities for correlation index 0 (parallel-hand Stokes I) |
-| `nW` | `sqrt(WEIGHT)` from the MS (sqrt of inverse variance) |
+| `nW` | `sqrt(WEIGHT)` from the MS, divided by `--noise-sigma-jy` |
+
+The simulator leaves `WEIGHT` at makems' 1.0 rather than writing `1/sigma^2` into every row - it is one number for the whole MS, and writing it was a third of the simulate stage. `polychord_r2d2.py` passes the sigma from the evaluation's `simulation.json` (`noise.complex_sigma_jy`) as `--noise-sigma-jy`, so `nW` comes out exactly where the column used to put it. The default of 1.0 takes `WEIGHT` at face value, which is what a Measurement Set carrying real weights wants.
 
 Imaging weights are generated inside R2D2 when `data_weighting: True` in the
 per-evaluation YAML config. The converter does not replicate the bundled

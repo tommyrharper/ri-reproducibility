@@ -822,11 +822,117 @@ attempts failed:
   time, then writing row 0 per evaluation. Same result - the ISM does not
   collapse to a single entry.
 
-Dropping the write entirely is not available either: `ms_to_r2d2_mat.py` reads
-`WEIGHT` to build R2D2's `nW = sqrt(1/sigma^2)`, so the column is load-bearing
-for the R2D2 search even though WSClean, weighting naturally with a constant
-weight, is indifferent to its value. Anything that fixes this has to change
-what makems writes, not what the simulator writes afterwards.
+> **Corrected below.** This section closed with "dropping the write entirely
+> is not available either ... anything that fixes this has to change what
+> makems writes, not what the simulator writes afterwards". That was wrong:
+> the write is gone, and makems was not touched. See "The two constant columns
+> are gone" below. Every measurement above still reproduces.
+
+Dropping the write looked unavailable: `ms_to_r2d2_mat.py` reads `WEIGHT` to
+build R2D2's `nW = sqrt(1/sigma^2)`, so the column is load-bearing for the R2D2
+search even though WSClean, weighting naturally with a constant weight, is
+indifferent to its value.
+
+## The two constant columns are gone
+
+The [simulate-stage section](#the-simulate-stage-two-thirds-of-what-is-left-is-two-constant-columns)
+above measured the TaQL `UPDATE $ms SET WEIGHT, SIGMA` at a third of the stage
+and concluded that dropping it "has to change what makems writes". It does
+not, because **makems already writes exactly the value the column needs to
+hold**: a fresh skeleton comes out with `WEIGHT = SIGMA = 1.0` on every row.
+The simulator was overwriting a uniform 1.0 with a uniform `1/sigma^2` - one
+number, replicated across the whole Measurement Set, at 1us per row per column
+because the pair sits in a variable-shaped `IncrementalStMan` group.
+
+That number is already recorded, per evaluation, in `simulation.json` as
+`noise.complex_sigma_jy`. So the write is gone and the sigma travels as data:
+
+- `fill_point_source_visibilities()` leaves `WEIGHT` and `SIGMA` at makems' 1.0.
+- `ms_to_r2d2_mat.py` takes `--noise-sigma-jy` and computes
+  `nW = sqrt(WEIGHT) / sigma`, which is the same number the old
+  `nW = sqrt(1/sigma^2)` produced while `WEIGHT` is 1.0. It defaults to 1.0, so
+  the tool is still correct on a Measurement Set that carries real weights.
+- `polychord_r2d2.py` reads `simulation.json` before the convert instead of
+  after it, and passes the sigma.
+
+`simulation.json` was already the channel simulator metadata reaches the
+imagers through - both runners read `observation.max_proj_baseline_lambda` from
+it for the cell size rather than recomputing it from the MS - so this is the
+existing route, not a new one.
+
+`self_check_noise_weighting()` (`./ri self-check simulate`) is what keeps the
+equivalence honest. It asserts both halves at two dynamic ranges 10^5 apart:
+that `WEIGHT` really is still all 1.0 after a simulate, and that `nW` comes out
+elementwise equal to `sqrt(1/sigma^2)`. If a future makems, or a change to the
+skeleton cache, ever leaves a different constant there, the first assertion
+fails rather than the science quietly moving.
+
+### What it is worth
+
+The stage, timed inside the meqtrees image against the baked skeleton cache,
+20 evaluations per worker, median:
+
+| | before | after |
+|---|---:|---:|
+| serial | 10.97ms | 7.58ms |
+| 19 concurrent workers | 22.80ms | 15.51ms |
+
+and the phases at 19 workers:
+
+| | before | after |
+|---|---:|---:|
+| skeleton copy + `SPECTRAL_WINDOW` patch | 4.06ms | 4.24ms |
+| fill visibilities | 11.62ms | 4.60ms |
+| &nbsp;&nbsp;of which the TaQL `UPDATE` | 7.14ms | - |
+| move out of `/dev/shm` into the evaluation directory | 5.32ms | 5.48ms |
+| **total** | **22.80ms** | **15.51ms** |
+
+End to end, three interleaved seed pairs at `--nlive 25 --num-repeats 10
+--max-ndead -1 --mpi-procs 20`, behind a discarded warm-up arm for the
+[burst-clock trap](#the-first-four-seconds-of-any-measurement-lie-by-20), the
+two arms differing only in which `MEQTREES_IMAGE` the search was handed:
+
+| seed | evaluations/s before | after | | simulate ms/evaluation before | after |
+|---|---:|---:|---:|---:|---:|
+| 4242 | 51.74 | 54.34 | +5.0% | 36.14 | 24.74 |
+| 7 | 53.08 | 53.12 | +0.1% | 36.79 | 24.81 |
+| 99 | 50.60 | 53.82 | +6.4% | 37.93 | 24.86 |
+| **mean** | **51.80** | **53.76** | **+3.8%** | **36.95** | **24.80** |
+
+Read the two halves differently. The simulate column is the real measurement -
+**-12.1ms per evaluation, -33%, in all three pairs and within 0.5% of itself
+across them**. It is *larger* than the 7.3ms the isolated 19-worker timing
+predicted, because in a real search the stage contends with 19 concurrent
+`wsclean` processes rather than 19 other simulates. The evaluations/s column
+carries the whole run's variance on top of a ~3% effect, which is why one pair
+lands on +0.1%; take the +3.8% mean as the estimate and the -12.1ms as the
+fact.
+
+### What it costs: the objective moves in its seventh decimal
+
+WSClean weights naturally, so a uniform weight images the same sky whatever
+the constant is - but not to the last bit, because summing `w * V` in float32
+rounds differently when `w` is 3.7e3 or 7.8e9 rather than 1.0. Re-imaging five
+recorded evaluations spanning the run's cost distribution, once with the
+`WEIGHT` the old simulator wrote and once with 1.0:
+
+| | max relative change |
+|---|---:|
+| `total_rms_jy` (the default objective) | 4.5e-7 |
+| `sigma_res` | 2.9e-4 |
+| dirty, restored and PSF pixels | 6.6e-7 |
+
+WSClean is bit-reproducible on the same input (the same MS twice gives
+identical FITS), so these are real differences, not measurement noise. They
+are the same size as the ones [the native build](#what-does-work-build-wsclean-for-the-cpu-it-runs-on)
+already introduced for +6-10% - median 9.7e-8, max 3.7e-7 on the objective -
+and four orders of magnitude below the gridder's own `1e-4` accuracy setting.
+`sigma_res` amplifies it because it is a ratio of a near-zero residual to the
+dirty image; the absolute move is 4.4e-8 on 1.5e-4.
+
+R2D2's input does not move at all: `nW` is computed to the same float64 value
+the column used to hold, which is what the self-check asserts.
+
 
 ## The sampler itself has no slack
 

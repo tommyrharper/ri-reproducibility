@@ -148,11 +148,32 @@ def evaluate(
             "timing": {"simulate_seconds": simulate_seconds},
         })
 
+    # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
+    # have to be told the cell size it used. Same figure WSClean is handed as
+    # `-scale`, from the same recorded baseline, so the two score the same sky
+    # - see image_pixel_size_arcsec() in common.py. Read here rather than after
+    # the convert because the convert needs this file's noise sigma too.
+    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    if "max_proj_baseline_lambda" not in simulation["observation"]:
+        raise SystemExit(
+            "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
+            "rebuild the meqtrees image (scripts/build.sh meqtrees), it bakes in a stale simulator"
+        )
+    scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
+
     mat_path = eval_dir / "r2d2_data.mat"
     # ms_to_r2d2_mat.py argv for the simulate worker that just wrote this MS (see
     # convert_ms_to_mat): its own `docker exec` cost ~0.15s, of which only ~0.01s
     # was the conversion and the rest a fresh interpreter and its imports.
-    convert_cmd = ["--ms-path", str(ms_path), "--mat-path", str(mat_path)]
+    #
+    # The noise sigma travels here rather than in the MS's WEIGHT column: it is
+    # one number for the whole MS, and writing it to every row was 31% of the
+    # simulate stage (see fill_point_source_visibilities).
+    convert_cmd = [
+        "--ms-path", str(ms_path),
+        "--mat-path", str(mat_path),
+        "--noise-sigma-jy", repr(float(simulation["noise"]["complex_sigma_jy"])),
+    ]
     convert_start = time.perf_counter()
     convert_returncode = convert_ms_to_mat(convert_cmd, eval_dir, args.meqtrees_image, args.platform)
     convert_seconds = time.perf_counter() - convert_start
@@ -208,18 +229,6 @@ def evaluate(
                 "image_container_seconds": run_result.wall_seconds,
             },
         })
-
-    # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
-    # have to be told the cell size it used. Same figure WSClean is handed as
-    # `-scale`, from the same recorded baseline, so the two score the same sky
-    # - see image_pixel_size_arcsec() in common.py.
-    simulation = json.loads((eval_dir / "simulation.json").read_text())
-    if "max_proj_baseline_lambda" not in simulation["observation"]:
-        raise SystemExit(
-            "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
-            "rebuild the meqtrees image (scripts/build.sh meqtrees), it bakes in a stale simulator"
-        )
-    scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
     image_path = r2d2_dir / "r2d2_data" / "R2D2_model_image.fits"
     dirty_path = r2d2_dir / "r2d2_data" / "dirty_normalised.fits"
@@ -328,6 +337,16 @@ def self_check_worker_death_is_not_scored() -> None:
         platform: str,
     ) -> tuple[Path, list[str], None]:
         eval_dir.mkdir(parents=True, exist_ok=False)
+        # A real simulate always leaves this, and evaluate() reads it before the
+        # convert for the cell size and the noise sigma; a stub without one
+        # takes the run out on FileNotFoundError before reaching what is being
+        # checked here.
+        (eval_dir / "simulation.json").write_text(
+            json.dumps({
+                "observation": {"max_proj_baseline_lambda": 1.0e5},
+                "noise": {"complex_sigma_jy": 0.01},
+            })
+        )
         return eval_dir / "sim.ms", ["simulate"], None
 
     def imaging(returncode: int) -> Callable[..., Any]:
@@ -420,9 +439,13 @@ def self_check_failure_record_persistence() -> None:
         ) -> tuple[Path, list[str], None]:
             eval_dir.mkdir(parents=True, exist_ok=False)
             # A real simulate always leaves this behind, and evaluate() reads it
-            # for the cell size R2D2's images carry no header for.
+            # for the cell size R2D2's images carry no header for and for the
+            # noise sigma the .mat convert needs.
             (eval_dir / "simulation.json").write_text(
-                json.dumps({"observation": {"max_proj_baseline_lambda": 1.0e5}})
+                json.dumps({
+                    "observation": {"max_proj_baseline_lambda": 1.0e5},
+                    "noise": {"complex_sigma_jy": 0.01},
+                })
             )
             return eval_dir / "sim.ms", ["simulate"], None
 

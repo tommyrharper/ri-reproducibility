@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -27,7 +28,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from casacore.tables import table, taql
+from casacore.tables import table
 
 
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
@@ -555,17 +556,15 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
                 ms.putcol(optional_col, data)
         if "FLAG" in ms.colnames():
             ms.putcol("FLAG", np.zeros(ms.getcol("FLAG").shape, dtype=bool))
-        # WEIGHT and SIGMA are variable-shaped IncrementalStMan columns in a
-        # makems MS, and python-casacore's putcol on those is quadratic in rows:
-        # 1755 rows cost 43ms for the pair, against 8ms for a putcell row loop
-        # and 3ms for this TaQL UPDATE, which is the same row loop in C++.
-        # They cannot be moved to a cheaper storage manager - removecols refuses
-        # to break up the ISM group makems put them in with 15 other columns.
-        if "WEIGHT" in ms.colnames():
-            taql(
-                "UPDATE $ms SET WEIGHT=%r, SIGMA=%r"
-                % (1.0 / (noise_sigma_jy * noise_sigma_jy), noise_sigma_jy)
-            )
+        # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
+        # noise is one sigma for every row and channel, so the pair carried a
+        # single number written to every row - and they are variable-shaped
+        # IncrementalStMan columns, the slowest thing in the whole stage to
+        # write (a TaQL UPDATE, the cheapest of the three ways tried, was 31% of
+        # it). The number itself is in this evaluation's simulation.json as
+        # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
+        # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
+        # weight of 1.0 images identically to a uniform 1/sigma^2.
 
     # The longest projected baseline in wavelengths, which is what both imagers
     # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
@@ -858,6 +857,46 @@ def self_check_phase_centre_predict() -> None:
     print("phase-centre predict self-check passed")
 
 
+def self_check_noise_weighting() -> None:
+    """R2D2's nW must be what the dropped `UPDATE ... SET WEIGHT` would have given.
+
+    The simulator no longer writes 1/sigma^2 to every row (it was 31% of the
+    stage); ms_to_r2d2_mat.py divides by the sigma from simulation.json instead.
+    That is only equivalent while makems leaves WEIGHT at exactly 1.0, so this
+    asserts both halves: the column is untouched, and nW comes out elementwise
+    equal to the old sqrt(WEIGHT) over a 1/sigma^2 column.
+    """
+    from ms_to_r2d2_mat import ms_to_r2d2_mat
+    from scipy.io import loadmat
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        for index, dynamic_range in enumerate((10.0, 1.0e6)):
+            ms = Path(scratch) / f"weights-{index}" / "sim.ms"
+            metadata_path = ms.parent / "simulation.json"
+            # simulate() prints the whole metadata document, which is the
+            # contract its callers rely on and only noise here.
+            with contextlib.redirect_stdout(io.StringIO()):
+                simulate(parse_args([
+                    "--output-ms", str(ms), "--metadata-json", str(metadata_path),
+                    "--observation-minutes", "4.0", "--channel-count", "2",
+                    "--start-frequency-hz", "1.0e9", "--channel-width-hz", "1.0e6",
+                    "--source-flux-jy", "1.0", "--dynamic-range", repr(dynamic_range),
+                    "--seed", "42",
+                ]))
+            with table(str(ms), readonly=True, ack=False) as opened:
+                weight = np.asarray(opened.getcol("WEIGHT"), dtype=np.float64)
+            assert np.array_equal(weight, np.ones_like(weight)), \
+                f"makems no longer leaves WEIGHT at 1.0 (dynamic range {dynamic_range})"
+            sigma = json.loads(metadata_path.read_text())["noise"]["complex_sigma_jy"]
+            mat = ms.parent / "r2d2_data.mat"
+            ms_to_r2d2_mat(ms, mat, noise_sigma_jy=sigma)
+            nW = np.asarray(loadmat(str(mat))["nW"], dtype=np.float64)
+            expected = np.sqrt(1.0 / (sigma * sigma))
+            assert np.allclose(nW, expected, rtol=0.0, atol=0.0), \
+                f"nW is {nW.min()}..{nW.max()}, not the {expected} the WEIGHT column used to carry"
+    print("noise weighting self-check passed")
+
+
 def self_check_meqserver_restart() -> None:
     """A wedged meqserver is replaced once; a second wedge kills the worker.
 
@@ -1110,6 +1149,7 @@ if __name__ == "__main__":
             self_check_skeleton_prebuild()
             self_check_forest_reuse()
             self_check_phase_centre_predict()
+            self_check_noise_weighting()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()
             self_check_wedge_kills_worker()

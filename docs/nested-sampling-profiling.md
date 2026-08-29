@@ -166,6 +166,8 @@ different CPU counts, which it previously was not.
 
 ### `WEIGHT`/`SIGMA` are written with one TaQL `UPDATE`, not `putcol`
 
+> **Superseded.** The `UPDATE` this section arrived at is gone - the pair is no longer written per evaluation at all. See "The two constant columns are gone" in [nested-sampling-throughput.md](nested-sampling-throughput.md). The storage-manager measurements below still stand and are why nothing cheaper was available while the write had to happen.
+
 `putcol` on these two columns was 42ms of the 81ms simulate - more than the
 RIME predict. Both are *variable-shaped* array columns in the `ISMData`
 `IncrementalStMan` group of a makems MS, and python-casacore's `putcol` on
