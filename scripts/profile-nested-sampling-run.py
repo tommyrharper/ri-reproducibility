@@ -134,6 +134,8 @@ def print_report(summary: dict[str, Any]) -> None:
         accounted / evals if evals else None,
     )
     line(breakdown["unaccounted_label"], breakdown["unaccounted_seconds"], breakdown["unaccounted_share"])
+    for row in breakdown["unaccounted_rows"]:
+        line(f"  {row['label']}", row["seconds"], row["share"])
     print()
     # The same arithmetic the HTML report prints under its chart: worker-seconds
     # only reach the run's wall clock once they are spread across the workers.

@@ -1147,6 +1147,10 @@ def render_profiling(summary):
         breakdown["unaccounted_share"],
         emphasis=True,
     )
+    # The remainder broken up the only way the records can support: the
+    # evaluation intervals say when nothing at all was being evaluated.
+    for remainder in breakdown["unaccounted_rows"]:
+        body += row(remainder["label"], remainder["seconds"], remainder["share"], indent=True)
     # The row the whole table exists to land on: divided across the workers, the
     # stages above come to the end-to-end wall clock on the run header.
     wall_seconds = (budget / workers) if budget else 0.0
@@ -2691,6 +2695,22 @@ def _self_check_profiling():
     assert (
         "5.00s accounted + 5.00s unaccounted <strong>= 10.0s end-to-end wall clock</strong>"
     ) in single, single
+    # Records carrying their wall-clock intervals: the remainder is broken up
+    # under itself, still charted as one segment, and the sub-rows add back up
+    # to it. See unaccounted_rows() for the arithmetic behind these numbers.
+    split = render_profiling({"algorithm": "wsclean", "profiling": {
+        "mpi_procs": 3, "total_wall_seconds": 10.0,
+        "stage_totals_seconds": {"simulate": 5.5},
+        "stage_eval_counts": {"simulate_seconds": 2},
+        "accounted_worker_seconds": 5.5,
+        "busy_worker_seconds": 6.0, "busy_wall_seconds": 4.0,
+    }})
+    assert "unaccounted (PolyChord sampling + idle)" not in split, split
+    assert split.count('class="profile-stage-sub"') == 3, split
+    assert "of which: PolyChord (nothing in flight)" in split, split
+    assert '<td class="num">12.0s</td>' in split and '<td class="num">2.00s</td>' in split, split
+    assert '<td class="num">500ms</td>' in split, split
+    assert split.count('class="profile-seg"') == 2 * 2, split  # one stage + remainder, per lane
     # No profiling block: nothing rendered.
     assert render_profiling({}) == ""
     # A profiling block with nothing in it must not divide by zero.
