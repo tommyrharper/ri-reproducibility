@@ -4,7 +4,10 @@ A profile of one evaluation at the concurrency a real search runs at, taken
 apart far enough to say what is left. The short answer: **69% of it is
 WSClean's clean loop, 11% is starting a process, 20% is the path to the first
 inversion, and 6% is everything this repo writes** - so there is nothing left
-in the harness, and the remaining lines are WSClean's or the host's.
+in the harness, and the remaining lines are WSClean's or the host's. Nor is
+there a WSClean flag that recovers any of it:
+[every result-preserving knob has now been measured](#what-the-remaining-wsclean-flags-are-worth)
+and the one with headroom buys it out of the gridder's accuracy.
 
 This is the per-evaluation companion to
 [the throughput doc](nested-sampling-throughput.md) (which is about how the
@@ -158,6 +161,91 @@ a live search, 40 opens gave p50 0.040 ms and max 0.056 ms, none over 5 ms.
   are cached for about a second. That is fine for that doc's purpose (it
   samples during a loaded run, where the value is fresh) but it is not a
   free or an instantaneous read.
+
+## What the remaining WSClean flags are worth
+
+The three timers above say the binary is 38% gridding, 23% degridding and 7%
+deconvolution. This section asks what any *flag* can do about that, and the
+answer is nothing: every result-preserving knob measured either does nothing or
+is already set the right way, and the only one with real headroom buys its
+speed out of the gridder's accuracy, which this parameter space cannot afford.
+
+### The rig
+
+Nineteen concurrent `wsclean` processes in one container, each imaging its own
+copy of a real 4140-visibility Measurement Set on `/dev/shm`, with the argv a
+real evaluation uses. Both arms run **simultaneously** - worker `k` takes arm A
+or B by the parity of `k`, and the assignment is swapped between the two runs
+of a pair - because
+[sequential arms on this host produce 4% false positives](nested-sampling-io-placement.md).
+Each run is 45 s of wall clock and each worker reports how many calls it
+finished; the arm ratio is the mean call count of B over A, and the pair's
+figure is the geometric mean of the two runs. Baseline is ~223 calls per worker
+per 45 s, i.e. **202 ms per call** at this concurrency.
+
+`cat /proc/cpuinfo > /dev/null` runs first in every container, for
+[the reason above](#proccpuinfo-costs-20-ms-to-open-and-the-search-hides-it).
+
+### The results
+
+A null pair - both arms running the identical command - calibrates the floor:
+
+| arm B | swap 0 | swap 1 | geometric mean | against the null |
+|---|---:|---:|---:|---:|
+| *(null: same command as A)* | 0.9895 | 0.9954 | 0.9924 | - |
+| `-parallel-reordering 1` | 0.9976 | 0.9922 | 0.9949 | +0.2% |
+| `-abs-mem 1` | 1.0063 | 0.9897 | 0.9980 | +0.6% |
+| `-reuse-reordered` (pre-seeded) | 1.0474 | 1.0407 | 1.0440 | +5.2% |
+| `-no-reorder` | 0.6389 | 0.6312 | 0.6350 | **-36.0%** |
+| `-wgridder-accuracy 1e-2` | 1.1175 | 1.1406 | 1.1290 | **+13.8%** |
+
+The null is 0.8% off unity in both runs, always favouring A, so **read nothing
+below about 1.5%**. That puts the first two rows at zero.
+
+- **`-parallel-reordering 1`** was the interesting-looking one: `-j 1` sets
+  WSClean's computing threads but reordering has its own default of 4 threads,
+  so 19 concurrent evaluations should have been briefly asking for 76. It is
+  worth nothing, because there is one reorder part and 1404 rows to put in it.
+- **`-abs-mem 1`** tests whether the `Max 933211696 rows fit in memory` line is
+  sizing a buffer off the host's 62 GB. It is not.
+- **`-no-reorder` costs 36%.** Reordering is not overhead here, it is the thing
+  that keeps casacore out of the major-cycle loop: without it the 15 gridding
+  and degridding passes each re-read the MS through casacore instead of a flat
+  137 KB temp file. WSClean's default (reorder whenever `-mgain` implies major
+  cycles) is right and must not be second-guessed on the grounds that the data
+  is small.
+- **`-reuse-reordered` is worth 5.2%**, which is the whole cost of the reorder
+  - one casacore pass over the MS plus the 137 KB of temp files. That is the
+  *upper bound* on making WSClean's input cheaper to read, and it is not
+  collectable: every evaluation images a different Measurement Set, so there is
+  nothing to reuse. The only way to claim it would be for the simulator to
+  write WSClean's private reordered format directly instead of an MS, which is
+  5% for a hard coupling to an upstream temp-file layout. Not worth it.
+
+### The 13.8% that must not be taken
+
+`-wgridder-accuracy` defaults to `1e-4`. Loosening it to `1e-2` is worth
+**+13.8%** - the only flag anywhere in this repo's WSClean work with real
+headroom behind it, and the proof that the ~12.7 ms gridding pass is dominated by ducc0's
+per-pass kernel setup (which scales with the kernel support the accuracy asks
+for) rather than by arithmetic over 4140 visibilities.
+
+It is still the wrong change. `log10_dynamic_range` is a searched parameter
+with a range of 1 to 6, so this search deliberately images skies whose faintest
+structure is 1e-6 of the peak. A gridder allowed 1e-2 - or 1e-3 - of error
+would put its own artefacts orders of magnitude above the signal at the top of
+that range, and a run that found a "failure mode" there would have found the
+gridder setting. Speed bought out of the imaging accuracy is not speed in a
+search whose whole output is where the imaging fails.
+
+### What that leaves
+
+Nothing. Combined with
+[the gridder A/B](nested-sampling-io-placement.md) (the default `wgridder`
+already beats `wstacking` by 13%), the temp-directory and FITS placement
+results in the same doc, and the process-start section above, every WSClean
+flag that could be changed without changing the science has now been measured
+and is either already set or worth zero.
 
 ## What is not measured here
 
