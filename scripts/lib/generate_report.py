@@ -27,6 +27,7 @@ NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
 
 from common import (  # noqa: E402
+    backfill_busy_seconds,
     format_duration,
     format_share,
     profiling_breakdown,
@@ -1096,7 +1097,9 @@ def render_profiling(summary):
     if not profiling:
         return ""
 
-    breakdown = profiling_breakdown(profiling, summary.get("algorithm"))
+    # backfill_busy_seconds first: a run archived before the evaluation epochs
+    # existed still has them, in the mtimes of its own metrics.json files.
+    breakdown = profiling_breakdown(backfill_busy_seconds(summary), summary.get("algorithm"))
     mpi_procs = breakdown["mpi_procs"]
     # Not the rank count: PolyChord's rank 0 administrates and never evaluates a
     # likelihood, so it has no worker-seconds to spend. See worker_procs().
