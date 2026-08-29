@@ -408,7 +408,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/run-health.md` | `./ri health`: every line of the report and what warns |
 | `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
-| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, and what does and does not make it cheaper (asynchronous MPI, `--native` WSClean, the phase-centre predict) |
+| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, why the concurrency wall is the all-core clock rather than memory bandwidth, and what does and does not make an evaluation cheaper (asynchronous MPI, `--native` WSClean, the phase-centre predict) |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 

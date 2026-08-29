@@ -336,7 +336,13 @@ mean of **6.76 major iterations**, each one a full prediction and a full
 inversion. That is the shape of the cost, and it is set by the deconvolution
 settings, not by anything the harness controls.
 
-## The host saturates at ~56 evaluations/s, and it is memory, not scheduling
+## The host saturates at ~56 evaluations/s, and it is not scheduling
+
+> The reading below - that the shortfall is last-level cache and memory
+> bandwidth - was measured again with the clock the workers actually ran at,
+> and it is mostly wrong. See "The wall is the clock, not the memory bus"
+> further down. The throughput numbers here all reproduce; the *cause*
+> attributed to them does not.
 
 Replaying the same 200 evaluations at increasing concurrency, with host CPU
 sampled from `/proc/stat` across each arm:
@@ -376,9 +382,11 @@ Two things fall out of that table:
 
 - **The parts do not add up.** 6 P-cores alone do 39.7 evals/s and 8 E-cores
   alone do 26.8, but the same 14 workers together do 43.3, not 66.5. Nothing
-  is idle and nothing is scheduled badly; they are competing for last-level
-  cache and memory bandwidth. That is the wall, and it is why every CPU-side
-  win below shrinks by roughly two thirds between one worker and twenty.
+  is idle and nothing is scheduled badly. This was read as last-level cache
+  and memory-bandwidth contention; measuring the clock says otherwise - a
+  six-core arm runs its cores near 4.5GHz and a fourteen-core arm near 3.2GHz,
+  which accounts for most of the gap on its own. See "The wall is the clock,
+  not the memory bus".
 - **The E-cores are nearly free of charge and nearly worthless.** Twelve
   workers on the P-core threads do 52.7 evals/s; adding all eight E-cores on
   top gets 54.8. The last eight ranks of a 20-rank run are buying ~4%. For
@@ -610,3 +618,224 @@ in evaluation count under asynchronous mode) and from the straggler tail that
 synchronous MPI used to add. It is a property of the search, not of the
 harness, and there is nothing to fix in it - it is here so a future
 extrapolation accounts for it.
+
+## The wall is the clock, not the memory bus
+
+The "parts do not add up" reading above - 6 P-cores at 39.7 evals/s plus 8
+E-cores at 26.8 giving 43.3 rather than 66.5 - was taken as evidence of a
+memory-bandwidth ceiling. It is not. Sampling `cpu MHz` from `/proc/cpuinfo`
+across a replay arm, alongside the throughput, closes the gap without invoking
+memory at all:
+
+| workers | evals/s | per evaluation | busiest core | Mcycles per evaluation |
+|---:|---:|---:|---:|---:|
+| 1 | 6.87 | 145.6ms | 4714 MHz | 686 |
+| 6 | 38.70 | 155.0ms | 4479 MHz | 694 |
+| 14 | 51.04 | 274.3ms | 3180 MHz | 872 |
+| 19 | 58.96 | 322.3ms | 2958 MHz | 953 |
+
+The last column is the one that matters: multiply the wall time by the clock
+the worker actually ran at and an evaluation costs **the same 690 Mcycles at 6
+concurrent workers as it does alone**. Six `wsclean` processes, each with a
+P-core to itself, contend for nothing measurable - which a memory-bandwidth
+ceiling would not allow. What is left, 872 and 953 Mcycles, arrives only once
+the extra workers are landing on E-cores (lower IPC at any clock) and on
+hyperthread siblings, and both of those are the same core getting less done per
+cycle, not a shared bus running out.
+
+So of the 2.21x an evaluation inflates between 1 and 19 workers, **1.59x is
+the all-core clock** (4714 MHz down to 2958 MHz - stock behaviour for an
+i5-13500, whose single-core turbo is 4.8GHz and whose all-core sustained clock
+is around 3GHz) and 1.39x is core heterogeneity. `cpuinfo_max_freq` puts the
+P-cores at 4.8GHz and the E-cores at 3.5GHz, so a lightly loaded run gets a
+much better core than a full one does, in clock as well as in IPC.
+
+Two things follow for the bigger runs:
+
+- **A CPU-side win is not discounted by a bandwidth ceiling**, so the "shrinks
+  by roughly two thirds" rule above is the wrong model. What a serial
+  measurement over-states is narrower: the win is realised at the all-core
+  clock, on cores of two different qualities, and (for a SIMD win such as the
+  native build) on E-cores with narrower vector units.
+- **A homogeneous machine will scale much better than this one.** The 6-worker
+  point says the work itself parallelises perfectly; the fall-off is this
+  particular CPU's hybrid topology and power budget.
+
+## The first four seconds of any measurement lie by 20%
+
+The all-core clock does not settle instantly. Sampling `/proc/cpuinfo` across
+a 19-worker replay:
+
+```
+loaded t=2s   mean 3851 MHz
+loaded t=4s   mean 3847 MHz
+loaded t=6s   mean 2951 MHz
+loaded t=8s   mean 2962 MHz
+loaded t=10s  mean 2996 MHz
+loaded t=12s  mean 2961 MHz
+```
+
+and the throughput follows it exactly: the first arm of any back-to-back
+replay sweep reports 70-71 evals/s where every later arm reports 58.2-58.8,
+a 20% overstatement that has nothing to do with the arm's contents. A real
+search shows the same thing in its own numbers - the first 5-second bucket of
+a fresh run does 72.8 evals/s against 52-58 for the rest of it.
+
+Two rules come out of it:
+
+- **Discard the first arm of a replay sweep**, or run a throwaway warm-up arm.
+  Every table in this document that was measured after this was found does.
+- **This is not the intra-run drift** in the last section. That one is the
+  sampler contracting onto expensive parameters over minutes; this one is the
+  package clock settling over seconds, and it is done before a search has
+  finished its first hundred evaluations.
+
+## The whole per-evaluation budget, measured
+
+4770 evaluations of a default WSClean search (`--nlive 25 --num-repeats 10`,
+20 ranks = 19 workers), reading each evaluation's `metrics.json` for the stage
+timings and its `wsclean.stdout.log` for `wsclean`'s own accounting:
+
+| | per evaluation | share |
+|---|---:|---:|
+| `wsclean` inversion (~7.5 of them) | 125.2ms | 37% |
+| `wsclean` prediction (~6.5 of them) | 77.4ms | 23% |
+| `wsclean` deconvolution | 19.7ms | 6% |
+| `wsclean` everything else | 67.7ms | 20% |
+| **`wsclean` binary total** | **290.0ms** | **86%** |
+| simulate | 37.6ms | 11% |
+| sidecar `docker exec` round trip | 7.3ms | 2% |
+| metrics (read three FITS, score) | 1.5ms | 0.5% |
+| **worker-seconds per evaluation** | **336.4ms** | |
+
+The major-cycle loop - inversion plus prediction, 60% of the budget - is set
+by `-mgain 0.8` and `-niter 100`, which are the fixed hyperparameters the
+search is defined against (`wsclean_fixed_hyperparameters` in `summary.json`).
+It is not harness overhead and it is not available to optimise.
+
+Everything that *is* overhead comes to about a third: 67.7ms of non-imaging
+`wsclean`, 37.6ms of simulate, 7.3ms of `docker exec`.
+
+### Per major cycle: mostly fixed cost, not gridding
+
+Bucketing the same 4770 evaluations by row count separates the two:
+
+| rows | n | inversion per cycle | prediction per cycle | `wsclean` binary |
+|---:|---:|---:|---:|---:|
+| <500 | 197 | 10.6ms | 7.7ms | 212.8ms |
+| 1000-1500 | 841 | 14.3ms | 10.1ms | 258.1ms |
+| 2000-2500 | 1195 | 17.0ms | 12.2ms | 295.8ms |
+| 3500+ | 591 | 20.4ms | 14.6ms | 339.5ms |
+
+which fits `inversion = 9ms + 3.2ms per 1000 rows` and `prediction = 7ms +
+2.1ms per 1000 rows` at 19 workers. **Roughly half the major-cycle cost is
+fixed per call**, and the image is only 128x128: serially, `-niter 0` (which
+still does the PSF and the dirty inversion) costs 38.4ms at `-size 16` and
+40.6ms at `-size 128` - and 55.5ms at `-size 512` - so the gridding arithmetic
+at this image size is
+effectively free and what is being paid is per-call setup inside `wsclean`.
+There is no flag for it.
+
+### `wsclean` startup is casacore's static initialisers
+
+`wsclean --version` - fork, exec, 73 shared libraries, constructors - is
+13.8ms of the 148.6ms an evaluation's `wsclean` costs serially, i.e. ~9%, and
+about 27ms of the 290ms at 19 workers. `LD_DEBUG=statistics` puts the dynamic
+loader at 2.9M cycles (~0.9ms, 45k relocations), so it is constructor work.
+`LD_PRELOAD`ing one library into `/bin/true` says which:
+
+| | per exec |
+|---|---:|
+| `/bin/true` | 0.6ms |
+| + `libcasa_casa.so.9` | 6.3ms |
+| + `libcasa_ms.so.9` (pulls tables, measures, scimath) | 9.4ms |
+| `wsclean --version` | 13.8ms |
+
+`libmpi`, `libpython3.11` and `libhdf5` - all linked, none used by this
+workload - cost 0.1ms, 0.2ms and 1.7ms respectively, so trimming the link line
+is not the win it looks like. It is casacore's own static initialisation, it
+is upstream, and there is no knob.
+
+## Nine more ways of making the evaluation cheaper that do not work
+
+Measured with the replay harness at 19 concurrent workers, each arm run at
+least twice after a throwaway warm-up arm (see "The first four seconds"),
+repeatable to about 0.5%. Baseline 58.3-58.8 evals/s.
+
+| change | evals/s | verdict |
+|---|---:|---|
+| `OMP_NUM_THREADS=1` in the sidecar | 58.6 | no change |
+| `-padding 1.0` | 58.6 | no change |
+| `-parallel-gridding 1` | 58.4 | no change |
+| `-temp-dir` on `/dev/shm` | 58.2 | marginally worse |
+| `-gridder wstacking` | 56.6 | worse |
+| `-no-small-inversion` | 56.6 | worse |
+| `-gridder tuned-wgridder` | *crashes* | ducc0 `no appropriate kernel found` |
+| `-wgridder-accuracy 1e-3` | 63.1 | +8%, wrong trade (below) |
+
+Notes worth keeping:
+
+- **`wsclean` runs 20 threads under `-j 1`.** They are a pool, they are
+  blocked rather than spinning, and `OMP_NUM_THREADS=1` changes neither the
+  count nor the throughput. It looks alarming at 19 concurrent workers and is
+  not.
+- **`-gridder tuned-wgridder` appears to be 4.8x faster** and is not: it aborts
+  in ducc0's `gridding_kernel.h` before writing anything, and the "throughput"
+  is the rate of failing. Any replay arm that beats the baseline by more than
+  a few percent should have its exit status checked first.
+- **`-wgridder-accuracy 1e-3`** is the same wrong trade as the `1e-2` already
+  rejected above, one order of magnitude in: 1e-3 of a 1 Jy peak is 1mJy of
+  gridding error against an objective (`total_rms_jy`) measured between 0.1mJy
+  and 25mJy.
+
+## The simulate stage: two thirds of what is left is two constant columns
+
+Timing the stage's own phases inside the meqtrees image, serially, against the
+skeleton cache:
+
+| | serial |
+|---|---:|
+| write makems config | 0.4ms |
+| skeleton copy + `SPECTRAL_WINDOW` patch | 2.0ms |
+| fill visibilities | 8.3ms |
+| move out of `/dev/shm` into the evaluation directory | 2.7ms |
+| **total** | **13.4ms** |
+
+and inside "fill visibilities", **4.7ms of the 8.3ms is the TaQL `UPDATE ...
+SET WEIGHT, SIGMA`** that writes two constants to every row. Everything else
+in the stage - opening the MS, reading `DATA` and `UVW`, generating the noise,
+writing `DATA` and `FLAG` - comes to 2.6ms combined.
+
+The comment in `fill_point_source_visibilities()` already records that TaQL is
+the fastest of the obvious options, and re-measuring agrees: `putcol` on the
+pair costs 62.3ms (it is quadratic in rows on an `IncrementalStMan`
+variable-shaped column), a `putcell` row loop 11.1ms, TaQL 4.7ms. Two further
+attempts failed:
+
+- **Writing row 0 only** and letting `IncrementalStMan` propagate it forward.
+  It does not: makems leaves an explicit entry on many rows (the group holds
+  `TIME`, `INTERVAL` and 15 other columns that do change per row), so row 0
+  alone leaves every other row at makems' 1.0.
+- **Collapsing the column first** with one full TaQL update at skeleton-publish
+  time, then writing row 0 per evaluation. Same result - the ISM does not
+  collapse to a single entry.
+
+Dropping the write entirely is not available either: `ms_to_r2d2_mat.py` reads
+`WEIGHT` to build R2D2's `nW = sqrt(1/sigma^2)`, so the column is load-bearing
+for the R2D2 search even though WSClean, weighting naturally with a constant
+weight, is indifferent to its value. Anything that fixes this has to change
+what makems writes, not what the simulator writes afterwards.
+
+## The sampler itself has no slack
+
+Three completed WSClean searches (`--nlive 25 --num-repeats 10`, five sampled
+dimensions) cost **20.9 likelihood evaluations per dead point** (6527/312,
+6830/324, 6350/313). That is `num_repeats` slice-sampling steps at ~2.1
+likelihood calls each, which is about as cheap as PolyChord's slice sampler
+gets - there is no wasted bracket expansion to reclaim.
+
+The consequence for the bigger runs is the plain one: evaluations scale
+linearly in `num_repeats`, and `num_repeats = 10` at 5 dimensions is 2 per
+dimension, well under PolyChord's own `5 x ndims` guidance. A statistically
+respectable `--num-repeats 25` is 2.5x the evaluations at the same `--nlive`,
+and nothing in the harness will absorb that.
