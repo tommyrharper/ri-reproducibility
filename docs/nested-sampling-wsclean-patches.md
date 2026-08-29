@@ -186,3 +186,19 @@ fork server, and the code it builds is this repo's rather than a change to
 WSClean's. It keeps the property that actually protects the archive - it alters
 nothing WSClean computes - and it is deliberately as small as a patch can be,
 so that a `WSCLEAN_GIT_TAG` bump has almost no surface to break against.
+
+## 0003: open the parent Measurement Set once
+
+`OpenMeasurementSet()` in `msproviders/msprovider.cpp` - a mutex, a map from
+path to an open `casacore::MeasurementSet`, and a returned copy of the
+reference-counted handle - replacing the four `casacore::MeasurementSet
+ms(path)` sites a run reaches before its first visibility. That is 21
+`table.dat` opens down to 4, worth -3.7% on the `wsclean` binary in an
+interleaved replay and -4.4%/-6.1% in two simultaneous swapped searches, with
+bit-identical images. The counting method, the per-open costs, the two
+load-bearing details of the cache and the measurements are in
+[the shared-open doc](nested-sampling-shared-ms-open.md).
+
+Upstream-shaped: it changes nothing WSClean computes, and it is the same shape
+as 0001 one level up - cache what does not change for the life of a process
+instead of re-deriving it.

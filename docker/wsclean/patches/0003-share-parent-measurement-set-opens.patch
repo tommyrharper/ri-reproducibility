@@ -1,0 +1,138 @@
+diff --git a/main/wsclean.cpp b/main/wsclean.cpp
+index 5d5ed95..2132018 100644
+--- a/main/wsclean.cpp
++++ b/main/wsclean.cpp
+@@ -32,6 +32,7 @@
+ 
+ #include "../msproviders/contiguousms.h"
+ #include "../msproviders/msdatadescription.h"
++#include "../msproviders/msprovider.h"
+ 
+ #include "progressbar.h"
+ 
+@@ -623,7 +624,7 @@ void WSClean::Predict(const ImagingTable::Group& facet_group) {
+ }
+ 
+ ObservationInfo WSClean::getObservationInfo() const {
+-  casacore::MeasurementSet ms(_settings.filenames[0]);
++  casacore::MeasurementSet ms = OpenMeasurementSet(_settings.filenames[0]);
+   ObservationInfo observationInfo =
+       ReadObservationInfo(ms, _settings.fieldIds[0]);
+   return observationInfo;
+@@ -2004,7 +2005,7 @@ void WSClean::makeImagingTable(size_t outputIntervalIndex) {
+   std::set<aocommon::ChannelInfo> channelSet;
+   _msBands.assign(_settings.filenames.size(), aocommon::MultiBandData());
+   for (size_t i = 0; i != _settings.filenames.size(); ++i) {
+-    casacore::MeasurementSet ms(_settings.filenames[i]);
++    casacore::MeasurementSet ms = OpenMeasurementSet(_settings.filenames[i]);
+     _msBands[i] = aocommon::MultiBandData(ms);
+     std::set<size_t> dataDescIds = _msBands[i].GetUsedDataDescIds(ms);
+     if (dataDescIds.size() != _msBands[i].BandCount()) {
+diff --git a/msproviders/msprovider.cpp b/msproviders/msprovider.cpp
+index 2a7626d..1c6c7ce 100644
+--- a/msproviders/msprovider.cpp
++++ b/msproviders/msprovider.cpp
+@@ -10,6 +10,10 @@
+ 
+ #include "../structures/msselection.h"
+ 
++#include <map>
++#include <mutex>
++#include <string>
++
+ using aocommon::Logger;
+ using schaapcommon::reordering::MSSelection;
+ using schaapcommon::reordering::StorageManagerType;
+@@ -43,6 +47,20 @@ std::vector<aocommon::MultiBandData> MakeSelectedBands(
+   return result;
+ }
+ 
++casacore::MeasurementSet OpenMeasurementSet(const std::string& path) {
++  static std::mutex mutex;
++  // Deliberately never destroyed: casacore's own table cache is a static too,
++  // and if it is torn down first the measurement sets left here close against
++  // freed state and the process dies in its exit handlers, after the images
++  // have already been written.
++  static std::map<std::string, casacore::MeasurementSet>& cache =
++      *new std::map<std::string, casacore::MeasurementSet>();
++  const std::lock_guard<std::mutex> lock(mutex);
++  const auto [iterator, inserted] = cache.try_emplace(path);
++  if (inserted) iterator->second = casacore::MeasurementSet(path);
++  return iterator->second;
++}
++
+ bool HasFrequencyBda(const casacore::MeasurementSet& ms) {
+   // This is a simple test that works in all current use-cases. Formally, we
+   // should check if there are rows with the same BDA_SET_ID to conclude BDA is
+diff --git a/msproviders/msprovider.h b/msproviders/msprovider.h
+index 59ceaa1..55faa1e 100644
+--- a/msproviders/msprovider.h
++++ b/msproviders/msprovider.h
+@@ -37,6 +37,24 @@ std::vector<aocommon::MultiBandData> MakeSelectedBands(
+ 
+ bool HasFrequencyBda(const casacore::MeasurementSet& ms);
+ 
++/**
++ * Open a measurement set, reusing an already-open one for the same path.
++ *
++ * Every construction of a casacore::MeasurementSet re-reads the table header
++ * and re-attaches all of its subtables. A wsclean run does that to its input
++ * set five times over before it reads a single visibility - twice in
++ * WSClean::RunClean(), for the observation info and for the imaging table,
++ * and again on the way into the reordering - which on a small set is
++ * milliseconds of an otherwise short run. A casacore::Table is a
++ * reference-counted handle, so handing out a copy of one that is already open
++ * costs nothing and refers to the same table.
++ *
++ * The cache lives as long as the process. Access is serialised, but the
++ * handles it returns are not thread-safe to use simultaneously - as with any
++ * two casacore::Table copies of the same table.
++ */
++casacore::MeasurementSet OpenMeasurementSet(const std::string& path);
++
+ /**
+  * The abstract MSProvider class is the base class for classes that read and
+  * write the visibilities. Write functionality is directly provided by classes
+diff --git a/msproviders/reorderedmsprovider.cpp b/msproviders/reorderedmsprovider.cpp
+index fdb7d73..d878376 100644
+--- a/msproviders/reorderedmsprovider.cpp
++++ b/msproviders/reorderedmsprovider.cpp
+@@ -1,5 +1,6 @@
+ #include "reorderedmsprovider.h"
+ 
++#include "msprovider.h"
+ #include "operations.h"
+ 
+ #include "msreaders/reorderedmsreader.h"
+@@ -233,8 +234,8 @@ ReorderedHandle ReorderMS(
+   // TODO use VectorMap instead
+   std::map<size_t, size_t> selected_data_desc_ids;
+   bool has_frequency_bda;
+-  {  // close ms asap
+-    casacore::MeasurementSet ms(ms_path);
++  {
++    casacore::MeasurementSet ms = OpenMeasurementSet(ms_path);
+     selected_data_desc_ids = GetSpwMap(aocommon::MultiBandData(ms));
+     has_frequency_bda = wsclean::HasFrequencyBda(ms);
+   }
+diff --git a/msproviders/rowproviders/msrowproviderbase.cpp b/msproviders/rowproviders/msrowproviderbase.cpp
+index 5e17248..ac8bdfb 100644
+--- a/msproviders/rowproviders/msrowproviderbase.cpp
++++ b/msproviders/rowproviders/msrowproviderbase.cpp
+@@ -3,6 +3,7 @@
+ #include "bdamsrowprovider.h"
+ #include "directmsrowprovider.h"
+ 
++#include "../msprovider.h"
+ #include "../operations.h"
+ 
+ #include <aocommon/throwruntimeerror.h>
+@@ -35,7 +36,7 @@ std::unique_ptr<MsRowProviderBase> MakeMsRowProvider(
+                                 " can't be opened for reading.");
+   }
+ 
+-  casacore::MeasurementSet ms(ms_name);
++  casacore::MeasurementSet ms = OpenMeasurementSet(ms_name);
+   if (MsHasBdaData(ms))
+     return std::make_unique<BdaMsRowProvider>(
+         ms, selection, selected_data_description_ids, data_column_name,
