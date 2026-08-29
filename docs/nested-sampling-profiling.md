@@ -52,7 +52,10 @@ summed across every evaluation, plus:
 ## Running the profiler
 
 The instrumentation runs automatically as part of every run - there's no
-separate flag. To read the breakdown of a completed run:
+separate flag. `./ri tui` shows this table for whichever run the cursor is on
+- `enter` opens the run, then `l` loops health, log, profile - and the HTML
+report carries it per run page. To read the breakdown of a completed run from
+the shell:
 
 ```bash
 ./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp>
