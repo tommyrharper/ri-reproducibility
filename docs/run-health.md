@@ -5,8 +5,8 @@ have while one is still going. See [nested-sampling.md](nested-sampling.md) for
 how to start a run, and [robustness.md](robustness.md) for what happens when
 one breaks.
 
-`./ri tui` is this report on a timer next to the run table and a form that
-starts a search - needs Go. `./ri health --monitor` is the lighter version of
+`./ri tui` is this report on a timer next to the run table, the profile of
+whichever run is selected, and a form that starts a search - needs Go. `./ri health --monitor` is the lighter version of
 the same idea: just this report, redrawn in place, no other tool required.
 Everything below is what both of them show.
 
