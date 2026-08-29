@@ -528,6 +528,19 @@ def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
     return model
 
 
+# makems writes the full MSv2 subtable set, and casacore attaches every subtable
+# on every open of the parent table - which WSClean does once per gridding and
+# degridding pass, ~16 times an evaluation, at 3.8ms an open against 2.8ms with
+# these five gone. They are empty (FLAG_CMD, HISTORY) or carry nothing a
+# single-field point-source simulation depends on, so they are dropped once the
+# visibilities are written - not in the cached skeleton, because casacore
+# refuses to open an MS that is missing any of them and the MeqTrees predict
+# needs it opened that way. Worth -13.8% on the wsclean binary and +14.9%
+# evaluations per second end to end, with bit-identical images; see
+# docs/nested-sampling-ms-open.md.
+UNUSED_SUBTABLES = ("FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
+
+
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
@@ -583,6 +596,14 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
         # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
         # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
         # weight of 1.0 images identically to a uniform 1/sigma^2.
+
+        attached = ms.getkeywords()
+        for unused in UNUSED_SUBTABLES:
+            if unused in attached:
+                ms.removekeyword(unused)
+    # After the close, so casacore is never holding a table whose files are gone.
+    for unused in UNUSED_SUBTABLES:
+        shutil.rmtree(output_ms / unused, ignore_errors=True)
 
     # The longest projected baseline in wavelengths, which is what both imagers
     # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
@@ -943,6 +964,40 @@ def self_check_noise_weighting() -> None:
     print("noise weighting self-check passed")
 
 
+def self_check_dropped_subtables() -> None:
+    """UNUSED_SUBTABLES must be gone from a finished MS, on both predict paths.
+
+    The offset case is the one that matters: casacore will not open an MS that
+    is missing a required subtable, so the drop has to happen after the MeqTrees
+    predict rather than in the cached skeleton, and this is the guard on that
+    ordering.
+    """
+    kept = ("ANTENNA", "DATA_DESCRIPTION", "FEED", "FIELD", "OBSERVATION",
+            "POLARIZATION", "SPECTRAL_WINDOW")
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        for index, (l_arcsec, m_arcsec) in enumerate(((0.0, 0.0), (5.0, 3.0))):
+            ms = Path(scratch) / f"subtables-{index}" / "sim.ms"
+            with contextlib.redirect_stdout(io.StringIO()):
+                simulate(parse_args([
+                    "--output-ms", str(ms), "--observation-minutes", "4.0",
+                    "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+                    "--channel-width-hz", "1.0e6", "--source-flux-jy", "1.0",
+                    "--source-l-arcsec", repr(l_arcsec), "--source-m-arcsec", repr(m_arcsec),
+                    "--dynamic-range", "300", "--seed", "42",
+                ]))
+            with table(str(ms), readonly=True, ack=False) as opened:
+                keywords = opened.getkeywords()
+                rows = opened.nrows()
+            assert rows, f"{ms} came out empty"
+            for name in UNUSED_SUBTABLES:
+                assert name not in keywords, f"{name} is still a keyword of {ms}"
+                assert not (ms / name).exists(), f"{name} is still on disk in {ms}"
+            for name in kept:
+                assert name in keywords and (ms / name).is_dir(), f"{name} went missing from {ms}"
+    _FOREST.clear()
+    print("dropped subtable self-check passed")
+
+
 def self_check_meqserver_restart() -> None:
     """A wedged meqserver is replaced once; a second wedge kills the worker.
 
@@ -1197,6 +1252,7 @@ if __name__ == "__main__":
             self_check_forest_reuse()
             self_check_phase_centre_predict()
             self_check_noise_weighting()
+            self_check_dropped_subtables()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()
             self_check_wedge_kills_worker()

@@ -82,6 +82,7 @@ IMAGE_ONLY = {
     "simulate_point_source_ms": (
         "self_check_forest_reuse",
         "self_check_meqserver_restart",
+        "self_check_dropped_subtables",
         "self_check_noise_weighting",
         "self_check_phase_centre_predict",
         "self_check_predict_timeout_recovery",

@@ -99,6 +99,17 @@ So of ~280 ms at this concurrency:
 - **~193 ms (69%) is the clean loop**, which is `-niter 100 -mgain 0.8` and
   therefore the science being searched.
 
+> **Correction, 29 August 2026.** The three-way split above hides where the
+> single largest recoverable item was. Opening the Measurement Set is not a
+> once-per-evaluation cost inside the 20%: WSClean re-opens the *parent* MS
+> once per gridding and degridding pass, 15.7 times an evaluation, so most of
+> it is spread through the 69% attributed to the clean loop. Deleting the five
+> subtables nothing reads was worth +14.9% evaluations per second with
+> bit-identical images - see
+> [the MS-open doc](nested-sampling-ms-open.md). `-log-time` gives that
+> decomposition without a rig; this section's coarser `-niter 0` arm could not
+> have shown it.
+
 ## The 30 ms of process start is casacore's, and it does not come off
 
 It is not the dynamic loader: `LD_DEBUG=statistics wsclean` reports 2.66M

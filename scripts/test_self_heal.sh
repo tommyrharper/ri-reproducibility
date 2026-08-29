@@ -100,10 +100,15 @@ SEARCH_PID=$!
 
 # Killing before the first evaluation would be a different test - that case is
 # the anti-spin guard, and progress-bar.sh's own self-check covers it.
-for _ in $(seq 1 120); do
+# Polled every 0.05s rather than every second: a 3-rank search runs at ~25
+# evaluations a second, so a one-second tick overshot the 8 this wants and
+# landed past PolyChord's first checkpoint at 20 - the drift the assertion
+# below is there to catch. Throughput only goes up, so poll finer than the
+# window is wide.
+for _ in $(seq 1 2400); do
   [ "$(completed_evals "${OUT}")" -ge "${KILL_AFTER_EVALS}" ] && break
   kill -0 "${SEARCH_PID}" 2>/dev/null || fail "search exited before scoring ${KILL_AFTER_EVALS} evaluations; see ${OUT}.log"
-  sleep 1
+  sleep 0.05
 done
 before="$(completed_evals "${OUT}")"
 [ "${before}" -ge "${KILL_AFTER_EVALS}" ] || fail "only ${before} evaluations after 120s; see ${OUT}.log"

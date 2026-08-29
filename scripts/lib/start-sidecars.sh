@@ -63,7 +63,14 @@ _sidecar_remove() {
     docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 &
   fi
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
-    rm -rf "${NS_SCRATCH_DIR}"
+    # A run that restarted after a kill leaves the killed attempt's in-flight
+    # evaluation directories here, and the containers created them as root, so
+    # this removes what it can and leaks the rest
+    # (docs/nested-sampling-io-placement.md has the root-container cleanup).
+    # `|| true` because this is the last command of an EXIT trap: a failed
+    # `rm` became the exit status of a search that had already written its
+    # summary.json, which is what `./ri self-check self-heal` caught.
+    rm -rf "${NS_SCRATCH_DIR}" 2>/dev/null || true
   fi
 }
 
