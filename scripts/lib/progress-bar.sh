@@ -86,18 +86,22 @@ run_with_progress() {
     _ns_add_trap '_ns_pin_teardown' EXIT
     _ns_add_trap '_ns_pin_teardown' INT
     _ns_add_trap '_ns_pin_teardown' TERM
+    local drawn
     while kill -0 "${pid}" 2>/dev/null; do
+      drawn="$(_ns_now_us)"
       _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
-      sleep 1
+      sleep "$(_ns_redraw_interval "${drawn}")"
     done
     _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
     _ns_pin_teardown
   elif [ -t 1 ]; then
     # No usable terminal control (e.g. tput/TERM missing): fall back to a
     # plain redrawn line instead of a pinned one.
+    local drawn
     while kill -0 "${pid}" 2>/dev/null; do
+      drawn="$(_ns_now_us)"
       printf '\r%s' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
-      sleep 1
+      sleep "$(_ns_redraw_interval "${drawn}")"
     done
     printf '\r%s\n' "$(_ns_truncate_pad "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")")"
   fi
@@ -479,10 +483,54 @@ _ns_truncate_pad() {
   printf '%-*.*s' "${width}" "${width}" "${text}"
 }
 
+# Microseconds since the epoch, or nothing at all where the shell cannot say.
+# EPOCHREALTIME is bash 5 and CI runs this file's self-check on macOS, whose
+# /bin/bash is 3.2; the one caller treats "cannot say" as "do not adapt". The
+# separator is matched as a class because it follows the locale.
+_ns_now_us() {
+  local t="${EPOCHREALTIME:-}"
+  printf '%s' "${t/[.,]/}"
+}
+
+# Usage: _ns_redraw_interval <_ns_now_us when this draw started>
+#
+# How long to sleep before the next redraw. Drawing the status line is
+# O(evaluations) - `_ns_count_evals` walks evaluations/ twice - so a fixed
+# one-second cadence gets more expensive the longer the run goes: the two
+# passes measure 0.37s and 0.35s at the 270,000 evaluations an
+# --nlive 500 --num-repeats 25 search reaches on this host, so the bar spent
+# 44% of a core - 2.2% of the machine - counting the run rather than
+# advancing it, and rising.
+#
+# Sleeping nine times the draw's own cost holds the bar to ~12% of one core at
+# any run size. Below ~100,000 evaluations a draw costs under 0.11s and the
+# cadence stays at one second, exactly as it was; at 270,000 the bar updates
+# every ~7s instead, which is still far inside the interval a human watches it
+# over. Capped at 30s so that a pathological draw cannot leave the line looking
+# dead. See docs/nested-sampling-throughput.md.
+_ns_redraw_interval() {
+  local started="$1" now cost
+  now="$(_ns_now_us)"
+  [ -n "${started}" ] && [ -n "${now}" ] || { echo 1; return; }
+  # Clamped in arithmetic rather than with `[ ] &&`, which is an AND-list that
+  # returns non-zero whenever the bound does not bite - and this file is
+  # sourced into a script running under `set -e`.
+  cost=$(((now - started) * 9 / 1000000))
+  cost=$((cost > 30 ? 30 : cost))
+  echo "$((cost < 1 ? 1 : cost))"
+}
+
 # "<evaluations> <of those, landed after `reference` was written>". `find`
 # rather than the glob loop this replaced, which cost 283ms of every
-# one-second redraw on a live 7,200-evaluation run - one find answering both
-# questions costs ~100ms, so the second count is free and the bar got cheaper.
+# one-second redraw on a live 7,200-evaluation run against ~100ms for one
+# find pass here.
+#
+# Two passes, though, not the one the comment here used to claim: POSIX find
+# has no way to mark which entries matched `-newer`, and `-printf '%T@'` -
+# which would answer both questions in one walk - is GNU-only, while CI runs
+# this file's self-check on macOS as well. Both passes are O(evaluations), so
+# what bounds their cost on a long run is `_ns_redraw_interval` above, not
+# this function.
 _ns_count_evals() {
   local dir="$1" reference="${2:-}" total since=0
   total="$(find "${dir}" -maxdepth 1 -name 'eval-*' 2>/dev/null | wc -l | tr -d ' ')"
@@ -784,6 +832,24 @@ self_check() {
   [ "$(_ns_count_evals "${tmp}/evaluations" "${tmp}/chains/absent")" = "4 0" ] || {
     echo "FAIL: missing reference must not split"; exit 1
   }
+
+  # The redraw backs off with the cost of the draw, so the bar cannot grow
+  # into a share of the machine on a long run. A shell that cannot time itself
+  # keeps the one-second cadence.
+  local now_us
+  now_us="$(_ns_now_us)"
+  if [ -n "${now_us}" ]; then
+    [ "$(_ns_redraw_interval "$((now_us - 40000))")" = "1" ] || {
+      echo "FAIL: a 40ms draw must keep the one-second cadence"; exit 1
+    }
+    [ "$(_ns_redraw_interval "$((now_us - 720000))")" = "6" ] || {
+      echo "FAIL: a 720ms draw must back off: $(_ns_redraw_interval "$((now_us - 720000))")"; exit 1
+    }
+    [ "$(_ns_redraw_interval "$((now_us - 60000000))")" = "30" ] || {
+      echo "FAIL: the back-off must be capped"; exit 1
+    }
+  fi
+  [ "$(_ns_redraw_interval "")" = "1" ] || { echo "FAIL: no clock means no back-off"; exit 1; }
 
   # Carrying the frozen dead-point count across the checkpoint interval: 100
   # dead points banked over 900 evaluations is one per nine, so the 100

@@ -974,10 +974,50 @@ two absolute-path prefixes and the same argv repeated on every line. Fixing it
 means changing the on-disk format and every reader of it, which is why it is
 recorded here rather than done.
 
-Measured but not fixed, for the same reason it is small until it is not: the
-live progress bar's `_ns_count_evals()` runs two `find` passes over
-`evaluations/` every second, ~1.35us per entry each. That is 40ms/s at a
-default run's 12k evaluations (invisible) and **0.72s of every second at 270k**,
-or ~3.6% of the machine. The obvious fix - one `find -printf '%T@'` answering
-both counts, which is what the comment above it already claims the code does -
-is GNU-only, and CI runs this file's self-check on macOS as well.
+## The progress bar cost more the longer the run got, and now it does not
+
+The bar `run_with_progress` pins to the terminal redrew once a second, and
+drawing it is O(evaluations): `_ns_count_evals()` walks `evaluations/` twice,
+once for the total and once with `-newer` for the evaluations banked since the
+last checkpoint. On a warm 270,000-entry directory here those two passes
+measure 0.37s and 0.35s (~1.35us per entry each), so the *redraw* took 0.72s
+and the *cycle* took 1.76s: the bar was busy for most of every cycle, for the
+whole of the run, and it got worse the longer the run went on.
+
+The fix is not a cheaper count, it is a slower one. `_ns_redraw_interval()`
+sleeps nine times the draw's own cost instead of a fixed second, so the bar is
+held to roughly a tenth of one core at any run size. Measured against a
+synthetic 270,000-evaluation run directory, 60s per arm, host otherwise idle:
+
+| redraw cadence | draws in 60s | CPU (user+sys) | share of one core |
+|---|---:|---:|---:|
+| fixed `sleep 1` | 34 | 26.6s | 44% |
+| back off to 9x the draw | 9 | 7.0s | 12% |
+
+Each arm was run twice, interleaved, and reproduced to within 0.1s of CPU.
+
+2.2% of this 20-thread machine down to 0.6%, and the important part is the
+second column: the fixed cadence scales with the run (a 1M-evaluation run
+would have had the bar at ~8% of the machine) while the back-off does not.
+Below ~100k evaluations a draw costs under 0.11s, the interval stays at one
+second and nothing changes; at 270k the bar updates every ~7s instead, which
+is well inside the interval a human reads it over. The back-off is capped at
+30s so a pathological draw cannot leave the line looking dead.
+
+Three things worth knowing about this one:
+
+- It only ever cost anything on a TTY. The pinned-bar loop is behind
+  `[ -t 1 ]`, so a search started under `nohup` - which is how a multi-day run
+  should be started - never paid it.
+- The one-pass fix is not available. POSIX `find` has no way to mark which
+  entries matched `-newer`, and `-printf '%T@'` is GNU-only while CI runs this
+  file's self-check on macOS; and it would only have halved a cost that still
+  grows with the run.
+- The timing uses `EPOCHREALTIME`, which is bash 5. On bash 3.2 (macOS)
+  `_ns_now_us` returns nothing and the interval falls back to one second,
+  which is what a run small enough to be started on a laptop wants anyway.
+
+The stall watchdog's `find -maxdepth 2 -name metrics.json` is the same shape
+and was left alone: it measures 1.24s at 270k evaluations, but it runs once
+every `NS_STALL_POLL_SECONDS` (60), so it is 2% of one core and it is the
+thing that turns a hang into a restart.
