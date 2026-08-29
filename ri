@@ -356,7 +356,7 @@ def build_parser():
                         help="keep each evaluation's sim.ms instead of deleting it once "
                              "the evaluation is scored. Off by default: the MS is most of "
                              "a run's ~1.4MB per evaluation and nothing reads it afterwards. "
-                             "What it keeps is missing five subtables the MSv2 specification "
+                             "What it keeps is missing six subtables the MSv2 specification "
                              "calls required, so CASA will not open it "
                              "[NS_KEEP_MEASUREMENT_SETS], see docs/nested-sampling-ms-open.md")
     search.add_argument("--omp-threads", type=int,

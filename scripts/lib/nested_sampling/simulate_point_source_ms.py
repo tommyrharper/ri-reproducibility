@@ -530,15 +530,16 @@ def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
 
 # makems writes the full MSv2 subtable set, and casacore attaches every subtable
 # on every open of the parent table - which WSClean does once per gridding and
-# degridding pass, ~16 times an evaluation, at 3.8ms an open against 2.8ms with
-# these five gone. They are empty (FLAG_CMD, HISTORY) or carry nothing a
-# single-field point-source simulation depends on, so they are dropped once the
+# degridding pass, ~16 times an evaluation, at ~0.21ms a subtable per open.
+# These six are empty (FLAG_CMD, HISTORY) or carry nothing a single-field
+# unpolarised point-source simulation depends on, so they are dropped once the
 # visibilities are written - not in the cached skeleton, because casacore
 # refuses to open an MS that is missing any of them and the MeqTrees predict
 # needs it opened that way. Worth -13.8% on the wsclean binary and +14.9%
-# evaluations per second end to end, with bit-identical images; see
-# docs/nested-sampling-ms-open.md.
-UNUSED_SUBTABLES = ("FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
+# evaluations per second for the first five, and FEED another ~3%, with
+# bit-identical images; see docs/nested-sampling-ms-open.md. The six that
+# stay were each tried and each kills WSClean, so this list is complete.
+UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
 
 
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -972,7 +973,7 @@ def self_check_dropped_subtables() -> None:
     predict rather than in the cached skeleton, and this is the guard on that
     ordering.
     """
-    kept = ("ANTENNA", "DATA_DESCRIPTION", "FEED", "FIELD", "OBSERVATION",
+    kept = ("ANTENNA", "DATA_DESCRIPTION", "FIELD", "OBSERVATION",
             "POLARIZATION", "SPECTRAL_WINDOW")
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         for index, (l_arcsec, m_arcsec) in enumerate(((0.0, 0.0), (5.0, 3.0))):
