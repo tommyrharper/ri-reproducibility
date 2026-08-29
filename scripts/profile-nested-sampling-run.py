@@ -9,9 +9,11 @@ without guessing.
 
 Every share is a fraction of the run's worker-time budget (wall clock x
 workers, which is one less than the rank count - PolyChord's rank 0
-administrates and never evaluates a likelihood), so the top-level stages plus
-the unaccounted remainder add up to 100% of what the whole process spent. The same breakdown - and the same
-numbers - back the Profiling section of the HTML run report.
+administrates and never evaluates a likelihood), so the top-level rows add up
+to 100% of what the whole process spent: the stages of an evaluation, then the
+time no evaluation was running in - PolyChord itself, and workers waiting on
+other workers. The same breakdown - and the same numbers - back the Profiling
+section of the HTML run report.
 
 Usage:
 
@@ -37,7 +39,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_sampling"))
 
 from common import (  # noqa: E402
-    PROFILING_VIEW_NOTE,
     format_duration,
     format_share,
     profiling_breakdown,
@@ -125,24 +126,20 @@ def print_report(summary: dict[str, Any]) -> None:
         line(label, row["seconds"], row["share"], row["per_eval_seconds"], str(row["evals"] or ""))
 
     print(rule)
-    evals = breakdown["evals"]
-    accounted = breakdown["accounted_seconds"]
     line(
-        "accounted (sum of stages above)",
-        accounted,
-        breakdown["accounted_share"],
-        accounted / evals if evals else None,
+        breakdown["subtotal_label"],
+        breakdown["subtotal_seconds"],
+        breakdown["subtotal_share"],
+        breakdown["subtotal_per_eval_seconds"],
     )
-    line(breakdown["unaccounted_label"], breakdown["unaccounted_seconds"], breakdown["unaccounted_share"])
-    for row in breakdown["unaccounted_rows"]:
-        line(f"  {row['label']}", row["seconds"], row["share"])
+    # Below the sum: the time no evaluation was running in, which is the half
+    # of the run the stage rows above can say nothing about.
+    for row in breakdown["remainder_rows"]:
+        line(row["label"], row["seconds"], row["share"])
     print()
     # The same arithmetic the HTML report prints under its chart: worker-seconds
     # only reach the run's wall clock once they are spread across the workers.
-    terms = [
-        f"{format_duration(accounted)} accounted",
-        f"+ {format_duration(breakdown['unaccounted_seconds'])} unaccounted",
-    ]
+    terms = list(breakdown["equation_terms"])
     if mpi_procs != 1:
         terms.append(f"= {format_duration(budget)} of worker-time")
         terms.append(f"/ {workers} workers")
@@ -150,7 +147,7 @@ def print_report(summary: dict[str, Any]) -> None:
     terms.append(f"= {format_duration(wall)} end-to-end wall clock")
     print(" ".join(terms))
     print()
-    print(f"note: {PROFILING_VIEW_NOTE}")
+    print(f"note: {breakdown['note']}")
 
 
 

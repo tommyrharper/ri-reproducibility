@@ -1295,6 +1295,11 @@ def format_duration(seconds: float | None) -> str:
     value = max(0.0, float(seconds))
     if value < 1.0:
         milliseconds = round(value * 1000)
+        # Sub-millisecond figures are real - a per-evaluation harness cost is
+        # hundreds of microseconds - and "0ms" reads as nothing measured
+        # rather than as something small.
+        if milliseconds == 0 and value > 0.0:
+            return f"{value * 1e6:.0f}us"
         # 0.9996s rounds up to 1000ms, which belongs in the seconds branch.
         if milliseconds < 1000:
             return f"{milliseconds}ms"
@@ -1335,60 +1340,29 @@ PROFILING_VIEW_STAGES = (
 UNACCOUNTED_LABEL = "unaccounted (PolyChord sampling + idle)"
 
 
-def unaccounted_rows(
-    unaccounted: float | None,
-    accounted: float,
-    total_wall: float | None,
-    workers: int,
-    busy_worker: float | None,
-    busy_wall: float | None,
-) -> list[dict[str, Any]]:
-    """Split the remainder into PolyChord, idle and harness overhead.
-
-    The remainder is a subtraction, not a measurement - budget minus the timed
-    stages - which is why it used to be printed as one bucket named after
-    everything that could be in it. The evaluation intervals on the records
-    (`started_epoch`/`ended_epoch`) measure two of the three directly:
-
-    - wall clock with *no* evaluation in flight is time no worker could spend
-      imaging, i.e. PolyChord's own sampling and bookkeeping, plus the run's
-      start-up and shutdown. Charged to every worker, because every one of them
-      was blocked on it.
-    - worker-seconds inside an evaluation but outside its timed stages are this
-      harness's own Python around the stages.
-    - what is left is workers waiting while other workers were still
-      evaluating: idle from load imbalance, which more ranks make worse and
-      more evaluations in flight make better.
-
-    Empty for a run written before the epochs were recorded, which leaves the
-    single combined row those runs have always shown.
-    """
-    if not unaccounted or busy_worker is None or busy_wall is None or total_wall is None:
-        return []
-    # Each term is capped by what is left, so rounding or a clock that moved
-    # cannot make the three add up to more than the remainder they divide.
-    sampling = min(unaccounted, max(0.0, total_wall - float(busy_wall)) * workers)
-    harness = min(unaccounted - sampling, max(0.0, float(busy_worker) - accounted))
-    return [
-        {"key": "polychord", "label": "of which: PolyChord (nothing in flight)", "seconds": sampling},
-        {"key": "idle", "label": "of which: idle (other workers busy)",
-         "seconds": max(0.0, unaccounted - sampling - harness)},
-        {"key": "harness", "label": "of which: harness around the stages", "seconds": harness},
-    ]
-
+HARNESS_LABEL = "harness (Python around the stages)"
+POLYCHORD_LABEL = "PolyChord (no evaluation in flight)"
+IDLE_LABEL = "idle (waiting on other workers)"
 
 PROFILING_VIEW_NOTE = (
     "stage totals are summed worker-seconds across every evaluation; shares are "
     "of the run's worker-time budget (wall clock x workers, and rank 0 is the "
     "administrator rather than a worker), so the top-level "
-    "stages plus the unaccounted remainder come to 100%. Dividing a worker-second "
+    "rows come to 100%. Dividing a worker-second "
     "total by the worker count gives what that stage cost in wall clock, since they "
     "spend it side by side, and those wall-clock figures add up to the run's "
-    "end-to-end wall time. The remainder is itself a subtraction, split by the "
-    "wall-clock interval each evaluation ran over: wall clock with no "
-    "evaluation in flight is charged to PolyChord, worker-seconds inside one "
-    "but outside its timed stages to this harness, and what is left is workers "
-    "waiting on other workers."
+    "end-to-end wall time."
+)
+
+# Appended to the note above once the records carry evaluation intervals, and
+# omitted for the runs written before they did, whose one combined row it would
+# be describing a split of that is not on the page.
+PROFILING_SPLIT_NOTE = (
+    " Everything above the sum happened inside a likelihood evaluation; below "
+    "it, PolyChord is wall clock during which no rank was inside one - the "
+    "sampler's own work, plus the run's start-up and shutdown, charged to every "
+    "worker because not one of them could spend it - and idle is what is left, "
+    "workers waiting while other workers were still evaluating."
 )
 
 
@@ -1397,13 +1371,18 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
 
     Shared by the HTML report and scripts/profile-nested-sampling-run.py so the
     two cannot drift apart. Every share is a fraction of the run's total
-    worker-time budget - wall clock x workers - so the top-level stages plus
-    the unaccounted remainder add up to 100% of what the whole process spent.
-    The worker count is `worker_procs(mpi_procs)`, not the rank count - rank 0
-    administrates. That holds for serial and MPI runs alike: at mpi_procs == 1
-    the budget is just the wall clock and the remainder is PolyChord's own
-    sampling, while at mpi_procs > 1 the remainder also absorbs the time
-    workers sat idle.
+    worker-time budget - wall clock x workers - so the top-level rows add up to
+    100% of what the whole process spent. The worker count is
+    `worker_procs(mpi_procs)`, not the rank count - rank 0 administrates.
+
+    The rows are the run in two halves. Above `subtotal_label`: what happened
+    inside a likelihood evaluation, the timed stages plus the harness Python
+    around them. Below it, from `remainder_rows`: PolyChord, measured as the
+    wall clock during which no rank was inside an evaluation, and idle, which
+    is whatever is left after that - workers waiting on other workers. Both
+    come from the `started_epoch`/`ended_epoch` stamped on every record; a run
+    written before those existed cannot be split, and keeps the single
+    "unaccounted (PolyChord sampling + idle)" row it has always shown.
     """
     imager = algorithm or "image"
     mpi_procs = int(profiling.get("mpi_procs") or 1)
@@ -1446,27 +1425,74 @@ def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None)
             "is_sub": is_sub,
         })
 
+    evals = max((row["evals"] for row in rows), default=0)
     unaccounted = None if denominator is None else max(0.0, denominator - accounted)
-    remainder = unaccounted_rows(
-        unaccounted, accounted, total_wall, workers,
-        profiling.get("busy_worker_seconds"), profiling.get("busy_wall_seconds"))
+    busy_worker = profiling.get("busy_worker_seconds")
+    busy_wall = profiling.get("busy_wall_seconds")
+
+    if unaccounted and busy_worker is not None and busy_wall is not None and total_wall is not None:
+        # Worker-seconds inside a likelihood call but outside every timed stage:
+        # this repo's own Python between the subprocess calls. A stage in all
+        # but name, so it joins them above the sum rather than below it.
+        harness = max(0.0, min(float(busy_worker), denominator) - accounted)
+        rows.append({
+            "key": "harness",
+            "label": HARNESS_LABEL,
+            "seconds": harness,
+            "evals": evals,
+            "per_eval_seconds": harness / evals if evals else None,
+            "share": share(harness),
+            "is_sub": False,
+        })
+        evaluating = accounted + harness
+        # Wall clock during which no rank was inside an evaluation, charged to
+        # every worker because not one of them could spend it. Capped by what
+        # is left, so a clock that moved cannot push the rows past 100%.
+        polychord = min(denominator - evaluating,
+                        max(0.0, total_wall - float(busy_wall)) * workers)
+        idle = max(0.0, denominator - evaluating - polychord)
+        remainder = [
+            {"key": "polychord", "label": POLYCHORD_LABEL, "seconds": polychord},
+            {"key": "idle", "label": IDLE_LABEL, "seconds": idle},
+        ]
+        subtotal_label, subtotal = "evaluating (sum of the above)", evaluating
+        note = PROFILING_VIEW_NOTE + PROFILING_SPLIT_NOTE
+        total_label = "end-to-end (evaluating + PolyChord + idle)"
+        terms = [f"{format_duration(evaluating)} evaluating",
+                 f"+ {format_duration(polychord)} PolyChord",
+                 f"+ {format_duration(idle)} idle"]
+    else:
+        # No evaluation intervals on the records - a run written before they
+        # were stamped - so the remainder stays the one bucket named after
+        # everything that could be in it.
+        remainder = [] if unaccounted is None else [
+            {"key": "unaccounted", "label": UNACCOUNTED_LABEL, "seconds": unaccounted}]
+        subtotal_label, subtotal = "accounted (sum of stages above)", accounted
+        note = PROFILING_VIEW_NOTE
+        total_label = "end-to-end (accounted + unaccounted)"
+        terms = [f"{format_duration(accounted)} accounted",
+                 f"+ {format_duration(unaccounted)} unaccounted"]
     for row in remainder:
         row["share"] = share(row["seconds"])
+
     return {
         "imager": imager,
         "mpi_procs": mpi_procs,
         "worker_procs": workers,
-        "evals": max((row["evals"] for row in rows), default=0),
+        "evals": evals,
         "total_wall_seconds": total_wall,
-        "busy_worker_seconds": profiling.get("busy_worker_seconds"),
-        "busy_wall_seconds": profiling.get("busy_wall_seconds"),
+        "busy_worker_seconds": busy_worker,
+        "busy_wall_seconds": busy_wall,
         "worker_seconds_budget": denominator,
         "accounted_seconds": accounted,
-        "accounted_share": share(accounted),
-        "unaccounted_label": "unaccounted" if remainder else UNACCOUNTED_LABEL,
-        "unaccounted_seconds": unaccounted,
-        "unaccounted_share": share(unaccounted),
-        "unaccounted_rows": remainder,
+        "subtotal_label": subtotal_label,
+        "subtotal_seconds": subtotal,
+        "subtotal_share": share(subtotal),
+        "subtotal_per_eval_seconds": subtotal / evals if evals else None,
+        "remainder_rows": remainder,
+        "total_label": total_label,
+        "note": note,
+        "equation_terms": terms,
         "rows": rows,
     }
 
@@ -2925,6 +2951,8 @@ def self_check_profiling() -> None:
 
     assert format_duration(None) == "n/a"
     assert format_duration(0.0) == "0ms"
+    assert format_duration(0.000143) == "143us"
+    assert format_duration(0.0005) == "500us"
     assert format_duration(0.0474) == "47ms"
     assert format_duration(0.9996) == "1.00s"
     assert format_duration(1.4351) == "1.44s"
@@ -2948,9 +2976,9 @@ def self_check_profiling() -> None:
     assert container["seconds"] == 15.0 and container["evals"] == 3
     assert abs(container["per_eval_seconds"] - 5.0) < 1e-9
     assert abs(container["share"] - 0.6) < 1e-9
-    assert abs(serial["unaccounted_seconds"] - 5.5) < 1e-9
+    assert abs(serial["remainder_rows"][0]["seconds"] - 5.5) < 1e-9
     top_level = sum(row["share"] for row in serial["rows"] if not row["is_sub"])
-    assert abs(top_level + serial["unaccounted_share"] - 1.0) < 1e-9
+    assert abs(top_level + serial["remainder_rows"][0]["share"] - 1.0) < 1e-9
 
     # MPI run: the budget is wall clock x *workers*, and 4 ranks are 3 workers
     # plus the administrator - counting rank 0 would invent 5s of idle time
@@ -2959,19 +2987,23 @@ def self_check_profiling() -> None:
     mpi = profiling_breakdown(mpi_profiling, algorithm="r2d2")
     assert mpi["worker_procs"] == 3
     assert mpi["worker_seconds_budget"] == 30.0  # not 40.0: rank 0 is not a worker
-    assert abs(mpi["accounted_share"] - 0.65) < 1e-9
-    assert abs(mpi["unaccounted_seconds"] - 10.5) < 1e-9
+    assert abs(mpi["subtotal_share"] - 0.65) < 1e-9
+    assert abs(mpi["remainder_rows"][0]["seconds"] - 10.5) < 1e-9
     assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
 
     # Accounted time above the nominal budget must not push shares over 100%.
     oversubscribed = profiling_breakdown(summarize_profiling(evaluations, total_wall_seconds=1.0, mpi_procs=2))
     assert oversubscribed["worker_seconds_budget"] == 19.5
-    assert oversubscribed["unaccounted_seconds"] == 0.0
+    assert oversubscribed["remainder_rows"][0]["seconds"] == 0.0
     assert oversubscribed["rows"][0]["label"] == "simulate (MeqTrees)"
 
-    # Records with no epochs on them keep the one combined remainder row.
-    assert serial["unaccounted_rows"] == [] and mpi["unaccounted_rows"] == []
-    assert serial["unaccounted_label"] == UNACCOUNTED_LABEL
+    # Records with no epochs on them keep the one combined remainder row, and
+    # nothing above the sum that a stage did not time.
+    for unsplit in (serial, mpi):
+        assert [row["label"] for row in unsplit["remainder_rows"]] == [UNACCOUNTED_LABEL]
+        assert unsplit["subtotal_label"] == "accounted (sum of stages above)"
+        assert "harness" not in [row["key"] for row in unsplit["rows"]]
+    assert serial["equation_terms"] == ["19.5s accounted", "+ 5.50s unaccounted"]
 
     # Two workers over 10s: one evaluates 1001-1005, the other 1001-1003, and
     # the third rank administrates. So 6s of the 20s budget was spent inside an
@@ -2991,21 +3023,25 @@ def self_check_profiling() -> None:
         timed, total_wall_seconds=10.0, mpi_procs=3, run_started_epoch=1000.0))
     assert split["worker_seconds_budget"] == 20.0
     assert abs(split["busy_worker_seconds"] - 6.0) < 1e-9, split["busy_worker_seconds"]
-    assert abs(split["unaccounted_seconds"] - 14.5) < 1e-9
-    assert split["unaccounted_label"] == "unaccounted"
-    assert [(row["key"], round(row["seconds"], 6)) for row in split["unaccounted_rows"]] == [
-        ("polychord", 12.0), ("idle", 2.0), ("harness", 0.5)], split["unaccounted_rows"]
-    assert abs(sum(row["share"] for row in split["unaccounted_rows"])
-               - split["unaccounted_share"]) < 1e-9
+    # The harness joins the stages above the sum, PolyChord and idle sit below
+    # it, and every top-level row together is the whole budget.
+    assert split["rows"][-1]["key"] == "harness" and split["rows"][-1]["seconds"] == 0.5
+    assert abs(split["subtotal_seconds"] - 6.0) < 1e-9
+    assert [(row["key"], round(row["seconds"], 6)) for row in split["remainder_rows"]] == [
+        ("polychord", 12.0), ("idle", 2.0)], split["remainder_rows"]
+    assert abs(sum(row["share"] for row in split["rows"] if not row["is_sub"])
+               + sum(row["share"] for row in split["remainder_rows"]) - 1.0) < 1e-9
+    assert split["equation_terms"] == ["6.00s evaluating", "+ 12.0s PolyChord", "+ 2.00s idle"]
+    assert split["total_label"] == "end-to-end (evaluating + PolyChord + idle)"
 
     # Without a start epoch from the caller the window is anchored on the last
     # evaluation to finish, which here ends the run - same split, one clock.
     anchored = profiling_breakdown(summarize_profiling(timed[:2], total_wall_seconds=4.0, mpi_procs=3))
     assert abs(anchored["busy_wall_seconds"] - 4.0) < 1e-9, anchored["busy_wall_seconds"]
-    assert anchored["unaccounted_rows"][0]["seconds"] == 0.0
+    assert anchored["remainder_rows"][0]["seconds"] == 0.0
 
     # A run with no timings at all still renders rather than dividing by zero.
     degenerate = profiling_breakdown({"mpi_procs": 1, "total_wall_seconds": 0.0, "stage_totals_seconds": {}})
     assert degenerate["worker_seconds_budget"] is None
-    assert degenerate["unaccounted_seconds"] is None
+    assert degenerate["remainder_rows"] == []
     assert degenerate["rows"] == []
