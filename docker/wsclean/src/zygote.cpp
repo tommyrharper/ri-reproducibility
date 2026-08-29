@@ -28,7 +28,10 @@
 #include <aocommon/checkblas.h>
 #include <aocommon/logger.h>
 
+#include <casacore/ms/MeasurementSets/MeasurementSet.h>
+
 #include <fftw3.h>
+#include <fitsio.h>
 
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -158,6 +161,26 @@ void WarmFftwPlanner() {
   }
 }
 
+// The other two pieces of process-global state a child builds for itself.
+//
+// cfitsio's one-time initialisation is 0.47 ms and needs nothing from the
+// request, so it is paid at start-up. casacore's is ~0.94 ms and needs a real
+// Measurement Set to open - opening a plain casacore::Table warms less than
+// half of it and creating a throwaway one costs 26 ms - so it is paid on the
+// first request, out of the set that request names. Both are ordinary lazy
+// initialisation of shared library state, so a child that inherits it images
+// exactly what it would have imaged. A path that turns out not to be a
+// Measurement Set costs this warm-up and nothing else: the child opens it
+// again and reports the error itself.
+//
+// See docs/nested-sampling-process-warm-up.md.
+void WarmCasacore(const std::string& measurement_set) {
+  try {
+    const casacore::MeasurementSet ms(measurement_set);
+  } catch (const std::exception&) {
+  }
+}
+
 double MonotonicSeconds() {
   timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -170,12 +193,23 @@ int main() {
   check_openblas_multithreading();
   RefuseIfThreaded();
   WarmFftwPlanner();
+  fits_init_cfitsio();
 
+  bool casacore_warmed = false;
   for (std::string line; std::getline(std::cin, line);) {
     const std::vector<std::string> fields = SplitTabs(line);
     if (fields.size() < 4) {
       std::cout << "126\t0\t0" << std::endl;
       continue;
+    }
+    if (!casacore_warmed) {
+      // wsclean's own argument order: the input Measurement Set is last.
+      WarmCasacore(fields.back());
+      // Re-checked rather than assumed, for the same reason it is checked at
+      // start-up: this is the one warm-up that runs library code with a
+      // thread pool in it, and it happens between the check and the fork.
+      RefuseIfThreaded();
+      casacore_warmed = true;
     }
     // Nothing buffered may survive into the child, or it is written twice.
     std::cout.flush();

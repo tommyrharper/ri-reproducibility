@@ -196,6 +196,14 @@ transform-plan building that a warmed parent hands to every child, which is what
 [the FFTW planner doc](nested-sampling-fftw-planner.md) measures. It keeps the
 property above: building an FFT plan runs no WSClean code.
 
+casacore's ~1% has since been taken as well, because a second process-global
+item turned up beside it - cfitsio's one-time initialisation, 0.47 ms - and the
+pair reads straight off the phase table. `WarmCasacore()` opens and closes the
+Measurement Set the *first request* names, which is the only way the parent can
+reach a real set without carrying one; it still runs no WSClean code, and no
+handle or lock file crosses the fork. See
+[the process warm-up doc](nested-sampling-process-warm-up.md).
+
 ## Reproducing it
 
 The start/shutdown split, from a corpus of Measurement Sets kept by

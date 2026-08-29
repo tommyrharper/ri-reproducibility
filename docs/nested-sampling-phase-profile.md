@@ -137,6 +137,16 @@ or ~2 ms at production concurrency: ~1% of an evaluation, and below what the
 rig below resolves. The rest of the 11 ms is per-Measurement-Set work the child
 would pay anyway.
 
+**Taken since, together with cfitsio's initialisation**: on its own this is
+under the resolution of every rig here, but the same 11 ms window turned out to
+hold a second process-global item (`fits_init_cfitsio()`, 0.47 ms serial), and
+the two together are large enough to read straight out of the phase table -
+the banner-to-`=== IMAGING TABLE ===` row falls from 7.15 ms to 4.78 ms an
+evaluation. See [the process warm-up doc](nested-sampling-process-warm-up.md),
+which also splits the window with a throwaway logging patch rather than a probe,
+and finds that the *whole* of `getObservationInfo()` is the first Measurement
+Set open - the measures conversion inside it is 45 us.
+
 Two things make that number small and worth knowing: casacore's *expensive*
 lazy initialisation is the measures tables, and the first
 `MDirection J2000 -> AZEL` conversion in a process costs **34 ms** - but WSClean
