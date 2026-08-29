@@ -4,8 +4,9 @@
 The MS skeleton and VLA.A antenna table come from makems' bundled VLA-A
 example (shipped by the `makems` KERN package). Visibilities are predicted by
 an actual MeqTrees/Meow point-source RIME run (see point_source_forest.py),
-driven non-interactively through meqtree-pipeliner.py; thermal noise is then
-added on top of that clean MeqTrees prediction.
+driven non-interactively through meqtree-pipeliner.py - except for a source at
+the phase centre, whose predict is a constant that phase_centre_visibility()
+writes directly. Thermal noise is then added on top of the clean prediction.
 """
 
 from __future__ import annotations
@@ -489,6 +490,25 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
     return errors
 
 
+def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
+    """What MeqTrees predicts for a Stokes-I point source at the phase centre.
+
+    point_source_forest.py hands Meow the phase-centre Direction itself at zero
+    offset, so no K-Jones is applied and the brightness matrix reaches the sinks
+    unchanged: XX = YY = I on every baseline, timeslot and channel, with the
+    cross-hands zero. Nothing in it depends on the data, which is why a predict
+    costs the same 13ms whether the Measurement Set has 1000 visibilities or
+    28000 - it is the meqserver round trip and the MS open, not the arithmetic.
+    That was ~15% of a run's worker time spent producing this constant, so at
+    the phase centre it is written directly and MeqTrees is only asked for the
+    offset source it is actually needed for. self_check_phase_centre_predict()
+    is the guard that the two agree exactly.
+    """
+    model = np.zeros(n_corr, dtype=np.complex64)
+    model[0] = model[-1] = source_flux_jy
+    return model
+
+
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
@@ -505,7 +525,11 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     # ponytail: this simulator supports one unpolarized point source; full Stokes
     # models and multi-source dynamic-range stress cases are a follow-up ceiling.
     corr_sel, n_corr = determine_corr_selection(output_ms)
-    run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
+    # A source at the phase centre predicts a constant, so the meqserver is
+    # not asked for it - see phase_centre_visibility().
+    model = phase_centre_visibility(args.source_flux_jy, n_corr) if not (l_rad or m_rad) else None
+    if model is None:
+        run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
 
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
@@ -516,6 +540,9 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
             raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
         if data_n_corr != n_corr:
             raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
+        if model is not None:
+            # The predict MeqTrees was not asked for; see phase_centre_visibility().
+            data[:] = model
 
         if noise_sigma_jy:
             per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
@@ -807,6 +834,30 @@ def self_check_forest_reuse() -> None:
     print("forest reuse self-check passed")
 
 
+def self_check_phase_centre_predict() -> None:
+    """The constant phase_centre_visibility() writes must be what MeqTrees predicts."""
+    cases = ((1, 0.3, 5.4e10, 2.0e6, 1.0), (8, 20.0, 5.4e7, 0.1e6, 1.0), (5, 7.3, 1.4e9, 1.1e6, 2.5))
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        for index, (n_chan, minutes, start_hz, width_hz, flux) in enumerate(cases):
+            ms = Path(scratch) / f"phase-centre-{index}" / "sim.ms"
+            built = parse_args([
+                "--output-ms", str(ms), "--observation-minutes", str(minutes),
+                "--channel-count", str(n_chan), "--start-frequency-hz", repr(start_hz),
+                "--channel-width-hz", repr(width_hz), "--dynamic-range", "300",
+                "--source-flux-jy", repr(flux),
+            ])
+            make_ms_skeleton(write_makems_config(built, ms), ms, built)
+            corr_sel, n_corr = determine_corr_selection(ms)
+            run_meqtrees_predict(ms, corr_sel, flux, 0.0, 0.0)
+            with table(str(ms), readonly=True, ack=False) as opened:
+                predicted = np.asarray(opened.getcol("DATA"))
+            expected = np.broadcast_to(phase_centre_visibility(flux, n_corr), predicted.shape)
+            assert np.array_equal(predicted, expected), \
+                f"MeqTrees predicts more than the phase-centre constant at {(n_chan, minutes, start_hz, width_hz, flux)}"
+    _FOREST.clear()
+    print("phase-centre predict self-check passed")
+
+
 def self_check_meqserver_restart() -> None:
     """A wedged meqserver is replaced once; a second wedge kills the worker.
 
@@ -962,10 +1013,14 @@ def self_check_wedge_kills_worker() -> None:
             text=True,
         )
         request = {
+            # Offset, so the request actually reaches the meqserver: a source at
+            # the phase centre never asks it for anything (see
+            # phase_centre_visibility()) and a wedged worker would answer it.
             "argv": [
                 "--output-ms", str(ms), "--observation-minutes", "4.0",
                 "--channel-count", "2", "--start-frequency-hz", "1.0e9",
                 "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+                "--source-l-arcsec", "0.5",
             ],
             "stdout": str(Path(scratch) / "out.log"),
             "stderr": str(Path(scratch) / "err.log"),
@@ -1054,6 +1109,7 @@ if __name__ == "__main__":
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
             self_check_forest_reuse()
+            self_check_phase_centre_predict()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()
             self_check_wedge_kills_worker()

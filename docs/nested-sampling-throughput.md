@@ -483,3 +483,130 @@ their evaluation count by 10%.
 so a plain `./ri search` puts the portable binary back under the tag before it
 runs. It stays opt-in because the binary will die with SIGILL on any other
 CPU, and the tag is shared with every other worktree on the host.
+
+## The other half: the simulate stage spends 13-22ms predicting a constant
+
+`wsclean` is 69-70% of the worker-time budget, and the sections above are all
+about it. The other 28% is the MeqTrees simulate. Replaying a run's recorded
+`simulate` argv the same way - `summary.json` records those too, and the
+meqtrees sidecar answers them over the same per-rank FIFOs a real run uses -
+breaks a serial simulate down as:
+
+| | per evaluation |
+|---|---:|
+| MeqTrees predict | 17.9ms |
+| skeleton copy + `SPECTRAL_WINDOW` patch | 2.3ms |
+| noise fill, `DATA`/`FLAG`/`WEIGHT` writes, baseline maximum | 7.4ms |
+| makems config, correlation probe, moving the MS out of `/dev/shm` | 4.0ms |
+| **simulate, wall** | **31.6ms** |
+
+The predict is over half of it, and it does not scale with the data. Binning
+the same 400 evaluations by the shape they asked for:
+
+| timeslots | fewest channels in the bin | 8 channels |
+|---:|---:|---:|
+| 1 | 13.4ms (3 channels) | 13.8ms |
+| 5 | 16.0ms (1 channel) | 16.4ms |
+| 10 | 21.0ms (2 channels) | 21.8ms |
+
+Eight times the visibilities costs nothing; ten times the timeslots costs 8ms.
+So the predict is ~13ms of fixed meqserver round trip and MS open plus ~0.85ms
+per timeslot of `VisDataMux` tile handling, and approximately none of it is the
+RIME arithmetic.
+
+That would be worth attacking on its own. It is worth more than that, because
+of what the arithmetic actually produces. `point_source_forest.py` hands Meow
+the phase centre `Direction` object itself when the source offset is zero, so
+no K-Jones phase shift is applied and the brightness matrix reaches the sinks
+unchanged. Read the `DATA` column back after a predict and every row, timeslot
+and channel holds the same number:
+
+```
+{'chan': 1, 'mins': 0.3,  'f0': 5.4e10} unique rows: 1 [[1. +0.j 0.+0.j 0.+0.j 1. +0.j]]
+{'chan': 8, 'mins': 20.0, 'f0': 5.4e7 } unique rows: 1 [[1. +0.j 0.+0.j 0.+0.j 1. +0.j]]
+{'chan': 5, 'mins': 7.3,  'f0': 1.4e9 } unique rows: 1 [[2.5+0.j 0.+0.j 0.+0.j 2.5+0.j]]   # 2.5 Jy
+```
+
+`source_offset_fraction` is `enabled = false` in `defaults.toml`, so *every*
+evaluation of a default run pays a meqserver round trip to be told the source
+flux back.
+
+**Fix.** `phase_centre_visibility()` in `simulate_point_source_ms.py` writes
+that constant directly, and MeqTrees is asked only for a source that is
+actually off the phase centre - which is the case the predict exists for, and
+which `--enable-param source_offset_fraction` still runs unchanged.
+`self_check_phase_centre_predict()` (in `./ri self-check simulate`) is the
+guard: it runs the real predict at three shapes and three fluxes and asserts
+the column matches the constant exactly.
+
+Replaying 40 evaluations per worker:
+
+| | before | after | |
+|---|---:|---:|---:|
+| 1 worker | 32.9ms | 13.2ms | **-60%** |
+| 19 workers | 74.0ms | 28.7ms | **-61%** |
+
+That is 45ms off a ~400ms evaluation at the default rank count.
+
+End to end - `./ri search wsclean --nlive 25 --num-repeats 10`, default 20
+ranks, three seeds, the two meqtrees images alternating:
+
+| seed | evals/s before | evals/s after | | simulate | `wsclean` |
+|---:|---:|---:|---:|---:|---:|
+| 4242 | 44.10 | 51.06 | **+15.8%** | 108.7ms -> 39.6ms | +3.2% |
+| 7 | 43.97 | 50.92 | **+15.8%** | 106.2ms -> 38.1ms | +3.8% |
+| 99 | 43.30 | 52.06 | **+20.2%** | 106.1ms -> 38.4ms | +1.7% |
+
+Tighter than any A/B on this page so far - three seeds inside five points of
+each other, against the 10% run-to-run swing everything else here has had to
+fight. The `wsclean` column is the memory wall taking a cut back: freeing 45ms
+of one worker gives the other 18 more bandwidth to compete for, so the imaging
+gets 2-4% slower and the run still comes out 16-20% ahead.
+
+**It does not move the science.** Running the same argv and seed through the
+old image and the new one gives Measurement Sets whose `DATA`, `UVW`,
+`WEIGHT`, `SIGMA` and `FLAG` columns are equal element for element, and
+identical `simulation.json`. Across the three A/B pairs above, 343 evaluations
+landed on a parameter vector both arms happened to visit, and all 343 scored
+bit-identical objectives.
+
+Two things fall out of it beyond the time:
+
+- A default run now does **no predicts at all**, so it cannot hit the MeqTrees
+  deadlock that `docs/robustness.md` documents at roughly one evaluation in
+  2,000-5,000. The watchdogs, the wedge counter and `restart_meqserver_session()`
+  all stay - they are what the offset-source case needs - but the default path
+  no longer reaches them.
+- The `meqserver` per rank is still started and the forest still compiled
+  during container start-up, which is free (it happens while the other two
+  containers, the manifest and mpirun still have to happen) and is what keeps
+  the offset case fast when it is enabled.
+
+## Throughput falls through a run, and it is the sampler doing it
+
+A run's evaluations get steadily more expensive as it goes. Across all 27
+WSClean runs on disk, the last tenth of a run's evaluations cost a **median of
+1.17x** the first tenth (range 1.11-1.34), and not one run bucks it.
+
+It is not thermal throttling, disk fill or a leak. It is what nested sampling
+is for. `channel_count` averages 4.6 in a run's first tenth and 7.4 in its
+last, while `observation_minutes` barely moves (12.5 -> 11.2): the sampler
+contracts onto the corner of the parameter space that maximises
+`total_rms_jy`, that corner has the most channels, and an evaluation's cost is
+roughly linear in its visibility count. A run gets slower because it is
+succeeding.
+
+Two consequences for planning a bigger run:
+
+- **Extrapolating from a short prefix under-predicts.** A run stopped at 10%
+  has not yet reached the expensive region it will spend most of its life in.
+- **The cost of `--nlive` and `--num-repeats` is worse than linear in wall
+  clock**, because both buy more of the *late* evaluations rather than a
+  uniform sample of them. Sizing a run off `evals/s` measured over its first
+  few minutes will be optimistic by 15-30%.
+
+This is separate from the run-to-run swing (two same-seed runs differ by ~10%
+in evaluation count under asynchronous mode) and from the straggler tail that
+synchronous MPI used to add. It is a property of the search, not of the
+harness, and there is nothing to fix in it - it is here so a future
+extrapolation accounts for it.

@@ -38,9 +38,11 @@ duration, channel count, start frequency, channel width - searched by
 PolyChord over the ranges in `docs/nested-sampling.md` ("Parameter
 space"). For one sample:
 
-1. MeqTrees/Cattery simulates a VLA.A Measurement Set of a single 1 Jy
-   point source at phase centre, with complex Gaussian thermal noise
-   setting the dynamic range.
+1. A VLA.A Measurement Set of a single 1 Jy point source is simulated,
+   with complex Gaussian thermal noise setting the dynamic range. An
+   offset source is predicted by MeqTrees/Cattery; one at the phase
+   centre, which is the default, has a constant visibility that is
+   written directly (see `docs/nested-sampling.md`).
 2. WSClean or R2D2-RI reconstructs it.
 3. The reconstruction is scored against the known truth.
 

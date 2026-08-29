@@ -457,7 +457,10 @@ moves the finished directory contents to the real output path in one go. The
 whole MS is ~1MB, so the copy out is ~2ms, and every artifact a run used to
 leave in the evaluation directory (including `makems.log`,
 `meqtree-pipeliner.log` and `point_source_forest.tdlconf`) still lands there -
-verified by `find`-diffing evaluation directories before and after.
+verified by `find`-diffing evaluation directories before and after. The two
+MeqTrees files are absent from an evaluation of a source at the phase centre,
+which no longer runs a predict at all (see
+[nested-sampling-throughput.md](nested-sampling-throughput.md)).
 
 Measured per-simulate cost dropped from 1.12s to 0.55s standalone, and on the
 profiled run from 23.7s to 13.3s of simulate (27.5s to 16.9s total, -38%) with

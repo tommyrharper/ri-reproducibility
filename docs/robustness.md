@@ -70,6 +70,12 @@ evaluations. The worker stays alive, the predict never completes, and no reply
 is written - so this is not a worker that died, and nothing watching for a
 death sees it.
 
+A source at the phase centre no longer runs a predict at all - its visibility
+is a constant that `phase_centre_visibility()` writes directly (see
+[nested-sampling-throughput.md](nested-sampling-throughput.md)) - so a default
+run cannot reach any of this. Everything below still stands, and is what an
+`--enable-param source_offset_fraction` run depends on.
+
 It used to stop the whole run. Timba's `wait=True` means wait *indefinitely*,
 so the rank blocked forever and, because PolyChord keeps every rank in the same
 collective, the other 19 burned a core each behind it.

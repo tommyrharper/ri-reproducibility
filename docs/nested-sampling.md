@@ -25,7 +25,16 @@ positions are not hand-rolled in this repo. Visibilities for that skeleton are
 predicted by an actual MeqTrees/Meow point-source RIME run
 (`scripts/lib/nested_sampling/point_source_forest.py`, driven through
 `meqtree-pipeliner.py`), not a hand-rolled formula; thermal noise is added on
-top of that clean MeqTrees prediction.
+top of that clean prediction.
+
+The exception is a source at the phase centre, where Meow applies no K-Jones
+and the predict is a constant - the source flux on the parallel hands, on
+every baseline, timeslot and channel. That case is written directly instead of
+paying a meqserver round trip for it; see "the simulate stage spends 13-22ms
+predicting a constant" in [nested-sampling-throughput.md](nested-sampling-throughput.md),
+and `./ri self-check simulate` for the check that the two agree exactly. With
+`source_offset_fraction` enabled (it is off by default) MeqTrees does the
+predict as before.
 
 ## Run it
 
