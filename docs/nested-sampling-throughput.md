@@ -1018,6 +1018,174 @@ Three things worth knowing about this one:
   which is what a run small enough to be started on a laptop wants anyway.
 
 The stall watchdog's `find -maxdepth 2 -name metrics.json` is the same shape
-and was left alone: it measures 1.24s at 270k evaluations, but it runs once
-every `NS_STALL_POLL_SECONDS` (60), so it is 2% of one core and it is the
-thing that turns a hang into a restart.
+and was left alone at the time on the strength of a synthetic measurement. It
+is worse than that measurement said and it now shares this back-off - see
+[the stall watchdog](#the-stall-watchdog-was-the-last-poll-that-grew-with-the-run)
+at the end of this page.
+
+## PolyChord itself costs microseconds a call, at every `nlive`
+
+[The one number that matters](#the-one-number-that-matters) asserts that
+PolyChord's own sampling is not a meaningful part of the unaccounted
+remainder. This is the number behind the assertion, and it is worth having
+because the obvious worry about a much larger `--nlive` is that the sampler's
+own bookkeeping - the live-point insertion, the Cholesky, the cluster search -
+grows with the number of live points.
+
+Running `pypolychord` serially against a free likelihood (a 5-dimensional
+Gaussian, ~1us a call) and dividing the whole run's wall clock by its
+likelihood-call count charges the sampler for everything it does per call:
+
+| `nlive` | `num_repeats` | likelihood calls | wall | per call |
+|---:|---:|---:|---:|---:|
+| 25 | 10 | 16,182 | 0.085s | 5.3us |
+| 50 | 10 | 30,381 | 0.211s | 6.9us |
+| 100 | 10 | 59,783 | 0.380s | 6.4us |
+| 200 | 10 | 124,085 | 0.771s | 6.2us |
+| 500 | 10 | 311,289 | 1.713s | 5.5us |
+| 1000 | 10 | 615,496 | 3.387s | 5.5us |
+| 500 | 25 | 776,932 | 2.686s | 3.5us |
+| 1000 | 25 | 1,545,778 | 5.213s | 3.4us |
+
+Against this repo's ~350ms evaluation that is **0.002% of the run**, and it
+does not grow with `nlive`: forty times the live points costs the same per
+call, and `--num-repeats 25` costs *less* per call than 10, because the fixed
+per-iteration work is spread over more slice steps.
+
+So there is no "running PolyChord" half of the wall clock to go after at any
+run size this repo will reach. Whatever is unaccounted is idle, and the next
+section is where the idle goes.
+
+Two notes on reproducing the table: it is preceded by a throwaway
+`run_polychord`, because the first one in a process measures ~22us a call and
+that is import and first-allocation cost; and `max_ndead` is left unset,
+because setting it does not stop a run where it says it will (a run asked to
+stop at 2000 dead points terminated on the evidence criterion at 388).
+
+## A bigger run is a *more* efficient run
+
+Every throughput number above this line was taken on a two-minute `--nlive 25`
+or `--nlive 50` search, and the scaling to the runs this repo actually wants
+was assumed. Measured, on the current working tree, one search per row, same
+seed (4242), `--num-repeats 10 --mpi-procs 20`, one warm-up search discarded
+first for the [burst-clock trap](#the-first-four-seconds-of-any-measurement-lie-by-20):
+
+| `nlive` | dead points | evaluations | evals/dead | wall | evals/s | per evaluation | utilisation |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 25 | 310 | 5,925 | 19.1 | 113s | 52.6 | 339ms | 93.9% |
+| 50 | 527 | 10,757 | 20.4 | 203s | 53.0 | 346ms | 96.4% |
+| 100 | 936 | 18,844 | 20.1 | 353s | 53.4 | 347ms | 97.6% |
+| 200 | 1,728 | 34,682 | 20.1 | 649s | 53.5 | 352ms | 98.3% |
+
+**Utilisation rises monotonically with the run and throughput holds** - which
+it should not do, because the evaluation itself gets 4% more expensive over
+this range (the sampler contracting onto the high-`channel_count` corner, as
+in [Throughput falls through a run](#throughput-falls-through-a-run-and-it-is-the-sampler-doing-it)).
+The two cancel.
+
+Turning the utilisation column back into wall clock says why. The
+non-evaluation wall time of each run is `(1 - utilisation) x wall`:
+
+| `nlive` | evaluations | non-evaluation wall |
+|---:|---:|---:|
+| 25 | 5,925 | 6.9s |
+| 50 | 10,757 | 7.3s |
+| 100 | 18,844 | 8.5s |
+| 200 | 34,682 | 11.0s |
+
+That is a **fixed ~6s per run plus ~0.14ms per evaluation**, not a rate. The
+constant is startup - MPI init, `warm()`, and the ramp while the first
+`nlive` prior points are drawn - and it is the whole of the 6% that an
+`--nlive 25` search appears to lose. The per-evaluation term is 2.7ms of
+worker time against a 352ms evaluation, i.e. **0.8%**, which is the MPI
+hand-off of a point to a worker and its answer back, and is where utilisation
+asymptotes: ~99%.
+
+The practical consequences:
+
+- **The idle time this document opened on is gone at the sizes this project is
+  aiming at.** It was 35-45% before asynchronous MPI, 6% at `--nlive 25`
+  today, and 1.7% at `--nlive 200`. Do not spend any more effort on it.
+- **Do not size a big run from a small one's `evals/s`,** and do not read a
+  small run's utilisation as a defect. A two-minute search is paying a 6s
+  startup over its whole length.
+- **Dead points are sub-linear in `nlive`.** The `ndead/nlive` ratio falls
+  12.4 -> 10.5 -> 9.4 -> 8.6 across the table, so a big run is cheaper than a
+  linear extrapolation from `--nlive 25` predicts, not dearer.
+
+Which makes the target run concretely affordable. At `--nlive 500` the ratio
+extrapolates to ~7.8, so ~3,900 dead points; `--num-repeats 25` is 2.5x the
+20.1 evaluations per dead point, so ~50; that is **~196,000 evaluations**, or
+about **65-90 minutes** at 50-53 evals/s and **~78GB** at the 0.40MB an
+evaluation directory now costs. Both fit this host. The earlier estimate on
+this page of 270,000 evaluations and 390GB predates the sub-linear `ndead`
+measurement and the [`sim.ms` pruning](#the-disk-footprint-is-what-caps-a-big-run-not-the-clock).
+
+### The harness does not decay as the evaluations pile up
+
+The same `--nlive 200` run, split into twelve equal wall-clock buckets, with
+utilisation computed per bucket from the evaluations that landed in it:
+
+| bucket | evals/s | per evaluation | utilisation | mean `channel_count` |
+|---:|---:|---:|---:|---:|
+| 1 | 58.6 | 321ms | 0.989 | 4.36 |
+| 2 | 55.2 | 341ms | 0.991 | 4.67 |
+| 4 | 55.6 | 339ms | 0.991 | 5.36 |
+| 6 | 54.4 | 346ms | 0.991 | 5.98 |
+| 8 | 50.7 | 372ms | 0.992 | 6.45 |
+| 10 | 52.0 | 362ms | 0.991 | 7.08 |
+| 12 | 45.9 | 377ms | 0.911 | 7.35 |
+
+**Utilisation is flat at 0.99 for eleven twelfths of the run** while
+throughput falls 11%, so the fall is entirely the evaluation getting dearer
+(321ms -> 377ms, a 1.18x first-to-last-decile drift that matches the 1.17x
+median already recorded here) as `channel_count` climbs 4.36 -> 7.35. Nothing
+in the harness gets slower as `evaluations/` fills: the flat-directory cost
+was checked directly too, and creating an evaluation directory with ten files
+in it costs 0.094ms whether the parent holds 0 entries or 280,000.
+
+The last bucket is the run ending - the final chains finishing while the other
+workers have nothing left to start - and it is a fixed cost, not a rate, in
+the same way the startup is.
+
+## The stall watchdog was the last poll that grew with the run
+
+The [progress bar section](#the-progress-bar-cost-more-the-longer-the-run-got-and-now-it-does-not)
+above ends by saying the stall watchdog's `find -maxdepth 2 -name metrics.json`
+is the same shape and was left alone at "1.24s at 270k evaluations, 2% of one
+core". Measured properly on a real run rather than a synthetic tree, it is
+worse than that, because it walks every evaluation *directory* rather than
+just `evaluations/`:
+
+| scan | at 34,682 evaluations | per evaluation |
+|---|---:|---:|
+| `find -maxdepth 1 -name 'eval-*'` (the bar) | 0.05s | 1.4us |
+| `find -maxdepth 2 -name metrics.json` (the watchdog) | 0.28s | 8.1us |
+
+and 2.4x that on a loaded host, which is the only kind a watchdog runs on
+(0.20s at 10,284 evaluations while the search was live). At the 270,000
+evaluations of a `--nlive 500 --num-repeats 25` search that is of order 5s of
+every 60s poll, and it keeps rising: a million-evaluation run would spend a
+third of a core on it.
+
+`_ns_redraw_interval` is now `_ns_backoff_interval <started> [floor] [cap]` and
+the watchdog uses it too, with the caller's `NS_STALL_POLL_SECONDS` as the
+floor and a 600s cap. Same rule as the bar - sleep nine times the poll's own
+measured cost - so the loop is bounded at ~10% of one core at any run size.
+
+Two honest caveats:
+
+- **At today's target run size this changes nothing.** Nine times a 5s scan is
+  45s, under the 60s floor, so the cadence only moves above ~450,000
+  evaluations. What the change buys is the bound, not a saving today.
+- **The signal is unchanged.** Counting `metrics.json` rather than `eval-*`
+  directories is deliberate - a directory without a record is an evaluation
+  that was in flight when the run died - and cheaper stall signals were
+  rejected for that reason. `evaluations/` mtime does not move when a record is
+  written, and `run.log` growing does not mean an evaluation landed, so a rank
+  retrying forever without dying - the exact failure this watchdog is the
+  backstop for - would look alive to both.
+
+The 600s cap is what keeps the message it prints honest: `quiet` accumulates in
+whole polls, so a poll longer than a tenth of `NS_STALL_TIMEOUT` would start
+reporting a stall length noticeably past the timeout it fired on.

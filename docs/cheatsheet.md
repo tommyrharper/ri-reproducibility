@@ -408,7 +408,7 @@ Everything above needs no Docker. `./ri self-check` is the half that does.
 | `docs/run-health.md` | `./ri health`: every line of the report and what warns |
 | `docs/robustness.md` | Failure handling, self-healing restarts, `./ri resume` |
 | `docs/nested-sampling-profiling.md` | Profiling fields, measured optimisations |
-| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, why the concurrency wall is the all-core clock rather than memory bandwidth, and what does and does not make an evaluation cheaper (asynchronous MPI, `--native` WSClean, the phase-centre predict); and why a run's disk footprint, its rank memory and its own progress bar, not its clock, are what cap a big one |
+| `docs/nested-sampling-throughput.md` | Throughput: why the ranks idled, why rank 0 is not one, where an evaluation's time goes, why the concurrency wall is the all-core clock rather than memory bandwidth, and what does and does not make an evaluation cheaper (asynchronous MPI, `--native` WSClean, the phase-centre predict); and why a run's disk footprint, its rank memory and its own polling loops, not its clock, are what cap a big one; and the `nlive` scan showing utilisation *rises* with run size (93.9% at `--nlive 25`, 98.3% at `--nlive 200`) because the unaccounted time is a ~6s per-run constant |
 | `docs/parameter-space-proposal.md` | What to add to the searched space next, ranked |
 | `r2d2-paper/`, `claims/`, `latex/` | Reference material: the R2D2 paper, published claims, our own write-up |
 
