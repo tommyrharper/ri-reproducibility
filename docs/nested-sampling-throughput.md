@@ -910,3 +910,74 @@ directory on `/dev/shm` moved replay throughput by under 1%).
 
 So this is not a speed change and is not offered as one. It is the change that
 lets a run long enough to need the speed actually reach its end.
+
+## The next wall after disk: a resume of a big run wanted 62GB of RAM
+
+With `sim.ms` pruned, `--nlive 500 --num-repeats 25` fits on the disk (~270k
+evaluations x 0.43MB = ~116GB against 202GB free). The next thing it hits is
+memory, and it hits it on a path nobody profiles because it runs for ten
+seconds at startup: `adopt_completed_evaluations()`.
+
+A run that long *will* be resumed - `run_with_retries` restarts the job after a
+worker dies, the stall watchdog restarts it after a hang, and `./ri resume`
+picks it up after a reboot. Every restart re-reads every `metrics.json` written
+so far, and **every rank does it**, because the cache and the eval-id counter it
+rebuilds are per-rank state. Measured against a synthetic `evaluations/`
+directory of 120,000 real records:
+
+| adopted evaluations | wall | peak RSS, *per rank* |
+|---|---:|---:|
+| 120,000, keeping the records | 5.6s | 1371MB |
+| 120,000, keeping only the objective | 4.5s | 119MB |
+| 270,000 (extrapolated), keeping the records | 12.6s | 3084MB |
+| 270,000 (extrapolated), keeping only the objective | 10.2s | 268MB |
+
+At 20 ranks that is **62GB on a 62GB host** against 5.4GB - a guaranteed OOM
+kill at the target run size, and already 27GB (uncomfortable next to the
+workers) at half of it.
+
+Nothing ever read the records back. The likelihood does
+`return float(cache[key]["objective"])`, and rank 0's `summary.json` re-reads
+every record from disk with `load_evaluations_from_dir()` at the end of the run.
+The list the records were appended to was used for exactly one thing:
+`len(evaluations) + 1`, the next eval id. So the cache is now `dict[str, float]`
+and the list is an `int`, in both `polychord_wsclean.py` and
+`polychord_r2d2.py`. Behaviour is unchanged - same ids, same cache hits, same
+scores - and `./ri self-check self-heal`, which kills and resumes five real
+searches, covers it.
+
+### And the other end of the same run: `json.dumps` was the peak
+
+`write_json_atomic()` built the whole document as a string before writing it.
+For `metrics.json` that is 4KB and irrelevant; for a 270k-evaluation
+`summary.json` it is a **1.3GB string held alongside the 3.1GB of records it
+was built from**. Streaming it with `json.dump(payload, handle)` instead
+produces a byte-identical file and keeps the rename-into-place atomicity:
+
+| 270k-evaluation summary.json | wall | peak RSS above the records |
+|---|---:|---:|
+| `dumps()` to a string, then write | 5.9s | 2633MB |
+| `json.dump()` streamed to the file | 13.2s | 0MB |
+
+7 seconds more, once, at the end of a multi-hour run, for 2.6GB of headroom on
+the rank that is already holding the most. On a 4KB `metrics.json` the streamed
+form costs 22us against a 336ms evaluation - 0.007%, and it is written once per
+evaluation, so it does not reach the throughput either.
+
+### What is still ahead on this path
+
+`summary.json` itself. At 270k evaluations it is a **1.3GB single JSON
+document** that every reader (`./ri profile`, `./ri report`, `merge`) loads
+whole - ~3.1GB of Python objects to answer a question about one field. The
+record is 3.9KB and 3.0KB of that is `paths` and `commands`, which are the same
+two absolute-path prefixes and the same argv repeated on every line. Fixing it
+means changing the on-disk format and every reader of it, which is why it is
+recorded here rather than done.
+
+Measured but not fixed, for the same reason it is small until it is not: the
+live progress bar's `_ns_count_evals()` runs two `find` passes over
+`evaluations/` every second, ~1.35us per entry each. That is 40ms/s at a
+default run's 12k evaluations (invisible) and **0.72s of every second at 270k**,
+or ~3.6% of the machine. The obvious fix - one `find -printf '%T@'` answering
+both counts, which is what the comment above it already claims the code does -
+is GNU-only, and CI runs this file's self-check on macOS as well.

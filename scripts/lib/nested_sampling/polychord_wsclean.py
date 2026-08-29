@@ -333,14 +333,19 @@ def main() -> None:
     evaluations_dir.mkdir(exist_ok=True)
     (output_dir / "parameter-space.json").write_text(json.dumps(load_parameter_space(), indent=2) + "\n")
 
-    cache: dict[str, dict[str, Any]] = {}
-    evaluations: list[dict[str, Any]] = []
+    # key -> objective, not key -> record: nothing reads the record back (the
+    # summary re-reads them all from disk below) and holding them is what made
+    # a resume of a big run cost gigabytes on every rank. `scored` is the eval
+    # id counter the list length used to supply.
+    cache: dict[str, float] = {}
+    scored = 0
 
     def prior(cube: np.ndarray) -> np.ndarray:
         params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
+        nonlocal scored
         # ponytail: theta values are rounded back to the documented parameter
         # space here; a later science run should keep integer/discrete handling
         # in one sampler-aware transform instead of this bridge.
@@ -349,7 +354,8 @@ def main() -> None:
         params["noise_seed"] = stable_seed(args.seed, key)
         key = params_key(params)
         if key not in cache:
-            eval_id = len(evaluations) + 1
+            scored += 1
+            eval_id = scored
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
             try:
                 record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
@@ -365,10 +371,9 @@ def main() -> None:
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
                 abort_run(traceback.format_exc())
-            cache[key] = record
-            evaluations.append(record)
+            cache[key] = float(record["objective"])
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
-        return float(cache[key]["objective"]), []
+        return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
     settings.base_dir = str(output_dir / "chains")
@@ -408,7 +413,7 @@ def main() -> None:
     # checkpoint, so the stream no longer lines up with the points on disk and
     # the cache answers none of the stretch being redone - which is what
     # `./ri health`'s `at risk` line puts a number on.
-    done = adopt_completed_evaluations(evaluations_dir, evaluations, cache)
+    done = scored = adopt_completed_evaluations(evaluations_dir, cache)
     if done:
         where = (f"resuming from {resume_path}" if settings.read_resume
                  else "no checkpoint to resume from, re-sampling from the cache")

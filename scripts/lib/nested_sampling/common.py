@@ -1420,8 +1420,7 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
 
 def adopt_completed_evaluations(
     evaluations_dir: Path,
-    evaluations: list[dict[str, Any]],
-    cache: dict[str, dict[str, Any]],
+    cache: dict[str, float],
 ) -> int:
     """Take an interrupted run's finished evaluations into this run's state.
 
@@ -1430,6 +1429,15 @@ def adopt_completed_evaluations(
     repeated point. With it the ids carry on and a point evaluated before is
     served from the cache instead of being paid for twice - which is the whole
     reason to resume rather than start again.
+
+    Only the objective is kept, not the record it came from, because only the
+    objective is ever read back: the likelihood returns `cache[key]`, and the
+    summary re-reads every record from disk at the end of the run. Keeping the
+    records made a resume scale into the host's memory instead of its disk -
+    120,000 adopted evaluations cost 1.37GB of resident memory here, and *every
+    rank* runs this, so a 20-rank resume of the nlive-500 run this repo is
+    aiming at wanted 62GB for the caches alone on a 62GB host. Objectives cost
+    ~50MB at that size. See docs/nested-sampling-throughput.md.
 
     The evaluations that were still in flight when the run stopped are thrown
     away. An evaluation directory with no readable metrics.json holds nothing
@@ -1442,6 +1450,7 @@ def adopt_completed_evaluations(
     """
     import shutil
 
+    adopted = 0
     for eval_dir in sorted(evaluations_dir.glob("eval-*")):
         if not eval_dir.is_dir():
             continue
@@ -1451,9 +1460,9 @@ def adopt_completed_evaluations(
             # removing the same directories at the same moment.
             shutil.rmtree(eval_dir, ignore_errors=True)
             continue
-        evaluations.append(record)
-        cache[params_key(record["params"])] = record
-    return len(evaluations)
+        cache[params_key(record["params"])] = float(record["objective"])
+        adopted += 1
+    return adopted
 
 
 def self_check_resume_adoption() -> None:
@@ -1466,15 +1475,17 @@ def self_check_resume_adoption() -> None:
         eval_dir.mkdir()
         write_evaluation_record(eval_dir, {"eval_id": 1, "params": params, "objective": 0.5})
 
-        evaluations: list[dict[str, Any]] = []
-        cache: dict[str, dict[str, Any]] = {}
-        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        cache: dict[str, float] = {}
+        adopted = adopt_completed_evaluations(evaluations_dir, cache)
+        assert adopted == 1
         # Keyed the way the likelihood keys it, or the resumed run would
         # recompute the point and collide with its own directory.
         assert params_key(params) in cache
-        assert cache[params_key(params)]["objective"] == 0.5
+        # The objective alone, not the record: the likelihood returns this
+        # value directly and nothing else reads an adopted evaluation.
+        assert cache[params_key(params)] == 0.5
         # The next eval id continues rather than restarting at 1.
-        assert len(evaluations) + 1 == 2
+        assert adopted + 1 == 2
 
     with tempfile.TemporaryDirectory() as tmp:
         # An evaluation that was in flight when the run stopped has a
@@ -1490,9 +1501,8 @@ def self_check_resume_adoption() -> None:
         in_flight.mkdir()
         (in_flight / "sim.ms").write_text("half a measurement set")
 
-        evaluations = []
         cache = {}
-        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert adopt_completed_evaluations(evaluations_dir, cache) == 1
         assert finished.exists()
         assert not in_flight.exists()
 
@@ -1512,12 +1522,11 @@ def self_check_resume_adoption() -> None:
         half.mkdir()
         (half / "metrics.json").write_text('{\n  "eval_id": 3,\n  "para')
 
-        evaluations = []
         cache = {}
         assert load_evaluations_from_dir(evaluations_dir) == [
             {"eval_id": 1, "params": {"a": 1}, "objective": 0.5}
         ]
-        assert adopt_completed_evaluations(evaluations_dir, evaluations, cache) == 1
+        assert adopt_completed_evaluations(evaluations_dir, cache) == 1
         assert good.exists()
         # Removed, not merely skipped: simulate_measurement_set() creates the
         # directory with exist_ok=False, so a kept one crashes the run this is
@@ -1539,9 +1548,8 @@ def self_check_resume_adoption() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
-        evaluations = []
         cache = {}
-        assert adopt_completed_evaluations(Path(tmp), evaluations, cache) == 0
+        assert adopt_completed_evaluations(Path(tmp), cache) == 0
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
@@ -1559,9 +1567,18 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     summary.json finished - unrepairable. summary.json is the bigger window by
     far: it carries every evaluation of the run, so an R2D2 search spends
     seconds inside this call, not microseconds.
+
+    Streamed into the file rather than serialised to a string first, because
+    the string is the peak: a 270,000-evaluation summary.json is 1.3GB, and
+    json.dumps() holds all of it alongside the records it was built from
+    (2.6GB of peak RSS measured against 0 for the streaming form). It costs
+    ~7s more on a summary that size and ~22us on a metrics.json, both of which
+    are free next to a 336ms evaluation.
     """
     partial = path.with_name(path.name + ".partial")
-    partial.write_text(json.dumps(payload, indent=2) + "\n")
+    with partial.open("w") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
     partial.replace(path)
 
 
