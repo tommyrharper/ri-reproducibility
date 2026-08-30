@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred eighty profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred eighty-one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async control reached **116.2 evaluations/second at 20
 workers** (111.2, 116.2, and 116.3), with **141.5 ms/evaluation** by median and
 **125.9 ms/evaluation** of image-binary time, plus **34.5 MB** peak worker
@@ -139,6 +139,10 @@ The newest three-repeat asynchronous control measured **116.2 evaluations/second
 **34.5 MB** peak memory. Image binary remained dominant at **125.9
 ms/evaluation**; this is a control refresh after the profiler correction, not a
 claimed speedup.
+The latest three-repeat asynchronous control measured **109.9 evaluations/second**
+(102.9, 109.9, and 110.4), with **144.9 ms/evaluation** and **34.4 MB** peak
+memory. Image binary remained dominant at **129.2 ms/evaluation**; this is a
+control refresh, not a claimed speedup.
 The new rank-scaling probe measured **101.2 +/- 1.5 evaluations/second** at 15
 workers, with 34.5 MB peak memory; 20 workers remains faster on this host.
 The fresh three-repeat 10-worker probe measured **81.1 +/- 0.8 evaluations/second**
@@ -479,4 +483,3 @@ Chronological; each page starts where the last stopped.
 | [process warm-up](nested-sampling-process-warm-up.md) | The 5 ms before the first visibility - and the unsigned-arithmetic bug that makes WSClean fit its restoring beam on a quarter of the box it means to use. A real failure mode, not result-preserving to fix. |
 | [disk footprint](nested-sampling-disk-footprint.md) | Bytes rather than clock. A run is `~17 x nlive x num_repeats` evaluations, and `evaluations/` needs no sharding. |
 | [evaluation floor](nested-sampling-evaluation-floor.md) | The current budget, `--mgain` as a flag, and the last six avenues closed. |
-eval/s** for three threads and **0.7730 eval/s** for four threads (3.47 GB

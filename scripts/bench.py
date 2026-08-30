@@ -621,4 +621,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # `./ri bench | head` is normal report consumption, not a failure.
+        sys.stdout = open(os.devnull, "w")
