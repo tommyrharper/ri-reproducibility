@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Seventy-one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Seventy-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.9 +/- 2.8
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -134,6 +134,14 @@ unchanged 3.47 GB peak memory. Seven threads is rejected as well.
 An explicit eight-thread probe measured **0.7493 +/- 0.011 evaluations/second**
 (three runs) versus the matched four-thread median **0.8127**, a 7.8% regression,
 with unchanged 3.47 GB peak memory. Eight threads is rejected too.
+
+A fresh controlled preset probe repeated the comparison on the current commit:
+the automatic three-thread setting measured **0.7251 eval/s** median across
+three runs, while explicit four threads measured **0.7738 eval/s** median
+(+6.7%), with both at **3.47 GB** peak worker memory. Four threads remains a
+useful explicit setting for this 8-rank, 20-CPU host, but is not made automatic:
+the best thread count depends on the rank count and available CPUs, and forcing
+four threads would oversubscribe smaller-rank or larger-host configurations.
 
 ## What is priced but deliberately not taken
 
