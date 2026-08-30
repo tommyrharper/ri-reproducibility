@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Ninety-nine profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **105.7 +/- 3.0
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -88,6 +88,10 @@ The latest default synchronous baseline measures 71.6 evaluations/second
 imaging remains 132.8 +/- 0.4 ms/evaluation. The prior baseline measured 71.1
  +/- 0.85 evaluations/second at 150.9 +/- 0.011 ms/evaluation over three
 repeats; imaging remained 133.3 +/- 0.15 ms/evaluation.
+The current three-repeat synchronous refresh measured 71.8, 70.6, and 68.1
+evaluations/second, for a median of **70.6 +/- 0.82 evaluations/second** and
+150.5 +/- 0.39 ms/evaluation. Its 134.0 +/- 0.96 ms image-binary stage is
+consistent with the existing baseline; no optimization claim is made.
 The first three-repeat R2D2 benchmark with the checkpoint cache enabled measures
 **0.438 +/- 0.002 evaluations/second**, 11.8 +/- 0.03 seconds/evaluation, and
 3.47 GB peak worker memory at 8 ranks (`nlive=8`, `max_ndead=12`). The older
