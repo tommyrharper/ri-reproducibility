@@ -162,7 +162,8 @@ def do_serve(args):
 def do_profile(args):
     return {}, [uv("scripts/profile-nested-sampling-run.py", args.run,
                    *(["--json"] if args.json else []),
-                   *(["--phases"] if args.phases else []),
+                  *(["--phases"] if args.phases else []),
+                   *(["--r2d2-phases"] if args.r2d2_phases else []),
                    *(["--over-time"] if args.over_time else []),
                    *(["--top", str(args.top)] if args.top else []),
                    *(["--buckets", str(args.buckets)] if args.buckets else []))]
@@ -580,6 +581,8 @@ def build_parser():
     profile.add_argument("--over-time", action="store_true",
                          help="evaluations/second against wall clock, beside the visibility count "
                               "that sets it, see docs/nested-sampling-cost-model.md")
+    profile.add_argument("--r2d2-phases", action="store_true",
+                         help="break R2D2 imaging down by model update and residual timings")
     profile.add_argument("--top", type=int, help="with --phases: phases to print, largest first")
     profile.add_argument("--buckets", type=int, help="with --over-time: wall-clock buckets to print")
 

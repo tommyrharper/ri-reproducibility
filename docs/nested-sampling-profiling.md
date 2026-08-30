@@ -47,6 +47,7 @@ report carries it per run page. Read a completed run from the shell:
 ```bash
 ./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp>
 ./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp> --json
+./ri profile results/nested-sampling/r2d2-vlaa-<UTC timestamp> --r2d2-phases
 ```
 
 The profiler only reads `summary.json`; older runs without a `profiling` block
@@ -113,6 +114,12 @@ Worker-seconds exceed page wall time by `mpi_procs`. Dividing stage totals by
 and `evaluating + PolyChord + idle = worker-time / workers = wall clock`.
 `render_profiling()` in `scripts/lib/generate_report.py` charts these proportions
 as one average-worker lane per rank; imaging is coloured, other rows grey.
+
+R2D2's aggregate image stage can be split with `--r2d2-phases`. It reads the
+worker's model-update and residual timings, reporting median milliseconds per
+evaluation and call counts. The latest 41-evaluation run measured 7219.7
+ms/evaluation for model updates (25 calls) versus 80.1 ms/evaluation for
+residuals, making model inference the next optimization target.
 
 ### What the two halves show
 

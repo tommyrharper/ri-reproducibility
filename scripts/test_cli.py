@@ -289,6 +289,12 @@ check(
 )
 
 check(
+    "profile --r2d2-phases reaches the profiler",
+    [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--r2d2-phases"]],
+    plan("profile", "results/x", "--r2d2-phases")[1],
+)
+
+check(
     "bench with no subcommand prints the table",
     ({}, [["uv", "run", "scripts/bench.py"]]),
     plan("bench"),

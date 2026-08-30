@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Fifty-six profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Fifty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -87,6 +87,9 @@ The cross-evaluation FINUFFT cache reuses plan allocations while calling
 9.5x). A checkpoint-backed three-repeat run now measures **0.4372 +/- 0.004
 evaluations/second** versus 0.4381 +/- 0.002 before plan reuse, with unchanged
 3.47 GB peak memory; the real end-to-end result is statistically unchanged.
+R2D2 phase profiling on the same 41-evaluation run attributes **7219.7
+ms/evaluation** to 25 model updates and **80.1 ms/evaluation** to residual
+computations; model inference is therefore the next measured target.
 
 ## What is priced but deliberately not taken
 

@@ -180,6 +180,42 @@ def print_phases(run_dir: Path, top: int) -> None:
               f"{typical:8.3f}  {before[:52]} -> {after[:40]}")
 
 
+_R2D2_PHASE = re.compile(r"Time for (model update|residual computation): ([0-9.]+) sec")
+
+
+def r2d2_phase_totals(log_paths: Any) -> tuple[int, dict[str, list[float]], dict[str, int]]:
+    totals: dict[str, list[float]] = collections.defaultdict(list)
+    counts: dict[str, int] = collections.defaultdict(int)
+    for path in log_paths:
+        per_eval: dict[str, float] = collections.defaultdict(float)
+        per_count: dict[str, int] = collections.defaultdict(int)
+        for line in path.read_text(errors="replace").splitlines():
+            match = _R2D2_PHASE.search(line)
+            if match:
+                phase, seconds = match.groups()
+                per_eval[phase] += float(seconds)
+                per_count[phase] += 1
+        for phase, seconds in per_eval.items():
+            totals[phase].append(seconds * 1000.0)
+            counts[phase] += per_count[phase]
+    return len({path for path in log_paths if path.is_file()}), totals, counts
+
+
+def print_r2d2_phases(run_dir: Path) -> None:
+    logs = sorted(run_dir.glob("evaluations/*/r2d2.stdout.log"))
+    count, totals, calls = r2d2_phase_totals(logs)
+    if not logs or not totals:
+        raise SystemExit(f"no R2D2 phase timings under {run_dir}")
+    print(f"{count} R2D2 logs")
+    print()
+    print(f"{'phase':<28}{'ms/eval':>10}{'calls/eval':>12}{'ms/call':>10}")
+    print("-" * 60)
+    for phase in sorted(totals, key=lambda name: -statistics.median(totals[name])):
+        per_eval = statistics.median(totals[phase])
+        per_call = calls[phase] / count
+        print(f"{phase:<28}{per_eval:10.2f}{per_call:12.2f}{per_eval / per_call:10.2f}")
+
+
 _VIS_COUNT = re.compile(r"^Gridded visibility count: (\d+)")
 
 
@@ -258,6 +294,17 @@ def self_check() -> None:
     assert statistics.median([1.0, 1.0, 100.0]) == 1.0
 
     with tempfile.TemporaryDirectory() as raw:
+        log = Path(raw) / "r2d2.stdout.log"
+        log.write_text(
+            "Time for model update: 0.20 sec\n"
+            "Time for residual computation: 0.01 sec\n"
+            "Time for model update: 0.30 sec\n"
+        )
+        count, totals, calls = r2d2_phase_totals([log])
+    assert count == 1 and totals["model update"] == [500.0], (count, totals)
+    assert calls["model update"] == 2 and totals["residual computation"] == [10.0]
+
+    with tempfile.TemporaryDirectory() as raw:
         log = Path(raw) / "wsclean.stdout.log"
         log.write_text(
             "2026-Aug-29 10:19:02.100000 Gridding 1404 rows...\n"
@@ -287,6 +334,7 @@ def main() -> None:
     parser.add_argument("run", nargs="?", help="Run directory, run name, or summary.json path")
     parser.add_argument("--json", action="store_true", help="Print the raw profiling dict as JSON instead of a table")
     parser.add_argument("--phases", action="store_true", help="Break down WSClean phases from -log-time")
+    parser.add_argument("--r2d2-phases", action="store_true", help="Break down R2D2 model and residual timings")
     parser.add_argument("--over-time", action="store_true", help="Evaluations/second and visibility count over time")
     parser.add_argument("--top", type=int, default=25, help="Phases to print, largest first")
     parser.add_argument("--buckets", type=int, default=20, help="Buckets for --over-time")
@@ -298,11 +346,13 @@ def main() -> None:
         return
     if not args.run:
         parser.error("the following arguments are required: run")
-    if args.phases or args.over_time:
+    if args.phases or args.r2d2_phases or args.over_time:
         run_dir = resolve_run(args.run)
         run_dir = run_dir.parent if run_dir.is_file() else run_dir
         if args.phases:
             print_phases(run_dir, args.top)
+        if args.r2d2_phases:
+            print_r2d2_phases(run_dir)
         if args.over_time:
             print_over_time(run_dir, args.buckets)
         return
