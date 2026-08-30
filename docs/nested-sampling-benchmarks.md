@@ -45,7 +45,7 @@ One JSON object per line in `benchmarks.jsonl`, appended by
 self-healed run is skipped: its wall clock covers one segment and its
 evaluation count covers all of them, so the throughput it implies is fiction).
 
-A row carries evaluations/second, the per-evaluation cost of each stage the
+A row carries evaluations/second, peak worker memory, and the per-evaluation cost of each stage the
 profiler measures - the same numbers `./ri profile` prints, so
 [the profiling reference](nested-sampling-profiling.md) is what each stage
 means - the commit, the machine, and the settings the run used.
@@ -109,6 +109,10 @@ Each cell is a median over repeats in that column, `±` an IQR-based robust
 standard-error estimate. This prevents one long-tail timing from dominating
 the result while the error estimate narrows as repeats accumulate. A single
 row shows no error bar.
+
+`peak memory MB` is the largest recorded imaging-worker peak in the run. It is
+reported alongside speed because R2D2's per-rank memory budget limits useful
+parallelism; older rows without this field simply leave the cell blank.
 
 `Δ evals/s` is the change against the column to its right. It is starred when
 the two medians are more than two combined robust standard errors apart. One repeat

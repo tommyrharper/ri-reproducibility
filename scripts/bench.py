@@ -169,6 +169,14 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     run_env = read_run_env(run_dir)
     settings = {key: value for key, value in run_env.items() if key in WORKLOAD_KEYS}
     per_eval = breakdown["subtotal_per_eval_seconds"]
+    peak_memory = max(
+        (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
+         or float(record.get("peak_memory_bytes", 0.0))
+         for record in summary.get("evaluations", [])
+         if (record.get("metrics") or {}).get("peak_memory_bytes")
+         or record.get("peak_memory_bytes")),
+        default=0.0,
+    )
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -185,6 +193,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "wall_s": round(wall, 3),
         "evals_per_s": round(evals / wall, 4),
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
+        "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -377,6 +386,7 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                             series(by_commit[old], ("evals_per_s",)))
                        for new, old in zip(labels, labels[1:])])
     row_for_path("ms/eval", ("ms_per_eval",))
+    row_for_path("peak memory MB", ("peak_memory_mb",))
     stages: list[str] = []
     for row in rows:
         stages += [key for key in row.get("stages_ms", {}) if key not in stages]
@@ -485,6 +495,7 @@ def self_check() -> None:
                 "machine": "1234abcd", "host": "h", "imager": "wsclean",
                 "preset": "default", "run": "r", "evals": 100, "wall_s": 1.0,
                 "evals_per_s": 100.0, "ms_per_eval": 140.0,
+                "peak_memory_mb": 256.0,
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
             }) + "\nnot json\n")
             rows = load_rows()
