@@ -587,7 +587,7 @@ def build_parser():
             "cost behind it, one column per commit, newest first.\n"
             "\n"
             "Rows are grouped by machine, imager and settings, and each cell is a\n"
-            "mean with the standard error of its repeats - so it narrows as\n"
+            "median with robust standard error of its repeats - so it narrows as\n"
             "repeats at one commit accumulate, and a change is only starred once\n"
             "it is bigger than the noise it has to beat.\n"
             "\n"

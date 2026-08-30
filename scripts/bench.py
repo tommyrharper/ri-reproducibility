@@ -292,8 +292,8 @@ def number(value: float, digits: int = 4) -> str:
 def cell(values: list[float]) -> str:
     if not values:
         return ""
-    mean, error = stat(values)
-    return number(mean) if error is None else f"{number(mean)} ±{number(error, 2)}"
+    median, error = stat(values)
+    return number(median) if error is None else f"{number(median)} ±{number(error, 2)}"
 
 
 def delta(new: list[float], old: list[float]) -> str:
