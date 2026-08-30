@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Fifty-five profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Fifty-six profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -37,7 +37,7 @@ rates are historical and roughly half the current rate.
 | R2D2 `.mat` conversion avoids broadcast temporaries | `ms_to_r2d2_mat.py` | 1.13 to 1.09 ms for 1404 visibilities (10 warm calls, container microbenchmark) |
 | R2D2 `.mat` conversion flattens weights directly | `ms_to_r2d2_mat.py` | 1.802 to 1.657 us per weight expansion (100k calls, container microbenchmark; 8.0%) |
 | R2D2 checkpoints loaded once and shared by forked workers | `r2d2_serve.py` | Production `optimiser.R2D2` alias now hits the cache (self-check); removes repeated 25-checkpoint loads per evaluation; first real benchmark is 0.438 +/- 0.002 eval/s at 3.47 GB peak worker memory |
-| R2D2 FINUFFT plans reused across sequential evaluations | `r2d2_serve.py` | Synthetic 128x128 plan setup: 0.86 ms fresh versus 0.091 ms retargeted (9.5x); output-preserving self-check passed, end-to-end A/B pending |
+| R2D2 FINUFFT plans reused across sequential evaluations | `r2d2_serve.py` | Synthetic 128x128 plan setup: 0.86 ms fresh versus 0.091 ms retargeted (9.5x); real R2D2 benchmark shows no measurable end-to-end gain |
 
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
@@ -84,7 +84,9 @@ a regression and does not improve the memory budget.
 The cross-evaluation FINUFFT cache reuses plan allocations while calling
 `setpts` for each new trajectory; a synthetic 128x128 measurement measured
 0.86 ms for fresh construction versus 0.091 ms for retargeting (8 samples,
-9.5x). Full R2D2 throughput A/B remains pending a checkpoint-backed run.
+9.5x). A checkpoint-backed three-repeat run now measures **0.4372 +/- 0.004
+evaluations/second** versus 0.4381 +/- 0.002 before plan reuse, with unchanged
+3.47 GB peak memory; the real end-to-end result is statistically unchanged.
 
 ## What is priced but deliberately not taken
 
