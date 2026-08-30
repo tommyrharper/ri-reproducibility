@@ -476,6 +476,8 @@ def main() -> int:
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
+    if getattr(args, "handler", None) is do_run and args.repeat < 1:
+        parser.error("--repeat must be at least 1")
 
     if args.self_check:
         self_check()
