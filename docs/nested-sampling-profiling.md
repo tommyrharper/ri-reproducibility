@@ -1029,10 +1029,11 @@ That 0.56s still carries each rank's ~1.5s first request; steady state is ~0.3s.
 
 The oversubscription cliff is sharp, and it is about the product not the
 per-rank count. Sweeping `R2D2_OMP_THREADS` at 8 ranks on this 20-CPU host:
-1 thread 7.7s, 2 threads (the `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
-threads 24.2s - 32 threads over 20 cores is already most of the way back to the
-old behaviour. The default divides the host among the ranks, which is the right
-shape; do not raise it above it. The 1-thread column of that sweep is
+1 thread 7.7s, 2 threads (the old `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
+threads 24.2s. A later three-repeat search measurement found 3 threads at
+7.43s/evaluation versus 8.12s at 2 threads, so automatic allocation now rounds
+the per-rank CPU share up. Four threads still oversubscribes this host. The
+1-thread column of that sweep is
 misleading, though - most of what it was measuring was OpenMP spin-waiting, not
 the thread count; see "The imaging workers' OpenMP threads sleep between
 requests" below.

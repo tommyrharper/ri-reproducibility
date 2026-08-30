@@ -175,7 +175,7 @@ OpenMP/BLAS thread env vars (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
 `R2D2_OMP_THREADS`. The previous image default of
 `OMP_NUM_THREADS=4` capped finufft/OpenMP work when the Docker VM exposed more
 CPUs than four. To avoid CPU oversubscription, the script defaults
-`R2D2_OMP_THREADS` to `host CPUs / NS_MPI_PROCS` (minimum `1`) when not set
+`R2D2_OMP_THREADS` to the rounded-up per-rank CPU share (minimum `1`) when not set
 explicitly, so each rank's imaging worker gets a fair share of the host's cores
 instead of all of them. Set `R2D2_OMP_THREADS` explicitly to override this
 per-rank default. The same count is written into every per-evaluation
@@ -212,7 +212,7 @@ pinned run directory.
 | Flag | Variable | Meaning | Default |
 |---|---|---|---|
 | `--mpi-procs` | `NS_MPI_PROCS` | PolyChord rank count (`mpirun -np`); `1` is serial | `min(NS_NLIVE, host CPUs)`, host CPUs from `nproc` (`sysctl -n hw.ncpu` on macOS, which has no `nproc`), then clamped to what free memory holds - see "Rank count is the memory budget" |
-| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | `host CPUs / NS_MPI_PROCS`, min 1, from the rank count before the memory clamp |
+| `--omp-threads` | `R2D2_OMP_THREADS` | Per-rank R2D2 OpenMP/BLAS/torch threads | rounded-up `host CPUs / NS_MPI_PROCS`, min 1, from the rank count before the memory clamp |
 | `--output-dir` | `OUTPUT_DIR` | Run directory; must be inside the repository, and not one a job is still in | `results/nested-sampling/<algo>-vlaa-<UTC>` |
 
 ### Rank count is the memory budget
