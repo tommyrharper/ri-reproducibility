@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Fifty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Fifty-nine profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -38,6 +38,7 @@ rates are historical and roughly half the current rate.
 | R2D2 `.mat` conversion flattens weights directly | `ms_to_r2d2_mat.py` | 1.802 to 1.657 us per weight expansion (100k calls, container microbenchmark; 8.0%) |
 | R2D2 checkpoints loaded once and shared by forked workers | `r2d2_serve.py` | Production `optimiser.R2D2` alias now hits the cache (self-check); removes repeated 25-checkpoint loads per evaluation; first real benchmark is 0.438 +/- 0.002 eval/s at 3.47 GB peak worker memory |
 | R2D2 FINUFFT plans reused across sequential evaluations | `r2d2_serve.py` | Synthetic 128x128 plan setup: 0.86 ms fresh versus 0.091 ms retargeted (9.5x); real R2D2 benchmark shows no measurable end-to-end gain |
+| R2D2 model-load garbage collection removed | `docker/r2d2/patches/skip-model-load-gc.patch` | 25 checkpoint swaps: 1.05 s to 0.235 s; R2D2 throughput 0.4372 to 0.5622 eval/s in three-repeat-scale runs, with unchanged 3.47 GB peak memory |
 
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
@@ -90,6 +91,13 @@ evaluations/second** versus 0.4381 +/- 0.002 before plan reuse, with unchanged
 R2D2 phase profiling on the same 41-evaluation run attributes **7219.7
 ms/evaluation** to 25 model updates and **80.1 ms/evaluation** to residual
 computations; model inference is therefore the next measured target.
+Removing two full garbage collections from each model-update loop reduced the
+checkpoint-swap microbenchmark from 1.05 s to 0.235 s over 25 swaps. Three
+controlled default R2D2 runs then measured **0.5622 +/- 0.0025
+evaluations/second**, versus **0.4372 +/- 0.004** before the change, with
+unchanged 3.47 GB peak memory. The benchmark runs used the same 41-evaluation
+smoke workload, so this is a warm production-path speed result, not a
+production-scale 150-live-point claim.
 
 ## What is priced but deliberately not taken
 

@@ -1,0 +1,24 @@
+diff --git a/src/utils/util_model.py b/src/utils/util_model.py
+index 0000000..0000000 100644
+--- a/src/utils/util_model.py
++++ b/src/utils/util_model.py
+@@ -1,7 +1,6 @@
+ from model.network.unet_model import UnetModel
+ from model.network.unetWDSR_model import UnetModel as UnetWDSRModel
+ 
+ import torch
+ import glob
+-import gc
+ import os
+@@ -43,5 +43,4 @@ def load_state_dict_from_state_dict(net, state_dict):
+     state_dict = {'.'.join(f.split('.')[1:]): state_dict[f] for f in state_dict}
+     net.load_state_dict(state_dict)
+     del state_dict
+-    gc.collect()
+     return net
+@@ -50,5 +50,4 @@ def load_net(net, cur_iter, layers, dnn_dict):
+             net[i].load_state_dict(net_tmp)
+             del net_tmp
+         del state_dict
+-    gc.collect()
+     return net
