@@ -327,7 +327,7 @@ def serve_pool(fifo_dir: str) -> None:
         os._exit(status)
     while children:
         pid, _status = os.wait()
-        base = children.pop(pid, None)
+        base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
         # them a rank whose worker died would write into a pipe nobody reads
         # and then wait forever for a reply. Closing here gives it the same
