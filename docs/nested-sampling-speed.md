@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Ninety-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Ninety-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **105.7 +/- 3.0
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -44,6 +44,12 @@ rates are historical and roughly half the current rate.
 | R2D2 checkpoint weights assigned by reference | `docker/r2d2/patches/assign-checkpoint-weights.patch` | R2D2 throughput 0.5622 to 0.5948 eval/s in three controlled runs (5.8%), with unchanged 3.47 GB peak memory |
 | R2D2 checkpoint key normalization cached | `r2d2_serve.py` | 4.36 to 0.01 us per repeated 24-key lookup in a microbenchmark; three fresh end-to-end runs measured 0.7205, 0.7768, and 0.7350 eval/s, so no isolated throughput gain is claimed |
 | R2D2 auto thread count rounds up per-rank CPU share | `run-nested-sampling-r2d2.sh` | 0.6198 to 0.7249 eval/s at 8 ranks (16.9%), with unchanged 3.47 GB peak memory |
+
+The R2D2 CPU backend probe closed two inference alternatives: disabling
+MKLDNN was 1.853 s versus 1.363 s for a warmed 512x512 U-Net forward at three
+Torch threads, while TorchScript tracing was 1.313 s versus 1.324 s eager.
+The latter is below the observed run variance and also emits shape-dependent
+trace warnings, so the eager MKLDNN path remains the portable default.
 
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):

@@ -1951,3 +1951,14 @@ Sidecars use `--network none`, saving ~0.2s per container with identical
 results. `docker/meqtrees/Dockerfile` also replaces Timba's 10s shutdown sleep
 with 0.1s polling while preserving its ~200s SIGKILL ceiling; MS outputs stay
 identical.
+
+### R2D2 inference backend alternatives are closed
+
+The warmed 512x512 U-Net at three Torch threads measures 1.363 s with the
+runtime's default MKLDNN backend and 1.853 s with MKLDNN disabled. The backend
+is therefore doing real work and must stay enabled. TorchScript tracing the
+same `.eval()` model measures 1.313 s versus 1.324 s eager, with identical
+output in this fixed-shape probe, but emits warnings because U-Net padding
+branches are shape-dependent. The sub-percent difference is below the
+end-to-end evidence threshold and does not justify adding a traced model path;
+the existing eager model also supports any image shape without a second path.
