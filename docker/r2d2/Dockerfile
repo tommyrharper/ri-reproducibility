@@ -48,8 +48,9 @@ WORKDIR /opt/r2d2/R2D2-RI
 
 COPY docker/r2d2/patches/remove-final-residual.patch /tmp/remove-final-residual.patch
 COPY docker/r2d2/patches/skip-model-load-gc.patch /tmp/skip-model-load-gc.patch
-RUN git apply /tmp/remove-final-residual.patch /tmp/skip-model-load-gc.patch \
-    && rm /tmp/remove-final-residual.patch /tmp/skip-model-load-gc.patch
+COPY docker/r2d2/patches/assign-checkpoint-weights.patch /tmp/assign-checkpoint-weights.patch
+RUN git apply /tmp/remove-final-residual.patch /tmp/skip-model-load-gc.patch /tmp/assign-checkpoint-weights.patch \
+    && rm /tmp/remove-final-residual.patch /tmp/skip-model-load-gc.patch /tmp/assign-checkpoint-weights.patch
 
 RUN python3 -m venv /opt/venv
 ENV PATH=/opt/venv/bin:${PATH}

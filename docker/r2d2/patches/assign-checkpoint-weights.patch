@@ -1,0 +1,18 @@
+diff --git a/src/utils/util_model.py b/src/utils/util_model.py
+--- a/src/utils/util_model.py
++++ b/src/utils/util_model.py
+@@ -38,5 +38,5 @@ def load_state_dict_from_state_dict(net, state_dict):
+ def load_state_dict_from_state_dict(net, state_dict):
+     state_dict = {'.'.join(f.split('.')[1:]): state_dict[f] for f in state_dict}
+-    net.load_state_dict(state_dict)
++    net.load_state_dict(state_dict, assign=True)
+     del state_dict
+     return net
+@@ -53,6 +53,6 @@ def load_net(net, cur_iter, layers, dnn_dict):
+         for i in range(layers):
+             net_tmp = {f.split(f'unet{i+1}.')[1]: state_dict[f] for f in state_dict if f.startswith(f'unet{i+1}.')}
+-            net[i].load_state_dict(net_tmp)
++            net[i].load_state_dict(net_tmp, assign=True)
+             del net_tmp
+         del state_dict
+     return net
