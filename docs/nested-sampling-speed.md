@@ -53,6 +53,9 @@ peak imaging-worker memory across three repeats (30 August 2026). This is
 consistent with the host's observed run-to-run variance, not a code regression.
 The new rank-scaling probe measured **98.4 +/- 1.0 evaluations/second** at 16
 workers, with 34.8 MB peak memory; 20 workers remains faster on this host.
+Repeating that probe at 19 workers measured **107.1 +/- 2.8 evaluations/second**
+with 34.5 MB peak memory, statistically indistinguishable from 20 workers and
+not enough to change the default.
 The prior three-repeat group measured 117.2 +/- 2.5 evaluations/second. The production preset remains
 the comparable target-scale record: 114.7 +/- 0.71 evaluations/second over
 ~39,900 evaluations at 150 live points, 15 repeats, and unlimited dead points.
