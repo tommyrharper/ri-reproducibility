@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Sixty profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Sixty-one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -105,6 +105,12 @@ fresh controlled runs measured **0.5948 +/- 0.008 evaluations/second** versus
 0.5622 +/- 0.0025 before the change, a **5.8% throughput gain**, with unchanged
 3.47 GB peak worker memory. Outputs remain on the same model path and the
 benchmark used the same 41-evaluation smoke workload.
+
+A fresh three-repeat measurement of the unchanged checkpoint-swap path measured
+**0.6198 evaluations/second** (0.6200, 0.6198, and 0.6196), with **3.47 GB**
+peak worker memory. This refresh is not a claimed speedup: the 4.2% difference
+from the prior 0.5948 group was not interleaved and remains within observed
+run variance.
 
 ## What is priced but deliberately not taken
 
