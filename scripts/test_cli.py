@@ -325,7 +325,17 @@ def load_script(name):
     return module
 
 
-with tempfile.TemporaryDirectory() as runs_dir:
+with tempfile.TemporaryDirectory() as tmp:
+    # Reached through a symlink on purpose. macOS puts its temporary
+    # directories under /var, which is one, so a resolve() wrongly applied to
+    # a bare run name rewrites the path there and nowhere else - which is how
+    # it once reached main green on every Linux job. This reproduces it
+    # anywhere.
+    real = Path(tmp) / "real"
+    real.mkdir()
+    runs_dir = Path(tmp) / "runs"
+    runs_dir.symlink_to(real)
+
     named = Path(runs_dir) / "wsclean-vlaa-20260101T000000Z"
     named.mkdir()
     elsewhere = Path(runs_dir) / "elsewhere"

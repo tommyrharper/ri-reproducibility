@@ -29,7 +29,11 @@ NESTED_SAMPLING_DIR = Path(__file__).resolve().parents[1] / "results" / "nested-
 
 def resolve_run(raw: str) -> Path:
     target = Path(raw).expanduser()
-    return (NESTED_SAMPLING_DIR / raw if not target.exists() and (NESTED_SAMPLING_DIR / raw).is_dir() else target).resolve()
+    # A bare run name is returned unresolved, as the other three resolvers do:
+    # on macOS resolve() rewrites the /var symlink and the name stops matching.
+    if not target.exists() and (NESTED_SAMPLING_DIR / raw).is_dir():
+        return NESTED_SAMPLING_DIR / raw
+    return target.resolve()
 
 
 def load_summary(target: Path) -> dict[str, Any]:
