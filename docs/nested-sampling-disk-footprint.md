@@ -1,19 +1,7 @@
-# What a run costs on disk, and the ceiling that puts on its size
+# Run disk footprint
 
-Every other page under `docs/` about nested-sampling throughput asks how long
-one evaluation takes. This one asks how many bytes it leaves behind, because
-that - not CPU - is what says how big a search can be. Five iterations of
-per-evaluation optimisation have taken a WSClean evaluation to ~200 ms; at
-~50 evaluations a second on this host a search that runs for ten hours is
-1.8 million evaluations, and at the footprint this repo had before this page
-that is 700 GB against 188 GB free.
-
-The change this page records prunes four of the five FITS images WSClean
-writes per evaluation, once the metrics have been read out of them:
-**393.6 KB an evaluation down to 99.9 KB, a factor of 3.94**, for 48.5 us of
-`unlink()` an evaluation. It also records the measurement that says the
-`evaluations/` directory itself does *not* need sharding, which was the other
-suspected scaling wall.
+Removing four post-metric FITS files cut WSClean footprint **3.94x**, from
+393.6 KB to 99.9 KB per evaluation; `evaluations/` needs no sharding here.
 
 ## What an evaluation directory holds
 
@@ -50,42 +38,13 @@ by the time pruning happens their only consumer is finished with them.
 
 ## The change
 
-`PRUNED_ARTEFACTS` in `scripts/lib/nested_sampling/common.py` gains the four
-images:
-
-```python
-PRUNED_ARTEFACTS = (
-    ("sim.ms", "measurement_set"),
-    ("VLAA_ANT", None),
-    ("r2d2_data.mat", "mat"),
-    ("wsclean/recon-dirty.fits", "dirty"),
-    ("wsclean/recon-residual.fits", "residual"),
-    ("wsclean/recon-model.fits", None),
-    ("wsclean/recon-psf.fits", None),
-)
-```
-
-Everything about the surrounding machinery is unchanged, which is the point of
-putting them there rather than writing new code:
-
-- a **failed** evaluation keeps all of them, because a failure is what this
-  project exists to find and its artefacts are the first thing anyone will want;
-- `NS_KEEP_MEASUREMENT_SETS=1` (`./ri search --keep-measurement-sets`) keeps
-  all of them, so the replay benchmarks in
-  `docs/nested-sampling-throughput.md` are unaffected;
-- the record's `paths` block drops the `dirty` and `residual` keys with the
-  files, so a `metrics.json` never names a file that is not there;
-- `recon-image.fits`, the restored image, is never pruned. That is the evidence
-  a failure-mode search exists to produce, and
-  `self_check_evaluation_pruning()` has asserted it survives since iteration 8.
-
-WSClean is not asked to stop *writing* the four images, only to have them
-deleted. There is no flag for the model and the psf, the dirty image is needed
-for the metrics, and iteration 14 already measured that the five FITS writes
-are free (`-no-dirty` changed nothing). Deleting instead of not-writing also
-means the pages usually never reach the disk at all: 293 KB an evaluation of
-dirty page cache is unlinked ~200 ms after it is written, so at 50 evaluations
-a second this is ~15 MB/s of writeback that no longer happens.
+`PRUNED_ARTEFACTS` in `scripts/lib/nested_sampling/common.py` owns this list and
+the shared pruning path. Failed evaluations and
+`NS_KEEP_MEASUREMENT_SETS=1` retain all artefacts; successful evaluations retain
+the restored image, logs, JSON records, and replayable inputs. Dirty/residual
+paths are removed from records with their files. The self-check covers these
+contracts; implementation rationale and throughput measurements are in
+[nested-sampling-throughput.md](nested-sampling-throughput.md).
 
 ## What it measures
 
@@ -190,19 +149,9 @@ python3 -c 'import sys; sys.path.insert(0, "scripts/lib/nested_sampling"); \
 ./ri search wsclean --keep-measurement-sets ...
 ```
 
-## What is left
+## Remaining footprint
 
-- **74.9 KB of restored image an evaluation, 75% of what remains.** It is a
-  128x128 float32 in a 74880-byte FITS. Nothing smaller is possible without
-  either dropping the evidence the search exists to produce or storing it in
-  something that is not a FITS file; gzip on float32 noise is not worth the
-  complexity. The lever that would matter is a policy one - keep the image for
-  a bounded sample of evaluations plus every failure - and that reverses an
-  explicit project decision, so it is the owner's to take, not this page's.
-- **12.3 KB of `wsclean.stdout.log`, 12%.** That is the `-log-time` phase
-  timeline `./ri profile <run> --phases` reads, and it is the only reason that
-  command needs no rig. Worth keeping.
-- The R2D2 side is untouched. `polychord_r2d2.py` records one image path per
-  evaluation and this repo has never run an R2D2 search (`./ri
-  fetch-checkpoints` needs a browser), so there is no measured footprint to
-  prune against.
+- Restored image: 74.9 KB/evaluation (75%), the minimum measured FITS evidence;
+  reducing it requires an explicit retention-policy change.
+- `wsclean.stdout.log`: 12.3 KB/evaluation (12%), required by `./ri profile`.
+- R2D2 remains unmeasured and unpruned; this repo has no R2D2 search archive.

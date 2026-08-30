@@ -10,9 +10,7 @@ all eight of eight swapped simultaneous search pairs, -1.9% on the `wsclean`
 child over 230 interleaved replay pairs against a -0.26% null, with 230 of 230
 output FITS data blocks byte-identical.**
 
-Host: the same 20-thread i5-13500 as every other measurement in `docs/`, at the
-65 W package limit [the power-limit doc](nested-sampling-power-limit.md)
-describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## Where the phase table said to look
 

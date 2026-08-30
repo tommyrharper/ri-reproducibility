@@ -7,9 +7,7 @@
 corpus. This page is what that reads on the post-zygote tree, and the two
 avenues it closes.**
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65 W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## Where an evaluation goes now
 

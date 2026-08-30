@@ -6,9 +6,7 @@ visibilities - so a run's evaluations/second falls monotonically as it goes.
 That is what "inconsistent throughput" is. It is not the machine, it is not
 degradation, and `./ri profile <run> --over-time` shows it on any run.**
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65 W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## The measurement
 

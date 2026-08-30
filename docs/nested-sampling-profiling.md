@@ -1,21 +1,10 @@
 # Nested sampling: profiling
 
-This is the profiling companion to [nested-sampling.md](nested-sampling.md):
-what each stage of a likelihood evaluation costs, how the per-stage
-instrumentation works, and every optimisation that has been measured against
-the search - the ones that stayed, and the ones that were rejected. Read
-`nested-sampling.md` first for what the search does and how to run it; read this
-one when you want to know where the wall time goes or why the run scripts and
-images are shaped the way they are.
-
 ## What is instrumented
 
-Both `polychord_wsclean.py` and `polychord_r2d2.py` time every stage of
-each likelihood evaluation with plain `time.perf_counter()` calls around the
-existing subprocess/docker invocations already in `evaluate()` - no separate
-profiling framework, no changes to the container images' entrypoints. Each
-evaluation's `metrics.json` (and the aggregated `summary.json`) gets a
-`timing` block:
+Both `polychord_wsclean.py` and `polychord_r2d2.py` time each likelihood stage
+with `time.perf_counter()` around the existing invocations. Each evaluation's
+`metrics.json` (and aggregated `summary.json`) gets a `timing` block:
 
 | Field | Meaning |
 |---|---|
@@ -51,23 +40,17 @@ summed across every evaluation, plus:
 
 ## Running the profiler
 
-The instrumentation runs automatically as part of every run - there's no
-separate flag. `./ri tui` shows this table for whichever run the cursor is on
-- `enter` opens the run, then `l` loops health, log, profile - and the HTML
-report carries it per run page. To read the breakdown of a completed run from
-the shell:
+The instrumentation runs automatically. `./ri tui` shows this table for the
+selected run (`enter`, then `l` loops health, log, and profile), and the HTML
+report carries it per run page. Read a completed run from the shell:
 
 ```bash
 ./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp>
-# or directly:
-uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC timestamp>
-uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC timestamp> --json
+./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp> --json
 ```
 
-`scripts/profile-nested-sampling-run.py` only reads `summary.json` and
-prints a table (or the raw `profiling` dict with `--json`); it does not launch
-anything itself. Runs written before this instrumentation existed have no
-`profiling` block and must be re-run to get one.
+The profiler only reads `summary.json`; older runs without a `profiling` block
+must be re-run.
 
 ### How the printed shares are computed
 
@@ -125,50 +108,11 @@ not carry:
 
 ### How the report ties those shares back to the wall clock
 
-Worker-seconds do not add up to the run duration on the page header - eight
-ranks spend eight seconds of worker-time per second of wall clock - so the
-report renders the same numbers a second way. Dividing any stage total by
-`mpi_procs` gives what that stage cost in wall clock; those wall-clock figures
-are the report's `wall clock` column (omitted at `mpi_procs == 1`, where it
-would repeat the worker-time column) and they add up to the run's end-to-end
-wall time. `render_profiling()` in `scripts/lib/generate_report.py` spells the
-arithmetic out in one line under the chart -
-`evaluating + PolyChord + idle = worker-time / workers = wall clock` - and
-charts it as one lane per worker: each lane spans the run's wall clock and
-carries the same proportions, so a single lane reads as the wall clock and the
-lanes stacked together read as the worker-time budget. The chart colours the
-imaging stages and greys the two rows that are not imaging. The lanes are the average
-worker, not per-rank measurements, which the run summary does not record.
-
-## What a real bounded run showed
-
-A single-rank (`NS_MPI_PROCS=1`), 5-dimensional run at the default sampler
-settings (`NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12`, 62 likelihood
-evaluations, not committed) profiles as:
-
-| Stage | Total | Share |
-|---|---:|---:|
-| WSClean image container (total) | 6.8s | 66.5% |
-| &nbsp;&nbsp;of which: `wsclean` binary itself | 6.4s | 62.9% |
-| &nbsp;&nbsp;of which: container overhead | 0.37s | 3.6% |
-| MeqTrees simulate | 3.0s | 29.8% |
-| Metrics computation | 0.12s | 1.1% |
-| PolyChord overhead (unaccounted) | 0.26s | 2.5% |
-
-Total wall time 10.2s (~0.16s/eval; ~1.8s on the default 8 ranks). That is
-`summary.json`'s `total_wall_seconds`, measured around `run_polychord()`
-inside the PolyChord container - the end-to-end `time` of the run script is
-~1.1s more on one rank and ~1.2s more on eight, for starting and removing the
-containers (8-rank end to end is ~2.95s). No fixed overhead of any
-size is left in either sidecar: what remains is the science.
-Warm, an evaluation is ~0.05s of simulate (~0.022s RIME predict, ~0.007s
-re-pointing the forest at the new MS, ~0.008s of casacore table I/O, ~0.004s to
-copy a cached `makems` skeleton and ~0.005s to move the finished MS out of
-`/dev/shm`; no evaluation runs `makems` any more, the image ships every
-skeleton) and ~0.10s of `wsclean`, which is now well over half the run.
-The rest is one-off startup - the simulate worker, meqserver and the one TDL
-compile, now started concurrently before the sampler runs rather than serially
-inside the first evaluation - plus PolyChord's own sampling and bookkeeping.
+Worker-seconds exceed page wall time by `mpi_procs`. Dividing stage totals by
+`mpi_procs` gives the report's `wall clock` column (omitted for serial runs),
+and `evaluating + PolyChord + idle = worker-time / workers = wall clock`.
+`render_profiling()` in `scripts/lib/generate_report.py` charts these proportions
+as one average-worker lane per rank; imaging is coloured, other rows grey.
 
 ### What the two halves show
 
@@ -224,36 +168,6 @@ pin stays.
 its last bit, because a single-threaded `np.linalg.norm` reduces in a different
 order than a threaded one; that also makes it reproducible across hosts with
 different CPU counts, which it previously was not.
-
-### `WEIGHT`/`SIGMA` are written with one TaQL `UPDATE`, not `putcol`
-
-> **Superseded.** The `UPDATE` this section arrived at is gone - the pair is no longer written per evaluation at all. See "The two constant columns are gone" in [nested-sampling-throughput.md](nested-sampling-throughput.md). The storage-manager measurements below still stand and are why nothing cheaper was available while the write had to happen.
-
-`putcol` on these two columns was 42ms of the 81ms simulate - more than the
-RIME predict. Both are *variable-shaped* array columns in the `ISMData`
-`IncrementalStMan` group of a makems MS, and python-casacore's `putcol` on
-that combination is quadratic in rows: at this MS size 100 rows cost 0.06ms,
-500 rows 1.4ms and all 1755 rows 17ms per column. It is the storage manager,
-not the disk - a `TiledColumnStMan` column of the same size (`DATA`, `FLAG`,
-`UVW`) writes in 0.1ms, and an `IncrementalStMan` *scalar* column (`TIME`) in
-0.05ms. `setmaxcachesize()` does not help, and the columns cannot be dropped
-and re-added under another storage manager because the whole ISM group would
-have to go with them.
-
-A `putcell()` row loop is linear where `putcol` is quadratic - 7.9ms for the
-pair - and that was the fix for a while: measured 13.1s -> 10.9s single-rank
-(-16%, simulate 5.5s -> 3.4s) and 8.5s -> 8.2s on the default 8 ranks, with
-every column of all 62 Measurement Sets, the artifact trees, all 62
-evaluations' science metrics and `log(Z)` identical.
-
-`fill_point_source_visibilities()` now does the same row loop in C++ instead,
-as a single `taql("UPDATE $ms SET WEIGHT=..., SIGMA=...")`: 3.3ms for the pair
-against 7.9ms for the Python loop and 43ms for `putcol`, best of four on a
-1755-row MS, with both columns bit-identical to what the loop wrote. That is
-~4.6ms off every evaluation's ~0.06s of simulate. The `removecols` route stays
-closed: casacore refuses outright - `column WEIGHT cannot be removed from
-table` - because makems put `WEIGHT` and `SIGMA` in one ISM group with 15 other
-columns.
 
 ### The compiled TDL forest is reused across evaluations
 
@@ -1292,38 +1206,6 @@ does not cover either - `apt-get`/`pip` output drifting under a pinned base
 image, or a moved upstream git ref - so those still need `FORCE_BUILD=1` or a
 `docker rmi`, exactly as they previously needed `--no-cache`.
 
-##### Host `__pycache__` is not a build input
-
-The hash's one false positive was bytecode. `docker/polychord/Dockerfile` `COPY`s
-the whole of `scripts/lib/nested_sampling`, there was no `.dockerignore`, and
-anything that imports those modules on the host - the CI check `python3 -m
-compileall -q scripts config`, a `--self-check`, a local interpreter of a
-different version - writes a `__pycache__` next to them. Every appearance,
-disappearance or version change of those `.pyc` moved the `ri.build-inputs`
-hash, so `scripts/build.sh polychord` did a full 1.98-2.43s rebuild instead of a
-0.05s skip, and shipped host bytecode into an image that compiles its own with
-its own interpreter one `RUN` later.
-
-A root `.dockerignore` keeps `**/__pycache__` and `**/*.pyc` out of every build
-context, and `inputs_hash` prunes the same paths so the hash matches what the
-build can actually see. Note the `**/` - a bare `__pycache__/` in a
-`.dockerignore` matches only a *top-level* directory and silently lets the
-nested ones through.
-
-Blocked A/B of `make nested-sampling-r2d2-poc`, alternating "delete
-`__pycache__`" and "run `compileall`" between runs, which is what a CI check or a
-self-check does to a working tree:
-
-| | run 1 (deleted) | run 2 (compiled) | run 3 (deleted) |
-|---|---:|---:|---:|
-| before | 3.19s | 5.34s | 4.57s |
-| after | 3.15s | 3.10s | 3.29s |
-
-Interleaving is invalid here for the same reason it was in the section above -
-each arm rewrites the label the other arm reads - so these are blocks, and run 1
-of the "before" block skips only because a tree with no `__pycache__` happens to
-hash the same both ways. `log(Z) = 99.92878 +/- 0.06674` in all six runs.
-
 #### Where the remaining R2D2 wall clock is, and why it is a floor
 
 Stage timestamps from inside `polychord_r2d2_poc.py` on a 4.55s end-to-end run
@@ -2050,33 +1932,7 @@ path has a timeout (`simulate_worker_request()` blocks in `readline()`), so the
 run hangs until it is killed. Worth knowing when timing anything here: an A/B
 harness needs `timeout` around each run or one hang eats the whole measurement.
 
-### Sidecar containers run with `--network none`
-
-Every per-evaluation sidecar (MeqTrees, for simulate and the MS-to-`.mat`
-convert; WSClean; R2D2) is launched with `--network none`. None of them talks to the network:
-inputs and outputs are bind-mounted, and MeqTrees' `meqserver` only needs the
-loopback interface, which `none` still provides.
-
-Docker's default bridge network costs ~0.65s per container to set up and tear
-down here versus ~0.45s with `--network none` - about 0.2s per container, or
-0.44s per evaluation across the simulate and imaging sidecars. On the profiled
-run that cut total wall time from 51.5s to 43.0s (-16.5%) with byte-identical
-per-evaluation metrics and the same log(Z). The gap is largest under rootless
-Docker, where bridge setup goes through a userspace network stack.
-
-### The meqserver shutdown sleep
-
-An equivalent run before this fix profiled at 162.7s of MeqTrees simulate
-(~11.6s/eval, 92.6% of wall time). Almost none of that was RIME work: makems takes ~0.5s, the
-container start ~0.8s, and the TDL compile plus predict ~0.4s. The remaining
-~10s per evaluation was Timba's `stop_default_mqs()`, which reaps the meqserver
-child with a single `waitpid(WNOHANG)` and then sleeps a fixed 10 seconds before
-re-checking - so every evaluation paid a full 10s of pure shutdown wait.
-
-`docker/meqtrees/Dockerfile` rewrites that poll loop in the installed
-`Timba/Apps/meqserver.py` to sleep 0.1s per iteration over 2000 iterations,
-keeping the same ~200s ceiling before the SIGKILL fallback. Simulate wall time
-drops from ~11.8s to ~1.9s per evaluation with bit-identical `DATA`, `UVW`,
-`WEIGHT`, `SIGMA` and `FLAG` columns. The patch asserts on the exact upstream
-source lines, so a KERN package bump that changes them fails the image build
-rather than silently reverting the speedup.
+Sidecars use `--network none`, saving ~0.2s per container with identical
+results. `docker/meqtrees/Dockerfile` also replaces Timba's 10s shutdown sleep
+with 0.1s polling while preserving its ~200s SIGKILL ceiling; MS outputs stay
+identical.

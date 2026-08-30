@@ -1,19 +1,12 @@
 # What a bigger run costs
 
-**A ten-times-bigger `--nlive` costs nothing per evaluation. The same tree runs
-at 126 evaluations/second and accounts for 95.4% of its worker-time budget at
-`--nlive 600` exactly as it does at `--nlive 60`, so the wall clock of a big
-search is just its evaluation count divided by that rate. The remaining
-per-evaluation floor is `70.7 ms + 4.58 us x visibilities`, the largest item
-left inside the fixed half is the restoring-beam fit at 8.7% of the `wsclean`
-binary, and the one double-digit lever above the arithmetic - dropping
-w-gridding - is now closed on the parameter space's own numbers rather than on
-one corpus Measurement Set.**
+**A ten-times-bigger `--nlive` costs nothing per evaluation: this tree runs at
+126 evaluations/second and accounts for 95.4% of worker time at `--nlive 600`.
+The floor is `70.7 ms + 4.58 us x visibilities`; the restoring-beam fit is its
+largest fixed item at 8.7% of the `wsclean` binary, and dropping w-gridding is
+closed by measurements across the parameter space.**
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65 W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026,
-on `4b4698f`.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md). 29 August 2026, on `4b4698f`.
 
 ## Throughput does not care about `nlive`
 

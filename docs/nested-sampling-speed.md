@@ -1,24 +1,11 @@
 # Making a nested-sampling search faster: the index
 
-Start here. Thirty-two rounds of profiling took a WSClean likelihood
-evaluation from ~2.3 s to ~143 ms at production concurrency, and the host from
-~62 to **126 evaluations/second at 19 workers**. Each round left a page with
-its own measurements; this page says what shipped, what it was worth, and
-which page holds the evidence.
-
-Two things to know before reading any number below:
-
-- **The percentages do not add up, and are not meant to.** Each was measured
-  against the tree as it stood at that iteration, so a later 3% is 3% of an
-  already smaller evaluation. The only end-to-end figures are the two in the
-  paragraph above.
-- **Any evaluations/second figure written before iteration 18 is about half of
-  what the tree does now.** Where an older page still quotes one, it is the
-  measurement that page made at the time, not a current rate.
+Thirty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation and
+raised the host to **126 evaluations/second at 19 workers**. Values below are
+per-iteration baselines, except the end-to-end figure above; pre-iteration-18
+rates are historical and roughly half the current rate.
 
 ## What shipped
-
-Roughly in the order it was found, which is also roughly largest-first.
 
 | change | where it lives | measured worth |
 |---|---|---|
@@ -40,9 +27,8 @@ Roughly in the order it was found, which is also roughly largest-first.
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
-And two that bought run *size* rather than speed, which is what the speed was
-for - see [disk footprint](nested-sampling-disk-footprint.md) and
-[run scaling](nested-sampling-run-scaling.md):
+Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
+and [run scaling](nested-sampling-run-scaling.md):
 
 | change | measured worth |
 |---|---|
@@ -61,12 +47,9 @@ for - see [disk footprint](nested-sampling-disk-footprint.md) and
 
 ## Where the remaining time goes
 
-126 evals/s at 19 workers, 143 ms an evaluation, 5.3% unaccounted - of which a
-`--mpi-procs 1` control says 1.9% is the harness's own Python. **There is no
-idle time left to find.** The premise this work started from, that almost half
-a run is idling or running PolyChord, was true before iteration 1 and has not
-been true since; PolyChord itself is 3-7 us per likelihood call at every
-`nlive`.
+At 126 evals/s and 143 ms/evaluation, 5.3% is unaccounted; a
+`--mpi-procs 1` control attributes 1.9% to harness Python. **No idle time
+remains:** PolyChord costs 3-7 us per likelihood call at every `nlive`.
 
 59% of an evaluation is ducc0's gridding and degridding, and
 [the gridder floor](nested-sampling-gridder-floor.md) prices that as
@@ -76,7 +59,7 @@ current budget and the six further avenues closed with numbers.
 
 ## Reading your own run
 
-No rig, no patched tree, no replay - every run already carries this:
+Every run already carries these profiles:
 
 ```bash
 ./ri profile <run>              # per-stage budget and worker utilisation
@@ -84,15 +67,13 @@ No rig, no patched tree, no replay - every run already carries this:
 ./ri profile <run> --over-time  # why evaluations/second falls as a run goes deeper
 ```
 
-That last one is the answer to "inconsistent throughput": an evaluation costs
-`70.7 ms + 4.58 us x visibilities` and nested sampling compresses towards the
-long-observation, many-channel corner of the parameter space, so a run's rate
-falls monotonically with nothing degrading. See
-[the cost model](nested-sampling-cost-model.md).
+Throughput falls because nested sampling reaches longer observations and more
+channels: `70.7 ms + 4.58 us x visibilities` per evaluation. See [the cost
+model](nested-sampling-cost-model.md).
 
 ## The rest of the pages
 
-Chronological, because each one starts where the last stopped.
+Chronological; each page starts where the last stopped.
 
 | page | what it settles |
 |---|---|
@@ -115,12 +96,3 @@ Chronological, because each one starts where the last stopped.
 | [process warm-up](nested-sampling-process-warm-up.md) | The 5 ms before the first visibility - and the unsigned-arithmetic bug that makes WSClean fit its restoring beam on a quarter of the box it means to use. A real failure mode, not result-preserving to fix. |
 | [disk footprint](nested-sampling-disk-footprint.md) | Bytes rather than clock. A run is `~17 x nlive x num_repeats` evaluations, and `evaluations/` needs no sharding. |
 | [evaluation floor](nested-sampling-evaluation-floor.md) | The current budget, `--mgain` as a flag, and the last six avenues closed. |
-
-## If you are picking this up
-
-Read [the evaluation floor](nested-sampling-evaluation-floor.md) first - it is
-the most recent budget - then this page's "priced but not taken" table. The
-measurement discipline that made these numbers trustworthy is worth copying:
-run A/B arms **simultaneously**, compare FITS **data blocks** rather than
-files, read `--phases` on **medians**, and discard the first ~8 seconds of any
-burst (the power limit's averaging window).

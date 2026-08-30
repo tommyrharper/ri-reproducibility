@@ -1,35 +1,12 @@
 # reports/
 
-Host-side output of the nested-sampling searches. Everything in here
-except this file and `manifests/.gitkeep` is generated and gitignored.
+Host-side nested-sampling output. Contents are generated and gitignored except
+for this file and `manifests/.gitkeep`.
 
-- `nested-sampling-report/` - built by `./ri report` from
-  `results/nested-sampling/*/summary.json`. One page per run
-  (PolyChord log(Z), searched parameters and metrics per evaluation,
-  reconstructions rendered next to the truth, likelihood plot, and a
-  collapsible per-stage profiling table when the run recorded one), plus
-  an `index.html` listing and linking to every run.
+- `nested-sampling-report/`: HTML/PNG report from `./ri report`; see
+  `docs/nested-sampling.md` for options and serving.
 
-  Rendering a page reads that run's FITS output, so pages that are already
-  up to date are skipped and only new runs are built. Each page is stamped
-  with the report generator's version: `UPGRADE=1` rebuilds the pages an
-  older version wrote, `FORCE=1` rebuilds them all, `RUN=<run>` rebuilds
-  one, `LAST=N` limits to the newest N runs. The report runs inside the
-  r2d2 image (its astropy + matplotlib + anesthetic) via
-  `scripts/generate-report.sh`, same approach as `scripts/plot-fits.sh`,
-  so no host Python environment is needed. Open the index in a browser.
-  See `docs/nested-sampling.md` for the full description. `./ri serve`
-  serves this directory over HTTP on loopback, for reading it from a
-  browser on another machine over an `ssh -L` tunnel.
+- `merged-r2d2-wsclean-*.png`: comparison figures for `latex/notes.tex`.
 
-- `merged-r2d2-wsclean-*.png` - the merged and side-by-side failure-score
-  figures written by `scripts/plot-merged-likelihood-compare.py`, which is
-  where `latex/notes.tex` includes them from.
-
-- `manifests/` - one JSON file per run, written by
-  `scripts/record-environment.sh`: repo revision, image digests, host
-  CPU/memory, config checksums, and the exact command. Gitignored except
-  for the directory itself; they are metadata (small, text) so *could* be
-  committed, but are treated as run-local output, consistent with
-  `results/`. `git add -f` a specific one if you want it version
-  controlled.
+- `manifests/`: per-run environment records from
+  `scripts/record-environment.sh`.

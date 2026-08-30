@@ -1,25 +1,14 @@
 # Opening the Measurement Set
 
-**WSClean re-opens the parent Measurement Set once per gridding and degridding
-pass - ~16 times in a median evaluation - and casacore attaches every subtable
-on every one of those opens. Deleting the six subtables nothing downstream
-reads is worth +14.9% evaluations per second end to end for the first five and
-another -3.2% on the `wsclean` binary for `FEED`, with bit-identical images.**
+**WSClean re-opens the parent Measurement Set ~16 times per evaluation, and
+casacore attaches every subtable each time. Dropping unread subtables is worth
++14.9% end to end, then another -3.2% on `wsclean` for `FEED`, with identical
+image data.** The remaining re-opens were removed in
+[local WSClean patches](nested-sampling-wsclean-patches.md).
 
-> **Follow-up.** This page closes the avenue from the *simulator's* side. The
-> re-opens themselves were then removed on WSClean's side - it was re-opening
-> the parent MS on every pass only to read the `ANTENNA` table - see
-> [local WSClean patches](nested-sampling-wsclean-patches.md).
-
-This is the largest single item outside the gridding arithmetic itself, and it
-was invisible to every previous decomposition because WSClean's own phase line
-(`Inversion:, prediction:, deconvolution:`) does not count it -
-[the evaluation budget](nested-sampling-evaluation-budget.md) filed it under
-the 27% "untimed" residual along with process start.
-
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65W package limit [the power-limit doc](nested-sampling-power-limit.md)
-describes, 19 concurrent WSClean processes throughout. 29 August 2026.
+This was hidden in WSClean's untimed phase; the [evaluation budget](nested-sampling-evaluation-budget.md)
+measured it with process start. Results below use 19 concurrent WSClean
+processes on the documented 65W-limit host, 29 August 2026.
 
 ## Finding it
 

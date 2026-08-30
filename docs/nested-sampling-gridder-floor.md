@@ -13,51 +13,10 @@ worth -2.7% on the binary in an interleaved tmpfs replay and -3.2% over four
 simultaneous swapped searches, with 520 of 520 output FITS data blocks
 byte-identical.
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65 W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
-## Where an evaluation stands now
-
-A 2621-evaluation search at HEAD
-(`--nlive 60 --num-repeats 2 --mpi-procs 20`, 24.0 s wall):
-
-| | share |
-| --- | ---: |
-| `wsclean` binary | 84.9% (148 ms) |
-| simulate (MeqTrees) | 7.5% (13 ms) |
-| container overhead | 1.2% (2 ms) |
-| metrics | 0.8% (1 ms) |
-| unaccounted (PolyChord sampling + idle) | 5.6% |
-
-The 5.6% unaccounted is mostly the ~6 s per-run startup constant
-[the throughput doc](nested-sampling-throughput.md) measures, not idle ranks -
-at this run length it *is* the startup. The idling the objective started from
-is gone; what is left is the binary.
-
-Inside the binary, on the per-evaluation **median**
-([the simulate-stage doc](nested-sampling-simulate-stage.md) explains why the
-median and not the mean `./ri profile --phases` prints):
-
-| median ms | share | n/eval | median each | phase |
-| ---: | ---: | ---: | ---: | --- |
-| 47.21 | 35.9% | 8.09 | 5.84 | `Gridding N rows...` -> `Gridded visibility count` |
-| 29.10 | 22.1% | 6.09 | 4.78 | `Predicting N rows...` -> `Writing...` |
-| 7.67 | 5.8% | 3.97 | 1.93 | minor loop, `Stopped on peak N mJy` |
-| 7.04 | 5.4% | 1.00 | 7.04 | the reorder |
-| 6.45 | 4.9% | 1.00 | 6.45 | process start -> `=== IMAGING TABLE ===` |
-| 5.73 | 4.4% | 0.88 | 6.54 | `Fitting beam...` -> `Writing psf image... DONE` |
-| 3.67 | 2.8% | 8.09 | 0.45 | `Loading data in memory...` -> `Gridding N rows...` |
-| 3.02 | 2.3% | 6.09 | 0.50 | `Opening reordered part N` -> `Loading metadata` |
-| 2.47 | 1.9% | 5.09 | 0.49 | `Gridded visibility count` -> `== Deconvolving (N) ==` |
-| 2.11 | 1.6% | 1.12 | 1.89 | minor loop, `Stopped on peak N uJy` |
-| 2.05 | 1.6% | 0.89 | 2.29 | rendering and writing the restored image |
-| 1.54 | 1.2% | 1.00 | 1.54 | `Opening reordered part N` -> `== Constructing PSF ==` |
-
-131.4 ms in total on the median (142.7 ms on the mean). Gridding and
-degridding are **58%** of it, and every iteration since 21 has been mining the
-other 42%. Before mining any more of it, it is worth knowing whether the 58%
-is arithmetic or overhead.
+For the current phase breakdown and cost model, see the
+[run-scaling guide](nested-sampling-run-scaling.md).
 
 ## Asking ducc0 where its own time goes
 
