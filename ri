@@ -177,7 +177,8 @@ def do_bench_run(args):
     # without it the benchmark times whatever was baked last.
     return {}, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
         uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
-           "--repeat", str(args.repeat))]
+           "--repeat", str(args.repeat),
+           *( ["--timeout", str(args.timeout)] if args.timeout is not None else []))]
 
 
 def do_bench_record(args):
@@ -613,6 +614,8 @@ def build_parser():
     bench_run.add_argument("--repeat", type=int, default=1, metavar="N",
                            help="run it N times, which is how the error bar on "
                                 "this commit gets smaller (default: %(default)s)")
+    bench_run.add_argument("--timeout", type=float, metavar="SECONDS",
+                           help="stop the whole benchmark, including its process tree")
     bench_run.set_defaults(handler=do_bench_run)
 
     bench_record = bench_subs.add_parser(

@@ -10,6 +10,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --repeat 3   # synchronous, fixed-seed comparison
 ./ri bench run wsclean --preset throughput --repeat 3  # production async mode
 ./ri bench run wsclean --preset production --repeat 15 # target-scale workload
+./ri bench run wsclean --preset production --timeout 300 # bounded probe
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -60,6 +61,10 @@ The `production` preset matches target searches: `NS_NLIVE = 150`,
 `NS_NUM_REPEATS = 15`, `NS_MAX_NDEAD = -1`, fixed seed, and asynchronous
 scheduling. It is intentionally expensive and should be run only for final
 confirmation after a cheaper preset shows a candidate.
+
+Use `--timeout` for expensive probes. It stops the benchmark's entire process
+group and returns 124, without recording a partial run, so a failed or
+interrupted measurement cannot leave workers behind.
 
 ## What makes two commits comparable
 

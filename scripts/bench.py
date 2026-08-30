@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import shutil
 import statistics
 import subprocess
@@ -226,10 +227,23 @@ def do_run(args: argparse.Namespace) -> int:
     # so a cold first run is effectively a faster machine.
     for attempt in range(args.repeat + 1):
         warm_up = {"NS_BENCH_RECORD": "0"} if attempt == 0 else {}
-        done = subprocess.run(command, cwd=REPO_ROOT, env={**env, **warm_up},
-                              check=False)
-        if done.returncode != 0:
-            return done.returncode
+        process = subprocess.Popen(command, cwd=REPO_ROOT,
+                                   env={**env, **warm_up},
+                                   start_new_session=True)
+        try:
+            returncode = process.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            print(f"benchmark: timeout after {args.timeout}s; stopping run",
+                  file=sys.stderr)
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            return 124
+        if returncode:
+            return returncode
     return 0
 
 
@@ -443,6 +457,20 @@ def self_check() -> None:
                        "NS_MPI_PROCS": "3"}, "wsclean") == "default"
     assert preset_for({}, "wsclean") == "custom"
 
+    timeout = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                               start_new_session=True)
+    try:
+        try:
+            timeout.wait(timeout=0.01)
+            raise AssertionError("timeout self-check child finished unexpectedly")
+        except subprocess.TimeoutExpired:
+            os.killpg(timeout.pid, signal.SIGTERM)
+            timeout.wait(timeout=5)
+    finally:
+        if timeout.poll() is None:
+            os.killpg(timeout.pid, signal.SIGKILL)
+            timeout.wait()
+
     import tempfile
 
     with tempfile.TemporaryDirectory() as raw:
@@ -481,11 +509,15 @@ def main() -> int:
     run.add_argument("imager", choices=("wsclean", "r2d2"))
     run.add_argument("--preset", default="default")
     run.add_argument("--repeat", type=int, default=1)
+    run.add_argument("--timeout", type=float, metavar="SECONDS",
+                     help="stop the whole benchmark, including its process tree, after this time")
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
     if getattr(args, "handler", None) is do_run and args.repeat < 1:
         parser.error("--repeat must be at least 1")
+    if getattr(args, "handler", None) is do_run and args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
 
     if args.self_check:
         self_check()
