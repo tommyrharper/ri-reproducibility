@@ -117,5 +117,11 @@ sidecar_wait
 mkdir -p "${OUTPUT_DIR}/evaluations"
 run_with_retries "${NS_RETRIES}" "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" "${NS_NLIVE}" -- "${RUN_COMMAND[@]}"
 
+# One row in benchmarks.jsonl per finished search, so a change to this repo can
+# be shown to have helped rather than argued about; see
+# docs/nested-sampling-benchmarks.md. Best effort: the run is already done, and
+# no measurement of it is worth failing it after the fact.
+uv run scripts/bench.py record "${OUTPUT_DIR}" || true
+
 rm -rf "${SIMULATE_FIFO_DIR}"
 echo "OK: nested-sampling output in ${OUTPUT_DIR}"

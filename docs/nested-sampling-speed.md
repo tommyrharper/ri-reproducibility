@@ -71,12 +71,22 @@ Throughput falls because nested sampling reaches longer observations and more
 channels: `70.7 ms + 4.58 us x visibilities` per evaluation. See [the cost
 model](nested-sampling-cost-model.md).
 
+## Keeping what is on this page
+
+The table above is history: each row was measured once, against the commit
+before it. `./ri bench` is the standing version - what this commit costs on
+this machine now, with an error bar that narrows as repeats accumulate, so the
+next change is measured rather than argued about and a regression shows up as
+a column rather than a surprise. See
+[benchmarks](nested-sampling-benchmarks.md).
+
 ## The rest of the pages
 
 Chronological; each page starts where the last stopped.
 
 | page | what it settles |
 |---|---|
+| [benchmarks](nested-sampling-benchmarks.md) | `./ri bench`: throughput per commit, machine and settings, and the three measurement traps its preset is pinned against - asynchronous draw variation, the cold first run, and a window too short to mean anything. |
 | [throughput](nested-sampling-throughput.md) | The running log of iterations 1-14: idle ranks, the asynchronous-MPI switch, rank 0, the AVX2 build, the constant predict, the two constant columns, the scratch tmpfs. Long, and the older figures in it are superseded. |
 | [run scaling](nested-sampling-run-scaling.md) | What a bigger run costs. A 10x `--nlive` costs nothing per evaluation; the ceiling on this host is ~850k evaluations, set by rank 0's memory while it builds `summary.json`. |
 | [power limit](nested-sampling-power-limit.md) | The host's 65W RAPL cap, why it is not thermal, and the 8-second averaging window behind the burst-clock measurement trap. |

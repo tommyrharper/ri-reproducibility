@@ -45,10 +45,18 @@ finished run down per stage:
 ./ri profile results/nested-sampling/<run>
 ```
 
+Every finished search also adds a row to `benchmarks.jsonl`, so what this
+commit costs on this machine can be compared with what the last one did:
+
+```bash
+./ri bench                          # the table, per commit and machine
+./ri bench run wsclean --repeat 3   # the controlled measurement
+```
+
 ## 2. Reading the results
 
 ```bash
-./ri tui                # runs, live health, the profile and a new-run form in one screen (needs Go)
+./ri tui                # runs, live health, the profile, the benchmark table and a new-run form (needs Go)
 ./ri report             # all runs
 ./ri report --last 1    # newest run only
 ./ri serve              # read the report from a browser on another machine

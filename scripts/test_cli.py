@@ -274,6 +274,27 @@ check(
 )
 
 check(
+    "bench with no subcommand prints the table",
+    ({}, [["uv", "run", "scripts/bench.py"]]),
+    plan("bench"),
+)
+
+check(
+    "bench run builds the imager's images, then measures",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "3"]],
+    plan("bench", "run", "wsclean", "--repeat", "3")[1],
+)
+
+check(
+    "bench record names the run to add",
+    [["uv", "run", "scripts/bench.py", "record", "wsclean-vlaa-20260827T101500Z"]],
+    plan("bench", "record", "wsclean-vlaa-20260827T101500Z")[1],
+)
+
+check(
     "nested plot subcommands dispatch",
     [["uv", "run", "scripts/anesthetic-gui.py", "results/x"]],
     plan("plot", "gui", "results/x")[1],
@@ -342,6 +363,7 @@ with tempfile.TemporaryDirectory() as tmp:
     elsewhere.mkdir()
     for script, resolver in (("profile-nested-sampling-run.py", "resolve_run"),
                              ("merge-nested-sampling-runs.py", "resolve_run_dir"),
+                             ("bench.py", "resolve_run"),
                              ("anesthetic-gui.py", "resolve_target")):
         module = load_script(script)
         module.NESTED_SAMPLING_DIR = Path(runs_dir)

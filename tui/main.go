@@ -165,6 +165,9 @@ func commandLog(command, run string) func(ri) (string, error) {
 	return func(r ri) (string, error) { out, _ := r.run(command, run); return out, nil }
 }
 
+// benchLog is the one view that is about no single run: the whole ledger.
+func benchLog(r ri) (string, error) { out, _ := r.run("bench"); return out, nil }
+
 func runLog(path string) func(ri) (string, error) {
 	return func(r ri) (string, error) {
 		return tail(filepath.Join(r.root, path, "run.log"), 200_000)
@@ -342,6 +345,12 @@ func (m model) updateRuns(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.setRows()
 		m.table.SetCursor(0)
 		return m, nil
+	case "b":
+		// No run behind this one, which is what logView and l read logRun for.
+		m.logRun = Run{}
+		cmd := m.openLog("ri bench", benchLog)
+		m.paused = true
+		return m, cmd
 	case "n":
 		// Start on imager row; no text entry, so fields start blurred.
 		m.screen, m.focused, m.notice = screenForm, 0, ""
@@ -378,6 +387,9 @@ func (m model) updateLog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.paused = !m.paused
 		return m, nil
 	case "l":
+		if m.logRun.Name == "" {
+			return m, nil
+		}
 		cmd := m.showRun(m.logRun, m.pane.next())
 		return m, cmd
 	}
@@ -476,7 +488,7 @@ func (m model) runsView() string {
 		lines = append(lines, errStyle.Render(m.err))
 	}
 	lines = append(lines, helpStyle.Render(
-		"enter watch  ·  n new run  ·  a running only  ·  r refresh  ·  q quit"))
+		"enter watch  ·  n new run  ·  b benchmarks  ·  a running only  ·  r refresh  ·  q quit"))
 	return strings.Join(lines, "\n")
 }
 
@@ -488,8 +500,11 @@ func (m model) logView() string {
 	if !m.refreshed.IsZero() {
 		state += ", read " + m.refreshed.Format("15:04:05")
 	}
-	help := "esc runs  ·  l " + paneNames[m.pane.next()] +
-		"  ·  r refresh  ·  p pause  ·  ↑/↓ scroll"
+	help := "esc runs  ·  r refresh  ·  p pause  ·  ↑/↓ scroll"
+	if m.logRun.Name != "" {
+		help = "esc runs  ·  l " + paneNames[m.pane.next()] +
+			"  ·  r refresh  ·  p pause  ·  ↑/↓ scroll"
+	}
 	return strings.Join([]string{
 		titleStyle.Render(m.logTitle) + helpStyle.Render("  "+state),
 		m.view.View(),
