@@ -1032,7 +1032,10 @@ per-rank count. Sweeping `R2D2_OMP_THREADS` at 8 ranks on this 20-CPU host:
 1 thread 7.7s, 2 threads (the old `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
 threads 24.2s. A later three-repeat search measurement found 3 threads at
 7.43s/evaluation versus 8.12s at 2 threads, so automatic allocation now rounds
-the per-rank CPU share up. Four threads still oversubscribes this host. The
+the per-rank CPU share up. A current three-repeat explicit four-thread probe
+measured 7.39s/evaluation versus 7.45s at 3 threads, but four threads still
+oversubscribes this host and remains an explicit candidate rather than the
+automatic setting. The
 1-thread column of that sweep is
 misleading, though - most of what it was measuring was OpenMP spin-waiting, not
 the thread count; see "The imaging workers' OpenMP threads sleep between

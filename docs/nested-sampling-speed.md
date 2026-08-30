@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Sixty-three profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Sixty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **114.0 +/- 3.2
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -116,7 +116,11 @@ Rounding the automatic per-rank thread allocation up from `20 / 8 = 2` to 3
 threads was then measured in three controlled runs at **0.7249 +/- 0.0018
 evaluations/second**, a **16.9%** gain over the two-thread baseline, with
 unchanged 3.47 GB peak memory. Explicit `R2D2_OMP_THREADS` still overrides the
-automatic choice.
+automatic choice. A three-repeat explicit four-thread probe then measured
+**0.766 +/- 0.002 evaluations/second** at the same 8 ranks and **3.47 GB** peak
+memory, about **5.4%** above the three-thread result. This is a candidate rather
+than a new automatic default: four threads oversubscribe the nominal 20-CPU
+host, and the older pre-optimization sweep rejected four threads.
 
 ## What is priced but deliberately not taken
 
