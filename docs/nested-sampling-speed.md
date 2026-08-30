@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred thirty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred thirty-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.4 +/- 2.7
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -294,6 +294,11 @@ A fresh three-repeat explicit ten-thread R2D2 probe measured **0.7398 eval/s**
 peak worker memory. Ten threads is slower than the four-thread candidate and
 closes the next point in the thread-count sweep; four threads remains the
 fastest measured explicit setting on this host.
+
+A fresh three-repeat checkpoint-backed R2D2 control measured **0.7769 +/-
+0.0034 eval/s** (0.7735, 0.7843, and 0.7769) at 8 ranks and **3.47 GB** peak
+worker memory. It is consistent with the existing best result and does not
+justify a runtime change.
 
 ## What is priced but deliberately not taken
 
