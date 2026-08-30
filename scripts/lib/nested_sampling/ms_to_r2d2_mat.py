@@ -83,7 +83,8 @@ def ms_to_r2d2_mat(
             "y": y.reshape(-1, 1),
             "nW": nW.reshape(-1, 1),
         },
-        do_compression=True,
+        # Small per-evaluation MAT; compression costs more CPU than its I/O saves.
+        do_compression=False,
     )
     return {
         "visibility_count": int(y.size),

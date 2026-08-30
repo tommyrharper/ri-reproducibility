@@ -27,6 +27,7 @@ rates are historical and roughly half the current rate.
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
+| R2D2 `.mat` conversion skips compression on tmpfs | `ms_to_r2d2_mat.py` | 8.59 to 0.39 ms for 12k visibilities (microbenchmark) |
 
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
