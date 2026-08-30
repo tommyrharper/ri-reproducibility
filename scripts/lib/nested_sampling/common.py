@@ -623,7 +623,11 @@ def load_fits_2d(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
 
 
 def rms(values: np.ndarray) -> float:
-    return float(np.sqrt(np.nanmean(values * values))) if values.size else 0.0
+    if not values.size:
+        return 0.0
+    if not np.isnan(values).any():
+        return float(np.sqrt(np.dot(values.ravel(), values.ravel()) / values.size))
+    return float(np.sqrt(np.nanmean(values * values)))
 
 
 def sigma_res(residual: np.ndarray, dirty: np.ndarray) -> float:
