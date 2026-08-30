@@ -632,7 +632,12 @@ def rms(values: np.ndarray) -> float:
 
 def sigma_res(residual: np.ndarray, dirty: np.ndarray) -> float:
     """R2D2-paper data-fidelity: ||residual_dirty||_2 / ||dirty||_2."""
-    return float(np.linalg.norm(residual) / max(np.linalg.norm(dirty), 1e-12))
+    residual_flat = residual.ravel()
+    dirty_flat = dirty.ravel()
+    return float(
+        np.sqrt(np.dot(residual_flat, residual_flat))
+        / max(np.sqrt(np.dot(dirty_flat, dirty_flat)), 1e-12)
+    )
 
 
 def source_pixel(
@@ -2177,6 +2182,9 @@ def self_check_metric_resolution() -> None:
     assert sigma_fn(sample) == sample["sigma_res"]
     assert abs(rms(np.array([3.0, 4.0])) - 5.0 / math.sqrt(2.0)) < 1e-12
     assert abs(sigma_res(np.array([3.0, 4.0]), np.array([0.0, 2.0])) - 2.5) < 1e-12
+    residual = np.array([1.0, -2.0, 3.0])
+    dirty = np.array([4.0, 5.0, -6.0])
+    assert sigma_res(residual, dirty) == np.linalg.norm(residual) / np.linalg.norm(dirty)
     assert off_source_mask((8, 8), 4, 4) is off_source_mask((8, 8), 4, 4)
 
     expr_fn, _ = resolve_metric("log_snr + 0.1 * wall_seconds")
