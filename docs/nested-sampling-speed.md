@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred twenty profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred twenty-one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **105.7 +/- 3.0
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -220,10 +220,10 @@ useful explicit setting for this 8-rank, 20-CPU host, but is not made automatic:
 the best thread count depends on the rank count and available CPUs, and forcing
 four threads would oversubscribe smaller-rank or larger-host configurations.
 
-A fresh three-repeat asynchronous R2D2 throughput probe measured **0.7663
-eval/s** median (0.7206, 0.7663, and 0.7845) at 8 ranks with the automatic
-three-thread setting. Each run used 39-43 evaluations and recorded **3.47 GB**
-peak worker memory; the 7.26-7.28 s/evaluation imaging stage remains the
+A fresh three-repeat asynchronous R2D2 throughput probe measured **0.7633 +/-
+0.016 eval/s** median (0.7179, 0.7780, and 0.7633) at 8 ranks with the
+automatic three-thread setting. Each run used 39-43 evaluations and recorded
+**3.47 GB** peak worker memory; the 7.25-7.30 s/evaluation imaging stage remains the
 dominant cost. This refresh confirms the prior 0.7251-0.7738 range rather than
 isolating a new code speedup.
 
