@@ -1,0 +1,15 @@
+diff --git a/src/optimiser/R2D2.py b/src/optimiser/R2D2.py
+index 0000000..0000000 100644
+--- a/src/optimiser/R2D2.py
++++ b/src/optimiser/R2D2.py
+@@ -264,10 +264,6 @@ class R2D2(Optimiser):
+             if self._target_dynamic_range is not None:
+                 log_snr_tmp = snr_t(self._gdth_log, to_log(self._model, self._target_dynamic_range), 1e-110)
+                 vprint(f"logSNR: {log_snr_tmp:.4f} dB", self._verbose)
+ 
+-        residual = (
+-            self._meas_bp - self._meas_op.adjoint_op(self._meas_op.forward_op(self._model)) / self._psf_peak
+-        )
+-        residual = residual.squeeze().double().cpu().numpy()
+         fits.writeto(
+             os.path.join(self._save_pth, f"{self._series}_model_image.fits"),
