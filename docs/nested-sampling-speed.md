@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Seventy-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Eighty profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.3 +/- 1.9
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -151,6 +151,11 @@ three-thread setting. Each run used 39-43 evaluations and recorded **3.47 GB**
 peak worker memory; the 7.26-7.28 s/evaluation imaging stage remains the
 dominant cost. This refresh confirms the prior 0.7251-0.7738 range rather than
 isolating a new code speedup.
+
+A fresh three-repeat default R2D2 probe measured **0.7302 eval/s** median
+(0.7302, 0.7318, and 0.7218) at 8 ranks, with **3.468 GB** peak worker memory
+and 7.44 s/evaluation in the image container. This is a baseline refresh, not
+a claimed regression or speedup; model inference remains the dominant cost.
 
 A matched explicit four-thread probe measured **0.7595 eval/s** median (0.7548,
 0.7595, and 0.7652) at the same 8 ranks, with **3.47 GB** peak worker memory.
