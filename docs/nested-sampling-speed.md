@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Seventy profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Seventy-one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.9 +/- 2.8
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -51,6 +51,7 @@ and [run scaling](nested-sampling-run-scaling.md):
 | WSClean's four unread FITS images pruned | another 3.94x - 393.6 KB to 99.9 KB, so this host's ceiling went from 477k evaluations to 1.88M |
 | A resume keeps each adopted objective, not each record | 62 GB down to 5.4 GB, which is the difference between the target run finishing and being OOM-killed |
 | Progress-bar redraw backed off to 9x its own cost | 44% of a core down to ~12%, and no longer growing with the run |
+| GNU progress scans classify total and post-checkpoint evaluations in one `find` walk | 0.232 s to 0.073 s for 20 scans of a 635-evaluation run; BSD `find` keeps the portable fallback |
 
 The current async WSClean throughput check measures **110.9 +/- 2.8
 evaluations/second** at 20 workers, 143.3 +/- 3.0 ms/evaluation, and 34.2 MB
