@@ -68,7 +68,7 @@ def ms_to_r2d2_mat(
     v_lambda = (uvw[:, 1, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
     y = vis.reshape(-1)
     # Convert MS inverse-variance weights to R2D2 nW, applying simulated sigma.
-    nW = (np.sqrt(row_weight[:, None]) / noise_sigma_jy).repeat(n_chan, axis=1).reshape(-1)
+    nW = np.repeat(np.sqrt(row_weight) / noise_sigma_jy, n_chan)
 
     mat_path.parent.mkdir(parents=True, exist_ok=True)
     savemat(
