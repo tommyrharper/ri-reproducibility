@@ -86,6 +86,13 @@ def machine_id() -> str:
     return hashlib.sha256((raw or platform.node()).encode()).hexdigest()[:8]
 
 
+def available_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def read_run_env(run_dir: Path) -> dict[str, str]:
     # write_run_config quotes with printf %q; same unquoting as
     # scripts/nested-sampling-runs.py.
@@ -546,6 +553,10 @@ def main() -> int:
         parser.error("--timeout must be greater than 0")
     if getattr(args, "handler", None) is do_run and args.mpi_procs is not None and args.mpi_procs < 1:
         parser.error("--mpi-procs must be at least 1")
+    if getattr(args, "handler", None) is do_run and args.mpi_procs is not None:
+        available = available_cpu_count()
+        if args.mpi_procs > available:
+            parser.error(f"--mpi-procs cannot exceed {available} available CPU slots")
 
     if args.self_check:
         self_check()

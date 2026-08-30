@@ -41,6 +41,8 @@ versus 70.6 eval/s for the portable baseline: no measurable speedup.
 
 `--mpi-procs N` overrides host-derived worker count for rank-scaling probes;
 the count is recorded in row settings, keeping results in separate groups.
+Explicit values above the process affinity are rejected before starting a
+search, avoiding Open MPI slot errors and wasted probes.
 
 ## What a row is
 
