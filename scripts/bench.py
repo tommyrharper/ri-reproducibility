@@ -14,8 +14,9 @@ import hashlib
 import json
 import os
 import platform
-import signal
+import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -92,9 +93,14 @@ def read_run_env(run_dir: Path) -> dict[str, str]:
         text = (run_dir / "run.env").read_text()
     except OSError:
         return {}
-    return {name.strip(): raw.strip().strip("'").replace("'\\''", "'")
-            for name, raw in (line.split("=", 1)
-                              for line in text.splitlines() if "=" in line)}
+    values = {}
+    for name, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line):
+        try:
+            parsed = shlex.split(raw, comments=False, posix=True)
+        except ValueError:
+            parsed = [raw.strip()]
+        values[name.strip()] = parsed[0] if parsed else ""
+    return values
 
 
 def presets() -> dict[str, dict[str, dict[str, Any]]]:
@@ -484,6 +490,11 @@ def self_check() -> None:
     import tempfile
 
     with tempfile.TemporaryDirectory() as raw:
+        env_dir = Path(raw) / "env"
+        env_dir.mkdir()
+        (env_dir / "run.env").write_text("NS_METRIC=total_rms_jy\\ -\\ 0.5\\ *\\ snr\n")
+        assert read_run_env(env_dir)["NS_METRIC"] == "total_rms_jy - 0.5 * snr"
+
         run = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         run.mkdir()
         assert row_for(run) is None, "a run outside results/nested-sampling"
