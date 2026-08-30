@@ -48,6 +48,7 @@ def peak_memory_bytes() -> int:
 # Avoid eager imports from `utils`; the last two pull unused heavy dependencies.
 _UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
 _CHECKPOINT_CACHE: dict[tuple[int, str], dict] = {}
+_NUFFT_PLAN_CACHE: dict[tuple[int, tuple[int, ...], str, float], object] = {}
 
 
 def install_lazy_utils() -> None:
@@ -159,19 +160,27 @@ def patch_nufft_plans() -> None:
         key = (nufft_type, upsampfac)
         if key not in plans:
             points = np.ascontiguousarray(self._traj.detach().numpy())
-            made = finufft.Plan(
-                nufft_type,
-                tuple(int(size) for size in self._img_size),
-                1,
-                # pytorch_finufft's defaults for both transform types, plus the
-                # two the operator passes itself. isign is -1 for type 1 too:
-                # pytorch_finufft overrides FINUFFT's +1 there.
-                eps=1e-6,
-                isign=-1,
-                dtype=torch.empty(0, dtype=self._dtype_meas).numpy().dtype,
-                upsampfac=upsampfac,
-                modeord=0,
-            )
+            shape = tuple(int(size) for size in self._img_size)
+            dtype = torch.empty(0, dtype=self._dtype_meas).numpy().dtype
+            cache_key = (nufft_type, shape, dtype.str, upsampfac)
+            made = _NUFFT_PLAN_CACHE.get(cache_key)
+            if made is None:
+                made = finufft.Plan(
+                    nufft_type,
+                    shape,
+                    1,
+                    # pytorch_finufft's defaults for both transform types, plus the
+                    # two the operator passes itself. isign is -1 for type 1 too:
+                    # pytorch_finufft overrides FINUFFT's +1 there.
+                    eps=1e-6,
+                    isign=-1,
+                    dtype=dtype,
+                    upsampfac=upsampfac,
+                    modeord=0,
+                )
+                _NUFFT_PLAN_CACHE[cache_key] = made
+            # Workers process one request at a time, so one shared plan can be
+            # retargeted for each new operator without concurrent users.
             made.setpts(points[0], points[1])
             plans[key] = made
         return plans[key]
@@ -576,6 +585,9 @@ def self_check_nufft_plan_reuse() -> None:
     upstream = operator()
     visibilities = upstream.forward_op(image)
     adjoint = upstream.adjoint_op(visibilities)
+    second = operator()
+    second._traj = second._traj + 0.01
+    expected_second = second.forward_op(image)
 
     patch_nufft_plans()
     patched = operator()
@@ -602,6 +614,8 @@ def self_check_nufft_plan_reuse() -> None:
     assert patched.get_op_norm(True) > 0.0
     assert torch.equal(patched.forward_op(image), visibilities), "the op-norm plan leaked into imaging"
     assert set(patched._ri_nufft_plans) == {(1, OP_NORM_UPSAMPFAC), (1, 2.0), (2, OP_NORM_UPSAMPFAC), (2, 2.0)}
+    assert torch.allclose(second.forward_op(image), expected_second, rtol=1e-12, atol=0.0)
+    assert patched._ri_nufft_plans[(2, 2.0)] is second._ri_nufft_plans[(2, 2.0)]
     print("r2d2 nufft plan self-check passed")
 
 
