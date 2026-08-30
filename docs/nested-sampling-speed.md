@@ -1,8 +1,8 @@
 # Making a nested-sampling search faster: the index
 
-One hundred sixty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
-The latest three-repeat async measurement reached **110.4 +/- 2.7
-evaluations/second at 20 workers**; the historical peak is 126
+One hundred sixty-five profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest matched three-pair async measurement reached **106.3 evaluations/second
+at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
 The first paired current-image 19-vs-20-worker probe measured **112.4 vs 104.2
 evaluations/second** over two repeats per arm, with **34.3 MB** peak memory in
@@ -12,6 +12,10 @@ change the default; the interleaved probe is now available as
 The follow-up three-pair probe measured **110.5 evaluations/second at 19
 workers versus 110.7 at 20**, with **34.2-34.4 MB** peak memory. The larger
 sample removes the earlier apparent 19-worker advantage; keep 20 workers as
+the default.
+A new matched three-pair probe measured **101.3 evaluations/second at 18 workers
+versus 106.3 at 20**, with **34.4-34.5 MB** peak memory. Reducing concurrency
+below 20 workers still lowers throughput without a memory benefit; keep 20 as
 the default.
 Four fresh current-image async controls measured **113.6 evaluations/second**
 by median (113.7, 122.6, 113.4, and 107.3), with **138.8 ms/evaluation** and
