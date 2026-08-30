@@ -682,9 +682,9 @@ def compute_image_metrics(
     cy = max(0, min(y_size - 1, cy))
     sx, sy = source_pixel(header, cx, cy, source_l_arcsec, source_m_arcsec, x_size, y_size)
 
-    truth = np.zeros_like(image)
-    truth[sy, sx] = source_flux_jy
-    residual = image - truth
+    # Truth is a one-pixel point source; avoid allocating a second full image.
+    residual = image.copy()
+    residual[sy, sx] -= source_flux_jy
 
     yy, xx = np.ogrid[:y_size, :x_size]
     off_source = (yy - sy) ** 2 + (xx - sx) ** 2 > 25
@@ -693,7 +693,7 @@ def compute_image_metrics(
     peak = float(np.nanmax(np.abs(image)))
     snr = peak / off_rms if off_rms > 0 else float("inf")
     log_snr = math.log10(snr) if math.isfinite(snr) and snr > 0 else 99.0
-    relative_l2_error = float(np.linalg.norm(residual) / max(np.linalg.norm(truth), 1e-12))
+    relative_l2_error = float(np.linalg.norm(residual) / max(abs(source_flux_jy), 1e-12))
     peak_flux_error = abs(float(image[sy, sx]) - source_flux_jy)
 
     metrics = {
