@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Launch anesthetic's nested-sampling GUI with labelled PolyChord chains.
-
-Run on the host (needs a display), e.g.:
-
-  uv run scripts/anesthetic-gui.py
-  uv run scripts/anesthetic-gui.py results/nested-sampling/wsclean-vlaa-...
-  ./ri plot gui results/nested-sampling/wsclean-vlaa-...
-
-Also opens a merged run directory (summary.json with merged_from),
-re-merging the source runs' chains on the fly via anesthetic_io.
-"""
+"""Launch anesthetic's GUI for a labelled PolyChord chain."""
 
 from __future__ import annotations
 
@@ -24,18 +14,7 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
 
-from anesthetic_io import find_chain_root, load_nested_samples  # noqa: E402
-
-# GetDist / anesthetic axis labels (wrapped in $...$ by anesthetic).
-PARAMETER_TEX_LABELS = {
-    "log10_dynamic_range": r"\mathrm{log}_{10}(\rho_{DR})",
-    "observation_minutes": r"t_{\mathrm{obs}}\,[\mathrm{min}]",
-    "channel_count": r"n_{\mathrm{freq}}",
-    "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
-    "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
-    "wsclean_niter": r"N_{\mathrm{iter}}",
-    "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
-}
+from anesthetic_io import PARAMETER_TEX_LABELS, find_chain_root, load_nested_samples  # noqa: E402
 
 FALLBACK_PARAMETER_SPACE = [
     {"name": "log10_dynamic_range"},
@@ -51,7 +30,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "target",
         nargs="?",
-        default=None,
         help="Run directory, run name, chains/ directory, or PolyChord file root. "
         "Default: most recent completed results/nested-sampling/*/ ",
     )
@@ -59,19 +37,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def is_completed_run(run_dir: Path) -> bool:
-    """Completed: summary.json + chains/, or a merged run (summary.json only)."""
-    if not run_dir.is_dir():
-        return False
     summary_path = run_dir / "summary.json"
     if not summary_path.is_file():
         return False
     if (run_dir / "chains").is_dir():
         return True
     try:
-        summary = json.loads(summary_path.read_text())
+        return bool(json.loads(summary_path.read_text()).get("merged_from"))
     except (OSError, ValueError):
         return False
-    return bool(summary.get("merged_from"))
 
 
 def latest_run_dir() -> Path:
@@ -83,31 +57,9 @@ def latest_run_dir() -> Path:
 
 def resolve_target(target: Path) -> Path:
     target = target.expanduser()
-    # The bare run name `./ri runs` prints, as well as a path - the same door
-    # `./ri health` and `./ri resume` open. A real path of that name wins.
     if not target.exists() and (NESTED_SAMPLING_DIR / target).is_dir():
         return NESTED_SAMPLING_DIR / target
-    if not target.is_absolute():
-        target = (Path.cwd() / target).resolve()
-    else:
-        target = target.resolve()
-    return target
-
-
-def merged_run_dir(target: Path) -> Path | None:
-    """target itself if it's a merged run directory, else None."""
-    summary_path = target / "summary.json"
-    if not target.is_dir() or not summary_path.is_file():
-        return None
-    try:
-        summary = json.loads(summary_path.read_text())
-    except (OSError, ValueError):
-        return None
-    return target if summary.get("merged_from") else None
-
-
-def run_dir_for_chain_root(chain_root: Path) -> Path:
-    return chain_root.parent.parent if chain_root.parent.name == "chains" else chain_root.parent
+    return target.resolve()
 
 
 def load_parameter_space(run_dir: Path) -> list[dict[str, Any]]:
@@ -125,53 +77,45 @@ def load_parameter_space(run_dir: Path) -> list[dict[str, Any]]:
     return list(FALLBACK_PARAMETER_SPACE)
 
 
-def searched_param_names(parameter_space: list[dict[str, Any]]) -> list[str]:
-    """Fourier / search params only — never logL, logL_birth, nlive."""
-    return [str(spec["name"]) for spec in parameter_space if "name" in spec]
-
-
 def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) -> Path:
     path = chain_root.parent / f"{chain_root.name}.paramnames"
-    with path.open("w") as handle:
-        for spec in parameter_space:
-            name = str(spec["name"])
-            tex = PARAMETER_TEX_LABELS.get(name, name)
-            handle.write(f"{name}   {tex}\n")
+    path.write_text("".join(
+        f"{name}   {PARAMETER_TEX_LABELS.get(name, name)}\n"
+        for name in (str(spec["name"]) for spec in parameter_space)
+    ))
     return path
-
-
-def run_title(run_dir: Path, fallback_label: str) -> str:
-    """Human-readable window title for the anesthetic GUI."""
-    parts: list[str] = [run_dir.name]
-    summary_path = run_dir / "summary.json"
-    if summary_path.is_file():
-        data = json.loads(summary_path.read_text())
-        algorithm = data.get("algorithm")
-        metric = data.get("metric")
-        vla = data.get("vla_config")
-        meta = [str(x) for x in (algorithm, vla, metric) if x]
-        if data.get("merged_from"):
-            meta.append("merged")
-        if meta:
-            parts.append(" · ".join(meta))
-    else:
-        parts.append(fallback_label)
-    return " — ".join(parts)
 
 
 def main() -> None:
     args = parse_args()
     target = resolve_target(Path(args.target)) if args.target else latest_run_dir()
 
-    run_dir = merged_run_dir(target)
+    summary_path = target / "summary.json"
+    run_dir = None
+    if target.is_dir() and summary_path.is_file():
+        try:
+            if json.loads(summary_path.read_text()).get("merged_from"):
+                run_dir = target
+        except (OSError, ValueError):
+            pass
     chain_root = None
     if run_dir is None:
         chain_root = find_chain_root(target)
-        run_dir = run_dir_for_chain_root(chain_root)
+        run_dir = chain_root.parent.parent if chain_root.parent.name == "chains" else chain_root.parent
 
     space = load_parameter_space(run_dir)
-    params = searched_param_names(space)
-    title = run_title(run_dir, chain_root.name if chain_root else run_dir.name)
+    params = [str(spec["name"]) for spec in space if "name" in spec]
+    parts = [run_dir.name]
+    if summary_path.is_file():
+        data = json.loads(summary_path.read_text())
+        meta = [str(data.get(key)) for key in ("algorithm", "vla_config", "metric") if data.get(key)]
+        if data.get("merged_from"):
+            meta.append("merged")
+        if meta:
+            parts.append(" · ".join(meta))
+    else:
+        parts.append(chain_root.name if chain_root else run_dir.name)
+    title = " — ".join(parts)
 
     if chain_root is not None:
         paramnames = write_paramnames(chain_root, space)

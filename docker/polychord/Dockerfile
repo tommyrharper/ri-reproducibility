@@ -1,10 +1,6 @@
 # syntax=docker/dockerfile:1
-#
-# PolyChordLite plus the repo's nested-sampling driver.
-#
-# Build:
-#   docker build --platform linux/arm64 -f docker/polychord/Dockerfile \
-#     -t ri-reproducibility/polychord:lite .
+# PolyChordLite plus repo nested-sampling driver. Build with:
+# docker build --platform linux/arm64 -f docker/polychord/Dockerfile -t ri-reproducibility/polychord:lite .
 
 ARG POLYCHORD_GIT_URL=https://github.com/PolyChord/PolyChordLite.git
 ARG POLYCHORD_GIT_COMMIT=370f6af5d59a4d3af2ed3333acfba152fdb7a4cf

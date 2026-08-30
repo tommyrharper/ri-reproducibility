@@ -1,10 +1,6 @@
-# WSClean CLI arguments for the smoke test, one per line (blank lines and
-# '#' comments ignored). Read by scripts/smoke-test-wsclean.sh. The MS
-# path and -name output prefix are appended by the script itself.
-#
-# 256x256 / 1000 clean iterations / mgain 0.8 keeps this a genuine, if
-# tiny, gridding -> iFFT -> deconvolution pass on the ~530 KB JVLA
-# minimal test MS, completing in well under a minute on one thread.
+# WSClean smoke-test arguments, one per line. The script appends the MS path
+# and output prefix. This tiny 256x256, 1000-iteration imaging pass completes
+# in under a minute on one thread.
 -size
 256
 256
@@ -18,8 +14,5 @@
 3
 -j
 1
-# The MS fixture is bind-mounted read-only (kept pristine across re-runs);
-# this skips WSClean's normal write-back of predicted model visibilities
-# into the MS, which would otherwise fail with a "Read-only file system"
-# error at the very end of an otherwise-successful run.
+# Keep the read-only fixture pristine and skip predicted-model write-back.
 -no-update-model-required

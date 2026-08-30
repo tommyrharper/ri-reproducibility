@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""Merge compatible nested-sampling runs into one run directory.
-
-Post-processing only: concatenates PolyChord dead points via
-anesthetic.samples.merge_nested_samples and writes a new
-results/nested-sampling/<algorithm>-vlaa-merged-<UTC>/summary.json
-that points back at the source runs. Does not copy evaluations/ or chains/.
-
-Discover every compatible group (no args):
-
-  uv run scripts/merge-nested-sampling-runs.py
-
-Merge an explicit list (>= 2 dirs; refuses if any pair is incompatible):
-
-  uv run scripts/merge-nested-sampling-runs.py \\
-      results/nested-sampling/r2d2-vlaa-AAA \\
-      results/nested-sampling/r2d2-vlaa-BBB
-"""
+"""Merge compatible runs; see docs/nested-sampling.md for details."""
 
 from __future__ import annotations
 
@@ -49,7 +33,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--out",
-        default=None,
         help="Output directory (explicit run list only). "
         "Default: results/nested-sampling/<algorithm>-vlaa-merged-<UTC>",
     )
@@ -58,16 +41,8 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_run_dir(raw: str) -> Path:
     path = Path(raw).expanduser()
-    # The bare run name `./ri runs` prints, as well as a path - the same door
-    # `./ri health` and `./ri resume` open. A real path of that name wins.
     if not path.exists() and (NESTED_SAMPLING_DIR / raw).is_dir():
         return NESTED_SAMPLING_DIR / raw
-    # Resolved whether or not it was absolute, like resolve_run() in
-    # profile-nested-sampling-run.py: an absolute path through a symlink is a
-    # different string for the same directory, which is every temp path on
-    # macOS (/var -> /private/var).
-    if not path.is_absolute():
-        path = Path.cwd() / path
     return path.resolve()
 
 
@@ -90,10 +65,10 @@ def load_summary(run_dir: Path) -> dict[str, Any]:
 
 
 def fixed_hyperparameters_field(summary: dict[str, Any]) -> tuple[str | None, Any]:
-    for key in FIXED_HYPERPARAMETER_KEYS:
-        if summary.get(key) is not None:
-            return key, summary[key]
-    return None, None
+    return next(
+        ((key, summary[key]) for key in FIXED_HYPERPARAMETER_KEYS if summary.get(key) is not None),
+        (None, None),
+    )
 
 
 def check_compatible(run_dirs: list[Path], summaries: list[dict[str, Any]]) -> None:
@@ -141,30 +116,15 @@ def merged_polychord(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {"nlive": sum(nlive_values)}
     for field in ("num_repeats", "max_ndead", "seed"):
         values = [p.get(field) for p in polychords]
-        unique = list(dict.fromkeys(values))
-        result[field] = unique[0] if len(unique) == 1 else values
+        result[field] = values[0] if len(set(values)) == 1 else values
     return result
 
 
 def pooled_evaluations(run_dirs: list[Path], summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    pooled = []
-    next_id = 1
-    for run_dir, summary in zip(run_dirs, summaries):
-        for ev in summary.get("evaluations", []):
-            new_ev = dict(ev)
-            new_ev["source_eval_id"] = ev.get("eval_id")
-            new_ev["source_run"] = run_dir.name
-            new_ev["eval_id"] = next_id
-            next_id += 1
-            pooled.append(new_ev)
-    return pooled
-
-
-def merged_nested_samples(run_dirs: list[Path]):
-    from anesthetic.samples import merge_nested_samples
-
-    sub_samples = [read_chains_at(find_chain_root(run_dir)) for run_dir in run_dirs]
-    return merge_nested_samples(sub_samples)
+    evaluations = ((run_dir, ev) for run_dir, summary in zip(run_dirs, summaries)
+                   for ev in summary.get("evaluations", []))
+    return [{**ev, "source_eval_id": ev.get("eval_id"), "source_run": run_dir.name,
+             "eval_id": eval_id} for eval_id, (run_dir, ev) in enumerate(evaluations, 1)]
 
 
 def unique_merged_out_dir(algorithm: str) -> Path:
@@ -183,7 +143,11 @@ def merge_run_dirs(run_dirs: list[Path], summaries: list[dict[str, Any]], out_di
 
     first = summaries[0]
     algorithm = first["algorithm"]
-    samples = merged_nested_samples(run_dirs)
+    from anesthetic.samples import merge_nested_samples
+
+    samples = merge_nested_samples(
+        [read_chains_at(find_chain_root(run_dir)) for run_dir in run_dirs]
+    )
     logz_samples = samples.logZ(LOGZ_NSAMPLES)
     log_z = float(logz_samples.mean())
     log_z_err = float(logz_samples.std())
@@ -234,9 +198,7 @@ def discover_sources() -> list[tuple[Path, dict[str, Any]]]:
             try:
                 summary = json.loads(summary_path.read_text())
             except ValueError:
-                # Half a summary.json, from a rank killed writing it. Skipped
-                # like any other run that did not finish, rather than taking
-                # the merge of every other run down with it.
+                # Ignore torn summaries so one incomplete run cannot block others.
                 print(f"skip {run_dir.name}: half-written summary.json - "
                       f"./ri resume {run_dir.name} rewrites it")
                 continue

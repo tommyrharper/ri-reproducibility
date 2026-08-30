@@ -68,7 +68,6 @@ from common import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--repo-root", default=os.environ.get("REPO_ROOT", os.getcwd()))
     parser.add_argument("--meqtrees-image", default=os.environ.get("MEQTREES_IMAGE", "ri-reproducibility/meqtrees:kern-10"))
     parser.add_argument("--wsclean-image", default=os.environ.get("WSCLEAN_IMAGE", "ri-reproducibility/wsclean:v3.7"))
     parser.add_argument("--nlive", type=int, default=8)
@@ -147,30 +146,14 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
-        # Without this WSClean opens the whole parent measurement set once,
-        # before it has opened anything else, only to ask whether there is a
-        # CORRECTED_DATA column (Settings::determineDataColumn). There never
-        # is - self_check_dropped_subtables() asserts it - and naming the
-        # column is -1.0% on the wsclean binary over 800 paired replays
-        # against a 0.1%-resolution null, with 1000 FITS data blocks
-        # bit-identical. See docs/nested-sampling-cost-model.md.
+        # Avoids WSClean's unused CORRECTED_DATA probe; see the cost-model doc.
         "-data-column",
         "DATA",
-        # Every output line carries a microsecond timestamp, which makes each
-        # evaluation's wsclean.stdout.log a phase timeline at production
-        # concurrency with no rig and no instrumentation - that is what
-        # `./ri profile <run> --phases` reads. Measured at +0.9% against a
-        # 1.8%-resolution null pair on a 63-Measurement-Set replay, i.e. free,
-        # and ~1 KB on a 400 KB evaluation. See
-        # docs/nested-sampling-phase-profile.md.
+        # Timestamps make wsclean.stdout.log usable by `./ri profile --phases`.
         "-log-time",
         str(ms_path),
     ]
-    # No `docker stats` polling loop here, and no `/usr/bin/time -v` either:
-    # the zygote's own wait4() reports an exact peak RSS and the child's wall
-    # clock, where the 0.2s-interval stats sampler both missed short peaks and
-    # delayed noticing the process had exited, and GNU `time` cost a fork+exec
-    # per evaluation to answer in centiseconds.
+    # zygote wait4() supplies exact child wall time and peak RSS.
     run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = run_result.peak_memory_bytes
     image_binary_seconds = run_result.binary_seconds
@@ -406,36 +389,14 @@ def main() -> None:
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
-    # PolyChord's own checkpointing, on so that an interrupted run is not a
-    # wasted one. It was off, which was survivable when a run was 100s of toy
-    # evaluations and is not once a run is hours long: any interruption - the
-    # host running out of memory, a Ctrl-C, a reboot - threw away every
-    # evaluation. Resuming is `--output-dir <the interrupted run>`, which finds
-    # the resume file and continues; a fresh run has none and starts clean.
+    # Checkpoint long runs; `--output-dir <interrupted run>` resumes, while a
+    # fresh run without a resume file starts clean.
     resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
-    # Adopt what an earlier attempt already evaluated, so eval ids carry on
-    # rather than restarting at 1 and colliding with its directories, and so a
-    # repeated point is served from the cache instead of being recomputed.
-    #
-    # Not conditional on the resume file, because the two conditions are not
-    # the same one: PolyChord writes `.resume` at its first checkpoint, so an
-    # attempt killed before that - up to seventy minutes of R2D2 imaging, and
-    # every kill on a short run - leaves evaluations on disk and no resume
-    # file. Adopting only when resuming meant that restart began at eval id 1
-    # on top of the previous attempt's directories, which
-    # simulate_measurement_set creates with `exist_ok=False`: one rank died on
-    # FileExistsError and the rest hung forever in a collective that never
-    # completed. Sampling from scratch is cheap here anyway - PolyChord redraws
-    # the same points from the same seed and the cache answers without imaging.
-    # That holds only for the from-scratch case, and measurably so: a killed
-    # WSClean search and an uninterrupted control from the same seed shared
-    # exactly the 122 evaluations scored before the kill, and none of the 146
-    # scored after a *resume*. A resume re-seeds and then skips ahead to the
-    # checkpoint, so the stream no longer lines up with the points on disk and
-    # the cache answers none of the stretch being redone - which is what
-    # `./ri health`'s `at risk` line puts a number on.
+    # Always adopt disk evaluations: retries can die before PolyChord writes a
+    # resume file, and reusing ids prevents directory collisions. A fresh
+    # retry reuses the cache; a resumed sampler skips ahead, so it may not.
     done = scored = adopt_completed_evaluations(evaluations_dir, cache)
     if done:
         where = (f"resuming from {resume_path}" if settings.read_resume

@@ -1,26 +1,6 @@
 #!/usr/bin/env bash
-# Run the self-checks that need one of this repo's images to mean anything.
-#
-# The host-only checks run in CI on every change. These cannot: they need a live
-# meqserver, a real TDL compile, numpy and casacore. Before this existed nothing
-# ran them at all - they were written, wired into each module's own --self-check
-# entry point, and then only ever invoked by hand, which is the same as not
-# having them.
-#
-# The repo is bind-mounted and the working tree's copy is what runs, so these
-# check the code you are about to ship using the image's interpreter and
-# libraries - no rebuild needed to check a change. A run executes the copy baked
-# into the image instead, so rebuild before running one.
-#
-# All but the last of these start no search. The self-heal check does - five ~45
-# second, ~0.6GB WSClean searches: one killed, one hung by freezing a rank, one
-# killed with no retries left and resumed by hand, one whose workers are killed
-# under it, and one whose sidecar container is removed, each watched until it
-# recovers, plus a sixth break with no search of its own - the fifth run's
-# PolyChord checkpoint truncated and resumed - because the thing it checks
-# only exists in a real run. It is safe alongside another run:
-# 3 ranks at ~200MB, sized and refused by scripts/lib/rank-budget.sh like any
-# other, on a throwaway directory the report and `./ri runs` never see.
+# Run image checks; the working tree is mounted, but searches use baked copies
+# and need a rebuild. Self-heal uses throwaway searches with rank/memory limits.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,13 +23,9 @@ docker_run() {
 
 nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 
-# Through uv, like every other host-side entry point in `ri`, and pinned the
-# way scripts/lib/defaults.sh pins it: test_self_checks.py imports common.py,
-# which needs tomllib to read defaults.toml. A host whose `python3` predates
-# 3.11 - Ubuntu 22.04's 3.10 is one - took the whole of `./ri self-check` down
-# on that import, self-heal check included, so the only check that starts a
-# real search was unreachable through its own documented front door.
-# --no-project because these two need nothing from pyproject.toml.
+# Use uv's pinned Python >=3.11: host `python3` may lack tomllib, which
+# `test_self_checks.py` needs through common.py. `--no-project` keeps checks
+# independent of pyproject.toml.
 host_python() { uv run --no-project --python ">=3.11" python "$@"; }
 
 echo "=== host-side checks ==="
@@ -66,17 +42,12 @@ fi
 if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2-serve" ]]; then
   echo
   echo "=== r2d2 imaging worker (${R2D2_IMAGE}) ==="
-  # The R2D2 sidecar runs this file off the bind mount, so what runs here is
-  # what a run would run. Its numpy and measurement-operator checks skip
-  # themselves outside this image, which is what they do in CI.
   docker_run --entrypoint python3 "${R2D2_IMAGE}" -u "$(nested_sampling r2d2_serve.py)" --self-check
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "zygote" ]]; then
   echo
   echo "=== wsclean fork server (${WSCLEAN_IMAGE}) ==="
-  # In the WSClean image rather than the sampler's, because what is under test
-  # is the `wsclean-zygote` binary this repo adds to it.
   docker_run --entrypoint python3 "${WSCLEAN_IMAGE}" -u "${REPO_ROOT}/scripts/test_zygote.py"
 fi
 
@@ -97,10 +68,6 @@ fi
 if [[ "${TARGET}" == "all" || "${TARGET}" == "report" ]]; then
   echo
   echo "=== HTML report (${R2D2_IMAGE}) ==="
-  # In the image that builds the report, because most of these check the
-  # matplotlib fast paths the corner plots depend on. Until this existed the
-  # whole family was written and never run - the same gap the header above
-  # describes, one file further out.
   docker_run -e GENERATE_REPORT_SELF_CHECK=1 --entrypoint python3 \
     "${R2D2_IMAGE}" -u "${REPO_ROOT}/scripts/lib/generate_report.py"
 fi
@@ -108,9 +75,6 @@ fi
 if [[ "${TARGET}" == "all" || "${TARGET}" == "self-heal" ]]; then
   echo
   echo "=== self-healing (real searches, killed and hung) ==="
-  # Host-side, unlike the checks above: what is under test - run_with_retries in
-  # scripts/lib/progress-bar.sh and `./ri health` - runs on the host from the
-  # working tree. The search it drives executes the copy baked into the images.
   bash "${REPO_ROOT}/scripts/test_self_heal.sh"
 fi
 

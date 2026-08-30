@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# Renders FITS images to PNG using the r2d2 image's own astropy +
-# matplotlib (no host Python environment required - see README.md
-# "Visualizing FITS output"). Defaults to both smoke tests' standard
-# output sets (whichever have actually been run); pass one or more
-# paths (relative to the repo root, or absolute paths inside the r2d2
-# image such as the bundled ground-truth FITS baked into
-# /opt/r2d2/R2D2-RI/data) to render specific files instead. PNGs are
-# written flat into results/, named after the source file.
+# Render FITS images to PNG with astropy + matplotlib in the R2D2 image.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,8 +12,7 @@ source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
 if [ "$#" -gt 0 ]; then
   targets=("$@")
 else
-  # Both smoke tests' standard output sets. Either may not have been run
-  # yet, so defaults are skipped (not a hard failure) when missing.
+  # Use outputs from either smoke test; skip missing files.
   candidates=(results/smoke-test-r2d2/r2d2-unet/data_3c353/dirty_normalised.fits
               results/smoke-test-r2d2/r2d2-unet/data_3c353/PSF.fits
               results/smoke-test-r2d2/r2d2-unet/data_3c353/R2D2_model_image.fits

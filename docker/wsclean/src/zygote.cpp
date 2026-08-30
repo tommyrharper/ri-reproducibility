@@ -1,26 +1,5 @@
-// wsclean-zygote - a fork server for wsclean.
-//
-// Why this exists: at the concurrency a nested-sampling search runs at, ~27ms
-// of every ~163ms `wsclean` process is spent before main() gets control. That
-// is the C++ static initialisation of casacore and the 72 other shared objects
-// wsclean links (`LD_PRELOAD=libcasa_ms.so.9 /bin/true` alone costs 11ms), and
-// it is identical work every time. The search runs ~70 of these a second.
-//
-// So pay it once. This process links the same wsclean-lib the `wsclean` binary
-// does, and after its own static initialisers have run it reads one request per
-// line from stdin and forks a child per request. The child inherits the fully
-// initialised address space and calls the same CommandLine::Parse/Run pair
-// main() calls, so it images exactly what `wsclean` would have imaged.
-//
-// Protocol - one request line in, one reply line out, tab separated:
-//   request: <cwd> \t <stdout path> \t <stderr path> \t <arg> ...
-//   reply:   <exit status> \t <wall seconds> \t <peak rss bytes>
-// The reply carries what `/usr/bin/time -v` used to be spawned to report, from
-// wait4()'s rusage, so the caller also stops paying for that fork+exec. A child
-// killed by a signal reports 128+signal, as a shell would. Paths and arguments
-// therefore may not contain a tab or a newline; the caller checks that.
-//
-// See docs/nested-sampling-wsclean-zygote.md.
+// Fork an initialized WSClean child per evaluation. Protocol details:
+// docs/nested-sampling-wsclean-zygote.md.
 
 #include "commandline.h"
 #include "wsclean.h"
@@ -58,10 +37,7 @@ std::vector<std::string> SplitTabs(const std::string& line) {
   return fields;
 }
 
-// fork() only copies the calling thread, so a second thread holding a lock at
-// fork time deadlocks the child. Nothing wsclean links starts one from a static
-// initialiser today - checked here rather than assumed, because the failure is
-// a search that hangs rather than one that stops.
+// fork() copies only the calling thread; a held lock would hang the child.
 void RefuseIfThreaded() {
   std::ifstream status("/proc/self/status");
   std::string key;
@@ -97,15 +73,13 @@ void Redirect(const std::string& path, int fd, int flags) {
 
   int status = 0;
   try {
-    // Scoped so WSClean's destructor runs - it is what removes the reordered
-    // temp files - before _exit() skips the global destructors and the unmapping
-    // of 73 shared objects, which are pure teardown cost.
+    // Scope destructor removes reordered temp files before _exit skips globals.
     wsclean::WSClean wsclean;
     if (wsclean::CommandLine::Parse(wsclean, static_cast<int>(argv.size()),
                                     argv.data(), false))
       wsclean::CommandLine::Run(wsclean);
   } catch (std::exception& e) {
-    // Byte for byte what main.cpp prints, including its exit status of -1.
+    // Match main.cpp's exception output and failure status.
     aocommon::Logger::Error << "+ + + + + + + + + + + + + + + + + + +\n"
                             << "+ An exception occured:\n";
     std::istringstream iss(e.what());
@@ -119,25 +93,8 @@ void Redirect(const std::string& path, int fd, int flags) {
   _exit(status);
 }
 
-// FFTW builds a per-transform-size plan the first time it is asked for one, and
-// wsclean asks 63 times per evaluation while never keeping one: schaapcommon's
-// Convolve() creates and destroys four 1-D plans on every call (radler runs one
-// per major cycle) and its Resampler constructor creates two 2-D ones per
-// gridding and degridding pass. Counted with an LD_PRELOAD shim over the
-// fftwf_plan_* entry points, that is 6.3ms of a ~56ms serial process, of which
-// 4.4ms is the once-per-size build and 1.9ms the repeats.
-//
-// The once-per-size half is process-global state a forked child inherits, so
-// the parent pays it here and no evaluation pays it again. Sizes, for this
-// search's fixed `-size 128 128` and its baseline-derived `-scale`:
-//   128  the image itself
-//   142  radler's deconvolution convolution, even(ceil(1.1 x 128))
-//   156  the padded image
-//   108  the gridder's chosen inversion size ("using optimal: 108 x 108" in
-//        every one of a 6641-evaluation run's logs)
-// A size that stops being used costs this warm-up and nothing else; one that
-// starts being used is simply not warmed, so this can only lose the speedup,
-// never a result. See docs/nested-sampling-fftw-planner.md.
+// Warm process-global FFTW plans inherited by forked evaluations. Sizes match
+// this search's fixed image and scale; see docs/nested-sampling-fftw-planner.md.
 void WarmFftwPlanner() {
   for (const int n : {108, 128, 142, 156}) {
     fftwf_destroy_plan(fftwf_plan_dft_r2c_1d(n, nullptr, nullptr, FFTW_ESTIMATE));
@@ -147,8 +104,7 @@ void WarmFftwPlanner() {
         fftwf_plan_dft_1d(n, nullptr, nullptr, FFTW_BACKWARD, FFTW_ESTIMATE));
     fftwf_destroy_plan(fftwf_plan_dft_c2r_1d(n, nullptr, nullptr, FFTW_ESTIMATE));
 
-    // Resampler plans against fftw-allocated buffers, and FFTW keys what it
-    // learns on their alignment, so the warm-up has to allocate too.
+    // FFTW keys resampler plans by buffer alignment, so allocate matching buffers.
     float* image = fftwf_alloc_real(static_cast<size_t>(n) * n);
     fftwf_complex* spectrum =
         fftwf_alloc_complex(static_cast<size_t>(n) * (n / 2 + 1));
@@ -161,19 +117,7 @@ void WarmFftwPlanner() {
   }
 }
 
-// The other two pieces of process-global state a child builds for itself.
-//
-// cfitsio's one-time initialisation is 0.47 ms and needs nothing from the
-// request, so it is paid at start-up. casacore's is ~0.94 ms and needs a real
-// Measurement Set to open - opening a plain casacore::Table warms less than
-// half of it and creating a throwaway one costs 26 ms - so it is paid on the
-// first request, out of the set that request names. Both are ordinary lazy
-// initialisation of shared library state, so a child that inherits it images
-// exactly what it would have imaged. A path that turns out not to be a
-// Measurement Set costs this warm-up and nothing else: the child opens it
-// again and reports the error itself.
-//
-// See docs/nested-sampling-process-warm-up.md.
+// Warm casacore once against the first request's Measurement Set.
 void WarmCasacore(const std::string& measurement_set) {
   try {
     const casacore::MeasurementSet ms(measurement_set);
@@ -203,15 +147,12 @@ int main() {
       continue;
     }
     if (!casacore_warmed) {
-      // wsclean's own argument order: the input Measurement Set is last.
       WarmCasacore(fields.back());
-      // Re-checked rather than assumed, for the same reason it is checked at
-      // start-up: this is the one warm-up that runs library code with a
-      // thread pool in it, and it happens between the check and the fork.
+      // Casacore warm-up may create threads between the initial check and fork.
       RefuseIfThreaded();
       casacore_warmed = true;
     }
-    // Nothing buffered may survive into the child, or it is written twice.
+    // Avoid duplicated buffered output after fork.
     std::cout.flush();
     std::cerr.flush();
     const double started = MonotonicSeconds();

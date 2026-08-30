@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Interactive bash inside one of the built images, with this repo's usual
-# mounts. Image tags come from defaults.toml, not from a second copy here.
+# Open bash in a built image with this repo's usual mounts.
 #
-#   scripts/shell.sh <wsclean|r2d2|meqtrees|polychord>
-#
-# No --platform is passed: Docker runs the image for the host architecture and
-# honours DOCKER_DEFAULT_PLATFORM when set, same as compose.yaml.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

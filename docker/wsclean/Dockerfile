@@ -1,22 +1,5 @@
 # syntax=docker/dockerfile:1
-#
-# WSClean, built from a pinned source revision. See ../../versions.env for
-# the exact tag/commit and README.md for why casacore is also built from
-# source rather than taken from Debian packages.
-#
-# WSCLEAN_TARGET_CPU is the one knob over the instruction set the gridder is
-# compiled for; it is WSClean's own `-DTARGET_CPU` (see README.md "Which CPU
-# WSClean is built for"):
-#
-#   x86-64-v3   the default: AVX2 + FMA, i.e. every x86-64 CPU since ~2013.
-#               One fixed binary, so two hosts still image bit-identically.
-#   native      this exact CPU, and SIGILL on any other (`./ri build wsclean
-#               --native`).
-#   (empty)     the plain x86-64 baseline, ~10% slower - and what a non-x86
-#               build falls back to, since the default names an x86 target.
-#
-#   docker build --platform linux/arm64 -f docker/wsclean/Dockerfile \
-#     --build-arg WSCLEAN_TARGET_CPU= -t ri-reproducibility/wsclean .
+# WSClean, built from pinned source; see README.md for build and CPU guidance.
 
 ARG WSCLEAN_GIT_URL=https://gitlab.com/aroffringa/wsclean.git
 ARG WSCLEAN_GIT_TAG=v3.7

@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""Print a per-stage timing breakdown for a nested-sampling run.
-
-Post-processing only: reads the `profiling` block that `polychord_wsclean.py`
-/ `polychord_r2d2.py` write into `summary.json` (summed from per-evaluation
-`timing.*` fields recorded around each pipeline stage) and renders it as a
-human-readable table, so you can see which stage actually dominates wall time
-without guessing.
-
-Every share is a fraction of the run's worker-time budget (wall clock x
-workers, which is one less than the rank count - PolyChord's rank 0
-administrates and never evaluates a likelihood), so the top-level rows add up
-to 100% of what the whole process spent: the stages of an evaluation, then the
-time no evaluation was running in - PolyChord itself, and workers waiting on
-other workers. The same breakdown - and the same numbers - back the Profiling
-section of the HTML run report.
-
-Usage:
-
-  uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC>
-  uv run scripts/profile-nested-sampling-run.py results/nested-sampling/wsclean-vlaa-<UTC>/summary.json
-  uv run scripts/profile-nested-sampling-run.py <run-dir> --json
-  uv run scripts/profile-nested-sampling-run.py <run-dir> --phases
-  uv run scripts/profile-nested-sampling-run.py <run-dir> --over-time
-"""
+"""Print per-stage timing from ``summary.json``; shares match HTML report."""
 
 from __future__ import annotations
 
@@ -51,25 +28,14 @@ NESTED_SAMPLING_DIR = Path(__file__).resolve().parents[1] / "results" / "nested-
 
 
 def resolve_run(raw: str) -> Path:
-    """A path, or the bare run name `./ri runs` prints in its first column.
-
-    The name is what a reader has in front of them, and `./ri health` and
-    `./ri resume` both take one, so a path-only profiler was the odd door out.
-    Only when nothing of that name exists as a path: a real `./wsclean-.../`
-    in the working directory still wins, as it does for every other command.
-    """
     target = Path(raw).expanduser()
-    return NESTED_SAMPLING_DIR / raw if not target.exists() \
-        and (NESTED_SAMPLING_DIR / raw).is_dir() else target.resolve()
+    return (NESTED_SAMPLING_DIR / raw if not target.exists() and (NESTED_SAMPLING_DIR / raw).is_dir() else target).resolve()
 
 
 def load_summary(target: Path) -> dict[str, Any]:
     summary_path = target / "summary.json" if target.is_dir() else target
     if not summary_path.is_file():
         if target.is_dir():
-            # The common case now that `./ri tui` loops through this view:
-            # a run that is still going has nothing to profile yet, and saying
-            # which command does watch a live run is more use than a path.
             raise SystemExit(
                 f"{target.name} has not written a summary.json yet - a run writes "
                 f"one when it finishes.\n./ri health {target.name} is the view of a "
@@ -79,8 +45,6 @@ def load_summary(target: Path) -> dict[str, Any]:
     try:
         return json.loads(summary_path.read_text())
     except ValueError:
-        # Half a summary.json, from a rank killed writing it. Said plainly,
-        # with the command that rewrites it, rather than as a JSONDecodeError.
         raise SystemExit(
             f"{summary_path} is only half written - the run was killed while "
             f"writing it.\n./ri resume {summary_path.parent.name} rewrites it "
@@ -144,13 +108,9 @@ def print_report(summary: dict[str, Any]) -> None:
         breakdown["subtotal_share"],
         breakdown["subtotal_per_eval_seconds"],
     )
-    # Below the sum: the time no evaluation was running in, which is the half
-    # of the run the stage rows above can say nothing about.
     for row in breakdown["remainder_rows"]:
         line(row["label"], row["seconds"], row["share"])
     print()
-    # The same arithmetic the HTML report prints under its chart: worker-seconds
-    # only reach the run's wall clock once they are spread across the workers.
     terms = list(breakdown["equation_terms"])
     if mpi_procs != 1:
         terms.append(f"= {format_duration(budget)} of worker-time")
@@ -161,19 +121,7 @@ def print_report(summary: dict[str, Any]) -> None:
     print()
     print(f"note: {breakdown['note']}")
 
-
-
-
-# --- inside one wsclean process ------------------------------------------
-#
-# `wsclean -log-time` stamps every output line, so a run's own
-# wsclean.stdout.log files are a phase timeline at production concurrency with
-# no rig and no instrumentation (polychord_wsclean.py passes the flag; it costs
-# nothing measurable). A line's stamp is written when the line *starts*, so the
-# work a line announces sits in the gap between it and the next line - and the
-# gaps are bucketed by (line, next line) rather than by line alone, because
-# "Loading data in memory..." appears once per gridding pass and means something
-# different each time. See docs/nested-sampling-phase-profile.md.
+# `-log-time` makes each WSClean log a phase timeline; see docs/nested-sampling-phase-profile.md.
 _MONTHS = {m: i + 1 for i, m in enumerate(
     "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
 _STAMP = re.compile(
@@ -181,13 +129,11 @@ _STAMP = re.compile(
 
 
 def _phase_label(text: str) -> str:
-    """Collapse the parts of a log line that differ between evaluations."""
     text = re.sub(r"/\S+", "<path>", text)
     return re.sub(r"[-+]?\d[\d.eE+-]*", "N", text)[:64]
 
 
 def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[float]]]:
-    """(logs read, mean logged milliseconds, gap milliseconds by phase)."""
     gaps: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     logged: list[float] = []
     for path in log_paths:
@@ -233,7 +179,6 @@ _VIS_COUNT = re.compile(r"^Gridded visibility count: (\d+)")
 
 
 def evaluation_timeline(log_paths: Any) -> list[tuple[float, float, int]]:
-    """(start epoch, logged milliseconds, gridded visibilities) per evaluation."""
     rows = []
     for path in log_paths:
         stamps: list[float] = []
@@ -257,14 +202,6 @@ def evaluation_timeline(log_paths: Any) -> list[tuple[float, float, int]]:
 
 
 def print_over_time(run_dir: Path, buckets: int) -> None:
-    """Throughput against wall clock, so a run's own slowdown can be attributed.
-
-    An evaluation costs roughly a constant plus a rate times its visibility
-    count, and nested sampling walks into the corner of the parameter space
-    with the most visibilities - so a run's evaluations/second falls as it
-    goes. Printing the visibility count beside the rate is what separates that
-    from the machine (see docs/nested-sampling-cost-model.md).
-    """
     logs = sorted(run_dir.glob("evaluations/*/wsclean.stdout.log"))
     if not logs:
         raise SystemExit(f"no evaluations/*/wsclean.stdout.log under {run_dir}")
@@ -297,7 +234,6 @@ def print_over_time(run_dir: Path, buckets: int) -> None:
 
 
 def self_check() -> None:
-    """A two-line timeline is enough to pin the gap arithmetic and the labels."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as raw:
@@ -326,7 +262,6 @@ def self_check() -> None:
     assert abs(timeline[0][1] - 7.5) < 1e-3, timeline
     assert timeline[0][2] == 4140, timeline
 
-    # A live run has no summary.json, and `./ri tui` now shows what this says.
     with tempfile.TemporaryDirectory() as raw:
         live = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         live.mkdir()
@@ -341,13 +276,11 @@ def self_check() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", nargs="?", help="Run directory, run name, or summary.json path")
     parser.add_argument("--json", action="store_true", help="Print the raw profiling dict as JSON instead of a table")
-    parser.add_argument("--phases", action="store_true",
-                        help="Break the wsclean binary down by phase, from every evaluation's own -log-time timeline")
-    parser.add_argument("--over-time", action="store_true",
-                        help="Evaluations/second against wall clock, beside the visibility count that sets it")
+    parser.add_argument("--phases", action="store_true", help="Break down WSClean phases from -log-time")
+    parser.add_argument("--over-time", action="store_true", help="Evaluations/second and visibility count over time")
     parser.add_argument("--top", type=int, default=25, help="Phases to print, largest first")
     parser.add_argument("--buckets", type=int, default=20, help="Buckets for --over-time")
     parser.add_argument("--self-check", action="store_true", help=argparse.SUPPRESS)

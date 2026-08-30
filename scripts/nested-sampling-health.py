@@ -1,68 +1,5 @@
 #!/usr/bin/env python3
-"""Say whether a nested-sampling run is healthy, stalled, stopped - or worthless.
-
-`./ri runs` answers "did this run finish?". This answers the question you have
-while one is still going: is it making progress, and is the progress worth
-anything? What every line reads and why is docs/run-health.md; this is what the
-report is *for*, which is the part that decides what belongs in it at all.
-
-Six ways a run here has actually gone wrong, none of them visible from the run
-directory without knowing what to look at:
-
-* **Progress.** `eval-*/metrics.json` exists only for an evaluation that
-  succeeded, so its count is the progress and the directories without one are
-  in flight (which should sit near `NS_MPI_PROCS`).
-* **Liveness.** A run that stopped and a run that finished both stop writing,
-  so an mtime alone means nothing. The order is the point: a *whole*
-  `summary.json` is finished, ranks running is healthy or stalled, a live
-  `docker exec` client with no ranks is starting (or restarting, if it already
-  has progress), nothing driving it is stopped however recently it wrote.
-* **Poisoning.** A failed evaluation scores `FAILURE_OBJECTIVE` (100.0), which
-  PolyChord maximizes against a real `total_rms_jy` of ~0.008, so a run whose
-  imager is broken concentrates its live points on its own failures and looks
-  perfectly healthy by every other measure. Asked of the last `RATE_WINDOW`
-  evaluations too, because a break part-way through a long run stays under any
-  whole-run ratio for hours.
-* **Cost.** Gaps between evaluations, and `meqserver-wedged.log`, put a number
-  on the MeqTrees deadlock the watchdogs in `simulate_point_source_ms.py`
-  absorb (docs/robustness.md, "When MeqTrees stops answering").
-* **Downtime.** `restarts.log` records every stop and start, self-healed or
-  typed, and those gaps come out of the span every rate here is measured over.
-  A resumed WSClean run did 64 evaluations in 17s of work either side of a
-  4h16m stop; over wall clock that reads 0.2/min and 0% occupancy. `history`
-  and `occupancy` stay on wall clock, because a stop is part of the shape they
-  exist to show.
-* **Shape and where the time goes.** Every other number is one moment.
-  `history` and `occupancy` bin throughput and imager duty cycle over the run's
-  life, which is what separates a dip that recovered from a step down that did
-  not, and hardware earning its keep all along from hardware busy at the moment
-  it was asked. `forecast` supplies the denominator a `--max-ndead -1` search
-  has nowhere else, and `at risk` the work a restart would redo.
-
-With no argument it reports every run being driven on this *host*, found in the
-process list rather than by globbing this checkout - several worktrees share
-this machine, and the biggest consumer of the host block is often a run this
-checkout has no path to. Such a run is named by a `path` line.
-
-Filesystem reads, one `ps` and one `docker ps`, plus a one second CPU sample
-when a run has live processes; nothing started, nothing imaged, so it costs a
-busy host nothing to ask. A run whose ranks host `ps` cannot see (they fork
-inside a container - the ordinary case under Docker Desktop) costs one
-`docker top` and its own five-second sample instead, only for that run.
-
-Usage:
-
-  uv run scripts/nested-sampling-health.py            # every run that is going
-  uv run scripts/nested-sampling-health.py <run>
-  uv run scripts/nested-sampling-health.py --all
-  uv run scripts/nested-sampling-health.py --json
-  uv run scripts/nested-sampling-health.py --monitor  # redraw in place every --interval
-
-Exit status is 0 when nothing needs attention and 1 when something does, so it
-can gate a script; the headline says the same in words and in colour, and only
-the headline and the WARNING label are coloured. Piped, redirected or under
-NO_COLOR the output is unchanged.
-"""
+"""Report run health and forecast; see ``docs/run-health.md``."""
 
 from __future__ import annotations
 
@@ -82,208 +19,58 @@ from typing import NamedTuple
 
 NESTED_SAMPLING_DIR = Path("results/nested-sampling")
 
-# A run's own MPI ranks, as `ps` shows them.
-# Anchored at the interpreter because `mpirun` and the host-side `docker
-# exec` both carry the whole rank command line in their own arguments, and
-# counting those as ranks puts the count two over `NS_MPI_PROCS`.
 RANK_COMMAND = re.compile(r"\S*python[\d.]*\s+\S*polychord_\w+\.py\b")
 
-# The host-side half of a running search: `run_with_progress` starts the ranks
-# as `docker exec ... mpirun ...` and the client stays a child of the run
-# script for the life of the run, which is what makes the run script findable
-# from the run's own processes.
 DOCKER_EXEC_CLIENT = re.compile(r"\bdocker\s+exec\b")
 
-# The shell that supervises a run: scripts/run-nested-sampling.sh and
-# -r2d2.sh, however they were spelled on the command line. `./ri resume` execs
-# into the same script, so a resumed run looks identical.
 RUN_SCRIPT_COMMAND = re.compile(r"run-nested-sampling[\w-]*\.sh\b")
 
-# What counts as the line worth quoting out of run.log. Deliberately broad: the
-# useful line is whichever one names the failure, and this only has to beat
-# "whatever happened to be printed last".
 ERROR_LINE = re.compile(r"Traceback|Error|Exception|FATAL", re.IGNORECASE)
 
-# common.py's FAILURE_OBJECTIVE, as write_evaluation_record's json.dumps writes
-# it. Matched as text because the alternative is parsing thousands of files to
-# read one number out of each.
 FAILURE_OBJECTIVE_MARKER = '"objective": 100.0'
 
-# The imager's own wall clock for one evaluation, out of the metrics.json this
-# scan already reads in full - so it costs a regex over a string in memory and
-# no extra I/O. Pulled out by pattern rather than json.loads for the same
-# reason the failure marker is: 5,000 files a run, and only one number wanted.
 WALL_SECONDS_PATTERN = re.compile(r'"wall_seconds":\s*([0-9.eE+-]+)')
-
-# ...and the imager's peak resident set for that same evaluation, from the same
-# string. Memory is what caps a run on this host - rank count is the knob that
-# has to fit in RAM, and scripts/lib/rank-budget.sh sizes it from a fixed
-# MB-per-rank measured once, by hand, on one set of images. This is that same
-# number measured continuously by the run itself, which is the only thing that
-# would notice the estimate going stale.
 PEAK_MEMORY_PATTERN = re.compile(r'"peak_memory_bytes":\s*([0-9.eE+-]+)')
 
-# Long enough that no legitimate evaluation reaches it: the slowest measured
-# here is ~33s of R2D2 imaging, and common.py's own ceilings (10s for a
-# simulate reply, 3600s for an imaging one) bound anything the run itself would
-# wait on. Overridable because a search over a slower parameter space moves it.
 DEFAULT_STALE_SECONDS = 600.0
 
-# How long nothing may complete before every rank burning CPU is read as a
-# deadlock rather than as ranks waiting on whichever peer is still imaging.
-# Much shorter than the stale threshold above because the two signals together
-# are unambiguous where either alone is not: a healthy run at any pace lands
-# something well inside a minute.
 SPIN_IDLE_SECONDS = 60.0
 
-# The "how is it going now" window - a tenth of the run, never fewer than this
-# many evaluations, never longer than the cap - and how far it must diverge
-# from the run's overall pace before both numbers are worth printing.
-# Doubled rather than half again because a healthy run's pace is noisier than
-# it looks: five-minute bins over 107 fault-free minutes ranged 91-165. Across
-# 269 sampled moments of that run the display fires in 15% at 1.5x and 5% at
-# 2.0x, the knee where ordinary swing stops and real events start.
 RATE_WINDOW = 50
 RATE_WINDOW_DIVISOR = 10
 RATE_WINDOW_MAX_SECONDS = 1800.0
 RATE_DIVERGENCE_FACTOR = 2.0
 
-# Below this much elapsed time, dividing a count by it measures mtime
-# granularity rather than throughput. Parallel ranks land their first batch
-# together - so the opening evaluations of any run share a timestamp to within
-# milliseconds - and a run killed during that batch is left holding nothing
-# else. Real runs on this host printed "6176.5/min over 0s" from 14
-# evaluations 0.14s apart and "8700112/min" from 42 of them 0.3ms apart, both
-# of which are the arithmetic working exactly as written on an input that
-# means nothing. One second, because that is the resolution the span is
-# displayed at: under it there is no honest way to print the denominator.
 MIN_RATE_SPAN_SECONDS = 1.0
 
-# The same window, read for failures rather than pace, and half of it is the
-# bar. The overall ratio below cannot see an imager that broke part-way
-# through: a run three hours healthy and twenty minutes broken is still ~2%
-# failures overall and silent, while every point it is now adding is a
-# FAILURE_OBJECTIVE that PolyChord will happily maximize. Half is not a tuned
-# number - across 37,000 evaluations of the six real runs on this host the
-# failure count is zero, so any sustained burst is a fault and the threshold
-# only has to sit above the noise, which is nothing.
 RECENT_FAILURE_FRACTION = 0.5
 
-# The run's life as one line of text. Twenty slices so the whole thing fits
-# beside a label at any terminal width, and a zero slice gets its own mark so a
-# gap where nothing landed is visible rather than rounding to "slow".
 HISTORY_BUCKETS = 20
 HISTORY_LEVELS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
 HISTORY_EMPTY = "\u00b7"
 
-# A gap between consecutive evaluations counts as a stall when it is this many
-# times the run's own *mean* gap. Relative because the two imagers are two
-# orders of magnitude apart - WSClean lands 30-50 evaluations a second, R2D2
-# roughly one every two seconds - so any fixed number is either blind on one or
-# crying wolf on the other. Floored at MIN_STALL_GAP_SECONDS so a fast run's
-# ordinary jitter does not register either.
-#
-# The gap statistic alone is not enough, because P ranks do not arrive one at a
-# time: they finish together, so the gaps are bimodal - a burst of near-zero
-# gaps, then one the length of an evaluation while the next batch images. The
-# median sits inside the burst, which pinned the threshold to its 2s floor and
-# made every ordinary inter-batch gap a stall. Measured on a healthy 8-rank
-# R2D2 search: a 0.48s median gap put the threshold at 4.8s and called 17 of
-# its 87 gaps stalls - "86% of running time lost" - on a run whose largest gap
-# was one 14.4s evaluation and whose ranks were 78% busy.
-#
-# So the threshold is also floored at STALL_COST_FACTOR times what one
-# evaluation costs the imager, which is the length of exactly those
-# inter-batch gaps and is already measured for the `imaging` line. A gap only
-# means something when it is long against the work one evaluation does. On
-# that run: 3 x 14.1s = 42.3s, and none of its gaps is a stall. The MeqTrees
-# deadlock this line exists to size cost 23-27% of wall clock in gaps far
-# longer than that, and the mean is not used instead because on a short run a
-# single stall inflates it enough to hide itself - 11 evaluations with one 20s
-# gap put the mean threshold at 29s and caught nothing.
 STALL_GAP_FACTOR = 10.0
 STALL_COST_FACTOR = 3.0
 MIN_STALL_GAP_SECONDS = 2.0
 
-# `_ns_stall_watchdog` in scripts/lib/progress-bar.sh polls every
-# NS_STALL_POLL_SECONDS (60 by default), so its kill lands up to one poll after
-# the timeout is reached. Only past that is a run that is still stalled
-# evidence that no watchdog is left, rather than one about to act.
 STALL_WATCHDOG_POLL_SECONDS = 60.0
 
-# Resolution of a restarts.log stamp: progress-bar.sh writes it with `date -u
-# +%Y-%m-%dT%H:%M:%SZ`, so it is truncated to whole seconds and names an
-# instant up to a second later than it reads.
 RESTART_STAMP_SECONDS = 1.0
 
-# `run_with_retries`' NS_RETRY_RESET_SECONDS default, from
-# scripts/lib/progress-bar.sh: an attempt that ran this long before dying hands
-# the retry budget back, so a long search is not out of restarts for the rest
-# of the week because it healed itself twice on day one. Not a `ri` flag and so
-# not recorded in run.env - the default is the only value any run here has had.
 RETRY_RESET_SECONDS = 1800.0
 
-# rank-budget.sh's NS_RANK_BUDGET_HEADROOM_MB. Reported, not enforced: it is
-# the line under which the next run will refuse to size itself.
 HEADROOM_MB = 4096
 
-# A process is reported as paged out when more of it is in swap than in memory
-# AND what is in swap is at least this much. The floor is
-# `NS_WSCLEAN_MB_PER_RANK` from scripts/lib/rank-budget.sh - the smallest
-# footprint this repo budgets a rank at - so anything over it is a whole
-# worker's worth of pages on disk rather than the tens of MB of cold startup
-# pages every long-lived Python process here accumulates. On the run this was
-# written for it separates one parked imager worker (52MB resident, 2.9GB
-# swapped) from the nineteen ranks and shims sitting at 10MB against 14MB.
 PAGED_OUT_MB = 200
 
-# Percent of wall clock the kernel says tasks spent stalled waiting on memory
-# (`some avg300` from /proc/pressure/memory) before pages on disk are read as
-# costing this run anything. Swap that nobody is faulting back in costs
-# nothing: the 16-rank R2D2 search here ran for hours with one worker at 52MB
-# resident against 2.9GB swapped while the host reported avg300=0.02%, i.e.
-# ~0.06s of stall across five minutes in which the run scored ~110
-# evaluations - so the paged-out warning fired every time it was asked, exited
-# 1, and named a cost that was not being paid. Five percent is 250x that idle
-# baseline and ~1.3s per evaluation on the same run, which is the point where
-# it stops hiding inside the ordinary spread of evaluation cost.
 MEMORY_STALL_PERCENT = 5.0
 
-# Disk is the one resource nothing here reserves, checks or frees, and the only
-# one that only ever grows: an evaluation directory keeps its measurement set,
-# its .mat and the imager's output, ~1.7MB on this host, and nothing deletes
-# it. A live R2D2 run writes ~2.6GB/hour and a WSClean run 18GB over a few, so
-# a multi-day search on a 233GB filesystem is a plausible ENOSPC and there is
-# no other place that would say so first.
-#
-# Measured from a sample rather than a walk: `du -s` on one live run directory
-# cost 3-5s of I/O against the disk the run is using, which is not what a
-# read-only health check should do to it. Twenty of the newest evaluations,
-# which cost milliseconds, since what varies between them is imager output size
-# and not the shape of the directory.
 DISK_SAMPLE = 20
 
-# Where PolyChord stops, as a fraction of the evidence already collected still
-# sitting in the live points. This is the one number the forecast rests on, and
-# it is measured rather than taken from the documentation: `precision_criterion`
-# defaults to 1e-3, but the two searches on this host that ran to natural
-# termination (wsclean, nlive=50, seeds 123 and 372) stopped at 446 and 463
-# dead points where 1e-3 predicts 350 for both. The ratio they actually reached
-# was 1.3e-4 and 9.6e-5; their mean forecasts 451, which is 1% and 3% out
-# instead of 25% short twice. Recalibrate here if a PolyChord upgrade or a
-# non-default precision_criterion moves it.
 TERMINATION_EVIDENCE_RATIO = 1.2e-4
 
 
-# --- host state: one `ps`, one `docker ps` ----------------------------------
-
-
 def _clock_seconds(field: str) -> float | None:
-    """`[[dd-]hh:]mm:ss` - what both BSD and GNU `ps` print for etime and time.
-
-    `etimes` would give seconds directly but is GNU-only, and this repo's
-    checks run on macOS too.
-    """
     match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", field.strip())
     if not match:
         return None
@@ -297,7 +84,6 @@ def _clock_seconds(field: str) -> float | None:
 
 
 def _parse_ps_rows(lines: list[str]) -> list[dict[str, object]]:
-    """(pid, ppid, state, elapsed, cpu, rss, args) rows, shared by every source."""
     rows: list[dict[str, object]] = []
     for line in lines:
         fields = line.split(None, 6)
@@ -306,16 +92,10 @@ def _parse_ps_rows(lines: list[str]) -> list[dict[str, object]]:
         pid, ppid, state, etime, cpu, rss, args = fields
         rows.append({
             "pid": int(pid),
-            # Only so this tool can leave its own process tree out of the run
-            # it is measuring; see own_process_tree.
             "ppid": int(ppid) if ppid.isdigit() else 0,
-            # A process killed while its parent is not wait()ing stays as a
-            # zombie, and `kill -0` succeeds on one - so state, not existence,
-            # is what says a process is alive.
             "alive": state[:1] != "Z",
             "elapsed_seconds": _clock_seconds(etime),
             "cpu_seconds": _clock_seconds(cpu),
-            # KB on both BSD and GNU ps.
             "rss_mb": int(rss) // 1024 if rss.isdigit() else 0,
             "args": args,
         })
@@ -323,12 +103,6 @@ def _parse_ps_rows(lines: list[str]) -> list[dict[str, object]]:
 
 
 def process_table() -> list[dict[str, object]]:
-    """Every process, as (pid, ppid, state, elapsed, cpu, rss, args).
-
-    One call, because everything here needs it: the ranks of a run, whether a
-    sidecar's launcher is still alive, how much of its life a rank has spent on
-    CPU, and how much memory the run is holding.
-    """
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid=,ppid=,state=,etime=,time=,rss=,args="],
@@ -340,20 +114,6 @@ def process_table() -> list[dict[str, object]]:
 
 
 def container_processes(container: str) -> list[dict[str, object]]:
-    """A sidecar's own processes - the ranks host `ps` can never see.
-
-    Ranks fork inside the polychord sidecar's own PID namespace. `docker top`
-    is the daemon reading its own view of a container's processes, so it needs
-    nothing installed in the image (this repo's images ship no `ps`) and works
-    whether or not the daemon shares the caller's kernel - Docker Desktop runs
-    it in a separate Linux VM, and a plain host `ps` never sees into any
-    container, on any platform, `--pid=host` or not.
-
-    Unlike `ps -eo field=`, `docker top` cannot suppress its header - it looks
-    for the literal column names to find field boundaries, so an all-`=`
-    format errors with "Couldn't find PID field" - and the first line here is
-    always that header, not a row.
-    """
     try:
         out = subprocess.run(
             ["docker", "top", container, "-eo", "pid,ppid,state,etime,time,rss,args"],
@@ -365,15 +125,6 @@ def container_processes(container: str) -> list[dict[str, object]]:
 
 
 def container_busy_fractions(container: str, pids: list[int]) -> dict[int, float]:
-    """cpu_busy_fractions, sourced from `docker top` for ranks host `ps` misses.
-
-    Its own sample rather than a share of the shared host one in `main`: these
-    pids are the container's own, meaningless to /proc or a host `ps -p`
-    lookup, and never worth mixing into a dict keyed by host pids that a
-    container pid could coincidentally collide with. Five seconds, not one:
-    `docker top`'s TIME column is whole seconds like plain `ps`'s cumulative
-    time, the same coarse case `cpu_busy_fractions` widens its own window for.
-    """
     if not pids:
         return {}
 
@@ -390,21 +141,6 @@ def container_busy_fractions(container: str, pids: list[int]) -> dict[int, float
 
 
 def sidecar_containers() -> list[dict[str, object]] | None:
-    """The run's long-lived containers, or None if docker cannot be asked.
-
-    Names are `ri-ns-sidecar-<launcher pid>-<n>` from start-sidecars.sh and
-    `ri-ns-sidecar-<rank pid>-<uuid8>` from common.py's own fallback path; both
-    carry the pid of whatever started them in the same position, which is what
-    makes a leak detectable.
-
-    The pid is not enough on its own, so start-sidecars.sh also labels each
-    container with the run it belongs to. A run script killed with SIGKILL
-    leaves the search itself going - the ranks are children of
-    containerd-shim, not of the shell - and the pid rule then called that live
-    search's containers abandoned and printed the `docker rm -f` line that
-    would have killed it. Containers started before the label existed have
-    none, and fall back to the pid.
-    """
     try:
         out = subprocess.run(
             ["docker", "ps", "--filter", "name=ri-ns-sidecar",
@@ -417,7 +153,6 @@ def sidecar_containers() -> list[dict[str, object]] | None:
 
 
 def _parse_sidecars(out: str) -> list[dict[str, object]]:
-    """Split from the docker call so the tab layout can be checked without one."""
     containers = []
     for line in out.splitlines():
         name, _, rest = line.partition("\t")
@@ -432,12 +167,6 @@ def _parse_sidecars(out: str) -> list[dict[str, object]]:
 
 
 def meminfo_mb(key: str) -> int | None:
-    """One /proc/meminfo field in MB, its macOS equivalent, or None elsewhere.
-
-    scripts/lib/rank-budget.sh is the authority on what a run may take;
-    `MemAvailable` here only reports the number its decision will be made from.
-    `MemTotal` is what turns a run's footprint into a share of the host.
-    """
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith(f"{key}:"):
@@ -446,7 +175,6 @@ def meminfo_mb(key: str) -> int | None:
         return _meminfo_mb_macos(key) if sys.platform == "darwin" else None
     except (ValueError, IndexError):
         return None
-    return None
 
 
 def _sysctl(name: str) -> str | None:
@@ -473,13 +201,6 @@ def _vm_stat_pages() -> dict[str, int] | None:
 
 
 def _meminfo_mb_macos(key: str) -> int | None:
-    """`meminfo_mb`'s four keys, read from `sysctl` and `vm_stat` instead.
-
-    macOS has no MemAvailable of its own; free + inactive + speculative pages
-    is the same reclaimable-without-paging estimate Activity Monitor's "Memory
-    Used" figure is built from, and the one rank-budget.sh's headroom check
-    needs to mean the same thing on both platforms.
-    """
     if key == "MemTotal":
         total = _sysctl("hw.memsize")
         return int(total) // 1024 // 1024 if total and total.isdigit() else None
@@ -502,16 +223,6 @@ def _meminfo_mb_macos(key: str) -> int | None:
 
 
 def load_average() -> tuple[float, float, float] | None:
-    """Runnable-plus-uninterruptible tasks averaged over 1, 5 and 15 minutes.
-
-    The one number here that sees load this project did not start, and free to
-    read - no sample interval, unlike cpu_busy_fractions. Read against the core
-    count it is returned beside: on Linux it counts tasks waiting on disk as
-    well as on CPU, which is the reading wanted on a host whose runs page.
-
-    None where the platform has no such thing; getloadavg is documented to
-    raise rather than return a placeholder.
-    """
     try:
         return os.getloadavg()
     except (OSError, AttributeError):
@@ -519,19 +230,6 @@ def load_average() -> tuple[float, float, float] | None:
 
 
 def pressure(resource: str) -> dict[str, float] | None:
-    """Kernel PSI for `resource`, or None where there is none (macOS, pre-4.20).
-
-    `some avgN` is the percentage of the last N seconds in which at least one
-    task was stalled waiting on this resource. It is the only reading here that
-    says what a shortage is *costing* rather than that one exists: free memory,
-    swap in use and a process's own VmSwap all describe a state the host may
-    have entered days ago and be paying nothing for, which is exactly how the
-    paged-out warning came to fire on a run that was not waiting on anything.
-
-    Three averages come out of the file; the two kept are the ones that answer
-    different questions - a minute for "is this happening now" and five for
-    "has it been happening long enough to explain the run's numbers".
-    """
     try:
         line = next(row for row in
                     Path(f"/proc/pressure/{resource}").read_text().splitlines()
@@ -546,13 +244,6 @@ def pressure(resource: str) -> dict[str, float] | None:
 
 
 def swap_mb(pids: list[int]) -> dict[int, int]:
-    """How much of each process the kernel has pushed to disk, in MB.
-
-    `ps` has no column for it and RSS excludes it, so a squeezed run reads as
-    holding less memory than it does while every page it touches next costs a
-    disk read - which surfaces as slow evaluations, never as a failure. Linux
-    only; processes whose /proc entry cannot be read are simply absent.
-    """
     swapped: dict[int, int] = {}
     for pid in pids:
         try:
@@ -565,47 +256,17 @@ def swap_mb(pids: list[int]) -> dict[int, int]:
     return swapped
 
 
-# --- one run ----------------------------------------------------------------
-
-
 def read_run_env(run_dir: Path) -> dict[str, str]:
-    """The settings the run recorded for itself; {} if it recorded none."""
-    values: dict[str, str] = {}
     try:
         text = (run_dir / "run.env").read_text()
     except OSError:
-        return values
-    for line in text.splitlines():
-        name, sep, raw = line.partition("=")
-        if sep:
-            values[name.strip()] = raw.strip().strip("'").replace("'\\''", "'")
-    return values
+        return {}
+    return {name.strip(): raw.strip().strip("'").replace("'\\''", "'")
+            for line in text.splitlines() if "=" in line
+            for name, raw in [line.split("=", 1)]}
 
 
 def summary_is_complete(run_dir: Path) -> bool:
-    """Whether the run has a whole summary.json rather than half of one.
-
-    A summary.json is what every reader here calls "finished", so half of one -
-    a rank killed while writing it, or a full disk - used to be the worst of
-    both: the run was called finished, while the HTML report, `./ri merge` and
-    `./ri profile` could not read it and `./ri resume` refused to rewrite it.
-    Not finished, then; a stopped run, which is the one status that prints the
-    `./ri resume` that repairs it (from the point cache, imaging nothing).
-
-    Tested by the last line rather than by parsing, because this runs over
-    every run in the results directory and a finished R2D2 search's summary
-    carries all of its evaluations - tens of MB to parse for a question the
-    tail answers in one seek.
-
-    The last line, not the last byte: write_json_atomic() writes with
-    `indent=2`, so the only `}` that ever starts a line is the outermost one,
-    while a cut anywhere inside the evaluations array lands after an *indented*
-    `}` about as often as not. "Ends with a closing brace" therefore called
-    roughly half of all torn summaries finished - including the one
-    scripts/test_self_heal.sh tears. (`{}`, which json.dumps writes on one
-    line, is the one complete file whose last line is not a bare brace.)
-    Runs written since write_json_atomic() cannot produce a torn one.
-    """
     try:
         with open(run_dir / "summary.json", "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -617,12 +278,6 @@ def summary_is_complete(run_dir: Path) -> bool:
 
 
 def stage(run_dir: Path) -> str:
-    """How far into PolyChord the run got.
-
-    Worth its own line because a run that dies before the main loop dies
-    without a single dead point, and looks from every count like a run that
-    simply has not got going yet.
-    """
     if summary_is_complete(run_dir):
         return "finished"
     chains = run_dir / "chains"
@@ -635,18 +290,6 @@ def stage(run_dir: Path) -> str:
 
 def _bucket(times: list[float],
             values: list[float]) -> tuple[list[float], float] | None:
-    """Sum `values` into HISTORY_BUCKETS even slices of [first, last].
-
-    Binned over [first evaluation, last evaluation] rather than up to now, so
-    every slice is a full one. A slice ending at the present moment is partial
-    by definition and reads low by exactly the fraction of it that has not
-    happened yet, which is indistinguishable from a real collapse - the same
-    trap the gap-based rate elsewhere exists to avoid.
-
-    None below two evaluations a slice, where the counts are too small to be a
-    shape rather than noise, and below a second a slice, where the slice rates
-    are mtime granularity rather than throughput (MIN_RATE_SPAN_SECONDS).
-    """
     if len(times) < 2 * HISTORY_BUCKETS:
         return None
     span = times[-1] - times[0]
@@ -660,19 +303,6 @@ def _bucket(times: list[float],
 
 
 def history(times: list[float]) -> dict[str, object] | None:
-    """The shape of the run's throughput over its own life, as one line of text.
-
-    The two medians already reported say how fast the run is going now against
-    how fast it has gone; neither can show the shape, and the shape is the
-    thing a reader actually wants. A dip that recovered, a step down that did
-    not, and a steady run all produce the same pair of numbers on the way past
-    each other - the observed collapse-and-recovery here (104, 23, 26, 93
-    against a 104-165 baseline) reads as an ordinary slowdown from the medians
-    alone and as an obvious V from twenty slices.
-
-    Slicing, and the reasons for it, are in `_bucket`. How long ago the last
-    evaluation landed is the activity line's job, not this one's.
-    """
     binned = _bucket(times, [1.0] * len(times))
     if binned is None:
         return None
@@ -693,27 +323,6 @@ def history(times: list[float]) -> dict[str, object] | None:
 
 def occupancy(times: list[float], costs: list[float | None],
               procs: int) -> dict[str, object] | None:
-    """The shape of the run's rank utilisation over its own life.
-
-    `imaging` says what fraction of the ranks the cost of an evaluation is
-    keeping busy right now; `history` says how the arrival rate has moved.
-    Neither answers the question a shared host actually raises, which is
-    whether the memory this run is holding has been earning its keep all along
-    - and the two cannot be read off each other, because the imager's own cost
-    drifts as the search concentrates. The live R2D2 search here got twice as
-    fast per evaluation while its arrival rate fell fivefold, so `history`
-    showed a collapse over a period the ranks were merely idle for.
-
-    Per slice: imaging seconds landed, over the rank-seconds the slice had to
-    spend. A duty cycle, so unlike `history` the scale is absolute - a full bar
-    is every rank imaging, and a run whose bar never leaves the floor is one
-    that should have been given fewer ranks or a larger `--nlive`.
-
-    Summed rather than taken from medians, because a duty cycle is a total over
-    an interval; evaluations with no recorded cost are simply not counted, so a
-    run whose imager never wrote `wall_seconds` gets no line rather than a
-    misleadingly empty one.
-    """
     if procs <= 0 or not any(c is not None for c in costs):
         return None
     binned = _bucket(times, [c or 0.0 for c in costs])
@@ -737,12 +346,6 @@ def occupancy(times: list[float], costs: list[float | None],
 
 
 def _dir_bytes(path: Path) -> int:
-    """A directory tree's disk usage, counted as `du` counts it.
-
-    Allocated blocks rather than st_size: an evaluation holds a measurement
-    set, which is a directory of many small files, so apparent size understates
-    what the filesystem actually gave it.
-    """
     total = 0
     stack = [path]
     while stack:
@@ -761,7 +364,6 @@ def _dir_bytes(path: Path) -> int:
 
 
 def free_bytes(path: Path) -> tuple[int, int] | None:
-    """(free, total) on the filesystem holding `path`, or None if it cannot say."""
     try:
         fs = os.statvfs(path)
     except (OSError, AttributeError):
@@ -770,13 +372,6 @@ def free_bytes(path: Path) -> tuple[int, int] | None:
 
 
 class Evaluation(NamedTuple):
-    """One finished evaluation, as the single pass over evaluations/ sees it.
-
-    Ordered so that sorting these sorts by when they landed. Named rather than
-    a bare tuple only because there are now five fields and most readers of it
-    want one.
-    """
-
     when: float
     failed: bool
     path: Path
@@ -786,21 +381,8 @@ class Evaluation(NamedTuple):
 
 def evaluation_scan(run_dir: Path, procs: int = 0,
                     checkpoint: float | None = None) -> dict[str, object]:
-    """Counts, timings and failures, in one pass over evaluations/.
-
-    The stat and the read are the same pass because the interesting things -
-    when an evaluation landed, and whether it landed on a failure - are one per
-    file and there is no cheaper place to get either. `checkpoint` (the mtime
-    of PolyChord's dead-point file) is here for the same reason: splitting the
-    evaluations either side of it is what lets `dead_points_now` carry the
-    frozen dead-point count forward, and a second pass to count them would
-    stat every directory again.
-    """
     evaluations = run_dir / "evaluations"
     directories = 0
-    # Kept together so that "how the run is going now" can be asked of
-    # failures as well as of pace, and so the newest few can be measured for
-    # size without a second glob.
     records: list[Evaluation] = []
     wedged_lines = 0
     for entry in evaluations.glob("eval-*"):
@@ -835,28 +417,12 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     imaging_costs = [r.wall_seconds for r in records if r.wall_seconds is not None]
     if imaging_costs:
         threshold = max(threshold, STALL_COST_FACTOR * statistics.median(imaging_costs))
-    # A restart's downtime is not a stall. The run was not running, the reason
-    # is known, and it is already on the `restarts` line - counting it here
-    # warned twice about one event and pointed the second warning at the wrong
-    # cause. Measured on a self-healed wsclean run whose only gap over the
-    # threshold was its own 12s restart: "13% of wall clock lost to gaps over
-    # 2s", which reads as the MeqTrees deadlock this number exists to size.
-    #
-    # The window opens a second early because the stamp is whole seconds while
-    # the mtimes it is compared against are fractional, and the crash lands in
-    # the same second as the last evaluation that survived it - so the stamp
-    # routinely reads a fraction of a second *before* the gap it explains.
-    # Measured on the self-healed wsclean run above: gap start ...45.09,
-    # restart stamp ...45, no overlap, warning fired anyway.
+    # Restart downtime is already reported and excluded from stall gaps. Open
+    # the match one second early: restart stamps are whole seconds, mtimes are
+    # fractional.
     downtime = restart_times(run_dir)
-    # One flag per gap: this one is the run not running, and every rate here is
-    # measured over time the run was actually going. Wall clock was the wrong
-    # denominator for exactly the runs this project's self-healing produces - a
-    # resumed wsclean run here did 64 evaluations in 18 seconds of work either
-    # side of a 4h15m stop, and the report called that "0.2/min" against a true
-    # 213/min, and forecast the remainder off it. Same gaps the stall
-    # accounting already skips over, so the two cannot disagree about what
-    # downtime is.
+    # Rates use running time, matching this downtime mask and avoiding a
+    # self-healed run appearing slow because of its stopped interval.
     explained = [gap > threshold
                  and any(start - RESTART_STAMP_SECONDS <= t <= start + gap for t in downtime)
                  for start, gap in zip(times, gaps)]
@@ -865,7 +431,6 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     down_seconds = sum(gap for gap, skip in zip(gaps, explained) if skip)
 
     def _elapsed(lo: int) -> float:
-        """Seconds the run was running, from records[lo] to the last one."""
         if len(times) - lo < 2:
             return 0.0
         return (times[-1] - times[lo]
@@ -873,26 +438,8 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
 
     span = _elapsed(0)
 
-    # How the run is going now against how it has gone. Both rates are
-    # evaluations divided by the time they took, so the two can be divided.
-    # The recent one used to be 60 / median(recent gaps), a different quantity
-    # from the count-over-span beside it: 33.3/min against 18.2 at one instant
-    # where an independent thirty-minute window said 17.0.
-    #
-    # Both ends are completed evaluations, never "the last N minutes": a clock
-    # window is partial, so it reads low by however much has not elapsed, which
-    # is indistinguishable from a slowdown. One partial five-minute bucket read
-    # 23.8/min against a 91-165 baseline, then finished at 164.
-    #
-    # Bounded on both axes because a run varies on both. In evaluations, a
-    # share of the run - a fixed fifty is two minutes at 25/min and ten at
-    # 5/min, so it grows exactly when the run slows. In time, capped, because a
-    # share grows without limit: seven and a half hours in, a tenth reached 62
-    # minutes and a real half-hour slowdown diluted to 1.36x and did not show.
-    #
-    # None of it sees a stall beginning after the last completed evaluation;
-    # last_activity_seconds and the idle clauses in describe() cover that. The
-    # two look redundant and are complementary; do not drop either.
+    # Compare completed-evaluation rates over bounded evaluation/time windows;
+    # idle checks cover stalls after the last completed evaluation.
     recent_rate, slowdown, recent_span = None, None, None
     window = max(RATE_WINDOW, len(times) // RATE_WINDOW_DIVISOR)
     if len(times) >= 2 * window:
@@ -912,45 +459,19 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
             recent_rate = len(recent_times) * 60 / recent_span
             slowdown = overall_rate / recent_rate if recent_rate > 0 else None
 
-    # What one evaluation costs the imager, against how fast evaluations are
-    # arriving. The arrival rate alone cannot separate "the imager got slower"
-    # from "the ranks are idle": both read as a smaller rate. The imager's own
-    # wall clock separates them, and the imaging seconds banked per second of
-    # wall clock is how many ranks the run is actually keeping busy, which is
-    # the number that says whether the memory it is holding is being used.
-    #
-    # The cost is a median, because evaluation cost genuinely varies with the
-    # parameters drawn and a nested-sampling run concentrates: the live R2D2
-    # search here ran at a 25.4s median over its life and 12.2s over its last
-    # 50, with no fault.
+    # Median cost handles parameter-dependent evaluation time.
     def _median(rows: list[Evaluation], field: str) -> float | None:
         seen = [v for v in (getattr(r, field) for r in rows) if v is not None]
         return statistics.median(seen) if seen else None
 
-    # The occupancy is a total, not a ratio of the two medians. A duty cycle is
-    # by definition seconds worked over seconds elapsed, and the median gap is
-    # shorter than the mean whenever a run stalls at all, so the ratio of
-    # medians reads systematically high - the live R2D2 search here printed a
-    # clamped "100% busy" over a life its own slices put at 6-92%. Two figures
-    # in one report disagreeing about the same thing is worse than either.
-    #
-    # Gated on the same span floor as the rate, and for the same reason: a run
-    # killed inside its opening parallel batch has every evaluation landing in
-    # the same millisecond, so the elapsed time is mtime granularity and the
-    # ratio is a division by noise rather than an occupancy.
-    #
-    # `elapsed` comes from `_elapsed` for the same reason the rates do: the
-    # hours a resumed run spent stopped are not hours its ranks were idle.
+    # Occupancy is total imaging time / running time, excluding restart gaps.
     def _duty(rows: list[Evaluation], elapsed: float) -> float | None:
         if len(rows) < 2 or elapsed < MIN_RATE_SPAN_SECONDS:
             return None
         return sum(r.wall_seconds for r in rows if r.wall_seconds is not None) / elapsed
 
     cost, recent_cost = _median(records, "wall_seconds"), None
-    # A median for the same reason the cost is: peak memory follows the
-    # parameters drawn, and a run that concentrates drifts away from its own
-    # opening. Peak rather than resident, because peak is what the OOM killer
-    # reacts to and what a rank has to be budgeted for.
+    # Peak memory varies with sampled parameters and drives rank budgeting.
     peak_memory = _median(records, "peak_memory_bytes")
     recent_peak_memory = None
     busy_ranks, recent_busy_ranks = _duty(records, span), None
@@ -962,29 +483,17 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
         recent_busy_ranks = _duty(records[-RATE_WINDOW:],
                                   _elapsed(len(gaps) + 1 - RATE_WINDOW))
 
-    # Spread over the run's life rather than taken from its tail. An
-    # evaluation's size follows its parameters, and a nested-sampling run
-    # concentrates on a shrinking region, so the newest evaluations drift away
-    # from the run's own average: newest-20 read 1.45MB against a true 1.68MB
-    # on the live R2D2 run here, while an even stride of 20 read 1.70MB.
-    # Strided rather than random so the number does not move between two
-    # readings of an unchanged run.
+    # Sample across the run: parameter-dependent sizes drift as sampling narrows;
+    # deterministic strides keep unchanged readings stable.
     stride = max(1, len(records) // DISK_SAMPLE)
     sample = [r.path for r in records[::stride]]
     per_evaluation = (statistics.mean(_dir_bytes(where) for where in sample)
                       if sample else None)
     rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
 
-    # What a restart would cost. PolyChord picks up at the checkpoint's dead
-    # points, so everything scored since is off the sampler's books - and it is
-    # imaged again from nothing, because the point cache cannot answer for it.
-    # Measured, because the opposite is written in polychord_r2d2.py and is
-    # true of the other case: a killed WSClean search resumed from its
-    # checkpoint and an uninterrupted control from the same seed shared exactly
-    # the 122 evaluations the kill preceded and none of the 146 after it. The
-    # seed makes a run deterministic from its start, which is what makes a
-    # restart with no resume file free; a resume re-seeds and then skips ahead,
-    # so the stream it draws from no longer lines up with the points on disk.
+    # A resumed PolyChord run loses evaluations after its checkpoint because
+    # they are re-imaged; WSClean resumes reuse them. A fresh restart costs
+    # nothing here because its deterministic seed regenerates the same stream.
     banked = bisect.bisect_right(times, checkpoint) if checkpoint else len(times)
     at_risk_seconds = None
     if checkpoint and len(times) > banked:
@@ -1032,14 +541,6 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
 
 
 def restarts(run_dir: Path) -> list[str]:
-    """The times this run died and started itself again from its checkpoint.
-
-    Written by run_with_retries in scripts/lib/progress-bar.sh, one line per
-    restart. Its own file rather than a grep of run.log because that file is
-    megabytes of PolyChord feedback after a day, and this is a handful of
-    lines - a self-healed run is still worth saying out loud, since the thing
-    that killed it once will do it again.
-    """
     try:
         return [line for line in
                 (run_dir / "restarts.log").read_text(errors="replace").splitlines()
@@ -1049,12 +550,6 @@ def restarts(run_dir: Path) -> list[str]:
 
 
 def restart_stamp(line: str) -> float | None:
-    """Epoch seconds of one restarts.log line, or None if it has no stamp.
-
-    progress-bar.sh writes the line with `date -u`, so the stamp is UTC and
-    has to be read as such - read as local time it would land hours away from
-    the evaluation mtimes it is compared against and match no gap at all.
-    """
     try:
         return calendar.timegm(time.strptime(line.split()[0], "%Y-%m-%dT%H:%M:%SZ"))
     except (ValueError, IndexError):
@@ -1062,34 +557,11 @@ def restart_stamp(line: str) -> float | None:
 
 
 def restart_times(run_dir: Path) -> list[float]:
-    """Epoch seconds of each restart, for the gap accounting to skip over."""
     return [when for when in map(restart_stamp, restarts(run_dir)) if when is not None]
 
 
 def restart_budget(run_dir: Path, retries: int | None,
                    lines: list[str], now: float) -> dict[str, int] | None:
-    """How many self-healed restarts are left before the next crash is final.
-
-    `run_with_retries` stops retrying once it has spent `NS_RETRIES`, and then
-    the run simply sits there until a human types `./ri resume`. A search that
-    has already used its budget is therefore one crash from being over, and
-    nothing here said so: the `restarts` line reported what had happened and
-    never what was left, so the run that most needed watching looked exactly
-    like one that had healed and moved on.
-
-    Reconstructed from restarts.log rather than recorded, because the counter
-    lives in the retry loop's own shell and resets: an attempt that ran
-    RETRY_RESET_SECONDS before dying hands the budget back, and `./ri resume`
-    starts a fresh loop at zero. Each restart line is one increment of that
-    counter, so replaying the log with the same two rules gives the same
-    number. The one approximation is the first attempt's start, taken as
-    run.env's mtime - written when the run directory was claimed, which is
-    before the ranks start (minutes of it on an R2D2 search), so an attempt
-    that died just under the reset can read as one that cleared it.
-
-    None when run.env does not record NS_RETRIES: a budget nobody can name is
-    not one to report.
-    """
     if retries is None:
         return None
     try:
@@ -1119,23 +591,6 @@ def restart_budget(run_dir: Path, retries: int | None,
 
 
 def log_tail(run_dir: Path) -> dict[str, object] | None:
-    """What the run last said, and how many ranks said it.
-
-    `run.log` is the only place a traceback survives - every other artifact a
-    stopped run leaves says that it broke, never why.
-
-    The count is the diagnosis, not decoration. An MPI crash produces one
-    traceback per rank, so a real failure here is the same stack fifteen or
-    twenty times over and the plain last line of the file is the right answer
-    only by luck of where the output stopped. All ranks reporting the same
-    error is a code bug every rank hits deterministically; one rank alone is a
-    flaky worker, an OOM kill, or bad luck on one evaluation. Those want
-    opposite responses, and the multiplicity is the only thing in the file that
-    tells them apart.
-
-    Falls back to the last non-empty line, which for a run that stopped without
-    a traceback is PolyChord's own last word on where it got to.
-    """
     path = run_dir / "run.log"
     try:
         with path.open("rb") as handle:
@@ -1155,19 +610,6 @@ def log_tail(run_dir: Path) -> dict[str, object] | None:
 
 
 def dead_points(run_dir: Path) -> tuple[int, float | None]:
-    """PolyChord's progress and when that number was written.
-
-    The timestamp is not decoration. PolyChord writes its checkpoint roughly
-    every `nlive` dead points, so between writes the count cannot move by
-    construction - and a count that has not moved for fifty minutes looks
-    exactly like a run that has stopped making progress. That misreading has
-    already cost an hour of investigation here, and it survived being checked
-    against the terminal, because PolyChord's own feedback box and these files
-    are written by the same event: two displays of one signal, not two
-    witnesses. The `stage` line reports this count with its age so that nobody
-    reads it as current; `dead_points_now` is what anything measuring progress
-    uses instead.
-    """
     for path in (run_dir / "chains").glob("*_dead-birth.txt"):
         try:
             return sum(1 for _ in path.open()), path.stat().st_mtime
@@ -1177,25 +619,6 @@ def dead_points(run_dir: Path) -> tuple[int, float | None]:
 
 
 def dead_points_now(dead: int, completed: int, banked: int) -> int:
-    """Dead points now, estimated across PolyChord's checkpoint interval.
-
-    `dead` is frozen between checkpoint writes - two hours at a time on the
-    16-rank R2D2 search here, which is 22% of that run - so every figure
-    derived from it (the percent done, the ETA, the pinned progress bar)
-    sits still and then jumps by a whole `nlive`. Reported live it put the
-    search at 38% done with 8h12m left when the very next write showed it was
-    really past 50%.
-
-    The evaluation directories do not have that problem: they appear every few
-    seconds, and PolyChord's slice sampler spends a near-constant number of
-    them per dead point (`num_repeats` times the dimension), so the
-    evaluations banked since the checkpoint convert straight back into dead
-    points. `banked` is how many had landed when the checkpoint was written,
-    which is what makes the ratio the run's own rather than one contaminated
-    by the very evaluations being converted.
-
-    An estimate, and marked `~` everywhere it is printed.
-    """
     since = completed - banked
     if dead <= 0 or banked <= 0 or since <= 0:
         return dead
@@ -1203,24 +626,11 @@ def dead_points_now(dead: int, completed: int, banked: int) -> int:
 
 
 def _setting(run_env: dict[str, str], key: str) -> int | None:
-    """A numeric setting out of run.env, or None if it is absent or not one."""
     raw = run_env.get(key, "")
     return int(raw) if raw.lstrip("-").isdigit() else None
 
 
 def sampler_stats(run_dir: Path) -> dict[str, object] | None:
-    """What PolyChord itself says it has found, out of `chains/*.stats`.
-
-    Rewritten at every checkpoint, and the only artifact that carries the
-    number the search exists to produce. Nothing here read it before, so a run
-    could be reported healthy on every operational line while saying nothing
-    about its own result - and `nlike` per dead point, the sampler's own
-    efficiency, is the one cost that a rate in evaluations per minute cannot
-    show, because it is what that rate is being spent on.
-
-    A checkpoint rewrite can be read half-written; every field is therefore
-    optional and a torn read simply reports less.
-    """
     for path in (run_dir / "chains").glob("*.stats"):
         try:
             text = path.read_text()
@@ -1245,11 +655,6 @@ def sampler_stats(run_dir: Path) -> dict[str, object] | None:
 
 
 def live_loglikelihoods(run_dir: Path) -> list[float]:
-    """The likelihood of every point still alive, from `chains/*_phys_live.txt`.
-
-    Last column, the same file PolyChord rewrites with the stats. Empty for a
-    finished run, which is how a finished run gets no forecast.
-    """
     for path in (run_dir / "chains").glob("*_phys_live.txt"):
         try:
             return [float(line.split()[-1]) for line in path.read_text().splitlines()
@@ -1262,29 +667,6 @@ def live_loglikelihoods(run_dir: Path) -> list[float]:
 def evidence_forecast(run_dir: Path, stats: dict[str, object] | None,
                       nlive: int | None, max_ndead: int | None,
                       ndead_now: int | None = None) -> dict[str, object] | None:
-    """How far through the search is, and how many dead points are left.
-
-    The gap this closes is that with `--max-ndead -1`, the default, a run has
-    no denominator anywhere: `./ri health` could say a search was healthy and
-    fast for three days without ever saying whether it was a tenth of the way
-    through or nearly done.
-
-    Nested sampling supplies one. Each dead point shrinks the prior volume by
-    the same factor, so what is left of it is exp(-ndead/nlive); the evidence
-    still to come is that volume times the mean likelihood of the points now
-    sitting in it, and the run ends when that falls to
-    TERMINATION_EVIDENCE_RATIO of the evidence already banked. The volume
-    shrinks one e-fold per `nlive` dead points, which turns "how much further
-    that ratio has to fall" into a count.
-
-    An explicit `--max-ndead` is a hard stop the sampler will hit first, so it
-    is used directly and the answer is not an estimate at all.
-
-    The total is worked out from the checkpoint's own `ndead`, because the
-    log(Z) and the live points it is computed with were written by that same
-    checkpoint. How far *through* that total the run is comes from
-    `ndead_now`, which does not have to wait for the next write.
-    """
     if not stats or "ndead" not in stats or not nlive:
         return None
     ndead = int(stats["ndead"])
@@ -1317,14 +699,6 @@ def evidence_forecast(run_dir: Path, stats: dict[str, object] | None,
 
 
 def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Everything alive that carries this run's directory in its arguments.
-
-    Wider than the ranks on purpose: the memory a run actually holds is almost
-    all in its imager workers, which name the run by their --fifo-dir and are
-    visible on the host even though they live inside the sidecar containers. A
-    rank itself is ~10MB against an R2D2 worker's ~3.3GB. Wide enough that it
-    would otherwise match this tool, which is why own_process_tree is here.
-    """
     marker = str(run_dir.resolve())
     mine = own_process_tree(processes)
     return [p for p in processes if p["alive"] and marker in str(p["args"])
@@ -1333,24 +707,6 @@ def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dic
 
 def supervised(owned: list[dict[str, object]],
                processes: list[dict[str, object]]) -> bool | None:
-    """Whether the shell that started this run is still watching it.
-
-    SIGKILLing a run script does not stop the run: the ranks are children of
-    `containerd-shim`, so they, the `docker exec` client and the stall
-    watchdog all survive reparented to init and evaluations keep landing. What
-    dies with the shell is `run_with_retries` - so an orphaned run looks
-    perfectly healthy right up until the first crash it can no longer restart
-    from, and its sidecars keep their ~33.7GB when it finally stops.
-
-    Found through the `docker exec` client rather than by hunting for the
-    shell: the client is the run's only host-side process that carries both
-    the run directory (so `run_processes` already has it) and the run script's
-    pid. The parent is checked by *what it is*, not for being pid 1, because a
-    reparented orphan lands on whatever subreaper the session has.
-
-    None when there is no client to ask - a stopped run, or one whose ranks
-    were started some other way.
-    """
     clients = [p for p in owned if DOCKER_EXEC_CLIENT.search(str(p["args"]))]
     if not clients:
         return None
@@ -1360,14 +716,6 @@ def supervised(owned: list[dict[str, object]],
 
 
 def own_process_tree(processes: list[dict[str, object]]) -> set[int]:
-    """This tool's own pids: itself and everything that started it.
-
-    `./ri health <run>` carries the run directory in its own arguments, and so
-    do the `ri` and the shell above it, so without this the tool is part of
-    what it measures: a finished run with no ranks left still reported
-    `resources 0.1GB resident over 3 processes`, and the CPU sample in `main`
-    spent its second measuring this process.
-    """
     parents = {int(p["pid"]): int(p.get("ppid", 0) or 0) for p in processes}
     tree, pid = set(), os.getpid()
     while pid > 1 and pid not in tree:
@@ -1377,13 +725,6 @@ def own_process_tree(processes: list[dict[str, object]]) -> set[int]:
 
 
 def _cpu_seconds(pid: int) -> float | None:
-    """CPU time for one process, in ticks rather than whole seconds.
-
-    `ps` rounds its `time` column to the second, which is too coarse to
-    difference over a short interval; /proc counts in clock ticks, so a one
-    second sample resolves to a percent. Linux only, and cpu_busy_fractions
-    falls back to `ps` and a longer interval where it is not there.
-    """
     try:
         # The comm field can itself contain spaces and brackets, so everything
         # before the last ") " is skipped rather than parsed. What is left
@@ -1395,7 +736,6 @@ def _cpu_seconds(pid: int) -> float | None:
 
 
 def _cpu_seconds_from_ps(pids: list[int]) -> dict[int, float]:
-    """The same, from `ps`, for hosts without /proc."""
     if not pids:
         return {}
     try:
@@ -1416,20 +756,6 @@ def _cpu_seconds_from_ps(pids: list[int]) -> dict[int, float]:
 
 
 def cpu_busy_fractions(pids: list[int]) -> dict[int, float]:
-    """What share of a short interval each process spent on CPU, right now.
-
-    Open MPI's ob1 busy-waits, so a rank blocked in a collective burns a core
-    and is indistinguishable from a working one on instantaneous CPU percent.
-    What separates them is how much of the interval went to CPU: a working rank
-    spends most of it waiting on its imager, a spinning one spends all of it.
-
-    Sampled twice rather than taken as cumulative CPU time over the process's
-    whole life. The lifetime ratio only reveals a rank that wedged early - a
-    run that works for an hour at 40% and then deadlocks still reads ~0.45 five
-    minutes later, and goes on reading under the threshold for as long as it
-    takes the spinning to outweigh the real work already done. Which is most of
-    an hour, on the runs this is for.
-    """
     if not pids:
         return {}
     fine = {pid: _cpu_seconds(pid) for pid in pids}
@@ -1452,30 +778,14 @@ def cpu_busy_fractions(pids: list[int]) -> dict[int, float]:
 
 
 def spinning_ranks(ranks: list[dict[str, object]], busy: dict[int, float]) -> int:
-    """Ranks that spent the whole sample on CPU.
-
-    Rank 0 is PolyChord's administrator and legitimately spins, so one is
-    normal and all of them is the signal.
-    """
     return sum(1 for rank in ranks if busy.get(int(rank["pid"]), 0.0) > 0.95)
 
 
 def is_local_run(run_dir: Path) -> bool:
-    """Whether this checkout's `results/nested-sampling` is what holds this run."""
     return run_dir.resolve().parent == NESTED_SAMPLING_DIR.resolve()
 
 
 def resume_target(run_dir: Path) -> str:
-    """What to paste after `./ri resume` for this run: its bare name, or its path.
-
-    `./ri resume` takes a bare name only under this checkout's
-    `results/nested-sampling`, while this report reaches runs anywhere on the
-    host - so every warning it wrote for a foreign run handed out a command
-    that answers "no such run". A name this report prints has to be one the
-    commands it names take back, which is the same rule that made `./ri health`
-    itself accept a live foreign run's name; the path is what stays true off
-    the checkout, and `./ri resume` has always taken one.
-    """
     return run_dir.name if is_local_run(run_dir) else str(run_dir.resolve())
 
 
@@ -1499,11 +809,11 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     # live, so no ranks here means look inside the one container that runs
     # them rather than conclude there are none.
     if not ranks and watched:
-        polychord = [c for c in (sidecar_containers() or [])
-                     if c["run_dir"] == str(run_dir.resolve())
-                     and "polychord" in str(c["image"])]
+        polychord = next((c for c in (sidecar_containers() or [])
+                          if c["run_dir"] == str(run_dir.resolve())
+                          and "polychord" in str(c["image"])), None)
         if polychord:
-            name = str(polychord[0]["name"])
+            name = str(polychord["name"])
             ranks = [p for p in container_processes(name)
                      if RANK_COMMAND.match(str(p["args"]))]
             effective_busy.update(
@@ -1534,23 +844,9 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     idle = scan["last_activity_seconds"]
     complete = summary_is_complete(run_dir)
 
-    # The order is the whole point. A finished run and a dead one both stop
-    # writing, and a run that has only just started has not written yet, so
-    # neither a stale mtime nor a missing summary means anything on its own.
-    #
-    # `watched is not None` is the answer to "has this run started": it means
-    # a `docker exec` client carrying this run directory is alive, whether or
-    # not the shell above it still is. Without it a run with no evaluations
-    # yet fell straight through to `stopped` - so the whole of an R2D2
-    # search's startup, minutes of sixteen workers loading their models,
-    # headlined STOPPED and offered `./ri resume` on a run that was fine.
-    #
-    # And it is the *only* answer. A recent evaluation used to count too, which
-    # is the same mistake pointing the other way: a run with no ranks and no
-    # client that wrote a second ago has not started, it has just died, and
-    # calling that STARTING gave a search killed mid-flight ten silent minutes
-    # at exit 0. What that clause covered is the gap between attempts, and the
-    # client covers all but the ~1s before the next `docker exec` is issued.
+    # Finished and dead runs both stop writing, while new runs may not have
+    # written yet. `watched` is the sole startup signal: it tracks a live
+    # `docker exec` client, including the gap while self-healing restarts it.
     run_stage = stage(run_dir)
     if complete:
         status = "finished"
@@ -1738,30 +1034,14 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             + (f"; the host spent {memory_stall_pct:.0f}% of the last five minutes "
                "stalled on memory" if memory_stall_pct is not None else "")
         )
-    # Nothing reserves disk, nothing frees it, and no evaluation directory is
-    # ever deleted, so the only warning available is the run's own write rate
-    # against what the filesystem has left. Asked only of a run that is still
-    # writing: a finished run's GB are already spent and its rate is history.
+    # Only active runs can exhaust space; compare free space with their horizon.
     space = free_bytes(run_dir)
     per_hour = scan["disk_bytes_per_hour"]
     disk_hours = None
     if space is not None and per_hour \
             and status in ("healthy", "starting", "restarting", "stalled"):
         disk_hours = space[0] / float(per_hour)
-        # Against how much longer this run needs, not against a fixed number of
-        # hours: space running out after the search is over is not a problem
-        # the run has. A WSClean smoke run 35s old writes 29.6GB/hour and
-        # projects "7h of space left" against 218GB free, which warned at
-        # HEAD's 12h floor and exited 1 while the run was minutes from
-        # finishing - and a multi-day R2D2 search with 20h of space never
-        # tripped that floor at all.
-        #
-        # `forecast` is the answer when there is one. There is none before
-        # PolyChord's first checkpoint writes chains/*.stats, which is the
-        # whole of a smoke run and was still true 7 hours into the 16-rank
-        # R2D2 search on this host, so the fallback is the run's own age on
-        # the flat assumption that a run has at least as long ahead of it as
-        # behind - it warns once the space left is shorter than the run so far.
+        # Use checkpoint forecast when available; otherwise use elapsed age.
         left_hours = (float(forecast["hours_remaining"])
                       if forecast and forecast.get("hours_remaining") else None)
         horizon = (left_hours if left_hours is not None
@@ -1871,20 +1151,6 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
         "disk_free_bytes": space[0] if space is not None else None,
         "disk_total_bytes": space[1] if space is not None else None,
         "cores": os.cpu_count(),
-        # The only host-wide CPU reading here, and the only one anywhere in the
-        # report that covers work this project did not start. A run's own
-        # `resources` line says how many cores *it* is keeping busy; nothing
-        # said whether the other cores were free, so "my run got slower and
-        # every number here looks fine" had no answer when the cause was
-        # another session's build or a second search. Free, unlike every other
-        # CPU figure here: no sample interval, so a report over finished runs
-        # still costs nothing.
-        #
-        # Three windows because the trend is the readable part: 19 / 18 / 16
-        # against 20 cores is a host filling up. Never warned on - this box is
-        # deliberately run at every core busy, so a 16-rank search sits at load
-        # 16-17 of 20 with nothing wrong and any "load against cores" rule would
-        # fire on the runs it is for. Same reason cpu pressure is not read.
         "load_average": load_average(),
         "sidecars": containers,
         "leaked_sidecars": leaked,
@@ -1906,13 +1172,6 @@ STATUS_COLORS = {"healthy": GREEN, "finished": GREEN, "starting": CYAN,
 
 
 def use_color() -> bool:
-    """Whether to emit escapes: a terminal, honouring NO_COLOR (no-color.org).
-
-    Off whenever stdout is not a tty, so `./ri health > report.txt`, a pipe
-    into grep, and --json stay byte-identical to what they printed before -
-    which also keeps every self-check assertion here reading plain text, since
-    they capture through a StringIO.
-    """
     return (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
             and os.environ.get("TERM") != "dumb")
 
@@ -1922,29 +1181,11 @@ def paint(text: str, code: str | None) -> str:
 
 
 def format_gb(value: float) -> str:
-    """GB at one decimal, MB under a gigabyte, so a young run does not read as 0.0GB.
-
-    The switch is at 1GB and not at 0.1GB because these figures get multiplied
-    together in front of the reader: a 49MB WSClean evaluation over 3 ranks is
-    147MB, and rounding that to "0.1GB" beside the "49MB" it came from reads as
-    an arithmetic error rather than as a unit.
-    """
     return (f"{value / 1024 ** 3:.1f}GB" if value >= 1024 ** 3
             else f"{value / 1024 ** 2:.0f}MB")
 
 
 def format_elapsed(seconds: float) -> str:
-    """`24s`, `7m36s`, `10h24m`, `2d 6h` - a duration that is not a clock time.
-
-    This used to be `H:MM:SS`, which every line here wears at least once and
-    which the report itself teaches the reader to misread: `last evaluation
-    10:24:14 ago` sits three lines above a real `2026-08-28T02:48:23Z`, and
-    `0:00:24` spends three fields on a value with one.
-
-    Above an hour it is `format_hours` exactly, so the same interval reads the
-    same way measured backwards (`checkpoint 4h16m ago`) and forwards (`~4h16m
-    left`); seconds are dropped there with it, being noise at that scale.
-    """
     seconds = int(max(0.0, seconds))
     if seconds < 60:
         return f"{seconds}s"
@@ -1954,25 +1195,12 @@ def format_elapsed(seconds: float) -> str:
 
 
 def format_hours(hours: float) -> str:
-    """`4h40m` under a day, `2d 6h` over one - a wait, not a duration to add up."""
     if hours >= 24:
         return f"{int(hours // 24)}d {int(hours % 24)}h"
     return f"{int(hours)}h{int(hours % 1 * 60):02d}m"
 
 
 def format_clock(hours: float, now: float | None = None) -> str:
-    """The clock time a wait of `hours` ends at: `19:47`, or `Sat 05:32` past today.
-
-    Local time, because the reader is at a terminal on the host the run is on.
-    A duration is the honest measurement and stays first; this is the arithmetic
-    the reader would otherwise do against a wall clock to answer the only
-    question a multi-hour wait raises, which is when to come back.
-
-    The day name only when the finish is not today - a bare `05:32` on a
-    fourteen-hour wait reads as this morning, the one time it cannot be. Nothing
-    beyond the day name even for a wait of weeks: the duration it is printed
-    beside (`~9d 6h left`) is what says which Tuesday.
-    """
     now = time.time() if now is None else now
     end = now + hours * 3600
     # The calendar date rather than tm_yday, which repeats every year and would
@@ -2083,9 +1311,6 @@ def render(run: dict[str, object]) -> None:
                             float(slowdown) > RATE_DIVERGENCE_FACTOR
                             or float(slowdown) < 1 / RATE_DIVERGENCE_FACTOR) else "")),
     ]
-    # ...and the same throughput as a shape rather than as two numbers, which
-    # is the only line here that shows a dip that recovered as different from
-    # a step down that did not.
     past = run["history"]
     if past:
         assert isinstance(past, dict)
@@ -2093,11 +1318,6 @@ def render(run: dict[str, object]) -> None:
                       (f"{past['bar']}  {past['low_per_minute']:.0f}-"
                        f"{past['high_per_minute']:.0f}/min per "
                        f"{format_elapsed(float(past['bucket_seconds']))} slice")))
-    # What an evaluation costs and how much of the run's hardware that cost is
-    # spread over. `activity` reports arrival rate, which confounds a slower
-    # imager with idle ranks; this line separates them, and the occupancy is
-    # the only place in the report where memory the run is holding but not
-    # using shows up as such.
     cost = run["seconds_per_evaluation"]
     if cost is not None:
         # As a percentage of the ranks the run was given, clamped: an
@@ -2224,9 +1444,8 @@ def render(run: dict[str, object]) -> None:
             moved = f"  (last {RATE_WINDOW}: {format_gb(float(recent_peak))})"
         lines.append(("memory", f"{format_gb(float(peak))} peak imager memory"
                                 + across + moved))
-    # Memory and cores are held and given back; disk is only ever taken, and
-    # by the time it runs out the run is over. So the run's own share is shown
-    # as a rate and, while it is still writing, as the time that rate has left.
+    # Memory and cores return; disk only accumulates. Show its write rate and
+    # remaining time while the run is active.
     if run["disk_bytes"]:
         per_hour = run["disk_bytes_per_hour"]
         remaining = run["disk_hours_remaining"]
@@ -2235,30 +1454,18 @@ def render(run: dict[str, object]) -> None:
                       + (f", +{format_gb(float(per_hour))}/hour" if per_hour else "")
                       + (f", {float(remaining):.0f}h of space left at that rate"
                          if remaining is not None else "")))
-    # Only when there were any: a run that has never crashed should not carry a
-    # line saying so. Reported, not warned on - the crash was survived, and a
-    # warning here would make `./ri health` exit nonzero for a run that is
-    # currently fine.
-    #
-    # Split, because restarts.log holds two different events and calling them
-    # one number is a lie in both directions: a `./ri resume` someone typed is
-    # not the run healing itself, and a run that healed itself twice and was
-    # then continued by hand should say so as two facts.
+    # Report crashes only when present. Separate self-heals from manual resumes
+    # because they have different budgets and meanings.
     events = list(run["restarts"])
     healed = [e for e in events if " resumed " not in e]
     resumed = [e for e in events if " resumed " in e]
-    # What is left of the budget, on the restarts line only: it bounds the
-    # self-healing, and a manual resume is unbounded by it. A run down to zero
-    # is one crash from sitting there until a human notices, which is the whole
-    # point of saying it while the run is still alive - but it is still fine
-    # right now, so it stays a report and never a warning.
+    # Show remaining self-heal budget, not manual resumes. Exhaustion is
+    # reported while healthy; stopped-run warning handles the later crash.
     budget = run.get("restart_budget")
     budget_note = ""
     if budget:
         if not budget["left"]:
-            # No `./ri resume` command here: the crash has not happened, and
-            # the stopped warning prints the right one for this run when it
-            # does.
+            # No resume command: crash has not happened; stopped warning covers it.
             budget_note = (f"; {budget['used']} of {budget['limit']} used, so the next "
                            "crash stops the run until someone resumes it")
         elif not budget["used"]:
@@ -2332,43 +1539,21 @@ def render_host(host: dict[str, object]) -> None:
         print(f"  {paint('WARNING', YELLOW)}   {warning}")
 
 
-# --- entry point -------------------------------------------------------------
-
-
 def started_at(run_dir: Path) -> str:
-    """The UTC stamp every run directory is named for, for ordering by age.
-
-    Sorting the names themselves puts every `wsclean-*` after every `r2d2-*`,
-    so "the newest run" would mean "the newest WSClean run" - which on a host
-    running both is the wrong run to be shown by default.
-    """
     match = re.search(r"(\d{8}T\d{6}Z)$", run_dir.name)
     return match.group(1) if match else run_dir.name
 
 
-# What a nested-sampling run leaves in its directory, so that a directory
-# which is not one can be told apart from a run that stopped. Every other
-# reading here is the absence of something - no ranks, no evaluations, no
-# summary.json - which is exactly what an unrelated directory looks like, and
-# `./ri health results/nested-sampling` used to headline the runs directory
-# itself as a STOPPED run and offer `./ri resume` on it. `./ri resume` then
-# refuses it ("has no run.env"), so the report was advising a command that
-# cannot work.
-#
-# `run.env` is written milliseconds after the run directory is claimed and
-# before anything can go wrong, so any run started since it existed has one
-# however early it died. The rest are for runs that predate it, and for the
-# summary-only directories `./ri merge` writes.
+# Markers distinguishing run directories from unrelated or merged directories.
+# `run.env` covers runs since its introduction; other markers preserve older runs.
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 
 
 def is_run_directory(path: Path) -> bool:
-    """Whether anything in this directory says a nested-sampling run used it."""
     return any((path / artifact).exists() for artifact in RUN_ARTIFACTS)
 
 
 def run_directories() -> list[Path]:
-    """Every run on disk, newest first."""
     if not NESTED_SAMPLING_DIR.is_dir():
         return []
     return sorted((d for d in NESTED_SAMPLING_DIR.iterdir()
@@ -2377,26 +1562,6 @@ def run_directories() -> list[Path]:
 
 
 def live_run_directories(processes: list[dict[str, object]]) -> list[Path]:
-    """Every run being driven on this host, newest first - wherever it lives.
-
-    Read out of the ranks' own `--output-dir` rather than by filtering
-    `run_directories()`, because a run directory is only under this checkout's
-    `NESTED_SAMPLING_DIR` if this checkout started it, and this host runs
-    several worktrees at once. Memory is what caps a run here, so a report that
-    can only see its own checkout answers "why do I have 11GB left" with a host
-    block whose whole cause is a 48GB search it has no path to.
-
-    Matched anywhere in the command line rather than only at its start, so the
-    `docker exec` client and the mpirun under it - both of which carry the whole
-    rank command, `--output-dir` and all - count as well as the ranks. That is
-    the difference between a run that has started and a run that has ranks: an
-    R2D2 search spends minutes in `docker exec` while sixteen workers load
-    their models, and anchoring here left it invisible for all of it.
-
-    Still not every process carrying the run directory: a killed run's sidecar
-    workers outlive it until the next run reaps them, and they are not a run
-    still going. The client and the mpirun die with it.
-    """
     live = {Path(match.group(1)) for p in processes
             if RANK_COMMAND.search(str(p["args"]))
             for match in [re.search(r"--output-dir\s+(\S+)", str(p["args"]))]
@@ -2405,20 +1570,6 @@ def live_run_directories(processes: list[dict[str, object]]) -> list[Path]:
 
 
 def default_directories(processes: list[dict[str, object]] | None = None) -> list[Path]:
-    """Every run being driven on this host, newest first - or the newest run.
-
-    Runs rather than the newest run: this report's question is about a search
-    that is going, and the newest run stops being that one the moment a short
-    test lands after a multi-hour search - the test finishes in minutes, the
-    search does not, and "the newest run" then names the only one of the two
-    nobody is asking about. Falls back to the newest run in this checkout on a
-    host with nothing running, which is every host most of the time.
-
-    All of them rather than the newest live one, because memory is what caps a
-    run here and this host is shared: a second search is the usual reason the
-    one being asked about is slow, and hiding it leaves the report explaining a
-    squeezed run with numbers whose cause is off the page.
-    """
     live = live_run_directories(processes or [])
     if live:
         return live
@@ -2430,15 +1581,7 @@ def default_directories(processes: list[dict[str, object]] | None = None) -> lis
 
 def resolve(name: str | None,
             processes: list[dict[str, object]] | None = None) -> Path:
-    """A run directory from a path or a bare run name.
-
-    A bare name is looked for in this checkout first and then among the runs
-    live anywhere on this host, because the default report has been host-wide
-    since it started finding runs in the process list: it prints a foreign
-    run's bare name in its headline, and a name this report prints has to be
-    one it accepts back. This checkout first so a local run always wins its
-    own name; the stamp makes a genuine collision vanishingly unlikely anyway.
-    """
+    """Resolve path or run name, preferring local runs over live host runs."""
     if name:
         candidate = Path(name)
         if not candidate.is_dir():
@@ -2461,8 +1604,7 @@ def resolve(name: str | None,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", nargs="?", metavar="RUN",
                         help="run directory, or the name this report prints - "
                              "including a run another checkout started, while "
@@ -2492,9 +1634,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         while True:
-            # Clear-and-redraw rather than one line appended per tick: a
-            # terminal watched for hours would otherwise scroll its whole
-            # history away in redraws nobody is reading.
             sys.stdout.write("\033[2J\033[H")
             report_once(args)
             sys.stdout.flush()
@@ -2544,7 +1683,6 @@ def self_check() -> None:
     import tempfile
 
     def io_capture(report: dict[str, object]) -> str:
-        """What render() prints for a run, so the report lines can be asserted on."""
         sink = io.StringIO()
         with contextlib.redirect_stdout(sink):
             render(report)
@@ -2713,17 +1851,12 @@ def self_check() -> None:
                  "cpu_seconds": 1.0, "rss_mb": 5,
                  "args": f"/usr/bin/docker exec c mpirun python3 polychord_r2d2.py "
                          f"--output-dir {live.resolve()}"},
-                # The shell supervising the run. It carries no run directory,
-                # so it is none of the run's memory - it is here because a run
-                # whose shell has died is a warning, and this fixture is the
-                # healthy case.
+                # Supervising shell: no run directory, so no run memory.
                 {"pid": 89, "ppid": 1, "alive": True, "elapsed_seconds": 100.0,
                  "cpu_seconds": 1.0, "rss_mb": 5,
                  "args": "bash scripts/run-nested-sampling-r2d2.sh"},
-                # The sidecar's imager worker: not a rank, and where all of the
-                # run's memory is. Named by --fifo-dir rather than
-                # --output-dir, which is why the footprint is taken over
-                # everything carrying the run directory rather than the ranks.
+                # Sidecar imager: not a rank; its --fifo-dir path still carries
+                # run memory, so footprint scans all matching processes.
                 {"pid": 92, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 90.0,
                  "rss_mb": 3300,
                  "args": f"python3 r2d2_serve.py --fifo-dir {live.resolve()}/.r2d2-workers"},
@@ -2787,11 +1920,8 @@ def self_check() -> None:
                 os.environ.clear()
                 os.environ.update(saved_env)
 
-            def _always_color() -> bool:
-                return True
-
             plain = use_color
-            use_color = _always_color
+            use_color = lambda: True
             try:
                 lit = io_capture({**report, "warnings": ["a"]})
                 assert f"\033[1;{YELLOW}mRUNNING - 1 WARNING\033[0m" in lit, repr(lit)

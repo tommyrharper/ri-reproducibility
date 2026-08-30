@@ -1,26 +1,5 @@
 #!/usr/bin/env bash
-# A pinned status line for a nested-sampling search: elapsed time, dead points
-# with a percent and an ETA extrapolated from the rate so far, plus the raw
-# evaluation count. The denominator is the run's --max-ndead cap when it has
-# one and, when it does not, the total its own evidence implies - the same
-# estimate `./ri health` reports, marked `~` so the two cannot be confused.
-#
-# Dead points come from PolyChord's own chains/*_dead-birth.txt (one line per
-# dead point) - the same file scripts/lib/nested_sampling/anesthetic_io.py
-# already reads for finished runs. evaluations/eval-* is *not* the same
-# count: PolyChord's slice sampler makes several likelihood evaluations per
-# accepted dead point (roughly num_repeats per dimension), so it always runs
-# ahead - shown separately, not conflated with dead points.
-#
-# On a TTY the status is pinned to the terminal's last line via a scroll
-# region (DECSTBM), so PolyChord's own feedback scrolling by above it doesn't
-# bury the line - the fix for a WSClean search producing dead points faster
-# than a human can read a scrolling counter.
-
-# `run_with_retries` below re-sizes a restart against the memory free at the
-# moment it restarts, which is `ns_budget_ranks`. Sourced here rather than left
-# to the caller so the retry loop is never silently the un-guarded version; the
-# run scripts source it again for their own first clamp, which is idempotent.
+# Nested-sampling status line and retry loop; restarts re-clamp ranks to free memory.
 # shellcheck source=scripts/lib/rank-budget.sh
 . "${BASH_SOURCE[0]%/*}/rank-budget.sh"
 
@@ -30,28 +9,11 @@ run_with_progress() {
   shift 3
   [ "${1:-}" = "--" ] && shift
 
-  # Keep the run's own output. Everything a stopped run leaves on disk says
-  # *that* it broke - empty imager directories, chains stuck at the initial
-  # live points - and nothing says *why*: the traceback existed only in the
-  # terminal it was started from, and diagnosing one meant starting the search
-  # again under a redirect and waiting for it to happen twice.
-  #
-  # Teed rather than redirected, because the status line below needs this
-  # shell's own stdout to still be a terminal: `> run.log 2>&1` around the
-  # whole script makes `[ -t 1 ]` false and silently takes the progress bar
-  # away. Only the command's output is diverted, and nothing downstream
-  # notices - the `docker exec` this wraps is issued without `-t`, so the
-  # container's stdout was already a pipe and its buffering does not change.
-  #
-  # Through a named pipe rather than `> >(tee ...)` so that tee has a pid that
-  # can be waited for. The last thing a dying run writes is the whole point of
-  # having the file, and a process substitution offers no way to know it was
-  # flushed before the script moves on.
+  # FIFO keeps tee waitable, so run.log is complete while stdout stays a TTY.
   local log="${output_dir}/run.log" pipe="${output_dir}/.run.log.fifo"
   rm -f "${pipe}"
   mkfifo "${pipe}"
-  # Appended, not truncated: `./ri resume` re-runs this against a directory
-  # that already has a log, and the first failure is usually the one to read.
+  # Resume appends, preserving the first failure in the log.
   tee -a "${log}" <"${pipe}" &
   local tee_pid=$!
   "$@" >"${pipe}" 2>&1 &
@@ -59,25 +21,12 @@ run_with_progress() {
   local start
   start="$(date +%s)"
 
-  # Started here rather than in run_with_retries so it covers the run however
-  # it is watched: the pinned-bar loop below only exists on a TTY, and a
-  # multi-day search is exactly the thing somebody starts under nohup.
+  # Keep watchdog coverage when started under nohup, where no status bar runs.
   local watchdog_pid=""
   if [ "${NS_STALL_TIMEOUT:-0}" -gt 0 ]; then
     _ns_stall_watchdog "${output_dir}" "${NS_STALL_TIMEOUT}" &
     watchdog_pid=$!
-    # On a signal as well as on the normal path below. The watchdog is a
-    # forked subshell, so Ctrl-C or a SIGTERM to the run script used to leave
-    # it polling a directory nobody writes to any more for the rest of
-    # NS_STALL_TIMEOUT - two hours by default. Two were found orphaned on this
-    # host, `bash run-nested-sampling.sh` with a `sleep` child, against run
-    # directories that had already been deleted. Nothing can be done about
-    # SIGKILL, which is what `./ri health` warns about instead.
-    #
-    # EXIT alone, no INT/TERM: bash installs its own handlers for the fatal
-    # signals once any EXIT trap is set, so the trap runs on the way out of a
-    # signal too - checked by dropping the INT/TERM pair and watching the
-    # self-check below still pass.
+    # EXIT covers INT/TERM; SIGKILL is reported by `./ri health`.
     _NS_WATCHDOG_PID="${watchdog_pid}"
     _ns_add_trap '_ns_stop_watchdog' EXIT
   fi
@@ -95,8 +44,7 @@ run_with_progress() {
     _ns_pin_draw "$(_ns_status_line "${output_dir}" "${max_ndead}" "${nlive}" "${start}")"
     _ns_pin_teardown
   elif [ -t 1 ]; then
-    # No usable terminal control (e.g. tput/TERM missing): fall back to a
-    # plain redrawn line instead of a pinned one.
+    # Missing terminal control: redraw a plain line.
     local drawn
     while kill -0 "${pid}" 2>/dev/null; do
       drawn="$(_ns_now_us)"
@@ -112,56 +60,22 @@ run_with_progress() {
   if [ -n "${watchdog_pid}" ]; then
     wait "${watchdog_pid}" 2>/dev/null || true
   fi
-  # The command's last writer is now closed, so tee sees EOF. Waited for so
-  # the function leaves no child behind and the file is known to be complete
-  # before the caller reads it. In practice tee always drains first and the
-  # self-check below cannot force it not to, so this is a guard against a race
-  # rather than a fix for an observed one - kept because the lines at risk are
-  # exactly the ones the file exists for.
+  # Wait for tee after the command closes its FIFO, leaving complete run.log.
   wait "${tee_pid}" 2>/dev/null || true
   rm -f "${pipe}"
   return "${status}"
 }
 
 # Usage: run_with_retries <retries> <output_dir> <max_ndead> <nlive> -- cmd args...
-#
-# The recovery half of the above: PolyChord checkpoints continuously, so a run
-# that dies at hour three already has what it needs to carry on - what it
-# lacked was anything to start it again. docs/robustness.md has the whole
-# story; four things that decide the code here:
-#
-# Retried only while the failed attempt made forward progress, measured in
-# completed evaluations. That is the guard against spinning - a deterministic
-# code bug, a bad parameter space or a missing image all fail before scoring
-# anything, so they stop at once rather than failing three times as slowly.
-#
-# Evaluations, not the dead points this used to count: PolyChord writes chains/
-# only every `nlive` dead points, so a crash inside that interval leaves the
-# count at exactly what the attempt started from. A real search killed at 31
-# scored evaluations and 0 dead points refused to retry.
-#
-# A retry reuses the sidecar containers but not their pooled workers, which
-# exit on EOF when the dying ranks close the FIFOs; each rank waits out
-# `_connect_shell_started_worker`'s 10s deadline and starts its own inside the
-# same sidecar. One-off wait, not a per-evaluation penalty: 216 evaluations/min
-# before a real kill against 219/min after, with a 12.1s gap. Re-launching the
-# pool would put two readers on one FIFO, splitting the messages.
-#
-# `retries` bounds a crash loop, not the lifetime of a long search, so an
-# attempt that ran NS_RETRY_RESET_SECONDS before dying hands the budget back -
-# otherwise a search that healed itself twice on day one is out of retries for
-# the rest of the week. Half an hour is ~70x one R2D2 evaluation and ~150x the
-# 12.1s a restart costs. Resetting too eagerly is the safe direction, since a
-# retry still has to have scored evaluations.
+# Recovery retries require progress, reuse sidecars without dead FIFO workers,
+# and reset after long attempts. See docs/robustness.md for the contract.
 run_with_retries() {
   local retries="$1" output_dir="$2"
   shift
   local reset_after="${NS_RETRY_RESET_SECONDS:-1800}"
   local attempt=0 status=0 before after started ranks arg prev resized
   local log_before=0 from_where
-  # The command is re-run rather than re-built, and the one part of it a
-  # restart must not replay verbatim is the rank count - see the re-clamp
-  # below - so it is held in an array this loop can rewrite.
+  # Keep arguments mutable so a restart can re-clamp its rank count.
   local -a args=("$@") rescaled
   while :; do
     before="$(_ns_completed_evals "${output_dir}")"
@@ -171,8 +85,7 @@ run_with_retries() {
     run_with_progress "${args[@]}" || status=$?
     [ "${status}" -eq 0 ] && return 0
     after="$(_ns_completed_evals "${output_dir}")"
-    # Before the budget check, so the attempt that earned the reset is the one
-    # that gets to use it.
+    # Let the attempt that earned the reset use it.
     if [ "$(($(date +%s) - started))" -ge "${reset_after}" ]; then
       attempt=0
     fi
@@ -187,27 +100,9 @@ run_with_retries() {
     fi
     from_where="PolyChord's checkpoint"
     if [ "${after}" -le "${before}" ]; then
-      # An attempt that scores nothing is normally deterministic and retrying
-      # only fails slower - except for the one input a restart can change:
-      # PolyChord's checkpoint. A truncated `chains/*.resume` aborts in Fortran
-      # before evaluation 1, so the guard below fires, no restart is tried, and
-      # every later `./ri resume` dies in the same place with every scored
-      # evaluation unreachable on disk.
-      #
-      # Moving it aside is the fix: `polychord_*.py` sets `read_resume` off
-      # that file's existence, so the next attempt starts the sampler from
-      # scratch and `adopt_completed_evaluations` replays what was scored out
-      # of the point cache without imaging it. Renamed rather than deleted -
-      # a checkpoint the run could not read is still the only record of where
-      # the sampler reached.
-      #
-      # Only on evidence that the checkpoint is what broke: a gfortran error
-      # naming read_write.F90 in *this attempt's* output, not anywhere in
-      # run.log, which accumulates across attempts. A missing image scores
-      # nothing too, and a good checkpoint thrown away costs a long search its
-      # position. Not capped per run - a full disk tears every checkpoint it
-      # writes, and the retry budget already bounds a fault that keeps coming
-      # straight back.
+      # Zero progress normally means a deterministic failure. Quarantine a
+      # checkpoint only when this attempt's output names its Fortran reader;
+      # otherwise preserve the checkpoint and stop.
       if _ns_attempt_output "${output_dir}" "${log_before}" \
            | grep -q 'read_write\.F90' \
         && _ns_quarantine_checkpoint "${output_dir}"; then
@@ -225,19 +120,9 @@ run_with_retries() {
         break
       fi
     fi
-    # The rank count this attempt ran at was `ns_budget_ranks`' answer to how
-    # much memory was free when the run *started*, which on a host several
-    # sessions share is not a fact about now: the common way a long search
-    # dies is another session's run growing into it, and replaying the old
-    # number puts the restart straight back into the OOM killer - which does
-    # not fail the run, it scores FAILURE_OBJECTIVE, which PolyChord
-    # maximizes. Same reasoning as `./ri resume`, which re-clamps the
-    # NS_MPI_PROCS it reads from run.env, and the same direction of error:
-    # clamping down costs wall clock, clamping up costs the run. Only ever
-    # down, because `ns_budget_ranks` never returns more than it is asked
-    # for. The FIFO pool the run script laid out for the original rank count
-    # is not a constraint here - a restart's ranks never use it, they start
-    # their own workers (see the note above), so the spare FIFOs go unread.
+    # Re-clamp against current memory: another run may have grown since the
+    # failed attempt. Down costs time; up risks an OOM score. Restarts create
+    # their own workers, so the original FIFO pool does not constrain them.
     ranks="$(_ns_retry_rank_count "${args[@]}")"
     if [ "${ranks}" = "0" ]; then
       _ns_retry_say "${output_dir}" \
@@ -259,26 +144,12 @@ run_with_retries() {
       done
       args=("${rescaled[@]}")
     fi
-    # The containers are started once, in front of this loop, so a sidecar that
-    # died takes every remaining attempt with it: the `docker exec` fails
-    # instantly, the attempt scores nothing, and the guard above stops the run
-    # for looking deterministic - which it is, until the container is back.
-    # Defined by start-sidecars.sh, which every real search sources and no
-    # fixture does, so the retry loop stays runnable on its own.
-    # Teed into run.log for the same reason the messages below are: run.log is
-    # the only artifact that says why a run stopped, and a restart that had to
-    # replace a container first is part of that. `|| true` so a relaunch that
-    # fails does not take the run script out through `set -e` without a word -
-    # the docker error is in the log, and the attempt that follows it stops on
-    # the guard above.
+    # Sidecar restore is optional for fixtures; log failures, then let the next
+    # attempt's progress guard stop if the sidecar remains unavailable.
     if declare -F sidecar_restore >/dev/null; then
       sidecar_restore 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
     fi
     attempt=$((attempt + 1))
-    # An index of the restarts, next to run.log which holds the tracebacks
-    # themselves. Its own file because `./ri health` wants the count of a run
-    # that has been going for a day, and run.log by then is megabytes of
-    # PolyChord feedback with the restart lines scattered through it.
     printf '%s exit %s after %s evaluations\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${status}" "${after}" \
       >>"${output_dir}/restarts.log"
@@ -289,12 +160,8 @@ run_with_retries() {
   return "${status}"
 }
 
-# The rank count a restart should run at, or empty for "leave the command
-# alone". Reads the current count and the algorithm out of the command itself
-# (`-np N`, and the `polychord_*.py` the ranks run) rather than being told
-# them, so nothing has to be threaded through the run scripts for the retry
-# loop to know what it is restarting. `0` means not even one rank fits, which
-# is the one answer the caller must not treat as a rank count.
+# Return a lower rank count, 0 when one rank does not fit, or nothing when the
+# command is not an MPI search.
 _ns_retry_rank_count() {
   local arg prev='' current='' mb='' label='' ranks
   for arg in "$@"; do
@@ -317,9 +184,7 @@ _ns_retry_rank_count() {
   return 0
 }
 
-# Both to the terminal and into run.log, because run.log is the only artifact
-# that records why a run stopped and a restart is part of that story - `./ri
-# health` reads these lines back to say a live run has healed itself.
+# Print retry status to stderr and run.log; health reads run.log.
 _ns_retry_say() {
   local output_dir="$1"
   shift
@@ -335,9 +200,7 @@ _ns_completed_evals() {
   find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
 }
 
-# run.log's size, so the next attempt's output can be told from every earlier
-# one's: the file is appended to across attempts and a failure this loop has
-# already recovered from must not be read as the current one's.
+# Return run.log size so retry output can be isolated from earlier attempts.
 _ns_log_size() {
   [ -f "$1/run.log" ] || { printf '0\n'; return 0; }
   wc -c <"$1/run.log" | tr -d ' '
@@ -349,9 +212,7 @@ _ns_attempt_output() {
   tail -c "+$(($2 + 1))" "$1/run.log"
 }
 
-# Move a run's PolyChord checkpoint out of the way, reporting whether there
-# was one to move. `chains/*.resume` is the path polychord_*.py builds from
-# `base_dir` and `file_root`, and a run only ever has the one.
+# Quarantine the run's PolyChord checkpoint, if present.
 _ns_quarantine_checkpoint() {
   local f moved=''
   for f in "$1"/chains/*.resume; do
@@ -361,10 +222,8 @@ _ns_quarantine_checkpoint() {
   [ -n "${moved}" ]
 }
 
-# Stops the watchdog run_with_progress started, from the normal path and from
-# its EXIT trap alike. The pid is cleared rather than left to be re-killed, so
-# that a trap firing minutes later cannot signal whatever has since been given
-# that pid.
+# Stop the watchdog from normal cleanup or its EXIT trap; clear its PID to avoid
+# a delayed trap signaling a reused PID.
 _ns_stop_watchdog() {
   [ -n "${_NS_WATCHDOG_PID:-}" ] || return 0
   kill "${_NS_WATCHDOG_PID}" 2>/dev/null || true
@@ -373,22 +232,11 @@ _ns_stop_watchdog() {
 
 # Usage: _ns_stall_watchdog <output_dir> <timeout seconds>
 #
-# The failure run_with_retries cannot see: a run that hangs instead of dying.
-# PolyChord calls the likelihood from Fortran, so one stuck rank leaves every
-# other waiting forever - every core busy, nothing landing, no exit status. The
-# in-worker timeouts only cover a worker that was *asked* for a reply.
-#
-# So this watches the one thing true of every healthy run and false of every
-# hung one - evaluations finishing - and turns a hang into the crash the retry
-# machinery already handles. The kill is by command line, not by the pid
-# run_with_progress holds: that pid is the `docker exec` client and the ranks
-# are children of containerd-shim, so killing it leaves the run going.
-#
-# The timeout has to clear IMAGING_REPLY_TIMEOUT (3600s), which is how long one
-# evaluation may already take before its worker is declared dead. Twice that by
-# default, against a measured worst gap of 23.5s over 6.3 hours of a live
-# 16-rank R2D2 search. The backstop for when nobody is watching; `./ri health`
-# answers the same question in seconds for somebody who is.
+# Detect hangs that worker timeouts cannot: a stuck rank leaves PolyChord
+# waiting forever. Watch completed evaluations, then kill the run by command
+# line so retry logic can resume it; the `docker exec` client PID is not enough.
+# Default timeout is twice IMAGING_REPLY_TIMEOUT, well above the measured
+# 23.5s maximum gap; `./ri health` provides the interactive equivalent.
 _ns_stall_watchdog() {
   local output_dir="$1" timeout="$2" floor="${NS_STALL_POLL_SECONDS:-60}"
   local last quiet=0 now poll scanned
@@ -427,21 +275,12 @@ _ns_stall_watchdog() {
   done
 }
 
-# Appends a command to whatever trap is already registered for a signal
-# instead of replacing it - start-sidecars.sh's cleanup trap on EXIT/INT/TERM
-# must keep running (a leftover R2D2 sidecar holds ~33.7GB), so ours must not
-# clobber it. New command runs first: INT/TERM's existing handler ends in
-# `exit N`, which would skip anything appended after it.
+# Append a trap without replacing sidecar cleanup; run the new command first.
 _ns_add_trap() {
   local new="$1" sig="$2" line existing=""
   line="$(trap -p "${sig}")"
   if [ -n "${line}" ]; then
-    # `trap -p` prints valid shell source for re-registering the trap
-    # (`trap -- 'cmd' SIG`), quoted so embedded quotes in the existing
-    # command survive - letting bash's own parser split it back into words
-    # is what correctly reverses that quoting; substring-stripping the
-    # 'trap -- ' prefix textually breaks the moment the command itself
-    # contains a quote.
+    # Let Bash parse trap's quoted command; textual prefix stripping breaks on quotes.
     eval "set -- ${line}"
     existing="$3"
   fi
@@ -884,15 +723,9 @@ self_check() {
     echo "FAIL: no clock means the caller's floor"; exit 1
   }
 
-  # Carrying the frozen dead-point count across the checkpoint interval: 100
-  # dead points banked over 900 evaluations is one per nine, so the 100
-  # evaluations since the checkpoint are worth 11 more.
   [ "$(_ns_dead_now 100 1000 100)" = "111" ] || { echo "FAIL: dead_now: $(_ns_dead_now 100 1000 100)"; exit 1; }
-  # Rounded, not truncated - truncation pins a slow run to its checkpoint.
   [ "$(_ns_dead_now 10 100 5)" = "11" ] || { echo "FAIL: dead_now rounds up"; exit 1; }
   [ "$(_ns_dead_now 10 100 4)" = "10" ] || { echo "FAIL: dead_now rounds down"; exit 1; }
-  # Nothing to extrapolate from, or nothing to extrapolate: the checkpoint's
-  # own count, never a division by zero.
   [ "$(_ns_dead_now 0 1000 100)" = "0" ] || { echo "FAIL: dead_now with no dead points"; exit 1; }
   [ "$(_ns_dead_now 100 1000 0)" = "100" ] || { echo "FAIL: dead_now on a fresh checkpoint"; exit 1; }
   [ "$(_ns_dead_now 100 100 100)" = "100" ] || { echo "FAIL: dead_now with nothing banked"; exit 1; }
@@ -903,12 +736,6 @@ self_check() {
   [ "$(_ns_format_elapsed 3599)" = "59m59s" ] || { echo "FAIL: format_elapsed hour boundary"; exit 1; }
   [ "$(_ns_format_elapsed 194400)" = "2d 6h" ] || { echo "FAIL: format_elapsed days"; exit 1; }
 
-  # A pinned draw is written to a fixed row and never re-checked, so a line
-  # even one column wider than the terminal wraps onto the row above (inside
-  # the scroll region) and gets scrolled away within seconds - confirmed by
-  # replaying a real run through a terminal emulator: the bar was in the byte
-  # stream but invisible on screen. `tput cols` fails outside a real
-  # terminal, so this exercises the 80-column fallback.
   local long_line padded
   long_line="$(printf 'x%.0s' $(seq 1 200))"
   padded="$(_ns_truncate_pad "${long_line}")"

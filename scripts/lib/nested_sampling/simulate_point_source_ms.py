@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Create a VLA Measurement Set for a noisy single point source.
-
-The MS skeleton and VLA.A antenna table come from makems' bundled VLA-A
-example (shipped by the `makems` KERN package). Visibilities are predicted by
-an actual MeqTrees/Meow point-source RIME run (see point_source_forest.py),
-driven non-interactively through meqtree-pipeliner.py - except for a source at
-the phase centre, whose predict is a constant that phase_centre_visibility()
-writes directly. Thermal noise is then added on top of the clean prediction.
-"""
+"""Create a noisy VLA Measurement Set for a single point source."""
 
 from __future__ import annotations
 
@@ -34,32 +26,16 @@ from casacore.tables import table
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
 ANTENNA_TABLE_NAME = "VLAA_ANT"
 TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
-# The MS time grid step. Shared with prebuild_skeletons(), which has to
-# enumerate the same NTimes values a run's evaluations will ask for.
+# Shared with prebuild_skeletons(), which enumerates evaluation NTimes.
 DEFAULT_INTEGRATION_SECONDS = 120.0
 SPEED_OF_LIGHT = 299792458.0
 
-# makems and casacore fsync on nearly every table write. On the bind-mounted
-# repo that is ~0.5s of ext4 journal wait per run (makems alone: 0.54s on the
-# bind mount vs 0.05s here), so build everything in RAM and copy the finished
-# artifacts out once at the end - ~2ms for a ~1MB Measurement Set.
-# ponytail: Docker gives /dev/shm 64MB by default, which is ~30x this run's
-# largest MS; raise --shm-size on the sidecar if the parameter space grows.
+# RAM avoids ~0.5s bind-mount fsync cost per run; final ~1MB copy costs ~2ms.
+# ponytail: Docker's 64MB /dev/shm is ~30x current largest MS; raise it if needed.
 SCRATCH_ROOT = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
 
 
 def scratch_root_for(destination: Path) -> str | None:
-    """Where to assemble a Measurement Set that is bound for `destination`.
-
-    SCRATCH_ROOT is this container's own /dev/shm, which docker gives it as a
-    private tmpfs - a different mount from the run's shared scratch
-    (`NS_SCRATCH_DIR`, bind-mounted into every container by
-    scripts/lib/start-sidecars.sh). So for a destination already inside that
-    shared tmpfs, simulate()'s closing `shutil.move` was a cross-device copy of
-    the whole MS - 1.60ms against 0.01ms for the rename it becomes when the two
-    are the same mount. Assembling it in the destination directory is as fast to
-    write (both are RAM) and makes the move free.
-    """
     shared = os.environ.get("NS_SCRATCH_DIR", "")
     if shared and destination.is_relative_to(shared):
         return str(destination)
@@ -147,45 +123,28 @@ def run_makems(output_ms: Path) -> None:
     raise SystemExit(f"FATAL: makems did not create {output_ms.name}_p0, {output_ms.name}_p1, or {output_ms}")
 
 
-# makems' output depends on every config field except StartFreq/StepFreq, which
-# only move six SPECTRAL_WINDOW columns. Copying a cached skeleton and rewriting
-# those columns costs ~0.002s against ~0.05s for a makems run, and reproduces a
-# fresh run's tables exactly (see --self-check). The parameter space has 20
-# (NTimes, NFrequencies) shapes, so a long-lived --serve worker hits this cache
-# for most of its evaluations.
+# Cache by (NTimes, NFrequencies): copy/patch ~0.002s vs makems ~0.05s;
+# shared /dev/shm serves all ranks.
 #
-# The cache lives on disk, not in this process, because all of the run's ranks
-# `docker exec` their --serve worker into one shared meqtrees sidecar: they see
-# the same /dev/shm, so a shape any rank has built is a copy away for all the
-# others. A run only visits ~12 distinct shapes but does ~41 evaluations, so
-# per-process caches missed on most of them.
-# ponytail: no eviction - the sidecar is torn down at the end of the run and the
-# whole parameter space is ~20MB of skeletons. Add an LRU sweep if a longer-lived
-# container ever reuses one.
+# ponytail: no eviction - the sidecar ends with the run and the full parameter
+# space is ~20MB. Add an LRU sweep if a longer-lived container reuses one.
 _SKELETON_DIR: Path | None = None
 
-# Where `--prebuild-skeletons` puts the whole parameter space at image build
-# time; see docker/meqtrees/Dockerfile. Every evaluation of a default run hits
-# it, so no run does any makems at all.
+# `--prebuild-skeletons` puts default-run shapes here at image build time;
+# see docker/meqtrees/Dockerfile.
 BAKED_SKELETON_DIR = Path("/opt/ms-skeletons")
 
 
 def skeleton_dir() -> Path:
     global _SKELETON_DIR
     if _SKELETON_DIR is None:
-        # The baked directory is a normal writable container path, so a shape
-        # the image was not built with is still built and published into it -
-        # it is a head start, not a fixed set.
+        # Baked shapes are a head start; unseen shapes are built and published.
         _SKELETON_DIR = BAKED_SKELETON_DIR if BAKED_SKELETON_DIR.is_dir() else Path(SCRATCH_ROOT or tempfile.gettempdir()) / "ms-skeletons"
         _SKELETON_DIR.mkdir(parents=True, exist_ok=True)
     return _SKELETON_DIR
 
 
 def use_skeleton_cache(directory: Path | None) -> None:
-    """Point the cache at `directory`, or back at the default when None.
-
-    A fresh directory is how the self-checks force a rebuild.
-    """
     global _SKELETON_DIR
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -193,12 +152,6 @@ def use_skeleton_cache(directory: Path | None) -> None:
 
 
 def publish_skeleton(built_ms: Path, cached: Path) -> None:
-    """Copy a fresh makems run into the shared cache under its final name.
-
-    Staged then renamed, so a concurrent worker either does not see the entry or
-    sees a complete one. Losing the rename race is normal - the winner's copy is
-    equivalent - so the loser just drops its own.
-    """
     staging = Path(tempfile.mkdtemp(dir=skeleton_dir()))
     try:
         shutil.copytree(built_ms, staging / "ms", symlinks=True)
@@ -211,7 +164,6 @@ def publish_skeleton(built_ms: Path, cached: Path) -> None:
 
 
 def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_width_hz: float) -> None:
-    """Rewrite the only columns makems derives from StartFreq/StepFreq."""
     with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=False, ack=False) as spw:
         n_chan = int(spw.getcol("NUM_CHAN")[0])
         spw.putcol("CHAN_FREQ", (start_frequency_hz + (np.arange(n_chan) + 0.5) * channel_width_hz)[None, :])
@@ -223,17 +175,6 @@ def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_wi
 
 
 def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune_unused: bool = False) -> None:
-    """run_makems(), reusing a cached run for configs that differ only in frequency.
-
-    `prune_unused` skips copying the subtables fill_point_source_visibilities()
-    is going to delete anyway (UNUSED_SUBTABLES): 27 of the cached skeleton's
-    66 files and 0.50ms of the 1.56ms copy. Only a caller that will not ask
-    MeqTrees for a predict may set it - casacore opens the MS as a
-    MeasurementSet there and refuses one that is missing a required subtable -
-    which is why it is an explicit argument rather than read off `args`:
-    warm_forest() and self_check_phase_centre_predict() both predict a source
-    that is *at* the phase centre, so the source position does not decide it.
-    """
     key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
     cached = skeleton_dir() / hashlib.sha256(key.encode()).hexdigest()[:32]
     if not cached.exists():
@@ -247,18 +188,6 @@ def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune
 
 
 def prebuild_skeletons(space: dict) -> None:
-    """Build a cache entry for every (NTimes, NFrequencies) the space can ask for.
-
-    A fresh makems run is ~0.11s against ~0.004s for a cache hit, and a default
-    run touches ~12 of the parameter space's 20 shapes, first-touching most of
-    them mid-sampler where the miss lands straight on the wall clock. Run once
-    at image build time (see docker/meqtrees/Dockerfile) the whole space costs
-    ~1.2s and ~18MB and no run ever calls makems again - including the workers'
-    own warm_forest(), which all eight used to race on the same fresh build.
-
-    The MS name is part of the cache key, so this has to build under the same
-    name a real evaluation uses; self_check_skeleton_prebuild() is the guard.
-    """
     minutes_lo, minutes_hi = space["observation_minutes"]
     chan_lo, chan_hi = space["channel_count"]
     step = DEFAULT_INTEGRATION_SECONDS
@@ -295,11 +224,7 @@ def determine_corr_selection(output_ms: Path) -> tuple[str, int]:
 
 @contextlib.contextmanager
 def redirect_fds(out_path: Path, err_path: Path | None = None):
-    """Point fds 1 and 2 - so child processes too - at files for this block.
-
-    `err_path=None` sends stderr to the stdout file, the way
-    `subprocess.run(stderr=STDOUT)` did when each stage was its own process.
-    """
+    """Redirect stdout and stderr for this block, merging stderr when omitted."""
     sys.stdout.flush()
     sys.stderr.flush()
     saved_out, saved_err = os.dup(1), os.dup(2)
@@ -329,14 +254,6 @@ _FOREST: dict[str, object] = {}
 
 
 def meqserver_session():
-    """The one meqserver this process talks to, started on first predict.
-
-    `meqtree-pipeliner.py` spent ~0.32s of its ~0.46s on Timba imports, starting
-    a meqserver and reaping it again, against ~0.14s of actual RIME predict, and
-    paid all of it again on every evaluation. Under `--serve` the imports and the
-    meqserver survive between requests; only the per-evaluation compile and run
-    remain. stop_meqserver_session() shuts it down again.
-    """
     global _MQS
     if _MQS is None:
         import Timba.utils
@@ -351,38 +268,17 @@ def meqserver_session():
     return _MQS
 
 
-# How long one predict may take before its meqserver is assumed wedged. Timba's
-# `wait=True` means wait forever, which is how a MeqTrees deadlock used to take a
-# whole run down: this process sat in Timba's 1s poll loop with no instruction to
-# ever give up, and the rank waiting on its reply held every other rank in
-# PolyChord's collective behind it. A number bounds that here, where the worker
-# can replace its own server and answer the rank normally, instead of out in the
-# rank where the only move is to kill this process. A predict is ~0.1s and the
-# slowest simulate on record is 0.6s, so 3s is ~30x the real thing.
+# Bound MeqTrees deadlocks so worker can restart its server; 3s is ~30x the
+# slowest recorded simulate and avoids blocking PolyChord's collective.
 PREDICT_WAIT_SECONDS = 3.0
 
 
 class MeqserverWedged(RuntimeError):
-    """A predict went unanswered for PREDICT_WAIT_SECONDS.
-
-    Deliberately not a failed evaluation: the sampler must never score this,
-    because it says nothing about the parameters. It is the local, recoverable
-    form of what common.py calls WORKER_DIED - the server is replaced and the
-    predict retried, and only a second failure gives up.
-    """
+    """Predict exceeded PREDICT_WAIT_SECONDS; restart server and retry."""
 
 
 def restart_meqserver_session() -> None:
-    """Replace a meqserver that stopped answering, without asking it politely.
-
-    stop_meqserver_session() below sends halt() and waits for the reply, which
-    is exactly what a wedged server will not send, so it would hang here too.
-    The server is this process's own child, so SIGKILL and reap it instead.
-    Octopussy stays up and only the server is replaced; the forest lives in the
-    server, so it dies with it and the next predict recompiles. Measured at
-    0.18s, against ~3s for the rank-side watchdog to kill this whole worker and
-    a replacement to import Timba from scratch.
-    """
+    """Kill and reap wedged meqserver, leaving worker alive for retry."""
     global _MQS
     from Timba.Apps import meqserver
 
@@ -400,13 +296,7 @@ def restart_meqserver_session() -> None:
 
 
 def stop_meqserver_session() -> None:
-    """Shut the meqserver down explicitly, the way meqtree-pipeliner.py does.
-
-    Timba registers stop_default_mqs() with atexit, but CPython joins non-daemon
-    threads - including octopussy's event thread, which only exits once the
-    server is stopped - before it runs atexit handlers, so leaving it to atexit
-    hangs the interpreter at exit forever.
-    """
+    """Stop explicitly so Timba's non-daemon threads cannot hang interpreter exit."""
     global _MQS
     if _MQS is not None:
         from Timba.Apps import meqserver
@@ -418,7 +308,6 @@ def stop_meqserver_session() -> None:
 
 
 def point_to_measurement_set(module, output_ms: Path) -> None:
-    """Aim an already-compiled forest at a different Measurement Set."""
     mssel = module.mssel
     if not mssel._select_new_ms(str(output_ms)):
         raise SystemExit(f"FATAL: MeqTrees could not read {output_ms}")
@@ -476,13 +365,7 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
 
 
 def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
-    """One compile-and-predict against this process's meqserver.
-
-    Same sequence meqtree-pipeliner.py runs for
-    `-c <tdlconf> point_source_forest.py[predict] =predict`, except that the
-    predict is bounded instead of waiting forever. Raises MeqserverWedged when
-    the server does not answer inside that bound.
-    """
+    """Compile and run bounded predict; raise MeqserverWedged on timeout."""
     mqs = meqserver_session()
     from Timba.TDL import Compile, TDLOptions
 
@@ -521,19 +404,7 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
 
 
 def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
-    """What MeqTrees predicts for a Stokes-I point source at the phase centre.
-
-    point_source_forest.py hands Meow the phase-centre Direction itself at zero
-    offset, so no K-Jones is applied and the brightness matrix reaches the sinks
-    unchanged: XX = YY = I on every baseline, timeslot and channel, with the
-    cross-hands zero. Nothing in it depends on the data, which is why a predict
-    costs the same 13ms whether the Measurement Set has 1000 visibilities or
-    28000 - it is the meqserver round trip and the MS open, not the arithmetic.
-    That was ~15% of a run's worker time spent producing this constant, so at
-    the phase centre it is written directly and MeqTrees is only asked for the
-    offset source it is actually needed for. self_check_phase_centre_predict()
-    is the guard that the two agree exactly.
-    """
+    """Return constant Stokes-I visibilities for a phase-centre source."""
     model = np.zeros(n_corr, dtype=np.complex64)
     model[0] = model[-1] = source_flux_jy
     return model
@@ -557,7 +428,6 @@ UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STA
 
 
 def meqtrees_predict_needed(args: argparse.Namespace) -> bool:
-    """Whether this source needs the meqserver - see phase_centre_visibility()."""
     return bool(args.source_l_arcsec or args.source_m_arcsec)
 
 
@@ -701,23 +571,7 @@ def simulate(args: argparse.Namespace) -> None:
 
 
 def warm_forest() -> None:
-    """Compile the forest and run one predict, so evaluation one does not.
-
-    Even against a warm skeleton cache the first simulate in a fresh worker
-    costs ~0.17s where the next one costs ~0.03s; the difference is the TDL
-    compile and the meqserver's first predict, and the forest is identical for
-    every evaluation in a run (see run_meqtrees_predict()). Only worth doing
-    when there is a window to hide it in - which is why serve() does this under
-    --fifo, where the worker is the meqtrees container's own startup command and
-    the run has three containers, a manifest and mpirun still to go, and not on
-    the stdin path, where the rank that spawned the worker is already waiting.
-
-    All the workers warm on the same shape, so seven of the eight lose the
-    skeleton cache's publish race; that costs ~0.11s of an idle core each,
-    inside the window, and the winner leaves an entry the run goes on to use.
-    Baking a ready-made Measurement Set into the image to skip those makems runs
-    was measured and moves worker-ready time by nothing.
-    """
+    """Prewarm forest and first predict before FIFO requests arrive."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         ms = Path(scratch) / "sim.ms"
         args = parse_args([
@@ -731,14 +585,7 @@ def warm_forest() -> None:
 
 
 def handle_request(request: dict) -> None:
-    """Run one request's work in this process.
-
-    The MS-to-`.mat` convert used to be its own `docker exec` of
-    ms_to_r2d2_mat.py at ~0.15s, of which ~0.01s was the conversion - the rest
-    was the exec, a fresh interpreter and the numpy/casacore/scipy imports.
-    This worker has all of that live and has just written the MS, so the R2D2
-    PoC asks it to convert too.
-    """
+    """Run one simulation or conversion request."""
     if request.get("action") == "convert":
         # Imported on first use, not at module scope: only the R2D2 PoC
         # converts, and the WSClean PoC's worker should not pay for scipy.
@@ -750,22 +597,7 @@ def handle_request(request: dict) -> None:
 
 
 def serve(fifo_base: str | None = None) -> None:
-    """Run one simulate per JSON request line, reusing this process.
-
-    A one-shot `docker exec` of this script spent ~0.45s of its ~0.7s on process
-    and meqserver startup that every evaluation repeated. A request is
-    `{"argv": [...], "stdout": path, "stderr": path}`; everything the run prints
-    goes to those two files, exactly as the caller's `docker exec` redirection
-    did, and the reply is one JSON line - `{"returncode": int}`. A request with
-    `"action": "convert"` runs handle_request()'s other entry point instead.
-
-    Requests arrive on stdin and replies go to the process's original stdout,
-    unless `fifo_base` is given: then they arrive on `<fifo_base>.in` and the
-    replies go to `<fifo_base>.out`, a pair of FIFOs on the bind mount both
-    containers share. That is what lets run-nested-sampling.sh start this
-    worker as the meqtrees container's command - and pay all of the warm-up
-    below - before the rank that will use it even exists.
-    """
+    """Serve JSON requests over stdin/stdout or a shared FIFO pair."""
     # meqserver_session() is otherwise first called inside request one, so every
     # rank paid ~0.3s of Timba import and meqserver startup in front of its first
     # evaluation - and because PolyChord asks all ranks for their initial live
@@ -821,12 +653,7 @@ def serve(fifo_base: str | None = None) -> None:
 
 
 def self_check_scratch_root() -> None:
-    """A destination inside the run's shared tmpfs is assembled in place.
-
-    Getting this wrong is silent - the MS still arrives, it is just copied
-    across two tmpfs mounts on the way (1.60ms an evaluation) instead of
-    renamed (0.01ms).
-    """
+    """Check shared scratch paths avoid an unnecessary cross-tmpfs copy."""
     was = os.environ.get("NS_SCRATCH_DIR")
     with tempfile.TemporaryDirectory() as shared:
         try:
@@ -849,8 +676,6 @@ def self_check_scratch_root() -> None:
 
 
 def self_check_skeleton_cache() -> None:
-    """A patched cache hit must reproduce a fresh makems run column for column."""
-
     def build(ms: Path, start_hz: float, step_hz: float, n_chan: int, minutes: float) -> Path:
         built = parse_args([
             "--output-ms", str(ms), "--observation-minutes", str(minutes),
@@ -961,14 +786,7 @@ def self_check_phase_centre_predict() -> None:
 
 
 def self_check_noise_weighting() -> None:
-    """R2D2's nW must be what the dropped `UPDATE ... SET WEIGHT` would have given.
-
-    The simulator no longer writes 1/sigma^2 to every row (it was 31% of the
-    stage); ms_to_r2d2_mat.py divides by the sigma from simulation.json instead.
-    That is only equivalent while makems leaves WEIGHT at exactly 1.0, so this
-    asserts both halves: the column is untouched, and nW comes out elementwise
-    equal to the old sqrt(WEIGHT) over a 1/sigma^2 column.
-    """
+    """Check untouched WEIGHT and equivalent nW conversion from simulation sigma."""
     from ms_to_r2d2_mat import ms_to_r2d2_mat
     from scipy.io import loadmat
 
@@ -1001,13 +819,7 @@ def self_check_noise_weighting() -> None:
 
 
 def self_check_dropped_subtables() -> None:
-    """UNUSED_SUBTABLES must be gone from a finished MS, on both predict paths.
-
-    The offset case is the one that matters: casacore will not open an MS that
-    is missing a required subtable, so the drop has to happen after the MeqTrees
-    predict rather than in the cached skeleton, and this is the guard on that
-    ordering.
-    """
+    """Finished MS must retain required subtables on both predict paths."""
     kept = ("ANTENNA", "DATA_DESCRIPTION", "FIELD", "OBSERVATION",
             "POLARIZATION", "SPECTRAL_WINDOW")
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
@@ -1052,19 +864,7 @@ def self_check_dropped_subtables() -> None:
 
 
 def self_check_meqserver_restart() -> None:
-    """A wedged meqserver is replaced once; a second wedge kills the worker.
-
-    The deadlock this covers is a real one: MeqTrees stopped answering a
-    predict, and because Timba's `wait=True` means wait forever, the worker sat
-    in its poll loop while the rank waiting on the reply held every other rank
-    in PolyChord's collective. Recovering here rather than out in the rank is
-    what keeps the stall to one restart instead of one killed worker.
-
-    The two outcomes have to stay apart. One wedge is a stuck server and the
-    caller must never know; two in a row is a worker that cannot be saved, and
-    it has to leave as a worker death, never as an exit status the sampler
-    would score against these parameters.
-    """
+    """Check one meqserver restart is retried and a second wedge kills worker."""
     original_predict = globals()["_compile_and_predict"]
     original_restart = globals()["restart_meqserver_session"]
     calls: list[str] = []
@@ -1128,16 +928,7 @@ def self_check_meqserver_restart() -> None:
 
 
 def self_check_predict_timeout_recovery() -> None:
-    """The real Timba path: a bounded predict expires, and the worker recovers.
-
-    self_check_meqserver_restart() above pins the control flow against a
-    stand-in. This one pins the two library facts the whole design rests on,
-    which no amount of monkeypatching can vouch for: that Timba honours a
-    numeric `wait` at all (`wait=True` means wait forever, and a version that
-    ignored a number would put the deadlock straight back), and that a
-    meqserver killed underneath a live octopussy can be replaced in the same
-    process. A Timba or base-image upgrade is exactly what would break either.
-    """
+    """Verify bounded predict timeout, meqserver replacement, and recovery."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         ms = Path(scratch) / "sim.ms"
         args = parse_args([
@@ -1182,15 +973,7 @@ def self_check_predict_timeout_recovery() -> None:
 
 
 def self_check_wedge_kills_worker() -> None:
-    """A worker that cannot fix itself must die, never answer with a status.
-
-    This is the invariant the whole WORKER_DIED split exists for: an exit
-    status comes back as a failed evaluation and PolyChord maximizes
-    FAILURE_OBJECTIVE, so a meqserver nobody can revive would become the
-    search's best point and the run would chase a host fault instead of the
-    algorithm. Reordering serve()'s except clauses is all it would take, and
-    nothing else here would notice.
-    """
+    """A wedged worker must die as WORKER_DIED, not answer with a status."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         ms = Path(scratch) / "sim.ms"
         # A worker whose predicts can never succeed, without a knob in the
@@ -1246,13 +1029,7 @@ def self_check_serve_reply_stream() -> None:
 
 
 def self_check_serve_fifo() -> None:
-    """A `--fifo` worker must answer on its FIFO pair without deadlocking.
-
-    Both ends block on open until the other side opens, so the request pipe has
-    to be opened first by both processes; get that backwards and the run hangs
-    with no error. The caller side here is the same O_NONBLOCK retry
-    common._connect_shell_started_worker() uses.
-    """
+    """Check that a `--fifo` worker answers without deadlocking."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         base = Path(scratch) / "0"
         os.mkfifo(f"{base}.in")

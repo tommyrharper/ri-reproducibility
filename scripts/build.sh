@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Build one or more images. Wraps `docker build` directly rather than
-# `docker compose build` so build args (portability, platform) stay
-# explicit and idempotent - re-running just hits Docker's layer cache.
+# Build images with explicit args; repeated builds use Docker's layer cache.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,26 +14,11 @@ TARGET="${1:-all}"
 # meaningful (the plain x86-64 baseline), so `-` rather than `:-`.
 WSCLEAN_TARGET_CPU="${WSCLEAN_TARGET_CPU-x86-64-v3}"
 
-# A `docker build` whose every step is CACHED is not free: buildkit still
-# resolves the `docker/dockerfile:1` frontend and the base image metadata over
-# the network, walks every CACHED step, and re-exports and re-tags the manifest
-# and its provenance attestation - 1.5-1.9s per image on this host. The
-# nested-sampling PoC targets build three images in front of a run whose sampler
-# is ~1.2s, so that check used to be a third of the command's wall clock.
-#
-# So: record a hash of everything a build reads in a label on the image it
-# produces, and skip the build when the image is already there with that exact
-# hash. `docker image inspect` is ~0.05s and answers "is it built from these
-# inputs" and "does it still exist" in one call. FORCE_BUILD=1 skips the skip.
+# Cache build inputs in an image label; FORCE_BUILD=1 bypasses the check.
 BUILD_INPUTS_LABEL="ri.build-inputs"
 
-# The files a build reads: its Dockerfile plus whatever that COPYs or
-# bind-mounts from the context (`grep -n 'COPY\|--mount=type=bind' docker/*/Dockerfile`).
-# Directories are walked. Names go into the hash as well as contents, so that
-# renaming a file inside a COPYed directory is a rebuild. <flavour> carries the
-# platform and any build args - same files, different flags, different image.
-# `__pycache__` is pruned to match `.dockerignore`: those files never reach a
-# build context, so they must not invalidate a hash either.
+# Hash Dockerfiles and copied or bind-mounted files. Include names so renames
+# invalidate builds; exclude __pycache__ to match .dockerignore.
 # Usage: inputs_hash <flavour> <path...>
 inputs_hash() {
   local flavour="$1"
@@ -65,10 +48,8 @@ build_image() {
     -t "${image}" "$@" .
 }
 
-# BUILD_JOBS is `make -j` for the casacore and WSClean source builds, ~40
-# minutes of compiling at the Dockerfile's default of 4, so it follows `nproc`
-# unless the caller sets it (a build that OOMs wants it lower). Deliberately
-# not in inputs_hash: it changes how long the build takes, not what it makes.
+# BUILD_JOBS controls source-build parallelism; default to `nproc` and exclude
+# it from inputs_hash because it changes build time, not output.
 build_wsclean() {
   build_image ri-reproducibility/wsclean:v3.7 \
     "$(inputs_hash "${PLATFORM} TARGET_CPU=${WSCLEAN_TARGET_CPU}" \
