@@ -242,6 +242,8 @@ def do_run(args: argparse.Namespace) -> int:
     a search starts is written down twice. ./ri bench run has already built.
     """
     env = {**os.environ, **preset_settings(args.preset, args.imager)}
+    if args.allow_oversubscription:
+        env["NS_MPI_OVERSUBSCRIBE"] = "1"
     mpi_arms = args.interleave_mpi_procs or (args.mpi_procs,)
     if args.mpi_procs is not None:
         env["NS_MPI_PROCS"] = str(args.mpi_procs)
@@ -565,6 +567,8 @@ def main() -> int:
     run.add_argument("--interleave-mpi-procs", type=int, nargs=2,
                      metavar=("A", "B"),
                      help="alternate two MPI worker counts; --repeat is per arm")
+    run.add_argument("--allow-oversubscription", action="store_true",
+                     help="allow MPI counts above CPU affinity for explicit probes")
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
@@ -588,11 +592,13 @@ def main() -> int:
             parser.error("use --interleave-mpi-procs or --mpi-procs, not both")
         if any(value < 1 for value in args.interleave_mpi_procs):
             parser.error("interleaved MPI worker counts must be at least 1")
-    if getattr(args, "handler", None) is do_run and args.mpi_procs is not None:
+    if (getattr(args, "handler", None) is do_run and args.mpi_procs is not None
+            and not args.allow_oversubscription):
         available = available_cpu_count()
         if args.mpi_procs > available:
             parser.error(f"--mpi-procs cannot exceed {available} available CPU slots")
-    if getattr(args, "handler", None) is do_run and args.interleave_mpi_procs:
+    if (getattr(args, "handler", None) is do_run and args.interleave_mpi_procs
+            and not args.allow_oversubscription):
         available = available_cpu_count()
         if max(args.interleave_mpi_procs) > available:
             parser.error(f"--interleave-mpi-procs cannot exceed {available} available CPU slots")

@@ -14,6 +14,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --native --repeat 3       # host-specific WSClean build
 ./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3  # rank-scaling probe
 ./ri bench run wsclean --preset throughput --interleave-mpi-procs 19 20 --repeat 3  # paired rank A/B
+./ri bench run wsclean --preset throughput --interleave-mpi-procs 20 21 --allow-oversubscription --repeat 3  # explicit oversubscription probe
 ./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3  # thread-count probe
 ```
 
@@ -54,7 +55,9 @@ unrecorded warm-up; `--repeat N` runs N measured searches per arm. This keeps
 small thread-count differences paired against host drift.
 
 `--interleave-mpi-procs A B` does the same for MPI worker counts. It rejects
-counts above available CPU affinity before launching the warm-up.
+counts above available CPU affinity before launching the warm-up. Add
+`--allow-oversubscription` only for an explicit probe of counts above that
+limit; it does not change search defaults or rank budgeting.
 
 ## What a row is
 

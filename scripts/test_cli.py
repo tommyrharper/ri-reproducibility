@@ -341,6 +341,17 @@ check(
 )
 
 check(
+    "benchmark allows explicit oversubscription probes",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "1", "--mpi-procs", "21",
+      "--allow-oversubscription"]],
+    plan("bench", "run", "wsclean", "--mpi-procs", "21",
+         "--allow-oversubscription")[1],
+)
+
+check(
     "bench record names the run to add",
     [["uv", "run", "scripts/bench.py", "record", "wsclean-vlaa-20260827T101500Z"]],
     plan("bench", "record", "wsclean-vlaa-20260827T101500Z")[1],

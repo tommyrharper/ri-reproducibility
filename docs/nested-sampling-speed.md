@@ -14,6 +14,10 @@ The follow-up three-pair probe measured **110.5 evaluations/second at 19
 workers versus 110.7 at 20**, with **34.2-34.4 MB** peak memory. The larger
 sample removes the earlier apparent 19-worker advantage; keep 20 workers as
 the default.
+A controlled three-pair oversubscription probe measured **104.97 evaluations/s
+at 20 workers versus 99.60 at 21** (about 5.1% slower), with unchanged ~34.5 MB
+peak memory. The benchmark now supports this as an explicit opt-in, but 20
+remains the production ceiling on this host.
 A new matched three-pair probe measured **101.3 evaluations/second at 18 workers
 versus 106.3 at 20**, with **34.4-34.5 MB** peak memory. Reducing concurrency
 below 20 workers still lowers throughput without a memory benefit; keep 20 as

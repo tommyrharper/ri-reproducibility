@@ -75,6 +75,7 @@ RUN_COMMAND=(
   -e WSCLEAN_IMAGE="${WSCLEAN_IMAGE}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  -e NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-}"
   -e NS_SIDECARS="${NS_SIDECARS}"
   -e NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
   -e NS_SCRATCH_DIR="${NS_SCRATCH_DIR}"
@@ -92,6 +93,7 @@ RUN_COMMAND=(
   mpirun
   --allow-run-as-root
   --use-hwthread-cpus
+  ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_wsclean.py
   --output-dir "${OUTPUT_DIR}"

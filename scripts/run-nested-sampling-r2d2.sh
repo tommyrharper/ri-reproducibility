@@ -142,6 +142,7 @@ RUN_COMMAND=(
   -e CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  -e NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-}"
   -e NS_SIDECARS="${NS_SIDECARS}"
   -e NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
   -e NS_SCRATCH_DIR="${NS_SCRATCH_DIR}"
@@ -171,6 +172,7 @@ RUN_COMMAND=(
   --allow-run-as-root
   # Match Open MPI's slot units to `nproc`'s hardware-thread rank count.
   --use-hwthread-cpus
+  ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_r2d2.py
   --output-dir "${OUTPUT_DIR}"
