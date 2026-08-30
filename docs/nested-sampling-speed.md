@@ -1,7 +1,7 @@
 # Making a nested-sampling search faster: the index
 
-Seventy-six profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
-The latest three-repeat async measurement reached **106.8 +/- 3.2
+Seventy-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest three-repeat async measurement reached **110.3 +/- 1.9
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
 Values below are
@@ -53,11 +53,12 @@ and [run scaling](nested-sampling-run-scaling.md):
 | Progress-bar redraw backed off to 9x its own cost | 44% of a core down to ~12%, and no longer growing with the run |
 | GNU progress scans classify total and post-checkpoint evaluations in one `find` walk | 0.232 s to 0.073 s for 20 scans of a 635-evaluation run; BSD `find` keeps the portable fallback |
 
-The current async WSClean throughput check measures **106.8 +/- 3.2
-evaluations/second** at 20 workers, 145.2 +/- 1.5 ms/evaluation, and 34.1 MB
+The current async WSClean throughput check measures **110.3 +/- 1.9
+evaluations/second** at 20 workers, 140.5 +/- 2.8 ms/evaluation, and 34.4 MB
 peak imaging-worker memory across three repeats (30 August 2026). This is
-consistent with the host's observed run-to-run variance, not a code regression;
-the image binary remains the dominant stage at 129.7 +/- 1.6 ms/evaluation.
+consistent with the host's observed run-to-run variance, not a claimed code
+speedup; the image binary remains the dominant stage at 125.6 +/- 2.7
+ms/evaluation.
 The new rank-scaling probe measured **98.4 +/- 1.0 evaluations/second** at 16
 workers, with 34.8 MB peak memory; 20 workers remains faster on this host.
 Repeating that probe at 19 workers measured **107.1 +/- 2.8 evaluations/second**
