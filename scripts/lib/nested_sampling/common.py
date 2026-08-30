@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -649,6 +649,12 @@ def source_pixel(
     return max(0, min(x_size - 1, sx)), max(0, min(y_size - 1, sy))
 
 
+@lru_cache(maxsize=64)
+def off_source_mask(shape: tuple[int, int], sx: int, sy: int) -> np.ndarray:
+    yy, xx = np.ogrid[:shape[0], :shape[1]]
+    return (yy - sy) ** 2 + (xx - sx) ** 2 > 25
+
+
 def compute_image_metrics(
     image_path: Path,
     source_flux_jy: float,
@@ -682,9 +688,7 @@ def compute_image_metrics(
     cy = max(0, min(y_size - 1, cy))
     sx, sy = source_pixel(header, cx, cy, source_l_arcsec, source_m_arcsec, x_size, y_size)
 
-    yy, xx = np.ogrid[:y_size, :x_size]
-    off_source = (yy - sy) ** 2 + (xx - sx) ** 2 > 25
-    off_rms = rms(image[off_source])
+    off_rms = rms(image[off_source_mask(image.shape, sx, sy)])
     peak = float(np.nanmax(np.abs(image)))
     snr = peak / off_rms if off_rms > 0 else float("inf")
     log_snr = math.log10(snr) if math.isfinite(snr) and snr > 0 else 99.0
@@ -2169,6 +2173,7 @@ def self_check_metric_resolution() -> None:
     assert sigma_fn(sample) == sample["sigma_res"]
     assert abs(rms(np.array([3.0, 4.0])) - 5.0 / math.sqrt(2.0)) < 1e-12
     assert abs(sigma_res(np.array([3.0, 4.0]), np.array([0.0, 2.0])) - 2.5) < 1e-12
+    assert off_source_mask((8, 8), 4, 4) is off_source_mask((8, 8), 4, 4)
 
     expr_fn, _ = resolve_metric("log_snr + 0.1 * wall_seconds")
     assert expr_fn(sample) == sample["log_snr"] + 0.1 * sample["wall_seconds"]
