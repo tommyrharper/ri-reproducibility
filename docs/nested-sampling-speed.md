@@ -30,6 +30,7 @@ rates are historical and roughly half the current rate.
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
+| Sigma-res FITS files load only when the objective uses `sigma_res` | `polychord_*.py` | 1.03 to 0.46 ms metrics stage on the current WSClean benchmark; objective-preserving for other metrics |
 | Residual metrics reuse the loaded image buffer | `common.py` | Removes one full-image allocation per evaluation; memory-only change at current image size |
 | Off-source metric masks are bounded and reused | `common.py` | 25.2 to 3.6 us per mask (container microbenchmark); no measurable end-to-end gain |
 | R2D2 `.mat` conversion skips compression on tmpfs | `ms_to_r2d2_mat.py` | 8.59 to 0.39 ms for 12k visibilities (microbenchmark) |
@@ -59,6 +60,9 @@ not enough to change the default.
 The prior three-repeat group measured 117.2 +/- 2.5 evaluations/second. The production preset remains
 the comparable target-scale record: 114.7 +/- 0.71 evaluations/second over
 ~39,900 evaluations at 150 live points, 15 repeats, and unlimited dead points.
+The sigma-res lazy-load change measured 101.7 +/- 2.4 evaluations/second over
+three current throughput repeats; this is within normal end-to-end variance,
+while the metrics stage itself fell from about 1.0 to 0.46 ms/evaluation.
 R2D2 has only smoke-scale rows until `checkpoints/R2D2_A1` is supplied.
 
 ## What is priced but deliberately not taken
