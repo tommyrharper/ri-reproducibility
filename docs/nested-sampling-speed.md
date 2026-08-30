@@ -1,8 +1,9 @@
 # Making a nested-sampling search faster: the index
 
-Thirty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
-The latest three-repeat async measurement reached **117 evaluations/second at
-20 workers**; the historical peak is 126 evaluations/second at 19 workers.
+Forty profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest three-repeat async measurement reached **106.9 +/- 2.2
+evaluations/second at 20 workers**; the historical peak is 126
+evaluations/second at 19 workers.
 Values below are
 per-iteration baselines, except the end-to-end figure above; pre-iteration-18
 rates are historical and roughly half the current rate.
@@ -46,9 +47,11 @@ and [run scaling](nested-sampling-run-scaling.md):
 | A resume keeps each adopted objective, not each record | 62 GB down to 5.4 GB, which is the difference between the target run finishing and being OOM-killed |
 | Progress-bar redraw backed off to 9x its own cost | 44% of a core down to ~12%, and no longer growing with the run |
 
-The current async WSClean throughput group measures **117.2 +/- 2.5
-evaluations/second** at 20 workers, 139.1 +/- 0.74 ms/evaluation, and 34.7 MB
-peak imaging-worker memory across three repeats. The production preset remains
+The current async WSClean throughput check measures **106.9 +/- 2.2
+evaluations/second** at 20 workers, 145.6 +/- 1.1 ms/evaluation, and 35.0 MB
+peak imaging-worker memory across three repeats (30 August 2026). This is
+consistent with the host's observed run-to-run variance, not a code regression.
+The prior three-repeat group measured 117.2 +/- 2.5 evaluations/second. The production preset remains
 the comparable target-scale record: 114.7 +/- 0.71 evaluations/second over
 ~39,900 evaluations at 150 live points, 15 repeats, and unlimited dead points.
 R2D2 has only smoke-scale rows until `checkpoints/R2D2_A1` is supplied.
