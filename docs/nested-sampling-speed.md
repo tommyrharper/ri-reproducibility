@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred twenty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred twenty-six profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **105.7 +/- 3.0
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -44,6 +44,11 @@ rates are historical and roughly half the current rate.
 | R2D2 checkpoint weights assigned by reference | `docker/r2d2/patches/assign-checkpoint-weights.patch` | R2D2 throughput 0.5622 to 0.5948 eval/s in three controlled runs (5.8%), with unchanged 3.47 GB peak memory |
 | R2D2 checkpoint key normalization cached | `r2d2_serve.py` | 4.36 to 0.01 us per repeated 24-key lookup in a microbenchmark; three fresh end-to-end runs measured 0.7205, 0.7768, and 0.7350 eval/s, so no isolated throughput gain is claimed |
 | R2D2 auto thread count rounds up per-rank CPU share | `run-nested-sampling-r2d2.sh` | 0.6198 to 0.7249 eval/s at 8 ranks (16.9%), with unchanged 3.47 GB peak memory |
+
+Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
+throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
+111.6), versus 114.8, 119.2, and 111.2 (median 114.8) for matched
+`x86-64-v3`. The native build is not retained as the default.
 
 The R2D2 CPU backend probe closed two inference alternatives: disabling
 MKLDNN was 1.853 s versus 1.363 s for a warmed 512x512 U-Net forward at three
