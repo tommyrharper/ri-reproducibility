@@ -183,9 +183,12 @@ def print_phases(run_dir: Path, top: int) -> None:
 _R2D2_PHASE = re.compile(r"Time for (model update|residual computation): ([0-9.]+) sec")
 
 
-def r2d2_phase_totals(log_paths: Any) -> tuple[int, dict[str, list[float]], dict[str, int]]:
+def r2d2_phase_totals(
+    log_paths: Any,
+) -> tuple[int, dict[str, list[float]], dict[str, int], dict[str, int]]:
     totals: dict[str, list[float]] = collections.defaultdict(list)
     counts: dict[str, int] = collections.defaultdict(int)
+    phase_evals: dict[str, int] = collections.defaultdict(int)
     for path in log_paths:
         per_eval: dict[str, float] = collections.defaultdict(float)
         per_count: dict[str, int] = collections.defaultdict(int)
@@ -198,12 +201,13 @@ def r2d2_phase_totals(log_paths: Any) -> tuple[int, dict[str, list[float]], dict
         for phase, seconds in per_eval.items():
             totals[phase].append(seconds * 1000.0)
             counts[phase] += per_count[phase]
-    return len({path for path in log_paths if path.is_file()}), totals, counts
+            phase_evals[phase] += 1
+    return len({path for path in log_paths if path.is_file()}), totals, counts, phase_evals
 
 
 def print_r2d2_phases(run_dir: Path) -> None:
     logs = sorted(run_dir.glob("evaluations/*/r2d2.stdout.log"))
-    count, totals, calls = r2d2_phase_totals(logs)
+    count, totals, calls, phase_evals = r2d2_phase_totals(logs)
     if not logs or not totals:
         raise SystemExit(f"no R2D2 phase timings under {run_dir}")
     print(f"{count} R2D2 logs")
@@ -212,7 +216,7 @@ def print_r2d2_phases(run_dir: Path) -> None:
     print("-" * 60)
     for phase in sorted(totals, key=lambda name: -statistics.median(totals[name])):
         per_eval = statistics.median(totals[phase])
-        per_call = calls[phase] / count
+        per_call = calls[phase] / phase_evals[phase]
         print(f"{phase:<28}{per_eval:10.2f}{per_call:12.2f}{per_eval / per_call:10.2f}")
 
 
@@ -300,9 +304,22 @@ def self_check() -> None:
             "Time for residual computation: 0.01 sec\n"
             "Time for model update: 0.30 sec\n"
         )
-        count, totals, calls = r2d2_phase_totals([log])
+        count, totals, calls, phase_evals = r2d2_phase_totals([log])
     assert count == 1 and totals["model update"] == [500.0], (count, totals)
-    assert calls["model update"] == 2 and totals["residual computation"] == [10.0]
+    assert calls["model update"] == 2 and phase_evals["model update"] == 1
+    assert totals["residual computation"] == [10.0]
+
+    with tempfile.TemporaryDirectory() as raw:
+        complete = Path(raw) / "complete-r2d2.stdout.log"
+        complete.write_text(
+            "Time for model update: 0.20 sec\n"
+            "Time for residual computation: 0.01 sec\n"
+            "Time for model update: 0.30 sec\n"
+        )
+        missing = Path(raw) / "r2d2.stdout.log"
+        missing.write_text("Time for residual computation: 0.02 sec\n")
+        count, totals, calls, phase_evals = r2d2_phase_totals([complete, missing])
+    assert count == 2 and phase_evals["model update"] == 1
 
     with tempfile.TemporaryDirectory() as raw:
         log = Path(raw) / "wsclean.stdout.log"
