@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Eighty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Eighty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **112.5 +/- 2.2
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -167,6 +167,11 @@ updates and **99.0 ms/evaluation** for residual computation. A 512x512 CPU
 `_model_prev` clone costs about **0.221 ms** with one Torch thread, or roughly
 0.00013% of the model-update stage; this dead-work removal is therefore not a
 useful speed target.
+
+The latest three-repeat explicit four-thread R2D2 probe measured **0.7676
+eval/s** median (0.7670-0.7686) at 8 ranks, with **3.47 GB** peak worker memory.
+This is consistent with the prior 0.7595-0.7738 range and does not justify
+changing the portable automatic three-thread default.
 
 ## What is priced but deliberately not taken
 
