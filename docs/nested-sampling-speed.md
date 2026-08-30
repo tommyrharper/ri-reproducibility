@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Forty-six profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Forty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **111.2 +/- 3.9
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
