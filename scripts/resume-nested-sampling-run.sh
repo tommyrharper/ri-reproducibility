@@ -155,10 +155,11 @@ if ns_run_is_live "${RUN_DIR}"; then
   exit 1
 fi
 
-# Complete summary means finished; partial summary is rebuilt from checkpoint
-# and cached evaluations. Check tail because summaries can be tens of MB.
+# Complete, parseable summary means finished; partial summary is rebuilt from
+# checkpoint and cached evaluations.
 if [ -s "${RUN_DIR}/summary.json" ] \
-  && [ "$(tail -c 64 "${RUN_DIR}/summary.json" | tr -d '[:space:]' | tail -c 1)" = "}" ]; then
+  && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+       "${RUN_DIR}/summary.json" >/dev/null 2>&1; then
   echo "Nothing to do: ${RUN_DIR##*/} already finished (it has a summary.json)."
   echo "Start a new search instead, or delete the summary to force a rerun."
   exit 0
