@@ -84,6 +84,9 @@ def patch_checkpoint_loading() -> None:
     package = sys.modules.get("utils")
     if package is not None:
         package.get_DNNs = get_DNNs
+    optimiser = sys.modules.get("optimiser.R2D2")
+    if optimiser is not None:
+        optimiser.get_DNNs = get_DNNs
 
 
 def warm_imports() -> None:
@@ -648,18 +651,22 @@ def self_check_checkpoint_cache() -> None:
         return {"N1": object()}
 
     module.get_DNNs = loader
+    optimiser = types.ModuleType("optimiser.R2D2")
+    optimiser.get_DNNs = loader
     sys.modules["utils"] = package
     sys.modules["utils.util_model"] = module
+    sys.modules["optimiser.R2D2"] = optimiser
     _CHECKPOINT_CACHE.clear()
     try:
         patch_checkpoint_loading()
         package.get_DNNs(1, "/checkpoints/R2D2_A1")
-        package.get_DNNs(1, "/checkpoints/R2D2_A1")
+        optimiser.get_DNNs(1, "/checkpoints/R2D2_A1")
         assert calls == [(1, "/checkpoints/R2D2_A1")], calls
     finally:
         _CHECKPOINT_CACHE.clear()
         del sys.modules["utils.util_model"]
         del sys.modules["utils"]
+        del sys.modules["optimiser.R2D2"]
     print("r2d2 checkpoint cache self-check passed")
 
 
