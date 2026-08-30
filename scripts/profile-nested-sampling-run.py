@@ -137,8 +137,11 @@ def _phase_label(text: str) -> str:
     return re.sub(r"[-+]?\d[\d.eE+-]*", "N", text)[:64]
 
 
-def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[float]]]:
+def phase_gaps(
+    log_paths: Any,
+) -> tuple[int, float, dict[tuple[str, str], list[float]], dict[tuple[str, str], list[float]]]:
     gaps: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
+    per_eval: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     logged: list[float] = []
     for path in log_paths:
         rows = []
@@ -153,16 +156,22 @@ def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[f
         if len(rows) < 2:
             continue
         logged.append((rows[-1][0] - rows[0][0]) * 1000.0)
+        totals: dict[tuple[str, str], float] = collections.defaultdict(float)
         for (start, text), (end, following) in zip(rows, rows[1:]):
-            gaps[(_phase_label(text), _phase_label(following))].append((end - start) * 1000.0)
-    return len(logged), (statistics.median(logged) if logged else 0.0), gaps
+            phase = (_phase_label(text), _phase_label(following))
+            milliseconds = (end - start) * 1000.0
+            gaps[phase].append(milliseconds)
+            totals[phase] += milliseconds
+        for phase, milliseconds in totals.items():
+            per_eval[phase].append(milliseconds)
+    return len(logged), (statistics.median(logged) if logged else 0.0), gaps, per_eval
 
 
 def print_phases(run_dir: Path, top: int) -> None:
     logs = sorted(run_dir.glob("evaluations/*/wsclean.stdout.log"))
     if not logs:
         raise SystemExit(f"no evaluations/*/wsclean.stdout.log under {run_dir}")
-    count, logged_ms, gaps = phase_gaps(logs)
+    count, logged_ms, gaps, per_eval = phase_gaps(logs)
     if not count:
         raise SystemExit(
             f"{len(logs)} wsclean logs under {run_dir} carry no timestamps - the "
@@ -176,9 +185,9 @@ def print_phases(run_dir: Path, top: int) -> None:
     for (before, after), values in sorted(gaps.items(), key=lambda kv: -sum(kv[1]))[:top]:
         typical = statistics.median(values)
         total = len(values) / count * typical
-        ordered = sorted(values)
+        ordered = sorted(per_eval[(before, after)])
         p90 = ordered[min(len(ordered) - 1, (9 * len(ordered) - 1) // 10)]
-        print(f"{total:8.2f} {p90 * len(values) / count:8.2f} {total / logged_ms:6.1%} "
+        print(f"{total:8.2f} {p90:8.2f} {total / logged_ms:6.1%} "
               f"{len(values) / count:7.2f} {typical:8.3f}  {before[:52]} -> {after[:40]}")
 
 
@@ -293,11 +302,23 @@ def self_check() -> None:
             "not a timestamped line\n"
             "2026-Aug-29 10:19:02.107500 Opening reordered part 0 for /a/b/sim.ms\n"
         )
-        count, logged, gaps = phase_gaps([log])
+        count, logged, gaps, per_eval = phase_gaps([log])
     assert count == 1, count
     assert abs(logged - 7.5) < 1e-3, logged
     assert abs(gaps[("Gridding N rows...", "Gridded visibility count: N")][0] - 5.5) < 1e-3, gaps
     assert ("Gridded visibility count: N", "Opening reordered part N for <path>") in gaps, gaps
+    assert abs(per_eval[("Gridding N rows...", "Gridded visibility count: N")][0] - 5.5) < 1e-3
+
+    with tempfile.TemporaryDirectory() as raw:
+        log = Path(raw) / "wsclean.stdout.log"
+        log.write_text(
+            "2026-Aug-29 10:19:02.100000 A 1\n"
+            "2026-Aug-29 10:19:02.101000 B 1\n"
+            "2026-Aug-29 10:19:02.111000 A 2\n"
+            "2026-Aug-29 10:19:02.121000 B 2\n"
+        )
+        _, _, _, per_eval = phase_gaps([log])
+    assert abs(per_eval[("A N", "B N")][0] - 11.0) < 1e-3
 
     assert statistics.median([1.0, 1.0, 100.0]) == 1.0
 
