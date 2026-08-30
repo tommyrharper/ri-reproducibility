@@ -24,10 +24,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run(cmd: list[str], cwd: Path | None = None) -> None:
-    subprocess.run(cmd, check=True, cwd=cwd)
-
-
 def main() -> None:
     args = parse_args()
     repo_root = Path(args.repo_root).resolve()
@@ -40,7 +36,7 @@ def main() -> None:
         work_dir = ms_path.parent
         mat_path = work_dir / "r2d2_data.mat"
     else:
-        run(
+        subprocess.run(
             [
                 "docker",
                 "run",
@@ -70,10 +66,11 @@ def main() -> None:
                 "100",
                 "--seed",
                 "42",
-            ]
+            ],
+            check=True,
         )
 
-    run(
+    subprocess.run(
         [
             "docker",
             "run",
@@ -90,7 +87,8 @@ def main() -> None:
             "/work/sim.ms",
             "--mat-path",
             "/work/r2d2_data.mat",
-        ]
+        ],
+        check=True,
     )
 
     load_cmd = [

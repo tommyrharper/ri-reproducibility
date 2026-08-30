@@ -1,21 +1,12 @@
 # Where a WSClean evaluation's 280 ms goes
 
-A profile of one evaluation at the concurrency a real search runs at, taken
-apart far enough to say what is left. The short answer: **69% of it is
-WSClean's clean loop, 11% is starting a process, 20% is the path to the first
-inversion, and 6% is everything this repo writes** - so there is nothing left
-in the harness, and the remaining lines are WSClean's or the host's. Nor is
-there a WSClean flag that recovers any of it:
-[every result-preserving knob has now been measured](#what-the-remaining-wsclean-flags-are-worth)
-and the one with headroom buys it out of the gridder's accuracy. The one knob
-that *does* move the 69% is `-mgain`, which is not result-preserving and has
-its own doc: [the clean loop](nested-sampling-clean-loop.md).
+At production concurrency, **69% is WSClean's clean loop, 11% process start,
+20% the path to first inversion, and 6% this repo's writes**. Result-preserving
+flags have no useful headroom; `-mgain` does, but trades accuracy for speed -
+see [the clean loop](nested-sampling-clean-loop.md).
 
-This is the per-evaluation companion to
-[the throughput doc](nested-sampling-throughput.md) (which is about how the
-ranks are kept busy) and to
-[the power-limit doc](nested-sampling-power-limit.md) (which is about how fast
-the host is allowed to run while they are).
+Per-evaluation companion to [throughput](nested-sampling-throughput.md) and
+[power-limit](nested-sampling-power-limit.md).
 
 ## The measurement
 
@@ -262,11 +253,5 @@ and is either already set or worth zero.
 
 ## What is not measured here
 
-`results/nested-sampling/` holds 45 runs and every one of them is a WSClean
-run. The R2D2 side cannot be profiled on this host at all: `checkpoints/`
-contains only its README, and `./ri fetch-checkpoints` cannot complete without
-a browser (the upstream host serves the ~5 GB realisation archives behind a
-Cloudflare challenge - see `checkpoints/README.md`). Every per-evaluation
-number this repo has ever published is therefore a WSClean number, and the
-R2D2 evaluation - simulate, `ms_to_r2d2_mat`, then 25 network iterations in a
-long-lived sidecar - remains entirely unprofiled.
+Only WSClean runs are archived; R2D2's ~5 GB checkpoints remain unavailable
+without a browser because upstream uses Cloudflare (see `checkpoints/README.md`).

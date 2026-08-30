@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Algorithm-agnostic nested-sampling helpers."""
-
 from __future__ import annotations
 
 import atexit
@@ -22,19 +20,6 @@ from typing import Any
 
 
 class _LazyNumpy:
-    """numpy, imported on first attribute access instead of at import time.
-
-    numpy is 0.134s of this module's 0.144s import (0.03s of it once the
-    report's own stdlib imports have primed the shared machinery), and the
-    report only wants the formatting helpers below - a rebuild that writes
-    pages from the image store never touches an array, so it should not pay
-    for numpy at all. Every `np.x` here is inside a function body (annotations
-    are strings under
-    ``from __future__ import annotations``), so the first such access rebinds
-    the module global to the real numpy and this shim drops out of the picture
-    for the rest of the process, including the sampler's likelihood loop.
-    """
-
     def __getattr__(self, name: str) -> Any:
         global np
         import numpy as np
@@ -58,109 +43,44 @@ METRIC_NAMES = (
     "peak_memory_bytes",
 )
 
-# An evaluation the algorithm failed. PolyChord maximizes the objective and a
-# real total_rms_jy is ~0.008, so this makes a failure the most interesting
-# point in the search - which is the point, because failure modes are what
-# this repo looks for. It is only correct for failures of the *algorithm*:
-# see WORKER_DIED.
+# PolyChord maximizes this; infrastructure failures use WORKER_DIED (see docs/robustness.md).
 FAILURE_OBJECTIVE = 100.0
 
-# A worker died mid-request instead of a tool running and failing. Real exit
-# statuses are 0-255, so this cannot be mistaken for one.
-#
-# The distinction matters more than it looks. A host that runs out of memory
-# has its OOM killer take a worker, and without this the rank could not tell
-# that from R2D2 exiting non-zero on the parameters it was given - so it
-# recorded FAILURE_OBJECTIVE, and the search treated running out of memory as
-# the most interesting result it had ever found. The infrastructure dying says
-# nothing about the algorithm, so it must never reach the sampler as a
-# likelihood: it is retried, and if it persists the run stops.
+# Worker died mid-request; negative keeps it distinct from real exit statuses.
 WORKER_DIED = -1
 
-# How long to keep putting a request to a worker before its death is called
-# permanent, as the pause before each attempt. A worker is dropped from the
-# cache when it dies, so every attempt gets a freshly started one.
-#
-# The retries are patient rather than immediate because of what kills a worker
-# here: the host running out of memory, usually because another run on the
-# same machine is holding it. That clears on its own - the memory this
-# attempt died for is freed by its own death, and the other run eventually
-# finishes - so waiting is what turns a dead run into a slow one. ~51s of
-# patience, then the evaluation is treated as impossible.
+# Fresh worker per attempt; increasing delays allow transient OOM pressure to
+# clear. See docs/robustness.md for retry semantics.
 WORKER_RETRY_DELAYS = (0.0, 1.0, 5.0, 15.0, 30.0)
 
 
 def worker_attempts() -> Any:
-    """Attempt numbers for a worker request, pausing longer before each retry."""
     for attempt, delay in enumerate(WORKER_RETRY_DELAYS):
         if delay:
             time.sleep(delay)
         yield attempt
 
 
-# A worker that goes silent is not a worker that died, and until these bounds
-# existed only the second one was survivable. MeqTrees deadlocks with its
-# meqserver roughly once in 2,000 evaluations - the worker stays alive, its
-# request never completes and no reply is ever written - which left the rank
-# waiting on it blocked in readline() forever and the other ranks burning a core
-# each in the MPI collective behind it. Every run left unattended came back
-# stopped rather than finished.
-#
-# The bound is also the stall: PolyChord has every rank in the same collective,
-# so one silent worker holds all of them until its timeout expires. At 30s a
-# 20-rank wsclean run spent 92s of 408s - 23% of its wall clock - waiting out
-# four of these. So each bound wants to be as small as it can be without ever
-# firing on a stage that was only slow.
-#
-# Both requests this one covers are far below it, measured over 17,644
-# evaluations: simulate peaks at 0.34s on wsclean and 0.60s on R2D2, and the
-# R2D2-only MS-to-.mat convert - the slower of the two, and the reason this is
-# not smaller still - peaks at 1.42s, with nothing over 2s. 10s leaves 7x on
-# the worst of them. R2D2's actually slow stage is its imaging, which is
-# IMAGING_REPLY_TIMEOUT below and nothing to do with this.
+# Reply bounds turn silent-worker deadlocks into recoverable failures. Keep
+# SIMULATE_REPLY_TIMEOUT above normal simulation/convert latency and below the
+# longer imaging bound; rationale and measurements live in docs/robustness.md.
 SIMULATE_REPLY_TIMEOUT = 10.0
 SHELL_REPLY_TIMEOUT = 300.0
 IMAGING_REPLY_TIMEOUT = 3600.0
 
 
 def worker_reply(stream: Any, timeout: float) -> str | None:
-    """One reply line: `""` if the worker died, None if it stopped answering.
-
-    select() reads the file descriptor underneath the buffer, which is only
-    safe because the protocol is strictly one flushed reply line per request
-    and a request only goes out once the previous reply has been read - so
-    there is never a second line already sitting in the buffer for select() to
-    miss. A reply is short enough to be an atomic pipe write, so a readable
-    stream always holds the whole line.
-    """
     if not select.select([stream], [], [], timeout)[0]:
         return None
     return stream.readline()
 
 
 def worker_send(stream: Any, request: str) -> bool:
-    """Write one request to a worker; False if its pipe is already closed.
-
-    The counterpart to worker_reply, and the case it did not cover. Every
-    request path here caches its worker between evaluations, so the death that
-    matters most is the one that happens while nobody is talking to it - the
-    host's OOM killer taking an idle 3.4GB R2D2 worker, or a sidecar container
-    going away - and that death is invisible until the next write, which then
-    fails before the request has been sent. Unhandled, that BrokenPipeError
-    unwound out of the likelihood: PolyChord calls it from Fortran, so instead
-    of the WORKER_DIED retry these loops exist to give it, one dead worker
-    aborted the whole job with a traceback. Reproduced by removing a live
-    WSClean search's sidecar container - the run died on the next evaluation
-    with no retry attempted at all.
-    """
     try:
         stream.write(request)
         stream.flush()
     except OSError:
-        # Closed here, and the failure of the close swallowed too: the buffer
-        # still holds the request that could not be written, so Python retries
-        # the flush when it collects the object and prints "Exception ignored:
-        # BrokenPipeError" from a worker this rank gave up on long before.
+        # Close too, or the buffered request can emit a late BrokenPipeError.
         try:
             stream.close()
         except OSError:
@@ -170,26 +90,10 @@ def worker_send(stream: Any, request: str) -> bool:
 
 
 class WorkerDied(RuntimeError):
-    """A worker died and did not come back, so the host failed, not the algorithm.
-
-    Raised out of an evaluation rather than scored, because there is no honest
-    value to return. Scoring it high makes the sampler chase the OOM killer;
-    scoring it low carves a hole out of exactly the expensive corner of the
-    parameter space where the real failure modes live. Both are a lie about
-    the algorithm, so the run stops instead.
-    """
+    pass
 
 
 def abort_run(message: str) -> None:
-    """Stop every rank now, without returning a likelihood.
-
-    Raising out of the likelihood would only unwind this rank - it is called
-    from PolyChord's Fortran - and leave the others waiting on a collective
-    that never comes, so the job is torn down explicitly. Exiting with the
-    results so far on disk and a reason on stderr is the honest outcome: the
-    evaluations that did finish are still valid, and the chain is not
-    contaminated by a value nobody measured.
-    """
     print(f"FATAL: {message}", file=sys.stderr, flush=True)
     try:
         from mpi4py import MPI
@@ -205,51 +109,16 @@ def abort_run(message: str) -> None:
 DEFAULT_WSCLEAN_NITER = 100
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
-# The major-cycle gain, and by a wide margin the most expensive number in this
-# file: it sets how deep each minor loop goes, hence how many major cycles the
-# `DEFAULT_WSCLEAN_NITER` budget is spread over, hence how many gridding passes
-# an evaluation pays for. 0.8 costs ~6.5 major cycles; 0.9 costs ~4.7 and is
-# worth ~20% more evaluations per second for a change in the default
-# `total_rms_jy` objective of 1e-7 (median) to 1e-4 (worst of 600).
-# The default stays 0.8 because it is part of the experiment definition every
-# archived run was scored under; `./ri search --mgain 0.9` (NS_WSCLEAN_MGAIN)
-# is how a run that wants the throughput instead asks for it, and every run
-# records what it used in its summary. See docs/nested-sampling-clean-loop.md
-# for the science cost and docs/nested-sampling-evaluation-floor.md for why
-# this is now the largest lever left.
+# Keep archived runs reproducible; override with `--mgain` when throughput matters.
 DEFAULT_WSCLEAN_MGAIN = float(os.environ.get("NS_WSCLEAN_MGAIN") or 0.8)
 
-# Image geometry, shared by both imagers so that they reconstruct the same sky.
-# R2D2 derives its cell size from the data it is given rather than taking one
-# (src/utils/io.py in the pinned upstream commit), so WSClean has to apply the
-# same formula instead of a fixed `-scale`: the search sweeps start_frequency_hz
-# over three orders of magnitude, and a fixed cell is either far finer or far
-# coarser than the synthesized beam at almost every frequency in that range.
-#
-# 1.5 is R2D2's own `CommonArgs` default (src/utils/args.py). It is stated here
-# and written into the R2D2 config explicitly rather than left to that default,
-# because WSClean's `-scale` is derived from it: an unpinned value on one side
-# is the same mismatch in a quieter form. (The 1.52 this repo used to record as
-# R2D2's super-resolution factor is a property of upstream's bundled
-# `data_3c353.mat` example, not of these runs, and was never written into the
-# config - so R2D2 has always run at 1.5.)
+# Shared image geometry; detailed rationale: docs/nested-sampling.md.
 DEFAULT_IMAGE_DIM = 128
-# Changing it also stales docker/wsclean/src/zygote.cpp's FFTW warm-up, whose
-# four transform sizes are derived from this one (docs/nested-sampling-fftw-planner.md).
-# A stale list costs the speedup, never a result.
 DEFAULT_SUPER_RESOLUTION = 1.5
 
-# `source_offset_fraction` geometry (docs/parameter-space-proposal.md, section 1).
-# VLA-A's longest baseline, used to pick the offset before the MS exists (the
-# simulator needs an absolute source position; the real cell size is only known
-# from the simulated observation, after the source has already been placed).
-# Declination barely changes VLA-A's maximum baseline near 65 degrees, so this
-# is accurate enough for a controlled, small offset - see
-# docs/nested-sampling.md, "Toggling dimensions on and off".
+# `source_offset_fraction` geometry: docs/parameter-space-proposal.md.
 VLA_A_MAX_BASELINE_M = 36_000.0
 SPEED_OF_LIGHT_M_S = 299_792_458.0
-# Fixed, not axis-aligned: avoids the symmetries a purely horizontal or
-# vertical offset would have.
 SOURCE_OFFSET_POSITION_ANGLE_DEG = 30.0
 
 
@@ -257,31 +126,12 @@ def image_pixel_size_arcsec(
     max_proj_baseline_lambda: float,
     super_resolution: float = DEFAULT_SUPER_RESOLUTION,
 ) -> float:
-    """The cell size R2D2 would pick for this sampling pattern, in arcsec.
-
-    Upstream `src/utils/io.py`, verbatim:
-
-        spatial_bandwidth = 2 * max_proj_baseline
-        image_pixel_size = (180.0 / np.pi) * 3600.0 / (super_resolution * spatial_bandwidth)
-
-    `max_proj_baseline` is the longest projected baseline in wavelengths, which
-    the simulator records as `observation.max_proj_baseline_lambda`.
-    """
     if not max_proj_baseline_lambda > 0.0:
         raise SystemExit(f"FATAL: non-positive max projected baseline: {max_proj_baseline_lambda!r}")
     return (180.0 / math.pi) * 3600.0 / (super_resolution * 2.0 * max_proj_baseline_lambda)
 
 
 def source_offset_to_lm(fraction: float, start_frequency_hz: float) -> tuple[float, float]:
-    """`source_offset_fraction` (0.0-0.35) to an (l, m) sky offset in arcsec.
-
-    The offset is `fraction` of the image half-width, at a fixed
-    `SOURCE_OFFSET_POSITION_ANGLE_DEG`. The half-width uses
-    `image_pixel_size_arcsec()` against `VLA_A_MAX_BASELINE_M` and the sampled
-    frequency - a nominal max projected baseline, not the one the simulator
-    will actually record for this evaluation, because the source position has
-    to be chosen before the MS (and its real baselines) exist.
-    """
     max_proj_baseline_lambda = VLA_A_MAX_BASELINE_M * start_frequency_hz / SPEED_OF_LIGHT_M_S
     half_width_arcsec = image_pixel_size_arcsec(max_proj_baseline_lambda) * (DEFAULT_IMAGE_DIM / 2.0)
     radius_arcsec = fraction * half_width_arcsec
@@ -291,17 +141,6 @@ def source_offset_to_lm(fraction: float, start_frequency_hz: float) -> tuple[flo
 
 @cache
 def load_defaults() -> dict[str, Any]:
-    """defaults.toml, the one file both the host and the containers read.
-
-    REPO_ROOT is what the containers get: the repo is bind-mounted at the same
-    path inside them, and this module is baked in at /opt/ri-nested-sampling,
-    where the __file__-relative repo root a host run walks up to does not exist.
-
-    Read on first use rather than at import, for the same reason numpy is: the
-    report imports this module inside the R2D2 image, whose Python 3.10 has no
-    tomllib, and it wants the formatting helpers - never the prior box, which
-    it reads back out of each run's summary.json.
-    """
     import tomllib
 
     here = Path(__file__).resolve()
@@ -317,11 +156,6 @@ def load_defaults() -> dict[str, Any]:
 
 @cache
 def load_receiver_bands() -> list[dict[str, Any]]:
-    """The receiver bands a spectral window has to fit inside - `[[receiver_band]]`.
-
-    Sorted by frequency so the unit-cube mapping does not depend on the order
-    they happen to be written in.
-    """
     bands = load_defaults()["receiver_band"]
     if not bands:
         raise SystemExit("defaults.toml: [[receiver_band]] is empty")
@@ -330,13 +164,6 @@ def load_receiver_bands() -> list[dict[str, Any]]:
 
 @cache
 def load_all_parameter_specs() -> list[dict[str, Any]]:
-    """Every `[[parameter_space]]` entry in defaults.toml, enabled or not.
-
-    `load_parameter_space()` is the ones the sampler actually searches; this
-    is every one that has ever been added, disabled entries included, so
-    `cube_to_params()` can still fix a disabled dimension at its pinned value
-    and `./ri params` can show the full list.
-    """
     return load_defaults()["parameter_space"]
 
 
@@ -346,18 +173,6 @@ def _param_name_set(env_var: str) -> set[str]:
 
 @cache
 def load_parameter_space() -> list[dict[str, Any]]:
-    """The parameter space the sampler searches - `[[parameter_space]]` in defaults.toml.
-
-    An entry is included unless `enabled = false` in defaults.toml, further
-    overridden by the `NS_DISABLE_PARAMS` / `NS_ENABLE_PARAMS` comma-separated
-    name lists (what `./ri search --disable-param` / `--enable-param` set), so
-    a one-off search does not need a defaults.toml edit. See "Toggling
-    dimensions on and off" in docs/nested-sampling.md.
-
-    A `kind = "band_start"` dimension carries no `min`/`max` of its own: its
-    box is the span of the receiver bands, filled in here so that everything
-    reading a spec (paramnames, plots, summary.json) sees a plain box.
-    """
     force_off = _param_name_set("NS_DISABLE_PARAMS")
     force_on = _param_name_set("NS_ENABLE_PARAMS")
     specs = [
@@ -376,16 +191,6 @@ def load_parameter_space() -> list[dict[str, Any]]:
 
 
 def check_channel_box_against_bands(specs: list[dict[str, Any]]) -> None:
-    """The channel box against the bandwidth the bands actually have.
-
-    A window that overflows the band its start frequency landed in is fitted
-    to it (see fit_spectral_window()), so a box asking for more than a band
-    holds is normal. The one box no fitting can rescue is one whose *smallest*
-    window - the minimum channel count at the minimum width - fits no band at
-    all: every draw would then fail, whatever start frequency came up. That is
-    a configuration error, fatal here at load rather than after the images are
-    warm.
-    """
     by_name = {str(spec["name"]): spec for spec in specs}
     count, width = by_name.get("channel_count"), by_name.get("channel_width_hz")
     if not count or not width:
@@ -401,25 +206,14 @@ def check_channel_box_against_bands(specs: list[dict[str, Any]]) -> None:
         )
 
 
-# A start frequency with too little room above it for even the smallest window
-# is replaced by stepping this far around the unit interval and drawing again.
-# The golden ratio conjugate spreads successive tries across every band rather
-# than nudging along the one that just failed, and stepping (rather than
-# drawing from an RNG) keeps the prior transform a pure function of the cube,
-# which is what PolyChord requires.
+# Redraw invalid starts by golden-ratio steps: they spread tries across bands
+# while keeping the prior transform a pure function of the PolyChord cube.
 START_REDRAW_STEP = 0.6180339887498949
 MAX_START_REDRAWS = 64
 
 
 @dataclass
 class WindowFitStats:
-    """What fitting sampled windows into receiver bands costs.
-
-    `draws` counts prior transforms, not evaluations: a draw whose window is
-    reduced still becomes one evaluation, it just measures narrower channels
-    (or fewer of them) than the one that was drawn.
-    """
-
     draws: int = 0
     as_sampled: int = 0
     width_reduced: int = 0
@@ -452,14 +246,6 @@ WINDOW_FIT_STATS = WindowFitStats()
 
 
 def gathered_window_fit_stats() -> dict[str, Any]:
-    """Every rank's fitting tally, summed.
-
-    PolyChord's rank 0 coordinates and barely runs the prior transform at all -
-    the workers do the drawing - so this has to be collected across the run or
-    the numbers in `summary.json` describe nobody's work. Collective: call it
-    from every rank once PolyChord has returned, before rank 0 branches off to
-    write the summary.
-    """
     counters = ("draws", "as_sampled", "width_reduced", "count_reduced", "redrawn_draws", "redraws", "seconds")
     mine = WINDOW_FIT_STATS.as_dict()
     try:
@@ -485,13 +271,6 @@ def window_fit_summary_line(stats: dict[str, Any]) -> str:
 
 
 def start_frequency_from_cube(cube_value: float) -> tuple[dict[str, Any], float]:
-    """The band a unit-cube value picks, and where in it the window starts.
-
-    Every band gets an equal share of the dimension and the start frequency is
-    uniform inside the band - equal share rather than uniform across the union
-    of the bands, or the 32 MHz-wide 4-band would come up about once in every
-    1500 draws and never actually be searched.
-    """
     bands = load_receiver_bands()
     position = min(1.0, max(0.0, cube_value)) * len(bands)
     index = min(int(position), len(bands) - 1)
@@ -501,7 +280,6 @@ def start_frequency_from_cube(cube_value: float) -> tuple[dict[str, Any], float]
 
 
 def start_frequency_cube_value(start_frequency_hz: float) -> float:
-    """The inverse of start_frequency_from_cube(), for the theta -> cube round trip."""
     bands = load_receiver_bands()
     for index, band in enumerate(bands):
         lower, upper = float(band["min"]), float(band["max"])
@@ -513,7 +291,6 @@ def start_frequency_cube_value(start_frequency_hz: float) -> float:
 
 @cache
 def channel_floors() -> tuple[int, float]:
-    """The smallest channel count and channel width the parameter space allows."""
     by_name = {str(spec["name"]): spec for spec in load_parameter_space()}
     return int(by_name["channel_count"]["min"]), float(by_name["channel_width_hz"]["min"])
 
@@ -521,26 +298,6 @@ def channel_floors() -> tuple[int, float]:
 def fit_spectral_window(
     cube_value: float, channel_count: int, channel_width_hz: float, track: bool = False
 ) -> tuple[float, int, float]:
-    """Fit a sampled window into the band its start frequency landed in.
-
-    The start frequency is drawn first and the window is fitted to the room
-    left above it, giving up as little as possible at each step:
-
-    1. the window fits - keep the draw;
-    2. it does not - narrow the channels until it does, if that stays at or
-       above the minimum width;
-    3. it would go below that - hold the width at the minimum and drop
-       channels instead, if that stays at or above the minimum count;
-    4. even the smallest window does not fit, so the start frequency is too
-       close to the top of its band to hold anything - draw another one and
-       start over.
-
-    `track` is set by the prior transform, the one caller whose draws are real
-    sampler work; the likelihood re-derives parameters it has already been
-    given, which always fit and would otherwise pad the tally.
-
-    Returns (start_frequency_hz, channel_count, channel_width_hz).
-    """
     started = time.perf_counter() if track else 0.0
     count_min, width_min = channel_floors()
     cube_value = min(1.0, max(0.0, cube_value))
@@ -592,7 +349,6 @@ def write_polychord_paramnames(
     file_root: str,
     parameter_space: list[dict[str, Any]] | None = None,
 ) -> Path:
-    """Write PolyChord's <file_root>.paramnames beside future chain output."""
     base_dir.mkdir(parents=True, exist_ok=True)
     path = base_dir / f"{file_root}.paramnames"
     specs = parameter_space if parameter_space is not None else load_parameter_space()
@@ -610,7 +366,7 @@ class DockerRunResult:
     wall_seconds: float
     peak_memory_bytes: int
     # The command's own wall clock, as distinct from what this rank waited.
-    # Only zygote_run() can tell them apart; sidecar_run() leaves it at 0.
+    # Only zygote_run() can tell them apart.
     binary_seconds: float = 0.0
 
 
@@ -622,13 +378,6 @@ def r2d2_thread_count() -> int:
 
 
 def r2d2_docker_thread_env_flags() -> list[str]:
-    """Thread settings for a rank-started imaging worker.
-
-    PASSIVE mirrors the pre-warmed pool's container (see the R2D2 run script):
-    libgomp spins after every parallel region by default, and the regions here
-    are single 128x128 NUFFTs, so with one worker per rank the spinning is a
-    whole core per rank burning on nothing.
-    """
     threads = str(r2d2_thread_count())
     return [
         "-e",
@@ -642,20 +391,7 @@ def r2d2_docker_thread_env_flags() -> list[str]:
     ]
 
 
-def scale(cube_value: float, lower: float, upper: float) -> float:
-    return lower + cube_value * (upper - lower)
-
-
 def fill_disabled_parameters(raw: dict[str, Any]) -> None:
-    """Pin every dimension `load_parameter_space()` left out at a fixed value.
-
-    A disabled dimension is still a key every downstream reader (the
-    simulator CLI, `compute_image_metrics()`, `simulate_measurement_set()`)
-    expects in `params`, so it is fixed here instead of drawn from the cube:
-    at its `default` if defaults.toml gives one, otherwise at its `min` (which
-    is why disabling `source_offset_fraction` alone reproduces the old
-    hard-coded centred source - its `min` already is 0.0).
-    """
     enabled_names = {spec["name"] for spec in load_parameter_space()}
     for spec in load_all_parameter_specs():
         name = spec["name"]
@@ -674,7 +410,8 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw: dict[str, Any] = {}
     specs = load_parameter_space()
     for i, spec in enumerate(specs):
-        value = scale(float(cube[i]), float(spec["min"]), float(spec["max"]))
+        lower, upper = float(spec["min"]), float(spec["max"])
+        value = lower + float(cube[i]) * (upper - lower)
         if spec.get("kind") == "integer":
             value = int(round(value))
         raw[spec["name"]] = value
@@ -689,11 +426,7 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw["dynamic_range"] = 10.0 ** raw.pop("log10_dynamic_range")
     raw["vla_config"] = "VLA.A"
     raw["source_flux_jy"] = 1.0
-    # Kept under its own name, not popped like log10_dynamic_range above:
-    # prior_vector() only has a reverse formula for that one special case, so
-    # every other cube dimension has to survive into `raw` under its own name
-    # for the theta -> cube -> params round trip self_check_spectral_window()
-    # checks.
+    # Keep source_offset_fraction for prior_vector()'s round-trip check.
     raw["source_l_arcsec"], raw["source_m_arcsec"] = source_offset_to_lm(
         raw["source_offset_fraction"], raw["start_frequency_hz"]
     )
@@ -701,50 +434,21 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
 
 
 def params_key(params: dict[str, Any]) -> str:
-    return hashlib_sha256(json.dumps(params, sort_keys=True))
-
-
-def hashlib_sha256(text: str) -> str:
     import hashlib
 
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def stable_seed(global_seed: int, key: str) -> int:
     return (global_seed + int(key[:8], 16)) % (2**31 - 1)
 
 
-# Pre-started by scripts/lib/start-sidecars.sh, one container per image shared by
-# every rank; anything missing here is started by this rank on first use.
+# Usually pre-started by start-sidecars.sh; missing images start on first use.
 _SIDECAR_CONTAINERS: dict[str, str] = json.loads(os.environ.get("NS_SIDECARS", "{}"))
 _IMAGE_ENTRYPOINTS: dict[str, list[str]] = {}
 
 
 def sidecar_container(image: str, platform: str, extra_args: list[str] | None = None) -> str:
-    """Name of the run's long-lived container for `image`.
-
-    A per-evaluation `docker run` costs ~0.40s of create/start/teardown on this
-    host regardless of image, mounts or platform; `docker exec` into an
-    already-running container costs ~0.03s. Every sidecar here is short work
-    against bind-mounted paths, so one reused container removes ~0.75s of the
-    ~2.3s per evaluation.
-
-    The whole repo is mounted at its host path (as the PolyChord container
-    already does), so callers pass absolute paths where they previously passed
-    `/work/...` against a per-evaluation `-v {eval_dir}:/work`.
-
-    One container per image is enough for the whole run - separate `docker exec`
-    processes are already isolated from each other - so the run script starts
-    them before the PolyChord container and hands them over in `NS_SIDECARS`.
-    Starting them per rank instead meant 16 concurrent `docker run`s on the
-    default 8 ranks, which cost 1.3s against 0.36s for a single one, all of it
-    in front of the first evaluation.
-
-    `extra_args` are `docker run` arguments this image needs on top of the repo
-    mount (the R2D2 image's read-only `/checkpoints`), and only apply when this
-    process is the one starting the container - the run script passes the same
-    arguments through `sidecar_launch`.
-    """
     if image not in _SIDECAR_CONTAINERS:
         repo_root = os.environ.get("REPO_ROOT", os.getcwd())
         # The shared MS scratch tmpfs, when the run script made one; see
@@ -755,13 +459,10 @@ def sidecar_container(image: str, platform: str, extra_args: list[str] | None = 
         subprocess.run(
             [
                 "docker", "run", "--detach", "--rm", "--name", name,
-                # No sidecar needs networking, and docker's default bridge setup
-                # costs ~0.2s per container under rootless Docker. "none" still
-                # gives a loopback interface for meqserver.
+                # No network needed; "none" keeps loopback for meqserver and avoids
+                # rootless Docker's bridge setup.
                 "--network", "none",
-                # Everything the simulate builds - the working MS and the cached
-                # makems skeletons - lives in /dev/shm, and docker's 64MB default
-                # is only ~3x the largest cache this parameter space fills.
+                # MS and makems caches live in /dev/shm.
                 "--shm-size", "512m",
                 "--platform", platform,
                 "-v", f"{repo_root}:{repo_root}",
@@ -772,9 +473,7 @@ def sidecar_container(image: str, platform: str, extra_args: list[str] | None = 
             stdout=subprocess.DEVNULL,
             check=True,
         )
-        # ponytail: covers normal exit and SystemExit; a SIGKILLed rank leaks one
-        # sleeping container, cleaned up with
-        # `docker rm -f $(docker ps -q --filter name=ri-ns-sidecar-)`.
+        # ponytail: a SIGKILLed rank can leak this container; reap labelled sidecars.
         atexit.register(
             subprocess.run,
             ["docker", "rm", "--force", name],
@@ -793,16 +492,6 @@ def sidecar_exec(
     prefix: list[str] | None = None,
     interactive: bool = False,
 ) -> list[str]:
-    """`docker exec` argv prefix equivalent to `docker run <image>` in `workdir`.
-
-    `docker exec` ignores the image ENTRYPOINT, so read it back from the image
-    rather than restating the Dockerfile here. `prefix` runs ahead of the
-    entrypoint, the way `docker run --entrypoint` would (e.g. GNU `time`).
-
-    Each evaluation gets its own working directory so anything a sidecar writes
-    relative to the cwd stays per-evaluation, as it did when every evaluation
-    had its own container.
-    """
     return [
         "docker", "exec",
         *(["--interactive"] if interactive else []),
@@ -813,7 +502,6 @@ def sidecar_exec(
 
 
 def sidecar_command(image: str, prefix: list[str] | None = None) -> list[str]:
-    """The in-container argv `docker run <image>` would execute, without arguments."""
     if image not in _IMAGE_ENTRYPOINTS:
         inspected = subprocess.run(
             ["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", image],
@@ -832,85 +520,19 @@ _SIDECAR_WORKERS: dict[tuple[str, str], subprocess.Popen] = {}
 
 
 def sidecar_worker(image: str, platform: str, argv: list[str]) -> subprocess.Popen:
-    """This rank's long-lived `argv` inside the sidecar, one `docker exec` per run.
-
-    `docker exec` costs ~0.033s on this host - a third of the `wsclean` binary's
-    own ~0.107s - and every evaluation paid it again. One process reading request
-    lines from its stdin pays it once per rank; a request costs a pipe write and
-    a `read`.
-
-    Two shapes use this: `sh`, which runs an arbitrary command line, and
-    `wsclean-zygote`, which forks an already-initialised wsclean per request
-    (see docs/nested-sampling-wsclean-zygote.md).
-    """
     key = (image, argv[0])
     if key not in _SIDECAR_WORKERS:
         worker = subprocess.Popen(
-            # Not sidecar_exec(): these deliberately bypass the image ENTRYPOINT,
-            # and each request names its own evaluation directory.
+            # Bypass image ENTRYPOINT; each request names its evaluation directory.
             ["docker", "exec", "--interactive", sidecar_container(image, platform), *argv],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
         )
-        # The container itself is torn down by sidecar_container()'s own atexit
-        # hook, which is registered first and so runs last.
+        # Container teardown is registered by sidecar_container().
         atexit.register(worker.terminate)
         _SIDECAR_WORKERS[key] = worker
     return _SIDECAR_WORKERS[key]
-
-
-def sidecar_shell(image: str, platform: str) -> subprocess.Popen:
-    return sidecar_worker(image, platform, ["sh"])
-
-
-def sidecar_run(
-    image: str,
-    platform: str,
-    workdir: Path,
-    cmd: list[str],
-    stdout_path: Path,
-    stderr_path: Path,
-) -> DockerRunResult:
-    """Run `cmd` in this rank's sidecar and report its exit code and wall time.
-
-    The command's own output goes to the log files, so only the exit code `echo`
-    comes back down the shell's stdout and nothing a sidecar prints can be
-    mistaken for a reply. A shell that dies - without answering, or before the
-    request could even be written to it (worker_send) - is dropped from the
-    cache, so the retry below starts a fresh one; a death that survives that is
-    reported as WORKER_DIED rather than as an exit status the command never
-    returned.
-    """
-    request = (
-        f"cd {shlex.quote(str(workdir))} && {shlex.join(cmd)}"
-        f" >{shlex.quote(str(stdout_path))} 2>{shlex.quote(str(stderr_path))}; echo $?\n"
-    )
-    started = time.perf_counter()
-    for attempt in worker_attempts():
-        shell = sidecar_shell(image, platform)
-        if not worker_send(shell.stdin, request):
-            # The shell died between evaluations, so the request never left
-            # this rank; the next attempt opens a fresh `docker exec`.
-            _SIDECAR_WORKERS.pop((image, "sh"), None)
-            continue
-        reply = worker_reply(shell.stdout, SHELL_REPLY_TIMEOUT)
-        if reply:
-            wall_seconds = time.perf_counter() - started
-            return DockerRunResult(returncode=int(reply), wall_seconds=wall_seconds, peak_memory_bytes=0)
-        if reply is None:
-            # ponytail: kills the `docker exec` client, leaving the `sh` it was
-            # talking to wedged in the sidecar - the ranks' shells are
-            # indistinguishable in there, so there is nothing to pgrep for. One
-            # leaks per timeout; give the shell an `echo $$` handshake at
-            # startup if that ever costs more than the retry does.
-            shell.kill()
-        _SIDECAR_WORKERS.pop((image, "sh"), None)
-    wall_seconds = time.perf_counter() - started
-    stderr_path.write_text(
-        f"FATAL: {image} sidecar shell gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
-    )
-    return DockerRunResult(returncode=WORKER_DIED, wall_seconds=wall_seconds, peak_memory_bytes=0)
 
 
 ZYGOTE_COMMAND = "wsclean-zygote"
@@ -924,20 +546,6 @@ def zygote_run(
     stdout_path: Path,
     stderr_path: Path,
 ) -> DockerRunResult:
-    """Image with this rank's wsclean fork server; the retry shape of sidecar_run.
-
-    ~27ms of every ~163ms `wsclean` process at production concurrency runs
-    before main() does - casacore's static initialisers across 73 shared
-    objects - and the search starts ~70 of them a second. `wsclean-zygote` pays
-    that once per rank and forks a child per request, so this asks it for an
-    image instead of asking `sh` to start a fresh `wsclean`. It also reports the
-    child's own wall clock and peak RSS out of wait4(), which is what
-    `/usr/bin/time -v` used to be forked per evaluation to write to a file.
-
-    The request is tab separated, so nothing in it may contain a tab or a
-    newline. Every field is a path this repo built or a WSClean flag, so that is
-    a bug rather than an input to sanitise - hence the assertion.
-    """
     fields = [str(workdir), str(stdout_path), str(stderr_path), *argv]
     assert not any("\t" in field or "\n" in field for field in fields), fields
     request = "\t".join(fields) + "\n"
@@ -969,17 +577,7 @@ def zygote_run(
     )
 
 
-def run_checked(cmd: list[str], stdout_path: Path, stderr_path: Path) -> None:
-    with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
-        subprocess.run(cmd, stdout=stdout, stderr=stderr, check=True)
-
-
 def _fits_card_value(field: str) -> Any:
-    """The value half of a FITS card, comment stripped.
-
-    A quoted string may contain the `/` that otherwise starts the comment
-    (`BUNIT = 'JY/BEAM '`), so quotes are closed before the comment is cut.
-    """
     field = field.lstrip()
     if field.startswith("'"):
         end = field.index("'", 1)
@@ -989,16 +587,7 @@ def _fits_card_value(field: str) -> Any:
 
 
 def load_fits_2d(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
-    """Read the primary HDU of a WSClean/R2D2 image as a 2-D float64 array.
-
-    `from astropy.io import fits` costs ~0.45s when the 8 default ranks import
-    it at once - more than every other per-rank startup put together, and more
-    than 10% of the run's wall clock - to read a single-HDU uncompressed float
-    image. Everything needed here is 30 lines of the FITS standard: 2880-byte
-    header blocks of 80-column cards, then big-endian samples in C order.
-    Anything outside that (a scaled or integer image, an extension) raises
-    rather than being guessed at.
-    """
+    """Read an unscaled float primary HDU as a 2-D float64 array; reject others."""
     header: dict[str, Any] = {}
     with path.open("rb") as handle:
         while True:
@@ -1051,22 +640,6 @@ def source_pixel(
     x_size: int,
     y_size: int,
 ) -> tuple[int, int]:
-    """The pixel a source at (`source_l_arcsec`, `source_m_arcsec`) lands on.
-
-    Plain WCS: `pixel = CRPIX - 1 + world_offset / CDELT`, applied on each axis
-    with that axis's own signed `CDELT` (arcsec/pixel) - `CDELT1` is negative
-    (RA increases the opposite way pixel x does), `CDELT2` positive, so the
-    same formula on both axes reproduces Meow's `LMDirection` convention (the
-    one `point_source_forest.py` places the source with) without a manual sign
-    flip. Checked against an actual WSClean image with a non-zero offset, not
-    derived from the FITS standard alone - see self_check_source_offset().
-
-    `header` must carry both CDELT keys; `compute_image_metrics()` supplies
-    them for R2D2, which writes none. It used to be true that an unoffset
-    source never reached this read, which is why a header-less image only
-    failed once `source_offset_fraction` was searched - do not lean on that
-    again.
-    """
     if source_l_arcsec == 0.0 and source_m_arcsec == 0.0:
         return cx, cy
     cdelt1_arcsec = float(header["CDELT1"]) * 3600.0
@@ -1090,14 +663,8 @@ def compute_image_metrics(
     image, header = load_fits_2d(image_path)
 
     y_size, x_size = image.shape
-    # WSClean writes a full WCS; R2D2 writes a bare header - SIMPLE, BITPIX,
-    # NAXIS and nothing else - so for R2D2 both the reference pixel and the
-    # cell size have to be supplied. Its grid is the centred one the FFT
-    # implies, and its cell size is what `image_pixel_size_arcsec()` derives
-    # from the same recorded baseline R2D2 sized its own pixels from (the
-    # figure WSClean is passed as `-scale`). Missing CDELT with no
-    # `pixel_size_arcsec` is a caller bug, not something to guess a scale for:
-    # silently centring the source scores a good image as a catastrophic one.
+    # R2D2 headers lack WCS, so callers must provide CDELT; guessing it can
+    # centre a good image incorrectly. WSClean headers already provide it.
     if "CDELT1" not in header or "CDELT2" not in header:
         if pixel_size_arcsec is None:
             raise ValueError(
@@ -1108,10 +675,7 @@ def compute_image_metrics(
             "CDELT1": -pixel_size_arcsec / 3600.0,
             "CDELT2": pixel_size_arcsec / 3600.0,
         }
-    # FITS CRPIX is 1-based, so the centre of an even axis is `size / 2 + 1`:
-    # 65 for the 128-pixel images here, which is what WSClean writes and what
-    # R2D2's own grid uses. Defaulting to `size / 2` put a header-less image's
-    # centre one pixel low on both axes.
+    # FITS CRPIX is 1-based; `size / 2 + 1` is the centred default for even axes.
     cx = int(round(float(header.get("CRPIX1", x_size / 2.0 + 1.0)) - 1.0))
     cy = int(round(float(header.get("CRPIX2", y_size / 2.0 + 1.0)) - 1.0))
     cx = max(0, min(x_size - 1, cx))
@@ -1173,18 +737,6 @@ def evaluation_busy_seconds(
     evaluations: list[dict[str, Any]],
     window: tuple[float, float],
 ) -> tuple[float, float]:
-    """(worker-seconds inside an evaluation, wall seconds with any in flight).
-
-    Both numbers come from the same intervals seen two ways: summed, they are
-    what the workers spent evaluating; unioned, they are the part of the run's
-    wall clock during which *something* was being evaluated. Their complement
-    is what splits the profiler's remainder - wall clock with no evaluation in
-    flight is PolyChord, the rest is workers waiting on other workers.
-
-    Intervals are clamped to `window`, the current run segment, because a
-    resumed run re-reads every record on disk while its wall clock covers only
-    this segment.
-    """
     start, end = window
     spans = []
     for record in evaluations:
@@ -1211,24 +763,6 @@ def evaluation_busy_seconds(
 
 
 def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
-    """The evaluation intervals of a run that finished before they were stamped.
-
-    Reading them is what splits a profile's remainder into PolyChord and idle,
-    and a run archived before `started_epoch`/`ended_epoch` existed would
-    otherwise be stuck for good with the one bucket named after both. It is not
-    stuck: each evaluation's own `metrics.json` is written once, at the end of
-    that evaluation, so its mtime is the interval's end, and the stage totals
-    already on the record are its length. Measured against a run that carries
-    both, the two numbers this returns are within 0.5% of the stamped ones.
-
-    Returns the run's `profiling` block unchanged when the intervals are
-    already on it, when a record's evaluation directory has gone (the time of
-    an evaluation nobody can see would be charged to PolyChord, which is worse
-    than not splitting), or when the mtimes cannot be a timeline at all -
-    directories restored from a backup or copied by a merge all carry the time
-    of the copy, and the giveaway is worker-seconds of imaging that will not
-    fit in the wall clock they are supposed to have happened in.
-    """
     profiling = summary.get("profiling") or {}
     total_wall = profiling.get("total_wall_seconds")
     if profiling.get("busy_worker_seconds") is not None or not total_wall:
@@ -1264,16 +798,7 @@ def summarize_profiling(
     mpi_procs: int,
     run_started_epoch: float | None = None,
 ) -> dict[str, Any]:
-    """Aggregate per-evaluation stage timing into a run-level breakdown.
-
-    Sums each `timing.*` field across every evaluation that has one (failed
-    evaluations that errored out before a stage ran simply omit that field).
-    `image_container_overhead_seconds` is the docker round-trip minus the
-    binary's own GNU-time-reported elapsed time, i.e. container create/start/
-    teardown plus the `docker stats` polling loop. Stage totals are summed
-    worker-seconds; only serial runs can subtract them from run wall time to
-    estimate PolyChord's own sampling/bookkeeping overhead.
-    """
+    """Aggregate evaluation timings into a run-level breakdown."""
     totals: dict[str, float] = {field: 0.0 for field in PROFILING_STAGE_FIELDS}
     counts: dict[str, int] = {field: 0 for field in PROFILING_STAGE_FIELDS}
     image_container_overhead = 0.0
@@ -1298,9 +823,7 @@ def summarize_profiling(
     accounted = sum(totals[field] for field in ACCOUNTED_STAGE_FIELDS)
     polychord_overhead = total_wall_seconds - accounted if mpi_procs == 1 else None
 
-    # The run segment this wall clock covers. Its start is the caller's when it
-    # has one; failing that the last evaluation to finish anchors it, which is
-    # short by however long the sampler took to shut down afterwards.
+    # Anchor missing starts to the last evaluation's end.
     ends = [
         float(timing["ended_epoch"]) for timing in
         ((record.get("timing") or {}) for record in evaluations)
@@ -1337,23 +860,15 @@ def summarize_profiling(
 
 
 def format_duration(seconds: float | None) -> str:
-    """Human-readable duration: '47ms', '1.44s', '12.3s', '7m 36s', '2h 05m 09s'.
-
-    Seconds stop being readable at both ends of the range a profile spans - a
-    per-eval metrics stage is milliseconds, a run total is hours - so each
-    magnitude gets the unit that carries its digits.
-    """
     if seconds is None:
         return "n/a"
     value = max(0.0, float(seconds))
     if value < 1.0:
         milliseconds = round(value * 1000)
-        # Sub-millisecond figures are real - a per-evaluation harness cost is
-        # hundreds of microseconds - and "0ms" reads as nothing measured
-        # rather than as something small.
+        # Preserve nonzero sub-millisecond measurements.
         if milliseconds == 0 and value > 0.0:
             return f"{value * 1e6:.0f}us"
-        # 0.9996s rounds up to 1000ms, which belongs in the seconds branch.
+        # Rounded 1000ms belongs in the seconds branch.
         if milliseconds < 1000:
             return f"{milliseconds}ms"
     if value < 10.0:
@@ -1369,7 +884,6 @@ def format_duration(seconds: float | None) -> str:
 
 
 def format_share(fraction: float | None) -> str:
-    """A share of the worker-time budget as a percentage, e.g. '64.6%'."""
     if fraction is None:
         return ""
     pct = 100.0 * fraction
@@ -1379,8 +893,6 @@ def format_share(fraction: float | None) -> str:
 
 
 # (stage key, eval-count key, label, indented under the row above it).
-# `{imager}` is filled in with the run's algorithm so the table says "wsclean
-# container" or "r2d2 container" rather than the uninformative "image container".
 PROFILING_VIEW_STAGES = (
     ("simulate", "simulate_seconds", "simulate (MeqTrees)", False),
     ("convert", "convert_seconds", "convert (MS -> .mat)", False),
@@ -1398,13 +910,9 @@ POLYCHORD_LABEL = "PolyChord (no evaluation in flight)"
 IDLE_LABEL = "idle (waiting on other workers)"
 
 PROFILING_VIEW_NOTE = (
-    "stage totals are summed worker-seconds across every evaluation; shares are "
-    "of the run's worker-time budget (wall clock x workers, and rank 0 is the "
-    "administrator rather than a worker), so the top-level "
-    "rows come to 100%. Dividing a worker-second "
-    "total by the worker count gives what that stage cost in wall clock, since they "
-    "spend it side by side, and those wall-clock figures add up to the run's "
-    "end-to-end wall time."
+    "stage totals are worker-seconds across evaluations; shares use worker-time "
+    "(wall clock x workers, excluding rank 0), so top-level rows total 100%. "
+    "Divide totals by workers for wall-clock stage costs; they sum to end-to-end time."
 )
 
 # Appended to the note above once the records carry evaluation intervals, and
@@ -1428,23 +936,6 @@ PROFILING_UNSPLIT_NOTE = (
 
 
 def profiling_breakdown(profiling: dict[str, Any], algorithm: str | None = None) -> dict[str, Any]:
-    """Rows and denominators for the per-stage timing view.
-
-    Shared by the HTML report and scripts/profile-nested-sampling-run.py so the
-    two cannot drift apart. Every share is a fraction of the run's total
-    worker-time budget - wall clock x workers - so the top-level rows add up to
-    100% of what the whole process spent. The worker count is
-    `worker_procs(mpi_procs)`, not the rank count - rank 0 administrates.
-
-    The rows are the run in two halves. Above `subtotal_label`: what happened
-    inside a likelihood evaluation, the timed stages plus the harness Python
-    around them. Below it, from `remainder_rows`: PolyChord, measured as the
-    wall clock during which no rank was inside an evaluation, and idle, which
-    is whatever is left after that - workers waiting on other workers. Both
-    come from the `started_epoch`/`ended_epoch` stamped on every record; a run
-    written before those existed cannot be split, and keeps the single
-    "unaccounted (PolyChord sampling + idle)" row it has always shown.
-    """
     imager = algorithm or "image"
     mpi_procs = int(profiling.get("mpi_procs") or 1)
     total_wall = profiling.get("total_wall_seconds")
@@ -1573,10 +1064,6 @@ def badness_from_metrics(metrics: dict[str, float]) -> float:
     return float(log_snr_loss + fidelity_loss + 0.05 * time_loss + 0.02 * memory_loss)
 
 
-def _math_namespace() -> dict[str, Any]:
-    return {name: getattr(math, name) for name in dir(math) if not name.startswith("_")}
-
-
 def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float], str]:
     if metric_spec == "badness":
         return badness_from_metrics, (
@@ -1585,11 +1072,7 @@ def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float
 
     if metric_spec in METRIC_NAMES:
         key = metric_spec
-
-        def raw_metric(metrics: dict[str, float]) -> float:
-            return float(metrics[key])
-
-        return raw_metric, (
+        return lambda metrics: float(metrics[key]), (
             f"PolyChord log-likelihood is the raw metric `{key}` with no sign flip; "
             "higher returned values are preferred by PolyChord."
         )
@@ -1599,7 +1082,7 @@ def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float
     except SyntaxError as exc:
         raise SystemExit(f"invalid --metric expression: {exc}") from exc
 
-    globals_ns = _math_namespace()
+    globals_ns = {name: getattr(math, name) for name in dir(math) if not name.startswith("_")}
     globals_ns["__builtins__"] = {}
     probe_metrics = {name: 1.0 for name in METRIC_NAMES}
     try:
@@ -1607,10 +1090,7 @@ def resolve_metric(metric_spec: str) -> tuple[Callable[[dict[str, float]], float
     except Exception as exc:
         raise SystemExit(f"invalid --metric expression: {exc}") from exc
 
-    def expression_metric(metrics: dict[str, float]) -> float:
-        return float(eval(code, globals_ns, metrics))
-
-    return expression_metric, (
+    return lambda metrics: float(eval(code, globals_ns, metrics)), (
         f"PolyChord log-likelihood is the expression `{metric_spec}` with no sign flip; "
         "higher returned values are preferred by PolyChord."
     )
@@ -1632,28 +1112,10 @@ def mpi_rank() -> int:
 
 
 def worker_procs(mpi_procs: int) -> int:
-    """How many of a job's ranks actually evaluate a likelihood.
-
-    Not all of them: PolyChord's rank 0 is the administrator, and
-    `nested_sampling.F90` sizes its worker arrays `nprocs-1`. A run of N ranks
-    therefore has a worker-time budget of `wall x (N-1)`, not `wall x N`, and
-    using N understated rank utilisation by a factor (N-1)/N - 7% at 15 ranks -
-    which reads as idle time that no scheduling change can ever recover. A
-    serial run has no administrator: rank 0 is the worker.
-    """
     return mpi_procs - 1 if mpi_procs > 1 else 1
 
 
 def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
-    """One evaluation's metrics.json, or None if it is not a readable record.
-
-    A metrics.json that does not parse is a write something interrupted - the
-    OOM killer, the stall watchdog, ENOSPC - and it is not recoverable, so
-    every reader here has to be able to go on without it. Raising instead ends
-    the run for good: the file is read at startup by every restart and every
-    `./ri resume`, all of which then die before scoring anything, which is
-    also what stops `run_with_retries` from trying again.
-    """
     try:
         record = json.loads(metrics_path.read_text())
     except FileNotFoundError:
@@ -1681,32 +1143,7 @@ def adopt_completed_evaluations(
     evaluations_dir: Path,
     cache: dict[str, float],
 ) -> int:
-    """Take an interrupted run's finished evaluations into this run's state.
-
-    Without this a resumed run restarts its eval ids at 1 and rebuilds
-    directories the first attempt already wrote, which fails on the first
-    repeated point. With it the ids carry on and a point evaluated before is
-    served from the cache instead of being paid for twice - which is the whole
-    reason to resume rather than start again.
-
-    Only the objective is kept, not the record it came from, because only the
-    objective is ever read back: the likelihood returns `cache[key]`, and the
-    summary re-reads every record from disk at the end of the run. Keeping the
-    records made a resume scale into the host's memory instead of its disk -
-    120,000 adopted evaluations cost 1.37GB of resident memory here, and *every
-    rank* runs this, so a 20-rank resume of the nlive-500 run this repo is
-    aiming at wanted 62GB for the caches alone on a 62GB host. Objectives cost
-    ~50MB at that size. See docs/nested-sampling-throughput.md.
-
-    The evaluations that were still in flight when the run stopped are thrown
-    away. An evaluation directory with no readable metrics.json holds nothing
-    worth keeping - the run died between creating it and scoring it, or in the
-    middle of writing the record - and simulate_measurement_set() creates each
-    one with `exist_ok=False`, on purpose, so that two ranks cannot land on the
-    same directory. Left in place, one of these would crash the resumed run the
-    moment the sampler proposed that point again: the very run this is supposed
-    to rescue.
-    """
+    """Cache finished evaluations and remove incomplete directories."""
     import shutil
 
     adopted = 0
@@ -1812,28 +1249,7 @@ def self_check_resume_adoption() -> None:
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
-    """Write `payload` as JSON, or leave `path` as it was.
-
-    Written under a temporary name and renamed into place, so a rank killed
-    mid-write - the OOM killer, the stall watchdog, ENOSPC - leaves either no
-    file or the whole one, never half of one. The rename is atomic (same
-    directory, so same filesystem) and costs one syscall.
-
-    Both files this writes are read by something that cannot go on without
-    them: half a metrics.json used to end a search for good (see
-    read_evaluation_record), and half a summary.json makes a finished run
-    unreportable, unmergeable and - because every reader calls a run with a
-    summary.json finished - unrepairable. summary.json is the bigger window by
-    far: it carries every evaluation of the run, so an R2D2 search spends
-    seconds inside this call, not microseconds.
-
-    Streamed into the file rather than serialised to a string first, because
-    the string is the peak: a 270,000-evaluation summary.json is 1.3GB, and
-    json.dumps() holds all of it alongside the records it was built from
-    (2.6GB of peak RSS measured against 0 for the streaming form). It costs
-    ~7s more on a summary that size and ~22us on a metrics.json, both of which
-    are free next to a 336ms evaluation.
-    """
+    """Write JSON through a same-directory temporary file, then replace `path` atomically."""
     partial = path.with_name(path.name + ".partial")
     with partial.open("w") as handle:
         json.dump(payload, handle, indent=2)
@@ -1841,20 +1257,9 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     partial.replace(path)
 
 
-# Intermediate artefacts a scored evaluation no longer needs, relative to its
-# evaluation directory. Nothing outside the evaluation reads any of them, and
-# each is reproducible from the record: the Measurement Set from the params
-# (`noise_seed` included), the four intermediate images by replaying the
-# recorded `wsclean` argv. What survives is the restored image, the metrics and
-# every recorded argv. Set NS_KEEP_MEASUREMENT_SETS=1 to keep the lot - the
-# replay benchmarks in docs/nested-sampling-throughput.md need the MS.
-#
-# Disk, not CPU, is what caps the run sizes this repo is aiming at, and both
-# groups below are load-bearing for that - see
-# docs/nested-sampling-disk-footprint.md. The MS was 1.5MB of a 1.44MB mean
-# evaluation; with it gone the five 128x128 FITS were 368KB of 394KB, of which
-# WSClean's model and psf have never had a reader at all and its dirty and
-# residual are read once, by compute_image_metrics(), before this runs.
+# Scored evaluations keep only replayable inputs, metrics and restored images;
+# see docs/nested-sampling-disk-footprint.md. Set NS_KEEP_MEASUREMENT_SETS=1
+# to retain intermediate artefacts for replay benchmarks.
 PRUNED_ARTEFACTS = (
     ("sim.ms", "measurement_set"),
     ("VLAA_ANT", None),
@@ -1867,31 +1272,11 @@ PRUNED_ARTEFACTS = (
 
 
 def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
-    """Where this evaluation builds its Measurement Set, or None for `eval_dir`.
-
-    The simulator assembles the MS in the meqtrees container's own /dev/shm,
-    which no other container can see, so it used to copy the finished tables
-    onto the bind mount purely so the wsclean sidecar could open them - 5.1ms of
-    a 14.3ms simulate at 19 concurrent workers, for a file the next few hundred
-    milliseconds delete again. `NS_SCRATCH_DIR` is a host tmpfs directory
-    bind-mounted into every container at the same path (see
-    scripts/lib/start-sidecars.sh), so the MS is written once, imaged where it
-    lies and deleted there. Unset - a self-check, a host with no writable
-    /dev/shm - it is built in the evaluation directory exactly as before.
-    """
     root = os.environ.get("NS_SCRATCH_DIR", "")
     return Path(root) / eval_dir.name if root else None
 
 
 def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
-    """Drop a scored evaluation's intermediate artefacts, and the paths naming them.
-
-    Only for an evaluation that produced a score. A failed one keeps
-    everything: a failure is what this project is searching for, and its
-    inputs are the first thing anyone will want - so anything it left in the
-    scratch directory is moved back beside its record first, since the scratch
-    directory is RAM and goes away with the run.
-    """
     import shutil
 
     keeping = "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
@@ -2015,7 +1400,6 @@ _EVALUATION_STARTED_EPOCH: float | None = None
 
 
 def mark_evaluation_start() -> None:
-    """Stamp the start of an evaluation; write_evaluation_record() closes it."""
     global _EVALUATION_STARTED_EPOCH
     _EVALUATION_STARTED_EPOCH = time.time()
 
@@ -2043,30 +1427,10 @@ _FIFO_POOL_ABANDONED = False
 
 
 def fifo_worker_pgrep_pattern(base: Path) -> str:
-    """pgrep -f regex matching exactly the pooled worker serving `base`.
-
-    The `$` does the real work, and check_fifo_kill_pattern() in
-    scripts/test_watchdogs.py is the guard on it: without the anchor this
-    matches every rank whose number starts with this one's, so killing rank 1
-    would take ranks 10 to 19 with it. The anchor also stops the `sh -c`
-    carrying this pattern from matching itself, because that command line
-    continues past the pattern and ends with the `$` as a literal character.
-    The bracket is belt and braces for the same self-match - it is a character
-    class here and a literal `[` in any command line quoting this string - and
-    a mutation of it changes no behaviour while the anchor stands.
-    """
     return f"serve --fif[o] {base}$"
 
 
 class FifoWorker:
-    """A `--serve --fifo` worker the run script already started.
-
-    Same `.stdin`/`.stdout`/`.kill()`/`.terminate()` surface as the
-    `subprocess.Popen` below, over the FIFO pair the worker is serving on.
-    Closing stdin is what ends it: the worker's request loop sees EOF and
-    exits.
-    """
-
     def __init__(self, write_fd: int, reply_path: Path, container: str, base: Path) -> None:
         self.stdin = os.fdopen(write_fd, "w")
         # Opening a FIFO blocks until the other end is open, so this must be the
@@ -2079,17 +1443,7 @@ class FifoWorker:
         self.stdin.close()
 
     def kill(self) -> None:
-        """SIGKILL this worker inside the sidecar, wedged meqserver and all.
-
-        A worker that stopped answering is still holding its end of the FIFO
-        pair open, so leaving it alive means the next attempt reconnects to the
-        same wedged process rather than a fresh one - and its meqserver is
-        ~0.4GB that nothing else will ever reclaim. `--fifo <base>` is unique to
-        this rank's worker, so pgrep finds it with no pid file to keep in sync.
-        The bracket in the pattern is what stops the `sh -c` running it from
-        matching its own command line; the image has pgrep but no pkill, hence
-        killing the meqserver child by pid.
-        """
+        """Kill wedged worker and its meqserver inside the sidecar."""
         global _FIFO_POOL_ABANDONED
         _FIFO_POOL_ABANDONED = True
         pattern = fifo_worker_pgrep_pattern(self.base)
@@ -2111,26 +1465,12 @@ class FifoWorker:
 
 
 def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWorker | None:
-    """Attach to this rank's pre-warmed worker, or None if there is not one.
-
-    A rank-started worker is not ready to answer for a while - interpreter,
-    Timba, meqserver and the first TDL compile for simulate, ~1.3s of `import
-    torch` and the R2D2 modules for imaging - and PolyChord asks every rank for
-    a live point at once, so all of it used to land on the wall clock in front
-    of evaluation one. The run scripts make one warm worker per rank the
-    sidecar's own startup command instead, and this connects to it. Falling back
-    to a rank-started worker is what happens when there is no pool - no
-    NS_SIMULATE_FIFO_DIR at all, or a pool this rank has already abandoned
-    because its worker died.
-    """
+    """Attach to this rank's pre-warmed worker, or return None if unavailable."""
     fifo_dir = os.environ.get(fifo_dir_var)
     if not fifo_dir or _FIFO_POOL_ABANDONED:
         return None
     base = Path(fifo_dir) / str(mpi_rank())
-    # O_NONBLOCK is how a FIFO write-open says "no reader yet" (ENXIO) instead of
-    # blocking forever, which is what a worker that never started would do. The
-    # deadline is generous because it is only ever reached when something is
-    # broken, and the fallback below is correct, just slower.
+    # Nonblocking open returns ENXIO until worker starts; timeout falls back.
     deadline = time.monotonic() + 10.0
     while True:
         try:
@@ -2145,14 +1485,7 @@ def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWork
 
 
 def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | FifoWorker:
-    """This rank's long-lived `simulate_point_source_ms.py --serve` process.
-
-    Even inside a reused sidecar container, a per-evaluation `docker exec` of the
-    simulate script paid ~0.45s of the ~0.7s it took: the Python interpreter,
-    numpy/casacore and Timba imports, starting a meqserver and reaping it again.
-    One worker per rank keeps all of that warm and leaves only the per-evaluation
-    compile, RIME predict and noise fill.
-    """
+    """Keep one warm simulator worker per rank to avoid repeated startup cost."""
     if meqtrees_image not in _SIMULATE_WORKERS:
         worker = _connect_shell_started_worker(
             "NS_SIMULATE_FIFO_DIR", sidecar_container(meqtrees_image, platform)
@@ -2175,37 +1508,10 @@ def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | Fi
 _R2D2_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
 
 
-def r2d2_serve_path(repo_root: Path) -> str:
-    """The imaging worker script, read live off the repo bind mount."""
-    return str(repo_root / "scripts" / "lib" / "nested_sampling" / "r2d2_serve.py")
-
-
-def r2d2_checkpoint_mount(checkpoints_dir: str) -> list[str]:
-    """`docker run` arguments putting the host checkpoints at `/checkpoints`.
-
-    The mount point stays `/checkpoints` rather than becoming a host path so
-    that `ckpt_path` - which every `poc-summary.json` records and
-    merge-nested-sampling-runs.py compares across runs - keeps its
-    machine-independent value.
-    """
-    return ["-v", f"{checkpoints_dir}:/checkpoints:ro"]
-
-
 def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> "subprocess.Popen | FifoWorker":
-    """This rank's long-lived `r2d2_serve.py` process inside the R2D2 sidecar.
-
-    A per-evaluation `docker run` of this image cost ~2.4s warm on this host and
-    only ~0.6s of it was science: ~0.5s of container create/start plus ~1.3s of
-    `import torch` and the R2D2 module imports, repeated every evaluation. One
-    worker per rank pays both once.
-
-    The thread limits go on the `docker exec`, not the container, because torch
-    and finufft read them at import time and each rank gets its own share. The
-    pre-warmed variant takes them from the container instead - every rank gets
-    the same value, so there is nothing per-rank to lose.
-    """
+    """Return this rank's long-lived R2D2 worker, creating it once per image."""
     if r2d2_image not in _R2D2_WORKERS:
-        container = sidecar_container(r2d2_image, platform, r2d2_checkpoint_mount(checkpoints_dir))
+        container = sidecar_container(r2d2_image, platform, ["-v", f"{checkpoints_dir}:/checkpoints:ro"])
         worker = _connect_shell_started_worker("NS_R2D2_FIFO_DIR", container)
         if worker is None:
             repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
@@ -2217,7 +1523,7 @@ def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> "subpro
                     "python3",
                     # Read live off the repo bind mount: the R2D2 image bakes in
                     # no copy of this repo's scripts, so nothing to rebuild.
-                    r2d2_serve_path(repo_root),
+                    str(repo_root / "scripts" / "lib" / "nested_sampling" / "r2d2_serve.py"),
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -2238,16 +1544,7 @@ def run_r2d2_imaging(
     stdout_path: Path,
     stderr_path: Path,
 ) -> DockerRunResult:
-    """Run one `imager.py` in this rank's R2D2 worker, same shape as sidecar_run().
-
-    This is the request the host's OOM killer interrupts when memory runs
-    short, so a death here is retried against a fresh worker and, if it
-    happens again, reported as WORKER_DIED - never as an `imager.py` exit
-    status, which is what the sampler would otherwise score as a failure mode.
-    A worker killed while it was idle between evaluations counts: the pipe is
-    already broken when the next request is written, which is what worker_send
-    turns back into a retry.
-    """
+    """Run one `imager.py` request, retrying worker deaths as `WORKER_DIED`."""
     request = {"argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}
     started = time.perf_counter()
     for attempt in worker_attempts():
@@ -2264,7 +1561,7 @@ def run_r2d2_imaging(
                 peak_memory_bytes=answer["peak_memory_bytes"],
             )
         if reply is None:
-            # ponytail: as in sidecar_run(), this kills the `docker exec`
+            # ponytail: this kills the `docker exec`
             # client and leaves the worker wedged in the sidecar.
             worker.kill()
         # The worker died or went silent mid-request; drop it so the next
@@ -2281,19 +1578,7 @@ def run_r2d2_imaging(
 
 
 def prewarm(*targets: Callable[[], None]) -> Callable[[], None]:
-    """Start this rank's sidecar attachments concurrently; returns a joiner.
-
-    The first evaluation on a rank cost time that later ones did not, and every
-    rank paid it at the same moment, so all of it landed on the wall clock in
-    front of evaluation one: the simulate worker's Python/Timba/meqserver
-    startup, the R2D2 worker's `import torch`, and the `docker inspect`s for an
-    image entrypoint - one after the other. Here they run in threads, so the
-    rank pays the slowest instead of the sum, and the caller can overlap them
-    with PolyChord's own startup by joining late.
-
-    Nothing may touch a sidecar between this call and the returned joiner: the
-    caches these threads fill are plain dicts with no lock.
-    """
+    """Start sidecar attachments concurrently and return a joiner."""
     threads = [threading.Thread(target=target, daemon=True) for target in targets]
     for thread in threads:
         thread.start()
@@ -2311,16 +1596,6 @@ def simulate_worker_request(
     request: dict[str, Any],
     stderr_path: Path,
 ) -> int:
-    """Send one request to this rank's simulate worker and report its exit code.
-
-    A worker that dies without answering, or before the request could be
-    written to it at all (worker_send), is dropped from the cache so the retry
-    gets a fresh one instead of inheriting the corpse. One that stops answering
-    without dying - the MeqTrees/meqserver deadlock SIMULATE_REPLY_TIMEOUT
-    exists for - is killed first, so that it leaves the same way. Either one
-    surviving the retries reports WORKER_DIED, not an exit status the simulate
-    never returned, with the reason in the caller's stderr log.
-    """
     for attempt in worker_attempts():
         worker = simulate_worker(meqtrees_image, platform)
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
@@ -2400,13 +1675,6 @@ def convert_ms_to_mat(
     meqtrees_image: str,
     platform: str,
 ) -> int:
-    """Convert this evaluation's MS to R2D2's `.mat` in the warm simulate worker.
-
-    Its own `docker exec` of ms_to_r2d2_mat.py cost ~0.15s and only ~0.01s of
-    that was the conversion; the rest was the exec, a fresh interpreter and the
-    numpy/casacore/scipy imports. The simulate worker already has all of that
-    live and has just written the MS, so it does the convert too.
-    """
     return simulate_worker_request(
         meqtrees_image,
         platform,
@@ -2443,21 +1711,10 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
 
 
 def self_check_worker_timeout() -> None:
-    """A worker that goes silent must be retried, then reported as WORKER_DIED.
-
-    The run this guards against is a real one: MeqTrees deadlocked with its
-    meqserver, the worker stayed alive and answered nothing, and the rank
-    waiting on it sat in readline() for 82 of the run's 84 minutes with the
-    other 19 ranks spinning in the collective behind it. Silence has to leave
-    by the same door a death does - killed, dropped, retried against a fresh
-    worker - and a silence that outlasts the retries has to reach the sampler
-    as WORKER_DIED rather than as an exit status the simulate never returned.
-    """
+    """Silent workers are retried, then reported as WORKER_DIED."""
     import tempfile
 
     class Worker:
-        """A worker whose reply never arrives, or arrives, on a real fd."""
-
         def __init__(self, reply: str | None, broken_stdin: bool = False) -> None:
             read_fd, self._write_fd = os.pipe()
             self.stdout = os.fdopen(read_fd, "r")
@@ -2551,14 +1808,6 @@ def self_check_worker_timeout() -> None:
 
 
 def self_check_worker_pool_connect() -> None:
-    """Both workers must reach their pre-warmed FIFO pool, not just simulate.
-
-    `_connect_shell_started_worker` has two call sites, and a signature change
-    that updated only the simulate one left `r2d2_worker` raising TypeError on
-    the first evaluation of every pooled R2D2 run - invisible to a WSClean run,
-    which never takes this path. Calling both here is what makes the two call
-    sites drift loudly instead of silently.
-    """
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2596,14 +1845,6 @@ def self_check_worker_pool_connect() -> None:
 
 
 def self_check_parameter_space() -> None:
-    """The parameter space survived the trip through defaults.toml.
-
-    5, not 6: the default-enabled count in the committed defaults.toml, which
-    is what `source_offset_fraction` being `enabled = false` leaves. Meant to
-    be retuned by toggling `enabled`, same as the ranges below - bump this when
-    the default-enabled set changes, so a stray toggle in a commit still trips
-    a canary.
-    """
     specs = load_parameter_space()
     assert len(specs) == 5, specs
     for spec in specs:
@@ -2620,7 +1861,6 @@ def self_check_parameter_space() -> None:
 
 
 def self_check_parameter_toggle() -> None:
-    """`enabled = false` and `NS_ENABLE_PARAMS`/`NS_DISABLE_PARAMS` actually toggle a dimension."""
     saved_off = os.environ.get("NS_DISABLE_PARAMS")
     saved_on = os.environ.get("NS_ENABLE_PARAMS")
     try:
@@ -2653,7 +1893,6 @@ def self_check_parameter_toggle() -> None:
 
 
 def self_check_source_offset() -> None:
-    """`source_offset_fraction` reaches `cube_to_params()` as an (l, m) offset that `source_pixel()` can invert."""
     l_arcsec, m_arcsec = source_offset_to_lm(0.0, 1.4e9)
     assert l_arcsec == 0.0 and m_arcsec == 0.0, (l_arcsec, m_arcsec)
 
@@ -2753,7 +1992,6 @@ def self_check_source_offset() -> None:
 
 
 def self_check_spectral_window() -> None:
-    """Every fitted window sits inside one receiver band, and inverts back."""
     bands = load_receiver_bands()
     assert bands and all(float(b["min"]) < float(b["max"]) for b in bands), bands
 
@@ -2872,12 +2110,6 @@ def self_check_r2d2_thread_env() -> None:
 
 
 def self_check_fits_reader() -> None:
-    """load_fits_2d() against astropy on a WSClean-shaped image.
-
-    astropy is still in the polychord image; it is just not imported on the hot
-    path. The trap this guards is card parsing, not the data block: a quoted
-    value may contain the `/` that starts a comment (`BUNIT = 'JY/BEAM '`).
-    """
     import tempfile
 
     from astropy.io import fits
@@ -2902,13 +2134,7 @@ def self_check_fits_reader() -> None:
 
 
 def self_check_lazy_numpy() -> None:
-    """Importing this module must not import numpy, and `np` must still work.
-
-    Needs a fresh interpreter: any caller that has already touched an array has
-    numpy in sys.modules. The regression this catches is a new module-level
-    `np.` use, which would re-import numpy eagerly and silently give the
-    report's page-only rebuild its 0.03s back.
-    """
+    """Importing this module must defer numpy until `np` is used."""
     probe = (
         "import sys, common;"
         "assert 'numpy' not in sys.modules, 'common imported numpy eagerly';"
@@ -2953,12 +2179,7 @@ def self_check_metric_resolution() -> None:
 
 
 def self_check_image_pixel_size() -> None:
-    """The derived cell has to be the one R2D2 picks for the same sampling pattern.
-
-    Reproduces upstream's expression (src/utils/io.py) from raw u/v the way
-    ms_to_r2d2_mat.py writes them, rather than restating this module's own
-    formula, so a drift on either side shows up here.
-    """
+    """Check derived pixel size against R2D2's upstream expression."""
     speed_of_light = 299792458.0
     baseline_m = np.array([120.0, 36400.0, 4800.0])
     freqs_hz = np.array([1.0e9, 1.4e9])
@@ -2989,12 +2210,10 @@ def self_check_image_pixel_size() -> None:
 
 
 def self_check_backfilled_intervals() -> None:
-    """A run archived before the epochs existed still splits, or says why not."""
     import os
     import tempfile
 
     def run_dir(root: Path, ends: list[float], length: float = 1.0) -> dict[str, Any]:
-        """A summary whose evaluations are on disk with the given end times."""
         evaluations = []
         for index, end in enumerate(ends):
             eval_dir = root / f"eval-{index:04d}-abc"
@@ -3105,7 +2324,6 @@ def self_check_profiling() -> None:
     assert format_share(0.0001) == "<0.1%"
     assert format_share(0.0) == "0.0%"
 
-    # Serial run: budget is the wall clock, so stages + unaccounted make 100%.
     serial = profiling_breakdown(profiling, algorithm="wsclean")
     assert serial["worker_procs"] == 1
     assert serial["worker_seconds_budget"] == 25.0
@@ -3121,9 +2339,6 @@ def self_check_profiling() -> None:
     top_level = sum(row["share"] for row in serial["rows"] if not row["is_sub"])
     assert abs(top_level + serial["remainder_rows"][0]["share"] - 1.0) < 1e-9
 
-    # MPI run: the budget is wall clock x *workers*, and 4 ranks are 3 workers
-    # plus the administrator - counting rank 0 would invent 5s of idle time
-    # that no rank could ever have spent imaging.
     assert (worker_procs(1), worker_procs(2), worker_procs(15)) == (1, 1, 14)
     mpi = profiling_breakdown(mpi_profiling, algorithm="r2d2")
     assert mpi["worker_procs"] == 3
@@ -3132,40 +2347,28 @@ def self_check_profiling() -> None:
     assert abs(mpi["remainder_rows"][0]["seconds"] - 10.5) < 1e-9
     assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
 
-    # Accounted time above the nominal budget must not push shares over 100%.
     oversubscribed = profiling_breakdown(summarize_profiling(evaluations, total_wall_seconds=1.0, mpi_procs=2))
     assert oversubscribed["worker_seconds_budget"] == 19.5
     assert oversubscribed["remainder_rows"][0]["seconds"] == 0.0
     assert oversubscribed["rows"][0]["label"] == "simulate (MeqTrees)"
 
-    # Records with no epochs on them keep the one combined remainder row, and
-    # nothing above the sum that a stage did not time.
     for unsplit in (serial, mpi):
         assert [row["label"] for row in unsplit["remainder_rows"]] == [UNACCOUNTED_LABEL]
         assert unsplit["subtotal_label"] == "accounted (sum of stages above)"
         assert "harness" not in [row["key"] for row in unsplit["rows"]]
     assert serial["equation_terms"] == ["19.5s accounted", "+ 5.50s unaccounted"]
 
-    # Two workers over 10s: one evaluates 1001-1005, the other 1001-1003, and
-    # the third rank administrates. So 6s of the 20s budget was spent inside an
-    # evaluation (0.5s of it this harness, around the timed stages), 2s was the
-    # second worker waiting for the first, and the 6s of wall clock with
-    # nothing in flight cost both workers 12s between them.
     timed = [
         {"timing": {"simulate_seconds": 1.0, "image_container_seconds": 2.0, "metrics_seconds": 0.5,
                     "started_epoch": 1001.0, "ended_epoch": 1005.0}},
         {"timing": {"simulate_seconds": 0.5, "image_container_seconds": 1.0, "metrics_seconds": 0.5,
                     "started_epoch": 1001.0, "ended_epoch": 1003.0}},
-        # A record adopted from an earlier segment of a resumed run: outside
-        # this wall clock, so it is not evidence about how this one was spent.
         {"timing": {"started_epoch": 900.0, "ended_epoch": 950.0}},
     ]
     split = profiling_breakdown(summarize_profiling(
         timed, total_wall_seconds=10.0, mpi_procs=3, run_started_epoch=1000.0))
     assert split["worker_seconds_budget"] == 20.0
     assert abs(split["busy_worker_seconds"] - 6.0) < 1e-9, split["busy_worker_seconds"]
-    # The harness joins the stages above the sum, PolyChord and idle sit below
-    # it, and every top-level row together is the whole budget.
     assert split["rows"][-1]["key"] == "harness" and split["rows"][-1]["seconds"] == 0.5
     assert abs(split["subtotal_seconds"] - 6.0) < 1e-9
     assert [(row["key"], round(row["seconds"], 6)) for row in split["remainder_rows"]] == [
@@ -3175,15 +2378,12 @@ def self_check_profiling() -> None:
     assert split["equation_terms"] == ["6.00s evaluating", "+ 12.0s PolyChord", "+ 2.00s idle"]
     assert split["total_label"] == "end-to-end (evaluating + PolyChord + idle)"
 
-    # Without a start epoch from the caller the window is anchored on the last
-    # evaluation to finish, which here ends the run - same split, one clock.
     anchored = profiling_breakdown(summarize_profiling(timed[:2], total_wall_seconds=4.0, mpi_procs=3))
     assert abs(anchored["busy_wall_seconds"] - 4.0) < 1e-9, anchored["busy_wall_seconds"]
     assert anchored["remainder_rows"][0]["seconds"] == 0.0
 
     self_check_backfilled_intervals()
 
-    # A run with no timings at all still renders rather than dividing by zero.
     degenerate = profiling_breakdown({"mpi_procs": 1, "total_wall_seconds": 0.0, "stage_totals_seconds": {}})
     assert degenerate["worker_seconds_budget"] is None
     assert degenerate["remainder_rows"] == []

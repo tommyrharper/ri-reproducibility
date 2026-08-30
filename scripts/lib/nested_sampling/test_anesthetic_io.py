@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Regression check for merging sources with mismatched on-disk .paramnames.
-
-Run: uv run python3 scripts/lib/nested_sampling/test_anesthetic_io.py
-
-Before the fix, a merge source whose chains/ already had a .paramnames file
-on disk (e.g. because anesthetic-gui.py had been run against it) kept its
-real tex label, while a source without one got a blank tex label. concat
-then saw two same-named-but-differently-labelled columns as duplicates, and
-plot_2d raised ValueError on the ambiguous WeightedLabelledSeries. This
-builds exactly that mismatched pair and merges them through the real
-load_nested_samples() path.
-"""
-
 from __future__ import annotations
 
 import json
@@ -91,9 +78,7 @@ def main() -> None:
         import matplotlib
 
         matplotlib.use("Agg")
-        # ncompress=False for the same reason generate_report.py sets it: on a
-        # chain this small anesthetic's triangular compression intermittently
-        # builds a probability vector that does not sum to 1.
+        # Anesthetic's triangular compression intermittently misnormalizes this small chain.
         axes = like.plot_2d(PARAM_NAMES[:2], ncompress=False)
         assert axes is not None
 

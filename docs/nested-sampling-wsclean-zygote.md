@@ -6,9 +6,7 @@ shared objects the last one initialised. `wsclean-zygote` pays that once per
 rank and forks an already-initialised child per evaluation: +8.4% evaluations per second end to end over eight simultaneous swapped
 pairs of real searches, with bit-identical images.****
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## Where the 27 ms was found
 

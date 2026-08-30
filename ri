@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""ri - drive the failure-mode search over R2D2 and WSClean.
-
-This repo runs nested sampling (PolyChord) over the observing-parameter space
-of the R2D2-RI and WSClean imagers to find the setups they reconstruct worst.
-This script is the front door: it builds the Docker images, runs the searches,
-and turns their output into reports, profiles and plots.
-
-It is a thin dispatcher. Every command below runs a script under scripts/ (or
-docker directly); the behaviour lives there. Flags that configure a search set
-the matching environment variable and then delegate, so the layering stays
-
-    flag  >  environment variable  >  defaults.toml
-
-exactly as before: a flag exports the variable, an unset flag leaves whatever
-the environment already had, and scripts/lib/defaults.sh fills in the rest.
-"""
+"""Thin CLI dispatcher for the R2D2 and WSClean failure-mode searches."""
 
 import argparse
 import os
@@ -459,16 +444,14 @@ def build_parser():
             "whole life, the memory and cores the run is holding, how much\n"
             "of it the host has pushed out to swap and whether anything is\n"
             "waiting on those pages, against what the host has left and what\n"
-            "the host as a whole is loaded to,\n"
-            "what one evaluation peaks at and what that\n"
-            "costs across every rank, how fast it is filling the disk and\n"
-            "how long that leaves, how much running time went to stalls, how\n"
-            "many evaluations scored FAILURE_OBJECTIVE - which PolyChord\n"
-            "maximizes, so a broken imager looks like a spectacular\n"
+            "the host as a whole is loaded to, what one evaluation peaks at\n"
+            "and what that costs across every rank, how fast it is filling\n"
+            "the disk and how long that leaves, how much running time went to\n"
+            "stalls, how many evaluations scored FAILURE_OBJECTIVE - which\n"
+            "PolyChord maximizes, so a broken imager looks like a spectacular\n"
             "discovery - how many self-healed restarts a live run has left\n"
-            "before the next crash leaves it waiting for a ./ri resume,\n"
-            "and any sidecar container left holding memory by\n"
-            "a run that is gone.\n"
+            "before the next crash leaves it waiting for a ./ri resume, and\n"
+            "any sidecar container left holding memory by a run that is gone.\n"
             "\n"
             "Reads files, runs one ps and one docker ps, and samples CPU\n"
             "for a second when a run is live, so it costs a busy\n"

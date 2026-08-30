@@ -1,35 +1,5 @@
 #!/usr/bin/env python3
-"""Long-lived R2D2 imaging worker: one `imager.py` run per JSON request line.
-
-A per-evaluation `docker run` of the R2D2 image cost ~2.4s warm on this host and
-only ~0.6s of that was science: ~0.5s of container create/start plus ~1.3s of
-`import torch` and the R2D2 module imports, paid again on every evaluation. This
-process keeps both alive inside the shared R2D2 sidecar. A request is
-`{"argv": [...], "stdout": path, "stderr": path}` on stdin - everything the
-imaging run prints goes to those two files, exactly as the caller's `docker run`
-redirection did - and the reply is one JSON line on stdout,
-`{"returncode": int, "peak_memory_bytes": int}`. With `--fifo <base>` the same
-conversation happens over the FIFO pair `<base>.in` / `<base>.out` instead, and
-`--fifo-dir <dir>` serves one such pair per rank from a single warm-up. Either
-is what lets the run script start these workers as the R2D2 container's own
-command, before the ranks that will use them exist. `--fifo-dir` also opens
-every pair before it warms up, so a rank attaches at ~0.3s rather than ~1.2s and
-spends the difference on its own startup instead of on this one's.
-
-The warm-up also patches `MeasOp.get_op_norm` to a Lanczos solve, runs that
-solve on a coarser FINUFFT upsampling grid than the imaging transforms use, and
-gives each measurement operator one plan per (transform type, upsampling
-factor); see `patch_op_norm`, `OP_NORM_UPSAMPFAC` and `patch_nufft_plans`.
-
-Upstream's `src/imager.py` has no importable entry point (its whole body sits
-under `if __name__ == "__main__"`), so each request re-runs that body with
-runpy. Its imports are then served from `sys.modules`, which is where the saving
-comes from - and the same guard is what lets the warm-up run the file under a
-different name to pay for those imports up front.
-
-This script runs from the repository bind mount, not from a copy baked into the
-R2D2 image, so editing it needs no image rebuild.
-"""
+"""Serve warmed R2D2 imaging workers over JSON lines or rank-specific FIFOs."""
 
 from __future__ import annotations
 
@@ -49,7 +19,6 @@ IMAGER = Path(os.environ.get("R2D2_IMAGER", R2D2_HOME / "src" / "imager.py"))
 
 @contextmanager
 def redirect_fds(out_path: Path, err_path: Path):
-    """Point fds 1 and 2 - so child processes too - at files for this block."""
     sys.stdout.flush()
     sys.stderr.flush()
     saved_out, saved_err = os.dup(1), os.dup(2)
@@ -67,42 +36,20 @@ def redirect_fds(out_path: Path, err_path: Path):
             os.close(saved_err)
 
 
-# The high-water RSS a forked worker inherits from the warm-up it was forked
-# from. A child process starts a fresh ru_maxrss counter even though it starts
-# holding all of the parent's resident pages, so without this a pool worker
-# under-reports by the whole cost of the imports - measured 196MB against the
-# 303MB the same request reports from a worker that imported for itself.
+# Forked workers inherit warm-up pages but reset ru_maxrss, so retain the
+# parent's high-water mark or memory reports omit import cost.
 _PEAK_FLOOR = 0
 
 
 def peak_memory_bytes() -> int:
-    """This worker's high-water RSS.
-
-    `docker stats` used to sample a container that held one evaluation; a worker
-    holds the whole rank, so this is a running maximum across its evaluations
-    rather than a per-evaluation peak. It still answers the question the metric
-    exists for - how much memory an R2D2 reconstruction of this size needs - and
-    the first evaluation on a worker reports exactly what the container did.
-    """
     return max(_PEAK_FLOOR, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
 
 
-# `utils/__init__.py` re-exports one name from each of these, so importing any
-# part of `utils` imports all of them. The two at the end are the ones nothing
-# on the imaging path uses - `util_training` pulls lightning and `noise` pulls
-# scipy.optimize, 0.13s of the imaging worker's readiness between them - so the
-# search below reaches them only for a name the rest do not define.
+# Avoid eager imports from `utils`; the last two pull unused heavy dependencies.
 _UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
 
 
 def install_lazy_utils() -> None:
-    """Make `utils` import its submodules on demand rather than all at once.
-
-    A module `__getattr__` (PEP 562) that resolves a name by walking the
-    submodules in order, so `from utils import vprint` costs the submodules up
-    to the one that defines it and no more. Same names, same values - only the
-    ones nothing asks for go unimported.
-    """
     import importlib
 
     package = types.ModuleType("utils")
@@ -121,31 +68,18 @@ def install_lazy_utils() -> None:
 
 
 def warm_imports() -> None:
-    """Pay `import torch` and the R2D2 modules before request one.
-
-    ~0.9s, and it used to be paid inside evaluation one, where it landed on the
-    sampler's wall clock. Run by the container's own command it happens while
-    the PolyChord container, mpirun and PolyChord's own setup still have to.
-    """
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
     install_lazy_utils()
-    # Run imager.py's own body under a name that is not "__main__": its imaging
-    # work is all behind an `if __name__ == "__main__"` guard, so what executes
-    # is exactly its import block - no hand-maintained copy of it to drift.
-    # Under redirect_fds because a stray import-time print would otherwise land
-    # in the reply stream and be read as a reply.
+    # Reuse imager.py's import block; suppress import-time output from the
+    # JSON reply stream.
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
             runpy.run_path(str(IMAGER), run_name="__warmup__")
             patch_op_norm()
             patch_nufft_plans()
-            # `create_meas_op` imports its NUFFT backend inside the function,
-            # so imager.py's import block does not reach it and every worker
-            # paid it on request one instead: 0.165s against a 0.072s steady
-            # state. This is the backend `write_r2d2_config` asks for, and it
-            # goes after patch_op_norm so that picking another one costs a slow
-            # request one rather than an unpatched operator norm.
+            # `create_meas_op` imports this backend lazily; preload it after
+            # patching the operator norm.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
             )
@@ -174,27 +108,7 @@ OP_NORM_UPSAMPFAC = 1.25
 
 
 def patch_nufft_plans() -> None:
-    """Build each operator's FINUFFT plans once instead of once per transform.
-
-    `finufft`'s simple interface - the one pytorch_finufft calls - creates a
-    plan, sets the sampling points on it and destroys it again on every single
-    transform. An evaluation applies the same trajectory tens of times (~21
-    Lanczos matvecs, ~45 transforms, before the UNet passes even start), so all
-    of that setup is repetition: measured at 0.018s of the 0.063s an operator
-    norm cost when this landed, at the 29 matvecs `tol=1e-5` then took.
-    Keeping one plan per (operator, transform type, upsampling factor) measured
-    a forward/adjoint pair at 0.99ms against 1.89ms.
-
-    Same library, same eps/isign/modeord, so for the imaging transforms - which
-    keep upstream's `upsampfac` of 2.0 - this only removes
-    `makeplan`/`setpts`/`destroy` plus the autograd `Function.apply` dispatch
-    that eager inference has no use for, and they come back bit-identical at
-    this problem size. `upsampfac` is in the key because `get_op_norm` asks for
-    a coarser grid; see OP_NORM_UPSAMPFAC. Anything the cached plans do not cover - a non-CPU
-    device, a batch of more than one image - falls back to upstream. Both are
-    under `no_grad`: the plan path detaches through numpy anyway, and this
-    worker only ever runs `imager.py`, which is inference.
-    """
+    """Cache CPU FINUFFT plans; unsupported devices and batches use upstream."""
     import finufft
     import numpy as np
     import torch
@@ -205,7 +119,6 @@ def patch_nufft_plans() -> None:
     forward, adjoint = MeasOpPytorchFinufft._GA, MeasOpPytorchFinufft._AtGt
 
     def plan(self, nufft_type: int):
-        """This operator's plan for `nufft_type`, or None if upstream must run."""
         if str(self._device or "cpu") != "cpu":
             return None
         plans = getattr(self, "_ri_nufft_plans", None)
@@ -257,33 +170,7 @@ def patch_nufft_plans() -> None:
 
 
 def lanczos_largest_eigenvalue(matvec, size: int, dtype, v0=None, max_restarts: int = 100):
-    """Largest eigenvalue of a Hermitian positive semi-definite operator.
-
-    `matvec` maps a flat vector to `A x`. ARPACK's Lanczos builds a Krylov
-    subspace, so it converges on a clustered spectrum where a power iteration
-    crawls: measured on this parameter space it is 17-25 operator applications
-    against the 39-305 the power iteration takes, and lands within ~3e-6 of the
-    true value against the power iteration's ~1e-4.
-
-    `tol` is 1e-3, not the 1e-5 this started at: the answer only scales the
-    operator, so upstream's own ~1e-4 is the accuracy that has to be beaten, and
-    over 24 real operators from this parameter space 1e-5 cost 28.7 applications
-    on average (max 33) for a 9e-11 median error where 1e-3 costs 21.2 (max 25)
-    for 2.9e-6. Going further is where it stops being free - 1e-2 is 16.8
-    applications but a 4.9e-4 median error, i.e. worse than the power iteration.
-
-    Returns `(eigenvalue, eigenvector)`; asking for the eigenvector costs
-    `eigsh` no extra applications.
-
-    The start vector defaults to `ones`, and is never a random draw: with no
-    seeding the upstream power iteration gives a different answer, and takes a
-    different number of iterations, on every run of the same evaluation. `v0`
-    is how `get_op_norm` feeds back a converged eigenvector; see
-    `_reused_start_vector`.
-
-    ponytail: `max_restarts` bounds the worst case at ~600 applications; the
-    caller falls back to the power iteration if it is ever hit.
-    """
+    """Return largest eigenpair; caller falls back on non-convergence."""
     import numpy as np
     from scipy.sparse.linalg import LinearOperator, eigsh
 
@@ -303,41 +190,16 @@ def lanczos_largest_eigenvalue(matvec, size: int, dtype, v0=None, max_restarts: 
     return float(eigenvalues[0]), np.ascontiguousarray(eigenvectors[:, 0], dtype=dtype)
 
 
-# The last eigenvector `get_op_norm` converged on in this worker, reused as the
-# next operator's ARPACK start vector. One worker sees a whole sequence of
-# operators from the same parameter space, and their top eigenvalues sit in a
-# shared dominant subspace even though the individual eigenvectors are nearly
-# orthogonal (cos ~0.01), so a converged one is a far better guess than `ones`:
-# over 24 real operators it costs 14.3 applications (max 17) against 21.2 (max
-# 25) and cuts the solve from 19.6ms to 14.0ms.
-#
-# It is deliberately the FIRST one, held for the rest of the worker's life,
-# rather than a rolling one - rolling ties on the mean but has a 25-application
-# worst case where freezing has 17. The price is that the answer depends on
-# which operator the worker saw first, which is bounded well below the
-# tolerance it is already specified to: over those operators the eigenvalue
-# moves 6.3e-07 median / 3.4e-06 worst against a solve from `ones`, and the
-# spread across five different frozen start vectors is the same size - against
-# ARPACK's own 1e-3 `tol` and upstream's ~1e-4 power iteration. Nothing generic
-# reproduces it: seeded randn, low-passed randn, Gaussians and one or two power
-# iterations from `ones` all measure 18.7-25.5 applications.
+# Reuse the first converged eigenvector for every operator in this worker.
+# Operators share a dominant subspace, so this cuts real solves from 19.6ms to
+# 14.0ms (24-operator median) while keeping eigenvalue variation below 4e-6,
+# far below ARPACK's 1e-3 tolerance. Freeze the first vector: rolling starts
+# have the same mean cost but a worse 25-application maximum versus 17.
 _reused_start_vector = None
 
 
 def patch_op_norm() -> None:
-    """Solve `MeasOp.get_op_norm` with Lanczos instead of a power iteration.
-
-    `get_op_norm` is the whole cost of an R2D2 evaluation that stops before the
-    UNet passes, and most of one that does not: the operator's spectrum is
-    tightly clustered, so upstream's power iteration needs 39-305 forward/
-    adjoint NUFFT pairs to meet its 1e-5 relative-change test - and how many is
-    a lottery decided by the unseeded `torch.randn` it starts from. That tail is
-    what the sampler waits on, because a PolyChord round costs the slowest
-    rank's evaluation, not the median one.
-
-    Same quantity, same caching contract, ~2.5x fewer operator applications and
-    ~1e-10 relative accuracy instead of ~1e-4.
-    """
+    """Patch `MeasOp.get_op_norm` with the cached Lanczos implementation."""
     import numpy as np
     import torch
     from ri_measurement_operator.pysrc.measOperator.meas_op import MeasOp
@@ -381,18 +243,7 @@ def patch_op_norm() -> None:
 
 
 def serve_pool(fifo_dir: str) -> None:
-    """One worker per FIFO pair in `fifo_dir`, all forked from a single warm-up.
-
-    A run wants one worker per rank, and as separate interpreters they all
-    `import torch` at the same moment: 0.89s on its own becomes 1.05-1.61s
-    across 8 of them on a 20-CPU host, and the sampler waits for the slowest.
-    Importing once and forking pays it at the solo price, and the children then
-    share the ~300MB of it copy-on-write instead of holding a copy each.
-
-    This process holds both ends of every pair open from before the warm-up
-    until the pair's child exits, so a rank can attach while the warm-up is
-    still running and get on with its own startup.
-    """
+    """Fork one warmed worker per FIFO pair in `fifo_dir`."""
     global _PEAK_FLOOR
     bases = sorted(str(path)[: -len(".in")] for path in Path(fifo_dir).glob("*.in"))
     # A rank attaches by write-opening `<rank>.in` - ENXIO until someone is
@@ -447,13 +298,11 @@ def serve_pool(fifo_dir: str) -> None:
 
 
 def serve(fifo_base: str | None = None) -> None:
-    """Warm this process up and answer requests until the stream ends."""
     warm_imports()
     answer(fifo_base)
 
 
 def answer(fifo_base: str | None) -> None:
-    """Run one imager.py per request line until the request stream ends."""
     if fifo_base is None:
         requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
     else:
@@ -480,14 +329,11 @@ def answer(fifo_base: str | None) -> None:
         replies.flush()
 
 
-# What the stub imagers below do: `sys.exit(argv[1])`, behind the same
-# `if __name__ == "__main__"` guard the real imager.py puts its body behind - so
-# the warm-up's runpy pass over it runs its imports and nothing else.
+# Stub imager exits under real imager's guard, so warm-up imports only.
 _GUARDED_EXIT_IMAGER = "import sys\nif __name__ == '__main__':\n    sys.exit(int(sys.argv[1]))\n"
 
 
 def self_check_serve_reply_stream() -> None:
-    """Replies must carry JSON only, and a failed request must not end the worker."""
     import subprocess
     import tempfile
 
@@ -523,7 +369,6 @@ def self_check_serve_reply_stream() -> None:
 
 
 def self_check_serve_fifo() -> None:
-    """A `--fifo` worker must answer on its FIFO pair without deadlocking."""
     import subprocess
     import tempfile
     import time
@@ -559,7 +404,6 @@ def self_check_serve_fifo() -> None:
 
 
 def self_check_serve_pool() -> None:
-    """`--fifo-dir` must serve every pair in the directory off one warm-up."""
     import subprocess
     import tempfile
     import time
@@ -625,16 +469,6 @@ def self_check_serve_pool() -> None:
 
 
 def self_check_lanczos_largest_eigenvalue() -> None:
-    """The solver must beat the power iteration on a tightly clustered spectrum.
-
-    Only runs where scipy is installed, which is the R2D2 image - the other
-    checks here stub out everything the image provides, but this one is about
-    the numerics themselves. Run it there with:
-
-        docker run --rm -v "$PWD:$PWD" --entrypoint python3
-        ri-reproducibility/r2d2:cpu
-        "$PWD/scripts/lib/nested_sampling/r2d2_serve.py" --self-check
-    """
     try:
         import numpy as np
     except ImportError:
@@ -692,11 +526,6 @@ def self_check_lanczos_largest_eigenvalue() -> None:
 
 
 def self_check_nufft_plan_reuse() -> None:
-    """A cached plan must give bit-identical transforms to a per-call one.
-
-    Only runs inside the R2D2 image, where the measurement operator lives -
-    same command as the op-norm check above.
-    """
     sys.path.insert(0, str(IMAGER.parent))
     try:
         import torch
@@ -747,7 +576,6 @@ def self_check_nufft_plan_reuse() -> None:
 
 
 def self_check_lazy_utils() -> None:
-    """A name must resolve to the same value, and no later submodule than needed."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:

@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Self-check for ./ri, the repo's command-line front door.
-
-Covers the only non-trivial thing it does: turn arguments into an environment
-override plus a list of commands, without losing the
-flag > environment > defaults.toml precedence. Also renders every --help, which
-is where a malformed parser shows up.
-
-Run it directly - `uv run --no-project scripts/test_cli.py` - or via CI.
-Needs no Docker and no project dependencies.
-"""
+"""Self-check ./ri argument dispatch, environment precedence, and help output."""
 
 import argparse
 import importlib.machinery
@@ -39,49 +30,36 @@ def check(what, expected, actual):
 
 
 def plan(*argv):
-    """The (env overrides, commands) ./ri would use for these arguments."""
     args = ri.build_parser().parse_args(argv)
     if args.handler is ri.do_record and args.command[:1] == ["--"]:
         args.command = args.command[1:]
     return args.handler(args)
 
 
-# Flags set the environment variable the scripts already read. `--metric=-snr`
-# is the = form on purpose: a negated metric starts with a dash, which argparse
-# would otherwise read as a flag.
 check(
     "search flags become NS_* overrides",
     {"NS_NLIVE": "8", "NS_METRIC": "-snr", "NS_MPI_PROCS": "1"},
     plan("search", "wsclean", "--nlive", "8", "--metric=-snr", "--mpi-procs", "1")[0],
 )
 
-# --mgain is the only float flag here, and it has to arrive as WSClean would
-# print it rather than as Python's repr, because common.py renders it into the
-# argv with %g and every run records what it used.
 check(
     "search --mgain reaches the run script",
     {"NS_WSCLEAN_MGAIN": "0.9"},
     plan("search", "wsclean", "--mgain", "0.9")[0],
 )
 
-# --retries 0 is the flag most likely to be dropped by env_from(), because 0 is
-# falsy and turning off the self-restart has to reach the run script.
 check(
     "search --retries 0 reaches the run script",
     {"NS_RETRIES": "0"},
     plan("search", "wsclean", "--retries", "0")[0],
 )
 
-# Same falsy-zero hazard, same reason: 0 turns the stall watchdog off, which
-# is the setting somebody reaches for when it is misfiring on their run.
 check(
     "search --stall-timeout 0 reaches the run script",
     {"NS_STALL_TIMEOUT": "0"},
     plan("search", "wsclean", "--stall-timeout", "0")[0],
 )
 
-# The booleans here reach shell scripts that test them the shell way, so they
-# have to arrive as 1/0 rather than Python's True/False.
 check(
     "search --synchronous/--no-synchronous become 1/0",
     ({"NS_SYNCHRONOUS": "1"}, {"NS_SYNCHRONOUS": "0"}),
@@ -98,8 +76,6 @@ check(
 )
 
 
-# ...and a flag that was not given contributes nothing, so an environment
-# variable exported by hand survives and defaults.toml still fills the rest.
 check(
     "unset flags leave the environment alone",
     {},
@@ -123,8 +99,6 @@ check(
     plan("search", "wsclean", "--no-build")[1],
 )
 
-# --enable-param / --disable-param are repeatable and join into the same
-# comma-separated names load_parameter_space() reads from the environment.
 check(
     "search --enable-param/--disable-param join into NS_*_PARAMS",
     {"NS_ENABLE_PARAMS": "source_offset_fraction", "NS_DISABLE_PARAMS": "channel_count,observation_minutes"},
@@ -146,8 +120,6 @@ check(
     plan("params", "--disable-param", "source_offset_fraction")[0],
 )
 
-# `runs` and `resume` are how an interrupted run is found and continued, so
-# the flags have to reach the scripts that do the finding and the continuing.
 check(
     "runs passes its selectors through",
     ({}, [["uv", "run", "scripts/nested-sampling-runs.py", "--incomplete", "--json"]]),
@@ -160,9 +132,6 @@ check(
     plan("runs"),
 )
 
-# `health` takes either a run or --all, never both, and the run is a bare
-# positional rather than a flag - so it is the one place a mistranslation would
-# silently report on the wrong run.
 check(
     "health with no arguments leaves the run choice to the script",
     ({}, [["uv", "run", "scripts/nested-sampling-health.py"]]),
@@ -189,11 +158,6 @@ check(
     plan("health", "--monitor", "--interval", "10"),
 )
 
-# Both at once is a mistake, and it has to reach the script to be rejected -
-# dropping one here would report on the wrong thing without saying so.
-# The TUI is the one command that is not Python or Docker: it shells back into
-# this script for everything it shows, and `go -C tui` is what lets its module
-# live in tui/ without a go.mod at the repository root.
 check(
     "tui runs the Go module in tui/",
     ({}, [["go", "-C", "tui", "run", "."]]),
@@ -206,18 +170,12 @@ check(
     plan("health", "somerun", "--all"),
 )
 
-# No flags: resuming reads the settings back out of the run directory, so the
-# run name is the only thing that has to travel. The image builds a resume does
-# are the resume script's own, because only run.env knows which images the run
-# needs - so nothing but the run name is on this command line either.
 check(
     "resume passes the run through and nothing else",
     ({}, [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
     plan("resume", "r2d2-vlaa-20260827T101500Z"),
 )
 
-# ...and the one way to stop it rebuilding, for a working tree that has moved
-# on since the run started.
 check(
     "resume --no-build reaches the script as an environment override",
     ({"NS_NO_BUILD": "1"},
@@ -237,8 +195,6 @@ check(
     plan("report")[0],
 )
 
-# `serve` defaults live in the script, not here, so an unset flag must stay out
-# of the environment rather than pin the port or the bind address.
 check(
     "serve overrides only what was asked for",
     ({"REPORT_PORT": "9000"}, [["scripts/serve-report.sh"]]),
@@ -333,7 +289,6 @@ check(
          "--", "docker", "run", "--rm", "img:tag")[1],
 )
 
-# --dry-run is the seam this file leans on, so check it end to end too.
 dry = subprocess.run(
     [sys.executable, str(CLI_PATH), "--dry-run", "search", "wsclean",
      "--no-build", "--seed", "7"],
@@ -345,10 +300,6 @@ check(
     dry.stdout,
 )
 
-# Every --help renders: a bad parser (a duplicate flag, a stray %-format in a
-# help string) raises here rather than in front of a user. The subparser
-# choices are argparse-private, but that is the only place the command tree
-# lives, and reading it beats hardcoding a second copy of the command list.
 def command_paths(parser, prefix=()):
     yield list(prefix)
     for action in parser._actions:
@@ -365,13 +316,6 @@ for path in command_paths(ri.build_parser()):
     label = " ".join(["./ri", *path, "--help"])
     check(f"{label} renders", (0, True), (result.returncode, bool(result.stdout)))
 
-# The name in the first column of `./ri runs` is what a reader copies, and it
-# has to work in every command that takes a run. `health` and `resume` resolve
-# it in the shell/Python they dispatch to; these three each own a resolver, and
-# each one used to accept only a path - `./ri profile <name>` answered "no
-# summary.json found at <cwd>/<name>". Checked here rather than three new
-# self-checks because "every run-taking command takes the name" is a property
-# of the front door, not of any one script.
 def load_script(name):
     path = REPO_ROOT / "scripts" / name
     loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
@@ -381,9 +325,17 @@ def load_script(name):
     return module
 
 
-with tempfile.TemporaryDirectory() as runs_dir:
-    # Pointed at a temporary directory rather than the real one: a fixture run
-    # under results/nested-sampling/ is a run to every glob in this repo.
+with tempfile.TemporaryDirectory() as tmp:
+    # Reached through a symlink on purpose. macOS puts its temporary
+    # directories under /var, which is one, so a resolve() wrongly applied to
+    # a bare run name rewrites the path there and nowhere else - which is how
+    # it once reached main green on every Linux job. This reproduces it
+    # anywhere.
+    real = Path(tmp) / "real"
+    real.mkdir()
+    runs_dir = Path(tmp) / "runs"
+    runs_dir.symlink_to(real)
+
     named = Path(runs_dir) / "wsclean-vlaa-20260101T000000Z"
     named.mkdir()
     elsewhere = Path(runs_dir) / "elsewhere"
@@ -393,8 +345,6 @@ with tempfile.TemporaryDirectory() as runs_dir:
                              ("anesthetic-gui.py", "resolve_target")):
         module = load_script(script)
         module.NESTED_SAMPLING_DIR = Path(runs_dir)
-        # Each resolver is fed what its own argparse hands it - a str for two
-        # of them, a Path for the GUI's - rather than a normalised type.
         resolve = getattr(module, resolver)
         wants_path = script == "anesthetic-gui.py"
 
@@ -402,12 +352,8 @@ with tempfile.TemporaryDirectory() as runs_dir:
             return resolve(Path(raw) if wants_path else raw)
 
         check(f"{script} resolves a bare run name", named, resolved(named.name))
-        # A real path of that name still wins, so nothing that worked stops.
         check(f"{script} keeps a path that exists", elsewhere.resolve(),
               resolved(str(elsewhere)))
-        # "alone" means not rewritten into NESTED_SAMPLING_DIR; each resolver
-        # still canonicalises it, and on macOS /tmp is itself a symlink to
-        # /private/tmp, so the expectation has to be resolved too.
         unknown = "/tmp/ri-no-such-run"
         check(f"{script} leaves an unknown path alone", Path(unknown).resolve(),
               resolved(unknown))

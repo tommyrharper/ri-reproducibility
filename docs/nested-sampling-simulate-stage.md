@@ -9,9 +9,7 @@ production concurrency (15.1 ms -> 12.1 ms an evaluation), with a bit-identical
 Measurement Set.** The same page records the median-based phase table that
 picked the target and the two avenues it closes.
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65 W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## Read the phase table on medians, not means
 

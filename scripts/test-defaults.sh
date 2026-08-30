@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Self-check for scripts/lib/defaults.sh, the loader every other script
-# sources. Covers the rules that matter: the Docker platform follows the host,
-# defaults.toml supplies the project values, and the environment always wins
-# over both.
-#
-# Run it directly - `scripts/test-defaults.sh` - or via CI. Needs uv (as
-# defaults.sh itself does) but not Docker.
+# Self-check defaults, platform detection, and environment precedence.
+# Direct or CI use; needs uv, not Docker.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,19 +8,11 @@ cd "${REPO_ROOT}"
 
 failures=0
 
-# Load the defaults in a clean child shell and print one value from it.
-#
-#   load PLATFORM                       -> the shell variable PLATFORM
-#   load env:DOCKER_DEFAULT_PLATFORM    -> the same name from the environment,
-#                                          which only passes if it is exported
-#
-# DOCKER_DEFAULT_PLATFORM is cleared first so the host-derived path runs; any
-# trailing KEY=VALUE arguments are set for that load only.
+# Load defaults in a clean child shell; trailing KEY=VALUE arguments override it.
 load() {
   local var="$1"
   shift
-  # Single-quoted on purpose: the child shell expands these itself, from the
-  # positional arguments passed after the script.
+  # Child shell expands positional arguments itself.
   # shellcheck disable=SC2016
   env -u DOCKER_DEFAULT_PLATFORM "$@" bash -c '
     REPO_ROOT="$1"
@@ -75,9 +62,7 @@ check "the environment overrides defaults.toml" \
 check "the environment overrides the generated seed" \
   "41" "$(load NS_SEED NS_SEED=41)"
 
-# The seed is the one default a rerun must not inherit: two searches sharing
-# it explore the same points in the same order. Compared across two loads
-# rather than against a value, because the point is that there is no value.
+# Reruns must not inherit the generated seed; compare two loads, not a value.
 check "the seed is different on every load" \
   "different" "$([ "$(load NS_SEED)" = "$(load NS_SEED)" ] && echo same || echo different)"
 

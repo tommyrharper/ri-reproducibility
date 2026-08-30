@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the latest comparable merged R2D2 and WSClean likelihoods.
-
-Picks the newest merged R2D2 run and newest merged WSClean run that share
-vla_config, metric, and parameter_space (imager hyperparameters may differ).
-
-  uv run scripts/plot-merged-likelihood-compare.py
-"""
+"""Compare latest comparable merged R2D2 and WSClean likelihoods."""
 
 from __future__ import annotations
 
@@ -65,7 +59,6 @@ def merged_runs() -> list[tuple[Path, dict]]:
 
 
 def latest_comparable_pair() -> tuple[Path, dict, Path, dict]:
-    """Newest R2D2 + WSClean merged dirs that share metric / VLA / prior box."""
     groups: dict[str, dict[str, list[tuple[Path, dict]]]] = defaultdict(
         lambda: {"r2d2": [], "wsclean": []}
     )
@@ -88,11 +81,6 @@ def latest_comparable_pair() -> tuple[Path, dict, Path, dict]:
     return r2d2[0], r2d2[1], wsclean[0], wsclean[1]
 
 
-def searched_params(summary: dict) -> list[str]:
-    names = [spec["name"] for spec in (summary.get("parameter_space") or []) if "name" in spec]
-    return names or list(FALLBACK_PARAMS)
-
-
 def corner(samples, params, color, title):
     axes = samples.plot_2d(params, label=title, color=color, **PLOT_KW)
     fig = axes.iloc[0, 0].figure
@@ -111,7 +99,7 @@ def fig_to_array(fig):
 
 def main() -> None:
     r2d2_dir, r2d2_summary, wsclean_dir, wsclean_summary = latest_comparable_pair()
-    params = searched_params(r2d2_summary)
+    params = [spec["name"] for spec in (r2d2_summary.get("parameter_space") or []) if "name" in spec] or list(FALLBACK_PARAMS)
     print(f"R2D2:    {r2d2_dir.name}")
     print(f"WSClean: {wsclean_dir.name}")
     print(f"metric:  {r2d2_summary.get('metric')}  vla: {r2d2_summary.get('vla_config')}")

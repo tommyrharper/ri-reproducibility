@@ -1,10 +1,6 @@
 # syntax=docker/dockerfile:1
-#
-# MeqTrees/Cattery runtime for VLA Measurement Set simulation.
-#
-# Build:
-#   docker build --platform linux/arm64 -f docker/meqtrees/Dockerfile \
-#     -t ri-reproducibility/meqtrees:kern-10 .
+# MeqTrees/Cattery runtime for VLA Measurement Set simulation. Build with:
+# docker build --platform linux/arm64 -f docker/meqtrees/Dockerfile -t ri-reproducibility/meqtrees:kern-10 .
 
 FROM ubuntu:24.04
 

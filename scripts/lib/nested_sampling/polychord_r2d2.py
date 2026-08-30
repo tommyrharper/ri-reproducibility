@@ -66,12 +66,8 @@ DEFAULT_R2D2_NUM_CHANS = 64
 DEFAULT_R2D2_ARCHITECTURE = "unet"
 DEFAULT_R2D2_CKPT_REALISATIONS = 1
 
-# The checkpoint set, under the container's read-only /checkpoints mount. The
-# name comes from R2D2_CKPT_NAME in defaults.toml, which the run script exports
-# and `ns_refuse_missing_checkpoints` uses to check the host side before a run
-# starts - one name, so the two cannot look in different places. The mount
-# point is fixed rather than a host path so that the ckpt_path recorded in
-# every evaluation means the same thing on every machine.
+# Fixed container path for the checkpoint named by R2D2_CKPT_NAME; the run
+# script and `ns_refuse_missing_checkpoints` use the same name on the host.
 R2D2_CKPT_PATH = f"/checkpoints/{os.environ.get('R2D2_CKPT_NAME', 'R2D2_A1')}"
 
 
@@ -131,14 +127,12 @@ def evaluate(
     eval_id: int,
     objective_from_metrics: Callable[[dict[str, float]], float],
 ) -> dict[str, Any]:
-    # Opens the wall-clock interval write_evaluation_record() closes, which is
-    # what lets the profiler tell PolyChord's time from idle time.
+    # Open interval lets profiler separate PolyChord time from idle time.
     mark_evaluation_start()
     sim_start = time.perf_counter()
     ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
     simulate_seconds = time.perf_counter() - sim_start
-    # A dead worker is the host failing, not the algorithm, so it is never
-    # scored - see WORKER_DIED in common.py.
+    # Dead worker is host failure, not an algorithm score.
     if sim_error is not None and sim_error.returncode == WORKER_DIED:
         raise WorkerDied(f"simulate worker died on evaluation {eval_id} ({eval_dir})")
     if sim_error is not None:
@@ -166,13 +160,7 @@ def evaluate(
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
     mat_path = eval_dir / "r2d2_data.mat"
-    # ms_to_r2d2_mat.py argv for the simulate worker that just wrote this MS (see
-    # convert_ms_to_mat): its own `docker exec` cost ~0.15s, of which only ~0.01s
-    # was the conversion and the rest a fresh interpreter and its imports.
-    #
-    # The noise sigma travels here rather than in the MS's WEIGHT column: it is
-    # one number for the whole MS, and writing it to every row was 31% of the
-    # simulate stage (see fill_point_source_visibilities).
+    # Convert in simulate worker; passing noise sigma once avoids a 31% fill cost.
     convert_cmd = [
         "--ms-path", str(ms_path),
         "--mat-path", str(mat_path),
@@ -322,12 +310,7 @@ def self_check_r2d2_config_thread_cap() -> None:
 
 
 def self_check_worker_death_is_not_scored() -> None:
-    """A dead worker must stop the run, not become the search's best point.
-
-    The two cases have to stay apart: R2D2 exiting non-zero on its parameters
-    is a failure mode and is scored, while a worker the OOM killer took says
-    nothing about the algorithm and must never reach the sampler.
-    """
+    """A dead worker must stop the run, not become its best point."""
     import tempfile
 
     original_convert = globals()["convert_ms_to_mat"]
@@ -494,10 +477,7 @@ def main() -> None:
         args.checkpoints_dir = str(Path(args.repo_root) / "checkpoints")
     args.checkpoints_dir = str(Path(args.checkpoints_dir).resolve())
 
-    # Before `import pypolychord`, so both workers do their startup - Timba plus
-    # a meqserver on the simulate side, `import torch` and the R2D2 modules on
-    # the imaging side - while the sampler is still loading. Joined just below,
-    # right before the first evaluation can ask for one.
+    # Start both workers before `import pypolychord`, then join before evaluation.
     warm = prewarm(
         lambda: simulate_worker(args.meqtrees_image, args.platform),
         lambda: r2d2_worker(args.r2d2_image, args.platform, args.checkpoints_dir),
@@ -560,36 +540,13 @@ def main() -> None:
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
-    # PolyChord's own checkpointing, on so that an interrupted run is not a
-    # wasted one. It was off, which was survivable when a run was 100s of toy
-    # evaluations and is not once a run is hours long: any interruption - the
-    # host running out of memory, a Ctrl-C, a reboot - threw away every
-    # evaluation. Resuming is `--output-dir <the interrupted run>`, which finds
-    # the resume file and continues; a fresh run has none and starts clean.
+    # Checkpoint long runs so interruptions are resumable via `--output-dir`.
     resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
-    # Adopt what an earlier attempt already evaluated, so eval ids carry on
-    # rather than restarting at 1 and colliding with its directories, and so a
-    # repeated point is served from the cache instead of being recomputed.
-    #
-    # Not conditional on the resume file, because the two conditions are not
-    # the same one: PolyChord writes `.resume` at its first checkpoint, so an
-    # attempt killed before that - up to seventy minutes of R2D2 imaging, and
-    # every kill on a short run - leaves evaluations on disk and no resume
-    # file. Adopting only when resuming meant that restart began at eval id 1
-    # on top of the previous attempt's directories, which
-    # simulate_measurement_set creates with `exist_ok=False`: one rank died on
-    # FileExistsError and the rest hung forever in a collective that never
-    # completed. Sampling from scratch is cheap here anyway - PolyChord redraws
-    # the same points from the same seed and the cache answers without imaging.
-    # That holds only for the from-scratch case, and measurably so: a killed
-    # WSClean search and an uninterrupted control from the same seed shared
-    # exactly the 122 evaluations scored before the kill, and none of the 146
-    # scored after a *resume*. A resume re-seeds and then skips ahead to the
-    # checkpoint, so the stream no longer lines up with the points on disk and
-    # the cache answers none of the stretch being redone - which is what
-    # `./ri health`'s `at risk` line puts a number on.
+    # Always adopt disk evaluations: retries can die before PolyChord writes a
+    # resume file, and reusing ids prevents directory collisions. A fresh
+    # retry reuses the cache; a resumed sampler skips ahead, so it may not.
     done = scored = adopt_completed_evaluations(evaluations_dir, cache)
     if done:
         where = (f"resuming from {resume_path}" if settings.read_resume

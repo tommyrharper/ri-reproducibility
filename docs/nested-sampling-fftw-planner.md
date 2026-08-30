@@ -9,9 +9,7 @@ every forked child inherits it: -6.9% on the `wsclean` binary over 960
 interleaved tmpfs replay pairs against a -0.2% null, with 400 output FITS data
 blocks byte-identical.**
 
-Host: the same 20-thread i5-13500 as every other measurement in `docs/`, at the
-65 W package limit [the power-limit doc](nested-sampling-power-limit.md)
-describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## Where it was hiding
 

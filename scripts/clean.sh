@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Remove the images this repo builds and the generated smoke-test output.
-# Image tags come from defaults.toml, not from a second copy here.
-#
-# data/, checkpoints/, results/ and reports/ contents you added yourself are
-# left alone. `docker builder prune` reclaims the build cache separately.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,8 +7,6 @@ cd "${REPO_ROOT}"
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
-# The :native WSClean tag is not in defaults.toml - it is what an opt-in
-# host-optimized build produces, so remove it here if it exists.
 docker rmi "${WSCLEAN_IMAGE}" "${WSCLEAN_IMAGE%:*}:native" "${R2D2_IMAGE}" \
   "${MEQTREES_IMAGE}" "${POLYCHORD_IMAGE}" 2>/dev/null || true
 

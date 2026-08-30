@@ -6,17 +6,10 @@ Measurement Set through casacore. Caching those names inside the process is
 worth +10.5% evaluations per second end to end, -13.1% on the `wsclean` binary,
 with bit-identical images.**
 
-This is the other half of
-[the Measurement Set open](nested-sampling-ms-open.md). That page closed the
-avenue from the simulator's side: every subtable that could be deleted has
-been, the ones that stay are load-bearing, their columns cannot be stripped,
-and what is left is a ~1.9 ms floor per open paid ~16 times an evaluation. What
-it did not do was ask why WSClean opens the Measurement Set 16 times in the
-first place. It does not need to.
+This is the WSClean-side half of [the Measurement Set open](nested-sampling-ms-open.md);
+the simulator-side avenue is closed there.
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## How a patch is carried
 
@@ -199,10 +192,6 @@ bit-identical images. The counting method, the per-open costs, the two
 load-bearing details of the cache and the measurements are in
 [the shared-open doc](nested-sampling-shared-ms-open.md).
 
-Upstream-shaped: it changes nothing WSClean computes, and it is the same shape
-as 0001 one level up - cache what does not change for the life of a process
-instead of re-deriving it.
-
 ## 0004: cache the FFTW transform plans
 
 `CachedPlan1D()` and `CachedPlan2D()` in
@@ -218,9 +207,7 @@ cache is leaked, and the measurements are in
 
 The first patch here that touches the `schaapcommon` submodule rather than
 WSClean itself, so its paths are `external/schaapcommon/...` and it is the one
-most likely to need regenerating against a `WSCLEAN_GIT_TAG` bump. Otherwise
-the same shape as 0001 and 0003: cache what does not change for the life of a
-process.
+most likely to need regenerating against a `WSCLEAN_GIT_TAG` bump.
 
 ## 0005: read the Measurement Set in row blocks
 

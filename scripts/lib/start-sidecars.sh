@@ -1,54 +1,14 @@
 # shellcheck shell=bash  # sourced, so no shebang
-# Start the long-lived containers a run `docker exec`s into, and export
-# NS_SIDECARS.
-#
-# Separate `docker exec` processes are already isolated, so one container per
-# image serves the whole run. Letting each rank start its own meant 16
-# concurrent `docker run`s on the default 8 ranks - 1.3s against 0.36s for a
-# single one, all of it in front of the first evaluation.
-#
-# `--network none`: no sidecar needs networking, and the default bridge setup
-# costs ~0.2s per container under rootless Docker, while "none" still gives the
-# loopback meqserver and MPI want. `--shm-size 512m`: the simulate builds its
-# working MS and cached makems skeletons in /dev/shm, and docker's 64MB default
-# is only ~3x the largest cache this parameter space fills.
-#
-# Source this, then either
-#
-#   start_sidecars <platform> <image>...              # start these, then wait
-#
-# or, when a container needs extra `docker run` arguments or the caller has
-# work to overlap with the startup,
-#
-#   sidecar_launch <platform> <image> [docker args...] [-- command...]
-#   ...other setup...
-#   sidecar_wait                                         # before the first exec
-#
-# Everything after `--` replaces the container's default `sleep infinity`, which
-# is how the meqtrees sidecar starts its simulate workers ~0.1s before a
-# `docker exec` could be issued. `sidecar_launch` returns immediately and leaves
-# the name in SIDECAR_NAME. Requires REPO_ROOT. Every container is removed by an
-# EXIT trap.
-#
-# No warm-up hook here on purpose: a fresh container's first Python process used
-# to cost ~0.8s more than the next, paid for with a throwaway `docker exec`, and
-# that was the interpreter byte-compiling modules shipped without a valid .pyc.
-# The images compile them at build time instead.
+# Start sidecars for `docker exec`; export NS_SIDECARS. Requires REPO_ROOT.
+# API: start_sidecars, sidecar_launch, sidecar_wait; `--` replaces sleep.
 SIDECAR_NAMES=()
 _SIDECAR_PIDS=()
 _SIDECAR_COMMANDS=()
 _SIDECAR_JSON=""
 
-# One host tmpfs directory, bind-mounted into every container below at its own
-# path, for the Measurement Set each evaluation builds and deletes again. Each
-# container's own /dev/shm is private to it, so the simulator had to copy the
-# finished MS onto the (disk-backed) bind mount purely so the wsclean sidecar
-# could open it; here it is written, imaged and deleted without ever leaving
-# RAM. Only the evaluations in flight are ever present - each is deleted as its
-# metrics.json is written (evaluation_scratch_dir() in
-# scripts/lib/nested_sampling/common.py) - so this holds ~1.5MB per rank, not
-# per evaluation. Left unset where there is no host /dev/shm to put it in
-# (Docker Desktop's VM), and every reader then falls back to the old behaviour.
+# Bind each container to one host /dev/shm directory for its in-flight
+# Measurement Set. It avoids copying between private container tmpfses and is
+# disabled when host /dev/shm is unavailable; readers then use the old path.
 if [ -z "${NS_SCRATCH_DIR:-}" ] && [ -w /dev/shm ]; then
   NS_SCRATCH_DIR="/dev/shm/ri-ns-scratch-$$"
   mkdir -p "${NS_SCRATCH_DIR}"
@@ -63,13 +23,8 @@ _sidecar_remove() {
     docker rm --force "${SIDECAR_NAMES[@]}" >/dev/null 2>&1 &
   fi
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
-    # A run that restarted after a kill leaves the killed attempt's in-flight
-    # evaluation directories here, and the containers created them as root, so
-    # this removes what it can and leaks the rest
-    # (docs/nested-sampling-io-placement.md has the root-container cleanup).
-    # `|| true` because this is the last command of an EXIT trap: a failed
-    # `rm` became the exit status of a search that had already written its
-    # summary.json, which is what `./ri self-check self-heal` caught.
+    # Containers may leave root-owned evaluation directories. Best-effort
+    # cleanup must not replace a successful search's exit status.
     rm -rf "${NS_SCRATCH_DIR}" 2>/dev/null || true
   fi
 }
@@ -153,21 +108,7 @@ sidecar_launch() {
   trap '_sidecar_remove; exit 143' TERM
 }
 
-# Start any of this run's containers that has gone away again, under the same
-# name and the same `docker run` arguments, and wait for them.
-#
-# The containers are started once, before `run_with_retries`, so a container
-# that dies - the OOM killer taking its whole cgroup, a stray `docker rm`, a
-# daemon restart - is the one failure the retry loop could not heal: every
-# attempt after it `docker exec`s into a name that no longer exists, scores no
-# evaluation, and the run stops on "the attempt scored no evaluations, so
-# another one fails the same way". Re-launching is safe precisely because the
-# containers hold no run state: the workers inside them are started on demand
-# by the ranks over FIFOs on the bind mount, and a restart's ranks start their
-# own anyway (see run_with_retries in progress-bar.sh).
-#
-# Only containers that are actually gone are touched, so a normal restart -
-# by far the common case - costs one `docker inspect` each and changes nothing.
+# Restore gone containers before retry; workers recreate over bind-mounted FIFOs.
 sidecar_restore() {
   local i restarted=0
   for i in "${!SIDECAR_NAMES[@]}"; do
@@ -204,10 +145,8 @@ start_sidecars() {
   sidecar_wait
 }
 
-# `bash scripts/lib/start-sidecars.sh --self-check` - guards the two things a
-# caller depends on: per-container `docker run` arguments must reach that
-# container's command line and no other's, and NS_SIDECARS must map every image
-# to its container. Stubs `docker` so nothing is actually started.
+# `bash scripts/lib/start-sidecars.sh --self-check` - checks isolated container
+# arguments and NS_SIDECARS mapping with a stub `docker`.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   REPO_ROOT="${REPO_ROOT:-$(pwd)}"
@@ -227,32 +166,24 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     echo "FAIL: img:a's -v flag leaked into img:b"; exit 1
   }
   grep -q -- "--entrypoint sh img:c -c echo hi sh /some/dir" "${_log}"
-  # Every container gets the MS scratch tmpfs at its own path, or the simulate
-  # writes an MS the imager's container cannot open.
+  # Every container gets the MS scratch tmpfs or the imager cannot open it.
   if [ -n "${NS_SCRATCH_DIR}" ]; then
     [ "$(grep -c -- "-v ${NS_SCRATCH_DIR}:${NS_SCRATCH_DIR}" "${_log}")" = 3 ] \
       || { echo "FAIL: the scratch mount did not reach all three containers"; exit 1; }
-    # And its path in the environment, which is how the simulator knows the
-    # destination is a tmpfs it can assemble in - see scratch_root_for().
+    # The simulator reads its destination from this environment variable.
     [ "$(grep -c -- "-e NS_SCRATCH_DIR=${NS_SCRATCH_DIR}" "${_log}")" = 3 ] \
       || { echo "FAIL: NS_SCRATCH_DIR did not reach all three containers"; exit 1; }
   fi
   [ "${NS_SIDECARS}" = '{"img:a":"ri-ns-sidecar-'"$$"'-0","img:b":"ri-ns-sidecar-'"$$"'-1","img:c":"ri-ns-sidecar-'"$$"'-2"}' ]
-  # No OUTPUT_DIR above, so no label - the pid rule in rank-budget.sh is still
-  # the whole story for a caller that has no run directory.
+  # Without OUTPUT_DIR, the pid rule in rank-budget.sh applies.
   grep -q -- 'ri.run-dir' "${_log}" && { echo "FAIL: labelled with no OUTPUT_DIR"; exit 1; }
-  # With one, every container carries it: that label is what stops the reaper
-  # in rank-budget.sh from removing the containers of a run whose launcher
-  # shell was killed but whose ranks are still going.
+  # With one, the label stops rank-budget.sh reaping a live run's containers.
   : >"${_log}"
   OUTPUT_DIR=/some/run sidecar_launch linux/amd64 img:d
   sidecar_wait
   grep -q -- '--label ri.run-dir=/some/run' "${_log}"
 
-  # sidecar_restore starts the containers that are gone again - under the same
-  # name, because the run command already holds it - and leaves the running
-  # ones alone. Without it, a retry after a container died `docker exec`s into
-  # a name that no longer exists, scores nothing, and the run stops.
+  # Restore keeps retries from execing into a dead container; live ones stay.
   SIDECAR_NAMES=()
   _SIDECAR_PIDS=()
   _SIDECAR_COMMANDS=()

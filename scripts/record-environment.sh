@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
-# Write a machine-readable JSON manifest capturing everything needed to
-# reproduce a single experiment run, per README.md "Reproducibility
-# metadata". Intended to wrap an actual run, e.g.:
+# Write a JSON manifest for one experiment run. Everything after `--` is
+# recorded verbatim, not executed.
 #
-#   scripts/record-environment.sh \
-#     --tool wsclean \
-#     --image ri-reproducibility/wsclean:v3.7 \
-#     --config config/wsclean/example.cfg \
-#     -- docker run --rm ri-reproducibility/wsclean:v3.7 -name /results/x ...
-#
-# Everything after `--` is the exact command that was (or will be) run;
-# it is recorded verbatim, not re-interpreted. This script does not
-# execute it - call it, then run the command yourself, or wrap it.
+#   scripts/record-environment.sh --tool wsclean --image image:tag [--config path] -- command...
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,11 +31,8 @@ fi
 
 MANIFEST_PATH="${MANIFEST_DIR}/${TOOL}-$(date -u +%Y%m%dT%H%M%SZ).json"
 
-# NB: `cmd 2>/dev/null || fallback` is not safe here - some of these
-# commands (e.g. `git rev-parse HEAD` in a repo with no commits yet)
-# print partial/wrong output to stdout AND fail, so `||` leaks that
-# partial output into the command substitution alongside the fallback.
-# Check exit status explicitly instead.
+# Check status explicitly: failed commands can print partial output before
+# `|| fallback`, which would leak it into the command substitution.
 REPO_GIT_REV="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)" \
   || REPO_GIT_REV="unknown (no commits yet?)"
 REPO_GIT_DIRTY="$(git -C "${REPO_ROOT}" diff --quiet 2>/dev/null && echo false || echo true)"

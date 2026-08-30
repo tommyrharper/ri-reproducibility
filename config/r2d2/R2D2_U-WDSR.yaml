@@ -1,7 +1,5 @@
-# Adapted from R2D2-RI's config/imaging/R2D2_U-WDSR.yaml (pinned commit
-# 22669259f770a0cb3a3191a5d3e8dbad4ae5a70c) for this repo's container
-# paths. See R2D2_U-Net.yaml for field-by-field notes; only the
-# architecture-specific fields differ (num_chans, ckpt_path).
+# Adapted from R2D2-RI's config/imaging/R2D2_U-WDSR.yaml at
+# 22669259f770a0cb3a3191a5d3e8dbad4ae5a70c; container paths differ.
 
 # i/o
 gdth_file: /data/3c353_gdth.fits

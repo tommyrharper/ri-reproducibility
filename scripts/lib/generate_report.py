@@ -1,12 +1,4 @@
-"""
-Builds an HTML report from the nested-sampling runs under
-results/nested-sampling/*/summary.json - one page per run, an index, and
-an images/ directory of the PNGs those pages reference.
-
-Run via scripts/generate-report.sh, which wraps this in the r2d2 image so it
-can reuse the imager's own astropy + matplotlib + anesthetic rather than
-requiring a host Python environment - same approach as scripts/plot-fits.sh.
-"""
+"""Build HTML and PNG reports from nested-sampling runs."""
 import argparse
 import gc
 import glob
@@ -39,33 +31,13 @@ LOG_Z_RE = re.compile(
 )
 RUN_ID_TS_RE = re.compile(r"(\d{8}T\d{6}Z)$")
 
-# Every generated page records the version of the code that produced it, so a
-# later run can tell "already rendered" from "rendered by an older report".
-# The version is the hash of this file: editing the rendering or the CSS bumps
-# it by itself, which is one less thing to remember than a hand-kept number.
+# Hash source so pages detect rendering or CSS changes without a manual version.
 REPORT_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 REPORT_VERSION_RE = re.compile(r'<meta name="report-version" content="([0-9a-f]+)">')
 
 
-def page_report_version(path):
-    """Version stamped into an already-written page, or None if absent/unreadable."""
-    try:
-        with open(path) as f:
-            head = f.read(2048)
-    except OSError:
-        return None
-    m = REPORT_VERSION_RE.search(head)
-    return m.group(1) if m else None
-
-
-# The drawing stack is ~0.5s of import and is only touched when a PNG has to be
-# drawn, so it loads on demand and a run that reuses the whole image store - the
-# page-only rebuild after a REPORT_VERSION bump, and the all-current no-op -
-# never pays for it. It splits in two because the two kinds of PNG need
-# different halves: the corner plot needs only matplotlib (anesthetic pulls it
-# in regardless), the eval rasters need astropy + PIL on top. Keeping them apart
-# keeps astropy off the corner plot's critical path, which is the longest task
-# in a cold build.
+# Load plotting libraries only when rendering uncached PNGs; keep astropy and
+# PIL off the corner-plot path.
 def load_plot_libs():
     global plt
     if "plt" in globals():
@@ -75,16 +47,7 @@ def load_plot_libs():
     import matplotlib
 
     matplotlib.use("Agg")
-    # matplotlib.projections imports mpl_toolkits.mplot3d solely to register the
-    # '3d' projection, and already wraps that import in a try/except that
-    # degrades to "3d unavailable" when it fails. Nothing here draws in 3d - a
-    # corner plot is a grid of 2d axes - so short-circuit it: a None in
-    # sys.modules makes the import raise ImportError, which is exactly the case
-    # matplotlib handles, and skips 17ms (6.7%) of the 258ms `import
-    # matplotlib.pyplot` that sits on the build's serial prologue. The poison is
-    # removed again immediately, so a later `import mpl_toolkits.mplot3d` still
-    # works; only the registry entry stays gone, which turns an accidental
-    # projection='3d' into a loud ValueError rather than a silent wrong plot.
+    # Corner plots are 2D; skip optional 3D registration during import.
     poisoned = "mpl_toolkits.mplot3d" not in sys.modules
     if poisoned:
         sys.modules["mpl_toolkits.mplot3d"] = None
@@ -95,18 +58,6 @@ def load_plot_libs():
     finally:
         if poisoned:
             sys.modules.pop("mpl_toolkits.mplot3d", None)
-
-
-def load_chain_libs():
-    """anesthetic, which every corner-plot worker needs. Imported in the parent
-    so the forked pool inherits it once instead of each worker repeating the
-    same 0.34s - with more runs to draw than cores, that repetition is what the
-    build spends its extra CPU on. A missing anesthetic is not fatal - the
-    corner plot degrades to "unavailable" - so leave that to the worker."""
-    try:
-        import anesthetic  # noqa: F401
-    except ImportError:
-        pass
 
 
 def load_render_libs():
@@ -134,26 +85,14 @@ def _image_norm_for_display(data):
     return ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
 
 
-# Images live in files next to the pages rather than inlined as base64 data
-# URIs. Rendering them is where nearly all of the report's time goes, and their
-# inputs (a run's FITS files and chains) never change once a run has finished -
-# so a page rebuilt for a report-code change reuses the PNGs it rendered last
-# time instead of redrawing every one. Files are content-addressed and never
-# deleted; `rm -rf reports/nested-sampling-report` is the way to reclaim space.
+# Keep rendered images beside pages: content-addressed inputs let rebuilt pages
+# reuse them. They are never deleted; remove `reports/nested-sampling-report`
+# to reclaim space.
 IMAGE_SUBDIR = "images"
 image_dir = None  # set by main(); the self-checks point it at a temp dir
 
 
 def tight_bbox(fig):
-    """The box `savefig(bbox_inches="tight")` would measure, without its extra pass.
-
-    savefig can't trust the artist positions it is handed - a layout engine may
-    still be pending - so before measuring a "tight" box it walks the whole
-    figure once in a draw-disabled pass. After `fig.tight_layout()` that is
-    wasted work: the layout has run and all it left behind is a do-nothing
-    placeholder engine. Clear the engine and hand savefig the measured box, and
-    the pass goes away for a byte-identical PNG (~20% of the corner plot's save).
-    """
     fig.set_layout_engine(None)
     pad = plt.rcParams["savefig.pad_inches"]
     return fig.get_tightbbox().padded(pad, pad)
@@ -175,7 +114,6 @@ IMAGE_RENDER_VERSION = "2"
 
 
 def cached_png(key, render):
-    """URL of the PNG for `key`, calling `render() -> bytes | None` only if absent."""
     name = hashlib.sha1(f"{IMAGE_RENDER_VERSION}|{key}".encode()).hexdigest()[:16] + ".png"
     path = os.path.join(image_dir, name)
     if not os.path.exists(path):
@@ -193,7 +131,6 @@ def cached_png(key, render):
 
 
 def file_stamp(path):
-    """Identity of a file's contents for cache keys, without reading it."""
     try:
         st = os.stat(path)
     except OSError:
@@ -201,14 +138,9 @@ def file_stamp(path):
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
-# The eval rasters are the bulk of the report. Drawing one through a matplotlib
-# Figure cost ~25ms - half of it tight_layout's trial draw - and upsampled the
-# 128x128 data into a ~336px antialiased raster, 224 KiB of PNG the browser then
-# scaled back down anyway. Normalising and colour-mapping straight into a PIL
-# image at the data's own resolution is ~16x faster for ~5x fewer bytes, and the
-# browser's own smoothing makes it indistinguishable at display size. figsize/dpi
-# are kept as the caller's pixel budget: an image larger than that is scaled down
-# to it, but nothing is ever scaled up.
+# PIL rendering is ~16x faster and produces ~5x smaller eval rasters than the
+# old matplotlib path; the browser provides equivalent smoothing. Keep
+# figsize/dpi as a maximum pixel budget, never upscaling smaller images.
 def render_array_png(data, figsize=(4, 4), dpi=130):
     load_render_libs()
     data = np.squeeze(np.asarray(data, dtype=float))
@@ -240,7 +172,6 @@ def render_fits_image(path, figsize=(4, 4), dpi=130):
 
 
 def synthesize_truth_array(image_path, source_flux_jy):
-    """Mirror common.compute_image_metrics truth construction."""
     load_render_libs()
     data, header = fits.getdata(image_path, header=True)
     image = np.squeeze(np.asarray(data, dtype=np.float64))
@@ -256,33 +187,25 @@ def synthesize_truth_array(image_path, source_flux_jy):
     return truth
 
 
-def format_wall_duration(seconds):
-    """Run wall-clock seconds for the card header (e.g. 4m 12s), or None when unknown."""
-    return None if seconds is None else format_duration(seconds)
-
-
-def format_run_id_timestamp(run_name):
-    """Human-readable UTC label when run_name ends with %Y%m%dT%H%M%SZ (see run-nested-sampling-*.sh)."""
+def run_id_timestamp(run_name):
     match = RUN_ID_TS_RE.search(run_name)
     if not match:
         return None
     try:
-        dt = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        return datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
-    return dt.strftime("%d %b %Y, %H:%M:%S UTC")
+
+
+def format_run_id_timestamp(run_name):
+    dt = run_id_timestamp(run_name)
+    return dt.strftime("%d %b %Y, %H:%M:%S UTC") if dt else None
 
 
 def nested_sampling_run_sort_key(summary_path):
-    """Sort key for newest-first nested-sampling cards (run-id UTC, else mtime)."""
     run_name = os.path.basename(os.path.dirname(summary_path))
-    match = RUN_ID_TS_RE.search(run_name)
-    if match:
-        try:
-            dt = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-            return (0, -dt.timestamp(), run_name)
-        except ValueError:
-            pass
+    if dt := run_id_timestamp(run_name):
+        return (0, -dt.timestamp(), run_name)
     try:
         mtime = os.path.getmtime(summary_path)
     except OSError:
@@ -314,7 +237,6 @@ def parse_log_evidence_from_text(text):
 
 
 def parse_log_evidence(stats_path):
-    """Return (log_z, log_z_err) from a PolyChord *.stats file, or None."""
     try:
         text = Path(stats_path).read_text(errors="replace")
     except OSError:
@@ -323,7 +245,6 @@ def parse_log_evidence(stats_path):
 
 
 def find_chain_stats(run_dir):
-    """Return (stats_path, chain_root_without_extension) or (None, None)."""
     stats_files = sorted(glob.glob(os.path.join(run_dir, "chains", "*.stats")))
     if len(stats_files) != 1:
         return None, None
@@ -351,7 +272,6 @@ def resolve_run_path(run_dir, path):
 
 
 def resolve_eval_path(run_dirs, path):
-    """resolve_run_path against each candidate run dir (own dir, then merge sources)."""
     for run_dir in run_dirs:
         resolved = resolve_run_path(run_dir, path)
         if resolved:
@@ -360,7 +280,6 @@ def resolve_eval_path(run_dirs, path):
 
 
 def merged_source_run_dirs(summary):
-    """Container-mounted directories of a merged run's source runs (see merged_from)."""
     dirs = []
     for entry in summary.get("merged_from") or []:
         name = entry.get("name") if isinstance(entry, dict) else str(entry)
@@ -374,8 +293,6 @@ def merged_source_run_dirs(summary):
 
 
 def render_likelihood_plot(run_dir, param_names):
-    """URL of the run's corner plot. The anesthetic KDE is the single most
-    expensive thing the report draws, so it goes through the image store too."""
     chains = sorted(glob.glob(os.path.join(run_dir, "chains", "*")))
     key = "likelihood|{}|{}|{}".format(
         run_dir,
@@ -402,15 +319,9 @@ def likelihood_section(uri):
         """
 
 
-# anesthetic draws the corner plot as 15 separate pandas plot calls into one
-# 20-axes grid, and after every one of them pandas re-runs its shared-axis tick
-# housekeeping over *every* axis in the figure - 44% of plot_2d, for work that
-# is idempotent after the first pass. Do it once per axis instead. The repeats
-# are not entirely free, though: reading an axis' tick labels un-stales the
-# shared view limits, and that side effect is load-bearing - without it each
-# diagonal panel's CDF twin drifts off its parent's x range (~5%) and the plot
-# changes. Touching viewLim keeps exactly that and drops the rest.
-# Best-effort: if pandas moves the private helper, the plot is just slower.
+# anesthetic's 15 pandas plots repeatedly scan the 20-axis grid for shared-axis
+# housekeeping. Dedupe the scan while retaining the viewLim touch that keeps
+# diagonal CDF twins aligned.
 _tick_housekeeping_deduped = False
 # Axes the in-progress handle_shared_axes scan has selected, innermost last.
 _shared_axes_recording = []
@@ -497,7 +408,6 @@ def dedupe_pandas_tick_housekeeping():
 # Reading get_view_interval() to build the key keeps _update_ticks' own viewLim
 # un-staling side effect, which the shared diagonal/CDF axes depend on (see
 # dedupe_pandas_tick_housekeeping above).
-# Best-effort: if matplotlib renames the private method, the plot is just slower.
 _tick_updates_memoized = False
 
 
@@ -533,16 +443,8 @@ def memoize_matplotlib_tick_updates():
     return True
 
 
-# Laying a Text out - splitting it into lines, measuring each against the font,
-# rotating the box - is a pure function of the string and its font/alignment
-# properties, and matplotlib re-does it from scratch on every call. One corner
-# plot asks for it 441 times for 70 distinct texts, because the three passes
-# over the figure (tight_layout, the tight-bbox measurement, the render) each
-# re-measure every tick label and axis title. The result is position-free -
-# get_window_extent translates it afterwards - so one global cache serves every
-# Text with the same properties. Texts with wrapping on are left alone: their
-# layout also depends on the figure width, which is not in the key.
-# Best-effort: if matplotlib renames the private method, the plot is just slower.
+# Text layout is position-free and repeated across plot passes, so cache it by
+# text and font properties. Wrapped text depends on figure width and bypasses it.
 _text_layout_memoized = False
 
 
@@ -601,7 +503,6 @@ def memoize_matplotlib_text_layout():
 # which misses the cache. The entry holds the Index alive so its id() cannot be
 # recycled under the key. fill=False is deliberately not cached: that is the
 # variant set_label() mutates in place.
-# Best-effort: if anesthetic moves the private class, the plot is just slower.
 _labels_map_memoized = False
 
 
@@ -643,15 +544,8 @@ def memoize_anesthetic_labels_map():
 # plot makes ~380 copies of the same handful of frames. The result is a pure
 # function of the frame's data and of which (axis, level) pairs actually get
 # dropped, so cache it on exactly that.
-# The key pins the frame's identity *and* both of its pandas Index objects: an
-# Index is immutable, so anything that adds, drops or relabels a column swaps in
-# a new one and misses the cache. That is the guard iteration 13 found was
-# missing from a plain id(self) cache, which went stale the moment anesthetic
-# added its weight columns. Rewriting an existing column's values in place would
-# still slip past it, but nothing on the plotting path does that - the frame is
-# read-only from load to savefig. The entry holds the frame and its indexes
-# alive so their id()s cannot be recycled underneath the key.
-# Best-effort: if anesthetic moves the private class, the plot is just slower.
+# Pin frame and index identities: immutable indexes change when structure
+# changes, and retaining them prevents id() reuse while the cache is live.
 _drop_labels_memoized = False
 
 
@@ -696,31 +590,12 @@ def memoize_anesthetic_drop_labels():
     return True
 
 
-# Even with both halves cached, `df[key]` on a labelled frame still *runs* all
-# four label-stripped lookups and throws three of them away: anesthetic's `ac`
-# evaluates every candidate, sorts them by dimensionality (fewest first, then
-# most index levels, ties going to the earliest candidate) and returns the
-# first. For the case the corner plot hits ~65 times per plot - a plain string
-# column name on a frame whose *columns* carry the labels level - the winner is
-# decided in advance, so run only that one.
-#
-# The winner is candidate `1` (drop the labels off the columns) because, with
-# labelled columns, `df["x"]` on the two candidates that keep them (`0` and
-# `None`) indexes a >=2-level MultiIndex and so yields a 2-D frame, which loses
-# to any 1-D result outright; and of the two that strip them (`1` and `[0, 1]`)
-# candidate `1` leaves the *index* untouched, so it never has fewer index
-# levels than candidate `[0, 1]` and it comes first on a tie. A DataFrame lookup
-# cannot return a 0-D result, so nothing can undercut a 1-D one. Any candidate
-# that raises is dropped by `ac` and cannot win either.
-#
-# Each guard is a premise of that argument rather than a safety net: a string
-# key is what forces candidates `0` and `None` to be 2-D, labelled columns are
-# what make the labels a level to strip in the first place, and a Series is a
-# two-candidate search over scalar results - a different comparison entirely.
-# Anything outside the guards, any candidate that raises, and any result that
-# turns out not to be 1-D all fall back to anesthetic's own search, so a shape
-# the argument does not cover is slow rather than wrong.
-# Best-effort: if anesthetic moves the private class, the plot is just slower.
+# For the common corner-plot lookup (string key, labelled DataFrame columns),
+# anesthetic always selects candidate `1`: dropping column labels yields the
+# only possible 1-D result, and ties favour it over dropping index labels too.
+# Run that candidate directly; all other shapes and failures use anesthetic's
+# original search, keeping the shortcut slow rather than wrong when assumptions
+# change.
 _labelled_column_shortcut = False
 
 
@@ -769,7 +644,6 @@ def shortcut_anesthetic_labelled_column():
 # rebuilt axis misses and the map is built again. Only the ordinary 2D case is
 # cached; a projection with a different _axis_names falls through to the
 # original property.
-# Best-effort: if matplotlib drops the property, the plot is just slower.
 _axis_map_cached = False
 
 
@@ -808,7 +682,6 @@ def cache_matplotlib_axis_map():
 # answer for the life of the process: memoise it per class. One corner plot
 # makes ~3400 of these calls. Callers that pass a plain dict (or None) keep the
 # original path.
-# Best-effort: if matplotlib changes the helper's shape, the plot is slower.
 _alias_maps_memoized = False
 
 
@@ -877,7 +750,6 @@ def memoize_matplotlib_alias_maps():
 # an autoscale that re-stales the group on its way out is not recorded as
 # settled. Nothing else in matplotlib or mpl_toolkits writes _stale_viewlims to
 # True, so the counter sees every transition.
-# Best-effort: if matplotlib renames either private method, the plot is slower.
 _viewlim_scan_skipped = False
 
 
@@ -922,7 +794,6 @@ def skip_settled_matplotlib_viewlims():
 # is ever shared between them. The class bodies close over nothing but their
 # base, so one class per (helper, base type) is enough: let the first panel
 # build it as usual and rebind the rest onto the same class.
-# Best-effort: if anesthetic moves the helpers, the plot is just slower.
 _axes_subclasses_shared = False
 
 
@@ -1005,8 +876,7 @@ def objective_fill(objective, obj_min, obj_max):
     return 1.0
 
 
-# Categorical slot per top-level stage, assigned by identity and never by size,
-# so a stage keeps its colour whether or not the other stages are present.
+# Stable categorical colour per stage.
 PROFILING_STAGE_COLOURS = {
     "simulate": "var(--series-1)",
     "convert": "var(--series-2)",
@@ -1014,31 +884,16 @@ PROFILING_STAGE_COLOURS = {
     "metrics": "var(--series-4)",
     "polychord": "var(--series-5)",
     "unaccounted": "var(--series-5)",
-    # Grey, and deliberately not a sixth categorical hue: these two are the run
-    # not imaging. The eye should read the coloured slices as the science and
-    # the grey as everything spent getting between them.
     "harness": "color-mix(in srgb, CanvasText 45%, transparent)",
     "idle": "color-mix(in srgb, CanvasText 18%, transparent)",
 }
 
 
-# Enough lanes to read as "the workers ran side by side" without turning a
-# 64-rank run into a wall of identical stripes.
 PROFILING_LANE_CAP = 8
 
 
 def render_profiling_lanes(segments, mpi_procs, wall_seconds):
-    """Stacked worker lanes plus legend: how the stage times fit inside the wall clock.
-
-    Each lane is one worker's averaged timeline, so the stages along a single
-    lane add up to the end-to-end wall clock shown on the run header, while the
-    lanes stacked on top of each other add up to the worker-time budget. That
-    is the parallelisation made visible: the table's worker-seconds only reach
-    the wall clock once they are spread across the lanes they ran on.
-
-    Segments are flex-grown in proportion to their share, so the 2px gaps
-    between them come out of the available width rather than overflowing it.
-    """
+    """Render worker timelines, stacked to show parallel worker-time."""
     if not segments:
         return ""
     bars, legend = [], []
@@ -1091,8 +946,7 @@ def render_profiling_lanes(segments, mpi_procs, wall_seconds):
 
 
 def render_profiling(summary):
-    """Collapsed per-stage timing breakdown, sharing its numbers with
-    scripts/profile-nested-sampling-run.py via common.profiling_breakdown."""
+    """Collapsed timing breakdown shared with the profiler."""
     profiling = summary.get("profiling")
     if not profiling:
         return ""
@@ -1148,12 +1002,10 @@ def render_profiling(summary):
         breakdown["subtotal_per_eval_seconds"],
         emphasis=True,
     )
-    # Below the sum: the time no evaluation was running in. PolyChord is
-    # measured, idle is what is left over once it has been taken out.
+    # Remainders are time outside evaluation; idle is measured time minus them.
     for remainder in breakdown["remainder_rows"]:
         body += row(remainder["label"], remainder["seconds"], remainder["share"])
-    # The row the whole table exists to land on: divided across the workers, the
-    # rows above come to the end-to-end wall clock on the run header.
+    # Total worker-time divided by workers gives the run's wall clock.
     wall_seconds = (budget / workers) if budget else 0.0
     body += row(
         breakdown["total_label"],
@@ -1175,9 +1027,7 @@ def render_profiling(summary):
         f"worker-time {format_duration(budget)} ({workers} × wall clock)",
         f"{evals} evaluations",
     ])
-    # Spelled out left to right so the arithmetic behind the run header's wall
-    # clock is readable without doing any of it yourself; the term it lands on
-    # is the one the header shows, so that term carries the emphasis.
+    # Keep equation order aligned with the wall-clock header.
     terms = list(breakdown["equation_terms"])
     if mpi_procs != 1:
         terms.append(f"= {format_duration(budget)} of worker-time")
@@ -1208,21 +1058,7 @@ def render_profiling(summary):
     """
 
 
-def format_searched_params(params, parameter_space):
-    parts = []
-    for spec in parameter_space:
-        name = spec.get("name")
-        if not name:
-            continue
-        value = (params or {}).get(name)
-        if value is None:
-            continue
-        parts.append(f"{html.escape(name)}={fmt_value(value)}")
-    return " · ".join(parts)
-
-
 def format_param_range(spec):
-    """"min-max" for a `parameter_space` entry, or "" if it has no range (fixed)."""
     lo, hi = spec.get("min"), spec.get("max")
     if lo is None or hi is None:
         return ""
@@ -1230,9 +1066,6 @@ def format_param_range(spec):
 
 
 def render_param_space_badges(parameter_space):
-    """One small pill per searched parameter's range, for the index card - the
-    same "row of tabs" treatment as the algorithm/nlive/evals badges above it,
-    so the parameter space is visible without opening the run page."""
     badges = []
     for spec in parameter_space:
         name = spec.get("name")
@@ -1250,9 +1083,6 @@ def render_param_space_badges(parameter_space):
 
 
 def render_parameter_space_section(parameter_space):
-    """The searched parameters and the range each was drawn from, for the report
-    page - the per-run record of what was actually varied, distinct from any
-    fixed hyperparameters shown elsewhere."""
     if not parameter_space:
         return ""
     rows = []
@@ -1323,7 +1153,11 @@ def render_eval_card(ev, parameter_space, run_dirs, metric, is_best):
     image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
     metric_label = html.escape(metric or "objective")
     best_class = " is-best" if is_best else ""
-    params_caption = format_searched_params(params, parameter_space)
+    params_caption = " · ".join(
+        f"{html.escape(name)}={fmt_value(value)}"
+        for spec in parameter_space
+        if (name := spec.get("name")) and (value := params.get(name)) is not None
+    )
     recon_html = render_eval_recon(image_path, eval_id)
     return f"""
     <article class="eval-card{best_class}">
@@ -1447,10 +1281,8 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
             if key not in param_names:
                 param_names.append(key)
 
-    duration_html = ""
-    duration_label = format_wall_duration(summary.get("total_wall_seconds"))
-    if duration_label:
-        duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>'
+    duration_label = format_duration(summary["total_wall_seconds"]) if summary.get("total_wall_seconds") is not None else None
+    duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>' if duration_label else ""
 
     run_name_bits = [f'<span class="ts">{html.escape(run_name)}</span>']
     run_ts_label = format_run_id_timestamp(run_name)
@@ -1621,11 +1453,7 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
 
 
 def render_run_images_page(summary_path):
-    """Body of one run's images page: every evaluation raster, and nothing else.
-
-    Kept off the run page so the details load without decoding one PNG per
-    evaluation; the run page links here.
-    """
+    """Render one run's evaluation images page."""
     run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
     with open(summary_path) as f:
@@ -1931,20 +1759,7 @@ def resolve_nested_sampling_summary(run):
 
 
 def summary_is_complete(summary_path):
-    """Whether `summary_path` is a whole summary.json rather than half of one.
-
-    A run killed while writing its summary - the OOM killer, ENOSPC - leaves a
-    truncated file, and one of those used to take the entire report down:
-    every page and the index are built in one pass, so json.load raising on one
-    run left every other run with no report at all. Runs written since
-    write_json_atomic() cannot produce one; this is for the ones already on
-    disk, and for a filesystem that fills up between the rename and the read.
-
-    Tested by the last byte rather than by parsing, because this runs over
-    every run in the results directory and a finished R2D2 search's summary
-    carries all of its evaluations - tens of MB to parse for a question the
-    tail answers in one seek. json.dumps ends every complete write with `}`.
-    """
+    """Whether summary ends like a complete JSON object; avoids parsing large runs."""
     try:
         with open(summary_path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -1971,7 +1786,6 @@ def run_images_page_name(run_name):
 
 
 def run_page_name(run_name):
-    """Filename for a run's own page - same sanitising the old RUN= output used."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", run_name) + ".html"
 
 
@@ -1980,7 +1794,13 @@ def page_status(out_dir, run_name):
     path = os.path.join(out_dir, run_page_name(run_name))
     if not os.path.exists(path):
         return "missing"
-    return "current" if page_report_version(path) == REPORT_VERSION else "outdated"
+    try:
+        with open(path) as f:
+            head = f.read(2048)
+    except OSError:
+        return "outdated"
+    match = REPORT_VERSION_RE.search(head)
+    return "current" if match and match.group(1) == REPORT_VERSION else "outdated"
 
 
 def run_log_evidence(run_dir, summary):
@@ -2002,10 +1822,7 @@ ALGORITHM_LABELS = {"r2d2": "R2D2", "wsclean": "WSClean"}
 
 
 def render_index_entry(summary_path, status):
-    """Returns (card_html, algorithm_token, parameter_space) - the token feeds the
-    index toolbar's algorithm filter options ("" when the run has none worth
-    filtering on), and parameter_space feeds its parameter/range filter and the
-    run-comparison panel."""
+    """Return the index card, algorithm filter token, and parameter space."""
     run_dir = os.path.dirname(summary_path)
     run_name = os.path.basename(run_dir)
     with open(summary_path) as f:
@@ -2033,10 +1850,8 @@ def render_index_entry(summary_path, status):
     if ts_label:
         title_bits.append(f'<span class="ts">{html.escape(ts_label)}</span>')
 
-    duration_html = ""
-    duration_label = format_wall_duration(summary.get("total_wall_seconds"))
-    if duration_label:
-        duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>'
+    duration_label = format_duration(summary["total_wall_seconds"]) if summary.get("total_wall_seconds") is not None else None
+    duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>' if duration_label else ""
 
     badges = []
     if is_merged:
@@ -2327,17 +2142,6 @@ INDEX_SCRIPT = """
 
 
 def unfinished_run_names():
-    """Runs that stopped before finishing, newest first.
-
-    summary.json is written only once PolyChord returns, so a run directory
-    without a readable one stopped early. That matters here more than
-    anywhere: the index below is built by globbing for summary.json, so an
-    interrupted run is not listed as failed, it is simply missing - and a run
-    that silently vanishes from the report is the one nobody goes back to. A
-    torn summary (summary_is_complete) belongs in the same list: the run is
-    unreportable until it is rewritten, and `./ri resume` is what rewrites it,
-    from the point cache and without imaging anything again.
-    """
     names = []
     for path in sorted(glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*")), reverse=True):
         if os.path.isdir(path) and not summary_is_complete(os.path.join(path, "summary.json")):
@@ -2400,10 +2204,6 @@ def render_nested_sampling_index(status_for):
     )
 
 
-def index_nav_html():
-    return '<p class="nav"><a href="index.html">&larr; All runs</a></p>'
-
-
 def write_html_doc(out_path, title, subtitle, body):
     html_doc = f"""<!doctype html>
 <html>
@@ -2427,50 +2227,24 @@ def write_html_doc(out_path, title, subtitle, body):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "out_path",
-        nargs="?",
-        default=None,
-        help="Output directory for the report pages.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Newest N runs (timestamp sort). Omit for all.",
-    )
-    parser.add_argument(
-        "--run",
-        default=None,
-        help="One run directory or name under nested-sampling/.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Rebuild run pages that already exist.",
-    )
-    parser.add_argument(
-        "--upgrade",
-        action="store_true",
-        help=(
-            "Rebuild run pages written by an older report version, leaving "
-            "up-to-date ones alone."
-        ),
-    )
+    parser.add_argument("out_path", nargs="?", help="Output directory for the report pages.")
+    parser.add_argument("--limit", type=int, help="Newest N runs (timestamp sort). Omit for all.")
+    parser.add_argument("--run", help="One run directory or name under nested-sampling/.")
+    parser.add_argument("--force", action="store_true", help="Rebuild run pages that already exist.")
+    parser.add_argument("--upgrade", action="store_true",
+                        help="Rebuild pages written by an older report version, leaving up-to-date ones alone.")
     return parser.parse_args(argv)
 
 
 def run_body_task(item):
-    """Both page bodies, with LIKELIHOOD_SLOT standing in for the corner plot."""
     summary_path = item[0]
-    body = index_nav_html() + render_nested_sampling_run(
+    body = '<p class="nav"><a href="index.html">&larr; All runs</a></p>' + render_nested_sampling_run(
         summary_path, likelihood_html=LIKELIHOOD_SLOT
     )
     return body, render_run_images_page(summary_path)
 
 
 def likelihood_task(item):
-    """URL of one run's corner plot, or None. Runs alongside its page body."""
     summary_path = item[0]
     with open(summary_path) as f:
         summary = json.load(f)
@@ -2501,16 +2275,7 @@ def write_run_page(item, body, images_body):
 
 
 def main(argv=None):
-    # The report is a batch process: it builds its figures, writes the pages
-    # and exits, so nothing it allocates has to be reclaimed while it runs.
-    # matplotlib figures are dense with reference cycles, so the cyclic
-    # collector wakes constantly and finds almost nothing that refcounting
-    # would not have freed anyway - it is 12% of a corner plot's render and 9%
-    # of the whole build. Disable it here rather than at import, so importing
-    # this module (the self-checks, the host-side helpers) leaves the caller's
-    # gc alone; the pool workers inherit the setting across fork. The cycles it
-    # would have collected are simply held to exit instead, which measured as
-    # +3MB of a worker's 128MB peak.
+    # Batch process: cyclic GC adds 9% to builds; workers inherit this setting.
     gc.disable()
     args = parse_args(argv)
     out_dir = args.out_path or "/workspace/out/nested-sampling-report"
@@ -2542,24 +2307,12 @@ def main(argv=None):
             skipped += 1
             continue
         todo.append((summary_path, page_path, run_name))
-        # A run with no page yet has no images either, so every worker would
-        # otherwise import the drawing stack separately after the fork. Load it
-        # once here instead and let them inherit it. Only the matplotlib half
-        # now, though: the corner plot is the longest task and never touches
-        # astropy or PIL, so those wait until the plots are already running
-        # (below) rather than sitting on the parent's serial prologue.
+        # Preload matplotlib before forking; defer astropy and PIL until plots run.
         if status == "missing":
             drawing = True
             load_plot_libs()
 
-    # Pages are independent, and within a page the corner plot and the eval
-    # rasters are independent too, so every run contributes two concurrent
-    # tasks. Two pools rather than one, so that astropy can be imported in
-    # between: the corner plots - the build's critical path - are already
-    # running by then, and the eval-raster workers forked after it inherit the
-    # import instead of each repeating it while the plots want the CPU. The
-    # image store is written with write-then-rename, so two workers racing on
-    # the same PNG is harmless.
+    # Separate pools overlap page work while letting raster workers inherit imports.
     written = len(todo)
     if todo:
         # Only a build with something to draw forks anything, and the import is
@@ -2568,22 +2321,17 @@ def main(argv=None):
 
         workers = min(len(todo), os.cpu_count() or 1)
         if drawing:
-            load_chain_libs()
+            try:
+                import anesthetic  # noqa: F401
+            except ImportError:
+                pass
         with multiprocessing.Pool(workers) as plot_pool:
             plots = [plot_pool.apply_async(likelihood_task, (item,)) for item in todo]
             if drawing:
                 load_render_libs()
             with multiprocessing.Pool(workers) as body_pool:
                 bodies = [body_pool.apply_async(run_body_task, (item,)) for item in todo]
-                # write_run_page already prints "wrote <path>" per page, on
-                # its own newline-terminated line - a \r-redrawn line here
-                # collided with it instead of overwriting it (no newline of
-                # its own to end on, so the next page's "wrote ..." print
-                # kept appending to the end of this one instead of starting
-                # fresh), which is what made this look like nothing was
-                # printed at all rather than a run-on mess. Printing our own
-                # plain line, always newline-terminated, avoids that outright
-                # instead of trying to redraw in place.
+                # Use newline output: page writes already emit complete lines.
                 start = time.monotonic()
                 for i, (item, plot, body) in enumerate(zip(todo, plots, bodies), start=1):
                     page_body, images_body = body.get()
@@ -2631,9 +2379,6 @@ log(Z)       =   0.145917983191460E+001 +/-   0.309608121862379E-001
 
 
 def _self_check_profiling():
-    # MPI run: shares are of the worker-time budget, null stages are dropped,
-    # and the imaging rows are named after the run's algorithm. 8 ranks are 7
-    # workers - rank 0 administrates - so the budget is 7 x the wall clock.
     html_out = render_profiling({"algorithm": "r2d2", "profiling": {
         "mpi_procs": 8, "total_wall_seconds": 455.58,
         "stage_totals_seconds": {
@@ -2644,24 +2389,17 @@ def _self_check_profiling():
         },
         "accounted_worker_seconds": 2389.37, "polychord_overhead_seconds": None,
     }})
-    # Minutes and hours where seconds stopped being readable, and a per-eval column.
     assert "r2d2 container (total)" in html_out, html_out
     assert "image container" not in html_out, html_out
     assert "39m 15s" in html_out and "53.5s" in html_out, html_out
-    # A share that rounds to nothing still renders as escaped text, not as a tag.
     assert "&lt;0.1%" in html_out and "<0.1%" not in html_out, html_out
     assert "7 workers + administrator" in html_out and "53m 09s" in html_out, html_out
     assert "convert" not in html_out, html_out
-    # Every top-level stage plus the unaccounted remainder is charted, adds to
-    # 100%, and is repeated once per worker lane.
     assert html_out.count('class="profile-bar"') == 7, html_out
     assert html_out.count('class="profile-seg"') == 4 * 7, html_out
     assert "unaccounted (PolyChord sampling + idle)" in html_out, html_out
     shares = [float(s) for s in re.findall(r"--seg-share: ([\d.]+)", html_out)]
     assert abs(sum(shares) / 7 - 1.0) < 1e-6, shares
-    # The parallelisation arithmetic is spelled out and lands on the wall clock
-    # the run header shows, and the table carries the wall-clock column that
-    # turns each stage's worker-seconds into its cost in wall time.
     assert (
         "39m 49s accounted + 13m 20s unaccounted = 53m 09s of worker-time ÷ 7 workers"
         " <strong>= 7m 36s end-to-end wall clock</strong>"
@@ -2670,7 +2408,6 @@ def _self_check_profiling():
     assert ">wall clock</th>" in html_out, html_out
     assert "5m 36s" in html_out, html_out  # r2d2's 39m 15s of worker-time, in wall clock
     assert "end-to-end (accounted + unaccounted)" in html_out, html_out
-    # Serial run: the budget is just the wall clock, so shares are of wall time.
     single = render_profiling({"algorithm": "wsclean", "profiling": {
         "mpi_procs": 1, "total_wall_seconds": 10.0,
         "stage_totals_seconds": {"simulate": 5.0},
@@ -2681,15 +2418,10 @@ def _self_check_profiling():
     assert single.count("--seg-share: 0.500000") == 2, single  # the one stage, and the remainder
     assert single.count('class="profile-bar"') == 1, single  # one worker, one lane
     assert "1 worker ·" in single, single
-    # Serial: worker-time is the wall clock, so no redundant column and no division.
     assert ">wall clock</th>" not in single, single
     assert (
         "5.00s accounted + 5.00s unaccounted <strong>= 10.0s end-to-end wall clock</strong>"
     ) in single, single
-    # Records carrying their wall-clock intervals: PolyChord and idle are rows
-    # and chart segments of their own rather than one "unaccounted" bucket, and
-    # the harness joins the stages above the sum. See profiling_breakdown() for
-    # the arithmetic behind these numbers.
     split = render_profiling({"algorithm": "wsclean", "profiling": {
         "mpi_procs": 3, "total_wall_seconds": 10.0,
         "stage_totals_seconds": {"simulate": 5.5},
@@ -2707,13 +2439,10 @@ def _self_check_profiling():
         "6.00s evaluating + 12.0s PolyChord + 2.00s idle = 20.0s of worker-time ÷ 2 workers"
         " <strong>= 10.0s end-to-end wall clock</strong>"
     ) in split, split
-    # One segment per top-level row, in both lanes, adding to the whole budget.
     assert split.count('class="profile-seg"') == 4 * 2, split
     shares = [float(s) for s in re.findall(r"--seg-share: ([\d.]+)", split)]
     assert abs(sum(shares) / 2 - 1.0) < 1e-6, shares
-    # No profiling block: nothing rendered.
     assert render_profiling({}) == ""
-    # A profiling block with nothing in it must not divide by zero.
     empty = render_profiling({"profiling": {"mpi_procs": 1, "total_wall_seconds": 0.0}})
     assert 'class="profile-seg"' not in empty, empty
 
@@ -2740,13 +2469,6 @@ def _self_check_page_status():
 
 
 def _self_check_torn_summary():
-    """One half-written summary.json must not take the whole report down.
-
-    Every page and the index are built in one pass, so json.load raising on one
-    run left every other run with no report at all - reproduced by truncating a
-    real 285KB summary. The run is not lost either: it joins the runs that
-    stopped before finishing, with the `./ri resume` that rewrites it.
-    """
     import shutil
     import tempfile
 
@@ -2780,9 +2502,6 @@ def _self_check_torn_summary():
 
 
 def _self_check_index_toolbar():
-    """Index cards carry the algorithm/merged/evals/parameter-space data the
-    toolbar filters, sorts, and compares on, and the toolbar options match what
-    was actually seen across runs."""
     import shutil
     import tempfile
 
@@ -2865,8 +2584,6 @@ def _self_check_index_toolbar():
 
 
 def _self_check_parameter_space_section():
-    """The report page's parameter-space table shows each searched parameter's
-    range and kind, and is empty when a run has none."""
     html_out = render_parameter_space_section([
         {"name": "log10_dynamic_range", "min": 2.0, "max": 3.0},
         {"name": "channel_count", "min": 2, "max": 6, "kind": "integer"},
@@ -2878,7 +2595,6 @@ def _self_check_parameter_space_section():
 
 
 def _self_check_cached_png():
-    """A second request for the same key reuses the file instead of re-rendering."""
     import shutil
     import tempfile
 
@@ -2923,8 +2639,6 @@ def _self_check_render_array_png():
 
 
 def _self_check_tick_housekeeping():
-    """The corner plot's speedup rests on one side effect - that the memoized
-    path still un-stales the shared view limits. Assert it directly."""
     load_plot_libs()
     if not dedupe_pandas_tick_housekeeping():
         return
@@ -2941,8 +2655,6 @@ def _self_check_tick_housekeeping():
 
 
 def _self_check_shared_axes_dedupe():
-    """A repeated handle_shared_axes call must skip the scan but still un-stale
-    the view limits of every axis the first scan selected."""
     load_plot_libs()
     if not dedupe_pandas_tick_housekeeping():
         return
@@ -2981,8 +2693,6 @@ def _self_check_shared_axes_dedupe():
 
 
 def _self_check_tick_memo():
-    """The tick memo must hit while the axis is unchanged, miss once its view
-    limits move, and keep un-staling the shared view limits either way."""
     load_plot_libs()
     if not memoize_matplotlib_tick_updates():
         return
@@ -2998,8 +2708,6 @@ def _self_check_tick_memo():
 
 
 def _self_check_text_layout_memo():
-    """The text-layout memo must share one layout between two texts with the
-    same properties, and miss once any of those properties differs."""
     load_plot_libs()
     if not memoize_matplotlib_text_layout():
         return
@@ -3020,7 +2728,6 @@ def _self_check_text_layout_memo():
 
 
 def _self_check_tight_bbox():
-    """tight_bbox must reproduce what savefig(bbox_inches="tight") measures."""
     load_plot_libs()
 
     def draw():
@@ -3037,8 +2744,6 @@ def _self_check_tight_bbox():
 
 
 def _self_check_labels_map_memo():
-    """The labels-map memo must hit while the frame's columns are unchanged and
-    miss once a new column swaps the Index out, so a stale mapping can't stick."""
     if not memoize_anesthetic_labels_map():
         return
     from anesthetic.labelled_pandas import LabelledDataFrame
@@ -3058,10 +2763,6 @@ def _self_check_labels_map_memo():
 
 
 def _self_check_drop_labels_memo():
-    """The drop-labels memo must reuse one copy for every spec that drops the
-    same levels, keep specs that drop different ones apart, and miss as soon as
-    a new column swaps the columns Index out - that last one is the guard that
-    stops a stale copy of the frame reaching the plot."""
     if not memoize_anesthetic_drop_labels():
         return
     from anesthetic.labelled_pandas import LabelledDataFrame
@@ -3084,12 +2785,6 @@ def _self_check_drop_labels_memo():
 
 
 def _self_check_labelled_column_shortcut():
-    """The labelled-column shortcut must return exactly what anesthetic's own
-    four-way search returns - same type, same index, same values, same
-    relabelled name - on every shape the corner plot can hand it, and raise
-    where it raises. Each case is built twice: pandas caches a frame's column
-    Series, so resolving both ways on one frame would compare an object with
-    itself and prove nothing."""
     if not shortcut_anesthetic_labelled_column():
         return
     from anesthetic.labelled_pandas import (
@@ -3166,9 +2861,6 @@ def _self_check_labelled_column_shortcut():
 
 
 def _self_check_viewlim_skip():
-    """The settled-viewLim skip must not run the scan twice for one settled
-    epoch, must still autoscale once something asks for it, and must not record
-    an epoch when the autoscale it ran re-staled the group."""
     load_plot_libs()
     if not skip_settled_matplotlib_viewlims():
         return
@@ -3199,8 +2891,6 @@ def _self_check_viewlim_skip():
 
 
 def _self_check_axis_map_cache():
-    """The cached _axis_map must answer with the axes' own axis objects and
-    must notice when fresh ones are swapped in."""
     load_plot_libs()
     if not cache_matplotlib_axis_map():
         return
@@ -3218,9 +2908,6 @@ def _self_check_axis_map_cache():
 
 
 def _self_check_alias_map_memo():
-    """The memoised normalize_kwargs must canonicalise aliases exactly as
-    matplotlib does, keep the two artist classes' maps apart, and still reject
-    a canonical name given twice under different aliases."""
     load_plot_libs()
     if not memoize_matplotlib_alias_maps():
         return
@@ -3243,8 +2930,6 @@ def _self_check_alias_map_memo():
 
 
 def _self_check_axes_subclass_sharing():
-    """Two panels made by the same anesthetic helper must land on one shared
-    subclass, and the two helpers must not share a subclass with each other."""
     load_plot_libs()
     if not share_anesthetic_axes_subclasses():
         return
@@ -3270,7 +2955,6 @@ def _self_check_axes_subclass_sharing():
 
 
 def _self_check_mplot3d_skip():
-    """The skipped 3d projection costs the registry nothing else, and unpoisons."""
     load_plot_libs()
     import mpl_toolkits.mplot3d  # noqa: F401  - the None must be gone again
 
@@ -3293,8 +2977,6 @@ def _self_check_run_page_name():
 
 
 def _self_check_run_page_split():
-    """The run page carries no evaluation raster - only a link to the page that
-    does - so opening the details does not decode one PNG per evaluation."""
     import shutil
     import tempfile
 

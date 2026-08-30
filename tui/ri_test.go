@@ -1,5 +1,3 @@
-// The checks for the parts of the TUI that are not just drawing: what order
-// runs come out in, which flags a launch actually sends, and finding the repo.
 package main
 
 import (
@@ -14,9 +12,6 @@ import (
 )
 
 func TestParseRunsKeepsNewestFirst(t *testing.T) {
-	// ./ri runs --json in the order it prints, which is newest first. The
-	// newest run here is a finished one and the oldest is still going, so
-	// anything reordering by status would show up.
 	runs, err := parseRuns([]byte(`[
 		{"name": "newest", "status": "complete", "algorithm": "wsclean", "evaluations": 9322,
 		 "started_label": "today 18:38 (2h ago)"},
@@ -38,8 +33,6 @@ func TestParseRunsKeepsNewestFirst(t *testing.T) {
 	if runs[0].Evaluations != 9322 || runs[0].Algorithm != "wsclean" {
 		t.Errorf("run fields lost: %+v", runs[0])
 	}
-	// The column is drawn from this string, so losing it empties the column
-	// rather than failing anywhere.
 	if runs[0].StartedLabel != "today 18:38 (2h ago)" {
 		t.Errorf("started label lost: %+v", runs[0])
 	}
@@ -66,13 +59,9 @@ func TestClaimRunDirNamesARunTheScriptsRecognise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The shape ./ri runs sorts by and nested-sampling-health.py parses: the
-	// prefix ns_claim_run_dir would have used, and a whole-second UTC stamp.
 	if !regexp.MustCompile(`^results/nested-sampling/r2d2-vlaa-\d{8}T\d{6}Z$`).MatchString(dir) {
 		t.Errorf("run directory not named like a run: %q", dir)
 	}
-	// Created, and created as a claim: the second search of the same second
-	// must not be handed the directory the first one is about to fill.
 	if info, err := os.Stat(filepath.Join(r.root, dir)); err != nil || !info.IsDir() {
 		t.Fatalf("run directory not created: %v", err)
 	}
@@ -82,8 +71,6 @@ func TestClaimRunDirNamesARunTheScriptsRecognise(t *testing.T) {
 	}
 }
 
-// A launched run belongs in the table before ./ri runs can see it, and has to
-// leave it again - once, not twice - when the listing catches up.
 func TestVisibleShowsALaunchedRunUntilTheListingHasIt(t *testing.T) {
 	pending := Run{Name: "wsclean-vlaa-20260101T000000Z", Status: "starting"}
 	m := model{
@@ -93,8 +80,6 @@ func TestVisibleShowsALaunchedRunUntilTheListingHasIt(t *testing.T) {
 	if got := m.visible(); len(got) != 2 || got[0].Name != pending.Name {
 		t.Fatalf("launched run missing from the table: %+v", got)
 	}
-	// Running-only is the one view most likely to hide it, and the one a run
-	// just started is most likely to be watched from.
 	m.runningOnly = true
 	if got := m.visible(); len(got) != 1 || got[0].Name != pending.Name {
 		t.Errorf("launched run hidden by the running-only filter: %+v", got)
@@ -108,8 +93,6 @@ func TestVisibleShowsALaunchedRunUntilTheListingHasIt(t *testing.T) {
 	if got[1].Status != "running" {
 		t.Errorf("stale pending row shown instead of the real one: %+v", got)
 	}
-	// The log stays with the run: it holds the build output, which the run's
-	// own run.log never had.
 	if m.launchLogFor(pending.Name) != "/tmp/launch.log" {
 		t.Error("launch log lost once the run was listed")
 	}
@@ -137,8 +120,6 @@ func TestTailKeepsWholeLinesFromTheEnd(t *testing.T) {
 	if err := os.WriteFile(path, []byte("first\nsecond\nthird\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A limit that lands mid-line drops that partial line rather than showing
-	// its tail, which is what makes a megabyte run.log readable.
 	if got, err := tail(path, 12); err != nil || got != "third\n" {
 		t.Errorf("tail = %q, %v", got, err)
 	}
@@ -147,9 +128,6 @@ func TestTailKeepsWholeLinesFromTheEnd(t *testing.T) {
 	}
 }
 
-// The loop the interface exists for: into a run, around its three views, back
-// out to the table, and in again. The commands returned would shell out to
-// ./ri, so they are dropped - what is checked here is where each key lands.
 func TestWatchingARunLoopsBackToTheTable(t *testing.T) {
 	m := newModel(ri{root: t.TempDir()})
 	m.runs = []Run{{Name: "wsclean-vlaa-20260101T000000Z", Path: "results/nested-sampling/x",
@@ -177,15 +155,12 @@ func TestWatchingARunLoopsBackToTheTable(t *testing.T) {
 		if m.logRun.Name != m.runs[0].Name {
 			t.Fatalf("round %d: log pane is showing %q", round, m.logRun.Name)
 		}
-		// `l` all the way around: health, log, profile, and back to health.
 		for _, want := range []pane{paneLog, paneProfile, paneHealth} {
 			press("l")
 			if m.pane != want {
 				t.Fatalf("round %d: l landed on %v, wanted %v", round, m.pane, want)
 			}
 		}
-		// The profile is a finished-run report, so it opens paused; the two
-		// live views must not stay that way behind it.
 		press("l")
 		press("l")
 		if m.pane != paneProfile || !m.paused {

@@ -1,22 +1,5 @@
 # shellcheck shell=bash  # sourced, so no shebang
-# Record what a run was actually started with, so it can be resumed exactly.
-#
-# Written at startup rather than derived afterwards, because the settings a
-# resume needs are precisely the ones an interrupted run never got to write
-# down: summary.json is written after PolyChord returns, so a run that stopped
-# has none. Without this, resuming means remembering the flags by hand and
-# getting a different search if you remember wrong.
-#
-# The values are the resolved ones, after defaults.toml and after the memory
-# clamp in rank-budget.sh, so a run that was clamped to seven ranks resumes on
-# seven and not on the eight it originally asked for. PolyChord's resume file
-# describes a live-point set that a different rank count would not match.
-#
-# A KEY=VALUE file rather than JSON so that resuming is `set -a; . run.env`
-# with no parser: `%q` quoting makes it safe to source even when NS_METRIC is
-# an expression with spaces in it.
-#
-#   write_run_config <output-dir> <algorithm>
+# Save resolved run settings in a source-safe KEY=VALUE file for resume.
 
 write_run_config() {
   local output_dir="$1" algorithm="$2"
@@ -29,23 +12,10 @@ write_run_config() {
     printf 'NS_METRIC=%q\n' "${NS_METRIC}"
     printf 'NS_MPI_PROCS=%q\n' "${NS_MPI_PROCS}"
     printf 'NS_RETRIES=%q\n' "${NS_RETRIES}"
-    # The stall watchdog's timeout is a setting of the run, not of the shell
-    # that launched it: a search deliberately given a longer one - or given 0
-    # to turn the watchdog off - used to get the 7200s default back the moment
-    # it was resumed, silently, which is the opposite of what `--stall-timeout`
-    # was typed for. It is also the only thing that can tell `./ri health` when
-    # a stalled run is due to be killed and restarted.
+    # Persist run settings, including watchdog behavior, for exact resume.
     printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
-    # Same reason, and the same bug twice over: both of these are properties
-    # of the run rather than of the launching shell, and a resume that dropped
-    # them would change the run's MPI scheduling - or start keeping the
-    # Measurement Sets a nearly-full disk was the reason for deleting -
-    # half way through.
     printf 'NS_SYNCHRONOUS=%q\n' "${NS_SYNCHRONOUS}"
     printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
-    # WSClean-only, and for the same reason as the two above: `--mgain 0.9` is
-    # ~20% of a run's throughput and part of what its evaluations were scored
-    # under, so a resume that dropped it would change both half way through.
     if [ "${algorithm}" = wsclean ]; then
       printf 'NS_WSCLEAN_MGAIN=%q\n' "${NS_WSCLEAN_MGAIN}"
     fi
@@ -55,28 +25,15 @@ write_run_config() {
   } >"${output_dir}/run.env"
 }
 
-# Claim a run directory named for the moment the run started, and create it.
+# Claim a unique `<algorithm>-vlaa-<stamp>` directory. Bare `mkdir` prevents
+# same-second searches from sharing evaluations, FIFOs or checkpoints; retry
+# is bounded so an unwritable parent fails instead of spinning.
 #
-# `mkdir -p` on a name built from a whole-second UTC stamp is not a claim: two
-# searches started in the same second - two agent sessions sharing this host,
-# or one script launching a pair - land on the same directory and then write
-# each other's evaluations, FIFOs and summary.json, and the first to finish
-# deletes the FIFO directory the other is still reading. Seen for real: the
-# second run died with `mkfifo: ... No such file or directory` while the first
-# reported success.
-#
-# A bare `mkdir` is the claim, because it fails when the name is taken. The
-# loser then waits for the next second rather than decorating its name, so
-# every run directory keeps the `<algorithm>-vlaa-<stamp>` shape that
-# `./ri runs`, the health report and its `started_at` ordering all rely on.
-# Bounded, so an unwritable parent is an error rather than a spin.
-#
-#   ns_claim_run_dir <parent> <prefix>   - prints the directory it created
+#   ns_claim_run_dir <parent> <prefix>   - prints created directory
 
 ns_claim_run_dir() {
   local parent="$1" prefix="$2" stamp="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}" dir
-  # RUN_ID names the run when it is set, which is what lets the self-check
-  # below force the collision this exists to survive.
+  # RUN_ID lets the self-check force a same-stamp collision.
   mkdir -p "${parent}"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     dir="${parent}/${prefix}${stamp}"
@@ -130,34 +87,17 @@ ns_refuse_live_run() {
 #
 #   ns_refuse_unmounted_run <output-dir>
 
-# A missing checkpoint set is the one input whose absence the search cannot
-# report. R2D2 exits non-zero without it, which common.py scores as
-# FAILURE_OBJECTIVE (100.0) - and PolyChord maximizes, against a real
-# total_rms_jy of ~0.008, so every evaluation becomes the best point the search
-# has ever seen. Measured: an 8-rank run in a fresh worktree scored 55 of 55
-# that way and terminated at logZ = 99.93, a triumphant-looking number for a
-# search that imaged nothing. `./ri health` names it afterwards; this is the
-# same fault caught in 0.01s instead of after the run.
-#
-# Checked in front of the run directory being claimed, like the memory guard,
-# so a refused run leaves nothing for `./ri runs` to puzzle over. Only that
-# some checkpoint is there - which realisations the run needs is the imager's
-# business, and it says so itself once it can start.
+# Refuse missing checkpoints before claiming a run directory: otherwise every
+# evaluation scores FAILURE_OBJECTIVE, which PolyChord maximizes.
 #
 #   ns_refuse_missing_checkpoints <checkpoints-dir> <set-name>
 
 ns_refuse_missing_checkpoints() {
-  local dir="$1/$2" candidate found=''
+  local dir="$1/$2" candidate
   if [ -d "${dir}" ]; then
     for candidate in "${dir}"/*.ckpt; do
-      if [ -e "${candidate}" ]; then
-        found=1
-        break
-      fi
+      [ -e "${candidate}" ] && return 0
     done
-  fi
-  if [ -n "${found}" ]; then
-    return 0
   fi
   echo "FATAL: no R2D2 checkpoints in ${dir}" >&2
   echo "       Without them every evaluation fails, and a failed evaluation scores" >&2
@@ -197,7 +137,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 \
     NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 \
     write_run_config "${_dir}" r2d2
-  # A subshell, so the sourced values cannot leak into the checks below it.
   (
     set -a
     # shellcheck disable=SC1091
@@ -208,15 +147,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${NS_RETRIES}" = 2 ]
     [ "${NS_METRIC}" = 'total_rms_jy - 0.5 * snr' ]
     [ "${R2D2_OMP_THREADS}" = 2 ]
-    # Not the 7200s default: a resume replays this file, so a watchdog the
-    # caller retuned has to survive it.
     [ "${NS_STALL_TIMEOUT}" = 3600 ]
-    # Same: a run resumed after `--synchronous` or `--keep-measurement-sets`
-    # must not switch behaviour part-way through.
     [ "${NS_SYNCHRONOUS}" = 1 ]
     [ "${NS_KEEP_MEASUREMENT_SETS}" = 1 ]
   )
-  # WSClean has no thread setting, and must not write an empty one.
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
     NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
@@ -225,8 +159,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   grep -qx 'NS_WSCLEAN_MGAIN=0.9' "${_dir}/run.env" || {
     echo "FAIL: --mgain not recorded in run.env"; exit 1
   }
-  # 0 turns the watchdog off and must be written as 0, not dropped: an absent
-  # key reads as the default, which is the setting's opposite.
   grep -qx 'NS_STALL_TIMEOUT=0' "${_dir}/run.env" || {
     echo "FAIL: --stall-timeout 0 not recorded in run.env"; exit 1
   }
@@ -237,18 +169,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     echo "FAIL: empty R2D2_OMP_THREADS written for wsclean"; exit 1
   }
 
-  # A run directory is claimed, not shared: the second caller in the same
-  # second must not be handed the first one's directory.
   _parent="${_dir}/runs"
   _first="$(RUN_ID=20260101T000000Z ns_claim_run_dir "${_parent}" wsclean-vlaa-)"
   [ "${_first}" = "${_parent}/wsclean-vlaa-20260101T000000Z" ]
   [ -d "${_first}" ]
-  # Same stamp again: it waits for the next second rather than returning the
-  # taken name, so the two runs never share a directory.
   _second="$(RUN_ID=20260101T000000Z ns_claim_run_dir "${_parent}" wsclean-vlaa-)"
   [ "${_second}" != "${_first}" ]
   [ -d "${_second}" ]
-  # ...and it still ends in a stamp, which is what orders the report.
   case "${_second}" in
     "${_parent}/wsclean-vlaa-"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
     *) echo "FAIL: claimed run directory is not stamp-named: ${_second}"; exit 1 ;;

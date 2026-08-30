@@ -1,14 +1,9 @@
 # Run health
 
-`./ri runs` answers "did it finish?". `./ri health` answers the question you
-have while one is still going. See [nested-sampling.md](nested-sampling.md) for
-how to start a run, and [robustness.md](robustness.md) for what happens when
-one breaks.
-
-`./ri tui` is this report on a timer next to the run table, the profile of
-whichever run is selected, and a form that starts a search - needs Go. `./ri health --monitor` is the lighter version of
-the same idea: just this report, redrawn in place, no other tool required.
-Everything below is what both of them show.
+`./ri runs` lists finished runs; `./ri health` explains live ones. See
+[nested-sampling.md](nested-sampling.md) to start and [robustness.md](robustness.md)
+for failures. `./ri tui` adds this report, a profile, and a search form; it
+needs Go. `./ri health --monitor` redraws this report.
 
 ```console
 $ ./ri health
@@ -44,28 +39,14 @@ terminal with one scrollback entry per poll. Ctrl-C to stop.
 
 ## Which runs it reports on
 
-With no argument, every run being driven anywhere on this host - ranks running,
-or a `docker exec` client still starting them - falling back to the newest run
-when nothing is going. All of them, not the newest, because memory caps a run
-here and the host is shared: a second search is the usual reason the first is
-slow.
+With no argument, reports every active run on this host - ranks or `docker exec`
+clients - and otherwise the newest run. Names search this checkout first, then
+active foreign runs; foreign resume suggestions use paths. `--all` reports
+every on-disk run here; `--json` selects machine-readable output.
 
-Live runs are found in the host process list rather than by globbing this
-checkout, so a run from another worktree is reported too, named by a `path`
-line. `./ri health <name>` takes any name the report prints: a bare name is
-looked for in this checkout first, then among what is running on the host.
-Commands it *suggests* run the other way - `./ri resume` takes a bare name only
-under this checkout, so warnings about a foreign run give it a path.
-
-`--all` covers every run on disk under this checkout; `--json` is the
-machine-readable form.
-
-It reads files and runs one `ps` and one `docker ps`, plus a one second CPU
-sample when a run has live ranks. A run whose ranks fork inside their own
-container's PID namespace - invisible to that `ps`, the ordinary case under
-Docker Desktop - costs one `docker top` and its own five-second sample instead.
-Nothing is started and nothing is imaged, so a live run does not notice it.
-Exit status is 1 when something needs attention.
+It reads files, runs `ps`/`docker ps`, and samples live-rank CPU (under Docker
+Desktop, forked ranks use `docker top` and a five-second sample). It starts and
+images nothing, exiting 1 when attention is needed.
 
 ## Status
 

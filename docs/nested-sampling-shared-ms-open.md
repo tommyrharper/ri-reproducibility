@@ -19,9 +19,7 @@ target off its median phase table: 8.22 ms from process start to
 `=== IMAGING TABLE ===` plus 3.89 ms from there to the reorder, 8.8% of an
 evaluation.
 
-Host: the same 20-thread i5-13500 every other measurement in `docs/` was taken
-on, at the 65 W package limit
-[the power-limit doc](nested-sampling-power-limit.md) describes. 29 August 2026.
+Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-limit.md).
 
 ## Counting the opens, rather than guessing at them
 

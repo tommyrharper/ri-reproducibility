@@ -1,35 +1,13 @@
 #!/usr/bin/env bash
-# End-to-end check that a search which is killed mid-flight heals itself.
-#
-# The robustness property this repo depends on most: a multi-day R2D2 search
-# that loses its ranks at hour three has to come back on its own, because
-# nothing else notices for hours. `run_with_retries` implements it and its own
-# --self-check covers the decision with fixtures - but every bug found in this
-# machinery so far was invisible to a fixture and obvious to a real kill. So:
-# start a real search, break it, and assert it finishes anyway.
-#
-# Six breaks, because they recover through different machinery. Each is
-# explained where it is performed below; docs/robustness.md has the whole
-# story. In short: a SIGKILL is the crash the retry loop was written for; a
-# SIGSTOPped rank is the hang it cannot see, which the stall watchdog turns
-# into a crash; a kill with the retry budget spent is the one that does *not*
-# heal, and has to hand a human a `./ri resume` that works; killed workers are
-# supposed to cost nothing at all; a removed sidecar container needs
-# `sidecar_restore` before a retry has anywhere to land; and a truncated
-# checkpoint has to be moved aside rather than read again forever.
-#
-# ~5 minutes and ~0.6GB, on throwaway output directories that `./ri runs` and
-# the report never see. WSClean rather than R2D2 because it reaches its first
-# checkpoint in ~15s where R2D2 takes over an hour.
+# E2E recovery check for kills, hangs, missing sidecars, exhausted retries and
+# truncated checkpoints. See docs/robustness.md. Takes ~5 minutes and ~0.6GB;
+# WSClean reaches its first checkpoint in ~15s, R2D2 in over an hour.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Under REPO_ROOT, not /tmp: the simulate workers are reached over FIFOs inside
-# the run directory, and only the repo is bind-mounted into the sidecars. An
-# output directory outside it silently drops the worker pool, which is a
-# different run from the one this is meant to check. Under results/ but not
-# results/nested-sampling/, so it is already gitignored and `./ri runs` - which
-# globs results/nested-sampling/* - never sees it.
+# Under REPO_ROOT: sidecars only bind-mount the repo, and workers use FIFOs in
+# the run directory. Keep outputs under results/ but outside nested-sampling/:
+# git ignores them and `./ri runs` does not list them.
 OUT="${REPO_ROOT}/results/.self-heal-check-$$"
 HUNG_OUT="${REPO_ROOT}/results/.self-heal-hang-check-$$"
 RESUME_OUT="${REPO_ROOT}/results/.self-heal-resume-check-$$"
@@ -152,12 +130,7 @@ grep -q "exit 137" "${OUT}/restarts.log" || fail "restarts.log did not record th
 after="$(completed_evals "${OUT}")"
 [ "${after}" -ge "${before}" ] || fail "restart lost work: ${before} evaluations before the kill, ${after} after"
 
-# The run healed itself, so the report must not call that a fault. The run's
-# own headline, not the exit status: that is 1 for a host warning too, and this
-# host is shared - the same race the hang scenario below documents caught this
-# assertion on the search that had just finished one line above, whose three
-# sidecars are still running for the ~0.4s `_sidecar_remove` takes to remove
-# them in the background after their launcher pid is gone.
+# A healed run must not headline a warning; exit status also reports host warnings.
 health="$("${REPO_ROOT}/ri" health "${OUT}" 2>&1)" || true
 case "$(printf '%s\n' "${health}" | head -1)" in
   *WARNING*) fail "./ri health warns about a run that healed itself:
@@ -216,14 +189,7 @@ grep -q "exit 137" "${HUNG_OUT}/restarts.log" 2>/dev/null \
 hung_after="$(completed_evals "${HUNG_OUT}")"
 [ "${hung_after}" -ge "${hung_before}" ] \
   || fail "stall restart lost work: ${hung_before} evaluations before, ${hung_after} after"
-# The run's own headline, not the exit status: that is 1 for a host warning
-# too, and the host is shared. This check failed on "3 sidecar container(s)
-# outlived the run that started them" naming the containers of the search that
-# had just finished one line above - `_sidecar_remove` backgrounds its
-# `docker rm --force`, so for ~0.4s after a run exits its containers are
-# running with a launcher pid that is already gone. Another session's leaked
-# sidecar, or a host low on memory, failed it just as easily. What this check
-# is about is whether the *run* looks healthy after healing itself.
+# Check headline, not exit status: shared hosts can produce unrelated warnings.
 health="$("${REPO_ROOT}/ri" health "${HUNG_OUT}" 2>&1)" || true
 case "$(printf '%s\n' "${health}" | head -1)" in
   *WARNING*) fail "./ri health warns about a run that healed itself:
@@ -232,16 +198,7 @@ esac
 
 echo "self-heal: hung at ${hung_before} evaluations, recovered and finished at ${hung_after}"
 
-# Scenario three: the run does not heal itself, and a human puts it back. Every
-# route into `./ri resume` that `./ri health` prints - the STOPPED warning, the
-# orphaned-launcher warning, all three "not retrying" messages
-# `run_with_retries` gives up with - is a promise that a search interrupted hours in can be continued
-# rather than restarted, and none of it was checked against a real one. The two
-# scenarios above cannot reach it: they finish on their own, and a finished run
-# is the one thing `./ri resume` refuses.
-#
-# --retries 0, so the SIGKILL is final. That is also exactly what a run looks
-# like once it has spent its retry budget on the fault that keeps coming back.
+# Scenario three: retries disabled, then resume a stopped run through every health route.
 echo "self-heal: starting a third wsclean search in ${RESUME_OUT}"
 "${REPO_ROOT}/ri" search wsclean \
   --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 0 --no-build \
@@ -468,20 +425,11 @@ sidecar_after="$(completed_evals "${SIDECAR_OUT}")"
 
 echo "self-heal: sidecar removed at ${sidecar_before} evaluations, started again and finished at ${sidecar_after}"
 
-# Scenario six: the checkpoint itself is what is broken. A rank killed part-way
-# through writing `chains/*.resume` leaves a truncated file, and PolyChord
-# aborts reading it in Fortran before evaluation 1 - so the run scored nothing,
-# `run_with_retries`' anti-spin guard refused to restart it, and every later
-# `./ri resume` died in the identical place with every scored evaluation
-# unreachable on disk. The recovery is to move the checkpoint aside and let the
-# sampler start over, which replays those evaluations out of the point cache
-# without imaging any of them.
+# Scenario six: a truncated `chains/*.resume` makes PolyChord abort before
+# evaluation 1. Recovery moves it aside, then re-samples from the point cache.
 #
-# On the run scenario five just finished rather than a sixth search: the break
-# is deterministic (truncate a file) and needs no kill timing, so the only
-# thing a fresh run would add is another minute. Deleting summary.json is what
-# the resume script itself documents as the way to make a finished run
-# resumable.
+# Reuse scenario five's finished run: truncation is deterministic, and deleting
+# summary.json is the documented way to make it resumable.
 resume_file="$(find "${SIDECAR_OUT}/chains" -maxdepth 1 -name '*.resume' | head -1)"
 [ -n "${resume_file}" ] || fail "the finished run left no checkpoint to tear; see ${SIDECAR_OUT}/chains"
 torn_before="$(completed_evals "${SIDECAR_OUT}")"

@@ -1,49 +1,7 @@
 #!/usr/bin/env bash
-# Build the nested-sampling HTML report inside the r2d2 image (astropy +
-# matplotlib + anesthetic).
-#
-# Usage:
-#   scripts/generate-report.sh
-#   LAST=1 scripts/generate-report.sh
-#   RUN=results/nested-sampling/<id> scripts/generate-report.sh
-#   UPGRADE=1 scripts/generate-report.sh
-#   FORCE=1 scripts/generate-report.sh
-#
-# Outputs:
-#   reports/nested-sampling-report/index.html   (links to every run)
-#   reports/nested-sampling-report/<run>.html   (one page per run)
-#   reports/nested-sampling-report/images/      (PNGs the pages reference)
-#
-# The container is removed asynchronously after the run rather than by
-# `docker run --rm`, which blocks until the rootfs is torn down.
-#
-# Each page records the report version that wrote it. Up-to-date pages are
-# skipped; UPGRADE=1 rebuilds the ones an older report version wrote, and
-# FORCE=1 (or a RUN= selection) rebuilds them all. The index is always rebuilt.
-# Rebuilding a page reuses the PNGs under images/, which is most of the cost -
-# delete the whole report directory to force those to be drawn again. A rebuild
-# that draws nothing skips the astropy/matplotlib import as well, and numpy
-# with them (common binds `np` lazily, since the report wants only its
-# formatting helpers). Pages that
-# do need building are built in parallel: each run is two concurrent tasks, its
-# corner plot and the rest of its page, in two pools forked either side of the
-# astropy import so only the parent pays for it. anesthetic is imported in the
-# parent too, so the corner-plot workers inherit it rather than each repeating
-# the import. matplotlib's 3d projection is skipped on the way in - nothing here
-# draws in 3d and matplotlib already copes with an unimportable Axes3D - which
-# is 6.7% of the `import matplotlib.pyplot` on that same serial prologue. The corner plot also de-duplicates pandas' per-plot-call tick
-# housekeeping and the shared-axis scan that drives it, memoises matplotlib's
-# per-axis tick updates and its per-text layout measurements, skips its
-# shared-axis autoscale scan while nothing has gone stale, caches anesthetic's
-# per-index label mapping, its label-stripped frame copies and the per-panel
-# Axes subclasses it builds one at a time, resolves a labelled column straight
-# to the one of anesthetic's four candidate lookups that always wins, caches
-# matplotlib's per-Axes axis map and its per-class kwarg alias maps, and hands
-# savefig a pre-measured tight bbox so it skips its own extra layout pass. The
-# report is a batch process that exits when it is done, so it runs with the
-# cyclic garbage collector disabled - matplotlib's reference cycles keep it
-# busy for 9% of the build and refcounting frees the same objects anyway - see
-# docs/nested-sampling.md.
+# Build report in r2d2 image. `LAST=1`, `RUN=...`, `UPGRADE=1`, and `FORCE=1`
+# select rebuilds; index always rebuilds. Outputs go under reports/.
+# Container cleanup is asynchronous because `docker run --rm` blocks on teardown.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

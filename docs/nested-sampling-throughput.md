@@ -1,13 +1,9 @@
 # Nested sampling: throughput
 
-[nested-sampling-profiling.md](nested-sampling-profiling.md) is about what one
-likelihood evaluation costs. This one is about the other half of the wall
-clock: how much of the time the ranks are running an evaluation at all.
-
-The two are separate problems with separate fixes. Making an evaluation 10%
-cheaper and making the ranks 10% busier both buy 10% of the run, but nothing
-in the per-stage timings tells you which one you are short of - a run whose
-every stage is at its floor can still spend half its cores idle.
+The companion [profiling guide](nested-sampling-profiling.md) measures one
+evaluation; this page measures how much of the run the ranks spend evaluating.
+They need separate fixes: a run can have minimum-cost stages and still leave
+half its cores idle.
 
 ## The one number that matters
 
@@ -179,34 +175,17 @@ defensible as a *measurement of Z* should be started with `--synchronous`, and
 
 ## Rank 0 is not a worker, and the utilisation numbers above were wrong
 
-PolyChord's rank 0 is the *administrator*: it hands slice-sampling chains out,
-collects them, keeps the live set and writes the files. It never calls the
-likelihood. `nested_sampling.F90` says so in its own array shapes -
-`worker_cluster(nprocs-1)`, `worker_epochs(nprocs-1)` - and `generate.F90`
-sets `active_workers = nprocs-1` when it makes the initial live points.
+PolyChord's rank 0 is the administrator: it distributes chains, collects
+results, maintains live points, and writes files; it never calls the
+likelihood. Its worker arrays and initialisation use `nprocs-1` workers.
 
-So a job of N ranks has N-1 workers, and its worker-time budget is
-`wall x (N-1)`, not `wall x N`. Everything above this section, and
-`./ri profile`, and the report's profiling table, used the rank count. That
-understated utilisation by (N-1)/N - 7% at 15 ranks - and the shortfall reads
-as idle time, which is the one thing on this page anybody is trying to remove.
-`worker_procs()` in `common.py` is the fix, and every figure above has been
-restated through it: the asynchronous pairs move from 91-92% to 97-98%.
+Thus the worker-time budget is `wall x (N-1)`, not `wall x N`. Earlier figures
+used N, understating utilisation by 7% at 15 ranks; `worker_procs()` and the
+figures above correct that. The asynchronous pairs are 97-98% busy, not
+91-92%; the barrier gain remains 27-33%, leaving no meaningful idle time at
+these settings.
 
-The conclusion of the section above does not change - the barrier was real and
-removing it was worth 27-33%. What changes is what is left: **the workers are
-97-98% busy, not 91-92%.** There is no meaningful idle time left to recover at
-these settings, and any further speed has to come from a cheaper evaluation,
-fewer evaluations per dead point, or more workers.
-
-To read utilisation off a run:
-
-```bash
-python3 -c 'import json,sys; j=json.load(open(sys.argv[1]+"/summary.json")); p=j["profiling"]
-n=p["mpi_procs"]; w=n-1 if n>1 else 1
-print("%.0f%% utilised" % (100*p["accounted_worker_seconds"]/(p["total_wall_seconds"]*w)))' \
-  results/nested-sampling/<run>
-```
+Use command above to read utilisation off a run.
 
 ## The administrator burns a hardware thread, and nothing tried gets it back
 
@@ -446,60 +425,6 @@ peak, and some evaluations report an off-source RMS below that. Those numbers
 are the gridder's own error floor, not the imager's noise. That is a
 parameter-space concern rather than a throughput one, but it is the reason
 this flag is not a free 5%.
-
-## What does work: build WSClean for the CPU it runs on
-
-> **Superseded.** The default is no longer the plain x86-64 baseline this
-> section measured against: it is `x86-64-v3`, which is AVX2 and FMA on a
-> named target rather than the build machine's. See
-> [the AVX2 build stopped being opt-in](#the-avx2-build-stopped-being-opt-in).
-> The `--native` figures below are still what `--native` is worth *over the
-> baseline*; over today's default it is a few percent.
-
-`docker/wsclean/Dockerfile` took `WSCLEAN_PORTABLE`, which is WSClean's own
-`-DPORTABLE` CMake option, and defaulted it to `ON` - a binary that runs on any
-x86-64, so no AVX2, no FMA. WSClean's gridder is the one place that costs the
-most.
-
-Replaying 200 evaluations, three interleaved repeats each:
-
-| | portable | native | |
-|---|---:|---:|---:|
-| 1 worker | 7.29 evals/s | 8.74 evals/s | **+19.8%** |
-| 20 workers | 70.3 evals/s | 74.8 evals/s | **+6.5%** |
-
-That gap between the two rows is the memory wall from the section above doing
-its work: a fifth off the CPU time is worth a fifth only when there is a core
-free to spend it on.
-
-End to end - `./ri search wsclean --nlive 25 --num-repeats 10`, default 20
-ranks, three seeds, portable and native alternating:
-
-| seed | evals/s portable | evals/s native | | `wsclean` binary |
-|---:|---:|---:|---:|---:|
-| 4242 | 43.2 | 47.6 | +10.3% | -9.5% |
-| 7 | 44.3 | 46.2 | +4.4% | -5.8% |
-| 99 | 41.2 | 48.4 | +17.6% | -15.6% |
-
-Native wins all three, by a median of 10%. The spread is the run-to-run
-throughput noise this repo has seen throughout - the replay's +6.5% at matched
-concurrency is the number to plan with, and the `wsclean` binary column, which
-is a mean over ~6000 evaluations rather than one wall clock, is the one to
-check a rebuild against.
-
-**It does not move the science.** Recomputing the objective from both builds'
-FITS output over 200 evaluations, the relative difference is a median of
-9.7e-8 and a maximum of 3.7e-7 - `-march=native`'s FMA contraction, four
-orders of magnitude below the gridder's own 1e-4 accuracy setting and further
-still below the PolyChord noise that makes two same-seed runs disagree on
-their evaluation count by 10%.
-
-**How to use it.** `./ri search wsclean --native`. The flag has to be on the
-*search*, not only on `./ri build wsclean --native`: both write the same
-`ri-reproducibility/wsclean:v3.7` tag, and a search builds its images first,
-so a plain `./ri search` puts the portable binary back under the tag before it
-runs. It stays opt-in because the binary will die with SIGILL on any other
-CPU, and the tag is shared with every other worktree on the host.
 
 ## The other half: the simulate stage spends 13-22ms predicting a constant
 
@@ -821,43 +746,11 @@ skeleton cache:
 | move out of `/dev/shm` into the evaluation directory | 2.7ms |
 | **total** | **13.4ms** |
 
-and inside "fill visibilities", **4.7ms of the 8.3ms is the TaQL `UPDATE ...
-SET WEIGHT, SIGMA`** that writes two constants to every row. Everything else
-in the stage - opening the MS, reading `DATA` and `UVW`, generating the noise,
-writing `DATA` and `FLAG` - comes to 2.6ms combined.
-
-The comment in `fill_point_source_visibilities()` already records that TaQL is
-the fastest of the obvious options, and re-measuring agrees: `putcol` on the
-pair costs 62.3ms (it is quadratic in rows on an `IncrementalStMan`
-variable-shaped column), a `putcell` row loop 11.1ms, TaQL 4.7ms. Two further
-attempts failed:
-
-- **Writing row 0 only** and letting `IncrementalStMan` propagate it forward.
-  It does not: makems leaves an explicit entry on many rows (the group holds
-  `TIME`, `INTERVAL` and 15 other columns that do change per row), so row 0
-  alone leaves every other row at makems' 1.0.
-- **Collapsing the column first** with one full TaQL update at skeleton-publish
-  time, then writing row 0 per evaluation. Same result - the ISM does not
-  collapse to a single entry.
-
-> **Corrected below.** This section closed with "dropping the write entirely
-> is not available either ... anything that fixes this has to change what
-> makems writes, not what the simulator writes afterwards". That was wrong:
-> the write is gone, and makems was not touched. See "The two constant columns
-> are gone" below. Every measurement above still reproduces.
-
-Dropping the write looked unavailable: `ms_to_r2d2_mat.py` reads `WEIGHT` to
-build R2D2's `nW = sqrt(1/sigma^2)`, so the column is load-bearing for the R2D2
-search even though WSClean, weighting naturally with a constant weight, is
-indifferent to its value.
-
 ## The two constant columns are gone
 
-The [simulate-stage section](#the-simulate-stage-two-thirds-of-what-is-left-is-two-constant-columns)
-above measured the TaQL `UPDATE $ms SET WEIGHT, SIGMA` at a third of the stage
-and concluded that dropping it "has to change what makems writes". It does
-not, because **makems already writes exactly the value the column needs to
-hold**: a fresh skeleton comes out with `WEIGHT = SIGMA = 1.0` on every row.
+The simulator no longer writes these columns because **makems already writes
+exactly the value they need to hold**: a fresh skeleton comes out with
+`WEIGHT = SIGMA = 1.0` on every row.
 The simulator was overwriting a uniform 1.0 with a uniform `1/sigma^2` - one
 number, replicated across the whole Measurement Set, at 1us per row per column
 because the pair sits in a variable-shaped `IncrementalStMan` group.
@@ -942,7 +835,7 @@ recorded evaluations spanning the run's cost distribution, once with the
 
 WSClean is bit-reproducible on the same input (the same MS twice gives
 identical FITS), so these are real differences, not measurement noise. They
-are the same size as the ones [the native build](#what-does-work-build-wsclean-for-the-cpu-it-runs-on)
+are the same size as the ones [the AVX2 build](#the-avx2-build-stopped-being-opt-in)
 already introduced for +6-10% - median 9.7e-8, max 3.7e-7 on the objective -
 and four orders of magnitude below the gridder's own `1e-4` accuracy setting.
 `sigma_res` amplifies it because it is a ratio of a near-zero residual to the
@@ -1323,8 +1216,8 @@ reporting a stall length noticeably past the timeout it fired on.
 
 ## The AVX2 build stopped being opt-in
 
-[What does work: build WSClean for the CPU it runs on](#what-does-work-build-wsclean-for-the-cpu-it-runs-on)
-above measured `-DPORTABLE=OFF` - WSClean compiled with `-march=native` - at
+[The superseded CPU-target measurements](#the-avx2-build-stopped-being-opt-in)
+measured `-DPORTABLE=OFF` - WSClean compiled with `-march=native` - at
 +19.8% serial and +6.5% at matched concurrency, then left it behind
 `./ri search wsclean --native` because such a binary dies with SIGILL on any
 other CPU and the image tag is shared with every other worktree on the host.

@@ -1,12 +1,3 @@
-"""MeqTrees TDL forest: predicts one unpolarized point source's visibilities
-into the DATA column of an existing Measurement Set.
-
-Not imported directly. Driven non-interactively by meqtree-pipeliner.py (see
-run_meqtrees_predict() in simulate_point_source_ms.py), which loads MS name,
-correlation selection, and source flux/position from a generated .tdlconf
-file and then runs the "predict" TDL job below.
-"""
-
 from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
@@ -28,24 +19,15 @@ TDLCompileOption("source_m_rad", "Point source m offset (rad)", 0.0, more=float)
 
 def _define_forest(ns, **kw):
     array, observation = mssel.setup_observation_context(ns)
-    # Write straight to DATA: this run's MS has no MODEL_DATA/CORRECTED_DATA
-    # imaging columns (makems writes only the base columns).
+    # makems writes only base columns, so write predictions straight to DATA.
     mssel.output_column = "DATA"
 
-    # At zero offset, reuse the phase-centre Direction object itself (identity
-    # check in SkyComponent.visibilities()) rather than building a new
-    # LMDirection(0, 0): Meow's K-Jones phase-shift path degenerates at exact
-    # l=m=0 and writes a wrongly-shaped result ("shape of child result does
-    # not match output column"); the identity-direction path skips K-Jones
-    # entirely and is exact for a source at phase centre anyway.
+    # K-Jones degenerates at l=m=0; phase_centre skips it exactly there.
     if source_l_rad == 0.0 and source_m_rad == 0.0:
         direction = observation.phase_centre
     else:
         direction = Meow.LMDirection(ns, "psrc", source_l_rad, source_m_rad)
-    # Q/U/V=0.0 (not None) forces Meow to build the full 2x2 brightness matrix.
-    # Leaving them None marks the source "unpolarized" and PointSource.brightness()
-    # then returns a bare scalar, which Sink can't write into a 2x2 correlation
-    # column ("shape of child result does not match output column").
+    # Q/U/V=0.0 forces the 2x2 brightness matrix Sink requires.
     source = Meow.PointSource(ns, "psrc", direction, I=source_flux_jy, Q=0.0, U=0.0, V=0.0)
     predict = source.visibilities(array, observation)
 

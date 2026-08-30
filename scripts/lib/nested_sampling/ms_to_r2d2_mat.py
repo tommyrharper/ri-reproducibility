@@ -71,9 +71,7 @@ def ms_to_r2d2_mat(
     u_lambda = u_m / wavelength
     v_lambda = v_m / wavelength
     y = vis.reshape(-1)
-    # MS WEIGHT is inverse variance; R2D2 nW is sqrt(inverse variance). Dividing
-    # by sigma is the same thing as the simulator writing WEIGHT = 1/sigma^2 and
-    # this taking its square root, without the per-evaluation column write.
+    # Convert MS inverse-variance weights to R2D2 nW, applying simulated sigma.
     nW = np.sqrt(np.repeat(row_weight, n_chan)) / noise_sigma_jy
 
     mat_path.parent.mkdir(parents=True, exist_ok=True)

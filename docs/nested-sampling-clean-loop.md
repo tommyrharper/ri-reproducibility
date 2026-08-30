@@ -132,27 +132,5 @@ reached. Both settings are "100 CLEAN iterations", spent differently. If a
 future change wants the deconvolution to actually converge, that is a `-niter`
 decision and it costs throughput rather than buying it.
 
-## Rig
-
-Since `-mgain` became a flag this needs no second image at all: run the two
-searches **simultaneously** with `--mgain 0.8` and `--mgain 0.9` and read the
-grid/predict pass counts out of `./ri profile <run> --phases`. That is the
-measurement in
-[the floor doc](nested-sampling-evaluation-floor.md#mgain-measured-again-as-a-flag)
-- 8.52 + 6.52 passes against 6.73 + 4.73, i.e. 6.5 major cycles down to 4.7 -
-and the pass counts are a far better arm-to-arm signal than evals/s, because
-the faster arm finishes first and then has the host to itself.
-
-The original rig, for a change that *is* baked into the image: `docker tag` a
-baseline image aside, edit the constant, `scripts/build.sh polychord`, tag the
-result, `git checkout` the file and rebuild - then run the two searches
-alternately with `POLYCHORD_IMAGE=<tag> ./ri search wsclean --no-build`. Image
-tags are shared across worktrees, so tag both arms explicitly rather than
-trusting `:lite` to still be what you built.
-
-For the replay arms, the corpus comes from one search with
-`--keep-measurement-sets` (2070 evaluations, 3.5 GB) and the arms are built by
-rewriting each record's `commands.wsclean` with a new `-name`, `-temp-dir` and
-`-mgain`. Scoring the outputs needs numpy, which the host Python does not
-have: run the comparison inside `ri-reproducibility/polychord:lite` with the
-repo bind-mounted.
+Current flag-based measurement procedure lives in the
+[evaluation-floor guide](nested-sampling-evaluation-floor.md#-mgain-measured-again-as-a-flag).
