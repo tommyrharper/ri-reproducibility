@@ -1036,6 +1036,8 @@ the per-rank CPU share up. A current three-repeat explicit four-thread probe
 measured 7.39s/evaluation versus 7.45s at 3 threads, but four threads still
 oversubscribes this host and remains an explicit candidate rather than the
 automatic setting. The
+seven-thread follow-up measured 7.62s/evaluation (0.7956 eval/s median) versus
+7.45s at 3 threads and 7.39s at 4 threads, so it is not a candidate either.
 1-thread column of that sweep is
 misleading, though - most of what it was measuring was OpenMP spin-waiting, not
 the thread count; see "The imaging workers' OpenMP threads sleep between
