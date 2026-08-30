@@ -106,6 +106,15 @@ check(
 )
 
 check(
+    "benchmark --mpi-procs reaches benchmark",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "1", "--mpi-procs", "16"]],
+    plan("bench", "run", "wsclean", "--mpi-procs", "16")[1],
+)
+
+check(
     "search --enable-param/--disable-param join into NS_*_PARAMS",
     {"NS_ENABLE_PARAMS": "source_offset_fraction", "NS_DISABLE_PARAMS": "channel_count,observation_minutes"},
     plan(

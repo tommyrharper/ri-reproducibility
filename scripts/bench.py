@@ -234,6 +234,8 @@ def do_run(args: argparse.Namespace) -> int:
     a search starts is written down twice. ./ri bench run has already built.
     """
     env = {**os.environ, **preset_settings(args.preset, args.imager)}
+    if args.mpi_procs is not None:
+        env["NS_MPI_PROCS"] = str(args.mpi_procs)
     command = ["./ri", "search", args.imager, "--no-build"]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
@@ -533,6 +535,8 @@ def main() -> int:
     run.add_argument("--repeat", type=int, default=1)
     run.add_argument("--timeout", type=float, metavar="SECONDS",
                      help="stop the whole benchmark, including its process tree, after this time")
+    run.add_argument("--mpi-procs", type=int, metavar="N",
+                     help="override MPI worker count for rank-scaling probes")
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
@@ -540,6 +544,8 @@ def main() -> int:
         parser.error("--repeat must be at least 1")
     if getattr(args, "handler", None) is do_run and args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be greater than 0")
+    if getattr(args, "handler", None) is do_run and args.mpi_procs is not None and args.mpi_procs < 1:
+        parser.error("--mpi-procs must be at least 1")
 
     if args.self_check:
         self_check()

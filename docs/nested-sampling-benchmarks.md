@@ -12,6 +12,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --preset production --repeat 15 # target-scale workload
 ./ri bench run wsclean --preset production --timeout 300 # bounded probe
 ./ri bench run wsclean --native --repeat 3       # host-specific WSClean build
+./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3  # rank-scaling probe
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -37,6 +38,9 @@ where a run at settings you were exploring rather than benchmarking belongs.
 settings, so host-specific binaries cannot be mixed with portable-build rows.
 On this host, three native default-preset repeats measured 70.2 eval/s median
 versus 70.6 eval/s for the portable baseline: no measurable speedup.
+
+`--mpi-procs N` overrides host-derived worker count for rank-scaling probes;
+the count is recorded in row settings, keeping results in separate groups.
 
 ## What a row is
 
