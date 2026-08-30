@@ -267,3 +267,24 @@ NS_SEED = 1
 NS_METRIC = "total_rms_jy"
 NS_SYNCHRONOUS = 0
 NS_KEEP_MEASUREMENT_SETS = 0
+
+# Production-scale workload. Expensive by design: use explicitly when
+# validating changes against the searches this project ultimately runs.
+[benchmark.production.wsclean]
+NS_NLIVE = 150
+NS_NUM_REPEATS = 15
+NS_MAX_NDEAD = -1
+NS_SEED = 1
+NS_METRIC = "total_rms_jy"
+NS_SYNCHRONOUS = 0
+NS_KEEP_MEASUREMENT_SETS = 0
+NS_WSCLEAN_MGAIN = 0.8
+
+[benchmark.production.r2d2]
+NS_NLIVE = 150
+NS_NUM_REPEATS = 15
+NS_MAX_NDEAD = -1
+NS_SEED = 1
+NS_METRIC = "total_rms_jy"
+NS_SYNCHRONOUS = 0
+NS_KEEP_MEASUREMENT_SETS = 0

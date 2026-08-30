@@ -9,6 +9,7 @@ and the one after that cannot quietly give it back.
 ./ri bench                       # the table
 ./ri bench run wsclean --repeat 3   # synchronous, fixed-seed comparison
 ./ri bench run wsclean --preset throughput --repeat 3  # production async mode
+./ri bench run wsclean --preset production --repeat 15 # target-scale workload
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -54,6 +55,11 @@ The `throughput` preset keeps the workload but sets `NS_SYNCHRONOUS = 0`, so it
 measures the asynchronous scheduler used by production searches. Use it for
 throughput work; the `default` preset remains synchronous because its fixed seed
 makes repeated evaluation counts directly comparable.
+
+The `production` preset matches target searches: `NS_NLIVE = 150`,
+`NS_NUM_REPEATS = 15`, `NS_MAX_NDEAD = -1`, fixed seed, and asynchronous
+scheduling. It is intentionally expensive and should be run only for final
+confirmation after a cheaper preset shows a candidate.
 
 ## What makes two commits comparable
 
