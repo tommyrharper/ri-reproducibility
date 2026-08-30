@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Fifty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Fifty-three profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -36,7 +36,7 @@ rates are historical and roughly half the current rate.
 | R2D2 `.mat` conversion skips compression on tmpfs | `ms_to_r2d2_mat.py` | 8.59 to 0.39 ms for 12k visibilities (microbenchmark) |
 | R2D2 `.mat` conversion avoids broadcast temporaries | `ms_to_r2d2_mat.py` | 1.13 to 1.09 ms for 1404 visibilities (10 warm calls, container microbenchmark) |
 | R2D2 `.mat` conversion flattens weights directly | `ms_to_r2d2_mat.py` | 1.802 to 1.657 us per weight expansion (100k calls, container microbenchmark; 8.0%) |
-| R2D2 checkpoints loaded once and shared by forked workers | `r2d2_serve.py` | Production `optimiser.R2D2` alias now hits the cache (self-check); removes repeated 25-checkpoint loads per evaluation; end-to-end speed and RSS await checkpoint files |
+| R2D2 checkpoints loaded once and shared by forked workers | `r2d2_serve.py` | Production `optimiser.R2D2` alias now hits the cache (self-check); removes repeated 25-checkpoint loads per evaluation; first real benchmark is 0.438 +/- 0.002 eval/s at 3.47 GB peak worker memory |
 
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
@@ -68,7 +68,14 @@ about 1.0 ms before the change.
 The latest default synchronous baseline measures 71.1 +/- 0.85 evaluations/second
 at 150.9 +/- 0.011 ms/evaluation over three repeats; imaging remains 133.3 +/-
 0.15 ms/evaluation.
-R2D2 has only smoke-scale rows until `checkpoints/R2D2_A1` is supplied.
+The first three-repeat R2D2 benchmark with the checkpoint cache enabled measures
+**0.438 +/- 0.002 evaluations/second**, 11.8 +/- 0.03 seconds/evaluation, and
+3.47 GB peak worker memory at 8 ranks (`nlive=8`, `max_ndead=12`). The older
+pre-cache baseline was 0.37 +/- 0.002 evaluations/second, but it also predates
+the `.mat` conversion changes, so this is baseline evidence rather than an
+isolated cache A/B result. R2D2 production-scale measurement remains too
+expensive for this iteration; the checkpoint archive is now available through
+`CHECKPOINTS_DIR` for future controlled comparisons.
 
 ## What is priced but deliberately not taken
 
