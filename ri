@@ -168,6 +168,22 @@ def do_profile(args):
                    *(["--buckets", str(args.buckets)] if args.buckets else []))]
 
 
+def do_bench(args):
+    return {}, [uv("scripts/bench.py")]
+
+
+def do_bench_run(args):
+    # Builds first, exactly as a search does: the images bake the code, so
+    # without it the benchmark times whatever was baked last.
+    return {}, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
+        uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
+           "--repeat", str(args.repeat))]
+
+
+def do_bench_record(args):
+    return {}, [uv("scripts/bench.py", "record", args.run)]
+
+
 def do_merge(args):
     out = ["--out", args.out] if args.out else []
     return {}, [uv("scripts/merge-nested-sampling-runs.py", *args.runs, *out)]
@@ -483,7 +499,8 @@ def build_parser():
         description=(
             "A terminal front end over the commands above: the run table is\n"
             "./ri runs, selecting a run shows ./ri health for it and re-runs\n"
-            "that every 5 seconds, and the form starts ./ri search.\n"
+            "that every 5 seconds, b shows ./ri bench, and the form starts\n"
+            "./ri search.\n"
             "\n"
             "A search started here runs detached, so quitting the interface -\n"
             "or closing the terminal - leaves it going. It joins the table as\n"
@@ -562,6 +579,51 @@ def build_parser():
                               "that sets it, see docs/nested-sampling-cost-model.md")
     profile.add_argument("--top", type=int, help="with --phases: phases to print, largest first")
     profile.add_argument("--buckets", type=int, help="with --over-time: wall-clock buckets to print")
+
+    bench = add(
+        "bench", do_bench, "throughput per commit, to catch a regression",
+        description=(
+            "The table in benchmarks.jsonl: evaluations/second and the per-stage\n"
+            "cost behind it, one column per commit, newest first.\n"
+            "\n"
+            "Rows are grouped by machine, imager and settings, and each cell is a\n"
+            "mean with the standard error of its repeats - so it narrows as\n"
+            "repeats at one commit accumulate, and a change is only starred once\n"
+            "it is bigger than the noise it has to beat.\n"
+            "\n"
+            "Every search that finishes adds a row. `./ri bench run` adds the\n"
+            "controlled one, at the pinned settings in defaults.toml that make\n"
+            "commits comparable. Details: docs/nested-sampling-benchmarks.md."
+        ),
+    )
+    bench_subs = bench.add_subparsers(metavar="<what>")
+
+    bench_run = bench_subs.add_parser(
+        "run", parents=[dry_run], help="run the controlled search and record it",
+        description="Build the images, run the search a preset pins the settings "
+                    "of, and add its row. Commit first: a row carries the "
+                    "commit it was measured at, and one measured on a dirty "
+                    "tree is marked with a trailing +.",
+    )
+    bench_run.add_argument("imager", choices=("wsclean", "r2d2"),
+                           help="which imager to measure")
+    bench_run.add_argument("--preset", default="default", metavar="NAME",
+                           help="which [benchmark.NAME.<imager>] in defaults.toml "
+                                "to run (default: %(default)s)")
+    bench_run.add_argument("--repeat", type=int, default=1, metavar="N",
+                           help="run it N times, which is how the error bar on "
+                                "this commit gets smaller (default: %(default)s)")
+    bench_run.set_defaults(handler=do_bench_run)
+
+    bench_record = bench_subs.add_parser(
+        "record", parents=[dry_run], help="add a row for a run that already finished",
+        description="Every search does this itself when it finishes; this is for "
+                    "one that finished before it did, and it stamps the commit "
+                    "checked out now rather than the one that ran.",
+    )
+    bench_record.add_argument("run", metavar="RUN",
+                              help="run directory, or its name under results/nested-sampling/")
+    bench_record.set_defaults(handler=do_bench_record)
 
     merge = add("merge", do_merge, "merge compatible runs into one",
                 description="Post-processing only. Sources must agree on imager, "

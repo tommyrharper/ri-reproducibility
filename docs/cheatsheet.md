@@ -27,6 +27,8 @@ the complete interface.
 ./ri runs                         # list runs and completion state
 ./ri health results/nested-sampling/<run>
 ./ri profile results/nested-sampling/<run>
+./ri bench                        # throughput per commit, to catch a regression
+./ri bench run wsclean --repeat 3 # add rows for the commit checked out now
 ./ri report                       # generate HTML report
 ./ri serve                        # serve report for remote viewing
 ./ri merge <run-a> <run-b>

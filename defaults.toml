@@ -211,3 +211,38 @@ max = 40.0e9
 name = "Q"
 min = 40.0e9
 max = 50.0e9
+
+# The controlled searches `./ri bench run <imager>` times, and the settings a
+# row in benchmarks.jsonl is grouped by. Pinned rather than inherited from the
+# defaults above, so a tuning change up there cannot silently redefine what
+# every archived row was measured under - and the seed is pinned so repeats at
+# one commit draw the same points, leaving only the host's own noise in the
+# error bar. A table here rather than scalars, so defaults.sh skips it: these
+# are not defaults for anything, only for the benchmark.
+#
+# Keys are environment-variable names, as above. Add a second preset by adding
+# `[benchmark.<name>.<imager>]`; a run whose run.env matches every key of one
+# is recorded under it, and everything else is recorded as `custom`. See
+# docs/nested-sampling-benchmarks.md.
+
+[benchmark.default.wsclean]
+NS_NLIVE = 32
+NS_NUM_REPEATS = 2
+NS_MAX_NDEAD = 150
+NS_SEED = 1
+NS_METRIC = "total_rms_jy"
+NS_SYNCHRONOUS = 1
+NS_KEEP_MEASUREMENT_SETS = 0
+NS_WSCLEAN_MGAIN = 0.8
+
+# Sized down against the WSClean preset above, not for a shorter table: one
+# R2D2 evaluation is 14-26 seconds of imaging against WSClean's 0.13, so these
+# ~42 evaluations already cost ~2 minutes a repeat.
+[benchmark.default.r2d2]
+NS_NLIVE = 8
+NS_NUM_REPEATS = 2
+NS_MAX_NDEAD = 12
+NS_SEED = 1
+NS_METRIC = "total_rms_jy"
+NS_SYNCHRONOUS = 1
+NS_KEEP_MEASUREMENT_SETS = 0
