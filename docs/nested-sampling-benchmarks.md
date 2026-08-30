@@ -7,7 +7,8 @@ and the one after that cannot quietly give it back.
 
 ```bash
 ./ri bench                       # the table
-./ri bench run wsclean --repeat 3   # add three rows for the commit checked out
+./ri bench run wsclean --repeat 3   # synchronous, fixed-seed comparison
+./ri bench run wsclean --preset throughput --repeat 3  # production async mode
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -48,6 +49,11 @@ checkout, and a laptop's rows can never pool with a server's. `NS_SEED` is not
 part of the grouping - it changes which points are drawn, not the
 configuration being measured, and it is random per run, so in the key every
 ad-hoc search would be a group of one.
+
+The `throughput` preset keeps the workload but sets `NS_SYNCHRONOUS = 0`, so it
+measures the asynchronous scheduler used by production searches. Use it for
+throughput work; the `default` preset remains synchronous because its fixed seed
+makes repeated evaluation counts directly comparable.
 
 ## What makes two commits comparable
 

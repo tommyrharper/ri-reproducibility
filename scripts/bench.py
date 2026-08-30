@@ -426,6 +426,9 @@ def self_check() -> None:
         settings = preset_settings("default", imager)
         assert preset_for(settings, imager) == "default", settings
         assert preset_for({**settings, "NS_NLIVE": "999"}, imager) == "custom"
+        throughput = preset_settings("throughput", imager)
+        assert throughput["NS_SYNCHRONOUS"] == "0", throughput
+        assert preset_for(throughput, imager) == "throughput", throughput
     # A preset only claims a run that matches every key it pins, but a run may
     # carry keys the preset says nothing about - NS_MPI_PROCS is host-derived.
     assert preset_for({**preset_settings("default", "wsclean"),
