@@ -47,6 +47,7 @@ def peak_memory_bytes() -> int:
 
 # Avoid eager imports from `utils`; the last two pull unused heavy dependencies.
 _UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
+_CHECKPOINT_CACHE: dict[tuple[int, str], dict] = {}
 
 
 def install_lazy_utils() -> None:
@@ -67,6 +68,24 @@ def install_lazy_utils() -> None:
     sys.modules["utils"] = package
 
 
+def patch_checkpoint_loading() -> None:
+    """Load each checkpoint series once and share it across forked workers."""
+    import utils.util_model as util_model
+
+    original = util_model.get_DNNs
+
+    def get_DNNs(num_iter: int, ckpt_path):
+        key = (int(num_iter), os.path.abspath(str(ckpt_path)))
+        if key not in _CHECKPOINT_CACHE:
+            _CHECKPOINT_CACHE[key] = original(num_iter, ckpt_path)
+        return _CHECKPOINT_CACHE[key]
+
+    util_model.get_DNNs = get_DNNs
+    package = sys.modules.get("utils")
+    if package is not None:
+        package.get_DNNs = get_DNNs
+
+
 def warm_imports() -> None:
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
@@ -78,6 +97,14 @@ def warm_imports() -> None:
             runpy.run_path(str(IMAGER), run_name="__warmup__")
             patch_op_norm()
             patch_nufft_plans()
+            patch_checkpoint_loading()
+            checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
+            if checkpoint_path.is_dir():
+                # Load before fork: tensor pages stay shared until a child
+                # writes them, instead of paying torch.load once per rank.
+                sys.modules["utils"].get_DNNs(
+                    int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path)
+                )
             # `create_meas_op` imports this backend lazily; preload it after
             # patching the operator norm.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
@@ -611,11 +638,37 @@ def self_check_lazy_utils() -> None:
     print("r2d2 lazy utils self-check passed")
 
 
+def self_check_checkpoint_cache() -> None:
+    calls = []
+    package = types.ModuleType("utils")
+    module = types.ModuleType("utils.util_model")
+
+    def loader(num_iter, ckpt_path):
+        calls.append((num_iter, ckpt_path))
+        return {"N1": object()}
+
+    module.get_DNNs = loader
+    sys.modules["utils"] = package
+    sys.modules["utils.util_model"] = module
+    _CHECKPOINT_CACHE.clear()
+    try:
+        patch_checkpoint_loading()
+        package.get_DNNs(1, "/checkpoints/R2D2_A1")
+        package.get_DNNs(1, "/checkpoints/R2D2_A1")
+        assert calls == [(1, "/checkpoints/R2D2_A1")], calls
+    finally:
+        _CHECKPOINT_CACHE.clear()
+        del sys.modules["utils.util_model"]
+        del sys.modules["utils"]
+    print("r2d2 checkpoint cache self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_lanczos_largest_eigenvalue()
         self_check_nufft_plan_reuse()
         self_check_lazy_utils()
+        self_check_checkpoint_cache()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
