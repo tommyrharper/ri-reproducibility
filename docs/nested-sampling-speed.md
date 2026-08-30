@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred forty-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred forty-nine profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.4 +/- 2.7
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -140,6 +140,11 @@ threads (0.7660-0.7708), both at 8 ranks and **3.47 GB** peak worker memory.
 Four threads is a **5.7%** median improvement over the automatic three-thread
 setting, but remains an explicit candidate: the benchmark CLI runs each thread
 setting in a separate invocation, so this result is not an interleaved A/B.
+The new interleaved runner completed two paired repeats per arm at **0.7276
+eval/s** for three threads and **0.7730 eval/s** for four threads (3.47 GB
+peak memory in both arms), a 6.2% four-thread median advantage. This remains
+candidate evidence rather than a portable default because two pairs are not a
+full production-strength sample.
 The current three-repeat 7-worker WSClean probe measured **71.8 +/- 1.2
 evaluations/second** (68.3, 71.8, and 72.9), with **34.4 MB** peak memory and
 79.8 ms/evaluation. It is slower than the current 20-worker control and does
@@ -392,3 +397,4 @@ Chronological; each page starts where the last stopped.
 | [process warm-up](nested-sampling-process-warm-up.md) | The 5 ms before the first visibility - and the unsigned-arithmetic bug that makes WSClean fit its restoring beam on a quarter of the box it means to use. A real failure mode, not result-preserving to fix. |
 | [disk footprint](nested-sampling-disk-footprint.md) | Bytes rather than clock. A run is `~17 x nlive x num_repeats` evaluations, and `evaluations/` needs no sharding. |
 | [evaluation floor](nested-sampling-evaluation-floor.md) | The current budget, `--mgain` as a flag, and the last six avenues closed. |
+eval/s** for three threads and **0.7730 eval/s** for four threads (3.47 GB

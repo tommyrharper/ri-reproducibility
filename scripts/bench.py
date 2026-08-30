@@ -246,13 +246,18 @@ def do_run(args: argparse.Namespace) -> int:
         env["NS_MPI_PROCS"] = str(args.mpi_procs)
     if args.omp_threads is not None:
         env["R2D2_OMP_THREADS"] = str(args.omp_threads)
+    arms = args.interleave_omp_threads or (args.omp_threads,)
+    if args.interleave_omp_threads:
+        env["R2D2_OMP_THREADS"] = str(arms[0])
     command = ["./ri", "search", args.imager, "--no-build"]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
     # measured 8-16% faster than the ones behind it here: the package spends a
     # power budget it then has to pay back (docs/nested-sampling-power-limit.md),
     # so a cold first run is effectively a faster machine.
-    for attempt in range(args.repeat + 1):
+    for attempt in range(args.repeat * len(arms) + 1):
+        if attempt and arms[0] is not None:
+            env["R2D2_OMP_THREADS"] = str(arms[(attempt - 1) % len(arms)])
         warm_up = {"NS_BENCH_RECORD": "0"} if attempt == 0 else {}
         process = subprocess.Popen(command, cwd=REPO_ROOT,
                                    env={**env, **warm_up},
@@ -549,6 +554,9 @@ def main() -> int:
                      help="override MPI worker count for rank-scaling probes")
     run.add_argument("--omp-threads", type=int, metavar="N",
                      help="override per-rank R2D2 OpenMP/BLAS threads")
+    run.add_argument("--interleave-omp-threads", type=int, nargs=2,
+                     metavar=("A", "B"),
+                     help="alternate two R2D2 thread counts; --repeat is per arm")
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
@@ -560,6 +568,13 @@ def main() -> int:
         parser.error("--mpi-procs must be at least 1")
     if getattr(args, "handler", None) is do_run and args.omp_threads is not None and args.omp_threads < 1:
         parser.error("--omp-threads must be at least 1")
+    if getattr(args, "handler", None) is do_run and args.interleave_omp_threads:
+        if args.imager != "r2d2":
+            parser.error("--interleave-omp-threads is only valid for r2d2")
+        if args.omp_threads is not None:
+            parser.error("use --interleave-omp-threads or --omp-threads, not both")
+        if any(value < 1 for value in args.interleave_omp_threads):
+            parser.error("interleaved OMP thread counts must be at least 1")
     if getattr(args, "handler", None) is do_run and args.mpi_procs is not None:
         available = available_cpu_count()
         if args.mpi_procs > available:

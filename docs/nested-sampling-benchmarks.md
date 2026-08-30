@@ -48,6 +48,10 @@ search, avoiding Open MPI slot errors and wasted probes.
 `--omp-threads N` overrides R2D2's automatic per-rank thread count and is
 recorded in row settings, keeping thread-count probes in separate groups.
 
+`--interleave-omp-threads A B` alternates two R2D2 thread counts after one
+unrecorded warm-up; `--repeat N` runs N measured searches per arm. This keeps
+small thread-count differences paired against host drift.
+
 ## What a row is
 
 One JSON object per line in `benchmarks.jsonl`, appended by

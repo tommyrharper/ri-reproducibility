@@ -319,6 +319,17 @@ check(
 )
 
 check(
+    "bench run supports interleaved R2D2 thread arms",
+    [["scripts/build.sh", "r2d2"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "r2d2",
+      "--preset", "default", "--repeat", "3",
+      "--interleave-omp-threads", "3", "4"]],
+    plan("bench", "run", "r2d2", "--repeat", "3",
+         "--interleave-omp-threads", "3", "4")[1],
+)
+
+check(
     "bench record names the run to add",
     [["uv", "run", "scripts/bench.py", "record", "wsclean-vlaa-20260827T101500Z"]],
     plan("bench", "record", "wsclean-vlaa-20260827T101500Z")[1],
