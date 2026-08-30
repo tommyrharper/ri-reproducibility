@@ -249,6 +249,9 @@ def do_run(args: argparse.Namespace) -> int:
         env["NS_MPI_PROCS"] = str(args.mpi_procs)
     if args.interleave_mpi_procs:
         env["NS_MPI_PROCS"] = str(mpi_arms[0])
+    schedule_arms = args.interleave_synchronous or (None,)
+    if args.interleave_synchronous:
+        env["NS_SYNCHRONOUS"] = str(schedule_arms[0])
     if args.omp_threads is not None:
         env["R2D2_OMP_THREADS"] = str(args.omp_threads)
     arms = args.interleave_omp_threads or (args.omp_threads,)
@@ -260,11 +263,13 @@ def do_run(args: argparse.Namespace) -> int:
     # measured 8-16% faster than the ones behind it here: the package spends a
     # power budget it then has to pay back (docs/nested-sampling-power-limit.md),
     # so a cold first run is effectively a faster machine.
-    for attempt in range(args.repeat * len(arms) * len(mpi_arms) + 1):
+    for attempt in range(args.repeat * len(arms) * len(mpi_arms) * len(schedule_arms) + 1):
         if attempt and arms[0] is not None:
             env["R2D2_OMP_THREADS"] = str(arms[(attempt - 1) % len(arms)])
         if attempt and mpi_arms[0] is not None:
             env["NS_MPI_PROCS"] = str(mpi_arms[(attempt - 1) % len(mpi_arms)])
+        if attempt and schedule_arms[0] is not None:
+            env["NS_SYNCHRONOUS"] = str(schedule_arms[(attempt - 1) % len(schedule_arms)])
         warm_up = {"NS_BENCH_RECORD": "0"} if attempt == 0 else {}
         process = subprocess.Popen(command, cwd=REPO_ROOT,
                                    env={**env, **warm_up},
@@ -567,6 +572,9 @@ def main() -> int:
     run.add_argument("--interleave-mpi-procs", type=int, nargs=2,
                      metavar=("A", "B"),
                      help="alternate two MPI worker counts; --repeat is per arm")
+    run.add_argument("--interleave-synchronous", type=int, nargs=2,
+                     metavar=("A", "B"),
+                     help="alternate synchronous scheduling values; --repeat is per arm")
     run.add_argument("--allow-oversubscription", action="store_true",
                      help="allow MPI counts above CPU affinity for explicit probes")
     run.set_defaults(handler=do_run)
@@ -576,6 +584,9 @@ def main() -> int:
         parser.error("--repeat must be at least 1")
     if getattr(args, "handler", None) is do_run and args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be greater than 0")
+    if (getattr(args, "handler", None) is do_run and args.interleave_synchronous
+            and any(value not in (0, 1) for value in args.interleave_synchronous)):
+        parser.error("interleaved synchronous values must be 0 or 1")
     if getattr(args, "handler", None) is do_run and args.mpi_procs is not None and args.mpi_procs < 1:
         parser.error("--mpi-procs must be at least 1")
     if getattr(args, "handler", None) is do_run and args.omp_threads is not None and args.omp_threads < 1:

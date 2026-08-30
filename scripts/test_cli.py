@@ -341,6 +341,17 @@ check(
 )
 
 check(
+    "bench run supports interleaved scheduling arms",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "3",
+      "--interleave-synchronous", "0", "1"]],
+    plan("bench", "run", "wsclean", "--repeat", "3",
+         "--interleave-synchronous", "0", "1")[1],
+)
+
+check(
     "benchmark allows explicit oversubscription probes",
     [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
      ["scripts/build.sh", "polychord"],

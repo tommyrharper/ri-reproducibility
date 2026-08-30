@@ -15,6 +15,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3  # rank-scaling probe
 ./ri bench run wsclean --preset throughput --interleave-mpi-procs 19 20 --repeat 3  # paired rank A/B
 ./ri bench run wsclean --preset throughput --interleave-mpi-procs 20 21 --allow-oversubscription --repeat 3  # explicit oversubscription probe
+./ri bench run wsclean --interleave-synchronous 0 1 --mpi-procs 20 --repeat 3  # paired async/sync scheduling
 ./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3  # thread-count probe
 ```
 
@@ -58,6 +59,9 @@ small thread-count differences paired against host drift.
 counts above available CPU affinity before launching the warm-up. Add
 `--allow-oversubscription` only for an explicit probe of counts above that
 limit; it does not change search defaults or rank budgeting.
+
+`--interleave-synchronous A B` pairs asynchronous (`0`) and synchronous (`1`)
+scheduling under the same preset. Values other than `0` or `1` are rejected.
 
 ## What a row is
 
@@ -107,7 +111,7 @@ rather than for realism, all measured on the 20-CPU Hetzner host:
   every time. It costs ~45% of the throughput, which does not matter for a
   number that is only ever compared with itself - but it does mean this table
   cannot see a change to the asynchronous scheduler. That question is
-  [throughput](nested-sampling-throughput.md), and it needs its own A/B.
+  Use `--interleave-synchronous 0 1` for that paired A/B.
 - **A warm-up search that is not recorded.** The first search after an idle
   spell measured 76.5 evaluations/second against 70.2, 72.1 and 69.3 for the
   three behind it - the package spends a power budget it then has to pay back
