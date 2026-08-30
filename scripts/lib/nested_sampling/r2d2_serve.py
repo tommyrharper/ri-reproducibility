@@ -48,6 +48,7 @@ def peak_memory_bytes() -> int:
 # Avoid eager imports from `utils`; the last two pull unused heavy dependencies.
 _UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
 _CHECKPOINT_CACHE: dict[tuple[int, str], dict] = {}
+_NORMALIZED_CHECKPOINT_CACHE: dict[int, dict] = {}
 _NUFFT_PLAN_CACHE: dict[tuple[int, tuple[int, ...], str, float], object] = {}
 
 
@@ -74,6 +75,15 @@ def patch_checkpoint_loading() -> None:
     import utils.util_model as util_model
 
     original = util_model.get_DNNs
+    def load_state_dict_from_state_dict(net, state_dict):
+        key = id(state_dict)
+        normalized = _NORMALIZED_CHECKPOINT_CACHE.get(key)
+        if normalized is None:
+            normalized = {'.'.join(name.split('.')[1:]): state_dict[name]
+                          for name in state_dict}
+            _NORMALIZED_CHECKPOINT_CACHE[key] = normalized
+        net.load_state_dict(normalized, assign=True)
+        return net
 
     def get_DNNs(num_iter: int, ckpt_path):
         key = (int(num_iter), os.path.abspath(str(ckpt_path)))
@@ -82,6 +92,7 @@ def patch_checkpoint_loading() -> None:
         return _CHECKPOINT_CACHE[key]
 
     util_model.get_DNNs = get_DNNs
+    util_model.load_state_dict_from_state_dict = load_state_dict_from_state_dict
     package = sys.modules.get("utils")
     if package is not None:
         package.get_DNNs = get_DNNs
@@ -665,19 +676,32 @@ def self_check_checkpoint_cache() -> None:
         return {"N1": object()}
 
     module.get_DNNs = loader
+    module.load_state_dict_from_state_dict = lambda net, state_dict: net
     optimiser = types.ModuleType("optimiser.R2D2")
     optimiser.get_DNNs = loader
     sys.modules["utils"] = package
     sys.modules["utils.util_model"] = module
     sys.modules["optimiser.R2D2"] = optimiser
     _CHECKPOINT_CACHE.clear()
+    _NORMALIZED_CHECKPOINT_CACHE.clear()
     try:
         patch_checkpoint_loading()
         package.get_DNNs(1, "/checkpoints/R2D2_A1")
         optimiser.get_DNNs(1, "/checkpoints/R2D2_A1")
         assert calls == [(1, "/checkpoints/R2D2_A1")], calls
+        state_dict = {"unet.layer.weight": object()}
+
+        class Net:
+            def load_state_dict(self, values, **kwargs):
+                assert list(values) == ["layer.weight"]
+                assert kwargs == {"assign": True}
+
+        module.load_state_dict_from_state_dict(Net(), state_dict)
+        module.load_state_dict_from_state_dict(Net(), state_dict)
+        assert len(_NORMALIZED_CHECKPOINT_CACHE) == 1
     finally:
         _CHECKPOINT_CACHE.clear()
+        _NORMALIZED_CHECKPOINT_CACHE.clear()
         del sys.modules["utils.util_model"]
         del sys.modules["utils"]
         del sys.modules["optimiser.R2D2"]
