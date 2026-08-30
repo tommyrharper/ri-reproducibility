@@ -605,7 +605,8 @@ def build_parser():
                     "commit it was measured at, and one measured on a dirty "
                     "tree is marked with a trailing +.",
     )
-    bench_run.add_argument("imager", choices=("wsclean", "r2d2"))
+    bench_run.add_argument("imager", choices=("wsclean", "r2d2"),
+                           help="which imager to measure")
     bench_run.add_argument("--preset", default="default", metavar="NAME",
                            help="which [benchmark.NAME.<imager>] in defaults.toml "
                                 "to run (default: %(default)s)")
