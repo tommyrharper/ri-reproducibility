@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred forty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred forty-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.4 +/- 2.7
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -134,16 +134,12 @@ evaluations/second** (74.6, 74.9, and 73.3), with 34.1 MB peak memory and
 87.1 +/- 1.2 ms/evaluation. Its 75.4 +/- 1.1 ms/evaluation image-binary stage
 is slower than the 9-20-worker range and does not displace the 20-worker
 default.
-The latest three-repeat R2D2 control measured **0.7272 +/- 0.0014
-evaluations/second** (0.7248, 0.7272, and 0.7328) at 8 ranks with automatic
-three-thread workers. Peak worker memory remained **3.47 GB** and imaging
-remained **7.41 s/evaluation**; this refresh is not a new speed claim.
-The fresh three-repeat four-thread R2D2 probe measured **0.8143 +/- 0.018
-evaluations/second** (0.8217, 0.7543, and 0.8143) at 8 ranks, a 12.0% median
-improvement over the automatic three-thread control, with unchanged **3.47 GB**
-peak worker memory. Four threads is now the fastest measured R2D2 setting,
-though the variation warrants a matched control refresh before changing the
-automatic default.
+The matched fresh three-repeat R2D2 controls measured **0.7254 evaluations/second**
+at three threads (0.7253-0.7291) and **0.7671 evaluations/second** at four
+threads (0.7660-0.7708), both at 8 ranks and **3.47 GB** peak worker memory.
+Four threads is a **5.7%** median improvement over the automatic three-thread
+setting, but remains an explicit candidate: the benchmark CLI runs each thread
+setting in a separate invocation, so this result is not an interleaved A/B.
 The current three-repeat 7-worker WSClean probe measured **71.8 +/- 1.2
 evaluations/second** (68.3, 71.8, and 72.9), with **34.4 MB** peak memory and
 79.8 ms/evaluation. It is slower than the current 20-worker control and does
