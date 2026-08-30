@@ -171,13 +171,15 @@ def print_phases(run_dir: Path, top: int) -> None:
         )
     print(f"{count} wsclean logs, {logged_ms:.1f} ms of logged work per evaluation")
     print()
-    print(f"{'ms/eval':>8} {'share':>7} {'n/eval':>7} {'ms each':>8}  phase (log line -> next log line)")
+    print(f"{'ms/eval':>8} {'p90/eval':>8} {'share':>7} {'n/eval':>7} {'ms each':>8}  phase (log line -> next log line)")
     print("-" * 110)
     for (before, after), values in sorted(gaps.items(), key=lambda kv: -sum(kv[1]))[:top]:
         typical = statistics.median(values)
         total = len(values) / count * typical
-        print(f"{total:8.2f} {total / logged_ms:6.1%} {len(values) / count:7.2f} "
-              f"{typical:8.3f}  {before[:52]} -> {after[:40]}")
+        ordered = sorted(values)
+        p90 = ordered[min(len(ordered) - 1, (9 * len(ordered) - 1) // 10)]
+        print(f"{total:8.2f} {p90 * len(values) / count:8.2f} {total / logged_ms:6.1%} "
+              f"{len(values) / count:7.2f} {typical:8.3f}  {before[:52]} -> {after[:40]}")
 
 
 _R2D2_PHASE = re.compile(r"Time for (model update|residual computation): ([0-9.]+) sec")

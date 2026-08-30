@@ -44,9 +44,10 @@ between it and the next line - and gaps are bucketed by (line, next line),
 because `Loading data in memory...` appears once per gridding pass and means
 something different each time.
 
-The CLI reports median logged duration and median typical phase gaps, with the
-gap median weighted by its observed occurrences per evaluation. One long-tail
-evaluation cannot choose the next bottleneck.
+The CLI reports median logged duration, median typical phase gaps, and a p90
+phase contribution per evaluation. The gap median is weighted by its observed
+occurrences per evaluation, while p90 exposes tail cost without letting one
+long-tail evaluation choose the next bottleneck.
 
 For R2D2, `./ri profile <run> --r2d2-phases` reports the median and p90 total
 per evaluation for each logged phase. The p90 uses whole-evaluation totals, so
