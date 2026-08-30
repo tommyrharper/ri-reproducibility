@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Seventy-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Seventy-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.3 +/- 1.9
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -31,6 +31,7 @@ rates are historical and roughly half the current rate.
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
 | Sigma-res FITS files load only when the objective uses `sigma_res` | `polychord_*.py` | 1.03 to 0.46 ms metrics stage on the current WSClean benchmark; objective-preserving for other metrics |
+| Dirty FITS output is disabled when the objective does not use `sigma_res` | `polychord_wsclean.py` | 111.3 +/- 1.8 eval/s median in three patched runs versus 109.3 +/- 2.5 previously; within normal variance, with ~33.9 MB peak memory |
 | Residual metrics reuse the loaded image buffer | `common.py` | Removes one full-image allocation per evaluation; memory-only change at current image size |
 | Off-source metric masks are bounded and reused | `common.py` | 25.2 to 3.6 us per mask (container microbenchmark); no measurable end-to-end gain |
 | R2D2 `.mat` conversion skips compression on tmpfs | `ms_to_r2d2_mat.py` | 8.59 to 0.39 ms for 12k visibilities (microbenchmark) |
@@ -53,8 +54,8 @@ and [run scaling](nested-sampling-run-scaling.md):
 | Progress-bar redraw backed off to 9x its own cost | 44% of a core down to ~12%, and no longer growing with the run |
 | GNU progress scans classify total and post-checkpoint evaluations in one `find` walk | 0.232 s to 0.073 s for 20 scans of a 635-evaluation run; BSD `find` keeps the portable fallback |
 
-The current async WSClean throughput check measures **110.3 +/- 1.9
-evaluations/second** at 20 workers, 140.5 +/- 2.8 ms/evaluation, and 34.4 MB
+The current async WSClean throughput check measures **111.3 +/- 1.8
+evaluations/second** at 20 workers, 144.6 +/- 1.1 ms/evaluation, and 33.9 MB
 peak imaging-worker memory across three repeats (30 August 2026). This is
 consistent with the host's observed run-to-run variance, not a claimed code
 speedup; the image binary remains the dominant stage at 125.6 +/- 2.7
