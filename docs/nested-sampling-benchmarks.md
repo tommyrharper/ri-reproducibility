@@ -88,13 +88,13 @@ groups, which is the intended behaviour: they are not comparable any more.
 
 ## Reading the table
 
-Each cell is a mean over the repeats in that column, `±` the standard error of
-those repeats - so it narrows as `1/sqrt(n)` as repeats at one commit
-accumulate, and a single row shows no error bar at all because it has earned
-none.
+Each cell is a median over repeats in that column, `±` an IQR-based robust
+standard-error estimate. This prevents one long-tail timing from dominating
+the result while the error estimate narrows as repeats accumulate. A single
+row shows no error bar.
 
 `Δ evals/s` is the change against the column to its right. It is starred when
-the two means are more than two combined standard errors apart. One repeat
+the two medians are more than two combined robust standard errors apart. One repeat
 each can never earn a star; three tight ones can. With the ~2% run-to-run
 spread above, three repeats a side resolve a change of about 4%.
 

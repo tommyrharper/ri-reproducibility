@@ -3,8 +3,8 @@
 
 Rows live in `benchmarks.jsonl` at the repository root, one JSON object per
 line, appended by every search that finishes. Reading groups them and reports
-a mean with its standard error, so a group's error bar shrinks as repeats at
-the same commit accumulate. See docs/nested-sampling-benchmarks.md.
+a median with a robust standard-error estimate, so one long-tail run cannot
+dominate a group's result. See docs/nested-sampling-benchmarks.md.
 """
 
 from __future__ import annotations
@@ -276,10 +276,11 @@ def plural(count: int, word: str) -> str:
 
 
 def stat(values: list[float]) -> tuple[float, float | None]:
-    """Mean, and the standard error that shrinks as 1/sqrt(n) with repeats."""
+    """Median and IQR-based standard error, robust to long-tail timings."""
     if len(values) < 2:
-        return values[0], None
-    return statistics.fmean(values), statistics.stdev(values) / len(values) ** 0.5
+        return statistics.median(values), None
+    q1, q3 = statistics.quantiles(values, n=4, method="inclusive")[::2]
+    return statistics.median(values), 0.93 * (q3 - q1) / len(values) ** 0.5
 
 
 def number(value: float, digits: int = 4) -> str:
@@ -298,7 +299,7 @@ def cell(values: list[float]) -> str:
 def delta(new: list[float], old: list[float]) -> str:
     """Percentage change against the previous commit, starred when it is real.
 
-    Starred means the two means are more than two combined standard errors
+    Starred means the two medians are more than two combined standard errors
     apart - one repeat each can never earn a star, which is the point.
     """
     if not new or not old:
@@ -402,19 +403,20 @@ def self_check() -> None:
     assert machine_id() == machine_id(), "machine id must be stable"
     assert len(machine_id()) == 8, machine_id()
 
-    mean, error = stat([10.0, 12.0])
-    assert mean == 11.0 and abs(error - 1.0) < 1e-9, (mean, error)
+    median, error = stat([10.0, 12.0])
+    assert median == 11.0 and abs(error - 0.657) < 1e-3, (median, error)
     assert stat([10.0]) == (10.0, None)
     # The error bar shrinks as repeats accumulate; that is the whole point.
-    four = stat([10.0, 12.0, 10.0, 12.0])[1]
+    four = stat([10.0, 11.0, 11.0, 12.0])[1]
     assert four is not None and four < error, (four, error)
+    assert stat([100.0, 100.0, 100.0, 1000.0])[0] == 100.0
 
     assert delta([12.0], [10.0]) == "+20.0%", delta([12.0], [10.0])
     assert delta([10.0], []) == "", "a missing side has no delta"
     # One repeat each cannot be significant; many tight ones can.
     assert not delta([12.0], [10.0]).endswith("*")
     assert delta([12.0, 12.1], [10.0, 10.1]).endswith("*")
-    assert not delta([12.0, 20.0], [10.0, 2.0]).endswith("*")
+    assert not delta([10.0, 1000.0], [1.0, 100.0]).endswith("*")
 
     assert series([{"stages_ms": {"simulate": 3.0}}], ("stages_ms", "simulate")) == [3.0]
     assert series([{"stages_ms": {}}], ("stages_ms", "simulate")) == []
