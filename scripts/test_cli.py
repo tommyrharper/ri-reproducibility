@@ -115,6 +115,15 @@ check(
 )
 
 check(
+    "benchmark --omp-threads reaches benchmark",
+    [["scripts/build.sh", "r2d2"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "r2d2",
+      "--preset", "default", "--repeat", "1", "--omp-threads", "4"]],
+    plan("bench", "run", "r2d2", "--omp-threads", "4")[1],
+)
+
+check(
     "search --enable-param/--disable-param join into NS_*_PARAMS",
     {"NS_ENABLE_PARAMS": "source_offset_fraction", "NS_DISABLE_PARAMS": "channel_count,observation_minutes"},
     plan(

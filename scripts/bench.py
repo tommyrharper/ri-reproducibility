@@ -244,6 +244,8 @@ def do_run(args: argparse.Namespace) -> int:
     env = {**os.environ, **preset_settings(args.preset, args.imager)}
     if args.mpi_procs is not None:
         env["NS_MPI_PROCS"] = str(args.mpi_procs)
+    if args.omp_threads is not None:
+        env["R2D2_OMP_THREADS"] = str(args.omp_threads)
     command = ["./ri", "search", args.imager, "--no-build"]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
@@ -545,6 +547,8 @@ def main() -> int:
                      help="stop the whole benchmark, including its process tree, after this time")
     run.add_argument("--mpi-procs", type=int, metavar="N",
                      help="override MPI worker count for rank-scaling probes")
+    run.add_argument("--omp-threads", type=int, metavar="N",
+                     help="override per-rank R2D2 OpenMP/BLAS threads")
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
@@ -554,6 +558,8 @@ def main() -> int:
         parser.error("--timeout must be greater than 0")
     if getattr(args, "handler", None) is do_run and args.mpi_procs is not None and args.mpi_procs < 1:
         parser.error("--mpi-procs must be at least 1")
+    if getattr(args, "handler", None) is do_run and args.omp_threads is not None and args.omp_threads < 1:
+        parser.error("--omp-threads must be at least 1")
     if getattr(args, "handler", None) is do_run and args.mpi_procs is not None:
         available = available_cpu_count()
         if args.mpi_procs > available:

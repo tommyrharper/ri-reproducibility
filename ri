@@ -181,6 +181,7 @@ def do_bench_run(args):
         uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
            "--repeat", str(args.repeat),
            *( ["--mpi-procs", str(args.mpi_procs)] if args.mpi_procs is not None else []),
+           *( ["--omp-threads", str(args.omp_threads)] if args.omp_threads is not None else []),
            *( ["--timeout", str(args.timeout)] if args.timeout is not None else []))]
 
 
@@ -625,6 +626,8 @@ def build_parser():
                            help="build and benchmark WSClean for this exact CPU")
     bench_run.add_argument("--mpi-procs", type=int, metavar="N",
                            help="override MPI worker count for rank-scaling probes")
+    bench_run.add_argument("--omp-threads", type=int, metavar="N",
+                           help="override per-rank R2D2 OpenMP/BLAS threads")
     bench_run.set_defaults(handler=do_bench_run)
 
     bench_record = bench_subs.add_parser(

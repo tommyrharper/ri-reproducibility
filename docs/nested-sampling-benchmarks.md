@@ -13,6 +13,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --preset production --timeout 300 # bounded probe
 ./ri bench run wsclean --native --repeat 3       # host-specific WSClean build
 ./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3  # rank-scaling probe
+./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3  # thread-count probe
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -43,6 +44,9 @@ versus 70.6 eval/s for the portable baseline: no measurable speedup.
 the count is recorded in row settings, keeping results in separate groups.
 Explicit values above the process affinity are rejected before starting a
 search, avoiding Open MPI slot errors and wasted probes.
+
+`--omp-threads N` overrides R2D2's automatic per-rank thread count and is
+recorded in row settings, keeping thread-count probes in separate groups.
 
 ## What a row is
 
