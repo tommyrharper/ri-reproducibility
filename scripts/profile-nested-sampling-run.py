@@ -155,7 +155,7 @@ def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[f
         logged.append((rows[-1][0] - rows[0][0]) * 1000.0)
         for (start, text), (end, following) in zip(rows, rows[1:]):
             gaps[(_phase_label(text), _phase_label(following))].append((end - start) * 1000.0)
-    return len(logged), (statistics.mean(logged) if logged else 0.0), gaps
+    return len(logged), (statistics.median(logged) if logged else 0.0), gaps
 
 
 def print_phases(run_dir: Path, top: int) -> None:
@@ -174,9 +174,10 @@ def print_phases(run_dir: Path, top: int) -> None:
     print(f"{'ms/eval':>8} {'share':>7} {'n/eval':>7} {'ms each':>8}  phase (log line -> next log line)")
     print("-" * 110)
     for (before, after), values in sorted(gaps.items(), key=lambda kv: -sum(kv[1]))[:top]:
-        total = sum(values) / count
+        typical = statistics.median(values)
+        total = len(values) / count * typical
         print(f"{total:8.2f} {total / logged_ms:6.1%} {len(values) / count:7.2f} "
-              f"{statistics.mean(values):8.3f}  {before[:52]} -> {after[:40]}")
+              f"{typical:8.3f}  {before[:52]} -> {after[:40]}")
 
 
 _VIS_COUNT = re.compile(r"^Gridded visibility count: (\d+)")
@@ -253,6 +254,8 @@ def self_check() -> None:
     assert abs(logged - 7.5) < 1e-3, logged
     assert abs(gaps[("Gridding N rows...", "Gridded visibility count: N")][0] - 5.5) < 1e-3, gaps
     assert ("Gridded visibility count: N", "Opening reordered part N for <path>") in gaps, gaps
+
+    assert statistics.median([1.0, 1.0, 100.0]) == 1.0
 
     with tempfile.TemporaryDirectory() as raw:
         log = Path(raw) / "wsclean.stdout.log"

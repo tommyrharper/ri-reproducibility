@@ -44,6 +44,10 @@ between it and the next line - and gaps are bucketed by (line, next line),
 because `Loading data in memory...` appears once per gridding pass and means
 something different each time.
 
+The CLI reports median logged duration and median typical phase gaps, with the
+gap median weighted by its observed occurrences per evaluation. One long-tail
+evaluation cannot choose the next bottleneck.
+
 | ms/eval | share | n/eval | ms each | phase |
 | ---: | ---: | ---: | ---: | --- |
 | 48.83 | 29.6% | 8.51 | 5.737 | `Gridding N rows...` -> `Gridded visibility count` |
