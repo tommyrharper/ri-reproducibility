@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred fourteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred fifteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **105.7 +/- 3.0
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -110,6 +110,10 @@ The new 7-worker probe measured **70.17 evaluations/second** by the robust
 median of three repeats (66.37, 70.17, and 73.04), with 34.2 MB peak memory.
 Its 70.6 +/- 2.3 ms/evaluation image-binary stage is slower than the
 8-20-worker range and does not displace the 20-worker default.
+The new 6-worker probe measured **64.32 +/- 0.69 evaluations/second** by the
+robust median of three repeats (62.18, 64.32, and 64.75), with 34.2 MB peak
+memory. Its 65.26 +/- 1.0 ms/evaluation image-binary stage is slower than the
+7-20-worker range and does not displace the 20-worker default.
 The prior three-repeat group measured 117.2 +/- 2.5 evaluations/second. The production preset remains
 the comparable target-scale record: 114.7 +/- 0.71 evaluations/second over
 ~39,900 evaluations at 150 live points, 15 repeats, and unlimited dead points.
