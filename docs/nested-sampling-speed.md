@@ -1,9 +1,14 @@
 # Making a nested-sampling search faster: the index
 
-One hundred sixty profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred sixty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.4 +/- 2.7
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
+Four fresh current-image async controls measured **113.6 evaluations/second**
+by median (113.7, 122.6, 113.4, and 107.3), with **138.8 ms/evaluation** and
+**34.3 MB** peak memory. This refresh does not establish a speedup over the
+previous three-repeat control: the extra repeat remains within observed host
+variance, and image binary remains dominant at **123.5 ms/evaluation**.
 Values below are
 per-iteration baselines, except the end-to-end figure above; pre-iteration-18
 rates are historical and roughly half the current rate.
