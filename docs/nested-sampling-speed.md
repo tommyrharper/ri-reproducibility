@@ -1,7 +1,9 @@
 # Making a nested-sampling search faster: the index
 
-Thirty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation and
-raised the host to **126 evaluations/second at 19 workers**. Values below are
+Thirty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest three-repeat async measurement reached **117 evaluations/second at
+20 workers**; the historical peak is 126 evaluations/second at 19 workers.
+Values below are
 per-iteration baselines, except the end-to-end figure above; pre-iteration-18
 rates are historical and roughly half the current rate.
 
@@ -27,6 +29,8 @@ rates are historical and roughly half the current rate.
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
+| Residual metrics reuse the loaded image buffer | `common.py` | Removes one full-image allocation per evaluation; memory-only change at current image size |
+| Off-source metric masks are bounded and reused | `common.py` | 25.2 to 3.6 us per mask (container microbenchmark); no measurable end-to-end gain |
 | R2D2 `.mat` conversion skips compression on tmpfs | `ms_to_r2d2_mat.py` | 8.59 to 0.39 ms for 12k visibilities (microbenchmark) |
 | R2D2 `.mat` conversion avoids broadcast temporaries | `ms_to_r2d2_mat.py` | 1.13 to 1.09 ms for 1404 visibilities (10 warm calls, container microbenchmark) |
 | R2D2 `.mat` conversion flattens weights directly | `ms_to_r2d2_mat.py` | 1.802 to 1.657 us per weight expansion (100k calls, container microbenchmark; 8.0%) |
@@ -40,6 +44,13 @@ and [run scaling](nested-sampling-run-scaling.md):
 | WSClean's four unread FITS images pruned | another 3.94x - 393.6 KB to 99.9 KB, so this host's ceiling went from 477k evaluations to 1.88M |
 | A resume keeps each adopted objective, not each record | 62 GB down to 5.4 GB, which is the difference between the target run finishing and being OOM-killed |
 | Progress-bar redraw backed off to 9x its own cost | 44% of a core down to ~12%, and no longer growing with the run |
+
+The current async WSClean throughput group measures **117.2 +/- 2.5
+evaluations/second** at 20 workers, 139.1 +/- 0.74 ms/evaluation, and 34.7 MB
+peak imaging-worker memory across three repeats. The production preset remains
+the comparable target-scale record: 114.7 +/- 0.71 evaluations/second over
+~39,900 evaluations at 150 live points, 15 repeats, and unlimited dead points.
+R2D2 has only smoke-scale rows until `checkpoints/R2D2_A1` is supplied.
 
 ## What is priced but deliberately not taken
 
