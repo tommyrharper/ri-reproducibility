@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Fifty-three profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Fifty-four profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -76,6 +76,10 @@ the `.mat` conversion changes, so this is baseline evidence rather than an
 isolated cache A/B result. R2D2 production-scale measurement remains too
 expensive for this iteration; the checkpoint archive is now available through
 `CHECKPOINTS_DIR` for future controlled comparisons.
+An interleaved thread-count probe with real checkpoints measured **0.414 +/-
+0.015 evaluations/second** at one R2D2 thread versus 0.438 +/- 0.002 at the
+default two threads, with unchanged 3.47 GB peak memory. One thread is therefore
+a regression and does not improve the memory budget.
 
 ## What is priced but deliberately not taken
 
