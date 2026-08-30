@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Forty-seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Forty-nine profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **111.2 +/- 3.9
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -65,6 +65,9 @@ The sigma-res lazy-load change now measures 111.2 +/- 3.9 evaluations/second
 over three current throughput repeats, within normal end-to-end variance,
 while the metrics stage itself remains at 0.47 +/- 0.003 ms/evaluation versus
 about 1.0 ms before the change.
+The latest default synchronous baseline measures 71.1 +/- 0.85 evaluations/second
+at 150.9 +/- 0.011 ms/evaluation over three repeats; imaging remains 133.3 +/-
+0.15 ms/evaluation.
 R2D2 has only smoke-scale rows until `checkpoints/R2D2_A1` is supplied.
 
 ## What is priced but deliberately not taken
