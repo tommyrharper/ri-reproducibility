@@ -48,6 +48,11 @@ The CLI reports median logged duration and median typical phase gaps, with the
 gap median weighted by its observed occurrences per evaluation. One long-tail
 evaluation cannot choose the next bottleneck.
 
+For R2D2, `./ri profile <run> --r2d2-phases` reports the median and p90 total
+per evaluation for each logged phase. The p90 uses whole-evaluation totals, so
+it exposes worker stalls without letting one outlier choose the optimization
+target.
+
 | ms/eval | share | n/eval | ms each | phase |
 | ---: | ---: | ---: | ---: | --- |
 | 48.83 | 29.6% | 8.51 | 5.737 | `Gridding N rows...` -> `Gridded visibility count` |

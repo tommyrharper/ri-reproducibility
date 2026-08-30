@@ -212,12 +212,14 @@ def print_r2d2_phases(run_dir: Path) -> None:
         raise SystemExit(f"no R2D2 phase timings under {run_dir}")
     print(f"{count} R2D2 logs")
     print()
-    print(f"{'phase':<28}{'ms/eval':>10}{'calls/eval':>12}{'ms/call':>10}")
+    print(f"{'phase':<28}{'ms/eval':>10}{'p90/eval':>10}{'calls/eval':>12}{'ms/call':>10}")
     print("-" * 60)
     for phase in sorted(totals, key=lambda name: -statistics.median(totals[name])):
         per_eval = statistics.median(totals[phase])
+        ordered = sorted(totals[phase])
+        p90 = ordered[min(len(ordered) - 1, (9 * len(ordered) - 1) // 10)]
         per_call = calls[phase] / phase_evals[phase]
-        print(f"{phase:<28}{per_eval:10.2f}{per_call:12.2f}{per_eval / per_call:10.2f}")
+        print(f"{phase:<28}{per_eval:10.2f}{p90:10.2f}{per_call:12.2f}{per_eval / per_call:10.2f}")
 
 
 _VIS_COUNT = re.compile(r"^Gridded visibility count: (\d+)")
