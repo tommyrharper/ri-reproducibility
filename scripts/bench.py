@@ -40,7 +40,7 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 WORKLOAD_KEYS = (
     "NS_NLIVE", "NS_NUM_REPEATS", "NS_MAX_NDEAD", "NS_METRIC", "NS_MPI_PROCS",
     "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_KEEP_MEASUREMENT_SETS",
-    "R2D2_OMP_THREADS",
+    "R2D2_OMP_THREADS", "WSCLEAN_TARGET_CPU",
 )
 
 LABEL_WIDTH = 28  # the longest stage name, indented, plus a space

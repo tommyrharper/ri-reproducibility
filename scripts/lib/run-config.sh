@@ -18,6 +18,9 @@ write_run_config() {
     printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
     if [ "${algorithm}" = wsclean ]; then
       printf 'NS_WSCLEAN_MGAIN=%q\n' "${NS_WSCLEAN_MGAIN}"
+      if [ -n "${WSCLEAN_TARGET_CPU:-}" ]; then
+        printf 'WSCLEAN_TARGET_CPU=%q\n' "${WSCLEAN_TARGET_CPU}"
+      fi
     fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
@@ -167,6 +170,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   }
   grep -q R2D2_OMP_THREADS "${_dir}/run.env" && {
     echo "FAIL: empty R2D2_OMP_THREADS written for wsclean"; exit 1
+  }
+  WSCLEAN_TARGET_CPU=native write_run_config "${_dir}" wsclean
+  grep -qx 'WSCLEAN_TARGET_CPU=native' "${_dir}/run.env" || {
+    echo "FAIL: native WSClean target not recorded in run.env"; exit 1
   }
 
   _parent="${_dir}/runs"

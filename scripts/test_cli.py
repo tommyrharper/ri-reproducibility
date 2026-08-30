@@ -100,6 +100,12 @@ check(
 )
 
 check(
+    "benchmark --native reaches build and benchmark",
+    {"WSCLEAN_TARGET_CPU": "native"},
+    plan("bench", "run", "wsclean", "--native")[0],
+)
+
+check(
     "search --enable-param/--disable-param join into NS_*_PARAMS",
     {"NS_ENABLE_PARAMS": "source_offset_fraction", "NS_DISABLE_PARAMS": "channel_count,observation_minutes"},
     plan(

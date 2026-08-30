@@ -175,7 +175,8 @@ def do_bench(args):
 def do_bench_run(args):
     # Builds first, exactly as a search does: the images bake the code, so
     # without it the benchmark times whatever was baked last.
-    return {}, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
+    env = {"WSCLEAN_TARGET_CPU": "native"} if args.native else {}
+    return env, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
         uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
            "--repeat", str(args.repeat),
            *( ["--timeout", str(args.timeout)] if args.timeout is not None else []))]
@@ -616,6 +617,8 @@ def build_parser():
                                 "this commit gets smaller (default: %(default)s)")
     bench_run.add_argument("--timeout", type=float, metavar="SECONDS",
                            help="stop the whole benchmark, including its process tree")
+    bench_run.add_argument("--native", action="store_true",
+                           help="build and benchmark WSClean for this exact CPU")
     bench_run.set_defaults(handler=do_bench_run)
 
     bench_record = bench_subs.add_parser(
