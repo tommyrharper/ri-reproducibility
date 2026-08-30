@@ -1,7 +1,7 @@
 # Making a nested-sampling search faster: the index
 
-Forty-nine profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
-The latest three-repeat async measurement reached **111.2 +/- 3.9
+Fifty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest three-repeat async measurement reached **108.2 +/- 4.6
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
 Values below are
@@ -48,11 +48,11 @@ and [run scaling](nested-sampling-run-scaling.md):
 | A resume keeps each adopted objective, not each record | 62 GB down to 5.4 GB, which is the difference between the target run finishing and being OOM-killed |
 | Progress-bar redraw backed off to 9x its own cost | 44% of a core down to ~12%, and no longer growing with the run |
 
-The current async WSClean throughput check measures **111.2 +/- 3.9
-evaluations/second** at 20 workers, 141.0 +/- 2.5 ms/evaluation, and 34.5 MB
+The current async WSClean throughput check measures **108.2 +/- 4.6
+evaluations/second** at 20 workers, 144.5 +/- 3.9 ms/evaluation, and 34.8 MB
 peak imaging-worker memory across three repeats (30 August 2026). This is
 consistent with the host's observed run-to-run variance, not a code regression;
-the image binary remains the dominant stage at 125.7 +/- 2.4 ms/evaluation.
+the image binary remains the dominant stage at 129.0 +/- 3.8 ms/evaluation.
 The new rank-scaling probe measured **98.4 +/- 1.0 evaluations/second** at 16
 workers, with 34.8 MB peak memory; 20 workers remains faster on this host.
 Repeating that probe at 19 workers measured **107.1 +/- 2.8 evaluations/second**
@@ -61,7 +61,7 @@ not enough to change the default.
 The prior three-repeat group measured 117.2 +/- 2.5 evaluations/second. The production preset remains
 the comparable target-scale record: 114.7 +/- 0.71 evaluations/second over
 ~39,900 evaluations at 150 live points, 15 repeats, and unlimited dead points.
-The sigma-res lazy-load change now measures 111.2 +/- 3.9 evaluations/second
+The sigma-res lazy-load change now measures 108.2 +/- 4.6 evaluations/second
 over three current throughput repeats, within normal end-to-end variance,
 while the metrics stage itself remains at 0.47 +/- 0.003 ms/evaluation versus
 about 1.0 ms before the change.
