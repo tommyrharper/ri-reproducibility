@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Sixty-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Sixty-nine profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **114.0 +/- 3.2
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -130,6 +130,9 @@ unchanged 3.47 GB peak memory. Six threads is rejected.
 An explicit seven-thread probe measured **0.7956 evaluations/second** (three
 runs) versus the matched four-thread median **0.8127**, a 2.1% regression, with
 unchanged 3.47 GB peak memory. Seven threads is rejected as well.
+An explicit eight-thread probe measured **0.7493 +/- 0.011 evaluations/second**
+(three runs) versus the matched four-thread median **0.8127**, a 7.8% regression,
+with unchanged 3.47 GB peak memory. Eight threads is rejected too.
 
 ## What is priced but deliberately not taken
 
