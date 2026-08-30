@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred forty-one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred forty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async measurement reached **110.4 +/- 2.7
 evaluations/second at 20 workers**; the historical peak is 126
 evaluations/second at 19 workers.
@@ -80,6 +80,10 @@ The fresh three-repeat 10-worker probe measured **81.1 +/- 0.8 evaluations/secon
 (81.1, 83.1, and 80.7), with 34.5 MB peak memory and 97.5 ms/evaluation.
 It confirms that reducing concurrency below 20 workers lowers throughput without
 reducing memory; no worker-count default change is justified.
+The fresh three-repeat 9-worker probe measured **76.1 +/- 2.5 evaluations/second**
+(70.2, 76.1, and 79.6), with 34.2 MB peak memory and 92.6 ms/evaluation.
+It further confirms that reducing concurrency below 20 workers lowers throughput
+without reducing memory; no worker-count default change is justified.
 The 17-worker probe measured **115.9 evaluations/second** by the robust median
 of three repeats, with 34.5 MB peak memory; it does not displace the 20-worker
 default.
