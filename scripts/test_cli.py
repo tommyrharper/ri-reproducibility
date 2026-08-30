@@ -330,6 +330,17 @@ check(
 )
 
 check(
+    "bench run supports interleaved MPI worker arms",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "3",
+      "--interleave-mpi-procs", "19", "20"]],
+    plan("bench", "run", "wsclean", "--repeat", "3",
+         "--interleave-mpi-procs", "19", "20")[1],
+)
+
+check(
     "bench record names the run to add",
     [["uv", "run", "scripts/bench.py", "record", "wsclean-vlaa-20260827T101500Z"]],
     plan("bench", "record", "wsclean-vlaa-20260827T101500Z")[1],

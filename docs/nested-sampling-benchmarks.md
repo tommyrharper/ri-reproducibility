@@ -13,6 +13,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --preset production --timeout 300 # bounded probe
 ./ri bench run wsclean --native --repeat 3       # host-specific WSClean build
 ./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3  # rank-scaling probe
+./ri bench run wsclean --preset throughput --interleave-mpi-procs 19 20 --repeat 3  # paired rank A/B
 ./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3  # thread-count probe
 ```
 
@@ -51,6 +52,9 @@ recorded in row settings, keeping thread-count probes in separate groups.
 `--interleave-omp-threads A B` alternates two R2D2 thread counts after one
 unrecorded warm-up; `--repeat N` runs N measured searches per arm. This keeps
 small thread-count differences paired against host drift.
+
+`--interleave-mpi-procs A B` does the same for MPI worker counts. It rejects
+counts above available CPU affinity before launching the warm-up.
 
 ## What a row is
 
