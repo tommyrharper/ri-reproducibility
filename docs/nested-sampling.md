@@ -597,8 +597,13 @@ evaluations/eval-*/metrics.json
 Scored evaluations build `sim.ms` in shared tmpfs and delete it after scoring;
 R2D2 also deletes its derived `.mat`. Failed evaluations retain all artefacts,
 and `./ri search --keep-measurement-sets` retains them for every evaluation.
+Once the run finishes, it keeps the three images above only for the 20 worst and
+20 best evaluations by objective and one in every 100 between them, so a
+finished run holds a few hundred images rather than three per evaluation;
+`NS_KEEP_ALL_IMAGES=1` keeps every one.
 See [nested-sampling-disk-footprint.md](nested-sampling-disk-footprint.md) for
-pruning details. The record's `params` (`noise_seed` included) reproduce the MS.
+pruning details. The record's `params` (`noise_seed` included) reproduce the MS,
+and the images with it.
 
 ### Run summary and reports
 

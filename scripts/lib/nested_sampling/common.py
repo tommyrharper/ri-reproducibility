@@ -1289,17 +1289,19 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     partial.replace(path)
 
 
-# Scored evaluations keep only replayable inputs, metrics and restored images;
-# see docs/nested-sampling-disk-footprint.md. Set NS_KEEP_MEASUREMENT_SETS=1
-# to retain intermediate artefacts for replay benchmarks.
+# Scored evaluations keep only replayable inputs, metrics and the three images
+# the retention policy may later keep; see docs/nested-sampling-disk-footprint.md.
+# Set NS_KEEP_MEASUREMENT_SETS=1 to retain intermediate artefacts for replay
+# benchmarks. The dirty and residual images are NOT here: which evaluations keep
+# them is a whole-run decision, taken by prune_run_images() once every
+# evaluation has been scored and can be ranked.
 PRUNED_ARTEFACTS = (
     ("sim.ms", "measurement_set"),
     ("VLAA_ANT", None),
     ("r2d2_data.mat", "mat"),
-    ("wsclean/recon-dirty.fits", "dirty"),
-    ("wsclean/recon-residual.fits", "residual"),
     ("wsclean/recon-model.fits", None),
     ("wsclean/recon-psf.fits", None),
+    ("r2d2/r2d2_data/PSF.fits", None),
 )
 
 
@@ -1337,6 +1339,109 @@ def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
             record.get("paths", {}).pop(path_key, None)
 
 
+# A finished run keeps every image for the IMAGE_KEEP_ENDS worst and best
+# evaluations, then one in IMAGE_KEEP_STRIDE across the ordered middle. The
+# extremes are the failure modes the search exists to find and the contrast
+# that makes them readable; the stride keeps the ground between them legible
+# without storing an image per evaluation. Ordering is by objective, so this is
+# necessarily a whole-run decision: when an evaluation is scored, whether it
+# lands in the worst 20 depends on evaluations that have not run yet.
+IMAGE_KEEP_ENDS = int(os.environ.get("NS_IMAGE_KEEP_ENDS", "20"))
+IMAGE_KEEP_STRIDE = int(os.environ.get("NS_IMAGE_KEEP_STRIDE", "100"))
+
+# Both algorithms record their dirty image, reconstruction and residual dirty
+# image under these keys, so the policy needs no per-algorithm filenames.
+RETAINED_IMAGE_KEYS = ("image", "dirty", "residual")
+
+
+def evaluation_key(record: dict[str, Any]) -> str:
+    """Identify one evaluation.
+
+    Not eval_id: PolyChord reuses it across parameter vectors, so a run holds
+    several eval-0083-* directories and keying retention on the number alone
+    would spare or delete whole groups of evaluations together. The directory
+    name carries the parameter hash and is unique.
+    """
+    eval_dir = (record.get("paths") or {}).get("eval_dir")
+    return Path(eval_dir).name if eval_dir else f"eval_id:{record.get('eval_id')}"
+
+
+def evaluations_keeping_images(
+    records: list[dict[str, Any]],
+    ends: int | None = None,
+    stride: int | None = None,
+) -> set[str]:
+    """The evaluation keys whose images a finished run keeps."""
+    ends = IMAGE_KEEP_ENDS if ends is None else ends
+    stride = IMAGE_KEEP_STRIDE if stride is None else stride
+    # A failed evaluation keeps everything: it cannot be ranked on an objective
+    # it never produced, and it is the case worth looking at.
+    keep = {evaluation_key(r) for r in records if "error" in r}
+    scored = [r for r in records if "error" not in r and r.get("objective") is not None]
+    ordered = sorted(scored, key=lambda r: (r["objective"], evaluation_key(r)))
+    if len(ordered) <= 2 * ends:
+        return keep | {evaluation_key(r) for r in ordered}
+    keep |= {evaluation_key(r) for r in ordered[:ends]}
+    keep |= {evaluation_key(r) for r in ordered[len(ordered) - ends:]}
+    keep |= {evaluation_key(r) for r in ordered[ends:len(ordered) - ends:stride]}
+    return keep
+
+
+def _recorded_image_path(evaluations_dir: Path, recorded: str) -> Path | None:
+    """Resolve a recorded image path against the run being pruned.
+
+    Records carry absolute paths from wherever the run was scored, so a run
+    that was copied or moved still names the original files. Resolving inside
+    evaluations_dir first, and refusing anything that lands outside it, keeps
+    pruning one run from deleting another one's images.
+    """
+    root = evaluations_dir.resolve()
+    text = str(recorded)
+    candidates = []
+    if "evaluations" in text:
+        candidates.append(evaluations_dir / text.split("evaluations", 1)[1].lstrip("/\\"))
+    candidates.append(Path(recorded))
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if resolved == root or root in resolved.parents:
+            return resolved
+    return None
+
+
+def prune_run_images(evaluations_dir: Path, records: list[dict[str, Any]]) -> int:
+    """Delete the images of evaluations the retention policy does not keep.
+
+    Mutates `records` so a summary never names a file this just deleted, which
+    is what lets the report fall back to its placeholder. Set
+    NS_KEEP_ALL_IMAGES=1 to keep every image.
+    """
+    if os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0":
+        return 0
+    keep = evaluations_keeping_images(records)
+    removed = 0
+    for record in records:
+        paths = record.get("paths") or {}
+        retained = evaluation_key(record) in keep
+        for key in RETAINED_IMAGE_KEYS:
+            recorded = paths.get(key)
+            if not recorded:
+                continue
+            target = _recorded_image_path(evaluations_dir, recorded)
+            if target is None:
+                # Already gone; the record must not keep pointing at it.
+                paths.pop(key, None)
+                continue
+            if retained:
+                continue
+            target.unlink(missing_ok=True)
+            paths.pop(key, None)
+            removed += 1
+    return removed
+
+
+
 def self_check_evaluation_pruning() -> None:
     import tempfile
 
@@ -1365,14 +1470,17 @@ def self_check_evaluation_pruning() -> None:
         assert not (scored / "sim.ms").exists() and not (scored / "VLAA_ANT").exists()
         assert not (scored / "r2d2_data.mat").exists()
         # The evidence a failure-mode search exists to produce is never pruned.
-        assert (scored / "wsclean" / "recon-image.fits").exists()
-        # The four images the metrics have already been computed from are.
-        for image in ("dirty", "residual", "model", "psf"):
+        # These three survive scoring because which evaluations keep them is a
+        # whole-run decision, taken later by prune_run_images().
+        for image in ("image", "dirty", "residual"):
+            assert (scored / "wsclean" / f"recon-{image}.fits").exists(), image
+        # The two nothing ever reads go straight away.
+        for image in ("model", "psf"):
             assert not (scored / "wsclean" / f"recon-{image}.fits").exists(), image
         # A record must not name a file this just deleted.
         assert "measurement_set" not in written["paths"] and "mat" not in written["paths"]
-        assert "dirty" not in written["paths"] and "residual" not in written["paths"]
         assert written["paths"]["image"].endswith("recon-image.fits")
+        assert written["paths"]["dirty"].endswith("recon-dirty.fits")
         assert json.loads((scored / "metrics.json").read_text())["paths"] == written["paths"]
 
         # A failed evaluation keeps its inputs: that is the case worth looking at.
@@ -1434,6 +1542,68 @@ def self_check_evaluation_pruning() -> None:
 # start and an end on every record, the intervals say when *some* worker was
 # evaluating and when none was. See summarize_profiling().
 _EVALUATION_STARTED_EPOCH: float | None = None
+
+
+def self_check_image_retention() -> None:
+    import tempfile
+
+    def record(i, objective, **extra):
+        return {"eval_id": i, "objective": objective, "paths": {}, **extra}
+
+    # 20 worst + 20 best + every 100th of the 960 between them.
+    def keys(ids):
+        return {f"eval_id:{i}" for i in ids}
+
+    records = [record(i, i / 1000) for i in range(1000)]
+    keep = evaluations_keeping_images(records, ends=20, stride=100)
+    assert keep == keys(range(20)) | keys(range(980, 1000)) | keys(range(20, 980, 100)), keep
+    assert len(keep) == 50, len(keep)
+
+    # A run no bigger than both ends keeps everything.
+    assert evaluations_keeping_images(records[:40], ends=20, stride=100) == keys(range(40))
+
+    # A failure is kept whatever its rank, and is not ranked on an objective
+    # it never produced.
+    failed = records[:5] + [record(999, None, error="wsclean failed")]
+    assert "eval_id:999" in evaluations_keeping_images(failed, ends=1, stride=100)
+
+    # PolyChord reuses eval_id across parameter vectors, so two evaluations can
+    # share one and must still be ranked apart.
+    shared = [{"eval_id": 7, "objective": o,
+               "paths": {"eval_dir": f"/run/evaluations/eval-0007-{h}"}}
+              for o, h in ((0.1, "aaa"), (0.9, "bbb"))]
+    assert evaluations_keeping_images(shared, ends=1, stride=100) == {
+        "eval-0007-aaa", "eval-0007-bbb"}
+    assert len({evaluation_key(r) for r in shared}) == 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        evaluations = Path(tmp) / "evaluations"
+        made = []
+        for i in range(60):
+            eval_dir = evaluations / f"eval-{i:04d}-x"
+            (eval_dir / "wsclean").mkdir(parents=True)
+            paths = {"eval_dir": str(eval_dir)}
+            for key, name in (("image", "recon-image.fits"), ("dirty", "recon-dirty.fits"),
+                              ("residual", "recon-residual.fits")):
+                (eval_dir / "wsclean" / name).write_text(name)
+                paths[key] = str(eval_dir / "wsclean" / name)
+            made.append({"eval_id": i, "objective": i / 60, "paths": paths})
+
+        removed = prune_run_images(evaluations, made)
+        keep = evaluations_keeping_images(made, ends=20, stride=100)
+        # 60 evaluations, ends of 20: 40 at the ends plus every 100th of the 20
+        # between, which is just the first of them.
+        assert len(keep) == 41, len(keep)
+        assert removed == 3 * (60 - 41), removed
+        for rec in made:
+            kept = evaluation_key(rec) in keep
+            for key in RETAINED_IMAGE_KEYS:
+                exists = Path(rec["paths"][key]).is_file() if key in rec["paths"] else False
+                assert exists == kept, (rec["eval_id"], key, exists, kept)
+                # A summary must never name a file this deleted.
+                assert (key in rec["paths"]) == kept, (rec["eval_id"], key)
+
+    print("image retention self-check passed")
 
 
 def mark_evaluation_start() -> None:

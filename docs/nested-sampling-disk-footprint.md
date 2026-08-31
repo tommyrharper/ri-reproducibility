@@ -41,10 +41,42 @@ by the time pruning happens their only consumer is finished with them.
 `PRUNED_ARTEFACTS` in `scripts/lib/nested_sampling/common.py` owns this list and
 the shared pruning path. Failed evaluations and
 `NS_KEEP_MEASUREMENT_SETS=1` retain all artefacts; successful evaluations retain
-the restored image, logs, JSON records, and replayable inputs. Dirty/residual
-paths are removed from records with their files. The self-check covers these
-contracts; implementation rationale and throughput measurements are in
+the three images the retention policy below may keep, logs, JSON records, and
+replayable inputs. The self-check covers these contracts; implementation
+rationale and throughput measurements are in
 [nested-sampling-throughput.md](nested-sampling-throughput.md).
+
+## Which evaluations keep images
+
+An evaluation writes a dirty image, a reconstruction and a residual dirty image;
+`recon-model.fits`, `recon-psf.fits` and R2D2's `PSF.fits` are dropped at
+scoring, having never had a reader. Of the three that survive, a finished run
+keeps all three for the `IMAGE_KEEP_ENDS` (20) worst and best evaluations by
+objective, then one evaluation in every `IMAGE_KEEP_STRIDE` (100) across the
+ordered middle. The extremes are the failure modes the search exists to find,
+plus the contrast that makes them readable; the stride keeps the ground between
+them legible without an image per evaluation. `NS_IMAGE_KEEP_ENDS` and
+`NS_IMAGE_KEEP_STRIDE` override the two, and `NS_KEEP_ALL_IMAGES=1` keeps
+everything.
+
+This is necessarily a whole-run decision. When an evaluation is scored, whether
+it belongs in the worst 20 depends on evaluations that have not run yet, so
+`prune_run_images()` cannot hook the per-evaluation path and instead runs once,
+from each algorithm's summary writer, just before `summary.json` is written. It
+mutates the records the summary embeds, so a summary never names a file it
+deleted and the report falls back to its placeholder. A consequence worth
+knowing: a run holds every image until it finishes, so peak usage during a run
+is unchanged and only the finished run is small.
+
+Evaluations are identified by directory name, not `eval_id`: PolyChord reuses
+the number across parameter vectors, so one run holds several `eval-0083-*`
+directories and ranking on the number alone would spare or delete whole groups
+together.
+
+`scripts/prune-run-images.py` applies the same policy to runs that finished
+before it existed, from the records `summary.json` already embeds. It only
+touches finished runs: a run without a `summary.json` is incomplete or
+resumable, and `./ri resume` rebuilds its cache by walking `evaluations/`.
 
 ## What it measures
 
