@@ -115,6 +115,7 @@ rates are historical and roughly half the current rate.
 | R2D2 checkpoint key normalization cached | `r2d2_serve.py` | 4.36 to 0.01 us per repeated 24-key lookup in a microbenchmark; three fresh end-to-end runs measured 0.7205, 0.7768, and 0.7350 eval/s, so no isolated throughput gain is claimed |
 | R2D2 auto thread count rounds up per-rank CPU share | `run-nested-sampling-r2d2.sh` | 0.6198 to 0.7249 eval/s at 8 ranks (16.9%), with unchanged 3.47 GB peak memory |
 | R2D2 inference paths use `torch.inference_mode` | `r2d2_serve.py` | Representative 128x128 U-Net microbenchmark: 8.589 to 8.467 ms/forward (1.4%); no end-to-end claim without checkpoints |
+| R2D2 rank-count probe at four Torch threads | `./ri bench run r2d2` | Interleaved 2-repeat probe: 0.6934 eval/s at 5 ranks versus 0.7983 at 8 ranks, both at 3.47 GB peak memory; 8 ranks retained |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
@@ -523,13 +524,13 @@ Throughput falls because nested sampling reaches longer observations and more
 channels: `70.7 ms + 4.58 us x visibilities` per evaluation. See [the cost
 model](nested-sampling-cost-model.md).
 
-With the checkpoint archive supplied through external `CHECKPOINTS_DIR`, the
-current asynchronous four-thread R2D2 control measured **0.7633 eval/s**
-(0.7532, 0.7633, and 0.8147) across 40-43 evaluations at 8 ranks, with
-**3.47 GB** peak worker memory. The latest phase profile attributes **6568 ms**
-per evaluation to 25 model updates and **126 ms** to residual computation;
-model checkpoint swapping remains the dominant measured target. This refresh
-confirms the existing 0.75-0.81 eval/s range and claims no isolated speedup.
+With the checkpoint archive supplied through external `CHECKPOINTS_DIR`, an
+interleaved four-thread R2D2 rank probe measured **0.6934 eval/s** at 5 ranks
+and **0.7983 eval/s** at 8 ranks, both at **3.47 GB** peak worker memory. The
+two-repeat sample is directionally clear but below production-strength size;
+8 ranks remains the setting to test next. The latest phase profile attributes
+**6568 ms** per evaluation to 25 model updates and **126 ms** to residual
+computation, so U-Net inference remains the dominant optimization target.
 
 ## Keeping what is on this page
 
