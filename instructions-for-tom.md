@@ -69,6 +69,11 @@ Measurement params:
 - `channel_width_hz`: `0.1e6-2e6`
 
 ```zsh
-./ri search {wsclean|r2d2} --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_ju
+./ri search {wsclean|r2d2} --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_jy
+```
+
+Or:
+```zsh
+./ri search wsclean --then r2d2 --nlive=125 --num-repeats=25 ==max-ndead=-1 --metric=total_rms_jy
 ```
 
