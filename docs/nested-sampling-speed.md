@@ -7,6 +7,12 @@ validation; three throughput runs measured **0.9189, 0.9030, and 0.9101
 evaluations/second**, with **3.47 GB** peak worker memory. This confirms no
 memory regression, but this control alone does not establish a causal gain.
 
+A six-run interleaved oversubscription probe measured WSClean at **107.7
+evaluations/second** with 20 ranks versus **104.7 evaluations/second** with 21
+ranks, with **34.3-34.7 MB** peak worker memory in both arms. The extra rank is
+about **2.8% slower** and provides no memory benefit, so the 20-rank default
+remains the production setting.
+
 The latest interleaved three-repeat WSClean probe measured **111.5
 evaluations/second** at 18 ranks (111.9, 109.6, and 111.5) versus **109.6** at
 20 ranks (109.1, 117.1, and 109.6), with **34.4-34.9 MB** peak worker memory.
@@ -381,6 +387,7 @@ rates are historical and roughly half the current rate.
 | R2D2 inter-op thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --interleave-interop-threads 1 2 --repeat 2` | 0.9153 eval/s at one inter-op thread versus 0.8987 at two; short-run spread does not justify a default change, with unchanged 3.47 GB peak worker memory |
 | R2D2 oneDNN primitive-cache capacity probe | `ONEDNN_PRIMITIVE_CACHE_CAPACITY` | 109.60 versus 109.25 ms per synthetic 128x128 U-Net forward at capacities 1024 and 4096 (three fresh repeats; 0.3%); no production setting change |
 | WSClean 18-versus-20 rank probe | `./ri bench run wsclean --interleave-mpi-procs 18 20` | 111.5 versus 109.6 eval/s median across three repeats; 1.7% spread within host variance, with no memory benefit below 20 ranks |
+| WSClean 20-versus-21 rank probe | `./ri bench run wsclean --preset throughput --interleave-mpi-procs 20 21 --allow-oversubscription --repeat 3` | 107.7 versus 104.7 eval/s median across three interleaved repeats; 21 ranks is 2.8% slower with unchanged 34.3-34.7 MB peak memory |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
