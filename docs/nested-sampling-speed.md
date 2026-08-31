@@ -8,6 +8,11 @@ the remaining spread still shows host variance rather than a new runtime
 change. Reordered-part metadata caching and deferred UVW copying remain
 rejected by matched end-to-end experiments.
 
+A fresh three-repeat asynchronous control measured **109.1 evaluations/second**
+(108.8, 109.1, and 117.8) at 20 ranks, with **141.3 ms/evaluation** by median,
+**125.8 ms/evaluation** in the image binary, and **34.2-34.5 MB** peak memory.
+This refresh is consistent with host variance and is not a claimed speedup.
+
 The latest matched four-repeat checkpoint-backed R2D2 probe measured **0.9175
 evaluations/second** at 15 ranks and two Torch threads (0.9115, 0.9171, 0.9179,
 and 0.9194), with **3.47 GB** peak worker memory. Four Torch threads measured
