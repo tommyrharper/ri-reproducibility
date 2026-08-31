@@ -156,9 +156,9 @@ def load_defaults() -> dict[str, Any]:
 
 @cache
 def load_receiver_bands() -> list[dict[str, Any]]:
-    bands = load_defaults()["receiver_band"]
+    bands = [band for band in load_defaults()["receiver_band"] if band.get("enabled", True)]
     if not bands:
-        raise SystemExit("defaults.toml: [[receiver_band]] is empty")
+        raise SystemExit("defaults.toml: no enabled [[receiver_band]]")
     return sorted(bands, key=lambda band: float(band["min"]))
 
 
