@@ -139,6 +139,12 @@ row shows no error bar.
 reported alongside speed because R2D2's per-rank memory budget limits useful
 parallelism; older rows without this field simply leave the cell blank.
 
+`busy wall s` is the interval with at least one worker evaluation active, and
+`idle fraction` is the remainder of total wall time. A large idle fraction
+flags scheduler or host stalls that can make a single throughput row look
+slow even when per-evaluation stage timings are unchanged; older rows leave
+both fields blank.
+
 `Δ evals/s` is the change against the column to its right. It is starred when
 the two medians are more than two combined robust standard errors apart. One repeat
 each can never earn a star; three tight ones can. With the ~2% run-to-run

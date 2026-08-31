@@ -178,6 +178,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     wall, evals = breakdown["total_wall_seconds"], breakdown["evals"]
     if not wall or not evals:
         return skip("its summary.json carries no profiling block")
+    busy_wall = breakdown.get("busy_wall_seconds")
 
     imager = summary.get("algorithm") or "unknown"
     run_env = read_run_env(run_dir)
@@ -206,6 +207,9 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "evals": evals,
         "wall_s": round(wall, 3),
         "evals_per_s": round(evals / wall, 4),
+        "busy_wall_s": round(busy_wall, 3) if busy_wall else None,
+        "idle_fraction": round(max(0.0, 1.0 - busy_wall / wall), 4)
+        if busy_wall else None,
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
@@ -421,6 +425,8 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                             series(by_commit[old], ("evals_per_s",)))
                        for new, old in zip(labels, labels[1:])])
     row_for_path("ms/eval", ("ms_per_eval",))
+    row_for_path("busy wall s", ("busy_wall_s",))
+    row_for_path("idle fraction", ("idle_fraction",))
     row_for_path("peak memory MB", ("peak_memory_mb",))
     stages: list[str] = []
     for row in rows:
@@ -537,6 +543,7 @@ def self_check() -> None:
                 "evals_per_s": 100.0, "ms_per_eval": 140.0,
                 "peak_memory_mb": 256.0,
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
+                "busy_wall_s": 0.9, "idle_fraction": 0.1,
             }) + "\nnot json\n")
             rows = load_rows()
             assert len(rows) == 1, rows
