@@ -26,7 +26,7 @@ diff --git a/msproviders/rowproviders/msrowprovider.cpp b/msproviders/rowprovide
 index 5e9f8f1..e40baec 100644
 --- a/msproviders/rowproviders/msrowprovider.cpp
 +++ b/msproviders/rowproviders/msrowprovider.cpp
-@@ -4,12 +4,41 @@
+@@ -4,12 +4,40 @@
  
  #include <aocommon/throwruntimeerror.h>
  
@@ -44,10 +44,9 @@ index 5e9f8f1..e40baec 100644
 +/** Copy row @p index out of a block of rows read by fillBlock(). */
 +template <typename T>
 +void CopyRowFromBlock(const casacore::Array<T>& block, size_t index,
-+                      casacore::Array<T>& row) {
-+  const casacore::IPosition shape = block.shape().getFirst(block.ndim() - 1);
++                      casacore::Array<T>& row,
++                      const casacore::IPosition& shape, size_t n) {
 +  if (!row.shape().isEqual(shape)) row.resize(shape);
-+  const size_t n = shape.product();
 +  std::copy_n(block.data() + n * index, n, row.data());
 +}
 +
@@ -68,7 +67,7 @@ index 5e9f8f1..e40baec 100644
  MSRowProvider::MSRowProvider(
      const string& msPath, const MSSelection& selection,
      const std::map<size_t, size_t>& selectedDataDescIds,
-@@ -50,30 +79,107 @@ void MSRowProvider::Initialize() {
+@@ -50,30 +79,118 @@ void MSRowProvider::Initialize() {
          Ms(), casacore::MS::columnName(casacore::MSMainEnums::WEIGHT)));
    }
  
@@ -95,7 +94,8 @@ index 5e9f8f1..e40baec 100644
 +  _blockRows = BlockRowCount(columns.data.shape(BeginRow()).product());
 +  ensureBlock(_currentRow);
 +  _currentTime = _blockTime[0];
-+  CopyRowFromBlock(_blockUvw, 0, _currentUVWArray);
++  CopyRowFromBlock(_blockUvw, 0, _currentUVWArray, _blockUvwShape,
++                   _blockUvwElements);
 +  _currentDataDescId = _blockDataDescId[0];
 +  _currentAntenna1 = _blockAntenna1[0];
 +  _currentAntenna2 = _blockAntenna2[0];
@@ -161,6 +161,8 @@ index 5e9f8f1..e40baec 100644
 +    columns.data_description_id.getColumnRange(one, _blockDataDescId, true);
 +    columns.uvw.getColumnRange(one, _blockUvw, true);
 +  }
++  _blockUvwShape = _blockUvw.shape().getFirst(_blockUvw.ndim() - 1);
++  _blockUvwElements = _blockUvwShape.product();
 +  _blockBegin = row;
 +  _blockEnd = row + rows;
 +  _blockHasVisibilities = false;
@@ -176,6 +178,12 @@ index 5e9f8f1..e40baec 100644
 +    _weightSpectrumColumn->getColumnRange(range, _blockWeights, true);
 +  else
 +    _weightScalarColumn->getColumnRange(range, _blockWeights, true);
++  _blockDataShape = _blockData.shape().getFirst(_blockData.ndim() - 1);
++  _blockDataElements = _blockDataShape.product();
++  _blockFlagShape = _blockFlag.shape().getFirst(_blockFlag.ndim() - 1);
++  _blockFlagElements = _blockFlagShape.product();
++  _blockWeightsShape = _blockWeights.shape().getFirst(_blockWeights.ndim() - 1);
++  _blockWeightsElements = _blockWeightsShape.product();
 +  _blockHasVisibilities = true;
 +}
 +
@@ -183,18 +191,20 @@ index 5e9f8f1..e40baec 100644
 +  ensureBlock(_currentRow);
 +  if (!_blockHasVisibilities)
 +    fillBlockVisibilities(_blockBegin, _blockEnd - _blockBegin);
-+  CopyRowFromBlock(_blockData, _currentRow - _blockBegin, data);
++  CopyRowFromBlock(_blockData, _currentRow - _blockBegin, data,
++                   _blockDataShape, _blockDataElements);
 +}
 +
 +void MSRowProvider::getCurrentFlags(FlagArray& flags) {
 +  ensureBlock(_currentRow);
 +  if (!_blockHasVisibilities)
 +    fillBlockVisibilities(_blockBegin, _blockEnd - _blockBegin);
-+  CopyRowFromBlock(_blockFlag, _currentRow - _blockBegin, flags);
++  CopyRowFromBlock(_blockFlag, _currentRow - _blockBegin, flags,
++                   _blockFlagShape, _blockFlagElements);
  }
  
  void MSRowProvider::NextRow() {
-@@ -83,18 +189,20 @@ void MSRowProvider::NextRow() {
+@@ -83,18 +189,21 @@ void MSRowProvider::NextRow() {
      if (_currentRow == EndRow()) {
        break;
      } else {
@@ -219,13 +229,14 @@ index 5e9f8f1..e40baec 100644
        }
 -      _currentUVWArray = columns.uvw(_currentRow);
 -      isRowSelected = isCurrentRowSelected(fieldId, a1, a2);
-+      CopyRowFromBlock(_blockUvw, index, _currentUVWArray);
++      CopyRowFromBlock(_blockUvw, index, _currentUVWArray, _blockUvwShape,
++                       _blockUvwElements);
 +      isRowSelected = isCurrentRowSelected(_currentFieldId, _currentAntenna1,
 +                                           _currentAntenna2);
      }
    } while (!isRowSelected);
  }
-@@ -110,10 +218,14 @@ bool MSRowProvider::isCurrentRowSelected(int fieldId, int a1, int a2) const {
+@@ -110,10 +218,16 @@ bool MSRowProvider::isCurrentRowSelected(int fieldId, int a1, int a2) const {
  
  void MSRowProvider::getCurrentWeights(WeightArray& weights,
                                        const casacore::IPosition& shape) {
@@ -234,11 +245,13 @@ index 5e9f8f1..e40baec 100644
 +    fillBlockVisibilities(_blockBegin, _blockEnd - _blockBegin);
    if (_msHasWeights)
 -    _weightSpectrumColumn->get(_currentRow, weights, true);
-+    CopyRowFromBlock(_blockWeights, _currentRow - _blockBegin, weights);
++    CopyRowFromBlock(_blockWeights, _currentRow - _blockBegin, weights,
++                     _blockWeightsShape, _blockWeightsElements);
    else {
 -    _weightScalarColumn->get(_currentRow, _scratchWeightScalarArray, true);
 +    CopyRowFromBlock(_blockWeights, _currentRow - _blockBegin,
-+                     _scratchWeightScalarArray);
++                     _scratchWeightScalarArray, _blockWeightsShape,
++                     _blockWeightsElements);
      weights.resize(shape);
      ExpandScalarWeights(_scratchWeightScalarArray, weights);
    }
@@ -284,7 +297,7 @@ index d75da9a..90ded15 100644
    casacore::Vector<double> _currentUVWArray;
    size_t _currentDataDescId;
  
-@@ -69,9 +81,42 @@ class MSRowProvider : public MsRowProviderBase {
+@@ -69,9 +81,50 @@ class MSRowProvider : public MsRowProviderBase {
    bool _requireModel;
    casacore::Array<float> _scratchWeightScalarArray;
  
@@ -321,9 +334,17 @@ index d75da9a..90ded15 100644
 +  casacore::Vector<int> _blockFieldId;
 +  casacore::Vector<int> _blockDataDescId;
 +  casacore::Array<double> _blockUvw;
++  casacore::IPosition _blockUvwShape;
++  size_t _blockUvwElements = 0;
 +  casacore::Array<casacore::Complex> _blockData;
++  casacore::IPosition _blockDataShape;
++  size_t _blockDataElements = 0;
 +  casacore::Array<bool> _blockFlag;
++  casacore::IPosition _blockFlagShape;
++  size_t _blockFlagElements = 0;
 +  casacore::Array<float> _blockWeights;
++  casacore::IPosition _blockWeightsShape;
++  size_t _blockWeightsElements = 0;
 +  /** @} */
  };
  
