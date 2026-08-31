@@ -1,6 +1,13 @@
 # Making a nested-sampling search faster: the index
 
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
+**0.9098 evaluations/second** (0.9058, 0.9151, and 0.9094) at 15 ranks and
+two Torch threads, with **13.62 s/evaluation** in the image container and
+**3.47 GB** peak worker memory. This refresh is consistent with the existing
+0.9128 eval/s operating point; model updates remain dominant and no runtime
+change is justified.
+
+The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9128 evaluations/second** (0.9065, 0.9128, and 0.9132) at 15 ranks and
 two Torch threads, with **13.64 s/evaluation** in the image container and
 **3.47 GB** peak worker memory. This confirms the current 15-rank operating
@@ -45,7 +52,7 @@ in imaging versus **13.8 s** at 16 ranks; aggregate throughput still favored
 16 ranks by **117%**. This confirms extra R2D2 ranks can improve throughput even
 when each worker slows, but the 16-rank setting remains memory-bound.
 
-Two hundred twenty-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Two hundred twenty-eight profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest interleaved R2D2 thread-count probe measured **0.7824 evaluations/second
 at five threads versus 0.7765 at six threads** (three repeats per arm), with
 unchanged **3.47 GB** peak worker memory. Five threads is only 0.8% faster than
