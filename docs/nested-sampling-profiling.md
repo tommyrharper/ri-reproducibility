@@ -53,6 +53,9 @@ report carries it per run page. Read a completed run from the shell:
 The profiler only reads `summary.json`; older runs without a `profiling` block
 must be re-run.
 
+For `--phases`, WSClean's beam-fit lines are grouped by operation even when
+the log switches between arcseconds and milliarcseconds.
+
 ### How the printed shares are computed
 
 The JSON fields above are raw sums. Turning them into something readable is

@@ -134,6 +134,9 @@ _STAMP = re.compile(
 
 def _phase_label(text: str) -> str:
     text = re.sub(r"/\S+", "<path>", text)
+    # WSClean changes beam units between PSF fitting and restoration; they are
+    # one operation for profiling, not two bottlenecks.
+    text = re.sub(r"^Fitting beam\.\.\..*", "Fitting beam...", text)
     return re.sub(r"[-+]?\d[\d.eE+-]*", "N", text)[:64]
 
 
@@ -319,6 +322,8 @@ def self_check() -> None:
         )
         _, _, _, per_eval = phase_gaps([log])
     assert abs(per_eval[("A N", "B N")][0] - 11.0) < 1e-3
+
+    assert _phase_label("Fitting beam... major=1 masec, minor=2 masec") == "Fitting beam..."
 
     assert statistics.median([1.0, 1.0, 100.0]) == 1.0
 
