@@ -100,6 +100,30 @@ check(
 )
 
 check(
+    "benchmark --native reaches build and benchmark",
+    {"WSCLEAN_TARGET_CPU": "native"},
+    plan("bench", "run", "wsclean", "--native")[0],
+)
+
+check(
+    "benchmark --mpi-procs reaches benchmark",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "1", "--mpi-procs", "16"]],
+    plan("bench", "run", "wsclean", "--mpi-procs", "16")[1],
+)
+
+check(
+    "benchmark --omp-threads reaches benchmark",
+    [["scripts/build.sh", "r2d2"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "r2d2",
+      "--preset", "default", "--repeat", "1", "--omp-threads", "4"]],
+    plan("bench", "run", "r2d2", "--omp-threads", "4")[1],
+)
+
+check(
     "search --enable-param/--disable-param join into NS_*_PARAMS",
     {"NS_ENABLE_PARAMS": "source_offset_fraction", "NS_DISABLE_PARAMS": "channel_count,observation_minutes"},
     plan(
@@ -274,6 +298,12 @@ check(
 )
 
 check(
+    "profile --r2d2-phases reaches the profiler",
+    [["uv", "run", "scripts/profile-nested-sampling-run.py", "results/x", "--r2d2-phases"]],
+    plan("profile", "results/x", "--r2d2-phases")[1],
+)
+
+check(
     "bench with no subcommand prints the table",
     ({}, [["uv", "run", "scripts/bench.py"]]),
     plan("bench"),
@@ -286,6 +316,28 @@ check(
      ["uv", "run", "scripts/bench.py", "run", "wsclean",
       "--preset", "default", "--repeat", "3"]],
     plan("bench", "run", "wsclean", "--repeat", "3")[1],
+)
+
+check(
+    "bench run passes an interleaved setting through",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "3",
+      "--interleave", "NS_WSCLEAN_MGAIN", "0.8", "0.9"]],
+    plan("bench", "run", "wsclean", "--repeat", "3",
+         "--interleave", "NS_WSCLEAN_MGAIN", "0.8", "0.9")[1],
+)
+
+check(
+    "benchmark allows explicit oversubscription probes",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "1", "--mpi-procs", "21",
+      "--allow-oversubscription"]],
+    plan("bench", "run", "wsclean", "--mpi-procs", "21",
+         "--allow-oversubscription")[1],
 )
 
 check(

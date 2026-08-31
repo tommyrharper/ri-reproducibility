@@ -3,8 +3,8 @@
 
 Rows live in `benchmarks.jsonl` at the repository root, one JSON object per
 line, appended by every search that finishes. Reading groups them and reports
-a mean with its standard error, so a group's error bar shrinks as repeats at
-the same commit accumulate. See docs/nested-sampling-benchmarks.md.
+a median with a robust standard-error estimate, so one long-tail run cannot
+dominate a group's result. See docs/nested-sampling-benchmarks.md.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -36,14 +38,18 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 # drawn, not the configuration being measured, and it is randomised per run -
 # in the key, every ad-hoc search would be a group of its own. NS_RETRIES and
 # NS_STALL_TIMEOUT are absent because they cost nothing until something breaks.
+# The three image ids are here because the images bake the code: two rows at
+# one commit measured different binaries if a rebuild landed between them.
 WORKLOAD_KEYS = (
     "NS_NLIVE", "NS_NUM_REPEATS", "NS_MAX_NDEAD", "NS_METRIC", "NS_MPI_PROCS",
-    "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_KEEP_MEASUREMENT_SETS",
-    "R2D2_OMP_THREADS",
+    "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_WSCLEAN_LOG_TIME",
+    "NS_KEEP_MEASUREMENT_SETS", "WSCLEAN_TARGET_CPU",
+    "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS",
+    "NS_IMAGER_IMAGE_ID", "NS_MEQTREES_IMAGE_ID", "NS_POLYCHORD_IMAGE_ID",
 )
 
 LABEL_WIDTH = 28  # the longest stage name, indented, plus a space
-COLUMN_WIDTH = 13
+COLUMN_WIDTH = 15  # "0.4656 ±0.0027" is the widest cell the metrics stage makes
 
 
 # --- recording ---------------------------------------------------------------
@@ -84,6 +90,13 @@ def machine_id() -> str:
     return hashlib.sha256((raw or platform.node()).encode()).hexdigest()[:8]
 
 
+def available_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def read_run_env(run_dir: Path) -> dict[str, str]:
     # write_run_config quotes with printf %q; same unquoting as
     # scripts/nested-sampling-runs.py.
@@ -91,9 +104,14 @@ def read_run_env(run_dir: Path) -> dict[str, str]:
         text = (run_dir / "run.env").read_text()
     except OSError:
         return {}
-    return {name.strip(): raw.strip().strip("'").replace("'\\''", "'")
-            for name, raw in (line.split("=", 1)
-                              for line in text.splitlines() if "=" in line)}
+    values = {}
+    for name, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line):
+        try:
+            parsed = shlex.split(raw, comments=False, posix=True)
+        except ValueError:
+            parsed = [raw.strip()]
+        values[name.strip()] = parsed[0] if parsed else ""
+    return values
 
 
 def presets() -> dict[str, dict[str, dict[str, Any]]]:
@@ -163,11 +181,20 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     wall, evals = breakdown["total_wall_seconds"], breakdown["evals"]
     if not wall or not evals:
         return skip("its summary.json carries no profiling block")
+    busy_wall = breakdown.get("busy_wall_seconds")
 
     imager = summary.get("algorithm") or "unknown"
     run_env = read_run_env(run_dir)
     settings = {key: value for key, value in run_env.items() if key in WORKLOAD_KEYS}
     per_eval = breakdown["subtotal_per_eval_seconds"]
+    peak_memory = max(
+        (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
+         or float(record.get("peak_memory_bytes", 0.0))
+         for record in summary.get("evaluations", [])
+         if (record.get("metrics") or {}).get("peak_memory_bytes")
+         or record.get("peak_memory_bytes")),
+        default=0.0,
+    )
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -183,7 +210,11 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "evals": evals,
         "wall_s": round(wall, 3),
         "evals_per_s": round(evals / wall, 4),
+        "busy_wall_s": round(busy_wall, 3) if busy_wall else None,
+        "idle_fraction": round(max(0.0, 1.0 - busy_wall / wall), 4)
+        if busy_wall else None,
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
+        "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -210,6 +241,15 @@ def do_record(args: argparse.Namespace) -> int:
 # --- running -----------------------------------------------------------------
 
 
+def arm_for(attempt: int, arms: list[str]) -> str:
+    """Which arm run `attempt` uses; attempt 0 is the unrecorded warm-up.
+
+    The warm-up repeats the first arm rather than consuming one, so `--repeat N`
+    is N recorded runs *per arm* and the arms stay balanced.
+    """
+    return arms[max(0, attempt - 1) % len(arms)]
+
+
 def do_run(args: argparse.Namespace) -> int:
     """Run the controlled search a preset defines, then let it record itself.
 
@@ -218,18 +258,43 @@ def do_run(args: argparse.Namespace) -> int:
     a search starts is written down twice. ./ri bench run has already built.
     """
     env = {**os.environ, **preset_settings(args.preset, args.imager)}
+    if args.allow_oversubscription:
+        env["NS_MPI_OVERSUBSCRIBE"] = "1"
+    if args.mpi_procs is not None:
+        env["NS_MPI_PROCS"] = str(args.mpi_procs)
+    if args.omp_threads is not None:
+        env["R2D2_OMP_THREADS"] = str(args.omp_threads)
+    # An A/B arm has to meet the same host the other one did, and this host
+    # drifts by more than most effects are worth, so the two settings alternate
+    # run by run rather than running as two blocks.
+    setting, arms = (args.interleave[0], args.interleave[1:]) if args.interleave else (None, [None])
     command = ["./ri", "search", args.imager, "--no-build"]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
     # measured 8-16% faster than the ones behind it here: the package spends a
     # power budget it then has to pay back (docs/nested-sampling-power-limit.md),
     # so a cold first run is effectively a faster machine.
-    for attempt in range(args.repeat + 1):
+    for attempt in range(args.repeat * len(arms) + 1):
+        if setting:
+            env[setting] = arm_for(attempt, arms)
         warm_up = {"NS_BENCH_RECORD": "0"} if attempt == 0 else {}
-        done = subprocess.run(command, cwd=REPO_ROOT, env={**env, **warm_up},
-                              check=False)
-        if done.returncode != 0:
-            return done.returncode
+        process = subprocess.Popen(command, cwd=REPO_ROOT,
+                                   env={**env, **warm_up},
+                                   start_new_session=True)
+        try:
+            returncode = process.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            print(f"benchmark: timeout after {args.timeout}s; stopping run",
+                  file=sys.stderr)
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            return 124
+        if returncode:
+            return returncode
     return 0
 
 
@@ -276,10 +341,11 @@ def plural(count: int, word: str) -> str:
 
 
 def stat(values: list[float]) -> tuple[float, float | None]:
-    """Mean, and the standard error that shrinks as 1/sqrt(n) with repeats."""
+    """Median and IQR-based standard error, robust to long-tail timings."""
     if len(values) < 2:
-        return values[0], None
-    return statistics.fmean(values), statistics.stdev(values) / len(values) ** 0.5
+        return statistics.median(values), None
+    q1, q3 = statistics.quantiles(values, n=4, method="inclusive")[::2]
+    return statistics.median(values), 0.93 * (q3 - q1) / len(values) ** 0.5
 
 
 def number(value: float, digits: int = 4) -> str:
@@ -291,14 +357,14 @@ def number(value: float, digits: int = 4) -> str:
 def cell(values: list[float]) -> str:
     if not values:
         return ""
-    mean, error = stat(values)
-    return number(mean) if error is None else f"{number(mean)} ±{number(error, 2)}"
+    median, error = stat(values)
+    return number(median) if error is None else f"{number(median)} ±{number(error, 2)}"
 
 
 def delta(new: list[float], old: list[float]) -> str:
     """Percentage change against the previous commit, starred when it is real.
 
-    Starred means the two means are more than two combined standard errors
+    Starred means the two medians are more than two combined standard errors
     apart - one repeat each can never earn a star, which is the point.
     """
     if not new or not old:
@@ -346,8 +412,10 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                     reverse=True)[:columns]
 
     def line(label: str, cells: list[str]) -> None:
+        # Joined with a space rather than padded to the full width, so a cell
+        # that fills its column is still separated from the next one.
         print((f"{label:<{LABEL_WIDTH}}"
-               + "".join(f"{text:<{COLUMN_WIDTH}}" for text in cells)).rstrip())
+               + " ".join(f"{text:<{COLUMN_WIDTH - 1}}" for text in cells)).rstrip())
 
     line("", [f"{label}" for label in labels])
     line("", [max(by_commit[label], key=lambda r: r["at"])["at"][5:10]
@@ -355,13 +423,20 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
     line("", [f"n={len(by_commit[label])}" for label in labels])
 
     def row_for_path(label: str, path: tuple[str, ...]) -> None:
-        line(label, [cell(series(by_commit[c], path)) for c in labels])
+        # A field no row in this group carries - busy wall and idle fraction
+        # predate most of the ledger - is left out rather than printed blank.
+        cells = [cell(series(by_commit[c], path)) for c in labels]
+        if any(cells):
+            line(label, cells)
 
     row_for_path("evals/s", ("evals_per_s",))
     line("Δ evals/s", [delta(series(by_commit[new], ("evals_per_s",)),
                             series(by_commit[old], ("evals_per_s",)))
                        for new, old in zip(labels, labels[1:])])
     row_for_path("ms/eval", ("ms_per_eval",))
+    row_for_path("busy wall s", ("busy_wall_s",))
+    row_for_path("idle fraction", ("idle_fraction",))
+    row_for_path("peak memory MB", ("peak_memory_mb",))
     stages: list[str] = []
     for row in rows:
         stages += [key for key in row.get("stages_ms", {}) if key not in stages]
@@ -402,19 +477,27 @@ def self_check() -> None:
     assert machine_id() == machine_id(), "machine id must be stable"
     assert len(machine_id()) == 8, machine_id()
 
-    mean, error = stat([10.0, 12.0])
-    assert mean == 11.0 and abs(error - 1.0) < 1e-9, (mean, error)
+    median, error = stat([10.0, 12.0])
+    assert median == 11.0 and abs(error - 0.657) < 1e-3, (median, error)
     assert stat([10.0]) == (10.0, None)
     # The error bar shrinks as repeats accumulate; that is the whole point.
-    four = stat([10.0, 12.0, 10.0, 12.0])[1]
+    four = stat([10.0, 11.0, 11.0, 12.0])[1]
     assert four is not None and four < error, (four, error)
+    assert stat([100.0, 100.0, 100.0, 1000.0])[0] == 100.0
+    # A cell that exactly fills its column must not run into the next one.
+    assert len(cell([0.4656, 0.4600])) < COLUMN_WIDTH, cell([0.4656, 0.4600])
+
+    # The warm-up repeats arm A, then the recorded runs alternate: two repeats
+    # of two arms is A A B A B, so each arm is measured --repeat times.
+    assert [arm_for(n, ["A", "B"]) for n in range(5)] == ["A", "A", "B", "A", "B"]
+    assert [arm_for(n, [None]) for n in range(3)] == [None, None, None]
 
     assert delta([12.0], [10.0]) == "+20.0%", delta([12.0], [10.0])
     assert delta([10.0], []) == "", "a missing side has no delta"
     # One repeat each cannot be significant; many tight ones can.
     assert not delta([12.0], [10.0]).endswith("*")
     assert delta([12.0, 12.1], [10.0, 10.1]).endswith("*")
-    assert not delta([12.0, 20.0], [10.0, 2.0]).endswith("*")
+    assert not delta([10.0, 1000.0], [1.0, 100.0]).endswith("*")
 
     assert series([{"stages_ms": {"simulate": 3.0}}], ("stages_ms", "simulate")) == [3.0]
     assert series([{"stages_ms": {}}], ("stages_ms", "simulate")) == []
@@ -426,15 +509,57 @@ def self_check() -> None:
         settings = preset_settings("default", imager)
         assert preset_for(settings, imager) == "default", settings
         assert preset_for({**settings, "NS_NLIVE": "999"}, imager) == "custom"
+        throughput = preset_settings("throughput", imager)
+        assert throughput["NS_SYNCHRONOUS"] == "0", throughput
+        assert preset_for(throughput, imager) == "throughput", throughput
+        production = preset_settings("production", imager)
+        assert production["NS_NLIVE"] == "150", production
+        assert production["NS_NUM_REPEATS"] == "15", production
+        assert production["NS_MAX_NDEAD"] == "-1", production
+        assert production["NS_SYNCHRONOUS"] == "0", production
+        assert preset_for(production, imager) == "production", production
     # A preset only claims a run that matches every key it pins, but a run may
     # carry keys the preset says nothing about - NS_MPI_PROCS is host-derived.
     assert preset_for({**preset_settings("default", "wsclean"),
                        "NS_MPI_PROCS": "3"}, "wsclean") == "default"
     assert preset_for({}, "wsclean") == "custom"
 
+    timeout = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                               start_new_session=True)
+    try:
+        try:
+            timeout.wait(timeout=0.01)
+            raise AssertionError("timeout self-check child finished unexpectedly")
+        except subprocess.TimeoutExpired:
+            os.killpg(timeout.pid, signal.SIGTERM)
+            timeout.wait(timeout=5)
+    finally:
+        if timeout.poll() is None:
+            os.killpg(timeout.pid, signal.SIGKILL)
+            timeout.wait()
+
+    # An interleaved setting the ledger does not group by would file both arms
+    # in one cell, so the probe would read as noise rather than as a comparison.
+    guard = argparse.ArgumentParser()
+    for probe, expected in ((["NS_WSCLEAN_MGAIN", "0.8", "0.9"], True),
+                            (["NS_SEED", "1", "2"], False)):
+        try:
+            validate_run(guard, argparse.Namespace(
+                repeat=1, timeout=None, interleave=probe, mpi_procs=None,
+                allow_oversubscription=False))
+            accepted = True
+        except SystemExit:
+            accepted = False
+        assert accepted is expected, probe
+
     import tempfile
 
     with tempfile.TemporaryDirectory() as raw:
+        env_dir = Path(raw) / "env"
+        env_dir.mkdir()
+        (env_dir / "run.env").write_text("NS_METRIC=total_rms_jy\\ -\\ 0.5\\ *\\ snr\n")
+        assert read_run_env(env_dir)["NS_METRIC"] == "total_rms_jy - 0.5 * snr"
+
         run = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         run.mkdir()
         assert row_for(run) is None, "a run outside results/nested-sampling"
@@ -446,7 +571,9 @@ def self_check() -> None:
                 "machine": "1234abcd", "host": "h", "imager": "wsclean",
                 "preset": "default", "run": "r", "evals": 100, "wall_s": 1.0,
                 "evals_per_s": 100.0, "ms_per_eval": 140.0,
+                "peak_memory_mb": 256.0,
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
+                "busy_wall_s": 0.9, "idle_fraction": 0.1,
             }) + "\nnot json\n")
             rows = load_rows()
             assert len(rows) == 1, rows
@@ -455,6 +582,38 @@ def self_check() -> None:
             LEDGER = ledger
 
     print("OK: benchmark ledger")
+
+
+def validate_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject a probe that would silently measure nothing, or oversubscribe.
+
+    Arms only mean anything if the ledger groups them apart, which it does by
+    WORKLOAD_KEYS - so an interleaved setting outside that set would file both
+    arms in one cell and read as noise.
+    """
+    if args.repeat < 1:
+        parser.error("--repeat must be at least 1")
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
+    if args.interleave and args.interleave[0] not in WORKLOAD_KEYS:
+        # The image ids are derived from what is built, not set, so they are
+        # in the group key but not offered as something to interleave.
+        settable = [key for key in WORKLOAD_KEYS if not key.endswith("_IMAGE_ID")]
+        parser.error(f"--interleave {args.interleave[0]} is not one of the "
+                     f"settings the ledger groups by: {', '.join(settable)}")
+    ranks = [args.mpi_procs] if args.mpi_procs is not None else []
+    if args.interleave and args.interleave[0] == "NS_MPI_PROCS":
+        try:
+            ranks += [int(value) for value in args.interleave[1:]]
+        except ValueError:
+            parser.error("interleaved NS_MPI_PROCS values must be whole numbers")
+    if any(rank < 1 for rank in ranks):
+        parser.error("MPI worker counts must be at least 1")
+    # Open MPI reports this as a slot error minutes into a probe otherwise.
+    available = available_cpu_count()
+    if ranks and not args.allow_oversubscription and max(ranks) > available:
+        parser.error(f"MPI worker count cannot exceed {available} available "
+                     "CPU slots without --allow-oversubscription")
 
 
 def main() -> int:
@@ -470,9 +629,22 @@ def main() -> int:
     run.add_argument("imager", choices=("wsclean", "r2d2"))
     run.add_argument("--preset", default="default")
     run.add_argument("--repeat", type=int, default=1)
+    run.add_argument("--timeout", type=float, metavar="SECONDS",
+                     help="stop the whole benchmark, including its process tree, after this time")
+    run.add_argument("--mpi-procs", type=int, metavar="N",
+                     help="override MPI worker count for rank-scaling probes")
+    run.add_argument("--omp-threads", type=int, metavar="N",
+                     help="override per-rank R2D2 OpenMP/BLAS threads")
+    run.add_argument("--interleave", nargs=3, metavar=("SETTING", "A", "B"),
+                     help="alternate one workload setting between two values; "
+                          "--repeat is per arm")
+    run.add_argument("--allow-oversubscription", action="store_true",
+                     help="allow MPI counts above CPU affinity for explicit probes")
     run.set_defaults(handler=do_run)
 
     args = parser.parse_args()
+    if getattr(args, "handler", None) is do_run:
+        validate_run(parser, args)
 
     if args.self_check:
         self_check()
@@ -481,4 +653,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # `./ri bench | head` is normal report consumption, not a failure.
+        # Python flushes stdout on the way out and would raise this again, so
+        # the real file descriptor goes to /dev/null first.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
