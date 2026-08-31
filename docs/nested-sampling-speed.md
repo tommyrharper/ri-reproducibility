@@ -5,6 +5,11 @@ The latest interleaved R2D2 thread-count probe measured **0.7824 evaluations/sec
 at five threads versus 0.7765 at six threads** (three repeats per arm), with
 unchanged **3.47 GB** peak worker memory. Five threads is only 0.8% faster than
 six and remains below the established four-thread control, so no default changes.
+The latest interleaved three-repeat control measured **0.7249 evaluations/second
+at three threads versus 0.7735 at four threads** on 8 ranks, a **6.7%** gain
+with unchanged **3.47 GB** peak worker memory. Four threads remains an explicit
+candidate, not the automatic default, because this probe was synchronous and
+the portable thread heuristic must also fit other CPU/rank configurations.
 The latest three-repeat throughput control measured **107.3 evaluations/second**
 (102.6, 107.3, and 112.9), with **143.1 ms/evaluation** by median,
 **127.6 ms/evaluation** in the image binary, **1.6-6.0%** idle time, and
