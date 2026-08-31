@@ -473,6 +473,12 @@ memory. Eleven threads is 6.2% slower than the latest four-thread control at
 0.7676 eval/s, so the thread-count sweep continues to reject further
 oversubscription.
 
+Putting the warmed R2D2 U-Net into PyTorch eval mode was also tested as a
+result-preserving inference cleanup: two checkpoint-backed runs measured
+**0.8103 eval/s** median versus **0.8126 eval/s** for the matched clean control,
+with no memory reduction (one run reached 3.51 GB). It is rejected as noise or a
+small regression; the source patch was removed.
+
 ## What is priced but deliberately not taken
 
 | lever | worth | why not |
