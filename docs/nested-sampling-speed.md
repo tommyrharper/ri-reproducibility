@@ -6,6 +6,13 @@ residual computation. Model updates are **98.3%** of logged image time, so
 checkpoint swapping, residual work, and sampler overhead are not credible next
 targets; the remaining optimization work is the U-Net convolution path.
 
+A synthetic 128x128 U-Net probe tested removing PyTorch's legacy weight-norm
+reparameterizations after model construction. Materialized weights produced
+bit-identical output but measured **114.96 ms/forward** versus **115.08 ms**
+with weight normalization under two Torch threads (0.1% faster). The change is
+therefore rejected: it does not move inference time, and checkpoint loading
+would need extra state-dict handling to use it in production.
+
 A fifteen-repeat asynchronous WSClean control on HEAD measured **105.6
 evaluations/second** (IQR **11.5 eval/s**) at 20 ranks, with **144.4
 ms/evaluation** by median, **128.8 ms/evaluation** in the image binary, and
