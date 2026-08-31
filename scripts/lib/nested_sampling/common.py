@@ -50,6 +50,20 @@ FAILURE_OBJECTIVE = 100.0
 # Worker died mid-request; negative keeps it distinct from real exit statuses.
 WORKER_DIED = -1
 
+# The zygote reports a signal-killed child as 128 + signal (docker/wsclean/src/
+# zygote.cpp), and SIGKILL is the one signal nothing in this pipeline sends an
+# imager: it is the kernel's OOM killer. A killed imager says nothing about the
+# parameters it was given, so it is classified with WORKER_DIED rather than
+# scored - see docs/robustness.md. A crash the imager chose (SIGSEGV, SIGABRT)
+# stays scored: that is a failure mode, which is what these runs look for.
+OOM_KILLED = 128 + 9
+
+
+def is_infrastructure_failure(returncode: int) -> bool:
+    """True when the host failed rather than the imager. Never scored."""
+    return returncode in (WORKER_DIED, OOM_KILLED)
+
+
 # Fresh worker per attempt; increasing delays allow transient OOM pressure to
 # clear. See docs/robustness.md for retry semantics.
 WORKER_RETRY_DELAYS = (0.0, 1.0, 5.0, 15.0, 30.0)

@@ -26,6 +26,13 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   else
     NS_MPI_PROCS="${HOST_CPUS}"
   fi
+  # R2D2 saturates a host well below one rank per core, so the memory clamp
+  # below is not the right stopping point: it would take every rank the memory
+  # allows for throughput that stopped rising. See NS_R2D2_MAX_RANKS in
+  # defaults.toml and docs/nested-sampling-throughput.md.
+  if [ "${NS_MPI_PROCS}" -gt "${NS_R2D2_MAX_RANKS}" ]; then
+    NS_MPI_PROCS="${NS_R2D2_MAX_RANKS}"
+  fi
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2)"
 else
   # Explicitly asked for, so it is honoured - but said out loud if it will

@@ -21,6 +21,7 @@ from common import (
     DEFAULT_WSCLEAN_MGAIN,
     DEFAULT_WSCLEAN_NITER,
     FAILURE_OBJECTIVE,
+    OOM_KILLED,
     WORKER_DIED,
     WorkerDied,
     ZYGOTE_COMMAND,
@@ -32,6 +33,7 @@ from common import (
     gathered_window_fit_stats,
     compute_image_metrics,
     image_pixel_size_arcsec,
+    is_infrastructure_failure,
     load_evaluations_from_dir,
     load_parameter_space,
     mark_evaluation_start,
@@ -160,8 +162,9 @@ def evaluate(
     run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = run_result.peak_memory_bytes
     image_binary_seconds = run_result.binary_seconds
-    if run_result.returncode == WORKER_DIED:
-        raise WorkerDied(f"wsclean {ZYGOTE_COMMAND} died on evaluation {eval_id} ({eval_dir})")
+    if is_infrastructure_failure(run_result.returncode):
+        killed = " was killed by the OOM killer" if run_result.returncode == OOM_KILLED else " died"
+        raise WorkerDied(f"wsclean {ZYGOTE_COMMAND}{killed} on evaluation {eval_id} ({eval_dir})")
     if run_result.returncode != 0:
         return write_evaluation_record(eval_dir, {
             "eval_id": eval_id,
@@ -305,7 +308,35 @@ def self_check_failure_record_persistence() -> None:
         def failing_metrics(*args: Any, **kwargs: Any) -> dict[str, float]:
             raise ValueError("bad fits")
 
+        # An imager the OOM killer took is the host failing, not the algorithm:
+        # it has to raise rather than write a record, or FAILURE_OBJECTIVE lands
+        # on the machine's memory limit and PolyChord maximises towards it. See
+        # docs/robustness.md.
+        def oom_killed_wsclean(
+            image: str,
+            platform: str,
+            workdir: Path,
+            argv: list[str],
+            stdout_path: Path,
+            stderr_path: Path,
+        ) -> argparse.Namespace:
+            return argparse.Namespace(
+                returncode=OOM_KILLED, wall_seconds=2.0, peak_memory_bytes=0, binary_seconds=1.5
+            )
+
         globals()["simulate_measurement_set"] = successful_simulate
+        globals()["zygote_run"] = oom_killed_wsclean
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(meqtrees_image="meqtrees", wsclean_image="wsclean", platform="linux/arm64")
+            try:
+                evaluate({"source_flux_jy": 1.0}, args, root / "eval-0003-deadbeef", 3, lambda metrics: 0.0)
+            except WorkerDied:
+                pass
+            else:
+                raise AssertionError("an OOM-killed wsclean must not be scored")
+            assert load_evaluations_from_dir(root) == [], "an OOM kill must leave no record"
+
         globals()["zygote_run"] = successful_wsclean
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:

@@ -1413,3 +1413,48 @@ quantised and `/usr/bin/time` is no longer forked at all;
 the pipe round trip to the rank's zygote. The paragraph above is what an
 archived run's numbers mean, and the ~5ms correction is what to apply before
 comparing one against a run made since.
+
+## R2D2 saturates this host at 8 ranks, and the rank count now stops there
+
+**R2D2 throughput is flat from 8 MPI ranks to 15 while the memory it needs
+doubles, so the derived rank count is capped at `NS_R2D2_MAX_RANKS` (8) before
+the memory clamp is applied.**
+
+The rank count for an R2D2 search used to be `min(nlive, host CPUs)` clamped by
+`ns_budget_ranks()` to whatever memory allowed - 15 ranks on the 20-thread,
+64GB rig, because 15 x 3500MB is what fits under the headroom. That rule
+optimises the wrong thing. It assumes throughput rises with ranks until memory
+stops it, and for R2D2 it stops rising well before memory does.
+
+Two rank counts, paired and interleaved so they share the host's own drift,
+`--nlive 40 --num-repeats 2 --max-ndead 40 --seed 1`:
+
+| ranks x OMP threads | run 1 | run 2 | median | memory |
+| --- | ---: | ---: | ---: | ---: |
+| 15 x 2 | 0.898 evals/s | 0.916 evals/s | 0.907 | ~53 GB |
+| 8 x 3 | 0.878 evals/s | 0.917 evals/s | 0.898 | ~28 GB |
+
+1% apart, inside the run-to-run spread, for 25GB. The per-evaluation numbers
+say why: 9.19 seconds of eval-slot time at 8 ranks against 16.9 at 15. The
+work per evaluation nearly doubles and the total does not move, which is what
+a saturated machine looks like - 20 threads are already busy at 8 concurrent
+evaluations, and the 16th rank is dividing the same cores, not adding any.
+
+(The benchmark rows in `benchmarks.jsonl` do not show this: the `default` R2D2
+preset is `nlive 8`, so at 15 ranks most of them are idle waiting for live
+points rather than contending, and the two configurations come out equal for
+the wrong reason. `nlive 40` is the smallest run measured here that keeps 15
+ranks fed.)
+
+WSClean needs no equivalent cap. It is ~200MB a rank against R2D2's 3.5GB, and
+[the saturation section](#the-host-saturates-at-56-evaluationss-and-it-is-not-scheduling)
+puts its knee at one rank per hardware thread, which is where the existing rule
+already lands.
+
+What the cap buys is not speed, it is the run surviving. A 30-hour R2D2 search
+at 15 ranks sits at ~53GB of 62GB for a day and a half, and an evaluation the
+OOM killer takes stops the run (it is never scored - see
+[robustness](robustness.md)), costing the wall clock back to the last PolyChord
+checkpoint. At 8 ranks the same search runs at the same speed in half the
+memory. `NS_R2D2_MAX_RANKS` in `defaults.toml` is the number, overridable from
+the environment, and an explicit `--mpi-procs` still wins over both.
