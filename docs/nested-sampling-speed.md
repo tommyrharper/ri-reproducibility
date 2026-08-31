@@ -231,6 +231,7 @@ rates are historical and roughly half the current rate.
 | FFTW planner warmed in the zygote parent | `zygote.cpp` | -6.9% on the binary ([FFTW](nested-sampling-fftw-planner.md)) |
 | `schaapcommon` FFTW plan cache | `patches/0004` | -2.7% on the binary ([gridder floor](nested-sampling-gridder-floor.md)) |
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
+| Row-block copy metadata cached | `patches/0005` follow-up | 72.95 evals/s median in three default controls; no isolated end-to-end gain yet |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
 | Finite-image RMS and relative L2 metrics share one residual norm | `common.py` | 0.456 to 0.453 ms/evaluation metrics stage in the latest control; no defensible end-to-end speedup |
