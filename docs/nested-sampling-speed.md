@@ -6,6 +6,11 @@ ms/evaluation** and **34.3-34.6 MB** peak worker memory. This refresh found no
 defensible runtime change; gridding and predicting remain the dominant measured
 binary phases.
 
+A fresh checkpoint-backed R2D2 control at 15 ranks and one Torch thread measured
+**0.749 evaluations/second** over 36 evaluations, versus the established
+two-thread operating point near **0.91 eval/s**. One thread is about **18%
+slower** with unchanged **3.47 GB** per-worker memory; retain two threads.
+
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9055 evaluations/second** (0.9055, 0.8989, and 0.9165) at 15 ranks and
 two Torch threads, with **13.62 s/evaluation** in the image container and
@@ -216,6 +221,7 @@ rates are historical and roughly half the current rate.
 | R2D2 15-rank control refresh | `./ri bench run r2d2 --repeat 3` | 0.9128 eval/s median (0.9065, 0.9128, 0.9132) at 15 ranks x 2 threads; 3.47 GB peak worker memory; confirms current operating point |
 | R2D2 14-versus-15 rank probe | `./ri bench run r2d2 --interleave-mpi-procs 14 15 --omp-threads 2 --repeat 2` | 0.9062 versus 0.9020 eval/s median; 3.47 GB per-worker memory in both arms; two repeats too close to change the 15-rank choice |
 | R2D2 automatic threads follow memory-clamped ranks | `run-nested-sampling-r2d2.sh` | Production-size probe clamped 20 -> 15 ranks and selected 2 threads; 178 evaluations in 175.9 s (1.01 eval/s), 3.64 GB peak worker memory |
+| R2D2 one-thread control at 15 ranks | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 1 --repeat 2` | 0.749 eval/s over 36 evaluations versus ~0.91 at two threads; ~18% slower with 3.47 GB per-worker memory |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
