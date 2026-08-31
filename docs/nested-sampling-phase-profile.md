@@ -120,6 +120,12 @@ hence every metric. It is recorded here because it is 6.7% of an evaluation
 sitting in ~200 lines of straight-line arithmetic, which is a better shape for
 a future upstream contribution than anything else left in the profile.
 
+A direct replay on a valid Measurement Set checked the least invasive box-size
+alternative: `-beam-fitting-size` 10, 15, and 20 took 0.58, 1.11, and 1.84 ms
+for the fit, respectively, while all returned the same 3.06'' x 2.27'' beam.
+The default 10 is therefore the fastest tested result-preserving setting; no
+runtime change was made.
+
 ## Two avenues closed
 
 ### Pre-warming the zygote parent is worth ~1%, not ~7%
