@@ -18,6 +18,7 @@ the complete interface.
 ./ri search wsclean
 ./ri search r2d2 --metric sigma_res
 ./ri search wsclean --nlive 20 --num-repeats 5 --max-ndead 20
+./ri search wsclean --then r2d2       # the second starts only if the first finished
 ./ri resume results/nested-sampling/<run>
 ```
 

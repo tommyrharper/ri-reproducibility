@@ -100,7 +100,25 @@ type model struct {
 	height int
 }
 
-var imagers = []string{"wsclean", "r2d2"}
+// What the form can launch: one imager, or one and then the other. A chained
+// pair runs as a single detached `./ri search --then`, so the second search
+// starts only if the first finished, and the two never share the host - see
+// the --then flag in ./ri and docs/nested-sampling-throughput.md.
+var targets = []target{
+	{first: "wsclean"},
+	{first: "r2d2"},
+	{first: "wsclean", then: "r2d2"},
+	{first: "r2d2", then: "wsclean"},
+}
+
+type target struct{ first, then string }
+
+func (t target) label() string {
+	if t.then == "" {
+		return t.first
+	}
+	return t.first + " then " + t.then
+}
 
 type launch struct {
 	run Run
@@ -482,17 +500,24 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	case "left", "right":
 		if m.focused == 0 {
-			m.imager = (m.imager + 1) % len(imagers)
+			step := 1
+			if msg.String() == "left" {
+				step = -1
+			}
+			m.imager = (m.imager + step + len(targets)) % len(targets)
 			return m, nil
 		}
 	case "enter":
-		imager := imagers[m.imager]
-		dir, err := m.ri.claimRunDir(imager)
+		t := targets[m.imager]
+		// The first search's directory, which is the one this session can name
+		// before it exists. A chained second search claims its own, and the
+		// table picks it up on the next ./ri runs.
+		dir, err := m.ri.claimRunDir(t.first)
 		if err != nil {
 			m.err = err.Error()
 			return m, nil
 		}
-		args := searchArgs(imager, m.fields, dir)
+		args := searchArgs(t, m.fields, dir)
 		log, err := m.ri.launch(dir, args)
 		if err != nil {
 			// The directory was claimed for a run that never started, so give
@@ -502,11 +527,14 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		run := Run{
-			Name: filepath.Base(dir), Path: dir, Algorithm: imager,
+			Name: filepath.Base(dir), Path: dir, Algorithm: t.first,
 			Status: "starting", StartedLabel: "just now",
 		}
 		m.launches = append([]launch{{run: run, log: log}}, m.launches...)
 		m.err, m.notice = "", "launched "+run.Name
+		if t.then != "" {
+			m.notice += ", then " + t.then
+		}
 		m.setRows()
 		m.table.SetCursor(0)
 		cmd := m.showRun(run, paneLog)
@@ -598,11 +626,11 @@ func (m model) logView() string {
 
 func (m model) formView() string {
 	choice := []string{}
-	for i, name := range imagers {
+	for i, t := range targets {
 		if i == m.imager {
-			choice = append(choice, focusStyle.Render("["+name+"]"))
+			choice = append(choice, focusStyle.Render("["+t.label()+"]"))
 		} else {
-			choice = append(choice, " "+name+" ")
+			choice = append(choice, " "+t.label()+" ")
 		}
 	}
 	cursor := func(row int) string {
@@ -614,7 +642,7 @@ func (m model) formView() string {
 	lines := []string{
 		titleStyle.Render("new search"),
 		"",
-		cursor(0) + fmt.Sprintf("%-14s", "imager") + strings.Join(choice, " "),
+		cursor(0) + fmt.Sprintf("%-14s", "imagers") + strings.Join(choice, " "),
 	}
 	for i, f := range m.fields {
 		lines = append(lines, cursor(i+1)+fmt.Sprintf("%-14s", f.flag)+
@@ -627,7 +655,7 @@ func (m model) formView() string {
 		lines = append(lines, errStyle.Render(m.err))
 	}
 	lines = append(lines, "",
-		helpStyle.Render("tab/↑↓ move  ·  ←/→ imager  ·  enter launch  ·  esc back"))
+		helpStyle.Render("tab/↑↓ move  ·  ←/→ imagers  ·  enter launch  ·  esc back"))
 	return strings.Join(lines, "\n")
 }
 

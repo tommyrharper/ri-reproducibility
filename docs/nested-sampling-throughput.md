@@ -1458,3 +1458,45 @@ OOM killer takes stops the run (it is never scored - see
 checkpoint. At 8 ranks the same search runs at the same speed in half the
 memory. `NS_R2D2_MAX_RANKS` in `defaults.toml` is the number, overridable from
 the environment, and an explicit `--mpi-procs` still wins over both.
+
+## Two searches at once finish no sooner than two in turn
+
+**The host is work-conserving: a WSClean and an R2D2 search running together
+keep 0.66 and 0.36 of their solo throughput, which sums to 1.015. Concurrency
+splits the cores rather than finding any, so `./ri search --then` runs a pair in
+turn instead of together.**
+
+Memory stopped being the objection when
+[the rank cap](#r2d2-saturates-this-host-at-8-ranks-and-the-rank-count-now-stops-there)
+put R2D2 at 8 ranks: 28GB for R2D2 and ~4GB for WSClean is 32GB of 62, and
+`ns_budget_ranks()` reservations already handle two runs asking at once. Cores
+are the objection.
+
+Solo baselines, then the pair started together, durations matched so they
+overlap almost end to end:
+
+| | solo | during overlap | share of solo |
+| --- | ---: | ---: | ---: |
+| WSClean, 20 ranks (`--nlive 150 --num-repeats 15 --max-ndead 600`) | 99.6 evals/s | 65.4 evals/s | 0.66 |
+| R2D2, 8 ranks x 3 threads (`--nlive 40 --num-repeats 2 --max-ndead 40`) | 0.885 evals/s | 0.317 evals/s | 0.36 |
+| | | **sum** | **1.015** |
+
+R2D2 outlived WSClean by 97 seconds, and in that tail it ran at 0.854 evals/s -
+back to its solo rate, which is the check that the contended window really is
+the contended window. Rates are computed from each record's own
+`started_epoch`/`ended_epoch`, so the overlap is cut at the last evaluation
+WSClean finished rather than at either run's total.
+
+1.015 is the whole result: within 1.5% the machine hands out the same total
+work whether one search is on it or two. For the pair this repo actually runs
+that is 0.18h + 31.0h = 31.2h sequentially, against 31.2h concurrently - the
+11-minute WSClean search stretches to 17 minutes and steals exactly the R2D2
+time it saves.
+
+What concurrency does cost is the measurement. Under contention R2D2's recorded
+`image_container_seconds` reads ~2.8x its solo cost, and that number is written
+into every record, into `summary.json` and into the `benchmarks.jsonl` row the
+run appends - so a run measured against a competing search is not comparable
+with anything in the archive. The split is also unfair to the run that can
+least afford it: 20 single-threaded WSClean ranks take 0.66 while the 31-hour
+R2D2 search gets 0.36.

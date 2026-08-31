@@ -106,6 +106,32 @@ check(
 )
 
 check(
+    "--then runs a second search, building the images both need once",
+    [
+        ["scripts/build.sh", "wsclean"],
+        ["scripts/build.sh", "meqtrees"],
+        ["scripts/build.sh", "polychord"],
+        ["scripts/build.sh", "r2d2"],
+        ["scripts/run-nested-sampling.sh"],
+        ["env", "OUTPUT_DIR=", "scripts/run-nested-sampling-r2d2.sh"],
+    ],
+    plan("search", "wsclean", "--then", "r2d2")[1],
+)
+
+# --output-dir names the first search's directory. The second has to claim its
+# own, or it would be pointed at a directory the first one has just finished in.
+check(
+    "a chained search does not inherit --output-dir",
+    ["results/nested-sampling/x", ""],
+    [
+        plan("search", "wsclean", "--then", "r2d2", "--output-dir",
+             "results/nested-sampling/x")[0]["OUTPUT_DIR"],
+        plan("search", "wsclean", "--then", "r2d2", "--output-dir",
+             "results/nested-sampling/x")[1][-1][1].split("=", 1)[1],
+    ],
+)
+
+check(
     "benchmark --native reaches build and benchmark",
     {"WSCLEAN_TARGET_CPU": "native"},
     plan("bench", "run", "wsclean", "--native")[0],
