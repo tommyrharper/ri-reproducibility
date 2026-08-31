@@ -1,5 +1,11 @@
 # Making a nested-sampling search faster: the index
 
+The newest 34-evaluation R2D2 run (14 ranks, two Torch threads) profiles at
+**11,816.55 ms/evaluation** for model updates and **203.95 ms/evaluation** for
+residual computation. Model updates are **98.3%** of logged image time, so
+checkpoint swapping, residual work, and sampler overhead are not credible next
+targets; the remaining optimization work is the U-Net convolution path.
+
 A fifteen-repeat asynchronous WSClean control on HEAD measured **105.6
 evaluations/second** (IQR **11.5 eval/s**) at 20 ranks, with **144.4
 ms/evaluation** by median, **128.8 ms/evaluation** in the image binary, and
