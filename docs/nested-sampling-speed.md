@@ -19,6 +19,11 @@ ms/evaluation** by median, **122.7-138.9 ms/evaluation** in the image
 container, and **34.4-34.6 MB** peak worker memory. This remains host variance,
 not a code speedup.
 
+An interleaved three-repeat rank probe measured WSClean at **99.48 evaluations/
+second** at 19 ranks (99.48, 93.30, and 109.01) versus **110.37** at 20 ranks
+(107.69, 114.47, and 110.37). The 19-rank arm was about **9.9% slower** with
+the same **34.5 MB** peak worker memory, so 20 ranks remains the default.
+
 A six-run interleaved oversubscription probe measured WSClean at **107.7
 evaluations/second** with 20 ranks versus **104.7 evaluations/second** with 21
 ranks, with **34.3-34.7 MB** peak worker memory in both arms. The extra rank is
