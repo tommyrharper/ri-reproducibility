@@ -93,6 +93,7 @@ rates are historical and roughly half the current rate.
 | R2D2 checkpoint weights assigned by reference | `docker/r2d2/patches/assign-checkpoint-weights.patch` | R2D2 throughput 0.5622 to 0.5948 eval/s in three controlled runs (5.8%), with unchanged 3.47 GB peak memory |
 | R2D2 checkpoint key normalization cached | `r2d2_serve.py` | 4.36 to 0.01 us per repeated 24-key lookup in a microbenchmark; three fresh end-to-end runs measured 0.7205, 0.7768, and 0.7350 eval/s, so no isolated throughput gain is claimed |
 | R2D2 auto thread count rounds up per-rank CPU share | `run-nested-sampling-r2d2.sh` | 0.6198 to 0.7249 eval/s at 8 ranks (16.9%), with unchanged 3.47 GB peak memory |
+| R2D2 inference paths use `torch.inference_mode` | `r2d2_serve.py` | Representative 128x128 U-Net microbenchmark: 8.589 to 8.467 ms/forward (1.4%); no end-to-end claim without checkpoints |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
