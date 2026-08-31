@@ -8,12 +8,11 @@ the remaining spread still shows host variance rather than a new runtime
 change. Reordered-part metadata caching and deferred UVW copying remain
 rejected by matched end-to-end experiments.
 
-The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
-**0.9040 evaluations/second** (0.9040, 0.9039, and 0.9060) at 15 ranks and
-two Torch threads, with **13.61 s/evaluation** in the image container and
-**3.47 GB** peak worker memory. This refresh is consistent with the current
-operating point; model updates remain dominant and no runtime change is
-justified.
+The latest matched four-repeat checkpoint-backed R2D2 probe measured **0.9175
+evaluations/second** at 15 ranks and two Torch threads (0.9115, 0.9171, 0.9179,
+and 0.9194), with **3.47 GB** peak worker memory. Four Torch threads measured
+**0.8737 evaluations/second** in the same probe, so two threads remains the
+fastest memory-safe operating point; model updates remain dominant.
 
 A fresh three-repeat asynchronous WSClean control measured **110.7 evaluations/second**
 (114.2, 110.7, and 108.8) at 20 ranks, with **144.5 ms/evaluation** by median,
