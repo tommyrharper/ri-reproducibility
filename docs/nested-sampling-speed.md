@@ -1,15 +1,15 @@
 # Making a nested-sampling search faster: the index
 
-Current measured operating points: WSClean **113.75 evaluations/second** at
+Current measured operating points: WSClean **117.5 evaluations/second** at
 20 ranks and R2D2 **0.9101 evaluations/second** at 15 ranks with two Torch
 threads. Deterministic MKLDNN kernels remain enabled after checkpoint-backed
 validation; three throughput runs measured **0.9189, 0.9030, and 0.9101
 evaluations/second**, with **3.47 GB** peak worker memory. This confirms no
 memory regression, but this control alone does not establish a causal gain.
 
-A fresh three-repeat asynchronous WSClean control measured **113.75
-evaluations/second** (106.31, 117.63, and 113.75) at 20 ranks, with **140.2
-ms/evaluation** by median, **125.2 ms/evaluation** in the image binary, and
+A fresh three-repeat asynchronous WSClean control measured **117.5
+evaluations/second** (117.5, 119.6, and 111.6) at 20 ranks, with **134.6
+ms/evaluation** by median, **119.3 ms/evaluation** in the image binary, and
 **34.3-34.6 MB** peak worker memory. This is a control refresh within normal
 host variance; no new runtime change is claimed.
 
