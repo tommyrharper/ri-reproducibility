@@ -37,6 +37,10 @@ type Run struct {
 	StartedLabel string            `json:"started_label"`
 	Settings     map[string]string `json:"settings"`
 	Space        []Param           `json:"parameter_space"`
+	// SpaceFromDefaults marks a Space that is defaults.toml standing in for a
+	// run that died before recording its own. defaults.toml is edited between
+	// runs, so this box is the repository's now, not necessarily the run's.
+	SpaceFromDefaults bool `json:"parameter_space_from_defaults"`
 }
 
 // Param is one searched dimension of a run's parameter-space.json. A
@@ -88,7 +92,15 @@ func (r Run) ranges(abbreviated bool) string {
 		return "-"
 	}
 	if abbreviated {
+		if r.SpaceFromDefaults {
+			// A trailing ? rather than a longer note: the cell is already the
+			// widest column, and the detail line below spells it out.
+			return strings.Join(parts, " ") + " ?"
+		}
 		return strings.Join(parts, " ")
+	}
+	if r.SpaceFromDefaults {
+		return strings.Join(parts, " · ") + "  (not recorded - showing defaults.toml)"
 	}
 	return strings.Join(parts, " · ")
 }

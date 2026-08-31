@@ -321,6 +321,17 @@ def self_check_failure_record_persistence() -> None:
 def main() -> None:
     args = parse_args()
 
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    evaluations_dir = output_dir / "evaluations"
+    evaluations_dir.mkdir(exist_ok=True)
+    # Before the sidecars, because warming them is where a run is most likely
+    # to die, and a run that dies with no record of its box cannot be told
+    # apart afterwards from one that searched a different one. Rank 0 alone:
+    # every rank ran this line, so twenty of them raced over one file.
+    if mpi_rank() == 0:
+        write_json_atomic(output_dir / "parameter-space.json", load_parameter_space())
+
     def warm_wsclean() -> None:
         sidecar_command(args.wsclean_image)
         sidecar_worker(args.wsclean_image, args.platform, [ZYGOTE_COMMAND])
@@ -337,11 +348,6 @@ def main() -> None:
     from pypolychord.settings import PolyChordSettings
 
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    evaluations_dir = output_dir / "evaluations"
-    evaluations_dir.mkdir(exist_ok=True)
-    (output_dir / "parameter-space.json").write_text(json.dumps(load_parameter_space(), indent=2) + "\n")
 
     # key -> objective, not key -> record: nothing reads the record back (the
     # summary re-reads them all from disk below) and holding them is what made
