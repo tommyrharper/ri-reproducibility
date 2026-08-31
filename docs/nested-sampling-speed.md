@@ -13,6 +13,14 @@ with weight normalization under two Torch threads (0.1% faster). The change is
 therefore rejected: it does not move inference time, and checkpoint loading
 would need extra state-dict handling to use it in production.
 
+Channels-last execution was tested as a lower-level convolution optimization.
+Three warmed 128x128 U-Net probes at four Torch threads measured **61.292
+ms/forward** in the existing NCHW layout versus **66.828 ms** after converting
+the model and inputs to channels-last, with maximum output difference
+**1.4e-5**. It is a 9.0% synthetic regression, so no memory-format change is
+retained; oneDNN kernel selection remains the next target only if a faster,
+result-preserving backend is found.
+
 A fifteen-repeat asynchronous WSClean control on HEAD measured **105.6
 evaluations/second** (IQR **11.5 eval/s**) at 20 ranks, with **144.4
 ms/evaluation** by median, **128.8 ms/evaluation** in the image binary, and
