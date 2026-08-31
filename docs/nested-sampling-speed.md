@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-One hundred ninety-two profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred ninety-three profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest fifteen-repeat async control measured **109.0 +/- 1.5 evaluations/second** at
 20 workers, with **143.0 +/- 1.1 ms/evaluation**, **127.4 +/- 0.93 ms/evaluation** in the image
 binary, **0.453 ms/evaluation** in metrics, and **34.1-34.5 MB** peak worker
@@ -169,6 +169,13 @@ evaluations/second** (102.1-115.9) at 20 workers, with **143.0 +/- 1.1
 ms/evaluation**, **127.4 +/- 0.93 ms/evaluation** in the image binary, and
 **34.2-34.7 MB** peak worker memory. The larger sample confirms established
 host variance and does not justify a new runtime change.
+The idle-time diagnostic then separated scheduler stalls from image cost: two
+normal controls measured **109.2** and **115.5 evaluations/second**, while one
+42.8 evaluations/second outlier spent **69.0%** of wall time idle despite only
+**101.1 ms/evaluation** in the image binary. This is host or scheduler
+interference, not a WSClean regression; future controls should report and
+inspect idle fraction before treating a slow run as an image optimization
+signal.
 The newest three-repeat asynchronous control measured **108.7 evaluations/second**
 (115.4, 108.2, and 108.7), with **140.3 ms/evaluation** and **34.2-34.4 MB**
 peak memory. Image binary remained dominant at **125.0 ms/evaluation**; this is
