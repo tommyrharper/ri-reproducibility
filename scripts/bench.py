@@ -41,7 +41,7 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 WORKLOAD_KEYS = (
     "NS_NLIVE", "NS_NUM_REPEATS", "NS_MAX_NDEAD", "NS_METRIC", "NS_MPI_PROCS",
     "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_KEEP_MEASUREMENT_SETS",
-    "R2D2_OMP_THREADS", "WSCLEAN_TARGET_CPU", "NS_IMAGER_IMAGE_ID",
+    "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS", "WSCLEAN_TARGET_CPU", "NS_IMAGER_IMAGE_ID",
     "NS_MEQTREES_IMAGE_ID", "NS_POLYCHORD_IMAGE_ID",
 )
 
@@ -261,15 +261,20 @@ def do_run(args: argparse.Namespace) -> int:
     arms = args.interleave_omp_threads or (args.omp_threads,)
     if args.interleave_omp_threads:
         env["R2D2_OMP_THREADS"] = str(arms[0])
+    interop_arms = args.interleave_interop_threads or (None,)
+    if args.interleave_interop_threads:
+        env["R2D2_INTEROP_THREADS"] = str(interop_arms[0])
     command = ["./ri", "search", args.imager, "--no-build"]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
     # measured 8-16% faster than the ones behind it here: the package spends a
     # power budget it then has to pay back (docs/nested-sampling-power-limit.md),
     # so a cold first run is effectively a faster machine.
-    for attempt in range(args.repeat * len(arms) * len(mpi_arms) * len(schedule_arms) + 1):
+    for attempt in range(args.repeat * len(arms) * len(interop_arms) * len(mpi_arms) * len(schedule_arms) + 1):
         if attempt and arms[0] is not None:
             env["R2D2_OMP_THREADS"] = str(arms[(attempt - 1) % len(arms)])
+        if attempt and interop_arms[0] is not None:
+            env["R2D2_INTEROP_THREADS"] = str(interop_arms[(attempt - 1) % len(interop_arms)])
         if attempt and mpi_arms[0] is not None:
             env["NS_MPI_PROCS"] = str(mpi_arms[(attempt - 1) % len(mpi_arms)])
         if attempt and schedule_arms[0] is not None:
@@ -576,6 +581,9 @@ def main() -> int:
     run.add_argument("--interleave-omp-threads", type=int, nargs=2,
                      metavar=("A", "B"),
                      help="alternate two R2D2 thread counts; --repeat is per arm")
+    run.add_argument("--interleave-interop-threads", type=int, nargs=2,
+                     metavar=("A", "B"),
+                     help="alternate R2D2 inter-op thread limits; 0 disables limit")
     run.add_argument("--interleave-mpi-procs", type=int, nargs=2,
                      metavar=("A", "B"),
                      help="alternate two MPI worker counts; --repeat is per arm")
@@ -605,6 +613,11 @@ def main() -> int:
             parser.error("use --interleave-omp-threads or --omp-threads, not both")
         if any(value < 1 for value in args.interleave_omp_threads):
             parser.error("interleaved OMP thread counts must be at least 1")
+    if getattr(args, "handler", None) is do_run and args.interleave_interop_threads:
+        if args.imager != "r2d2":
+            parser.error("--interleave-interop-threads is only valid for r2d2")
+        if any(value < 0 for value in args.interleave_interop_threads):
+            parser.error("interleaved inter-op thread counts must be non-negative")
     if getattr(args, "handler", None) is do_run and args.interleave_mpi_procs:
         if args.mpi_procs is not None:
             parser.error("use --interleave-mpi-procs or --mpi-procs, not both")

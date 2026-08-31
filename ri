@@ -184,6 +184,8 @@ def do_bench_run(args):
            *( ["--omp-threads", str(args.omp_threads)] if args.omp_threads is not None else []),
            *( ["--interleave-omp-threads", *(str(value) for value in args.interleave_omp_threads)]
               if args.interleave_omp_threads else []),
+           *( ["--interleave-interop-threads", *(str(value) for value in args.interleave_interop_threads)]
+              if args.interleave_interop_threads else []),
            *( ["--interleave-mpi-procs", *(str(value) for value in args.interleave_mpi_procs)]
               if args.interleave_mpi_procs else []),
            *( ["--interleave-synchronous", *(str(value) for value in args.interleave_synchronous)]
@@ -638,6 +640,9 @@ def build_parser():
     bench_run.add_argument("--interleave-omp-threads", type=int, nargs=2,
                            metavar=("A", "B"),
                            help="alternate two R2D2 thread counts; --repeat is per arm")
+    bench_run.add_argument("--interleave-interop-threads", type=int, nargs=2,
+                           metavar=("A", "B"),
+                           help="alternate R2D2 inter-op thread limits; 0 disables limit")
     bench_run.add_argument("--interleave-mpi-procs", type=int, nargs=2,
                            metavar=("A", "B"),
                            help="alternate two MPI worker counts; --repeat is per arm")

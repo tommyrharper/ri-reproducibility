@@ -110,6 +110,11 @@ def warm_imports() -> None:
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
             runpy.run_path(str(IMAGER), run_name="__warmup__")
+            import torch
+
+            interop_threads = int(os.environ.get("R2D2_INTEROP_THREADS", "0"))
+            if interop_threads:
+                torch.set_num_interop_threads(max(1, interop_threads))
             patch_op_norm()
             patch_nufft_plans()
             patch_checkpoint_loading()

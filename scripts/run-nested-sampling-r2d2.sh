@@ -39,6 +39,7 @@ if [ -z "${R2D2_OMP_THREADS:-}" ]; then
     R2D2_OMP_THREADS=1
   fi
 fi
+R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}"
 
 # shellcheck source=scripts/lib/run-config.sh
 . "${REPO_ROOT}/scripts/lib/run-config.sh"
@@ -108,6 +109,7 @@ sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
   -e OMP_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
+  -e R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}" \
   -e OMP_WAIT_POLICY=PASSIVE \
   -- sh -c '
   python3 "$2" --fifo-dir "$1" &
@@ -164,6 +166,7 @@ RUN_COMMAND=(
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   -e R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
+  -e R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-1}"
   "${POLYCHORD_CONTAINER}"
   mpirun
   --allow-run-as-root

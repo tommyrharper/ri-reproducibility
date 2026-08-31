@@ -17,6 +17,7 @@ and the one after that cannot quietly give it back.
 ./ri bench run wsclean --preset throughput --interleave-mpi-procs 20 21 --allow-oversubscription --repeat 3  # explicit oversubscription probe
 ./ri bench run wsclean --interleave-synchronous 0 1 --mpi-procs 20 --repeat 3  # paired async/sync scheduling
 ./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3  # thread-count probe
+./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --interleave-interop-threads 0 1 --repeat 3  # paired PyTorch inter-op probe
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -54,6 +55,11 @@ recorded in row settings, keeping thread-count probes in separate groups.
 `--interleave-omp-threads A B` alternates two R2D2 thread counts after one
 unrecorded warm-up; `--repeat N` runs N measured searches per arm. This keeps
 small thread-count differences paired against host drift.
+
+`--interleave-interop-threads A B` alternates PyTorch inter-op limits; `0`
+keeps PyTorch's default. Initial one-pair probe (15 ranks, 2 intra-op threads)
+measured 0.9163 eval/s unlimited versus 0.9118 eval/s at one; this is not
+enough evidence for a speed claim, so the production default remains unlimited.
 
 `--interleave-mpi-procs A B` does the same for MPI worker counts. It rejects
 counts above available CPU affinity before launching the warm-up. Add
