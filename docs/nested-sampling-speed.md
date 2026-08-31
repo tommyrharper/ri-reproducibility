@@ -1,16 +1,16 @@
 # Making a nested-sampling search faster: the index
 
-Current measured operating points: WSClean **109.70 evaluations/second** at
+Current measured operating points: WSClean **112.31 evaluations/second** at
 20 ranks and R2D2 **0.9101 evaluations/second** at 15 ranks with two Torch
 threads. Deterministic MKLDNN kernels remain enabled after checkpoint-backed
 validation; three throughput runs measured **0.9189, 0.9030, and 0.9101
 evaluations/second**, with **3.47 GB** peak worker memory. This confirms no
 memory regression, but this control alone does not establish a causal gain.
 
-The latest three-repeat asynchronous WSClean control measured **109.70
-evaluations/second** (114.49, 105.14, and 109.70) at 20 ranks, with **139.2
-ms/evaluation** by median, **120.2-126.3 ms/evaluation** in the image binary,
-and **34.3-34.6 MB** peak worker memory. This is another host-variance refresh,
+The latest three-repeat asynchronous WSClean control measured **112.31
+evaluations/second** (120.14, 101.23, and 112.31) at 20 ranks, with **144.4
+ms/evaluation** by median, **124.5-133.4 ms/evaluation** in the image binary,
+and **34.5-34.7 MB** peak worker memory. This is another host-variance refresh,
 not a new runtime change.
 
 A fresh three-repeat asynchronous WSClean control measured **108.9
@@ -409,6 +409,7 @@ rates are historical and roughly half the current rate.
 | R2D2 15-rank four-thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --interleave-omp-threads 2 4 --repeat 2` | 0.9183 eval/s at two threads versus 0.8737 at four; 4.9% slower with four and unchanged 3.47 GB peak worker memory |
 | R2D2 inter-op thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --interleave-interop-threads 1 2 --repeat 2` | 0.9153 eval/s at one inter-op thread versus 0.8987 at two; short-run spread does not justify a default change, with unchanged 3.47 GB peak worker memory |
 | R2D2 oneDNN primitive-cache capacity probe | `ONEDNN_PRIMITIVE_CACHE_CAPACITY` | 109.60 versus 109.25 ms per synthetic 128x128 U-Net forward at capacities 1024 and 4096 (three fresh repeats; 0.3%); no production setting change |
+| WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 112.31 eval/s median (120.14, 101.23, and 112.31), 144.4 ms/eval, 124.5-133.4 ms image binary, and 34.5-34.7 MB peak worker memory; host-variance refresh |
 | WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 109.70 eval/s median (114.49, 105.14, and 109.70), 139.2 ms/eval, 120.2-126.3 ms image binary, and 34.3-34.6 MB peak worker memory; host-variance refresh |
 | WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 108.9 eval/s median (108.1, 108.9, and 114.1), 140.4 ms/eval, 120.9-132.0 ms image binary, and 34.4-34.6 MB peak memory; host-variance refresh |
 | WSClean 18-versus-20 rank probe | `./ri bench run wsclean --interleave-mpi-procs 18 20` | 111.5 versus 109.6 eval/s median across three repeats; 1.7% spread within host variance, with no memory benefit below 20 ranks |
