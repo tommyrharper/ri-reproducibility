@@ -317,6 +317,7 @@ rates are historical and roughly half the current rate.
 | R2D2 15-rank control refresh | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --repeat 3` | 0.9040 eval/s median (0.9039-0.9060), 13.61 s/evaluation image container, 3.47 GB peak worker memory; no change justified |
 | R2D2 15-rank four-thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --interleave-omp-threads 2 4 --repeat 2` | 0.9183 eval/s at two threads versus 0.8737 at four; 4.9% slower with four and unchanged 3.47 GB peak worker memory |
 | R2D2 inter-op thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --interleave-interop-threads 1 2 --repeat 2` | 0.9153 eval/s at one inter-op thread versus 0.8987 at two; short-run spread does not justify a default change, with unchanged 3.47 GB peak worker memory |
+| R2D2 oneDNN primitive-cache capacity probe | `ONEDNN_PRIMITIVE_CACHE_CAPACITY` | 109.60 versus 109.25 ms per synthetic 128x128 U-Net forward at capacities 1024 and 4096 (three fresh repeats; 0.3%); no production setting change |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
@@ -335,6 +336,12 @@ tensor does not support view`. A plain 128x128 trace measured 31.71 ms versus
 33.12 ms eager in a short synthetic probe, but the traced graph is
 shape-dependent and the optimized graph cannot execute, so no production
 inference change is justified.
+
+The oneDNN primitive-cache capacity is also not a useful remaining lever. Three
+fresh 128x128 U-Net probes with two Torch threads measured **109.60 ms/forward**
+at the current capacity of 1024 versus **109.25 ms** at 4096, only **0.3%**
+faster. The larger cache is not retained; convolution kernel choice remains
+the only credible R2D2 target.
 
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
