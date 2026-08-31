@@ -1,12 +1,12 @@
 # Making a nested-sampling search faster: the index
 
-The latest three-repeat asynchronous WSClean control on HEAD measured
-**110.2 evaluations/second** (85.8, 110.2, and 113.1) at 20 ranks, with
-**135.9-143.6 ms/evaluation**, **120.4-128.5 ms/evaluation** in the image
-binary, and **34.3-34.6 MB** peak worker memory. The 85.8 outlier makes this
-refresh noisy, but its median remains within established host variance; no
-runtime change is justified after rejecting reordered-part metadata caching
-and deferred UVW copying in matched experiments.
+A fifteen-repeat asynchronous WSClean control on HEAD measured **105.6
+evaluations/second** (IQR **11.5 eval/s**) at 20 ranks, with **144.4
+ms/evaluation** by median, **128.8 ms/evaluation** in the image binary, and
+**34.2-34.7 MB** peak worker memory. One 61.1 eval/s run was a clear outlier;
+the remaining spread still shows host variance rather than a new runtime
+change. Reordered-part metadata caching and deferred UVW copying remain
+rejected by matched end-to-end experiments.
 
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9040 evaluations/second** (0.9040, 0.9039, and 0.9060) at 15 ranks and
