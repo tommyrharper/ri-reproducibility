@@ -47,10 +47,14 @@ report carries it per run page. Read a completed run from the shell:
 ```bash
 ./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp>
 ./ri profile results/nested-sampling/wsclean-vlaa-<UTC timestamp> --json
+./ri profile results/nested-sampling/r2d2-vlaa-<UTC timestamp> --r2d2-phases
 ```
 
 The profiler only reads `summary.json`; older runs without a `profiling` block
 must be re-run.
+
+For `--phases`, WSClean's beam-fit lines are grouped by operation even when
+the log switches between arcseconds and milliarcseconds.
 
 ### How the printed shares are computed
 
@@ -113,6 +117,12 @@ Worker-seconds exceed page wall time by `mpi_procs`. Dividing stage totals by
 and `evaluating + PolyChord + idle = worker-time / workers = wall clock`.
 `render_profiling()` in `scripts/lib/generate_report.py` charts these proportions
 as one average-worker lane per rank; imaging is coloured, other rows grey.
+
+R2D2's aggregate image stage can be split with `--r2d2-phases`. It reads the
+worker's model-update and residual timings, reporting median milliseconds per
+evaluation and call counts. The latest 41-evaluation run measured 7219.7
+ms/evaluation for model updates (25 calls) versus 80.1 ms/evaluation for
+residuals, making model inference the next optimization target.
 
 ### What the two halves show
 
@@ -1022,10 +1032,21 @@ That 0.56s still carries each rank's ~1.5s first request; steady state is ~0.3s.
 
 The oversubscription cliff is sharp, and it is about the product not the
 per-rank count. Sweeping `R2D2_OMP_THREADS` at 8 ranks on this 20-CPU host:
-1 thread 7.7s, 2 threads (the `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
-threads 24.2s - 32 threads over 20 cores is already most of the way back to the
-old behaviour. The default divides the host among the ranks, which is the right
-shape; do not raise it above it. The 1-thread column of that sweep is
+1 thread 7.7s, 2 threads (the old `host CPUs / NS_MPI_PROCS` default) 8.4s, 4
+threads 24.2s. A later three-repeat search measurement found 3 threads at
+7.43s/evaluation versus 8.12s at 2 threads, so automatic allocation now rounds
+the per-rank CPU share up. A current three-repeat explicit four-thread probe
+measured 7.39s/evaluation versus 7.45s at 3 threads, but four threads still
+oversubscribes this host and remains an explicit candidate rather than the
+automatic setting. The
+seven-thread follow-up measured 7.62s/evaluation (0.7956 eval/s median) versus
+7.45s at 3 threads and 7.39s at 4 threads, so it is not a candidate either.
+The eight-thread follow-up measured 7.72s/evaluation (0.7493 eval/s median),
+also slower than four threads, so it is rejected. The full sweep, and the
+rank/thread packing that supersedes it, is in
+[speed](nested-sampling-speed.md).
+
+The 1-thread column of that sweep is
 misleading, though - most of what it was measuring was OpenMP spin-waiting, not
 the thread count; see "The imaging workers' OpenMP threads sleep between
 requests" below.
@@ -1936,3 +1957,24 @@ Sidecars use `--network none`, saving ~0.2s per container with identical
 results. `docker/meqtrees/Dockerfile` also replaces Timba's 10s shutdown sleep
 with 0.1s polling while preserving its ~200s SIGKILL ceiling; MS outputs stay
 identical.
+
+### Five R2D2 Torch threads do not beat four
+
+An interleaved `./ri bench run r2d2 --preset throughput
+--interleave R2D2_OMP_THREADS 5 6 --repeat 3` probe, with the checkpoint archive
+mounted from the parent checkout, measured five threads at **0.7824
+evaluations/second** and six at **0.7765 evaluations/second**. Peak worker
+memory stayed **3.47 GB**. Five threads therefore beats six by only 0.8%, and
+the result remains below the existing four-thread control near 0.818 eval/s;
+four threads remains the fastest tested setting and the default is unchanged.
+
+### R2D2 inference backend alternatives are closed
+
+The warmed 512x512 U-Net at three Torch threads measures 1.363 s with the
+runtime's default MKLDNN backend and 1.853 s with MKLDNN disabled. The backend
+is therefore doing real work and must stay enabled. TorchScript tracing the
+same `.eval()` model measures 1.313 s versus 1.324 s eager, with identical
+output in this fixed-shape probe, but emits warnings because U-Net padding
+branches are shape-dependent. The sub-percent difference is below the
+end-to-end evidence threshold and does not justify adding a traced model path;
+the existing eager model also supports any image shape without a second path.
