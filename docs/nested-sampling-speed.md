@@ -29,6 +29,12 @@ the remaining spread still shows host variance rather than a new runtime
 change. Reordered-part metadata caching and deferred UVW copying remain
 rejected by matched end-to-end experiments.
 
+A fresh three-repeat asynchronous WSClean control measured **107.7
+evaluations/second** (102.998, 107.666, and 115.348) at 20 ranks, with
+**142.8 ms/evaluation** by median, **127.5 ms/evaluation** in the image binary,
+and **34.4-34.6 MB** peak worker memory. This is consistent with the established
+host variance and does not justify a runtime change.
+
 A fresh three-repeat asynchronous control measured **109.1 evaluations/second**
 (108.8, 109.1, and 117.8) at 20 ranks, with **141.3 ms/evaluation** by median,
 **125.8 ms/evaluation** in the image binary, and **34.2-34.5 MB** peak memory.
