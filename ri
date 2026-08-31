@@ -514,6 +514,10 @@ def build_parser():
             "`starting` straight away, before the images it builds are built.\n"
             "Needs Go installed; nothing else here does.\n"
             "\n"
+            "The table also deletes: d on a run that is not going asks to\n"
+            "confirm, then removes its directory and every evaluation in it.\n"
+            "Nothing else here deletes a run, and nothing undoes it.\n"
+            "\n"
             "Keys are listed along the bottom of each screen."
         ),
     )

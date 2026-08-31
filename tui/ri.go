@@ -4,10 +4,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,112 @@ type Run struct {
 	Evaluations  int               `json:"evaluations"`
 	StartedLabel string            `json:"started_label"`
 	Settings     map[string]string `json:"settings"`
+	Space        []Param           `json:"parameter_space"`
+}
+
+// Param is one searched dimension of a run's parameter-space.json. A
+// band_start dimension has its resolved bounds, so min/max cover every kind,
+// but a hand-made run directory may have neither.
+type Param struct {
+	Name string   `json:"name"`
+	Min  *float64 `json:"min"`
+	Max  *float64 `json:"max"`
+}
+
+// objective is what the sampler was maximizing, from the run's run.env.
+func (r Run) objective() string {
+	if metric := r.Settings["NS_METRIC"]; metric != "" {
+		return metric
+	}
+	return "-"
+}
+
+// age is the "(2h ago)" tail of the started label, as 2h: the run name already
+// carries the start timestamp, and the column header already says age.
+func (r Run) age() string {
+	label := r.StartedLabel
+	if open := strings.LastIndex(label, "("); open >= 0 {
+		label = strings.TrimSuffix(label[open+1:], ")")
+	}
+	if label == "just now" {
+		return "now"
+	}
+	return strings.TrimSuffix(label, " ago")
+}
+
+// ranges renders the searched box. Abbreviated it is a table cell; in full it
+// is the detail line under the table, which is where the initials are decoded.
+func (r Run) ranges(abbreviated bool) string {
+	var parts []string
+	for _, p := range r.Space {
+		name := p.Name
+		if abbreviated {
+			name = initials(p.Name)
+		}
+		if p.Min == nil || p.Max == nil {
+			parts = append(parts, name)
+			continue
+		}
+		parts = append(parts, name+" "+round(*p.Min)+"-"+round(*p.Max))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	if abbreviated {
+		return strings.Join(parts, " ")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// initials turns log10_dynamic_range into ldr, so five dimensions fit a cell.
+func initials(name string) string {
+	var short []byte
+	for _, word := range strings.Split(name, "_") {
+		if word != "" {
+			short = append(short, word[0])
+		}
+	}
+	return string(short)
+}
+
+// round keeps a bound readable in a cell: 5.4e+07 becomes 54M.
+func round(v float64) string {
+	for _, unit := range []struct {
+		scale  float64
+		suffix string
+	}{{1e9, "G"}, {1e6, "M"}, {1e3, "k"}} {
+		if math.Abs(v) >= unit.scale {
+			return strconv.FormatFloat(v/unit.scale, 'g', 3, 64) + unit.suffix
+		}
+	}
+	return strconv.FormatFloat(v, 'g', 3, 64)
+}
+
+// deletable reports why a run cannot be removed: pulling the directory out
+// from under live ranks is what ns_refuse_live_run exists to prevent.
+func (r Run) deletable() error {
+	if r.Status == "running" || r.Status == "starting" {
+		return fmt.Errorf("%s is still going - stop it before deleting it", r.Name)
+	}
+	return nil
+}
+
+// deleteRun removes a run and everything scored under it, which is why it
+// refuses anything but a directory ./ri runs itself would list.
+func (r ri) deleteRun(run Run) error {
+	if err := run.deletable(); err != nil {
+		return err
+	}
+	dir := filepath.Join(r.root, run.Path)
+	if filepath.Dir(dir) != filepath.Join(r.root, "results", "nested-sampling") {
+		return fmt.Errorf("%q is not a run directory", run.Path)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	// The launch log outlives the run directory it describes.
+	os.Remove(filepath.Join(r.root, "results", "tui-"+filepath.Base(dir)+".log"))
+	return nil
 }
 
 func parseRuns(out []byte) ([]Run, error) {
