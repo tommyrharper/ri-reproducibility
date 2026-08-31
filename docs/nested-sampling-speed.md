@@ -14,6 +14,14 @@ and 0.9194), with **3.47 GB** peak worker memory. Four Torch threads measured
 **0.8737 evaluations/second** in the same probe, so two threads remains the
 fastest memory-safe operating point; model updates remain dominant.
 
+A CPU `torch.profiler` pass over the 128x128 U-Net with two Torch threads
+attributes **72.0%** of self time to oneDNN convolutions, **8.0%** to batch
+normalization (the implementation behind InstanceNorm2d), and **2.4%** to
+LeakyReLU. Tensor concatenation and pooling are each below 2%. This makes
+convolution backend/kernel work the only remaining material R2D2 inference
+target. The profile is synthetic and is a localization result, not an
+end-to-end speed claim.
+
 Profiling the latest 36-evaluation run with `./ri profile --r2d2-phases` records
 **13,186.75 ms/evaluation** for 25 model updates and **421.20 ms/evaluation**
 for residual computation. Model updates are therefore **96.9%** of the logged
