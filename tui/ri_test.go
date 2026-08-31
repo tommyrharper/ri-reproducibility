@@ -211,9 +211,59 @@ func TestSearchArgsOmitsEmptyFields(t *testing.T) {
 	fields[0].input.SetValue("50")
 	fields[2].input.SetValue("  ") // whitespace is not a value
 
-	got := strings.Join(searchArgs("wsclean", fields, "results/nested-sampling/x"), " ")
+	got := strings.Join(searchArgs(target{first: "wsclean"}, fields, "results/nested-sampling/x"), " ")
 	if got != "search wsclean --output-dir results/nested-sampling/x --nlive 50" {
 		t.Errorf("unexpected search arguments: %q", got)
+	}
+}
+
+// --output-dir names the first search's directory only, so it has to stay
+// ahead of --then: the chained search claims its own.
+func TestSearchArgsChainsTheSecondImager(t *testing.T) {
+	fields := []field{{flag: "nlive", input: textinput.New()}}
+	fields[0].input.SetValue("125")
+
+	pair := target{first: "wsclean", then: "r2d2"}
+	got := strings.Join(searchArgs(pair, fields, "results/nested-sampling/x"), " ")
+	want := "search wsclean --output-dir results/nested-sampling/x --then r2d2 --nlive 125"
+	if got != want {
+		t.Errorf("unexpected chained arguments:\n got %q\nwant %q", got, want)
+	}
+	if pair.label() != "wsclean then r2d2" {
+		t.Errorf("unexpected label: %q", pair.label())
+	}
+	if (target{first: "r2d2"}).label() != "r2d2" {
+		t.Errorf("a single imager labels itself: %q", (target{first: "r2d2"}).label())
+	}
+}
+
+// Both arrows used to step forward, which is invisible with two choices and
+// wrong with four.
+func TestFormArrowsWalkTheTargetsBothWays(t *testing.T) {
+	m := newModel(ri{root: t.TempDir()})
+	press := func(key tea.KeyType) {
+		t.Helper()
+		next, _ := m.Update(tea.KeyMsg{Type: key})
+		m = next.(model)
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	m = next.(model)
+
+	press(tea.KeyRight)
+	if targets[m.imager].label() != "r2d2" {
+		t.Fatalf("right went to %q", targets[m.imager].label())
+	}
+	press(tea.KeyLeft)
+	if targets[m.imager].label() != "wsclean" {
+		t.Fatalf("left went to %q", targets[m.imager].label())
+	}
+	press(tea.KeyLeft)
+	if want := "r2d2 then wsclean"; targets[m.imager].label() != want {
+		t.Fatalf("left off the start went to %q, want %q", targets[m.imager].label(), want)
+	}
+	press(tea.KeyRight)
+	if targets[m.imager].label() != "wsclean" {
+		t.Fatalf("right off the end went to %q", targets[m.imager].label())
 	}
 }
 

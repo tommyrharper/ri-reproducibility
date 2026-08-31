@@ -165,8 +165,11 @@ func parseRuns(out []byte) ([]Run, error) {
 	return runs, err
 }
 
-func searchArgs(imager string, fields []field, outputDir string) []string {
-	args := []string{"search", imager, "--output-dir", outputDir}
+func searchArgs(t target, fields []field, outputDir string) []string {
+	args := []string{"search", t.first, "--output-dir", outputDir}
+	if t.then != "" {
+		args = append(args, "--then", t.then)
+	}
 	for _, f := range fields {
 		if value := strings.TrimSpace(f.value()); value != "" {
 			args = append(args, "--"+f.flag, value)

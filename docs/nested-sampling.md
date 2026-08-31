@@ -115,7 +115,26 @@ Useful overrides:
 ./ri search r2d2 --metric off_source_rms_jy
 ./ri search r2d2 --metric sigma_res
 ./ri search wsclean --output-dir results/nested-sampling/manual
+./ri search wsclean --then r2d2 --nlive 125 --num-repeats 25 --max-ndead=-1
 ```
+
+### Running both imagers
+
+`--then <imager>` runs a second search with the same settings once the first
+finishes, and only if it finishes: a failed first search means something is
+broken - a build, an image, the parameter space - and the second would meet the
+same fault. `./ri tui` offers the same pairs from its `n` form.
+
+One after the other rather than both at once, deliberately. This host is
+work-conserving: measured with a WSClean and an R2D2 search overlapping for
+280 seconds, WSClean kept 0.66 of its solo throughput and R2D2 0.36, summing to
+1.015 - so running the pair concurrently finishes at the same wall clock as
+running them in turn, and leaves every per-evaluation timing in both runs
+measured against the other one. See
+[the throughput doc](nested-sampling-throughput.md).
+
+The chained search claims its own output directory, so `--output-dir` names the
+first one only.
 
 PolyChord likelihood evaluations run in parallel across MPI ranks inside the
 PolyChord container. `NS_MPI_PROCS` sets the rank count (default
