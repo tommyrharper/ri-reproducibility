@@ -1312,6 +1312,8 @@ def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
                 shutil.move(str(produced), destination)
             if (eval_dir / "sim.ms").exists() and "measurement_set" in record.get("paths", {}):
                 record["paths"]["measurement_set"] = str(eval_dir / "sim.ms")
+            if (eval_dir / "r2d2_data.mat").exists() and "mat" in record.get("paths", {}):
+                record["paths"]["mat"] = str(eval_dir / "r2d2_data.mat")
         shutil.rmtree(scratch, ignore_errors=True)
     if keeping:
         return
@@ -1396,14 +1398,17 @@ def self_check_evaluation_pruning() -> None:
                 (scratch / "sim.ms").mkdir(parents=True)
                 (scratch / "sim.ms" / "table.f0").write_text("data")
                 (scratch / "VLAA_ANT").mkdir()
+                (scratch / "r2d2_data.mat").write_text("mat")
                 record = {"eval_id": 1, "params": {"a": 1}, "objective": 0.5,
-                          "paths": {"eval_dir": str(eval_dir), "measurement_set": str(scratch / "sim.ms")}, **extra}
+                          "paths": {"eval_dir": str(eval_dir), "measurement_set": str(scratch / "sim.ms"),
+                                    "mat": str(scratch / "r2d2_data.mat")}, **extra}
                 written = write_evaluation_record(eval_dir, record)
                 assert not scratch.exists(), f"{name} left its scratch behind"
                 if extra:
                     assert (eval_dir / "sim.ms" / "table.f0").read_text() == "data"
                     assert (eval_dir / "VLAA_ANT").is_dir()
                     assert written["paths"]["measurement_set"] == str(eval_dir / "sim.ms")
+                    assert written["paths"]["mat"] == str(eval_dir / "r2d2_data.mat")
                 else:
                     assert not (eval_dir / "sim.ms").exists()
                     assert "measurement_set" not in written["paths"]

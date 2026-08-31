@@ -29,6 +29,7 @@ from common import (
     compute_image_metrics,
     image_pixel_size_arcsec,
     convert_ms_to_mat,
+    evaluation_scratch_dir,
     load_evaluations_from_dir,
     load_parameter_space,
     mark_evaluation_start,
@@ -159,7 +160,8 @@ def evaluate(
         )
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
-    mat_path = eval_dir / "r2d2_data.mat"
+    # Keep conversion output beside the MS when run uses tmpfs scratch.
+    mat_path = (evaluation_scratch_dir(eval_dir) or eval_dir) / "r2d2_data.mat"
     # Convert in simulate worker; passing noise sigma once avoids a 31% fill cost.
     convert_cmd = [
         "--ms-path", str(ms_path),

@@ -14,6 +14,13 @@ memory. This is consistent with the existing result-preserving tradeoff being
 the only remaining double-digit speed lever; the benchmark now makes that
 comparison reproducible from `./ri bench`.
 
+A stronger interleaved three-repeat probe measured WSClean at **114.44
+evaluations/second** with `mgain=0.8` versus **131.77 evaluations/second** with
+`mgain=0.9` (medians of 113.32/114.44/106.19 and 126.23/131.77/131.83).
+Peak worker memory remained **34.4-34.7 MB**. The higher setting is about
+**15.2% faster** in this probe, but remains a science tradeoff rather than a
+result-preserving default.
+
 The latest three-repeat asynchronous WSClean control measured **112.31
 evaluations/second** (120.14, 101.23, and 112.31) at 20 ranks, with **144.4
 ms/evaluation** by median, **124.5-133.4 ms/evaluation** in the image binary,
@@ -400,6 +407,7 @@ rates are historical and roughly half the current rate.
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
 | WSClean phase timestamps are opt-out for throughput probes | `polychord_wsclean.py` | 111.6 versus 109.2 eval/s median across six interleaved repeats (logging off/on); no speedup, profiling remains on by default |
 | Interleaved `mgain` benchmark arms | `./ri bench run wsclean --interleave-mgain` | 112.0 versus 125.5 eval/s in two paired throughput-preset repeats at `mgain=0.8`/`0.9`; memory unchanged at 34.4-34.7 MB |
+| Interleaved `mgain` benchmark arms, three repeats | `./ri bench run wsclean --preset throughput --repeat 3 --interleave-mgain 0.8 0.9` | 114.44 versus 131.77 eval/s (three-arm medians; **+15.2%** at `mgain=0.9`); memory unchanged at 34.4-34.7 MB, still not result-preserving |
 | Finite-image RMS and relative L2 metrics share one residual norm | `common.py` | 0.456 to 0.453 ms/evaluation metrics stage in the latest control; no defensible end-to-end speedup |
 | Sigma-res FITS files load only when the objective uses `sigma_res` | `polychord_*.py` | 1.03 to 0.46 ms metrics stage on the current WSClean benchmark; objective-preserving for other metrics |
 | Dirty FITS output is disabled when the objective does not use `sigma_res` | `polychord_wsclean.py` | 111.3 +/- 1.8 eval/s median in three patched runs versus 109.3 +/- 2.5 previously; within normal variance, with ~33.9 MB peak memory |
@@ -407,6 +415,7 @@ rates are historical and roughly half the current rate.
 | Off-source metric masks are bounded and reused | `common.py` | 25.2 to 3.6 us per mask (container microbenchmark); no measurable end-to-end gain |
 | Sigma-res norms use direct dot products | `common.py` | 11.97 to 11.41 us per 512x512 metric call (host microbenchmark, identical result); too small to affect default throughput |
 | R2D2 `.mat` conversion skips compression on tmpfs | `ms_to_r2d2_mat.py` | 8.59 to 0.39 ms for 12k visibilities (microbenchmark) |
+| R2D2 `.mat` output follows MS onto tmpfs scratch | `polychord_r2d2.py` | Implemented; checkpoint-backed A/B still required before claiming throughput or conversion-time gain |
 | R2D2 `.mat` conversion avoids broadcast temporaries | `ms_to_r2d2_mat.py` | 1.13 to 1.09 ms for 1404 visibilities (10 warm calls, container microbenchmark) |
 | R2D2 `.mat` conversion flattens weights directly | `ms_to_r2d2_mat.py` | 1.802 to 1.657 us per weight expansion (100k calls, container microbenchmark; 8.0%) |
 | R2D2 checkpoints loaded once and shared by forked workers | `r2d2_serve.py` | Production `optimiser.R2D2` alias now hits the cache (self-check); removes repeated 25-checkpoint loads per evaluation; first real benchmark is 0.438 +/- 0.002 eval/s at 3.47 GB peak worker memory |
