@@ -814,6 +814,12 @@ updates and **99.0 ms/evaluation** for residual computation. A 512x512 CPU
 0.00013% of the model-update stage; this dead-work removal is therefore not a
 useful speed target.
 
+A fresh checkpoint-backed three-repeat R2D2 control measured **0.7299 eval/s**
+median (0.7253, 0.7299, and 0.7349) at 8 ranks with the automatic three-thread
+setting. Imaging remained **7408 ms/evaluation** by median and peak worker
+memory stayed **3.47 GB**. This establishes current MKLDNN-enabled control
+evidence; no new speedup is claimed.
+
 The current `load_state_dict(assign=True)` checkpoint-swap path takes **11.0
 ms for all 25 swaps** in a warmed container (three repeats: 10.95-11.01 ms),
 or about 0.44 ms/evaluation. It is below 0.2% of the latest model-update
