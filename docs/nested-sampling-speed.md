@@ -501,6 +501,14 @@ Throughput falls because nested sampling reaches longer observations and more
 channels: `70.7 ms + 4.58 us x visibilities` per evaluation. See [the cost
 model](nested-sampling-cost-model.md).
 
+With the checkpoint archive supplied through external `CHECKPOINTS_DIR`, the
+current asynchronous four-thread R2D2 control measured **0.7633 eval/s**
+(0.7532, 0.7633, and 0.8147) across 40-43 evaluations at 8 ranks, with
+**3.47 GB** peak worker memory. The latest phase profile attributes **6568 ms**
+per evaluation to 25 model updates and **126 ms** to residual computation;
+model checkpoint swapping remains the dominant measured target. This refresh
+confirms the existing 0.75-0.81 eval/s range and claims no isolated speedup.
+
 ## Keeping what is on this page
 
 The table above is history: each row was measured once, against the commit
