@@ -1112,12 +1112,18 @@ def render_parameter_space_section(parameter_space):
     """
 
 
+# Most evaluations have no image to show: a finished run keeps them only for
+# its best and worst and a sample between (see prune_run_images()), so the
+# placeholder says so rather than leaving a bare dash to puzzle over.
+NO_IMAGE = '<span class="empty" title="no image retained for this evaluation">—</span>'
+
+
 def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
     if not image_path:
-        return '<span class="empty">—</span>'
+        return NO_IMAGE
     recon_uri = render_fits_image(image_path, figsize=figsize, dpi=dpi)
     if not recon_uri:
-        return '<span class="empty">—</span>'
+        return NO_IMAGE
     return (
         f'<figure class="eval-recon">'
         f'<img src="{recon_uri}" alt="eval {html.escape(str(eval_id))} reconstruction">'

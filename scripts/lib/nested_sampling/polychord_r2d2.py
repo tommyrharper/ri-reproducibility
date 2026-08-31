@@ -36,6 +36,7 @@ from common import (
     mpi_rank,
     params_key,
     prewarm,
+    prune_run_images,
     prior_vector,
     r2d2_thread_count,
     r2d2_worker,
@@ -608,6 +609,10 @@ def main() -> None:
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
+        # Rank-based, so it can only run now that every evaluation is scored.
+        # Mutates the records the summary embeds, so summary.json never names
+        # an image this just deleted.
+        prune_run_images(evaluations_dir, all_evaluations)
         summary_path = output_dir / "summary.json"
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
