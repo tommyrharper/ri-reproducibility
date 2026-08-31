@@ -196,7 +196,7 @@ def patch_nufft_plans() -> None:
             plans[key] = made
         return plans[key]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _GA(self, x: torch.Tensor) -> torch.Tensor:
         image = x.view(x.shape[0], *x.shape[-2:]).squeeze(0)
         cached = plan(self, 2) if image.ndim == 2 else None
@@ -205,7 +205,7 @@ def patch_nufft_plans() -> None:
         values = cached.execute(np.ascontiguousarray(image.to(self._dtype_meas).numpy()))
         return torch.from_numpy(values) * self._data_weight
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _AtGt(self, y: torch.Tensor) -> torch.Tensor:
         values = y.conj() * self._data_weight
         flat = values.reshape(-1, values.shape[-1])
@@ -257,7 +257,7 @@ def patch_op_norm() -> None:
 
     power_iteration = MeasOp.get_op_norm
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def get_op_norm(self, compute_flag=False, rel_tol=1e-5, max_iter=500, verbose=False):
         if self._op_norm is not None and not compute_flag:
             return self._op_norm
