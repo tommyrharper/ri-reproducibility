@@ -1,6 +1,12 @@
 # Making a nested-sampling search faster: the index
 
 One hundred eighty-three profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest three-repeat async control measured **111.3 evaluations/second** at
+20 workers, with **144.6 ms/evaluation**, **129.1 ms/evaluation** in the image
+binary, **0.453 ms/evaluation** in metrics, and **34.1-34.5 MB** peak worker
+memory. Sharing the finite-image residual norm reduced the metrics stage from
+the preceding **0.456 ms/evaluation** control, but the end-to-end result is
+within host variance and is not a claimed throughput speedup.
 The latest three-repeat async control measured **110.1 +/- 1.1 evaluations/second**
 at 20 workers, with **139.1 +/- 0.55 ms/evaluation**, **123.8 +/- 0.5
 ms/evaluation** in the image binary, and **34.3 MB** peak worker memory. This is
@@ -68,6 +74,7 @@ rates are historical and roughly half the current rate.
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
+| Finite-image RMS and relative L2 metrics share one residual norm | `common.py` | 0.456 to 0.453 ms/evaluation metrics stage in the latest control; no defensible end-to-end speedup |
 | Sigma-res FITS files load only when the objective uses `sigma_res` | `polychord_*.py` | 1.03 to 0.46 ms metrics stage on the current WSClean benchmark; objective-preserving for other metrics |
 | Dirty FITS output is disabled when the objective does not use `sigma_res` | `polychord_wsclean.py` | 111.3 +/- 1.8 eval/s median in three patched runs versus 109.3 +/- 2.5 previously; within normal variance, with ~33.9 MB peak memory |
 | Residual metrics reuse the loaded image buffer | `common.py` | Removes one full-image allocation per evaluation; memory-only change at current image size |

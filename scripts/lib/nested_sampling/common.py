@@ -708,8 +708,13 @@ def compute_image_metrics(
     source_value = image[sy, sx]
     try:
         image[sy, sx] -= source_flux_jy
-        total_rms = rms(image)
-        relative_l2_error = float(np.linalg.norm(image) / max(abs(source_flux_jy), 1e-12))
+        if np.isnan(image).any():
+            total_rms = rms(image)
+            residual_norm = float(np.linalg.norm(image))
+        else:
+            residual_norm = float(np.sqrt(np.dot(image.ravel(), image.ravel())))
+            total_rms = residual_norm / math.sqrt(image.size)
+        relative_l2_error = residual_norm / max(abs(source_flux_jy), 1e-12)
     finally:
         image[sy, sx] = source_value
 
@@ -1975,6 +1980,7 @@ def self_check_source_offset() -> None:
             # residual carries the whole 1 Jy twice over.
             assert metrics["peak_flux_abs_error_jy"] == 0.0, (l_as, m_as, metrics["peak_flux_abs_error_jy"])
             assert metrics["total_rms_jy"] == 0.0, (l_as, m_as, metrics["total_rms_jy"])
+            assert metrics["relative_l2_error"] == 0.0, metrics["relative_l2_error"]
 
             # A header with no WCS and no scale to stand in for it must say so
             # rather than quietly centring the source and scoring a good image
