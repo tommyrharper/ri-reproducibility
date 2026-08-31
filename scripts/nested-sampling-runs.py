@@ -48,6 +48,17 @@ def read_parameter_space(run_dir: Path) -> list[dict[str, object]]:
     return space if isinstance(space, list) else []
 
 
+def read_summary(run_dir: Path) -> dict[str, object]:
+    """The finished run's own record of what it searched and scored. Runs from
+    before run.env and parameter-space.json existed, and merged runs which
+    write neither, still carry both here."""
+    try:
+        summary = json.loads((run_dir / "summary.json").read_text())
+    except (OSError, ValueError):  # absent, or caught mid-write
+        return {}
+    return summary if isinstance(summary, dict) else {}
+
+
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 
 
@@ -106,6 +117,15 @@ def format_started(started: float, now: float | None = None) -> str:
 
 def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     run_env = read_run_env(run_dir)
+    space = read_parameter_space(run_dir)
+    if not run_env.get("NS_METRIC") or not space:
+        # Only read the summary when the cheap sources came up short: a
+        # finished run's summary.json can be tens of megabytes.
+        summary = read_summary(run_dir)
+        if not run_env.get("NS_METRIC") and isinstance(summary.get("metric"), str):
+            run_env = {**run_env, "NS_METRIC": summary["metric"]}
+        if not space and isinstance(summary.get("parameter_space"), list):
+            space = summary["parameter_space"]
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
     evaluations = len(list((run_dir / "evaluations").glob("eval-*/metrics.json")))
     complete = summary_is_complete(run_dir)
@@ -126,7 +146,7 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
         "status": status,
         "evaluations": evaluations,
         "settings": run_env,
-        "parameter_space": read_parameter_space(run_dir),
+        "parameter_space": space,
     }
 
 
@@ -193,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
 def self_check() -> None:
     import contextlib
     import io
+    import shutil
     import tempfile
 
     global NESTED_SAMPLING_DIR, running_run_dirs
@@ -245,6 +266,29 @@ def self_check() -> None:
             assert {r["name"]: r for r in find_runs(running=set())
                     }[bare.name]["parameter_space"] == [], "a torn file must not break listing"
             (bare / "parameter-space.json").unlink()
+
+            # A legacy or merged run has neither run.env nor parameter-space.json,
+            # but the summary it finished with names the metric and the box.
+            legacy = NESTED_SAMPLING_DIR / "r2d2-vlaa-merged-20251231T000000Z"
+            legacy.mkdir()
+            (legacy / "summary.json").write_text(json.dumps({
+                "metric": "total_rms_jy",
+                "parameter_space": [{"name": "observation_minutes", "min": 4.0, "max": 10.0}],
+            }))
+            legacy_run = {r["name"]: r for r in find_runs(running=set())}[legacy.name]
+            assert legacy_run["settings"]["NS_METRIC"] == "total_rms_jy", legacy_run
+            assert legacy_run["parameter_space"] == [
+                {"name": "observation_minutes", "min": 4.0, "max": 10.0}], legacy_run
+            # run.env still wins where it has an answer of its own.
+            (legacy / "run.env").write_text("NS_METRIC=snr\n")
+            assert {r["name"]: r for r in find_runs(running=set())
+                    }[legacy.name]["settings"]["NS_METRIC"] == "snr"
+            # A torn summary must not break listing any more than a torn space does.
+            (legacy / "run.env").unlink()
+            (legacy / "summary.json").write_text('{"metric": "tot')
+            torn = {r["name"]: r for r in find_runs(running=set())}[legacy.name]
+            assert torn["settings"] == {} and torn["parameter_space"] == [], torn
+            shutil.rmtree(legacy)
 
             order = [r["name"] for r in find_runs(running=set())]
             assert order == [bare.name, stopped.name, done.name], order
