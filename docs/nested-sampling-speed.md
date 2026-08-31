@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Two hundred thirteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Two hundred fourteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest interleaved R2D2 thread-count probe measured **0.7824 evaluations/second
 at five threads versus 0.7765 at six threads** (three repeats per arm), with
 unchanged **3.47 GB** peak worker memory. Five threads is only 0.8% faster than
@@ -21,6 +21,9 @@ The latest three-repeat checkpoint-backed R2D2 throughput control measured
 evaluation** and **3.47 GB** peak worker memory. This refresh is consistent with
 the prior 0.7983 eval/s control and does not establish a new speedup; model
 updates remain the dominant stage.
+The latest phase profile measures **6609 ms/evaluation** for model updates and
+**145 ms/evaluation** for residual computation across 25 iterations, confirming
+that R2D2 model inference remains the only material runtime target.
 The latest fifteen-repeat async control measured **109.0 +/- 1.5 evaluations/second** at
 20 workers, with **143.0 +/- 1.1 ms/evaluation**, **127.4 +/- 0.93 ms/evaluation** in the image
 binary, **0.453 ms/evaluation** in metrics, and **34.1-34.5 MB** peak worker
