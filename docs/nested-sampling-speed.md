@@ -435,6 +435,12 @@ updates and **99.0 ms/evaluation** for residual computation. A 512x512 CPU
 0.00013% of the model-update stage; this dead-work removal is therefore not a
 useful speed target.
 
+The current `load_state_dict(assign=True)` checkpoint-swap path takes **11.0
+ms for all 25 swaps** in a warmed container (three repeats: 10.95-11.01 ms),
+or about 0.44 ms/evaluation. It is below 0.2% of the latest model-update
+phase, so further swap machinery is not a justified target; model inference
+remains the bottleneck.
+
 The latest three-repeat explicit four-thread R2D2 probe measured **0.7676
 eval/s** median (0.7670-0.7686) at 8 ranks, with **3.47 GB** peak worker memory.
 This is consistent with the prior 0.7595-0.7738 range and does not justify
