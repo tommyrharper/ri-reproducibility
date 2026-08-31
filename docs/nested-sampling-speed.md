@@ -343,6 +343,13 @@ at the current capacity of 1024 versus **109.25 ms** at 4096, only **0.3%**
 faster. The larger cache is not retained; convolution kernel choice remains
 the only credible R2D2 target.
 
+OpenMP placement was tested as another convolution-path lever. Five fresh
+synthetic 128x128 U-Net probes with two Torch threads measured **34.0 ms/forward**
+with the current unset placement and **76.4-82.2 ms** with
+`OMP_PROC_BIND=spread` and `OMP_PLACES=cores`; three `close` probes measured
+**33.9-34.2 ms**. Placement is therefore not changed: `spread` is a clear
+regression and `close` is equivalent to the existing default.
+
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
 
