@@ -1,8 +1,21 @@
 # shellcheck shell=bash  # sourced, so no shebang
 # Save resolved run settings in a source-safe KEY=VALUE file for resume.
 
+_run_image_id() {
+  [ -n "${1:-}" ] || { printf '%s\n' unknown; return; }
+  docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || printf '%s\n' unknown
+}
+
 write_run_config() {
   local output_dir="$1" algorithm="$2"
+  local meqtrees_image_id polychord_image_id imager_image_id
+  meqtrees_image_id="$(_run_image_id "${MEQTREES_IMAGE:-}")"
+  polychord_image_id="$(_run_image_id "${POLYCHORD_IMAGE:-}")"
+  if [ "${algorithm}" = wsclean ]; then
+    imager_image_id="$(_run_image_id "${WSCLEAN_IMAGE:-}")"
+  else
+    imager_image_id="$(_run_image_id "${R2D2_IMAGE:-}")"
+  fi
   {
     printf 'NS_ALGORITHM=%q\n' "${algorithm}"
     printf 'NS_NLIVE=%q\n' "${NS_NLIVE}"
@@ -16,11 +29,21 @@ write_run_config() {
     printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
     printf 'NS_SYNCHRONOUS=%q\n' "${NS_SYNCHRONOUS}"
     printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
+    printf 'NS_IMAGER_IMAGE_ID=%q\n' "${imager_image_id}"
+    printf 'NS_MEQTREES_IMAGE_ID=%q\n' "${meqtrees_image_id}"
+    printf 'NS_POLYCHORD_IMAGE_ID=%q\n' "${polychord_image_id}"
     if [ "${algorithm}" = wsclean ]; then
       printf 'NS_WSCLEAN_MGAIN=%q\n' "${NS_WSCLEAN_MGAIN}"
+      printf 'NS_WSCLEAN_LOG_TIME=%q\n' "${NS_WSCLEAN_LOG_TIME:-1}"
+      if [ -n "${WSCLEAN_TARGET_CPU:-}" ]; then
+        printf 'WSCLEAN_TARGET_CPU=%q\n' "${WSCLEAN_TARGET_CPU}"
+      fi
     fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
+    fi
+    if [ -n "${R2D2_INTEROP_THREADS:-}" ]; then
+      printf 'R2D2_INTEROP_THREADS=%q\n' "${R2D2_INTEROP_THREADS}"
     fi
   } >"${output_dir}/run.env"
 }
@@ -134,7 +157,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   _dir="$(mktemp -d)"
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=2 \
-    NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 \
+    NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 R2D2_INTEROP_THREADS=1 \
     NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 \
     write_run_config "${_dir}" r2d2
   (
@@ -147,9 +170,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${NS_RETRIES}" = 2 ]
     [ "${NS_METRIC}" = 'total_rms_jy - 0.5 * snr' ]
     [ "${R2D2_OMP_THREADS}" = 2 ]
+    [ "${R2D2_INTEROP_THREADS}" = 1 ]
     [ "${NS_STALL_TIMEOUT}" = 3600 ]
     [ "${NS_SYNCHRONOUS}" = 1 ]
     [ "${NS_KEEP_MEASUREMENT_SETS}" = 1 ]
+    [ "${NS_IMAGER_IMAGE_ID}" = unknown ]
+    [ "${NS_MEQTREES_IMAGE_ID}" = unknown ]
+    [ "${NS_POLYCHORD_IMAGE_ID}" = unknown ]
   )
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
@@ -167,6 +194,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   }
   grep -q R2D2_OMP_THREADS "${_dir}/run.env" && {
     echo "FAIL: empty R2D2_OMP_THREADS written for wsclean"; exit 1
+  }
+  NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
+    NS_METRIC=total_rms_jy NS_MPI_PROCS=8 NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 \
+    NS_KEEP_MEASUREMENT_SETS=0 NS_WSCLEAN_MGAIN=0.9 WSCLEAN_TARGET_CPU=native \
+    write_run_config "${_dir}" wsclean
+  grep -qx 'WSCLEAN_TARGET_CPU=native' "${_dir}/run.env" || {
+    echo "FAIL: native WSClean target not recorded in run.env"; exit 1
   }
 
   _parent="${_dir}/runs"

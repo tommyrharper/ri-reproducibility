@@ -6,8 +6,22 @@ costs *now*, on *this* machine, so the next change can be shown to have helped
 and the one after that cannot quietly give it back.
 
 ```bash
-./ri bench                       # the table
-./ri bench run wsclean --repeat 3   # add three rows for the commit checked out
+./ri bench                                              # the table
+./ri bench run wsclean --repeat 3                       # synchronous, fixed-seed comparison
+./ri bench run wsclean --preset throughput --repeat 3   # the asynchronous mode production uses
+./ri bench run wsclean --preset production --repeat 3   # target-scale workload; expensive
+./ri bench run wsclean --preset production --timeout 300 # bounded probe
+
+# one setting, two arms, alternating run by run
+./ri bench run wsclean --preset throughput --repeat 3 --interleave NS_MPI_PROCS 19 20
+./ri bench run wsclean --preset throughput --repeat 3 --interleave NS_WSCLEAN_MGAIN 0.8 0.9
+./ri bench run wsclean --preset throughput --repeat 3 --interleave NS_SYNCHRONOUS 0 1
+./ri bench run r2d2 --preset throughput --repeat 3 --interleave R2D2_OMP_THREADS 2 4
+
+# and the fixed overrides
+./ri bench run wsclean --native --repeat 3                        # host-specific WSClean build
+./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3
+./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3
 ```
 
 `b` in `./ri tui` shows the same table.
@@ -29,6 +43,43 @@ Every search that finishes adds a row, not only `./ri bench run` - an ad-hoc
 `./ri search` lands in a `custom` group beside the controlled one, which is
 where a run at settings you were exploring rather than benchmarking belongs.
 
+`--native` records `WSCLEAN_TARGET_CPU=native` in `run.env` and the row's
+settings, so host-specific binaries cannot be mixed with portable-build rows.
+On this host, three native default-preset repeats measured 70.2 eval/s median
+versus 70.6 eval/s for the portable baseline: no measurable speedup.
+
+`--mpi-procs N` overrides host-derived worker count for rank-scaling probes;
+the count is recorded in row settings, keeping results in separate groups.
+Explicit values above the process affinity are rejected before starting a
+search, avoiding Open MPI slot errors and wasted probes.
+
+`--omp-threads N` overrides R2D2's automatic per-rank thread count and is
+recorded in row settings, keeping thread-count probes in separate groups.
+
+`--interleave SETTING A B` alternates one setting between two values, run by
+run, after one unrecorded warm-up on arm A; `--repeat N` is N measured searches
+*per arm*. Both arms therefore meet the same host, which is what makes an
+effect smaller than this host's ~5% drift readable at all - sequential arms give
+consistent ~4% false positives here.
+
+`SETTING` must be one of the settings the ledger groups a row by (the
+`WORKLOAD_KEYS` tuple in `scripts/bench.py`: `NS_MPI_PROCS`, `NS_SYNCHRONOUS`,
+`NS_WSCLEAN_MGAIN`, `NS_WSCLEAN_LOG_TIME`, `R2D2_OMP_THREADS`,
+`R2D2_INTEROP_THREADS`, and the rest). Anything else is rejected, because the
+two arms would land in one cell and the comparison would read as noise.
+
+Interleaving a setting the preset itself pins splits the arms across two
+groups: the arm that matches the preset stays in it, the other lands in
+`custom`. That is the intended reading - they are different workloads - and the
+table shows them as two blocks rather than one column pair. A row-by-row
+comparison is `benchmarks.jsonl` itself.
+
+MPI worker counts above the process CPU affinity are rejected before the
+warm-up starts, whether they come from `--mpi-procs` or from an interleaved
+`NS_MPI_PROCS`; that is an Open MPI slot error several minutes into a probe
+otherwise. `--allow-oversubscription` is the explicit escape hatch for probing
+above the limit, and changes neither search defaults nor rank budgeting.
+
 ## What a row is
 
 One JSON object per line in `benchmarks.jsonl`, appended by
@@ -36,7 +87,7 @@ One JSON object per line in `benchmarks.jsonl`, appended by
 self-healed run is skipped: its wall clock covers one segment and its
 evaluation count covers all of them, so the throughput it implies is fiction).
 
-A row carries evaluations/second, the per-evaluation cost of each stage the
+A row carries evaluations/second, peak worker memory, and the per-evaluation cost of each stage the
 profiler measures - the same numbers `./ri profile` prints, so
 [the profiling reference](nested-sampling-profiling.md) is what each stage
 means - the commit, the machine, and the settings the run used.
@@ -48,6 +99,20 @@ checkout, and a laptop's rows can never pool with a server's. `NS_SEED` is not
 part of the grouping - it changes which points are drawn, not the
 configuration being measured, and it is random per run, so in the key every
 ad-hoc search would be a group of one.
+
+The `throughput` preset keeps the workload but sets `NS_SYNCHRONOUS = 0`, so it
+measures the asynchronous scheduler used by production searches. Use it for
+throughput work; the `default` preset remains synchronous because its fixed seed
+makes repeated evaluation counts directly comparable.
+
+The `production` preset matches target searches: `NS_NLIVE = 150`,
+`NS_NUM_REPEATS = 15`, `NS_MAX_NDEAD = -1`, fixed seed, and asynchronous
+scheduling. It is intentionally expensive and should be run only for final
+confirmation after a cheaper preset shows a candidate.
+
+Use `--timeout` for expensive probes. It stops the benchmark's entire process
+group and returns 124, without recording a partial run, so a failed or
+interrupted measurement cannot leave workers behind.
 
 ## What makes two commits comparable
 
@@ -63,7 +128,8 @@ rather than for realism, all measured on the 20-CPU Hetzner host:
   every time. It costs ~45% of the throughput, which does not matter for a
   number that is only ever compared with itself - but it does mean this table
   cannot see a change to the asynchronous scheduler. That question is
-  [throughput](nested-sampling-throughput.md), and it needs its own A/B.
+  [throughput](nested-sampling-throughput.md), and it needs its own A/B:
+  `--interleave NS_SYNCHRONOUS 0 1`.
 - **A warm-up search that is not recorded.** The first search after an idle
   spell measured 76.5 evaluations/second against 70.2, 72.1 and 69.3 for the
   three behind it - the package spends a power budget it then has to pay back
@@ -82,15 +148,28 @@ groups, which is the intended behaviour: they are not comparable any more.
 
 ## Reading the table
 
-Each cell is a mean over the repeats in that column, `±` the standard error of
-those repeats - so it narrows as `1/sqrt(n)` as repeats at one commit
-accumulate, and a single row shows no error bar at all because it has earned
-none.
+Each cell is a median over repeats in that column, `±` an IQR-based robust
+standard-error estimate. This prevents one long-tail timing from dominating
+the result while the error estimate narrows as repeats accumulate. A single
+row shows no error bar.
+
+`peak memory MB` is the largest recorded imaging-worker peak in the run. It is
+reported alongside speed because R2D2's per-rank memory budget limits useful
+parallelism; older rows without this field simply leave the cell blank.
+
+`busy wall s` is the interval with at least one worker evaluation active, and
+`idle fraction` is the remainder of total wall time. A large idle fraction
+flags scheduler or host stalls that can make a single throughput row look slow
+even when per-evaluation stage timings are unchanged: a 42.8 evaluations/second
+outlier turned out to be 69.0% idle at an entirely normal 101.1 ms/evaluation
+image cost. A field no row in a group carries is left out of that group's
+table rather than printed as a blank line, so older groups simply do not show
+these two.
 
 `Δ evals/s` is the change against the column to its right. It is starred when
-the two means are more than two combined standard errors apart. One repeat
-each can never earn a star; three tight ones can. With the ~2% run-to-run
-spread above, three repeats a side resolve a change of about 4%.
+the two medians are more than two combined robust standard errors apart. One
+repeat each can never earn a star; three tight ones can. With the ~2%
+run-to-run spread above, three repeats a side resolve a change of about 4%.
 
 The `evals` row is a diagnostic, not a result: in a group where it moves, the
 columns above it are comparing different work, and nothing there means what it

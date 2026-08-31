@@ -64,15 +64,11 @@ def ms_to_r2d2_mat(
     vis = data[:, :, corr_index]
     row_weight = weight[:, corr_index]
 
-    u_m = np.repeat(uvw[:, 0], n_chan)
-    v_m = np.repeat(uvw[:, 1], n_chan)
-    freqs = np.tile(freqs_hz, n_rows)
-    wavelength = SPEED_OF_LIGHT / freqs
-    u_lambda = u_m / wavelength
-    v_lambda = v_m / wavelength
+    u_lambda = (uvw[:, 0, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
+    v_lambda = (uvw[:, 1, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
     y = vis.reshape(-1)
     # Convert MS inverse-variance weights to R2D2 nW, applying simulated sigma.
-    nW = np.sqrt(np.repeat(row_weight, n_chan)) / noise_sigma_jy
+    nW = np.repeat(np.sqrt(row_weight) / noise_sigma_jy, n_chan)
 
     mat_path.parent.mkdir(parents=True, exist_ok=True)
     savemat(
@@ -83,7 +79,8 @@ def ms_to_r2d2_mat(
             "y": y.reshape(-1, 1),
             "nW": nW.reshape(-1, 1),
         },
-        do_compression=True,
+        # Small per-evaluation MAT; compression costs more CPU than its I/O saves.
+        do_compression=False,
     )
     return {
         "visibility_count": int(y.size),

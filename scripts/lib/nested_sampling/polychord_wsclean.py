@@ -146,12 +146,13 @@ def evaluate(
         "-j",
         "1",
         "-no-update-model-required",
+        *([] if "sigma_res" in getattr(args, "metric", "") else ["-no-dirty"]),
         # Avoids WSClean's unused CORRECTED_DATA probe; see the cost-model doc.
         "-data-column",
         "DATA",
         # Timestamps make wsclean.stdout.log usable by `./ri profile --phases`.
-        "-log-time",
-        str(ms_path),
+        *(["-log-time", str(ms_path)]
+          if os.environ.get("NS_WSCLEAN_LOG_TIME", "1") != "0" else []),
     ]
     # zygote wait4() supplies exact child wall time and peak RSS.
     run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
@@ -185,8 +186,8 @@ def evaluate(
             params["source_flux_jy"],
             run_result.wall_seconds,
             peak_memory_bytes,
-            dirty_path=dirty_path,
-            residual_dirty_path=residual_dirty_path,
+            dirty_path=dirty_path if "sigma_res" in args.metric else None,
+            residual_dirty_path=residual_dirty_path if "sigma_res" in args.metric else None,
             source_l_arcsec=params["source_l_arcsec"],
             source_m_arcsec=params["source_m_arcsec"],
         )
@@ -255,6 +256,7 @@ def self_check_failure_record_persistence() -> None:
         return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
 
     try:
+        seen_wsclean_argv: list[list[str]] = []
         globals()["sidecar_command"] = lambda image, prefix=None: ["stub-wsclean"]
         globals()["simulate_measurement_set"] = failing_simulate
         with tempfile.TemporaryDirectory() as tmp:
@@ -288,6 +290,7 @@ def self_check_failure_record_persistence() -> None:
             stdout_path: Path,
             stderr_path: Path,
         ) -> argparse.Namespace:
+            seen_wsclean_argv.append(argv)
             return argparse.Namespace(
                 returncode=0, wall_seconds=2.0, peak_memory_bytes=4096, binary_seconds=1.5
             )
@@ -303,6 +306,7 @@ def self_check_failure_record_persistence() -> None:
             params = {"source_flux_jy": 1.0}
             args = argparse.Namespace(meqtrees_image="meqtrees", wsclean_image="wsclean", platform="linux/arm64")
             record = evaluate(params, args, root / "eval-0002-deadbeef", 2, lambda metrics: 0.0)
+            assert "-no-dirty" in seen_wsclean_argv[0]
             loaded = load_evaluations_from_dir(root)
             assert loaded == [record]
             assert loaded[0]["objective"] == FAILURE_OBJECTIVE

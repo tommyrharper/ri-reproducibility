@@ -44,6 +44,16 @@ between it and the next line - and gaps are bucketed by (line, next line),
 because `Loading data in memory...` appears once per gridding pass and means
 something different each time.
 
+The CLI reports median logged duration, median typical phase gaps, and a p90
+phase contribution per evaluation. The gap median is weighted by its observed
+occurrences per evaluation, while p90 exposes tail cost without letting one
+long-tail evaluation choose the next bottleneck.
+
+For R2D2, `./ri profile <run> --r2d2-phases` reports the median and p90 total
+per evaluation for each logged phase. The p90 uses whole-evaluation totals, so
+it exposes worker stalls without letting one outlier choose the optimization
+target.
+
 | ms/eval | share | n/eval | ms each | phase |
 | ---: | ---: | ---: | ---: | --- |
 | 48.83 | 29.6% | 8.51 | 5.737 | `Gridding N rows...` -> `Gridded visibility count` |
@@ -109,6 +119,12 @@ knob that changes the box (`-beam-fitting-size`, `-circular-beam`,
 hence every metric. It is recorded here because it is 6.7% of an evaluation
 sitting in ~200 lines of straight-line arithmetic, which is a better shape for
 a future upstream contribution than anything else left in the profile.
+
+A direct replay on a valid Measurement Set checked the least invasive box-size
+alternative: `-beam-fitting-size` 10, 15, and 20 took 0.58, 1.11, and 1.84 ms
+for the fit, respectively, while all returned the same 3.06'' x 2.27'' beam.
+The default 10 is therefore the fastest tested result-preserving setting; no
+runtime change was made.
 
 ## Two avenues closed
 
@@ -190,6 +206,12 @@ other rather than with the clock:
 The null pair puts this rig's resolution at 1.8%; `-log-time` reads +0.9% on the
 mean and -0.4% on the median, i.e. nothing. On disk it is ~1 KB on a 400 KB
 evaluation.
+
+A current three-repeat interleaved throughput probe likewise found no usable
+runtime gain from disabling it: **109.4 evaluations/second** enabled versus
+**115.8** disabled, with one noisy low-throughput run in each arm. Logging
+remains enabled by default because its cost is below measurement noise and its
+timestamps support `./ri profile --phases` and `--over-time`.
 
 ## Reproducing it
 

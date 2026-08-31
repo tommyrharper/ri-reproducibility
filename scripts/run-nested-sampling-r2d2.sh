@@ -26,22 +26,20 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   else
     NS_MPI_PROCS="${HOST_CPUS}"
   fi
-  # Keep thread allocation based on requested, not memory-clamped, ranks.
-  NS_MPI_PROCS_UNCLAMPED="${NS_MPI_PROCS}"
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2)"
 else
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2
-  NS_MPI_PROCS_UNCLAMPED="${NS_MPI_PROCS}"
 fi
 
 if [ -z "${R2D2_OMP_THREADS:-}" ]; then
-  R2D2_OMP_THREADS="$(( HOST_CPUS / NS_MPI_PROCS_UNCLAMPED ))"
+  R2D2_OMP_THREADS="$(( (HOST_CPUS + NS_MPI_PROCS - 1) / NS_MPI_PROCS ))"
   if [ "${R2D2_OMP_THREADS}" -lt 1 ]; then
     R2D2_OMP_THREADS=1
   fi
 fi
+R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}"
 
 # shellcheck source=scripts/lib/run-config.sh
 . "${REPO_ROOT}/scripts/lib/run-config.sh"
@@ -111,6 +109,7 @@ sidecar_launch "${PLATFORM}" "${R2D2_IMAGE}" \
   -e OMP_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
   -e OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
+  -e R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}" \
   -e OMP_WAIT_POLICY=PASSIVE \
   -- sh -c '
   python3 "$2" --fifo-dir "$1" &
@@ -142,6 +141,7 @@ RUN_COMMAND=(
   -e CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
   -e DOCKER_DEFAULT_PLATFORM="${PLATFORM}"
   -e NS_MPI_PROCS="${NS_MPI_PROCS}"
+  -e NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-}"
   -e NS_SIDECARS="${NS_SIDECARS}"
   -e NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
   -e NS_SCRATCH_DIR="${NS_SCRATCH_DIR}"
@@ -166,11 +166,13 @@ RUN_COMMAND=(
   -e OMPI_ALLOW_RUN_AS_ROOT=1
   -e OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   -e R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
+  -e R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-1}"
   "${POLYCHORD_CONTAINER}"
   mpirun
   --allow-run-as-root
   # Match Open MPI's slot units to `nproc`'s hardware-thread rank count.
   --use-hwthread-cpus
+  ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_r2d2.py
   --output-dir "${OUTPUT_DIR}"

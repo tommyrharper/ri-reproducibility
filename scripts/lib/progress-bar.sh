@@ -390,6 +390,22 @@ _ns_backoff_interval() {
 # this function.
 _ns_count_evals() {
   local dir="$1" reference="${2:-}" total since=0
+  # GNU find can classify both counts during one directory walk. Keep the
+  # portable two-pass fallback for macOS and other BSD find implementations.
+  if find "${dir}" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    if [ -n "${reference}" ] && [ -e "${reference}" ]; then
+      read -r total since < <(
+        find "${dir}" -maxdepth 1 -name 'eval-*' \
+          \( -newer "${reference}" -printf 's\n' -o -printf 't\n' \) 2>/dev/null |
+          awk '{ total++; since += ($1 == "s") } END { print total + 0, since + 0 }'
+      )
+    else
+      total="$(find "${dir}" -maxdepth 1 -name 'eval-*' -printf 'x\n' 2>/dev/null |
+        wc -l | tr -d ' ')"
+    fi
+    echo "${total:-0} ${since:-0}"
+    return
+  fi
   total="$(find "${dir}" -maxdepth 1 -name 'eval-*' 2>/dev/null | wc -l | tr -d ' ')"
   if [ -n "${reference}" ] && [ -e "${reference}" ]; then
     since="$(find "${dir}" -maxdepth 1 -name 'eval-*' -newer "${reference}" 2>/dev/null |

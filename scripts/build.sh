@@ -61,7 +61,7 @@ build_wsclean() {
 
 build_r2d2() {
   build_image ri-reproducibility/r2d2:cpu \
-    "$(inputs_hash "${PLATFORM}" docker/r2d2/Dockerfile)" \
+    "$(inputs_hash "${PLATFORM}" docker/r2d2/Dockerfile docker/r2d2/patches)" \
     -f docker/r2d2/Dockerfile
 }
 

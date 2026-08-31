@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -616,19 +616,31 @@ def load_fits_2d(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
     if len(raw) != count * (abs(bitpix) // 8):
         raise ValueError(f"{path}: FITS data block is short")
     data = np.frombuffer(raw, dtype=">f4" if bitpix == -32 else ">f8").reshape(shape)
-    image = np.squeeze(np.asarray(data, dtype=np.float64))
+    # astype, not asarray: frombuffer gives a read-only view, and asarray would
+    # hand it straight back on a host where the FITS byte order is native.
+    # compute_image_metrics writes one pixel of what it is given.
+    image = np.squeeze(data.astype(np.float64))
     if image.ndim != 2:
         raise ValueError(f"{path} is not 2-D after squeezing; shape={image.shape}")
     return image, header
 
 
 def rms(values: np.ndarray) -> float:
-    return float(np.sqrt(np.nanmean(values * values))) if values.size else 0.0
+    if not values.size:
+        return 0.0
+    if not np.isnan(values).any():
+        return float(np.sqrt(np.dot(values.ravel(), values.ravel()) / values.size))
+    return float(np.sqrt(np.nanmean(values * values)))
 
 
 def sigma_res(residual: np.ndarray, dirty: np.ndarray) -> float:
     """R2D2-paper data-fidelity: ||residual_dirty||_2 / ||dirty||_2."""
-    return float(np.linalg.norm(residual) / max(np.linalg.norm(dirty), 1e-12))
+    residual_flat = residual.ravel()
+    dirty_flat = dirty.ravel()
+    return float(
+        np.sqrt(np.dot(residual_flat, residual_flat))
+        / max(np.sqrt(np.dot(dirty_flat, dirty_flat)), 1e-12)
+    )
 
 
 def source_pixel(
@@ -647,6 +659,19 @@ def source_pixel(
     sx = cx + int(round(source_l_arcsec / cdelt1_arcsec))
     sy = cy + int(round(source_m_arcsec / cdelt2_arcsec))
     return max(0, min(x_size - 1, sx)), max(0, min(y_size - 1, sy))
+
+
+@lru_cache(maxsize=64)
+def off_source_mask(shape: tuple[int, int], sx: int, sy: int) -> np.ndarray:
+    """Pixels more than 5 px from the source, cached: one mask serves a run.
+
+    Every evaluation of a search asks for the same handful of (shape, source)
+    combinations, and building one costs more than the reduction it feeds.
+    """
+    yy, xx = np.ogrid[:shape[0], :shape[1]]
+    mask = (yy - sy) ** 2 + (xx - sx) ** 2 > 25
+    mask.setflags(write=False)  # callers share this array; none may edit it
+    return mask
 
 
 def compute_image_metrics(
@@ -682,19 +707,26 @@ def compute_image_metrics(
     cy = max(0, min(y_size - 1, cy))
     sx, sy = source_pixel(header, cx, cy, source_l_arcsec, source_m_arcsec, x_size, y_size)
 
-    truth = np.zeros_like(image)
-    truth[sy, sx] = source_flux_jy
-    residual = image - truth
-
-    yy, xx = np.ogrid[:y_size, :x_size]
-    off_source = (yy - sy) ** 2 + (xx - sx) ** 2 > 25
-    off_rms = rms(image[off_source])
-    total_rms = rms(residual)
+    off_rms = rms(image[off_source_mask(image.shape, sx, sy)])
     peak = float(np.nanmax(np.abs(image)))
     snr = peak / off_rms if off_rms > 0 else float("inf")
     log_snr = math.log10(snr) if math.isfinite(snr) and snr > 0 else 99.0
-    relative_l2_error = float(np.linalg.norm(residual) / max(np.linalg.norm(truth), 1e-12))
     peak_flux_error = abs(float(image[sy, sx]) - source_flux_jy)
+
+    # The residual differs at one pixel only. Mutate the already-owned float64
+    # array for the two residual reductions, avoiding another full-image copy.
+    source_value = image[sy, sx]
+    try:
+        image[sy, sx] -= source_flux_jy
+        if np.isnan(image).any():
+            total_rms = rms(image)
+            residual_norm = float(np.linalg.norm(image))
+        else:
+            residual_norm = float(np.sqrt(np.dot(image.ravel(), image.ravel())))
+            total_rms = residual_norm / math.sqrt(image.size)
+        relative_l2_error = residual_norm / max(abs(source_flux_jy), 1e-12)
+    finally:
+        image[sy, sx] = source_value
 
     metrics = {
         "snr": float(snr),
@@ -1290,6 +1322,8 @@ def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
                 shutil.move(str(produced), destination)
             if (eval_dir / "sim.ms").exists() and "measurement_set" in record.get("paths", {}):
                 record["paths"]["measurement_set"] = str(eval_dir / "sim.ms")
+            if (eval_dir / "r2d2_data.mat").exists() and "mat" in record.get("paths", {}):
+                record["paths"]["mat"] = str(eval_dir / "r2d2_data.mat")
         shutil.rmtree(scratch, ignore_errors=True)
     if keeping:
         return
@@ -1374,14 +1408,17 @@ def self_check_evaluation_pruning() -> None:
                 (scratch / "sim.ms").mkdir(parents=True)
                 (scratch / "sim.ms" / "table.f0").write_text("data")
                 (scratch / "VLAA_ANT").mkdir()
+                (scratch / "r2d2_data.mat").write_text("mat")
                 record = {"eval_id": 1, "params": {"a": 1}, "objective": 0.5,
-                          "paths": {"eval_dir": str(eval_dir), "measurement_set": str(scratch / "sim.ms")}, **extra}
+                          "paths": {"eval_dir": str(eval_dir), "measurement_set": str(scratch / "sim.ms"),
+                                    "mat": str(scratch / "r2d2_data.mat")}, **extra}
                 written = write_evaluation_record(eval_dir, record)
                 assert not scratch.exists(), f"{name} left its scratch behind"
                 if extra:
                     assert (eval_dir / "sim.ms" / "table.f0").read_text() == "data"
                     assert (eval_dir / "VLAA_ANT").is_dir()
                     assert written["paths"]["measurement_set"] == str(eval_dir / "sim.ms")
+                    assert written["paths"]["mat"] == str(eval_dir / "r2d2_data.mat")
                 else:
                     assert not (eval_dir / "sim.ms").exists()
                     assert "measurement_set" not in written["paths"]
@@ -1958,6 +1995,7 @@ def self_check_source_offset() -> None:
             # residual carries the whole 1 Jy twice over.
             assert metrics["peak_flux_abs_error_jy"] == 0.0, (l_as, m_as, metrics["peak_flux_abs_error_jy"])
             assert metrics["total_rms_jy"] == 0.0, (l_as, m_as, metrics["total_rms_jy"])
+            assert metrics["relative_l2_error"] == 0.0, metrics["relative_l2_error"]
 
             # A header with no WCS and no scale to stand in for it must say so
             # rather than quietly centring the source and scoring a good image
@@ -2127,6 +2165,8 @@ def self_check_fits_reader() -> None:
         expected, expected_header = fits.getdata(path, header=True)
     assert image.shape == (8, 6), image.shape
     assert np.array_equal(image, np.squeeze(np.asarray(expected, dtype=np.float64)))
+    # compute_image_metrics writes one pixel of this array to form the residual.
+    assert image.flags.writeable
     assert header["BUNIT"] == "JY/BEAM", header["BUNIT"]
     assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
     assert header["SIMPLE"] is True
@@ -2165,6 +2205,12 @@ def self_check_metric_resolution() -> None:
     assert sigma_fn(sample) == sample["sigma_res"]
     assert abs(rms(np.array([3.0, 4.0])) - 5.0 / math.sqrt(2.0)) < 1e-12
     assert abs(sigma_res(np.array([3.0, 4.0]), np.array([0.0, 2.0])) - 2.5) < 1e-12
+    residual = np.array([1.0, -2.0, 3.0])
+    dirty = np.array([4.0, 5.0, -6.0])
+    assert sigma_res(residual, dirty) == np.linalg.norm(residual) / np.linalg.norm(dirty)
+    assert off_source_mask((8, 8), 4, 4) is off_source_mask((8, 8), 4, 4)
+    # One cached mask is handed to every caller, so none of them may write it.
+    assert not off_source_mask((8, 8), 4, 4).flags.writeable
 
     expr_fn, _ = resolve_metric("log_snr + 0.1 * wall_seconds")
     assert expr_fn(sample) == sample["log_snr"] + 0.1 * sample["wall_seconds"]

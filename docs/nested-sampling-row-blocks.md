@@ -93,6 +93,15 @@ The block is capped at 1024 rows *and* at 4M values, so a wide set
 block into hundreds of megabytes. This parameter space's sets are 4 x 4 to
 4 x 8, so they take the 1024-row cap.
 
+The follow-up keeps each block's row shape and element count beside the block,
+so `CopyRowFromBlock()` no longer asks casacore for shape metadata on every
+row. The rebuilt image passed WSClean self-checks and compiled cleanly. Six
+controlled default searches now measure 70.85, 72.95, 73.87, 71.78, 69.52 and
+72.01 evaluations/second (six-run median 71.90), versus the previous
+three-control median of 71.06 evaluations/second (+1.2%). Overlapping run
+variance means this is still not a statistically isolated end-to-end gain.
+Peak memory stayed 34.4-34.7 MB.
+
 ## Measurements
 
 Both arms' `wsclean-zygote` and `libwsclean.so` were `docker cp`'d out of their

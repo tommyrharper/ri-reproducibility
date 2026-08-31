@@ -163,6 +163,7 @@ def do_profile(args):
     return {}, [uv("scripts/profile-nested-sampling-run.py", args.run,
                    *(["--json"] if args.json else []),
                    *(["--phases"] if args.phases else []),
+                   *(["--r2d2-phases"] if args.r2d2_phases else []),
                    *(["--over-time"] if args.over_time else []),
                    *(["--top", str(args.top)] if args.top else []),
                    *(["--buckets", str(args.buckets)] if args.buckets else []))]
@@ -175,9 +176,15 @@ def do_bench(args):
 def do_bench_run(args):
     # Builds first, exactly as a search does: the images bake the code, so
     # without it the benchmark times whatever was baked last.
-    return {}, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
+    env = {"WSCLEAN_TARGET_CPU": "native"} if args.native else {}
+    return env, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
         uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
-           "--repeat", str(args.repeat))]
+           "--repeat", str(args.repeat),
+           *(["--mpi-procs", str(args.mpi_procs)] if args.mpi_procs is not None else []),
+           *(["--omp-threads", str(args.omp_threads)] if args.omp_threads is not None else []),
+           *(["--interleave", *args.interleave] if args.interleave else []),
+           *(["--allow-oversubscription"] if args.allow_oversubscription else []),
+           *(["--timeout", str(args.timeout)] if args.timeout is not None else []))]
 
 
 def do_bench_record(args):
@@ -577,6 +584,8 @@ def build_parser():
     profile.add_argument("--over-time", action="store_true",
                          help="evaluations/second against wall clock, beside the visibility count "
                               "that sets it, see docs/nested-sampling-cost-model.md")
+    profile.add_argument("--r2d2-phases", action="store_true",
+                         help="break R2D2 imaging down by model update and residual timings")
     profile.add_argument("--top", type=int, help="with --phases: phases to print, largest first")
     profile.add_argument("--buckets", type=int, help="with --over-time: wall-clock buckets to print")
 
@@ -587,7 +596,7 @@ def build_parser():
             "cost behind it, one column per commit, newest first.\n"
             "\n"
             "Rows are grouped by machine, imager and settings, and each cell is a\n"
-            "mean with the standard error of its repeats - so it narrows as\n"
+            "median with robust standard error of its repeats - so it narrows as\n"
             "repeats at one commit accumulate, and a change is only starred once\n"
             "it is bigger than the noise it has to beat.\n"
             "\n"
@@ -613,6 +622,21 @@ def build_parser():
     bench_run.add_argument("--repeat", type=int, default=1, metavar="N",
                            help="run it N times, which is how the error bar on "
                                 "this commit gets smaller (default: %(default)s)")
+    bench_run.add_argument("--timeout", type=float, metavar="SECONDS",
+                           help="stop the whole benchmark, including its process tree")
+    bench_run.add_argument("--native", action="store_true",
+                           help="build and benchmark WSClean for this exact CPU")
+    bench_run.add_argument("--mpi-procs", type=int, metavar="N",
+                           help="override MPI worker count for rank-scaling probes")
+    bench_run.add_argument("--omp-threads", type=int, metavar="N",
+                           help="override per-rank R2D2 OpenMP/BLAS threads")
+    bench_run.add_argument("--interleave", nargs=3, metavar=("SETTING", "A", "B"),
+                           help="alternate one NS_*/R2D2_* setting between two "
+                                "values, so both arms meet the same host: "
+                                "--interleave NS_WSCLEAN_MGAIN 0.8 0.9. "
+                                "--repeat is per arm")
+    bench_run.add_argument("--allow-oversubscription", action="store_true",
+                           help="allow MPI counts above CPU affinity for explicit probes")
     bench_run.set_defaults(handler=do_bench_run)
 
     bench_record = bench_subs.add_parser(
