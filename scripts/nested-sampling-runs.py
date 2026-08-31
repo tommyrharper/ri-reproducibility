@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
+from functools import cache
 from pathlib import Path
 
 NESTED_SAMPLING_DIR = Path("results/nested-sampling")
@@ -57,6 +58,23 @@ def read_summary(run_dir: Path) -> dict[str, object]:
     except (OSError, ValueError):  # absent, or caught mid-write
         return {}
     return summary if isinstance(summary, dict) else {}
+
+
+@cache
+def default_parameter_space() -> list[dict[str, object]]:
+    """defaults.toml's box, for a run that died before recording its own.
+
+    This is the repository's box now, not a record of the run's, so callers
+    have to say so - defaults.toml is edited between runs. It is still the
+    best answer available: nothing else on disk names the box, and the run
+    was launched from this same file."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_sampling"))
+        from common import load_parameter_space
+
+        return load_parameter_space()
+    except Exception:  # a listing must survive anything defaults.toml does
+        return []
 
 
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
@@ -126,6 +144,12 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
             run_env = {**run_env, "NS_METRIC": summary["metric"]}
         if not space and isinstance(summary.get("parameter_space"), list):
             space = summary["parameter_space"]
+    # A run that died warming its sidecars never wrote a box and never reached
+    # a summary. defaults.toml is what it was launched from, so show that and
+    # flag it rather than leave the column blank.
+    from_defaults = not space
+    if from_defaults:
+        space = default_parameter_space()
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
     evaluations = len(list((run_dir / "evaluations").glob("eval-*/metrics.json")))
     complete = summary_is_complete(run_dir)
@@ -147,6 +171,9 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
         "evaluations": evaluations,
         "settings": run_env,
         "parameter_space": space,
+        # False unless the box above is defaults.toml standing in for a record
+        # the run never wrote; the absent-field default is the honest one.
+        "parameter_space_from_defaults": from_defaults and bool(space),
     }
 
 
@@ -252,6 +279,8 @@ def self_check() -> None:
             assert runs[stopped.name]["settings"]["NS_MPI_PROCS"] == "7"
             assert runs[stopped.name]["parameter_space"] == [
                 {"name": "channel_count", "min": 1, "max": 8, "kind": "integer"}]
+            # A recorded box is never relabelled as borrowed.
+            assert runs[stopped.name]["parameter_space_from_defaults"] is False
 
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
             bare.mkdir()
@@ -261,10 +290,13 @@ def self_check() -> None:
             bare_run = {r["name"]: r for r in find_runs(running=set())}[bare.name]
             assert bare_run["status"] == "incomplete", bare_run
             assert bare_run["evaluations"] == 0, bare_run
-            assert bare_run["parameter_space"] == [], bare_run
+            assert bare_run["parameter_space"] == default_parameter_space(), bare_run
+            assert bare_run["parameter_space_from_defaults"] is True, bare_run
             (bare / "parameter-space.json").write_text('[{"name": "torn"')
-            assert {r["name"]: r for r in find_runs(running=set())
-                    }[bare.name]["parameter_space"] == [], "a torn file must not break listing"
+            torn_space = {r["name"]: r for r in find_runs(running=set())}[bare.name]
+            assert torn_space["parameter_space"] == default_parameter_space(), (
+                "a torn file must not break listing")
+            assert torn_space["parameter_space_from_defaults"] is True, torn_space
             (bare / "parameter-space.json").unlink()
 
             # A legacy or merged run has neither run.env nor parameter-space.json,
@@ -287,7 +319,10 @@ def self_check() -> None:
             (legacy / "run.env").unlink()
             (legacy / "summary.json").write_text('{"metric": "tot')
             torn = {r["name"]: r for r in find_runs(running=set())}[legacy.name]
-            assert torn["settings"] == {} and torn["parameter_space"] == [], torn
+            assert torn["settings"] == {}, torn
+            # Nothing recorded at all falls back to defaults.toml, flagged.
+            assert torn["parameter_space"] == default_parameter_space(), torn
+            assert torn["parameter_space_from_defaults"] is True, torn
             shutil.rmtree(legacy)
 
             order = [r["name"] for r in find_runs(running=set())]

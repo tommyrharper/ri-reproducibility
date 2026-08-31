@@ -75,6 +75,21 @@ func TestRunCondensesItsObjectiveAndBoxIntoARow(t *testing.T) {
 	if got := half.ranges(true); got != "sof" {
 		t.Errorf("a dimension without bounds = %q", got)
 	}
+
+	// A run that died before recording its box borrows defaults.toml's, which
+	// must never read as the run's own record.
+	stand := run
+	stand.SpaceFromDefaults = true
+	if got := stand.ranges(true); got != "ldr 1-6 cc 1-8 sfh 54M-50G cwh 100k-2M ?" {
+		t.Errorf("a borrowed box must be marked in the cell: %q", got)
+	}
+	if got := stand.ranges(false); !strings.Contains(got, "not recorded") {
+		t.Errorf("a borrowed box must be spelled out in the detail line: %q", got)
+	}
+	// Absent from the JSON means recorded, so an old ./ri cannot mislabel.
+	if runs[0].SpaceFromDefaults {
+		t.Error("parameter_space_from_defaults must default to false")
+	}
 }
 
 func TestDeleteRunOnlyEverRemovesARunDirectory(t *testing.T) {
