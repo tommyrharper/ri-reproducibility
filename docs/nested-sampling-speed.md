@@ -421,6 +421,11 @@ at the current capacity of 1024 versus **109.25 ms** at 4096, only **0.3%**
 faster. The larger cache is not retained; convolution kernel choice remains
 the only credible R2D2 target.
 
+Enabling PyTorch denormal flushing was tested as another low-risk CPU setting.
+At two Torch threads, a warmed 128x128 U-Net measured **124.014 ms/forward**
+with flushing disabled versus **132.847 ms** enabled (**6.65% slower**), with
+bit-identical output. The setting is rejected.
+
 OpenMP placement was tested as another convolution-path lever. Five fresh
 synthetic 128x128 U-Net probes with two Torch threads measured **34.0 ms/forward**
 with the current unset placement and **76.4-82.2 ms** with
