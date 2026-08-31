@@ -7,6 +7,16 @@ two Torch threads, with **13.61 s/evaluation** in the image container and
 operating point; model updates remain dominant and no runtime change is
 justified.
 
+An interleaved two-repeat 15-rank thread probe measured **0.9183 evaluations/second**
+at two Torch threads (0.9171, 0.9194) versus **0.8737** at four threads
+(0.8735, 0.8739), with unchanged **3.47 GB** peak worker memory. Four threads
+is **4.9% slower**, so retain two threads at this production operating point.
+
+A direct warmed U-Net microbenchmark measured **64.52 ms** per forward in the
+existing layout versus **64.23 ms** with channels-last tensors and weights
+(0.5% faster). This is too small to justify changing the inference layout,
+especially without an end-to-end result-preservation check.
+
 A matched three-repeat 15-rank thread probe measured **0.9059 evaluations/second**
 at two Torch threads (0.9058, 0.9059, and 0.9096) versus **0.8860** at three
 threads (0.8892, 0.8833, and 0.8860), with unchanged **3.47 GB** peak worker
@@ -236,6 +246,7 @@ rates are historical and roughly half the current rate.
 | R2D2 automatic threads follow memory-clamped ranks | `run-nested-sampling-r2d2.sh` | Production-size probe clamped 20 -> 15 ranks and selected 2 threads; 178 evaluations in 175.9 s (1.01 eval/s), 3.64 GB peak worker memory |
 | R2D2 one-thread control at 15 ranks | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 1 --repeat 2` | 0.749 eval/s over 36 evaluations versus ~0.91 at two threads; ~18% slower with 3.47 GB per-worker memory |
 | R2D2 15-rank control refresh | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --repeat 3` | 0.9040 eval/s median (0.9039-0.9060), 13.61 s/evaluation image container, 3.47 GB peak worker memory; no change justified |
+| R2D2 15-rank four-thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --interleave-omp-threads 2 4 --repeat 2` | 0.9183 eval/s at two threads versus 0.8737 at four; 4.9% slower with four and unchanged 3.47 GB peak worker memory |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
