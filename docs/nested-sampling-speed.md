@@ -1,10 +1,10 @@
 # Making a nested-sampling search faster: the index
 
-The latest three-repeat asynchronous WSClean control measured **117.5
-evaluations/second** (106.8, 120.6, and 117.5) at 20 ranks, with **136.9
-ms/evaluation**, **122.0 ms/evaluation** in the image binary, and **34.3 MB**
-peak worker memory. This refresh found no defensible runtime change; gridding
-and predicting remain the dominant measured binary phases.
+The latest three-repeat asynchronous WSClean control measured **109.3
+evaluations/second** (111.3, 109.3, and 107.8) at 20 ranks, with **145.0
+ms/evaluation** and **34.3-34.6 MB** peak worker memory. This refresh found no
+defensible runtime change; gridding and predicting remain the dominant measured
+binary phases.
 
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9055 evaluations/second** (0.9055, 0.8989, and 0.9165) at 15 ranks and
