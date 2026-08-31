@@ -13,6 +13,12 @@ ms/evaluation** by median, **120.9-132.0 ms/evaluation** in the image binary,
 and **34.4-34.6 MB** peak worker memory. This is consistent with host variance
 and does not justify a runtime change.
 
+The latest three-repeat asynchronous WSClean control measured **106.4
+evaluations/second** (106.4, 94.9, and 121.0) at 20 ranks, with **142.6
+ms/evaluation** and **127.2 ms/evaluation** in the image binary. Peak worker
+memory was **34.2-34.6 MB**; the spread remains host variance, not a code
+speedup.
+
 A six-run interleaved oversubscription probe measured WSClean at **107.7
 evaluations/second** with 20 ranks versus **104.7 evaluations/second** with 21
 ranks, with **34.3-34.7 MB** peak worker memory in both arms. The extra rank is
@@ -396,6 +402,7 @@ rates are historical and roughly half the current rate.
 | WSClean 18-versus-20 rank probe | `./ri bench run wsclean --interleave-mpi-procs 18 20` | 111.5 versus 109.6 eval/s median across three repeats; 1.7% spread within host variance, with no memory benefit below 20 ranks |
 | WSClean 20-versus-21 rank probe | `./ri bench run wsclean --preset throughput --interleave-mpi-procs 20 21 --allow-oversubscription --repeat 3` | 107.7 versus 104.7 eval/s median across three interleaved repeats; 21 ranks is 2.8% slower with unchanged 34.3-34.7 MB peak memory |
 | WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 110.2 eval/s median (105.4, 110.2, and 114.3), 142.2 ms/eval, 127.1-128.5 ms image binary, and 34.4-34.6 MB peak memory; host-variance control |
+| WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 106.4 eval/s median (106.4, 94.9, and 121.0), 142.6 ms/eval, 127.2 ms image binary, and 34.2-34.6 MB peak memory; host-variance control |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
