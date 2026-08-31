@@ -1,6 +1,13 @@
 # Making a nested-sampling search faster: the index
 
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
+**0.9055 evaluations/second** (0.9055, 0.8989, and 0.9165) at 15 ranks and
+two Torch threads, with **13.62 s/evaluation** in the image container and
+**3.47 GB** peak worker memory. This refresh confirms the current
+memory-safe operating point; model updates remain dominant and no runtime
+change is justified.
+
+The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9098 evaluations/second** (0.9058, 0.9151, and 0.9094) at 15 ranks and
 two Torch threads, with **13.62 s/evaluation** in the image container and
 **3.47 GB** peak worker memory. This refresh is consistent with the existing
