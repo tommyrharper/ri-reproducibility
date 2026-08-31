@@ -1,5 +1,12 @@
 # Making a nested-sampling search faster: the index
 
+The latest three-repeat asynchronous WSClean control on HEAD measured
+**100.7 evaluations/second** (109.0, 100.7, and 100.5) at 20 ranks, with
+**147.3-152.3 ms/evaluation**, **131.4 ms/evaluation** in the image binary,
+and **34.6-34.8 MB** peak worker memory. This is below the previous 110.7
+eval/s refresh but within observed host variance; no runtime change is
+justified before testing reordered-part metadata caching.
+
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9040 evaluations/second** (0.9040, 0.9039, and 0.9060) at 15 ranks and
 two Torch threads, with **13.61 s/evaluation** in the image container and
