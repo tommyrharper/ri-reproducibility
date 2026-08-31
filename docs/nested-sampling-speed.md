@@ -570,6 +570,14 @@ result-preserving inference cleanup: two checkpoint-backed runs measured
 with no memory reduction (one run reached 3.51 GB). It is rejected as noise or a
 small regression; the source patch was removed.
 
+A fresh three-repeat asynchronous R2D2 control at the benchmark's portable
+8-rank setting measured **0.7721 eval/s** median (0.7665, 0.7721, and 0.7960),
+with **3.47 GB** peak worker memory. The phase profile measured **6663.5 ms**
+per evaluation for 25 model updates and **93.4 ms** for residual computation.
+This refresh confirms that model inference still dominates and provides no
+result-preserving optimization target; the higher-throughput 15-rank x 2-thread
+configuration remains an explicit, capacity-aware production choice.
+
 ## What is priced but deliberately not taken
 
 | lever | worth | why not |
