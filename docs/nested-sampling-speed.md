@@ -13,6 +13,13 @@ ms/evaluation** by median, **119.3 ms/evaluation** in the image binary, and
 **34.3-34.6 MB** peak worker memory. This is a control refresh within normal
 host variance; no new runtime change is claimed.
 
+An interleaved three-repeat WSClean probe tested `-log-time` logging at the
+throughput preset: **109.4 evaluations/second** with logging enabled (114.3,
+74.8, and 109.4) versus **115.8** with it disabled (115.8, 71.9, and 117.9).
+The low pair is host noise, and the medians do not establish a speedup; peak
+worker memory stayed **34.6-34.7 MB**. Keep logging enabled because it powers
+phase and over-time profiling.
+
 The new benchmark arm supports interleaved `mgain` probes. Two repeats at the
 throughput preset measured WSClean at **112.0 and 125.5 evaluations/second**
 for `mgain=0.8` and `mgain=0.9`, respectively, with **34.4-34.7 MB** peak

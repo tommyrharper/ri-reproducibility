@@ -207,6 +207,12 @@ The null pair puts this rig's resolution at 1.8%; `-log-time` reads +0.9% on the
 mean and -0.4% on the median, i.e. nothing. On disk it is ~1 KB on a 400 KB
 evaluation.
 
+A current three-repeat interleaved throughput probe likewise found no usable
+runtime gain from disabling it: **109.4 evaluations/second** enabled versus
+**115.8** disabled, with one noisy low-throughput run in each arm. Logging
+remains enabled by default because its cost is below measurement noise and its
+timestamps support `./ri profile --phases` and `--over-time`.
+
 ## Reproducing it
 
 ```sh
