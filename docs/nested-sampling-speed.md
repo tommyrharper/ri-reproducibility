@@ -666,6 +666,13 @@ This refresh confirms that model inference still dominates and provides no
 result-preserving optimization target; the higher-throughput 15-rank x 2-thread
 configuration remains an explicit, capacity-aware production choice.
 
+A current-image U-Net probe measured **110.54 ms** per forward under
+`torch.no_grad()` versus **110.14 ms** under `torch.inference_mode()` (0.36%),
+and `torch.compile` could not compile because the runtime image has no working
+`g++`. No new inference change is justified: the first result is below
+end-to-end noise, while adding a compiler and compiling once per worker would
+change the image and worker lifecycle without a measured production benefit.
+
 ## What is priced but deliberately not taken
 
 | lever | worth | why not |
