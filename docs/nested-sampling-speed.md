@@ -7,6 +7,11 @@ two Torch threads, with **13.61 s/evaluation** in the image container and
 operating point; model updates remain dominant and no runtime change is
 justified.
 
+A fresh three-repeat asynchronous WSClean control measured **110.7 evaluations/second**
+(114.2, 110.7, and 108.8) at 20 ranks, with **144.5 ms/evaluation** by median,
+**129.1 ms/evaluation** in the image binary, and **34.3-34.7 MB** peak memory.
+This is consistent with host variance and does not justify a new runtime change.
+
 A fresh three-repeat asynchronous WSClean control measured **107.4
 evaluations/second** (107.4, 106.5, and 112.4) at 20 ranks, with
 **142.2-143.3 ms/evaluation** and **34.4-34.6 MB** peak worker memory. The
