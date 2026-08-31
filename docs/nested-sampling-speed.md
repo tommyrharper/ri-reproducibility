@@ -467,6 +467,10 @@ normal controls measured **109.2** and **115.5 evaluations/second**, while one
 interference, not a WSClean regression; future controls should report and
 inspect idle fraction before treating a slow run as an image optimization
 signal.
+The newest three-repeat asynchronous control measured **104.1 evaluations/second**
+(101.2, 104.1, and 110.1), with **144.3 ms/evaluation**, **128.8
+ms/evaluation** in the image binary, and **34.3-34.5 MB** peak worker memory.
+This remains host variance, not a claimed speedup or regression.
 The newest three-repeat asynchronous control measured **108.7 evaluations/second**
 (115.4, 108.2, and 108.7), with **140.3 ms/evaluation** and **34.2-34.4 MB**
 peak memory. Image binary remained dominant at **125.0 ms/evaluation**; this is
