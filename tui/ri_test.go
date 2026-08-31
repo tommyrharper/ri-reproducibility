@@ -38,6 +38,155 @@ func TestParseRunsKeepsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestRunCondensesItsObjectiveAndBoxIntoARow(t *testing.T) {
+	runs, err := parseRuns([]byte(`[{"name": "r2d2-vlaa-20260827T143426Z",
+		"started_label": "Wed 26 Aug 18:46 (2d ago)",
+		"settings": {"NS_METRIC": "total_rms_jy"},
+		"parameter_space": [
+			{"name": "log10_dynamic_range", "min": 1.0, "max": 6.0},
+			{"name": "channel_count", "min": 1, "max": 8, "kind": "integer"},
+			{"name": "start_frequency_hz", "kind": "band_start",
+			 "min": 54000000.0, "max": 50000000000.0},
+			{"name": "channel_width_hz", "min": 100000.0, "max": 2000000.0}]}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := runs[0]
+	if got := run.age(); got != "2d" {
+		t.Errorf("age = %q, wanted the bracketed tail without its ago", got)
+	}
+	if got := run.objective(); got != "total_rms_jy" {
+		t.Errorf("objective = %q", got)
+	}
+	if got := run.ranges(true); got != "ldr 1-6 cc 1-8 sfh 54M-50G cwh 100k-2M" {
+		t.Errorf("abbreviated ranges = %q", got)
+	}
+	if got := run.ranges(false); !strings.Contains(got, "log10_dynamic_range 1-6") ||
+		!strings.Contains(got, "channel_width_hz 100k-2M") {
+		t.Errorf("full ranges = %q", got)
+	}
+
+	// A run directory from before parameter-space.json, or a hand-made one.
+	bare := Run{StartedLabel: "just now"}
+	if bare.age() != "now" || bare.objective() != "-" || bare.ranges(true) != "-" {
+		t.Errorf("a run with nothing recorded reads as %+v", bare)
+	}
+	half := Run{Space: []Param{{Name: "source_offset_fraction"}}}
+	if got := half.ranges(true); got != "sof" {
+		t.Errorf("a dimension without bounds = %q", got)
+	}
+}
+
+func TestDeleteRunOnlyEverRemovesARunDirectory(t *testing.T) {
+	r := ri{root: t.TempDir()}
+	dir, err := r.claimRunDir("r2d2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := Run{Name: filepath.Base(dir), Path: dir, Status: "complete"}
+	log := filepath.Join(r.root, "results", "tui-"+run.Name+".log")
+	if err := os.WriteFile(log, []byte("launched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, blocked := range []Run{
+		{Name: run.Name, Path: run.Path, Status: "running"},
+		{Name: run.Name, Path: run.Path, Status: "starting"},
+		{Name: "results", Path: "results"},
+		{Name: "root", Path: ""},
+		{Name: "escape", Path: "results/nested-sampling/../.."},
+	} {
+		if err := r.deleteRun(blocked); err == nil {
+			t.Errorf("deleted %+v, which is not a stopped run directory", blocked)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(r.root, dir)); err != nil {
+		t.Fatalf("a refused delete removed the run anyway: %v", err)
+	}
+
+	if err := r.deleteRun(run); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, dir)); !os.IsNotExist(err) {
+		t.Errorf("run directory survived the delete: %v", err)
+	}
+	if _, err := os.Stat(log); !os.IsNotExist(err) {
+		t.Errorf("launch log outlived the run it describes: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, "results", "nested-sampling")); err != nil {
+		t.Errorf("deleting a run took its parent with it: %v", err)
+	}
+}
+
+func TestDeletingFromTheTableTakesAConfirmation(t *testing.T) {
+	r := ri{root: t.TempDir()}
+	dir, err := r.claimRunDir("wsclean")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := r.claimRunDir("r2d2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(r)
+	m.runs = []Run{
+		{Name: filepath.Base(dir), Path: dir, Status: "complete"},
+		{Name: filepath.Base(kept), Path: kept, Status: "complete"},
+	}
+	m.setRows()
+	m.table.SetCursor(1)
+
+	press := func(key string) {
+		t.Helper()
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		m = next.(model)
+	}
+
+	press("d")
+	if m.doomed != m.runs[1].Name {
+		t.Fatalf("d armed %q, not the selected run", m.doomed)
+	}
+	press("n")
+	if m.doomed != "" || len(m.runs) != 2 {
+		t.Fatalf("anything but y must keep the run: %+v", m.runs)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, kept)); err != nil {
+		t.Fatalf("declining still deleted the run: %v", err)
+	}
+
+	// A run resumed elsewhere while the prompt was up must survive the y.
+	press("d")
+	m.runs[1].Status = "running"
+	press("y")
+	if _, err := os.Stat(filepath.Join(r.root, kept)); err != nil {
+		t.Fatalf("a run that went live under the prompt was deleted: %v", err)
+	}
+	m.runs[1].Status = "complete"
+
+	// And d refuses a live run outright rather than asking first.
+	m.runs[1].Status = "running"
+	press("d")
+	if m.doomed != "" || m.err == "" {
+		t.Errorf("d offered to delete a running run (doomed %q, err %q)", m.doomed, m.err)
+	}
+	m.runs[1].Status = "complete"
+
+	press("d")
+	press("y")
+	if len(m.runs) != 1 || m.runs[0].Path != dir {
+		t.Fatalf("confirmed delete left %+v", m.runs)
+	}
+	if _, err := os.Stat(filepath.Join(r.root, kept)); !os.IsNotExist(err) {
+		t.Errorf("confirmed delete did not remove the directory: %v", err)
+	}
+	if m.table.Cursor() != 0 {
+		t.Errorf("cursor left past the end of a shorter table: %d", m.table.Cursor())
+	}
+	if !strings.Contains(m.runsView(), "deleted "+filepath.Base(kept)) {
+		t.Error("the table said nothing about the delete")
+	}
+}
+
 func TestSearchArgsOmitsEmptyFields(t *testing.T) {
 	fields := []field{
 		{flag: "nlive", input: textinput.New()},

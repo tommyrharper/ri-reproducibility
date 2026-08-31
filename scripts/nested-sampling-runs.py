@@ -39,6 +39,15 @@ def read_run_env(run_dir: Path) -> dict[str, str]:
             for name, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line)}
 
 
+def read_parameter_space(run_dir: Path) -> list[dict[str, object]]:
+    """The box the run actually searched, written by polychord_*.py at startup."""
+    try:
+        space = json.loads((run_dir / "parameter-space.json").read_text())
+    except (OSError, ValueError):  # absent, or caught mid-write
+        return []
+    return space if isinstance(space, list) else []
+
+
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 
 
@@ -117,6 +126,7 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
         "status": status,
         "evaluations": evaluations,
         "settings": run_env,
+        "parameter_space": read_parameter_space(run_dir),
     }
 
 
@@ -208,6 +218,9 @@ def self_check() -> None:
             (stopped / "run.env").write_text(
                 "NS_ALGORITHM=wsclean\nNS_MPI_PROCS=7\nNS_METRIC='total_rms_jy - snr'\n"
             )
+            (stopped / "parameter-space.json").write_text(
+                '[{"name": "channel_count", "min": 1, "max": 8, "kind": "integer"}]'
+            )
 
             runs = {r["name"]: r for r in find_runs(running=set())}
             assert runs[done.name]["status"] == "complete", runs[done.name]
@@ -216,6 +229,8 @@ def self_check() -> None:
             assert runs[stopped.name]["algorithm"] == "wsclean"
             assert runs[stopped.name]["settings"]["NS_METRIC"] == "total_rms_jy - snr"
             assert runs[stopped.name]["settings"]["NS_MPI_PROCS"] == "7"
+            assert runs[stopped.name]["parameter_space"] == [
+                {"name": "channel_count", "min": 1, "max": 8, "kind": "integer"}]
 
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
             bare.mkdir()
@@ -225,6 +240,11 @@ def self_check() -> None:
             bare_run = {r["name"]: r for r in find_runs(running=set())}[bare.name]
             assert bare_run["status"] == "incomplete", bare_run
             assert bare_run["evaluations"] == 0, bare_run
+            assert bare_run["parameter_space"] == [], bare_run
+            (bare / "parameter-space.json").write_text('[{"name": "torn"')
+            assert {r["name"]: r for r in find_runs(running=set())
+                    }[bare.name]["parameter_space"] == [], "a torn file must not break listing"
+            (bare / "parameter-space.json").unlink()
 
             order = [r["name"] for r in find_runs(running=set())]
             assert order == [bare.name, stopped.name, done.name], order

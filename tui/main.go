@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -90,6 +91,9 @@ type model struct {
 	launches []launch
 	focused  int
 
+	// The run d is waiting on a y for; empty means nothing to confirm.
+	doomed string
+
 	notice string
 	err    string
 	width  int
@@ -104,12 +108,15 @@ type launch struct {
 }
 
 func newModel(r ri) model {
+	// No imager column: it is the run name's first word. No start time either:
+	// the name carries the timestamp, so only the age is worth the width.
 	columns := []table.Column{
 		{Title: "run", Width: 40},
-		{Title: "imager", Width: 7},
 		{Title: "status", Width: 10},
-		{Title: "evals", Width: 7},
-		{Title: "started", Width: 25},
+		{Title: "evals", Width: 6},
+		{Title: "age", Width: 5},
+		{Title: "objective", Width: 16},
+		{Title: "param ranges", Width: 34},
 	}
 	t := table.New(table.WithColumns(columns), table.WithFocused(true))
 	style := table.DefaultStyles()
@@ -209,6 +216,15 @@ func (m model) selected() (Run, bool) {
 	return Run{}, false
 }
 
+func (m model) find(name string) (Run, bool) {
+	for _, run := range m.visible() {
+		if run.Name == name {
+			return run, true
+		}
+	}
+	return Run{}, false
+}
+
 func (m model) visible() []Run {
 	listed := map[string]bool{}
 	for _, run := range m.runs {
@@ -234,6 +250,12 @@ func (m model) visible() []Run {
 	return live
 }
 
+// forget drops a deleted run so its row goes before the next ./ri runs lands.
+func (m *model) forget(name string) {
+	m.runs = slices.DeleteFunc(m.runs, func(r Run) bool { return r.Name == name })
+	m.launches = slices.DeleteFunc(m.launches, func(l launch) bool { return l.run.Name == name })
+}
+
 // launchLogFor returns the log for a run started by this session.
 func (m model) launchLogFor(name string) string {
 	for _, l := range m.launches {
@@ -248,23 +270,30 @@ func (m *model) setRows() {
 	rows := []table.Row{}
 	for _, run := range m.visible() {
 		rows = append(rows, table.Row{
-			run.Name, run.Algorithm, run.Status,
-			strconv.Itoa(run.Evaluations), run.StartedLabel,
+			run.Name, run.Status, strconv.Itoa(run.Evaluations),
+			run.age(), run.objective(), run.ranges(true),
 		})
 	}
 	m.table.SetRows(rows)
+	// A deleted run leaves the cursor past the end of a shorter table.
+	if m.table.Cursor() >= len(rows) {
+		m.table.SetCursor(max(0, len(rows)-1))
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.table.SetHeight(max(3, msg.Height-6))
+		m.table.SetHeight(max(3, msg.Height-7))
 		columns := m.table.Columns()
-		// Keep run names readable while reserving 34 columns for other fields.
-		name := min(44, max(29, msg.Width-59))
+		// status, evals and age are fixed; cell padding costs two per column.
+		free := max(30, msg.Width-(10+6+5)-2*len(columns))
+		name := min(40, max(16, free*2/5))
+		objective := min(20, max(8, free/5))
 		columns[0].Width = name
-		columns[4].Width = min(25, max(12, msg.Width-34-name))
+		columns[4].Width = objective
+		columns[5].Width = max(10, free-name-objective)
 		m.table.SetColumns(columns)
 		m.view.Width, m.view.Height = msg.Width, max(3, msg.Height-4)
 
@@ -335,6 +364,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateRuns(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if name := m.doomed; name != "" {
+		m.doomed = ""
+		if msg.String() != "y" {
+			m.notice = "kept " + name
+			return m, nil
+		}
+		// Re-read the run rather than trust the snapshot d took: the table
+		// refreshes while the prompt is up, and a resumed run must survive.
+		run, ok := m.find(name)
+		if !ok {
+			m.notice = name + " is already gone"
+			return m, loadRuns(m.ri)
+		}
+		if err := m.ri.deleteRun(run); err != nil {
+			m.err = err.Error()
+			return m, nil
+		}
+		m.forget(name)
+		m.notice, m.err = "deleted "+name, ""
+		m.setRows()
+		return m, loadRuns(m.ri)
+	}
 	switch msg.String() {
 	case "q":
 		return m, tea.Quit
@@ -351,6 +402,17 @@ func (m model) updateRuns(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cmd := m.openLog("ri bench", benchLog)
 		m.paused = true
 		return m, cmd
+	case "d":
+		run, ok := m.selected()
+		if !ok {
+			return m, nil
+		}
+		if err := run.deletable(); err != nil {
+			m.notice, m.err = "", err.Error()
+			return m, nil
+		}
+		m.doomed, m.notice, m.err = run.Name, "", ""
+		return m, nil
 	case "n":
 		// Start on imager row; no text entry, so fields start blurred.
 		m.screen, m.focused, m.notice = screenForm, 0, ""
@@ -468,6 +530,15 @@ func (m model) View() string {
 	return m.runsView()
 }
 
+// fit clips a line to the terminal so a long one cannot wrap the table off
+// screen, without leaving the separator the clip landed on dangling.
+func (m model) fit(line string) string {
+	if m.width > 0 {
+		line = lipgloss.NewStyle().MaxWidth(m.width).Render(line)
+	}
+	return strings.TrimRight(line, " ·")
+}
+
 func (m model) runsView() string {
 	title := "ri runs"
 	if m.runningOnly {
@@ -481,6 +552,19 @@ func (m model) runsView() string {
 		}
 		lines = append(lines, helpStyle.Render(empty))
 	}
+	// The selected run's objective and box in full, since the columns hold
+	// only initials and truncate: this is where ldr reads as its own name.
+	if run, ok := m.selected(); ok {
+		detail := run.objective() + "  ·  " + run.ranges(false)
+		if run.objective() == "-" && len(run.Space) == 0 {
+			detail = "objective and parameter space not recorded"
+		}
+		lines = append(lines, helpStyle.Render(m.fit(detail)))
+	}
+	if m.doomed != "" {
+		lines = append(lines, errStyle.Render(
+			"delete "+m.doomed+" and every evaluation under it? y/n"))
+	}
 	if m.notice != "" {
 		lines = append(lines, noticeStyle.Render(m.notice))
 	}
@@ -488,7 +572,7 @@ func (m model) runsView() string {
 		lines = append(lines, errStyle.Render(m.err))
 	}
 	lines = append(lines, helpStyle.Render(
-		"enter watch  ·  n new run  ·  b benchmarks  ·  a running only  ·  r refresh  ·  q quit"))
+		"enter watch  ·  n new  ·  d delete  ·  b bench  ·  a running only  ·  r refresh  ·  q quit"))
 	return strings.Join(lines, "\n")
 }
 
