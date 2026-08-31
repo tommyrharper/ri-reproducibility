@@ -151,8 +151,8 @@ def evaluate(
         "-data-column",
         "DATA",
         # Timestamps make wsclean.stdout.log usable by `./ri profile --phases`.
-        "-log-time",
-        str(ms_path),
+        *(["-log-time", str(ms_path)]
+          if os.environ.get("NS_WSCLEAN_LOG_TIME", "1") != "0" else []),
     ]
     # zygote wait4() supplies exact child wall time and peak RSS.
     run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)

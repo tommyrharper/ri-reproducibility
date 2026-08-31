@@ -336,6 +336,7 @@ rates are historical and roughly half the current rate.
 | Row-block copy metadata cached | `patches/0005` follow-up | 72.95 evals/s median in three default controls; no isolated end-to-end gain yet |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 | NaN-free image RMS uses a BLAS dot product | `common.py` | 25.2 to 7.8 us per RMS call (container microbenchmark) |
+| WSClean phase timestamps are opt-out for throughput probes | `polychord_wsclean.py` | 113.9 versus 107.8 eval/s median across three interleaved repeats; no speedup, profiling remains on by default |
 | Finite-image RMS and relative L2 metrics share one residual norm | `common.py` | 0.456 to 0.453 ms/evaluation metrics stage in the latest control; no defensible end-to-end speedup |
 | Sigma-res FITS files load only when the objective uses `sigma_res` | `polychord_*.py` | 1.03 to 0.46 ms metrics stage on the current WSClean benchmark; objective-preserving for other metrics |
 | Dirty FITS output is disabled when the objective does not use `sigma_res` | `polychord_wsclean.py` | 111.3 +/- 1.8 eval/s median in three patched runs versus 109.3 +/- 2.5 previously; within normal variance, with ~33.9 MB peak memory |

@@ -41,7 +41,7 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 WORKLOAD_KEYS = (
     "NS_NLIVE", "NS_NUM_REPEATS", "NS_MAX_NDEAD", "NS_METRIC", "NS_MPI_PROCS",
     "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_KEEP_MEASUREMENT_SETS",
-    "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS", "WSCLEAN_TARGET_CPU", "NS_IMAGER_IMAGE_ID",
+    "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS", "WSCLEAN_TARGET_CPU", "NS_WSCLEAN_LOG_TIME", "NS_IMAGER_IMAGE_ID",
     "NS_MEQTREES_IMAGE_ID", "NS_POLYCHORD_IMAGE_ID",
 )
 
@@ -264,13 +264,16 @@ def do_run(args: argparse.Namespace) -> int:
     interop_arms = args.interleave_interop_threads or (None,)
     if args.interleave_interop_threads:
         env["R2D2_INTEROP_THREADS"] = str(interop_arms[0])
+    log_arms = args.interleave_log_time or (None,)
+    if args.interleave_log_time:
+        env["NS_WSCLEAN_LOG_TIME"] = str(log_arms[0])
     command = ["./ri", "search", args.imager, "--no-build"]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
     # measured 8-16% faster than the ones behind it here: the package spends a
     # power budget it then has to pay back (docs/nested-sampling-power-limit.md),
     # so a cold first run is effectively a faster machine.
-    for attempt in range(args.repeat * len(arms) * len(interop_arms) * len(mpi_arms) * len(schedule_arms) + 1):
+    for attempt in range(args.repeat * len(arms) * len(interop_arms) * len(mpi_arms) * len(schedule_arms) * len(log_arms) + 1):
         if attempt and arms[0] is not None:
             env["R2D2_OMP_THREADS"] = str(arms[(attempt - 1) % len(arms)])
         if attempt and interop_arms[0] is not None:
@@ -279,6 +282,8 @@ def do_run(args: argparse.Namespace) -> int:
             env["NS_MPI_PROCS"] = str(mpi_arms[(attempt - 1) % len(mpi_arms)])
         if attempt and schedule_arms[0] is not None:
             env["NS_SYNCHRONOUS"] = str(schedule_arms[(attempt - 1) % len(schedule_arms)])
+        if attempt and log_arms[0] is not None:
+            env["NS_WSCLEAN_LOG_TIME"] = str(log_arms[(attempt - 1) % len(log_arms)])
         warm_up = {"NS_BENCH_RECORD": "0"} if attempt == 0 else {}
         process = subprocess.Popen(command, cwd=REPO_ROOT,
                                    env={**env, **warm_up},
@@ -590,6 +595,9 @@ def main() -> int:
     run.add_argument("--interleave-synchronous", type=int, nargs=2,
                      metavar=("A", "B"),
                      help="alternate synchronous scheduling values; --repeat is per arm")
+    run.add_argument("--interleave-log-time", type=int, nargs=2,
+                     metavar=("A", "B"),
+                     help="alternate WSClean phase logging (1/0); --repeat is per arm")
     run.add_argument("--allow-oversubscription", action="store_true",
                      help="allow MPI counts above CPU affinity for explicit probes")
     run.set_defaults(handler=do_run)
@@ -602,6 +610,12 @@ def main() -> int:
     if (getattr(args, "handler", None) is do_run and args.interleave_synchronous
             and any(value not in (0, 1) for value in args.interleave_synchronous)):
         parser.error("interleaved synchronous values must be 0 or 1")
+    if (getattr(args, "handler", None) is do_run and args.interleave_log_time
+            and args.imager != "wsclean"):
+        parser.error("--interleave-log-time is only valid for wsclean")
+    if (getattr(args, "handler", None) is do_run and args.interleave_log_time
+            and any(value not in (0, 1) for value in args.interleave_log_time)):
+        parser.error("interleaved log-time values must be 0 or 1")
     if getattr(args, "handler", None) is do_run and args.mpi_procs is not None and args.mpi_procs < 1:
         parser.error("--mpi-procs must be at least 1")
     if getattr(args, "handler", None) is do_run and args.omp_threads is not None and args.omp_threads < 1:

@@ -190,6 +190,8 @@ def do_bench_run(args):
               if args.interleave_mpi_procs else []),
            *( ["--interleave-synchronous", *(str(value) for value in args.interleave_synchronous)]
               if args.interleave_synchronous else []),
+           *( ["--interleave-log-time", *(str(value) for value in args.interleave_log_time)]
+              if args.interleave_log_time else []),
            *( ["--allow-oversubscription"] if args.allow_oversubscription else []),
            *( ["--timeout", str(args.timeout)] if args.timeout is not None else []))]
 
@@ -649,6 +651,9 @@ def build_parser():
     bench_run.add_argument("--interleave-synchronous", type=int, nargs=2,
                            metavar=("A", "B"),
                            help="alternate synchronous scheduling values; --repeat is per arm")
+    bench_run.add_argument("--interleave-log-time", type=int, nargs=2,
+                           metavar=("A", "B"),
+                           help="alternate WSClean phase logging (1/0); --repeat is per arm")
     bench_run.add_argument("--allow-oversubscription", action="store_true",
                            help="allow MPI counts above CPU affinity for explicit probes")
     bench_run.set_defaults(handler=do_bench_run)
