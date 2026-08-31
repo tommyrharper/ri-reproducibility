@@ -1,12 +1,16 @@
 # Making a nested-sampling search faster: the index
 
-One hundred eighty-three profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+One hundred eighty-six profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async control measured **111.3 evaluations/second** at
 20 workers, with **144.6 ms/evaluation**, **129.1 ms/evaluation** in the image
 binary, **0.453 ms/evaluation** in metrics, and **34.1-34.5 MB** peak worker
 memory. Sharing the finite-image residual norm reduced the metrics stage from
 the preceding **0.456 ms/evaluation** control, but the end-to-end result is
 within host variance and is not a claimed throughput speedup.
+The latest paired scheduling control measured **110.1 evaluations/second
+asynchronously versus 70.4 synchronously** across three pairs at 20 workers,
+with **34.1-34.5 MB** peak worker memory. Async remains the production choice;
+the result refreshes prior evidence rather than claiming a new code speedup.
 The latest three-repeat async control measured **110.1 +/- 1.1 evaluations/second**
 at 20 workers, with **139.1 +/- 0.55 ms/evaluation**, **123.8 +/- 0.5
 ms/evaluation** in the image binary, and **34.3 MB** peak worker memory. This is
