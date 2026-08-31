@@ -1,6 +1,12 @@
 # Making a nested-sampling search faster: the index
 
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
+**0.9128 evaluations/second** (0.9065, 0.9128, and 0.9132) at 15 ranks and
+two Torch threads, with **13.64 s/evaluation** in the image container and
+**3.47 GB** peak worker memory. This confirms the current 15-rank operating
+point after the automatic memory clamp; no further default change is justified.
+
+The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.8133 evaluations/second** (0.7717, 0.8133, and 0.8149) at four Torch
 threads, with **7.04 s/evaluation** and **3.47 GB** peak worker memory. This
 refreshes the current baseline; model inference remains the bottleneck and no
@@ -181,6 +187,7 @@ rates are historical and roughly half the current rate.
 | R2D2 rank/thread packing probe | `./ri bench run r2d2` | 0.9077 eval/s at 16 ranks x 2 threads versus 0.8133 at 8 x 4 (three repeats; +11.6%); ~56 GB estimated total, memory warning retained |
 | R2D2 16-rank thread probe | `./ri bench run r2d2` | 0.9092 eval/s at 16 ranks x 2 threads versus 0.7374 at 16 x 1 (three repeats; +23.3%); unchanged 3.47 GB per worker, ~56 GB estimated total |
 | R2D2 15-versus-16 rank capacity probe | `./ri bench run r2d2` | 0.9109 eval/s at both 15 and 16 ranks x 2 threads (two repeats per arm); 15 ranks saves ~3.47 GB with no measured throughput loss |
+| R2D2 15-rank control refresh | `./ri bench run r2d2 --repeat 3` | 0.9128 eval/s median (0.9065, 0.9128, 0.9132) at 15 ranks x 2 threads; 3.47 GB peak worker memory; confirms current operating point |
 | R2D2 automatic threads follow memory-clamped ranks | `run-nested-sampling-r2d2.sh` | Production-size probe clamped 20 -> 15 ranks and selected 2 threads; 178 evaluations in 175.9 s (1.01 eval/s), 3.64 GB peak worker memory |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
