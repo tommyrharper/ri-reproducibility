@@ -363,6 +363,16 @@ check(
 )
 
 check(
+    "bench run supports interleaved WSClean mgain",
+    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
+     ["scripts/build.sh", "polychord"],
+     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+      "--preset", "default", "--repeat", "3", "--interleave-mgain", "0.8", "0.9"]],
+    plan("bench", "run", "wsclean", "--repeat", "3",
+         "--interleave-mgain", "0.8", "0.9")[1],
+)
+
+check(
     "benchmark allows explicit oversubscription probes",
     [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
      ["scripts/build.sh", "polychord"],
