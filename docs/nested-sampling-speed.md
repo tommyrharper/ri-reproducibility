@@ -329,6 +329,13 @@ Torch threads, while TorchScript tracing was 1.313 s versus 1.324 s eager.
 The latter is below the observed run variance and also emits shape-dependent
 trace warnings, so the eager MKLDNN path remains the portable default.
 
+TorchScript `optimize_for_inference` is closed as well: on the R2D2 image it
+fails immediately on this U-Net's `InstanceNorm2d` path with `Currently Mkldnn
+tensor does not support view`. A plain 128x128 trace measured 31.71 ms versus
+33.12 ms eager in a short synthetic probe, but the traced graph is
+shape-dependent and the optimized graph cannot execute, so no production
+inference change is justified.
+
 Two changes bought run *size* rather than speed - see [disk footprint](nested-sampling-disk-footprint.md)
 and [run scaling](nested-sampling-run-scaling.md):
 
