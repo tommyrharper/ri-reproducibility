@@ -26,18 +26,15 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   else
     NS_MPI_PROCS="${HOST_CPUS}"
   fi
-  # Keep thread allocation based on requested, not memory-clamped, ranks.
-  NS_MPI_PROCS_UNCLAMPED="${NS_MPI_PROCS}"
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2)"
 else
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2
-  NS_MPI_PROCS_UNCLAMPED="${NS_MPI_PROCS}"
 fi
 
 if [ -z "${R2D2_OMP_THREADS:-}" ]; then
-  R2D2_OMP_THREADS="$(( (HOST_CPUS + NS_MPI_PROCS_UNCLAMPED - 1) / NS_MPI_PROCS_UNCLAMPED ))"
+  R2D2_OMP_THREADS="$(( (HOST_CPUS + NS_MPI_PROCS - 1) / NS_MPI_PROCS ))"
   if [ "${R2D2_OMP_THREADS}" -lt 1 ]; then
     R2D2_OMP_THREADS=1
   fi

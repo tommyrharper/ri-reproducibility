@@ -6,6 +6,13 @@ threads, with **7.04 s/evaluation** and **3.47 GB** peak worker memory. This
 refreshes the current baseline; model inference remains the bottleneck and no
 new runtime change is claimed.
 
+The automatic production-size R2D2 probe requested 20 ranks, was safely clamped
+to **15 ranks** by the memory budget, and selected **2 Torch threads** after the
+clamp. It completed 178 evaluations in 175.9 seconds (**1.01 eval/s**) at
+**3.64 GB** peak worker memory. The prior code would have selected one thread
+from the unclamped 20-rank request; the measured 16-rank, two-thread control was
+0.9092 eval/s, so this fixes default selection without adding memory per worker.
+
 A matched two-repeat 15-versus-16-rank probe at two Torch threads measured
 **0.9109 evaluations/second** at both 15 ranks (0.9109, 0.9109) and 16 ranks
 (0.9075, 0.9132). Per-worker memory stayed **3.47 GB**, so 15 ranks saves one
@@ -174,6 +181,7 @@ rates are historical and roughly half the current rate.
 | R2D2 rank/thread packing probe | `./ri bench run r2d2` | 0.9077 eval/s at 16 ranks x 2 threads versus 0.8133 at 8 x 4 (three repeats; +11.6%); ~56 GB estimated total, memory warning retained |
 | R2D2 16-rank thread probe | `./ri bench run r2d2` | 0.9092 eval/s at 16 ranks x 2 threads versus 0.7374 at 16 x 1 (three repeats; +23.3%); unchanged 3.47 GB per worker, ~56 GB estimated total |
 | R2D2 15-versus-16 rank capacity probe | `./ri bench run r2d2` | 0.9109 eval/s at both 15 and 16 ranks x 2 threads (two repeats per arm); 15 ranks saves ~3.47 GB with no measured throughput loss |
+| R2D2 automatic threads follow memory-clamped ranks | `run-nested-sampling-r2d2.sh` | Production-size probe clamped 20 -> 15 ranks and selected 2 threads; 178 evaluations in 175.9 s (1.01 eval/s), 3.64 GB peak worker memory |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
