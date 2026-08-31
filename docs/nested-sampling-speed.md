@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Two hundred one profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Two hundred seven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat async control measured **111.1 evaluations/second** at
 20 workers (100.9, 111.1, and 112.4), with **143.9 ms/evaluation** by median,
 **128.4 ms/evaluation** in the image binary, **2.4-7.4%** idle time, and
@@ -472,6 +472,11 @@ A fresh three-repeat explicit eleven-thread R2D2 probe measured **0.7204 eval/s*
 memory. Eleven threads is 6.2% slower than the latest four-thread control at
 0.7676 eval/s, so the thread-count sweep continues to reject further
 oversubscription.
+
+A matched two-pair R2D2 thread probe measured **0.818 eval/s at four threads**
+(0.8223 and 0.8130) versus **0.657 eval/s at two threads** (0.6576 and
+0.6560), with **3.47 GB** peak worker memory in both arms. Four threads remains
+the fastest measured setting; no runtime change is needed.
 
 Putting the warmed R2D2 U-Net into PyTorch eval mode was also tested as a
 result-preserving inference cleanup: two checkpoint-backed runs measured
