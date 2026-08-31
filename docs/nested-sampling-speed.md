@@ -7,6 +7,12 @@ two Torch threads, with **13.61 s/evaluation** in the image container and
 operating point; model updates remain dominant and no runtime change is
 justified.
 
+A matched three-repeat 15-rank thread probe measured **0.9059 evaluations/second**
+at two Torch threads (0.9058, 0.9059, and 0.9096) versus **0.8860** at three
+threads (0.8892, 0.8833, and 0.8860), with unchanged **3.47 GB** peak worker
+memory. Three threads is **2.2% slower**, so retain two threads for this
+memory-clamped production point.
+
 The latest three-repeat asynchronous WSClean control measured **109.3
 evaluations/second** (111.3, 109.3, and 107.8) at 20 ranks, with **145.0
 ms/evaluation** and **34.3-34.6 MB** peak worker memory. This refresh found no
