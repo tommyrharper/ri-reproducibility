@@ -1,6 +1,10 @@
 # Making a nested-sampling search faster: the index
 
-Two hundred twelve profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Two hundred thirteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+The latest interleaved R2D2 thread-count probe measured **0.7824 evaluations/second
+at five threads versus 0.7765 at six threads** (three repeats per arm), with
+unchanged **3.47 GB** peak worker memory. Five threads is only 0.8% faster than
+six and remains below the established four-thread control, so no default changes.
 The latest three-repeat throughput control measured **107.3 evaluations/second**
 (102.6, 107.3, and 112.9), with **143.1 ms/evaluation** by median,
 **127.6 ms/evaluation** in the image binary, **1.6-6.0%** idle time, and

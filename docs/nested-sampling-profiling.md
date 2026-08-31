@@ -1955,6 +1955,16 @@ results. `docker/meqtrees/Dockerfile` also replaces Timba's 10s shutdown sleep
 with 0.1s polling while preserving its ~200s SIGKILL ceiling; MS outputs stay
 identical.
 
+### Five R2D2 Torch threads do not beat four
+
+An interleaved `./ri bench run r2d2 --preset throughput
+--interleave-omp-threads 5 6 --repeat 3` probe, with the checkpoint archive
+mounted from the parent checkout, measured five threads at **0.7824
+evaluations/second** and six at **0.7765 evaluations/second**. Peak worker
+memory stayed **3.47 GB**. Five threads therefore beats six by only 0.8%, and
+the result remains below the existing four-thread control near 0.818 eval/s;
+four threads remains the fastest tested setting and the default is unchanged.
+
 ### R2D2 inference backend alternatives are closed
 
 The warmed 512x512 U-Net at three Torch threads measures 1.363 s with the
