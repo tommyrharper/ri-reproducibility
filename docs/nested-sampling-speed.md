@@ -1,10 +1,16 @@
 # Making a nested-sampling search faster: the index
 
-Current measured operating points: WSClean **105.0 evaluations/second** at
+Current measured operating points: WSClean **107.3 evaluations/second** at
 20 ranks and R2D2 **0.9175 evaluations/second** at 15 ranks with two Torch
 threads. The latest R2D2 change enables deterministic MKLDNN kernels, which
 made a synthetic U-Net probe about **8% faster** with bit-identical output;
 checkpoint-backed end-to-end confirmation is still pending.
+
+The latest three-repeat asynchronous WSClean control measured **107.3
+evaluations/second** (94.572, 107.257, and 114.617) at 20 ranks, with
+**148.0 ms/evaluation** by median and **34.3-34.4 MB** peak worker memory.
+This remains consistent with established host variance and is not a claimed
+runtime change; image binary remains dominant.
 
 The newest 34-evaluation R2D2 run (14 ranks, two Torch threads) profiles at
 **11,816.55 ms/evaluation** for model updates and **203.95 ms/evaluation** for
