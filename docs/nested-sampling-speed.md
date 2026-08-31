@@ -6,6 +6,12 @@ threads, with **7.04 s/evaluation** and **3.47 GB** peak worker memory. This
 refreshes the current baseline; model inference remains the bottleneck and no
 new runtime change is claimed.
 
+A matched two-repeat 15-versus-16-rank probe at two Torch threads measured
+**0.9109 evaluations/second** at both 15 ranks (0.9109, 0.9109) and 16 ranks
+(0.9075, 0.9132). Per-worker memory stayed **3.47 GB**, so 15 ranks saves one
+worker's memory, about **3.47 GB**, with no measured throughput loss. Use 15
+ranks when the 16-rank configuration exceeds the host's memory headroom.
+
 A matched three-repeat 16-rank probe measured **0.9092 evaluations/second** at
 two Torch threads versus **0.7374** at one thread: **23.3% faster** with
 unchanged **3.47 GB per-worker** peak memory. Two threads remains the measured
@@ -167,6 +173,7 @@ rates are historical and roughly half the current rate.
 | R2D2 rank-count probe at four Torch threads | `./ri bench run r2d2` | Interleaved 2-repeat probe: 0.6934 eval/s at 5 ranks versus 0.7983 at 8 ranks, both at 3.47 GB peak memory; 8 ranks retained |
 | R2D2 rank/thread packing probe | `./ri bench run r2d2` | 0.9077 eval/s at 16 ranks x 2 threads versus 0.8133 at 8 x 4 (three repeats; +11.6%); ~56 GB estimated total, memory warning retained |
 | R2D2 16-rank thread probe | `./ri bench run r2d2` | 0.9092 eval/s at 16 ranks x 2 threads versus 0.7374 at 16 x 1 (three repeats; +23.3%); unchanged 3.47 GB per worker, ~56 GB estimated total |
+| R2D2 15-versus-16 rank capacity probe | `./ri bench run r2d2` | 0.9109 eval/s at both 15 and 16 ranks x 2 threads (two repeats per arm); 15 ranks saves ~3.47 GB with no measured throughput loss |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
