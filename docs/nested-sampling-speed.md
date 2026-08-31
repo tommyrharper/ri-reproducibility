@@ -12,6 +12,12 @@ evaluations/second** (107.4, 106.5, and 112.4) at 20 ranks, with
 **142.2-143.3 ms/evaluation** and **34.4-34.6 MB** peak worker memory. The
 spread is normal for this host and does not justify a runtime change.
 
+The matching phase profile covered 650 evaluations and measured **39.87 ms**
+per evaluation in gridding and **25.00 ms** in predicting, together **54.87 ms
+(54.3%)** of logged work. Beam fitting was the largest non-imaging phase at
+**5.92 ms/evaluation**; no result-preserving shortcut is justified by this
+profile.
+
 An interleaved four-repeat 15-rank thread probe measured **0.9175 evaluations/second**
 at two Torch threads (0.9115, 0.9171, 0.9179, 0.9194) versus **0.8737** at four
 threads (0.8685, 0.8735, 0.8739, 0.8774), with unchanged **3.47 GB** peak
