@@ -13,11 +13,11 @@ two Torch threads, with **13.62 s/evaluation** in the image container and
 memory-safe operating point; model updates remain dominant and no runtime
 change is justified.
 
-A matched two-repeat 14-versus-15-rank probe at two Torch threads measured
-**0.9062 evaluations/second** at 14 ranks (0.9078, 0.9045) versus **0.9020**
-at 15 ranks (0.9105, 0.8934). Per-worker memory was **3.47 GB** in both arms;
-the two-repeat sample is too small and too close to justify changing the
-15-rank operating point, so this remains a follow-up candidate.
+A matched three-repeat 14-versus-15-rank probe at two Torch threads measured
+**0.9040 evaluations/second** at 14 ranks (0.9040, 0.9034, 0.9076) versus
+**0.9117** at 15 ranks (0.9196, 0.9036, 0.9117), a small **0.9%** advantage
+for 15 ranks. Per-worker memory was **3.47 GB** in both arms; 15 ranks
+remains the measured operating point, with no code change justified.
 
 The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
 **0.9098 evaluations/second** (0.9058, 0.9151, and 0.9094) at 15 ranks and
