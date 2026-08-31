@@ -161,14 +161,22 @@ enabled = false
 # band the start frequency landed in. Equal share per band rather than
 # uniform across the union of them, otherwise the 32 MHz-wide 4-band would be
 # drawn about once in every 1500 evaluations and never actually searched.
+#
+# Each band also takes `enabled` (default true), the same toggle
+# `[[parameter_space]]` has. `enabled = false` drops the band from the search
+# without deleting it, so the frequency range is the union of the enabled
+# bands only. Changing which bands are enabled changes the prior on
+# `start_frequency_hz`, so it invalidates existing chains.
 
 [[receiver_band]]
 name = "4"
+enabled = false
 min = 54.0e6
 max = 86.0e6
 
 [[receiver_band]]
 name = "P"
+enabled = false
 min = 224.0e6
 max = 480.0e6
 

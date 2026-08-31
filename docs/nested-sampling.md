@@ -337,11 +337,18 @@ The committed list is the VLA's:
 
 | Band | Range | Band | Range |
 |---|---:|---|---:|
-| 4 | 54-86 MHz | X | 8-12 GHz |
-| P | 224-480 MHz | Ku | 12-18 GHz |
+| 4 | 54-86 MHz (off) | X | 8-12 GHz |
+| P | 224-480 MHz (off) | Ku | 12-18 GHz |
 | L | 1-2 GHz | K | 18-26.5 GHz |
 | S | 2-4 GHz | Ka | 26.5-40 GHz |
 | C | 4-8 GHz | Q | 40-50 GHz |
+
+A band takes `enabled` (default true), the same toggle `[[parameter_space]]`
+has: `enabled = false` drops it from the search without deleting it, and the
+searched frequency range is the union of the enabled bands only. Bands 4 and
+P ship disabled. Changing which bands are enabled changes the prior on
+`start_frequency_hz`, so - like toggling a dimension - it invalidates existing
+chains.
 
 Nothing in the code is VLA-specific: another telescope is a matter of
 replacing the list (any number of bands, in any order, gaps allowed).
