@@ -134,11 +134,17 @@ _STAMP = re.compile(
 
 def _phase_label(text: str) -> str:
     text = re.sub(r"/\S+", "<path>", text)
+    # WSClean changes beam units between PSF fitting and restoration; they are
+    # one operation for profiling, not two bottlenecks.
+    text = re.sub(r"^Fitting beam\.\.\..*", "Fitting beam...", text)
     return re.sub(r"[-+]?\d[\d.eE+-]*", "N", text)[:64]
 
 
-def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[float]]]:
+def phase_gaps(
+    log_paths: Any,
+) -> tuple[int, float, dict[tuple[str, str], list[float]], dict[tuple[str, str], list[float]]]:
     gaps: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
+    per_eval: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     logged: list[float] = []
     for path in log_paths:
         rows = []
@@ -153,16 +159,22 @@ def phase_gaps(log_paths: Any) -> tuple[int, float, dict[tuple[str, str], list[f
         if len(rows) < 2:
             continue
         logged.append((rows[-1][0] - rows[0][0]) * 1000.0)
+        totals: dict[tuple[str, str], float] = collections.defaultdict(float)
         for (start, text), (end, following) in zip(rows, rows[1:]):
-            gaps[(_phase_label(text), _phase_label(following))].append((end - start) * 1000.0)
-    return len(logged), (statistics.mean(logged) if logged else 0.0), gaps
+            phase = (_phase_label(text), _phase_label(following))
+            milliseconds = (end - start) * 1000.0
+            gaps[phase].append(milliseconds)
+            totals[phase] += milliseconds
+        for phase, milliseconds in totals.items():
+            per_eval[phase].append(milliseconds)
+    return len(logged), (statistics.median(logged) if logged else 0.0), gaps, per_eval
 
 
 def print_phases(run_dir: Path, top: int) -> None:
     logs = sorted(run_dir.glob("evaluations/*/wsclean.stdout.log"))
     if not logs:
         raise SystemExit(f"no evaluations/*/wsclean.stdout.log under {run_dir}")
-    count, logged_ms, gaps = phase_gaps(logs)
+    count, logged_ms, gaps, per_eval = phase_gaps(logs)
     if not count:
         raise SystemExit(
             f"{len(logs)} wsclean logs under {run_dir} carry no timestamps - the "
@@ -171,12 +183,57 @@ def print_phases(run_dir: Path, top: int) -> None:
         )
     print(f"{count} wsclean logs, {logged_ms:.1f} ms of logged work per evaluation")
     print()
-    print(f"{'ms/eval':>8} {'share':>7} {'n/eval':>7} {'ms each':>8}  phase (log line -> next log line)")
+    print(f"{'ms/eval':>8} {'p90/eval':>8} {'share':>7} {'n/eval':>7} {'ms each':>8}  phase (log line -> next log line)")
     print("-" * 110)
     for (before, after), values in sorted(gaps.items(), key=lambda kv: -sum(kv[1]))[:top]:
-        total = sum(values) / count
-        print(f"{total:8.2f} {total / logged_ms:6.1%} {len(values) / count:7.2f} "
-              f"{statistics.mean(values):8.3f}  {before[:52]} -> {after[:40]}")
+        typical = statistics.median(values)
+        total = len(values) / count * typical
+        ordered = sorted(per_eval[(before, after)])
+        p90 = ordered[min(len(ordered) - 1, (9 * len(ordered) - 1) // 10)]
+        print(f"{total:8.2f} {p90:8.2f} {total / logged_ms:6.1%} "
+              f"{len(values) / count:7.2f} {typical:8.3f}  {before[:52]} -> {after[:40]}")
+
+
+_R2D2_PHASE = re.compile(r"Time for (model update|residual computation): ([0-9.]+) sec")
+
+
+def r2d2_phase_totals(
+    log_paths: Any,
+) -> tuple[int, dict[str, list[float]], dict[str, int], dict[str, int]]:
+    totals: dict[str, list[float]] = collections.defaultdict(list)
+    counts: dict[str, int] = collections.defaultdict(int)
+    phase_evals: dict[str, int] = collections.defaultdict(int)
+    for path in log_paths:
+        per_eval: dict[str, float] = collections.defaultdict(float)
+        per_count: dict[str, int] = collections.defaultdict(int)
+        for line in path.read_text(errors="replace").splitlines():
+            match = _R2D2_PHASE.search(line)
+            if match:
+                phase, seconds = match.groups()
+                per_eval[phase] += float(seconds)
+                per_count[phase] += 1
+        for phase, seconds in per_eval.items():
+            totals[phase].append(seconds * 1000.0)
+            counts[phase] += per_count[phase]
+            phase_evals[phase] += 1
+    return len({path for path in log_paths if path.is_file()}), totals, counts, phase_evals
+
+
+def print_r2d2_phases(run_dir: Path) -> None:
+    logs = sorted(run_dir.glob("evaluations/*/r2d2.stdout.log"))
+    count, totals, calls, phase_evals = r2d2_phase_totals(logs)
+    if not logs or not totals:
+        raise SystemExit(f"no R2D2 phase timings under {run_dir}")
+    print(f"{count} R2D2 logs")
+    print()
+    print(f"{'phase':<28}{'ms/eval':>10}{'p90/eval':>10}{'calls/eval':>12}{'ms/call':>10}")
+    print("-" * 60)
+    for phase in sorted(totals, key=lambda name: -statistics.median(totals[name])):
+        per_eval = statistics.median(totals[phase])
+        ordered = sorted(totals[phase])
+        p90 = ordered[min(len(ordered) - 1, (9 * len(ordered) - 1) // 10)]
+        per_call = calls[phase] / phase_evals[phase]
+        print(f"{phase:<28}{per_eval:10.2f}{p90:10.2f}{per_call:12.2f}{per_eval / per_call:10.2f}")
 
 
 _VIS_COUNT = re.compile(r"^Gridded visibility count: (\d+)")
@@ -248,11 +305,51 @@ def self_check() -> None:
             "not a timestamped line\n"
             "2026-Aug-29 10:19:02.107500 Opening reordered part 0 for /a/b/sim.ms\n"
         )
-        count, logged, gaps = phase_gaps([log])
+        count, logged, gaps, per_eval = phase_gaps([log])
     assert count == 1, count
     assert abs(logged - 7.5) < 1e-3, logged
     assert abs(gaps[("Gridding N rows...", "Gridded visibility count: N")][0] - 5.5) < 1e-3, gaps
     assert ("Gridded visibility count: N", "Opening reordered part N for <path>") in gaps, gaps
+    assert abs(per_eval[("Gridding N rows...", "Gridded visibility count: N")][0] - 5.5) < 1e-3
+
+    with tempfile.TemporaryDirectory() as raw:
+        log = Path(raw) / "wsclean.stdout.log"
+        log.write_text(
+            "2026-Aug-29 10:19:02.100000 A 1\n"
+            "2026-Aug-29 10:19:02.101000 B 1\n"
+            "2026-Aug-29 10:19:02.111000 A 2\n"
+            "2026-Aug-29 10:19:02.121000 B 2\n"
+        )
+        _, _, _, per_eval = phase_gaps([log])
+    assert abs(per_eval[("A N", "B N")][0] - 11.0) < 1e-3
+
+    assert _phase_label("Fitting beam... major=1 masec, minor=2 masec") == "Fitting beam..."
+
+    assert statistics.median([1.0, 1.0, 100.0]) == 1.0
+
+    with tempfile.TemporaryDirectory() as raw:
+        log = Path(raw) / "r2d2.stdout.log"
+        log.write_text(
+            "Time for model update: 0.20 sec\n"
+            "Time for residual computation: 0.01 sec\n"
+            "Time for model update: 0.30 sec\n"
+        )
+        count, totals, calls, phase_evals = r2d2_phase_totals([log])
+    assert count == 1 and totals["model update"] == [500.0], (count, totals)
+    assert calls["model update"] == 2 and phase_evals["model update"] == 1
+    assert totals["residual computation"] == [10.0]
+
+    with tempfile.TemporaryDirectory() as raw:
+        complete = Path(raw) / "complete-r2d2.stdout.log"
+        complete.write_text(
+            "Time for model update: 0.20 sec\n"
+            "Time for residual computation: 0.01 sec\n"
+            "Time for model update: 0.30 sec\n"
+        )
+        missing = Path(raw) / "r2d2.stdout.log"
+        missing.write_text("Time for residual computation: 0.02 sec\n")
+        count, totals, calls, phase_evals = r2d2_phase_totals([complete, missing])
+    assert count == 2 and phase_evals["model update"] == 1
 
     with tempfile.TemporaryDirectory() as raw:
         log = Path(raw) / "wsclean.stdout.log"
@@ -284,6 +381,7 @@ def main() -> None:
     parser.add_argument("run", nargs="?", help="Run directory, run name, or summary.json path")
     parser.add_argument("--json", action="store_true", help="Print the raw profiling dict as JSON instead of a table")
     parser.add_argument("--phases", action="store_true", help="Break down WSClean phases from -log-time")
+    parser.add_argument("--r2d2-phases", action="store_true", help="Break down R2D2 model and residual timings")
     parser.add_argument("--over-time", action="store_true", help="Evaluations/second and visibility count over time")
     parser.add_argument("--top", type=int, default=25, help="Phases to print, largest first")
     parser.add_argument("--buckets", type=int, default=20, help="Buckets for --over-time")
@@ -295,11 +393,13 @@ def main() -> None:
         return
     if not args.run:
         parser.error("the following arguments are required: run")
-    if args.phases or args.over_time:
+    if args.phases or args.r2d2_phases or args.over_time:
         run_dir = resolve_run(args.run)
         run_dir = run_dir.parent if run_dir.is_file() else run_dir
         if args.phases:
             print_phases(run_dir, args.top)
+        if args.r2d2_phases:
+            print_r2d2_phases(run_dir)
         if args.over_time:
             print_over_time(run_dir, args.buckets)
         return
