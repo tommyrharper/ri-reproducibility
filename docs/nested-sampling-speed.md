@@ -7,6 +7,12 @@ validation; three throughput runs measured **0.9189, 0.9030, and 0.9101
 evaluations/second**, with **3.47 GB** peak worker memory. This confirms no
 memory regression, but this control alone does not establish a causal gain.
 
+The latest three-repeat asynchronous WSClean control measured **108.2
+evaluations/second** by median (93.6, 108.2, and 109.4) at 20 ranks, with
+**140.6 ms/evaluation** and **34.3-34.6 MB** peak worker memory. The image
+binary remained dominant at **125.0-126.4 ms/evaluation**; this is a control
+refresh within host variance, not a claimed speedup.
+
 The latest three-repeat asynchronous WSClean control measured **107.3
 evaluations/second** (94.572, 107.257, and 114.617) at 20 ranks, with
 **148.0 ms/evaluation** by median and **34.3-34.4 MB** peak worker memory.
