@@ -25,6 +25,12 @@ and 0.9194), with **3.47 GB** peak worker memory. Four Torch threads measured
 **0.8737 evaluations/second** in the same probe, so two threads remains the
 fastest memory-safe operating point; model updates remain dominant.
 
+A matched two-repeat inter-op-thread probe measured **0.9153 evaluations/second**
+with one inter-op thread (0.9134, 0.9176) versus **0.8987 evaluations/second**
+with two (0.8987, 0.8987), at 15 ranks and two Torch threads. The apparent 1.8%
+advantage for one is within the short-run spread and does not justify changing
+the existing default; peak worker memory stayed **3.47 GB**.
+
 A CPU `torch.profiler` pass over the 128x128 U-Net with two Torch threads
 attributes **72.0%** of self time to oneDNN convolutions, **8.0%** to batch
 normalization (the implementation behind InstanceNorm2d), and **2.4%** to
@@ -303,6 +309,7 @@ rates are historical and roughly half the current rate.
 | R2D2 one-thread control at 15 ranks | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 1 --repeat 2` | 0.749 eval/s over 36 evaluations versus ~0.91 at two threads; ~18% slower with 3.47 GB per-worker memory |
 | R2D2 15-rank control refresh | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --repeat 3` | 0.9040 eval/s median (0.9039-0.9060), 13.61 s/evaluation image container, 3.47 GB peak worker memory; no change justified |
 | R2D2 15-rank four-thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --interleave-omp-threads 2 4 --repeat 2` | 0.9183 eval/s at two threads versus 0.8737 at four; 4.9% slower with four and unchanged 3.47 GB peak worker memory |
+| R2D2 inter-op thread probe | `./ri bench run r2d2 --preset throughput --mpi-procs 15 --omp-threads 2 --interleave-interop-threads 1 2 --repeat 2` | 0.9153 eval/s at one inter-op thread versus 0.8987 at two; short-run spread does not justify a default change, with unchanged 3.47 GB peak worker memory |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
