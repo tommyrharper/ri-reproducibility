@@ -132,5 +132,36 @@ reached. Both settings are "100 CLEAN iterations", spent differently. If a
 future change wants the deconvolution to actually converge, that is a `-niter`
 decision and it costs throughput rather than buying it.
 
+## That `-niter` change has now shipped
+
+`NS_WSCLEAN_NITER` defaults to 1000. The prediction above was right about the
+diagnosis and wrong about the price: it costs almost nothing.
+
+Measured over one interleaved pair on this host, same seed, `--nlive 8
+--num-repeats 2 --max-ndead 40 --mpi-procs 4`:
+
+| `-niter` | Evaluations | Wall | Evaluations/s | Stopped on the cap | Median iterations |
+| --- | --- | --- | --- | --- | --- |
+| 100 | 291 | 6.8 s | 42.9 | 69.1% | 100 |
+| 1000 | 300 | 7.1 s | 42.2 | **0%** | 122 |
+
+**1.6% fewer evaluations per second, and nothing is truncated any more.** The
+cap was never expensive to lift because deconvolution is a small part of an
+evaluation and the median evaluation only wants ~122 iterations - it was
+sitting just above 100, which is exactly where a binding cap does most damage
+for least benefit. Runs across the wider archived parameter space wanted a
+median of 177.
+
+This is one pair on one host, not the interleaved triple the `-mgain`
+measurement above used; treat 1.6% as "small", not as a precise figure.
+
+Why it matters beyond throughput: at `-niter 100`, 77-84% of evaluations across
+five archived runs scored the residual after 100 components rather than what
+CLEAN converges to, and the worst 200 evaluations of a run were 90% capped
+against an 80% base rate - so the cap was shaping the failure map, not just the
+cost. Each record now carries `clean_stop_reason`, `clean_iterations` and
+`clean_major_iterations`, so this is answerable from `summary.json` instead of
+from logs that no longer exist.
+
 Current flag-based measurement procedure lives in the
 [evaluation-floor guide](nested-sampling-evaluation-floor.md#-mgain-measured-again-as-a-flag).

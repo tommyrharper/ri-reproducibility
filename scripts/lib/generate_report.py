@@ -1113,7 +1113,7 @@ def render_parameter_space_section(parameter_space):
 
 
 # Most evaluations have no image to show: a finished run keeps them only for
-# its best and worst and a sample between (see prune_run_images()), so the
+# its best and worst and a sample between (see prune_run_artefacts()), so the
 # placeholder says so rather than leaving a bare dash to puzzle over.
 NO_IMAGE = '<span class="empty" title="no image retained for this evaluation">—</span>'
 

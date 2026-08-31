@@ -49,6 +49,12 @@ check(
 )
 
 check(
+    "search --niter reaches the run script",
+    {"NS_WSCLEAN_NITER": "100"},
+    plan("search", "wsclean", "--niter", "100")[0],
+)
+
+check(
     "search --retries 0 reaches the run script",
     {"NS_RETRIES": "0"},
     plan("search", "wsclean", "--retries", "0")[0],

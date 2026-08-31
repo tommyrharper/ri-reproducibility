@@ -61,7 +61,7 @@ everything.
 
 This is necessarily a whole-run decision. When an evaluation is scored, whether
 it belongs in the worst 20 depends on evaluations that have not run yet, so
-`prune_run_images()` cannot hook the per-evaluation path and instead runs once,
+`prune_run_artefacts()` cannot hook the per-evaluation path and instead runs once,
 from each algorithm's summary writer, just before `summary.json` is written. It
 mutates the records the summary embeds, so a summary never names a file it
 deleted and the report falls back to its placeholder. A consequence worth
@@ -73,7 +73,15 @@ the number across parameter vectors, so one run holds several `eval-0083-*`
 directories and ranking on the number alone would spare or delete whole groups
 together.
 
-`scripts/prune-run-images.py` applies the same policy to runs that finished
+The imager's stdout goes the same way, and for the same reason: `./ri profile
+--phases` reads per-phase timings out of it, and a few hundred evaluations a run
+is plenty for the medians it reports. WSClean's stdout was 9.3 GB across 828,825
+files. The part of it worth outliving the log - why CLEAN stopped and how far it
+got - is read into each record at scoring time by `clean_convergence()`, so
+`clean_stop_reason`, `clean_iterations` and `clean_major_iterations` survive in
+`summary.json` after the log is gone. `PRUNED_EVALUATION_LOGS` owns the list.
+
+`scripts/prune-run-artefacts.py` applies the same policy to runs that finished
 before it existed, from the records `summary.json` already embeds. It only
 touches finished runs: a run without a `summary.json` is incomplete or
 resumable, and `./ri resume` rebuilds its cache by walking `evaluations/`.

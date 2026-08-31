@@ -5,6 +5,7 @@ import atexit
 import json
 import math
 import os
+import re
 import select
 import shlex
 import subprocess
@@ -106,7 +107,11 @@ def abort_run(message: str) -> None:
     os._exit(1)
 
 
-DEFAULT_WSCLEAN_NITER = 100
+# CLEAN's minor-iteration budget. At the old 100 roughly four evaluations in
+# five stopped on `maximum number of iterations` rather than on the threshold,
+# so the objective was scoring the residual after 100 components rather than
+# what CLEAN converges to; `clean_stop_reason` in each record now says which.
+DEFAULT_WSCLEAN_NITER = int(os.environ.get("NS_WSCLEAN_NITER") or 1000)
 DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 
 # Keep archived runs reproducible; override with `--mgain` when throughput matters.
@@ -1293,7 +1298,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 # the retention policy may later keep; see docs/nested-sampling-disk-footprint.md.
 # Set NS_KEEP_MEASUREMENT_SETS=1 to retain intermediate artefacts for replay
 # benchmarks. The dirty and residual images are NOT here: which evaluations keep
-# them is a whole-run decision, taken by prune_run_images() once every
+# them is a whole-run decision, taken by prune_run_artefacts() once every
 # evaluation has been scored and can be ranked.
 PRUNED_ARTEFACTS = (
     ("sim.ms", "measurement_set"),
@@ -1354,6 +1359,53 @@ IMAGE_KEEP_STRIDE = int(os.environ.get("NS_IMAGE_KEEP_STRIDE", "100"))
 RETAINED_IMAGE_KEYS = ("image", "dirty", "residual")
 
 
+# WSClean prints why CLEAN stopped and how far it got, and nothing else records
+# it: an evaluation that exhausted `-niter` scored where CLEAN had got to, not
+# what it converges to, which is a different thing for a failure-mode search to
+# have found. Read out of the log while it is still beside the evaluation, so
+# the log itself does not have to be kept.
+_CLEAN_STOPPED = re.compile(r"Stopped on peak [^,]+, because ([^\n]+)")
+_CLEAN_ITERATIONS = re.compile(r"Performed (\d+) iterations in total")
+_CLEAN_MAJOR = re.compile(r"(\d+) major iterations were performed")
+
+
+def clean_convergence(log_text: str) -> dict[str, Any]:
+    """WSClean's stopping condition and iteration counts, from its stdout.
+
+    The last `Stopped on peak` line is the terminal one; the earlier ones are
+    per-major-cycle minor-loop exits. `Performed N iterations in total` is
+    cumulative, so the last is the run's total.
+    """
+    out: dict[str, Any] = {}
+    reasons = _CLEAN_STOPPED.findall(log_text)
+    if reasons:
+        last = reasons[-1].strip()
+        if "maximum number" in last:
+            out["clean_stop_reason"] = "max-iterations"
+        elif "minor-loop threshold" in last:
+            out["clean_stop_reason"] = "minor-loop-threshold"
+        elif "threshold" in last:
+            out["clean_stop_reason"] = "threshold"
+        else:
+            out["clean_stop_reason"] = last.rstrip(".")
+    iterations = _CLEAN_ITERATIONS.findall(log_text)
+    if iterations:
+        out["clean_iterations"] = int(iterations[-1])
+    major = _CLEAN_MAJOR.search(log_text)
+    if major:
+        out["clean_major_iterations"] = int(major.group(1))
+    return out
+
+
+def clean_convergence_from(log_path: Path) -> dict[str, Any]:
+    """clean_convergence() for a log that may not be readable."""
+    try:
+        return clean_convergence(log_path.read_text(errors="replace"))
+    except OSError:
+        return {}
+
+
+
 def evaluation_key(record: dict[str, Any]) -> str:
     """Identify one evaluation.
 
@@ -1410,12 +1462,33 @@ def _recorded_image_path(evaluations_dir: Path, recorded: str) -> Path | None:
     return None
 
 
-def prune_run_images(evaluations_dir: Path, records: list[dict[str, Any]]) -> int:
-    """Delete the images of evaluations the retention policy does not keep.
+# Logs a scored evaluation keeps only for as long as its images: `./ri profile
+# --phases` reads per-phase timings out of the imager's stdout, and the few
+# hundred evaluations a run retains are plenty for the medians it reports.
+# WSClean's stdout was 9.3 GB across 828,825 files before this, and the part of
+# it worth outliving the log - why CLEAN stopped, how far it got - is read into
+# the record by clean_convergence() at scoring time. A failed evaluation keeps
+# every log, as it keeps every other artefact.
+PRUNED_EVALUATION_LOGS = (
+    "wsclean.stdout.log",
+    "wsclean.stderr.log",
+    "r2d2.stdout.log",
+    "r2d2.stderr.log",
+    "simulate.stdout.log",
+    "simulate.stderr.log",
+    "convert.stdout.log",
+    "convert.stderr.log",
+    "makems.log",
+    "meqtree-pipeliner.log",
+)
+
+
+def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) -> int:
+    """Delete images and logs of evaluations the retention policy does not keep.
 
     Mutates `records` so a summary never names a file this just deleted, which
     is what lets the report fall back to its placeholder. Set
-    NS_KEEP_ALL_IMAGES=1 to keep every image.
+    NS_KEEP_ALL_IMAGES=1 to keep everything.
     """
     if os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0":
         return 0
@@ -1438,6 +1511,17 @@ def prune_run_images(evaluations_dir: Path, records: list[dict[str, Any]]) -> in
             target.unlink(missing_ok=True)
             paths.pop(key, None)
             removed += 1
+        if retained or "error" in record:
+            continue
+        eval_dir = Path(paths.get("eval_dir") or "")
+        local = evaluations_dir / eval_dir.name if eval_dir.name else None
+        if local is None or not local.is_dir():
+            continue
+        for name in PRUNED_EVALUATION_LOGS:
+            log = local / name
+            if log.is_file():
+                log.unlink()
+                removed += 1
     return removed
 
 
@@ -1471,7 +1555,7 @@ def self_check_evaluation_pruning() -> None:
         assert not (scored / "r2d2_data.mat").exists()
         # The evidence a failure-mode search exists to produce is never pruned.
         # These three survive scoring because which evaluations keep them is a
-        # whole-run decision, taken later by prune_run_images().
+        # whole-run decision, taken later by prune_run_artefacts().
         for image in ("image", "dirty", "residual"):
             assert (scored / "wsclean" / f"recon-{image}.fits").exists(), image
         # The two nothing ever reads go straight away.
@@ -1587,15 +1671,26 @@ def self_check_image_retention() -> None:
                               ("residual", "recon-residual.fits")):
                 (eval_dir / "wsclean" / name).write_text(name)
                 paths[key] = str(eval_dir / "wsclean" / name)
+            for name in PRUNED_EVALUATION_LOGS:
+                (eval_dir / name).write_text(name)
             made.append({"eval_id": i, "objective": i / 60, "paths": paths})
+        # A failure keeps every artefact whatever its rank.
+        failed_dir = evaluations / "eval-0099-x"
+        (failed_dir / "wsclean").mkdir(parents=True)
+        for name in PRUNED_EVALUATION_LOGS:
+            (failed_dir / name).write_text(name)
+        made.append({"eval_id": 99, "objective": FAILURE_OBJECTIVE, "error": "wsclean failed",
+                     "paths": {"eval_dir": str(failed_dir)}})
 
-        removed = prune_run_images(evaluations, made)
+        removed = prune_run_artefacts(evaluations, made)
         keep = evaluations_keeping_images(made, ends=20, stride=100)
-        # 60 evaluations, ends of 20: 40 at the ends plus every 100th of the 20
-        # between, which is just the first of them.
-        assert len(keep) == 41, len(keep)
-        assert removed == 3 * (60 - 41), removed
-        for rec in made:
+        # 60 scored evaluations, ends of 20: 40 at the ends plus every 100th of
+        # the 20 between, which is just the first of them - and the failure,
+        # which is kept whatever its rank.
+        assert len(keep) == 42, len(keep)
+        dropped = 60 - 41
+        assert removed == dropped * (3 + len(PRUNED_EVALUATION_LOGS)), removed
+        for rec in made[:60]:
             kept = evaluation_key(rec) in keep
             for key in RETAINED_IMAGE_KEYS:
                 exists = Path(rec["paths"][key]).is_file() if key in rec["paths"] else False
@@ -1603,7 +1698,41 @@ def self_check_image_retention() -> None:
                 # A summary must never name a file this deleted.
                 assert (key in rec["paths"]) == kept, (rec["eval_id"], key)
 
+        # Logs go with the images, and a failure keeps all of them.
+        for rec in made:
+            eval_dir = Path(rec["paths"]["eval_dir"])
+            kept = evaluation_key(rec) in keep or "error" in rec
+            for name in PRUNED_EVALUATION_LOGS:
+                assert (eval_dir / name).is_file() == kept, (rec["eval_id"], name)
+
     print("image retention self-check passed")
+
+
+def self_check_clean_convergence() -> None:
+    capped = ("Stopped on peak 1 mJy, because the minor-loop threshold was reached.\n"
+              "Performed 40 iterations in total, 40 in this major iteration\n"
+              "Stopped on peak -326 uJy, because maximum number of iterations was reached.\n"
+              "Performed 100 iterations in total, 60 in this major iteration\n"
+              "7 major iterations were performed.\n")
+    got = clean_convergence(capped)
+    # The last Stopped-on-peak line is the terminal one; the earlier minor-loop
+    # exits are per-major-cycle, and `in total` is cumulative.
+    assert got == {"clean_stop_reason": "max-iterations", "clean_iterations": 100,
+                   "clean_major_iterations": 7}, got
+
+    converged = ("Stopped on peak -326.54 uJy, because the threshold was reached.\n"
+                 "Performed 84 iterations in total, 20 in this major iteration\n"
+                 "5 major iterations were performed.\n")
+    assert clean_convergence(converged) == {
+        "clean_stop_reason": "threshold", "clean_iterations": 84,
+        "clean_major_iterations": 5}, clean_convergence(converged)
+
+    # A log that never got as far as cleaning yields nothing, not a crash.
+    assert clean_convergence("WSClean version 3.7\n") == {}
+    assert clean_convergence("") == {}
+    assert clean_convergence_from(Path("/nonexistent/wsclean.stdout.log")) == {}
+
+    print("clean convergence self-check passed")
 
 
 def mark_evaluation_start() -> None:
