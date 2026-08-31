@@ -182,10 +182,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
     NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
-    NS_WSCLEAN_MGAIN=0.9 \
+    NS_WSCLEAN_MGAIN=0.9 NS_WSCLEAN_NITER=250 \
     write_run_config "${_dir}" wsclean
   grep -qx 'NS_WSCLEAN_MGAIN=0.9' "${_dir}/run.env" || {
     echo "FAIL: --mgain not recorded in run.env"; exit 1
+  }
+  grep -qx 'NS_WSCLEAN_NITER=250' "${_dir}/run.env" || {
+    echo "FAIL: --niter not recorded in run.env"; exit 1
   }
   grep -qx 'NS_STALL_TIMEOUT=0' "${_dir}/run.env" || {
     echo "FAIL: --stall-timeout 0 not recorded in run.env"; exit 1
@@ -198,7 +201,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   }
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 \
-    NS_KEEP_MEASUREMENT_SETS=0 NS_WSCLEAN_MGAIN=0.9 WSCLEAN_TARGET_CPU=native \
+    NS_KEEP_MEASUREMENT_SETS=0 NS_WSCLEAN_MGAIN=0.9 NS_WSCLEAN_NITER=250 \
+    WSCLEAN_TARGET_CPU=native \
     write_run_config "${_dir}" wsclean
   grep -qx 'WSCLEAN_TARGET_CPU=native' "${_dir}/run.env" || {
     echo "FAIL: native WSClean target not recorded in run.env"; exit 1
