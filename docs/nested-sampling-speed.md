@@ -7,10 +7,11 @@ two Torch threads, with **13.61 s/evaluation** in the image container and
 operating point; model updates remain dominant and no runtime change is
 justified.
 
-An interleaved two-repeat 15-rank thread probe measured **0.9183 evaluations/second**
-at two Torch threads (0.9171, 0.9194) versus **0.8737** at four threads
-(0.8735, 0.8739), with unchanged **3.47 GB** peak worker memory. Four threads
-is **4.9% slower**, so retain two threads at this production operating point.
+An interleaved four-repeat 15-rank thread probe measured **0.9175 evaluations/second**
+at two Torch threads (0.9115, 0.9171, 0.9179, 0.9194) versus **0.8737** at four
+threads (0.8685, 0.8735, 0.8739, 0.8774), with unchanged **3.47 GB** peak
+worker memory. Four threads is **4.8% slower**, so retain two threads at this
+production operating point.
 
 A direct warmed U-Net microbenchmark measured **64.52 ms** per forward in the
 existing layout versus **64.23 ms** with channels-last tensors and weights
