@@ -59,3 +59,16 @@ Then for the ranges:
 - `start_frequency_hz`: `band_start`
 - `channel_width_hz`: `100khz-2Mhz`
 
+## big run plan
+
+Measurement params:
+- `log10_dynamic_range`: `1-6`
+- `observation_minutes`: `0.3-20`
+- `channel_count`: `1-8`
+- `start_frequency_hz`: band `L-Q` (`1e9-50e9`)
+- `channel_width_hz`: `0.1e6-2e6`
+
+```zsh
+./ri search {wsclean|r2d2} --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_ju
+```
+
