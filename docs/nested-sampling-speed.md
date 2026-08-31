@@ -741,6 +741,13 @@ and `torch.compile` could not compile because the runtime image has no working
 end-to-end noise, while adding a compiler and compiling once per worker would
 change the image and worker lifecycle without a measured production benefit.
 
+The R2D2 worker now enables MKLDNN's deterministic CPU kernels. Three fresh
+runtime-container probes of the 128x128 U-Net measured **59.7-60.3 ms/forward**
+with the setting versus **65.0-70.6 ms** without it (about 8.0% faster), with
+bit-identical output in every pair. The checkpoint archive is not present in
+this checkout, so this remains synthetic evidence until the next checkpoint-
+backed end-to-end benchmark.
+
 ## What is priced but deliberately not taken
 
 | lever | worth | why not |
