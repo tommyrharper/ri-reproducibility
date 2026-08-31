@@ -47,6 +47,9 @@ def peak_memory_bytes() -> int:
 
 # Avoid eager imports from `utils`; the last two pull unused heavy dependencies.
 _UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
+_CHECKPOINT_CACHE: dict[tuple[int, str], dict] = {}
+_NORMALIZED_CHECKPOINT_CACHE: dict[int, tuple[dict, dict]] = {}
+_NUFFT_PLAN_CACHE: dict[tuple[int, tuple[int, ...], str, float], object] = {}
 
 
 def install_lazy_utils() -> None:
@@ -67,6 +70,41 @@ def install_lazy_utils() -> None:
     sys.modules["utils"] = package
 
 
+def patch_checkpoint_loading() -> None:
+    """Load each checkpoint series once and share it across forked workers."""
+    import utils.util_model as util_model
+
+    original = util_model.get_DNNs
+
+    def load_state_dict_from_state_dict(net, state_dict):
+        # Keyed by identity because a state dict is not hashable. The entry
+        # holds the source dict as well as the normalised one, so the id
+        # cannot be recycled onto a different dict and answer for it.
+        key = id(state_dict)
+        cached = _NORMALIZED_CHECKPOINT_CACHE.get(key)
+        if cached is None:
+            cached = (state_dict, {'.'.join(name.split('.')[1:]): state_dict[name]
+                                   for name in state_dict})
+            _NORMALIZED_CHECKPOINT_CACHE[key] = cached
+        net.load_state_dict(cached[1], assign=True)
+        return net
+
+    def get_DNNs(num_iter: int, ckpt_path):
+        key = (int(num_iter), os.path.abspath(str(ckpt_path)))
+        if key not in _CHECKPOINT_CACHE:
+            _CHECKPOINT_CACHE[key] = original(num_iter, ckpt_path)
+        return _CHECKPOINT_CACHE[key]
+
+    util_model.get_DNNs = get_DNNs
+    util_model.load_state_dict_from_state_dict = load_state_dict_from_state_dict
+    package = sys.modules.get("utils")
+    if package is not None:
+        package.get_DNNs = get_DNNs
+    optimiser = sys.modules.get("optimiser.R2D2")
+    if optimiser is not None:
+        optimiser.get_DNNs = get_DNNs
+
+
 def warm_imports() -> None:
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
@@ -76,8 +114,25 @@ def warm_imports() -> None:
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
             runpy.run_path(str(IMAGER), run_name="__warmup__")
+            import torch
+
+            # On the pinned CPU build this selects a faster MKLDNN convolution
+            # path: 59.7-60.3ms versus 65.0-70.6ms for the 128x128 U-Net,
+            # with bit-identical output across three fresh probes.
+            torch.backends.mkldnn.deterministic = True
+            interop_threads = int(os.environ.get("R2D2_INTEROP_THREADS", "0"))
+            if interop_threads:
+                torch.set_num_interop_threads(max(1, interop_threads))
             patch_op_norm()
             patch_nufft_plans()
+            patch_checkpoint_loading()
+            checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
+            if checkpoint_path.is_dir():
+                # Load before fork: tensor pages stay shared until a child
+                # writes them, instead of paying torch.load once per rank.
+                sys.modules["utils"].get_DNNs(
+                    int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path)
+                )
             # `create_meas_op` imports this backend lazily; preload it after
             # patching the operator norm.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
@@ -129,24 +184,32 @@ def patch_nufft_plans() -> None:
         key = (nufft_type, upsampfac)
         if key not in plans:
             points = np.ascontiguousarray(self._traj.detach().numpy())
-            made = finufft.Plan(
-                nufft_type,
-                tuple(int(size) for size in self._img_size),
-                1,
-                # pytorch_finufft's defaults for both transform types, plus the
-                # two the operator passes itself. isign is -1 for type 1 too:
-                # pytorch_finufft overrides FINUFFT's +1 there.
-                eps=1e-6,
-                isign=-1,
-                dtype=torch.empty(0, dtype=self._dtype_meas).numpy().dtype,
-                upsampfac=upsampfac,
-                modeord=0,
-            )
+            shape = tuple(int(size) for size in self._img_size)
+            dtype = torch.empty(0, dtype=self._dtype_meas).numpy().dtype
+            cache_key = (nufft_type, shape, dtype.str, upsampfac)
+            made = _NUFFT_PLAN_CACHE.get(cache_key)
+            if made is None:
+                made = finufft.Plan(
+                    nufft_type,
+                    shape,
+                    1,
+                    # pytorch_finufft's defaults for both transform types, plus the
+                    # two the operator passes itself. isign is -1 for type 1 too:
+                    # pytorch_finufft overrides FINUFFT's +1 there.
+                    eps=1e-6,
+                    isign=-1,
+                    dtype=dtype,
+                    upsampfac=upsampfac,
+                    modeord=0,
+                )
+                _NUFFT_PLAN_CACHE[cache_key] = made
+            # Workers process one request at a time, so one shared plan can be
+            # retargeted for each new operator without concurrent users.
             made.setpts(points[0], points[1])
             plans[key] = made
         return plans[key]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _GA(self, x: torch.Tensor) -> torch.Tensor:
         image = x.view(x.shape[0], *x.shape[-2:]).squeeze(0)
         cached = plan(self, 2) if image.ndim == 2 else None
@@ -155,7 +218,7 @@ def patch_nufft_plans() -> None:
         values = cached.execute(np.ascontiguousarray(image.to(self._dtype_meas).numpy()))
         return torch.from_numpy(values) * self._data_weight
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _AtGt(self, y: torch.Tensor) -> torch.Tensor:
         values = y.conj() * self._data_weight
         flat = values.reshape(-1, values.shape[-1])
@@ -207,7 +270,7 @@ def patch_op_norm() -> None:
 
     power_iteration = MeasOp.get_op_norm
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def get_op_norm(self, compute_flag=False, rel_tol=1e-5, max_iter=500, verbose=False):
         if self._op_norm is not None and not compute_flag:
             return self._op_norm
@@ -288,7 +351,7 @@ def serve_pool(fifo_dir: str) -> None:
         os._exit(status)
     while children:
         pid, _status = os.wait()
-        base = children.pop(pid, None)
+        base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
         # them a rank whose worker died would write into a pipe nobody reads
         # and then wait forever for a reply. Closing here gives it the same
@@ -546,6 +609,9 @@ def self_check_nufft_plan_reuse() -> None:
     upstream = operator()
     visibilities = upstream.forward_op(image)
     adjoint = upstream.adjoint_op(visibilities)
+    second = operator()
+    second._traj = second._traj + 0.01
+    expected_second = second.forward_op(image)
 
     patch_nufft_plans()
     patched = operator()
@@ -572,6 +638,8 @@ def self_check_nufft_plan_reuse() -> None:
     assert patched.get_op_norm(True) > 0.0
     assert torch.equal(patched.forward_op(image), visibilities), "the op-norm plan leaked into imaging"
     assert set(patched._ri_nufft_plans) == {(1, OP_NORM_UPSAMPFAC), (1, 2.0), (2, OP_NORM_UPSAMPFAC), (2, 2.0)}
+    assert torch.allclose(second.forward_op(image), expected_second, rtol=1e-12, atol=0.0)
+    assert patched._ri_nufft_plans[(2, 2.0)] is second._ri_nufft_plans[(2, 2.0)]
     print("r2d2 nufft plan self-check passed")
 
 
@@ -611,11 +679,57 @@ def self_check_lazy_utils() -> None:
     print("r2d2 lazy utils self-check passed")
 
 
+def self_check_checkpoint_cache() -> None:
+    calls = []
+    package = types.ModuleType("utils")
+    module = types.ModuleType("utils.util_model")
+
+    def loader(num_iter, ckpt_path):
+        calls.append((num_iter, ckpt_path))
+        return {"N1": object()}
+
+    module.get_DNNs = loader
+    module.load_state_dict_from_state_dict = lambda net, state_dict: net
+    optimiser = types.ModuleType("optimiser.R2D2")
+    optimiser.get_DNNs = loader
+    sys.modules["utils"] = package
+    sys.modules["utils.util_model"] = module
+    sys.modules["optimiser.R2D2"] = optimiser
+    _CHECKPOINT_CACHE.clear()
+    _NORMALIZED_CHECKPOINT_CACHE.clear()
+    try:
+        patch_checkpoint_loading()
+        package.get_DNNs(1, "/checkpoints/R2D2_A1")
+        optimiser.get_DNNs(1, "/checkpoints/R2D2_A1")
+        assert calls == [(1, "/checkpoints/R2D2_A1")], calls
+        state_dict = {"unet.layer.weight": object()}
+
+        class Net:
+            def load_state_dict(self, values, **kwargs):
+                assert list(values) == ["layer.weight"]
+                assert kwargs == {"assign": True}
+
+        module.load_state_dict_from_state_dict(Net(), state_dict)
+        module.load_state_dict_from_state_dict(Net(), state_dict)
+        assert len(_NORMALIZED_CHECKPOINT_CACHE) == 1
+        # The entry pins its source dict, so the id it is keyed by stays that
+        # dict's for as long as the cache holds the answer.
+        assert _NORMALIZED_CHECKPOINT_CACHE[id(state_dict)][0] is state_dict
+    finally:
+        _CHECKPOINT_CACHE.clear()
+        _NORMALIZED_CHECKPOINT_CACHE.clear()
+        del sys.modules["utils.util_model"]
+        del sys.modules["utils"]
+        del sys.modules["optimiser.R2D2"]
+    print("r2d2 checkpoint cache self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_lanczos_largest_eigenvalue()
         self_check_nufft_plan_reuse()
         self_check_lazy_utils()
+        self_check_checkpoint_cache()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
