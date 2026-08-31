@@ -1,5 +1,11 @@
 # Making a nested-sampling search faster: the index
 
+The latest three-repeat checkpoint-backed asynchronous R2D2 control measured
+**0.8133 evaluations/second** (0.7717, 0.8133, and 0.8149) at four Torch
+threads, with **7.04 s/evaluation** and **3.47 GB** peak worker memory. This
+refreshes the current baseline; model inference remains the bottleneck and no
+new runtime change is claimed.
+
 Two hundred fourteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest interleaved R2D2 thread-count probe measured **0.7824 evaluations/second
 at five threads versus 0.7765 at six threads** (three repeats per arm), with
