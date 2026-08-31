@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Two hundred eleven profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
+Two hundred twelve profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest three-repeat throughput control measured **107.3 evaluations/second**
 (102.6, 107.3, and 112.9), with **143.1 ms/evaluation** by median,
 **127.6 ms/evaluation** in the image binary, **1.6-6.0%** idle time, and
@@ -12,6 +12,11 @@ The latest three-repeat async control measured **114.6 evaluations/second** at
 **122.2 ms/evaluation** in the image binary, **2.1-6.1%** idle time, and
 **34.3-34.5 MB** peak worker memory. This matches established host variance,
 not a new speedup; image binary remains dominant.
+The latest three-repeat checkpoint-backed R2D2 throughput control measured
+**0.7787 evaluations/second** (0.7906, 0.7787, and 0.7770), with **7.34 s per
+evaluation** and **3.47 GB** peak worker memory. This refresh is consistent with
+the prior 0.7983 eval/s control and does not establish a new speedup; model
+updates remain the dominant stage.
 The latest fifteen-repeat async control measured **109.0 +/- 1.5 evaluations/second** at
 20 workers, with **143.0 +/- 1.1 ms/evaluation**, **127.4 +/- 0.93 ms/evaluation** in the image
 binary, **0.453 ms/evaluation** in metrics, and **34.1-34.5 MB** peak worker
