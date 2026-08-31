@@ -18,6 +18,12 @@ per evaluation in gridding and **25.00 ms** in predicting, together **54.87 ms
 **5.92 ms/evaluation**; no result-preserving shortcut is justified by this
 profile.
 
+A fresh three-repeat default WSClean control measured **71.8 evaluations/second**
+(71.8, 69.5, and 72.0) at 20 ranks, with **148.7-152.3 ms/evaluation** and
+**34.5-34.6 MB** peak worker memory. Combined with the prior three-repeat
+control after row-block metadata caching, the six-run median is **71.9 eval/s**;
+this remains within host variance, so no additional WSClean change is justified.
+
 An interleaved four-repeat 15-rank thread probe measured **0.9175 evaluations/second**
 at two Torch threads (0.9115, 0.9171, 0.9179, 0.9194) versus **0.8737** at four
 threads (0.8685, 0.8735, 0.8739, 0.8774), with unchanged **3.47 GB** peak

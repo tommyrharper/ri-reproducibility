@@ -95,11 +95,12 @@ block into hundreds of megabytes. This parameter space's sets are 4 x 4 to
 
 The follow-up keeps each block's row shape and element count beside the block,
 so `CopyRowFromBlock()` no longer asks casacore for shape metadata on every
-row. The rebuilt image passed WSClean self-checks and compiled cleanly. Three
-controlled default searches measured 70.85, 72.95 and 73.87 evaluations/second
-(median 72.95), versus the previous three-control median of 71.06
-evaluations/second (+2.7%). Overlapping run variance means this is not yet a
-statistically isolated end-to-end gain. Peak memory stayed 34.4-34.7 MB.
+row. The rebuilt image passed WSClean self-checks and compiled cleanly. Six
+controlled default searches now measure 70.85, 72.95, 73.87, 71.78, 69.52 and
+72.01 evaluations/second (six-run median 71.90), versus the previous
+three-control median of 71.06 evaluations/second (+1.2%). Overlapping run
+variance means this is still not a statistically isolated end-to-end gain.
+Peak memory stayed 34.4-34.7 MB.
 
 ## Measurements
 
