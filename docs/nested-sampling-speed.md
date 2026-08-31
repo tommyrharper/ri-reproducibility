@@ -14,6 +14,12 @@ and 0.9194), with **3.47 GB** peak worker memory. Four Torch threads measured
 **0.8737 evaluations/second** in the same probe, so two threads remains the
 fastest memory-safe operating point; model updates remain dominant.
 
+Profiling the latest 36-evaluation run with `./ri profile --r2d2-phases` records
+**13,186.75 ms/evaluation** for 25 model updates and **421.20 ms/evaluation**
+for residual computation. Model updates are therefore **96.9%** of the logged
+R2D2 image time; checkpoint swapping and residual work are not credible targets
+until the U-Net forward path changes.
+
 A fresh three-repeat asynchronous WSClean control measured **110.7 evaluations/second**
 (114.2, 110.7, and 108.8) at 20 ranks, with **144.5 ms/evaluation** by median,
 **129.1 ms/evaluation** in the image binary, and **34.3-34.7 MB** peak memory.
