@@ -26,6 +26,7 @@ from common import (
     ZYGOTE_COMMAND,
     abort_run,
     adopt_completed_evaluations,
+    clean_convergence_from,
     cube_like_from_theta,
     cube_to_params,
     gathered_window_fit_stats,
@@ -37,7 +38,7 @@ from common import (
     mpi_rank,
     params_key,
     prewarm,
-    prune_run_images,
+    prune_run_artefacts,
     prior_vector,
     resolve_metric,
     self_check_fits_reader,
@@ -193,6 +194,11 @@ def evaluate(
             source_m_arcsec=params["source_m_arcsec"],
         )
         objective = objective_from_metrics(metrics)
+        # Why CLEAN stopped and how far it got. Read now, while the log is
+        # still beside the evaluation: the retention policy keeps the log for
+        # only a few hundred evaluations a run, and these three fields are the
+        # part of it that has to outlive that.
+        metrics.update(clean_convergence_from(wsclean_stdout))
     except Exception as exc:
         metrics_seconds = time.perf_counter() - metrics_start
         return write_evaluation_record(eval_dir, {
@@ -463,7 +469,7 @@ def main() -> None:
         # Rank-based, so it can only run now that every evaluation is scored.
         # Mutates the records the summary embeds, so summary.json never names
         # an image this just deleted.
-        prune_run_images(evaluations_dir, all_evaluations)
+        prune_run_artefacts(evaluations_dir, all_evaluations)
         summary_path = output_dir / "summary.json"
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or

@@ -32,6 +32,7 @@ SEARCH_ENV = (
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
     ("mgain", "NS_WSCLEAN_MGAIN"),
+    ("niter", "NS_WSCLEAN_NITER"),
     ("synchronous", "NS_SYNCHRONOUS"),
     ("keep_measurement_sets", "NS_KEEP_MEASUREMENT_SETS"),
     ("retries", "NS_RETRIES"),
@@ -360,6 +361,12 @@ def build_parser():
                              "--metric=-snr, to search the worst corner [NS_METRIC]")
     search.add_argument("--mpi-procs", type=int,
                         help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
+    search.add_argument("--niter", type=int,
+                        help="WSClean minor-iteration budget per major cycle. "
+                             "At the old default of 100, ~80%% of evaluations "
+                             "stopped on the cap rather than the threshold; "
+                             "each record's clean_stop_reason says which "
+                             "[NS_WSCLEAN_NITER]")
     search.add_argument("--mgain", type=float,
                         help="WSClean major-cycle gain, the largest throughput lever "
                              "left: it sets how many of an evaluation's ~15 gridding "

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the image retention policy to runs that finished before it existed.
 
-A run scored before prune_run_images() was wired into the summary writers kept
+A run scored before prune_run_artefacts() was wired into the summary writers kept
 an image for every evaluation. This applies the same policy after the fact,
 from the records summary.json already embeds, and rewrites the summary so it
 never names a file this deleted.
@@ -10,7 +10,7 @@ Only finished runs are touched: summary.json is written once PolyChord returns,
 so a run without one is incomplete or resumable, and `./ri resume` rebuilds its
 cache by walking evaluations/.
 
-    scripts/prune-run-images.py results/nested-sampling/*/
+    scripts/prune-run-artefacts.py results/nested-sampling/*/
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_samplin
 from common import (  # noqa: E402
     PRUNED_ARTEFACTS,
     evaluations_keeping_images,
-    prune_run_images,
+    prune_run_artefacts,
     write_json_atomic,
 )
 
@@ -72,7 +72,7 @@ def main(argv: list[str]) -> int:
         records = summary.get("evaluations")
         if not isinstance(records, list) or not records:
             continue
-        removed = prune_run_images(run / "evaluations", records)
+        removed = prune_run_artefacts(run / "evaluations", records)
         removed += drop_always_pruned(run / "evaluations", records)
         if removed:
             write_json_atomic(summary_path, summary)

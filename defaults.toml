@@ -71,6 +71,18 @@ NS_KEEP_MEASUREMENT_SETS = 0
 # docs/nested-sampling-evaluation-floor.md for why nothing cheaper is left.
 NS_WSCLEAN_MGAIN = 0.8
 
+# CLEAN's minor-iteration budget per major cycle, WSClean's `-niter`. At the
+# old value of 100 roughly four evaluations in five stopped on `maximum number
+# of iterations` rather than on the auto-threshold (77-84% across five archived
+# runs), so for most of the parameter space the objective scored the residual
+# after 100 components rather than what CLEAN converges to - and the worst 200
+# evaluations of a run were 90% capped against a 80% base rate, so the cap was
+# shaping the failure map itself. 1000 lets most evaluations reach the
+# threshold; each record's `clean_stop_reason` says which of the two ended it,
+# so the question is now answerable from the summary rather than the logs.
+# Costs imaging time: deconvolution was ~7% of an evaluation at 100.
+NS_WSCLEAN_NITER = 1000
+
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
 # scored no evaluations is never retried, and one that ran longer than
@@ -242,6 +254,7 @@ NS_METRIC = "total_rms_jy"
 NS_SYNCHRONOUS = 1
 NS_KEEP_MEASUREMENT_SETS = 0
 NS_WSCLEAN_MGAIN = 0.8
+NS_WSCLEAN_NITER = 100
 
 # Sized down against the WSClean preset above, not for a shorter table: one
 # R2D2 evaluation is 14-26 seconds of imaging against WSClean's 0.13, so these
@@ -266,6 +279,7 @@ NS_METRIC = "total_rms_jy"
 NS_SYNCHRONOUS = 0
 NS_KEEP_MEASUREMENT_SETS = 0
 NS_WSCLEAN_MGAIN = 0.8
+NS_WSCLEAN_NITER = 100
 
 [benchmark.throughput.r2d2]
 NS_NLIVE = 8
@@ -287,6 +301,7 @@ NS_METRIC = "total_rms_jy"
 NS_SYNCHRONOUS = 0
 NS_KEEP_MEASUREMENT_SETS = 0
 NS_WSCLEAN_MGAIN = 0.8
+NS_WSCLEAN_NITER = 100
 
 [benchmark.production.r2d2]
 NS_NLIVE = 150

@@ -34,6 +34,7 @@ write_run_config() {
     printf 'NS_POLYCHORD_IMAGE_ID=%q\n' "${polychord_image_id}"
     if [ "${algorithm}" = wsclean ]; then
       printf 'NS_WSCLEAN_MGAIN=%q\n' "${NS_WSCLEAN_MGAIN}"
+      printf 'NS_WSCLEAN_NITER=%q\n' "${NS_WSCLEAN_NITER}"
       printf 'NS_WSCLEAN_LOG_TIME=%q\n' "${NS_WSCLEAN_LOG_TIME:-1}"
       if [ -n "${WSCLEAN_TARGET_CPU:-}" ]; then
         printf 'WSCLEAN_TARGET_CPU=%q\n' "${WSCLEAN_TARGET_CPU}"
