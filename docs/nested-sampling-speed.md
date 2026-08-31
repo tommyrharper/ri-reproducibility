@@ -6,6 +6,13 @@ threads, with **7.04 s/evaluation** and **3.47 GB** peak worker memory. This
 refreshes the current baseline; model inference remains the bottleneck and no
 new runtime change is claimed.
 
+A matched three-repeat packing probe measured **0.9077 evaluations/second** at
+16 ranks with two Torch threads, versus **0.8133 evaluations/second** at eight
+ranks with four threads: **11.6% faster** with the same **3.47 GB per-worker**
+peak. The 16-rank arm estimated **56 GB** total and triggered the memory warning
+on this 62 GB host, so this is a capacity-bound operating point, not a new
+default.
+
 Two hundred fourteen profiling rounds cut WSClean from ~2.3 s to ~143 ms/evaluation.
 The latest interleaved R2D2 thread-count probe measured **0.7824 evaluations/second
 at five threads versus 0.7765 at six threads** (three repeats per arm), with
@@ -145,6 +152,7 @@ rates are historical and roughly half the current rate.
 | R2D2 auto thread count rounds up per-rank CPU share | `run-nested-sampling-r2d2.sh` | 0.6198 to 0.7249 eval/s at 8 ranks (16.9%), with unchanged 3.47 GB peak memory |
 | R2D2 inference paths use `torch.inference_mode` | `r2d2_serve.py` | Representative 128x128 U-Net microbenchmark: 8.589 to 8.467 ms/forward (1.4%); no end-to-end claim without checkpoints |
 | R2D2 rank-count probe at four Torch threads | `./ri bench run r2d2` | Interleaved 2-repeat probe: 0.6934 eval/s at 5 ranks versus 0.7983 at 8 ranks, both at 3.47 GB peak memory; 8 ranks retained |
+| R2D2 rank/thread packing probe | `./ri bench run r2d2` | 0.9077 eval/s at 16 ranks x 2 threads versus 0.8133 at 8 x 4 (three repeats; +11.6%); ~56 GB estimated total, memory warning retained |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
