@@ -1,6 +1,6 @@
 # Making a nested-sampling search faster: the index
 
-Current measured operating points: WSClean **102.0 evaluations/second** at
+Current measured operating points: WSClean **110.2 evaluations/second** at
 20 ranks and R2D2 **0.9101 evaluations/second** at 15 ranks with two Torch
 threads. Deterministic MKLDNN kernels remain enabled after checkpoint-backed
 validation; three throughput runs measured **0.9189, 0.9030, and 0.9101
