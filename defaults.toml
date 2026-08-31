@@ -32,6 +32,20 @@ CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
 R2D2_CKPT_NAME = "R2D2_A1"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
+# Most concurrent R2D2 evaluations worth running, before the memory clamp in
+# scripts/lib/rank-budget.sh has its say. R2D2 is core-bound, not rank-bound:
+# measured on the 20-thread rig, paired and interleaved, throughput is flat
+# from 8 ranks (0.878, 0.917 evaluations/second) to 15 (0.898, 0.916) while
+# per-rank memory takes the run from 28GB to 53GB - per-evaluation work doubles
+# and the total does not move. Without this cap the derived rank count is
+# whatever memory allows, which buys nothing and spends the headroom a long run
+# needs. WSClean has no equivalent: it is 200MB a rank and scales to one rank
+# per core. See docs/nested-sampling-throughput.md.
+# ponytail: one number measured on one host, not a live probe. Re-measure with
+# `./ri search r2d2 --nlive 40 --num-repeats 2 --max-ndead 40 --mpi-procs N`
+# on a machine with a different core count.
+NS_R2D2_MAX_RANKS = 8
+
 # PolyChord sampler settings for the nested-sampling runs.
 # See docs/nested-sampling.md for what each one does.
 NS_NLIVE = 8

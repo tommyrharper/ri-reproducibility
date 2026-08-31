@@ -19,8 +19,26 @@ catastrophic when what failed was the machine.
 | What happened | What the run does |
 |---|---|
 | The tool ran and exited non-zero | `FAILURE_OBJECTIVE` - a failure mode, scored |
+| The tool was killed by SIGKILL | Retried, then the run stops - never scored |
 | A worker died mid-request | Retried, then the run stops - never scored |
 | A worker stopped answering | Its meqserver is replaced, or it is killed - never scored |
+
+The SIGKILL row is the OOM killer, and it is a separate row because it is the
+one failure that arrives looking like the algorithm's own. The zygote reports a
+signal-killed child as `128 + signal` (`docker/wsclean/src/zygote.cpp`), so an
+OOM-killed WSClean used to return 137, which is non-zero, which is scored -
+`FAILURE_OBJECTIVE` on the machine's memory limit, in a search that maximises.
+`is_infrastructure_failure()` in `common.py` classifies it with `WORKER_DIED`
+instead. Nothing in this pipeline sends an imager SIGKILL, so there is no
+legitimate case to lose; a crash the imager chose - SIGSEGV, SIGABRT, a
+non-zero exit - is still scored, because that *is* a failure mode.
+
+R2D2 never had this hole and does not need the rule: `r2d2_serve.py` runs
+`imager.py` in-process, so the imaging memory is the worker's own and the OOM
+killer takes the worker, which is already the "worker died" row. What it cannot
+distinguish is an allocation failure the worker catches (`torch` raising rather
+than the kernel killing), which still arrives as exit 1 and is scored. The
+defence there is not to run at the edge of memory: see `NS_R2D2_MAX_RANKS`.
 
 A dead worker is retried against a freshly started one, waiting longer each
 time (`WORKER_RETRY_DELAYS` in `common.py`, ~51s in total). That is usually

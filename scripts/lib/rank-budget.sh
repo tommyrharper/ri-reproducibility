@@ -264,8 +264,10 @@ ns_budget_warn_if_over() {
   if [ "$((requested * mb_per_rank))" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
     echo "WARNING: ${label} was asked for ${requested} ranks," \
       "~$((requested * mb_per_rank))MB, with only ${available}MB available." \
-      "Out-of-memory evaluations are recorded as failures and score as the" \
-      "search's best points - see scripts/lib/rank-budget.sh." >&2
+      "An evaluation the OOM killer takes is never scored, so this costs the" \
+      "run rather than the result: the attempt is retried against a fresh" \
+      "worker and then the run stops, to be picked up with ./ri resume" \
+      "- see docs/robustness.md." >&2
   fi
 }
 
