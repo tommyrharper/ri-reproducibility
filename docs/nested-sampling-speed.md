@@ -1,11 +1,17 @@
 # Making a nested-sampling search faster: the index
 
-Current measured operating points: WSClean **111.44 evaluations/second** at
+Current measured operating points: WSClean **113.75 evaluations/second** at
 20 ranks and R2D2 **0.9101 evaluations/second** at 15 ranks with two Torch
 threads. Deterministic MKLDNN kernels remain enabled after checkpoint-backed
 validation; three throughput runs measured **0.9189, 0.9030, and 0.9101
 evaluations/second**, with **3.47 GB** peak worker memory. This confirms no
 memory regression, but this control alone does not establish a causal gain.
+
+A fresh three-repeat asynchronous WSClean control measured **113.75
+evaluations/second** (106.31, 117.63, and 113.75) at 20 ranks, with **140.2
+ms/evaluation** by median, **125.2 ms/evaluation** in the image binary, and
+**34.3-34.6 MB** peak worker memory. This is a control refresh within normal
+host variance; no new runtime change is claimed.
 
 The new benchmark arm supports interleaved `mgain` probes. Two repeats at the
 throughput preset measured WSClean at **112.0 and 125.5 evaluations/second**
@@ -446,6 +452,7 @@ rates are historical and roughly half the current rate.
 | WSClean 20-versus-21 rank probe | `./ri bench run wsclean --preset throughput --interleave-mpi-procs 20 21 --allow-oversubscription --repeat 3` | 107.7 versus 104.7 eval/s median across three interleaved repeats; 21 ranks is 2.8% slower with unchanged 34.3-34.7 MB peak memory |
 | WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 110.2 eval/s median (105.4, 110.2, and 114.3), 142.2 ms/eval, 127.1-128.5 ms image binary, and 34.4-34.6 MB peak memory; host-variance control |
 | WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 106.4 eval/s median (106.4, 94.9, and 121.0), 142.6 ms/eval, 127.2 ms image binary, and 34.2-34.6 MB peak memory; host-variance control |
+| WSClean throughput control refresh | `./ri bench run wsclean --preset throughput --repeat 3` | 113.75 eval/s median (106.31, 117.63, and 113.75), 140.2 ms/eval, 125.2 ms image binary, and 34.3-34.6 MB peak memory; host-variance refresh |
 
 Compiling WSClean for this exact CPU (`-march=native`) was rejected: three
 throughput repeats measured 136.9, 36.9, and 111.6 evaluations/second (median
