@@ -112,6 +112,20 @@ def default_parameter_space() -> list[dict[str, object]]:
         return []
 
 
+def count_evaluations(run_dir: Path) -> int:
+    """How many evaluations this run has actually scored.
+
+    os.scandir rather than Path.glob: this is the busiest loop in a listing -
+    one stat per evaluation directory, thousands of them on a long run - and
+    glob spends as much again building a Path for every entry it walks."""
+    try:
+        with os.scandir(run_dir / "evaluations") as entries:
+            return sum(1 for e in entries if e.name.startswith("eval-")
+                       and os.path.exists(os.path.join(e.path, "metrics.json")))
+    except OSError:  # no evaluations directory yet
+        return 0
+
+
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
 
 
@@ -186,7 +200,7 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     if from_defaults:
         space = default_parameter_space()
     algorithm = run_env.get("NS_ALGORITHM") or run_dir.name.split("-", 1)[0]
-    evaluations = len(list((run_dir / "evaluations").glob("eval-*/metrics.json")))
+    evaluations = count_evaluations(run_dir)
     complete = summary_is_complete(run_dir)
     resumable = any((run_dir / "chains").glob("*.resume"))
     if complete:
