@@ -31,6 +31,11 @@ LOG_Z_RE = re.compile(
 )
 RUN_ID_TS_RE = re.compile(r"(\d{8}T\d{6}Z)$")
 
+# Runs reach thousands of evaluations, so both pages ship every row and card
+# but reveal one page at a time (see PAGINATE_SCRIPT).
+EVALS_PER_PAGE = 100
+IMAGES_PER_PAGE = 20
+
 # Hash source so pages detect rendering or CSS changes without a manual version.
 REPORT_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 REPORT_VERSION_RE = re.compile(r'<meta name="report-version" content="([0-9a-f]+)">')
@@ -1118,7 +1123,7 @@ def render_parameter_space_section(parameter_space):
 NO_IMAGE = '<span class="empty" title="no image retained for this evaluation">—</span>'
 
 
-def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
+def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120, off_page=False):
     if not image_path:
         return NO_IMAGE
     recon_uri = render_fits_image(image_path, figsize=figsize, dpi=dpi)
@@ -1126,7 +1131,8 @@ def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
         return NO_IMAGE
     return (
         f'<figure class="eval-recon">'
-        f'<img src="{recon_uri}" alt="eval {html.escape(str(eval_id))} reconstruction">'
+        f'<img {"data-src" if off_page else "src"}="{recon_uri}" '
+        f'alt="eval {html.escape(str(eval_id))} reconstruction">'
         f'<figcaption>recon</figcaption></figure>'
     )
 
@@ -1153,7 +1159,7 @@ def render_shared_truth_image(image_path, source_flux_jy, figsize=(3.2, 3.2), dp
     )
 
 
-def render_eval_card(ev, parameter_space, run_dirs, metric, is_best):
+def render_eval_card(ev, parameter_space, run_dirs, metric, is_best, off_page=False):
     eval_id = ev.get("eval_id", "?")
     params = ev.get("params") or {}
     image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
@@ -1164,9 +1170,9 @@ def render_eval_card(ev, parameter_space, run_dirs, metric, is_best):
         for spec in parameter_space
         if (name := spec.get("name")) and (value := params.get(name)) is not None
     )
-    recon_html = render_eval_recon(image_path, eval_id)
+    recon_html = render_eval_recon(image_path, eval_id, off_page=off_page)
     return f"""
-    <article class="eval-card{best_class}">
+    <article class="eval-card{best_class}"{" hidden" if off_page else ""}>
       <header class="eval-card-header">
         <span class="eval-card-id">#{html.escape(str(eval_id))}</span>
         <span class="eval-card-objective">{metric_label} <strong>{fmt_value(ev.get('objective'))}</strong></span>
@@ -1253,10 +1259,19 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
 
     best_eval_id = best.get("eval_id")
     cards = [
-        render_eval_card(ev, parameter_space, run_dirs, metric, ev.get("eval_id") == best_eval_id)
-        for ev in evaluations
+        render_eval_card(
+            ev,
+            parameter_space,
+            run_dirs,
+            metric,
+            ev.get("eval_id") == best_eval_id,
+            off_page=index >= IMAGES_PER_PAGE,
+        )
+        for index, ev in enumerate(evaluations)
     ]
-    cards_html = f'<div class="eval-gallery">{"".join(cards)}</div>'
+    cards_html = (
+        f'<div class="eval-gallery" data-page-size="{IMAGES_PER_PAGE}">{"".join(cards)}</div>'
+    )
 
     return f'<div class="eval-images">{truth_html}{cards_html}</div>'
 
@@ -1373,12 +1388,12 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
         + "<th>objective</th></tr>"
     )
     eval_rows = []
-    for ev in evaluations:
+    for index, ev in enumerate(evaluations):
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
         eval_rows.append(
-            "<tr>"
-            f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
+            ("<tr hidden>" if index >= EVALS_PER_PAGE else "<tr>")
+            + f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
             + "".join(f"<td>{fmt_value(params.get(name))}</td>" for name in param_names)
             + "".join(f"<td>{fmt_value(metrics.get(key))}</td>" for key in metric_keys)
             + f"<td>{fmt_value(ev.get('objective'))}</td>"
@@ -1420,7 +1435,7 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
             <div class="eval-table-wrap">
               <table class="eval-table">
                 <thead>{eval_header}</thead>
-                <tbody>{"".join(eval_rows)}</tbody>
+                <tbody data-page-size="{EVALS_PER_PAGE}">{"".join(eval_rows)}</tbody>
               </table>
             </div>
           </details>
@@ -1698,6 +1713,24 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
   line-height: 1.35;
   word-break: break-word;
 }
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+  font-size: 0.85rem;
+}
+.pager button {
+  font: inherit;
+  padding: 0.2rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.pager button:disabled { opacity: 0.4; cursor: default; }
+.pager-label { opacity: 0.7; font-variant-numeric: tabular-nums; }
 .likelihood-plot { margin: 0.5rem 0; }
 .likelihood-plot img { max-width: 100%; height: auto; border-radius: 6px; }
 .nav { font-size: 0.9rem; margin: 0 0 1rem; }
@@ -2210,6 +2243,71 @@ def render_nested_sampling_index(status_for):
     )
 
 
+# Reveals one page of children at a time for any container carrying
+# data-page-size. Off-page thumbnails ship with their URL in data-src rather
+# than src, so the browser only ever fetches the images of the open page.
+# loading="lazy" is deliberately not used: an unloaded <img> has no box, so a
+# lazy image revealed by script never intersects the viewport and never loads.
+PAGINATE_SCRIPT = """
+<script>
+(function () {
+  var boxes = document.querySelectorAll("[data-page-size]");
+  Array.prototype.forEach.call(boxes, function (box) {
+    var size = parseInt(box.getAttribute("data-page-size"), 10);
+    var items = Array.prototype.slice.call(box.children);
+    if (!(size > 0) || items.length <= size) return;
+    var pages = Math.ceil(items.length / size);
+    var page = 0;
+
+    var bar = document.createElement("nav");
+    bar.className = "pager";
+    var prev = document.createElement("button");
+    prev.type = "button";
+    prev.textContent = "\\u2190 Prev";
+    var next = document.createElement("button");
+    next.type = "button";
+    next.textContent = "Next \\u2192";
+    var label = document.createElement("span");
+    label.className = "pager-label";
+    bar.appendChild(prev);
+    bar.appendChild(label);
+    bar.appendChild(next);
+
+    function show() {
+      items.forEach(function (el, i) {
+        el.hidden = Math.floor(i / size) !== page;
+        // Off-page thumbnails ship with their URL parked in data-src, so
+        // revealing a page is what starts those (and only those) fetches.
+        if (!el.hidden) {
+          Array.prototype.forEach.call(el.querySelectorAll("img[data-src]"), function (img) {
+            img.src = img.getAttribute("data-src");
+            img.removeAttribute("data-src");
+          });
+        }
+      });
+      label.textContent = (page * size + 1) + "\\u2013"
+        + Math.min(items.length, (page + 1) * size) + " of " + items.length;
+      prev.disabled = page === 0;
+      next.disabled = page === pages - 1;
+    }
+    function go(delta) {
+      page = Math.min(pages - 1, Math.max(0, page + delta));
+      show();
+      bar.scrollIntoView({ block: "nearest" });
+    }
+    prev.addEventListener("click", function () { go(-1); });
+    next.addEventListener("click", function () { go(1); });
+
+    // A paginated <tbody> cannot host the bar itself; hang it off the wrapper.
+    var anchor = box.closest(".eval-table-wrap") || box;
+    anchor.parentNode.insertBefore(bar, anchor);
+    show();
+  });
+})();
+</script>
+"""
+
+
 def write_html_doc(out_path, title, subtitle, body):
     html_doc = f"""<!doctype html>
 <html>
@@ -2218,11 +2316,13 @@ def write_html_doc(out_path, title, subtitle, body):
 <meta name="report-version" content="{REPORT_VERSION}">
 <title>{html.escape(title)}</title>
 <style>{CSS}</style>
+<noscript><style>[data-page-size] > [hidden] {{ display: revert; }}</style></noscript>
 </head>
 <body>
 <h1>{html.escape(title)}</h1>
 <p class="subtitle">{subtitle}</p>
 {body}
+{PAGINATE_SCRIPT}
 </body>
 </html>
 """
@@ -3024,11 +3124,70 @@ def _self_check_run_page_split():
         shutil.rmtree(tmp_dir)
 
 
+def _self_check_pagination():
+    import shutil
+    import tempfile
+
+    count = EVALS_PER_PAGE + 5
+    summary = {
+        "algorithm": "r2d2",
+        "metric": "snr",
+        "parameter_space": [{"name": "log10_dynamic_range", "min": 2.0, "max": 3.0}],
+        "evaluations": [
+            {"eval_id": i, "objective": float(count - i), "params": {"log10_dynamic_range": 2.5}}
+            for i in range(count)
+        ],
+    }
+
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-pager-")
+    try:
+        run_dir = os.path.join(tmp_dir, "r2d2-run")
+        os.makedirs(run_dir)
+        summary_path = os.path.join(run_dir, "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f)
+
+        page = render_nested_sampling_run(summary_path, likelihood_html="")
+        assert f'<tbody data-page-size="{EVALS_PER_PAGE}">' in page, page
+        assert page.count("<tr hidden>") == count - EVALS_PER_PAGE, page.count("<tr hidden>")
+
+        images_page = render_run_images_page(summary_path)
+        assert f'data-page-size="{IMAGES_PER_PAGE}"' in images_page, images_page
+        hidden_cards = images_page.count('class="eval-card" hidden>')
+        assert hidden_cards == count - IMAGES_PER_PAGE, hidden_cards
+
+        out_path = os.path.join(tmp_dir, "page.html")
+        write_html_doc(out_path, "t", "s", images_page)
+        with open(out_path) as f:
+            doc = f.read()
+        # The paginator ships with the page and no-JS readers still see every item.
+        assert "[data-page-size]" in doc and "<noscript>" in doc, doc
+    finally:
+        shutil.rmtree(tmp_dir)
+
+    # Off-page thumbnails must park their URL in data-src so the browser cannot
+    # fetch them before their page is opened.
+    global render_fits_image
+    real_render_fits_image = render_fits_image
+    render_fits_image = lambda *a, **kw: "images/deadbeef.png"
+    try:
+        on_page = render_eval_recon("img.fits", 7)
+        off_page = render_eval_recon("img.fits", 7, off_page=True)
+    finally:
+        render_fits_image = real_render_fits_image
+    assert '<img src="images/deadbeef.png"' in on_page, on_page
+    assert '<img data-src="images/deadbeef.png"' in off_page, off_page
+    assert "src=" not in off_page.replace("data-src=", ""), off_page
+
+    assert (EVALS_PER_PAGE, IMAGES_PER_PAGE) == (100, 20)
+
+
 if __name__ == "__main__":
     if os.environ.get("GENERATE_REPORT_SELF_CHECK") == "1":
         _self_check_log_evidence_parser()
         _self_check_run_page_name()
         _self_check_run_page_split()
+        _self_check_pagination()
         _self_check_mplot3d_skip()
         _self_check_cached_png()
         _self_check_render_array_png()
