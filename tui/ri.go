@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -41,6 +43,10 @@ type Run struct {
 	// run that died before recording its own. defaults.toml is edited between
 	// runs, so this box is the repository's now, not necessarily the run's.
 	SpaceFromDefaults bool `json:"parameter_space_from_defaults"`
+	// Preliminary marks a run scanned off disk rather than listed by ./ri: its
+	// name and age are real, and every other field is simply not known yet.
+	// Never set from JSON - the listing is the thing that settles a run.
+	Preliminary bool `json:"-"`
 }
 
 // Param is one searched dimension of a run's parameter-space.json. A
@@ -132,10 +138,114 @@ func round(v float64) string {
 // deletable reports why a run cannot be removed: pulling the directory out
 // from under live ranks is what ns_refuse_live_run exists to prevent.
 func (r Run) deletable() error {
+	if r.Preliminary {
+		// A scanned row does not know whether the run is live, and "not known
+		// to be running" must never be read as "safe to delete".
+		return fmt.Errorf("%s is still loading - wait for the table to fill in", r.Name)
+	}
 	if r.Status == "running" || r.Status == "starting" {
 		return fmt.Errorf("%s is still going - stop it before deleting it", r.Name)
 	}
 	return nil
+}
+
+// runArtifacts mirrors RUN_ARTIFACTS in scripts/nested-sampling-runs.py: what
+// makes a directory under results/nested-sampling a run rather than a note.
+var runArtifacts = []string{"run.env", "run.log", "summary.json", "evaluations", "chains"}
+
+// runStamp matches the UTC timestamp a run's name ends with.
+var runStamp = regexp.MustCompile(`(\d{8}T\d{6}Z)$`)
+
+// scanRuns is what can be known about the runs from a readdir and a handful of
+// stats. ./ri runs --json is authoritative and replaces every row it returns,
+// but it counts every evaluation and reads every run's settings first, so the
+// table would otherwise sit empty for as long as that takes.
+func (r ri) scanRuns() []Run {
+	parent := filepath.Join(r.root, "results", "nested-sampling")
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return nil
+	}
+	type scanned struct {
+		run     Run
+		started time.Time
+	}
+	var found []scanned
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(parent, entry.Name())
+		if !isRunDir(dir) {
+			continue
+		}
+		started := startedAt(entry, dir)
+		found = append(found, scanned{
+			run: Run{
+				Name:         entry.Name(),
+				Path:         filepath.Join("results", "nested-sampling", entry.Name()),
+				StartedLabel: "(" + ago(started, time.Now()) + ")",
+				Preliminary:  true,
+			},
+			started: started,
+		})
+	}
+	// The same order the listing comes back in, so no row moves under the
+	// cursor when it lands.
+	sort.Slice(found, func(i, j int) bool {
+		if !found[i].started.Equal(found[j].started) {
+			return found[i].started.After(found[j].started)
+		}
+		return found[i].run.Name > found[j].run.Name
+	})
+	runs := make([]Run, 0, len(found))
+	for _, f := range found {
+		runs = append(runs, f.run)
+	}
+	return runs
+}
+
+func isRunDir(dir string) bool {
+	for _, artifact := range runArtifacts {
+		if _, err := os.Stat(filepath.Join(dir, artifact)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// startedAt reads the run's start from its name, as the listing does, and falls
+// back to the directory's mtime for a hand-made one that has no stamp.
+func startedAt(entry os.DirEntry, dir string) time.Time {
+	if match := runStamp.FindStringSubmatch(entry.Name()); match != nil {
+		if at, err := time.ParseInLocation("20060102T150405Z", match[1], time.UTC); err == nil {
+			return at
+		}
+	}
+	if info, err := entry.Info(); err == nil {
+		return info.ModTime()
+	}
+	return time.Time{}
+}
+
+// ago is the tail of the listing's started label, with the same thresholds as
+// format_started in scripts/nested-sampling-runs.py, so a scanned row's age
+// reads the same as the one that replaces it.
+func ago(started, now time.Time) string {
+	age := now.Sub(started)
+	if age < 0 {
+		age = 0 // a stamp from the future is a skewed clock
+	}
+	switch {
+	case age < 90*time.Second:
+		return "just now"
+	case age < time.Hour:
+		return strconv.Itoa(int(age.Minutes())) + "m ago"
+	case age < 24*time.Hour:
+		return strconv.Itoa(int(age.Hours())) + "h ago"
+	default:
+		return strconv.Itoa(int(age.Hours()/24)) + "d ago"
+	}
 }
 
 // deleteRun removes a run and everything scored under it, which is why it

@@ -61,3 +61,6 @@ latex/*.toc
 
 # agents
 .claude
+
+# Go TUI build artefacts
+tui/.build/

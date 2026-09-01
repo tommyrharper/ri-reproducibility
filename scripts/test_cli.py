@@ -214,11 +214,44 @@ check(
     plan("health", "--monitor", "--interval", "10"),
 )
 
-check(
-    "tui runs the Go module in tui/",
-    ({}, [["go", "-C", "tui", "run", "."]]),
-    plan("tui"),
-)
+with tempfile.TemporaryDirectory() as tui_tmp:
+    # ./ri tui runs a binary named for the sources it was built from, so point
+    # those sources somewhere writable rather than at the real tui/.
+    saved_tui = ri.TUI_DIR, ri.TUI_BUILD_DIR
+    ri.TUI_DIR = tui_tmp
+    ri.TUI_BUILD_DIR = str(Path(tui_tmp) / ".build")
+    for name, body in (("main.go", "package main\n"), ("go.mod", "module ri-tui\n"),
+                       ("go.sum", ""), ("notes.txt", "not an input to the build\n")):
+        (Path(tui_tmp) / name).write_text(body)
+
+    binary = ri.tui_binary()
+    check(
+        "tui builds the Go module in tui/ when it has not been built yet",
+        ({}, [["mkdir", "-p", ri.TUI_BUILD_DIR],
+              ["go", "-C", "tui", "build", "-o", binary, "."],
+              ["find", ri.TUI_BUILD_DIR, "-name", "ri-tui-*",
+               "!", "-name", Path(binary).name, "-delete"],
+              [binary]]),
+        plan("tui"),
+    )
+
+    Path(ri.TUI_BUILD_DIR).mkdir()
+    Path(binary).touch()
+    check(
+        "tui runs the built binary without going near the Go toolchain",
+        ({}, [[binary]]),
+        plan("tui"),
+    )
+
+    (Path(tui_tmp) / "main.go").write_text("package main\n// edited\n")
+    check("an edited source is a different binary, so the stale one is not run",
+          False, ri.tui_binary() == binary)
+    edited = ri.tui_binary()
+    (Path(tui_tmp) / "notes.txt").write_text("still not an input\n")
+    check("a file the build does not read does not change the binary",
+          edited, ri.tui_binary())
+
+    ri.TUI_DIR, ri.TUI_BUILD_DIR = saved_tui
 
 check(
     "health sends a run and --all together rather than picking one",

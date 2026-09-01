@@ -2,6 +2,7 @@
 """Thin CLI dispatcher for the R2D2 and WSClean failure-mode searches."""
 
 import argparse
+import hashlib
 import os
 import shlex
 import subprocess
@@ -146,11 +147,47 @@ def do_health(args):
     return {}, [uv("scripts/nested-sampling-health.py", *flags)]
 
 
+# Where `./ri tui` keeps its built binary. Gitignored: it is a build artefact,
+# and it is named for the sources it came from, so it is never shared.
+TUI_DIR = os.path.join(REPO_ROOT, "tui")
+TUI_BUILD_DIR = os.path.join(TUI_DIR, ".build")
+
+
+def tui_binary():
+    """Where the TUI built from the current sources lives.
+
+    `go run` caches the compile, but still re-resolves the module graph on
+    every start, and that was most of the wait before the interface appeared.
+    The name is a digest of every input to the build, so a binary is only ever
+    reused for the sources that produced it - a stale one is not picked up,
+    it simply has a different name and gets built."""
+    digest = hashlib.sha256()
+    for name in sorted(os.listdir(TUI_DIR)):
+        if name.endswith((".go", ".mod", ".sum")):
+            with open(os.path.join(TUI_DIR, name), "rb") as f:
+                digest.update(f"{name}\0".encode() + f.read() + b"\0")
+    # A checkout shared between machines must not swap binaries between them.
+    digest.update(f"{sys.platform}\0{os.uname().machine}".encode())
+    return os.path.join(TUI_BUILD_DIR, "ri-tui-" + digest.hexdigest()[:16])
+
+
 def do_tui(args):
     # `go -C tui` rather than a go.mod at the repository root: the TUI is the
-    # only Go in here, and `go run` caches its build, so a second start is
-    # instant. It shells back into this script for everything it shows.
-    return {}, [["go", "-C", "tui", "run", "."]]
+    # only Go in here. It shells back into this script for everything it shows.
+    binary = tui_binary()
+    if os.path.exists(binary):
+        return {}, [[binary]]
+    # Building is the rare path, so it also clears out the binaries built from
+    # sources that are no longer current. Done as a command rather than here,
+    # because --dry-run prints what a handler returns without running it, and
+    # printing must not delete anything.
+    return {}, [
+        ["mkdir", "-p", TUI_BUILD_DIR],
+        ["go", "-C", "tui", "build", "-o", binary, "."],
+        ["find", TUI_BUILD_DIR, "-name", "ri-tui-*",
+         "!", "-name", os.path.basename(binary), "-delete"],
+        [binary],
+    ]
 
 
 def do_resume(args):

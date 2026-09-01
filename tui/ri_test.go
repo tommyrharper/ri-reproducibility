@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -388,6 +389,130 @@ func TestWatchingARunLoopsBackToTheTable(t *testing.T) {
 		escape()
 		if m.screen != screenRuns {
 			t.Fatalf("round %d: esc did not return to the table", round)
+		}
+	}
+}
+
+func TestScanRunsReadsNamesAndAgesOffDisk(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "results", "nested-sampling")
+	for name, artifact := range map[string]string{
+		"wsclean-vlaa-20260101T000000Z": "run.env",
+		"r2d2-vlaa-20260103T000000Z":    "chains",
+		"r2d2-vlaa-20260102T000000Z":    "summary.json",
+	} {
+		if err := os.MkdirAll(filepath.Join(parent, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if artifact == "chains" {
+			if err := os.Mkdir(filepath.Join(parent, name, artifact), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(parent, name, artifact), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A directory with none of the run artifacts is not a run, exactly as
+	// find_runs decides it in scripts/nested-sampling-runs.py.
+	if err := os.MkdirAll(filepath.Join(parent, "notes-20260104T000000Z"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runs := ri{root: root}.scanRuns()
+	var order []string
+	for _, run := range runs {
+		order = append(order, run.Name)
+	}
+	want := "r2d2-vlaa-20260103T000000Z,r2d2-vlaa-20260102T000000Z,wsclean-vlaa-20260101T000000Z"
+	if got := strings.Join(order, ","); got != want {
+		t.Errorf("scan out of order:\n got %s\nwant %s", got, want)
+	}
+	for _, run := range runs {
+		if !run.Preliminary {
+			t.Errorf("%s is not marked preliminary: %+v", run.Name, run)
+		}
+		if run.Path != filepath.Join("results", "nested-sampling", run.Name) {
+			t.Errorf("%s has the wrong path: %q", run.Name, run.Path)
+		}
+		if run.age() == "" {
+			t.Errorf("%s has no age: %q", run.Name, run.StartedLabel)
+		}
+	}
+}
+
+func TestScannedRunRefusesDeletion(t *testing.T) {
+	// A scan cannot tell a live run from a finished one, and "not known to be
+	// running" must never open the door to deleting one that is.
+	scanned := Run{Name: "r2d2-vlaa-20260101T000000Z", Preliminary: true}
+	err := scanned.deletable()
+	if err == nil {
+		t.Fatal("a preliminary run agreed to be deleted")
+	}
+	if !strings.Contains(err.Error(), "still loading") {
+		t.Errorf("unhelpful refusal: %v", err)
+	}
+	settled := Run{Name: "r2d2-vlaa-20260101T000000Z", Status: "complete"}
+	if err := settled.deletable(); err != nil {
+		t.Errorf("a listed complete run refused deletion: %v", err)
+	}
+}
+
+func TestScanFillsTheTableThenTheListingReplacesIt(t *testing.T) {
+	m := newModel(ri{root: t.TempDir()})
+	scanned := []Run{{Name: "r2d2-vlaa-20260101T000000Z", Preliminary: true,
+		StartedLabel: "(2h ago)"}}
+
+	updated, _ := m.Update(scanMsg{runs: scanned})
+	m = updated.(model)
+	if len(m.table.Rows()) != 1 {
+		t.Fatalf("the scan did not reach the table: %v", m.table.Rows())
+	}
+	row := m.table.Rows()[0]
+	if row[0] != "r2d2-vlaa-20260101T000000Z" || row[3] != "2h" {
+		t.Errorf("scanned row lost its name or age: %v", row)
+	}
+	// Everything the scan cannot know stays blank; a 0 in evals would read as
+	// a run that scored nothing.
+	for _, i := range []int{1, 2, 4, 5} {
+		if row[i] != "" {
+			t.Errorf("column %d should be blank until the listing lands: %q", i, row[i])
+		}
+	}
+
+	listed := []Run{{Name: "r2d2-vlaa-20260101T000000Z", Status: "complete",
+		Evaluations: 12, StartedLabel: "today 09:00 (2h ago)"}}
+	updated, _ = m.Update(runsMsg{runs: listed})
+	m = updated.(model)
+	row = m.table.Rows()[0]
+	if row[1] != "complete" || row[2] != "12" {
+		t.Errorf("the listing did not replace the scanned row: %v", row)
+	}
+
+	// A scan that lost the race must not put half-known rows back.
+	updated, _ = m.Update(scanMsg{runs: scanned})
+	m = updated.(model)
+	if row = m.table.Rows()[0]; row[1] != "complete" || row[2] != "12" {
+		t.Errorf("a late scan overwrote the listing: %v", row)
+	}
+}
+
+func TestAgoMatchesTheListingsThresholds(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		back time.Duration
+		want string
+	}{
+		{0, "just now"},
+		{89 * time.Second, "just now"},
+		{-time.Hour, "just now"}, // a stamp from the future is a skewed clock
+		{20 * time.Minute, "20m ago"},
+		{2 * time.Hour, "2h ago"},
+		{30 * 24 * time.Hour, "30d ago"},
+	} {
+		if got := ago(now.Add(-c.back), now); got != c.want {
+			t.Errorf("%v back: got %q, want %q", c.back, got, c.want)
 		}
 	}
 }
