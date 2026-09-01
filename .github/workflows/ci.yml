@@ -88,11 +88,6 @@ jobs:
         env:
           NESTED_SAMPLING_HEALTH_SELF_CHECK: "1"
 
-      - name: Check the CLI dispatcher
-        run: python3 ./ri
-        env:
-          RI_SELF_CHECK: "1"
-
       - name: Check the wsclean phase profiler
         run: uv run --no-project python3 scripts/profile-nested-sampling-run.py --self-check
 

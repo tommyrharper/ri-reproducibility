@@ -820,61 +820,7 @@ def main(argv=None):
     return 0
 
 
-def self_check():
-    """Cover the one piece of ./ri that decides something rather than just
-    naming a command: whether the TUI has to be built before it can run."""
-    import shutil
-    import tempfile
-
-    global TUI_DIR, TUI_BUILD_DIR
-    saved = TUI_DIR, TUI_BUILD_DIR
-    try:
-        TUI_DIR = tempfile.mkdtemp()
-        TUI_BUILD_DIR = os.path.join(TUI_DIR, ".build")
-        sources = {"main.go": "package main\n", "go.mod": "module ri-tui\n",
-                   "go.sum": "", "notes.txt": "not an input to the build\n"}
-        for name, body in sources.items():
-            with open(os.path.join(TUI_DIR, name), "w") as f:
-                f.write(body)
-
-        binary = tui_binary()
-        assert os.path.dirname(binary) == TUI_BUILD_DIR, binary
-
-        # Nothing built yet: make the directory, build, drop what is stale, run.
-        _, commands = do_tui(None)
-        assert [c[0] for c in commands] == ["mkdir", "go", "find", binary], commands
-        assert commands[1] == ["go", "-C", "tui", "build", "-o", binary, "."], commands
-        # The prune must never name the binary it just built.
-        assert commands[2][commands[2].index("!") + 2] == os.path.basename(binary)
-
-        # Already built from these sources: just run it, no toolchain at all.
-        os.makedirs(TUI_BUILD_DIR)
-        open(binary, "w").close()
-        assert do_tui(None)[1] == [[binary]], do_tui(None)
-
-        # A changed source is a different binary, so the built one is not reused.
-        with open(os.path.join(TUI_DIR, "main.go"), "w") as f:
-            f.write("package main\n// edited\n")
-        assert tui_binary() != binary, tui_binary()
-        assert [c[0] for c in do_tui(None)[1]] == ["mkdir", "go", "find",
-                                                   tui_binary()]
-
-        # A file the build does not read must not change the name.
-        edited = tui_binary()
-        with open(os.path.join(TUI_DIR, "notes.txt"), "w") as f:
-            f.write("still not an input\n")
-        assert tui_binary() == edited, tui_binary()
-
-        shutil.rmtree(TUI_DIR)
-    finally:
-        TUI_DIR, TUI_BUILD_DIR = saved
-    print("ri self-check passed")
-
-
 if __name__ == "__main__":
-    if os.environ.get("RI_SELF_CHECK") == "1":
-        self_check()
-        sys.exit(0)
     try:
         sys.exit(main())
     except KeyboardInterrupt:

@@ -54,6 +54,9 @@ type runsMsg struct {
 	err  error
 }
 
+// scanMsg carries the rows read straight off disk, which arrive first.
+type scanMsg struct{ runs []Run }
+
 type logMsg struct {
 	body string
 	err  error
@@ -161,7 +164,13 @@ func newModel(r ri) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadRuns(m.ri), tick())
+	// The scan lands in a millisecond or two and the listing a few hundred
+	// later, so the table has names and ages in it almost immediately.
+	return tea.Batch(scanRuns(m.ri), loadRuns(m.ri), tick())
+}
+
+func scanRuns(r ri) tea.Cmd {
+	return func() tea.Msg { return scanMsg{runs: r.scanRuns()} }
 }
 
 func tick() tea.Cmd {
@@ -287,6 +296,12 @@ func (m model) launchLogFor(name string) string {
 func (m *model) setRows() {
 	rows := []table.Row{}
 	for _, run := range m.visible() {
+		if run.Preliminary {
+			// Blank rather than zeroes: none of these are known yet, and a 0
+			// in the evals column would read as a run that scored nothing.
+			rows = append(rows, table.Row{run.Name, "", "", run.age(), "", ""})
+			continue
+		}
 		rows = append(rows, table.Row{
 			run.Name, run.Status, strconv.Itoa(run.Evaluations),
 			run.age(), run.objective(), run.ranges(true),
@@ -324,6 +339,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = loadRuns(m.ri)
 		}
 		return m, tea.Batch(cmd, tick())
+
+	case scanMsg:
+		// Only ever fills an empty table. The listing is authoritative, and a
+		// scan that lost the race must not put half-known rows back.
+		if len(m.runs) == 0 {
+			m.runs = msg.runs
+			m.setRows()
+		}
 
 	case runsMsg:
 		if msg.err != nil {
@@ -584,7 +607,10 @@ func (m model) runsView() string {
 	// only initials and truncate: this is where ldr reads as its own name.
 	if run, ok := m.selected(); ok {
 		detail := run.objective() + "  ·  " + run.ranges(false)
-		if run.objective() == "-" && len(run.Space) == 0 {
+		switch {
+		case run.Preliminary:
+			detail = "reading this run..."
+		case run.objective() == "-" && len(run.Space) == 0:
 			detail = "objective and parameter space not recorded"
 		}
 		lines = append(lines, helpStyle.Render(m.fit(detail)))
