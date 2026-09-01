@@ -180,8 +180,12 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
 def find_runs(running: set[str] | None = None) -> list[dict[str, object]]:
     if not NESTED_SAMPLING_DIR.is_dir():
         return []
+    # One ps for the whole listing, not one per run: inside the comprehension
+    # this cost a process spawn per directory, and dominated the listing.
+    if running is None:
+        running = running_run_dirs()
     runs = sorted([d for d in NESTED_SAMPLING_DIR.iterdir() if d.is_dir() and any((d / artifact).exists() for artifact in RUN_ARTIFACTS)], key=lambda d: (started_at(d), d.name), reverse=True)
-    return [describe(d, running if running is not None else running_run_dirs()) for d in runs]
+    return [describe(d, running) for d in runs]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -378,6 +382,18 @@ def self_check() -> None:
 
             assert {r["name"]: r for r in find_runs(running={str(done.resolve())})
                     }[done.name]["status"] == "complete"
+
+            # One ps for the whole listing: this used to run per run directory,
+            # and that spawn cost was what made ./ri runs - and so the TUI's
+            # first frame - slow once there were a few dozen runs.
+            saved_running, calls = running_run_dirs, []
+            running_run_dirs = lambda ps_output=None: (calls.append(1), live)[1]
+            try:
+                counted = find_runs()
+            finally:
+                running_run_dirs = saved_running
+            assert len(counted) > 1, counted
+            assert calls == [1], (len(calls), len(counted))
 
             rank = f"python3 /opt/ri-nested-sampling/polychord_r2d2.py --output-dir {stopped.resolve()} --nlive 50"
             ps_output = "\n".join([
