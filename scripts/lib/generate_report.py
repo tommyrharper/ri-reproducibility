@@ -2310,12 +2310,21 @@ PAGINATE_SCRIPT = """
 <script>
 (function () {
   var boxes = document.querySelectorAll("[data-page-size]");
-  Array.prototype.forEach.call(boxes, function (box) {
+  Array.prototype.forEach.call(boxes, function (box, boxIndex) {
     var size = parseInt(box.getAttribute("data-page-size"), 10);
     var items = Array.prototype.slice.call(box.children);
     if (!(size > 0) || items.length <= size) return;
     var pages = Math.ceil(items.length / size);
-    var page = 0;
+    // Following a link to the images or table page and back is a fresh load
+    // each time, so the page a reader was on is remembered for the tab. Private
+    // modes and file:// URLs can refuse storage, hence the guards.
+    var key = "pager:" + location.pathname + ":" + boxIndex;
+    function remember(value) {
+      try { sessionStorage.setItem(key, value); } catch (e) { /* storage off */ }
+    }
+    var stored = 0;
+    try { stored = parseInt(sessionStorage.getItem(key), 10) || 0; } catch (e) { stored = 0; }
+    var page = Math.min(Math.max(stored, 0), pages - 1);
 
     var JUMP = 10;
 
@@ -2361,6 +2370,7 @@ PAGINATE_SCRIPT = """
       buttons.forEach(function (button) {
         button.el.disabled = button.delta < 0 ? page === 0 : page === pages - 1;
       });
+      remember(page);
     }
     function go(delta) {
       page = Math.min(pages - 1, Math.max(0, page + delta));
