@@ -9,6 +9,9 @@ so their URL changes whenever their bytes do and they never need revalidating.
 
 import argparse
 import functools
+import hashlib
+import os
+import re
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 IMAGE_PREFIX = "/images/"
@@ -31,6 +34,27 @@ class ReportHandler(SimpleHTTPRequestHandler):
             IMMUTABLE if self.path.startswith(IMAGE_PREFIX) else PAGE_CACHE,
         )
         super().end_headers()
+
+
+# Same construction as generate_report.REPORT_VERSION, recomputed rather than
+# imported: that module pulls in common.py, which needs a newer Python than the
+# host may have, and serving must not depend on it.
+GENERATOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_report.py")
+PAGE_VERSION_RE = re.compile(r'<meta name="report-version" content="([0-9a-f]+)">')
+
+
+def stale_report_warning(directory, generator=GENERATOR):
+    """A line to print when the pages on disk predate the current generator."""
+    index = os.path.join(directory, "index.html")
+    if not (os.path.exists(index) and os.path.exists(generator)):
+        return None
+    with open(index, encoding="utf-8", errors="replace") as f:
+        head = f.read(4096)
+    match = PAGE_VERSION_RE.search(head)
+    current = hashlib.sha256(open(generator, "rb").read()).hexdigest()[:12]
+    if match and match.group(1) == current:
+        return None
+    return "note: these pages predate the current report code - run './ri report' to rebuild"
 
 
 def serve(bind, port, directory):
@@ -68,7 +92,26 @@ def self_check():
     assert page.headers["Cache-Control"] == PAGE_CACHE, page.headers.items()
     assert image.headers["Cache-Control"] == IMMUTABLE, image.headers.items()
     assert page.version == 11, page.version  # keep-alive, not a connection per file
-    print("ok report_server serves images immutable and pages briefly fresh")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        generator = os.path.join(tmp_dir, "generate_report.py")
+        with open(generator, "w") as f:
+            f.write("# pretend generator\n")
+        version = hashlib.sha256(open(generator, "rb").read()).hexdigest()[:12]
+        index = os.path.join(tmp_dir, "index.html")
+
+        def write_index(stamp):
+            with open(index, "w") as f:
+                f.write(f'<meta name="report-version" content="{stamp}">')
+
+        write_index(version)
+        assert stale_report_warning(tmp_dir, generator) is None
+        write_index("deadbeef0000")
+        assert stale_report_warning(tmp_dir, generator) is not None
+        os.remove(index)
+        assert stale_report_warning(tmp_dir, generator) is None
+
+    print("ok report_server serves images immutable, pages briefly fresh, warns when stale")
 
 
 def main(argv=None):
@@ -84,6 +127,9 @@ def main(argv=None):
         return
     if args.port is None or not args.directory:
         parser.error("port and --directory are required when serving")
+    warning = stale_report_warning(args.directory)
+    if warning:
+        print(warning, flush=True)
     serve(args.bind, args.port, args.directory)
 
 
