@@ -166,7 +166,13 @@ def do_report(args):
         env["FORCE"] = "1"
     if args.upgrade:
         env["UPGRADE"] = "1"
-    return env, [["scripts/generate-report.sh"]]
+    if not args.live:
+        return env, [["scripts/generate-report.sh"]]
+    env["LIVE"] = "1"
+    # Finding a run in progress reads the host's process table, and the report
+    # renders inside an image that has none, so the summaries a live run has
+    # no summary.json for are written out here first.
+    return env, [uv("scripts/live_runs.py"), ["scripts/generate-report.sh"]]
 
 
 def do_serve(args):
@@ -221,7 +227,10 @@ def do_plot_likelihood(args):
 
 
 def do_plot_gui(args):
-    return {}, [uv("scripts/anesthetic-gui.py", *([args.run] if args.run else []))]
+    # Both, when both were given: the script is the one place that says a run
+    # in progress cannot also be a named one.
+    selector = (["--live"] if args.live else []) + ([args.run] if args.run else [])
+    return {}, [uv("scripts/anesthetic-gui.py", *selector)]
 
 
 def do_fetch_checkpoints(args):
@@ -270,6 +279,8 @@ def build_parser():
             "  ./ri smoke                  # can the imagers actually image?\n"
             "  ./ri search wsclean         # run a search\n"
             "  ./ri report                 # one HTML page per run\n"
+            "  ./ri report --live          # ...including the run still going\n"
+            "  ./ri plot gui --live        # its samples, in anesthetic's GUI\n"
             "\n"
             "Defaults come from defaults.toml; an exported environment variable\n"
             "overrides those, and a flag here overrides both. --dry-run prints\n"
@@ -590,6 +601,11 @@ def build_parser():
     report.add_argument("--upgrade", action="store_true",
                         help="rebuild pages written by an older report version "
                              "[UPGRADE=1]")
+    report.add_argument("--live", action="store_true",
+                        help="report on the runs still going, from what they have "
+                             "written so far - a page per live run, marked live and "
+                             "rebuilt every time. Rerun it for a later picture "
+                             "[LIVE=1]")
 
     serve = add(
         "serve", do_serve, "read the HTML report from another machine",
@@ -721,6 +737,10 @@ def build_parser():
     plot_gui.add_argument("run", nargs="?", metavar="RUN",
                           help="run directory, chains/, or PolyChord file root "
                                "(default: the newest completed run)")
+    plot_gui.add_argument("--live", action="store_true",
+                          help="the run in progress instead. Its chains are copied "
+                               "and read as they stand, so the plot is a snapshot: "
+                               "close it and rerun for a later one")
     plot_gui.set_defaults(handler=do_plot_gui)
 
     # Everything else

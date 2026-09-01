@@ -42,6 +42,11 @@ MAX_STRIP_BARS = 120
 REPORT_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 REPORT_VERSION_RE = re.compile(r'<meta name="report-version" content="([0-9a-f]+)">')
 
+# A run still going has no summary.json - that file is what says "finished" to
+# every other reader - so scripts/live_runs.py writes this beside it instead.
+LIVE_SUMMARY_NAME = "summary.live.json"
+REPORT_LIVE_RE = re.compile(r'<meta name="report-live" content="1">')
+
 
 # Load plotting libraries only when rendering uncached PNGs; keep astropy and
 # PIL off the corner-plot path.
@@ -1375,6 +1380,7 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
         {duration_html}
       </div>
       <div class="badges">
+        {'<span class="badge badge-warn">live</span>' if summary.get('live') else ''}
         {'<span class="badge badge-ok">merged</span>' if summary.get('merged_from') else ''}
         <span class="badge">{html.escape(str(vla_config))}</span>
         <span class="badge">nlive {html.escape(str(polychord.get('nlive', '?')))}</span>
@@ -1885,14 +1891,17 @@ table.ns-compare-table tbody th { opacity: 0.65; font-weight: normal; }
 
 
 def resolve_nested_sampling_summary(run):
-    """Accept a run dir, summary.json path, or directory name under nested-sampling/."""
+    """Accept a run dir, summary.json path, or directory name under nested-sampling/.
+
+    A run still going has only a live summary, so an explicit `--run` falls back
+    to that rather than refusing to report on the run the caller named.
+    """
     raw = Path(run)
-    name = raw.parent.name if raw.name == "summary.json" else raw.name
-    candidates = []
-    if raw.name == "summary.json":
-        candidates.append(raw)
-    candidates.append(raw / "summary.json")
-    candidates.append(Path(NESTED_SAMPLING_DIR) / name / "summary.json")
+    named = raw.name in ("summary.json", LIVE_SUMMARY_NAME)
+    name = raw.parent.name if named else raw.name
+    candidates = [raw] if named else []
+    for directory in (raw, Path(NESTED_SAMPLING_DIR) / name):
+        candidates += [directory / "summary.json", directory / LIVE_SUMMARY_NAME]
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
@@ -1913,15 +1922,27 @@ def summary_is_complete(summary_path):
         return False
 
 
-def nested_sampling_run_paths(limit=None, run=None):
-    """summary.json paths, newest first, optionally filtered to one run or newest N."""
+def nested_sampling_run_paths(limit=None, run=None, live=False):
+    """Summary paths, newest first, optionally filtered to one run or newest N.
+
+    One per run: a finished run's own summary.json wins over the live summary
+    left behind by whatever `./ri report --live` last wrote, so the two never
+    fight over the run's single page. `live=True` keeps only the runs that have
+    nothing but a live summary.
+    """
     if run:
         return [resolve_nested_sampling_summary(run)]
-    paths = sorted(
-        (p for p in glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*", "summary.json"))
-         if summary_is_complete(p)),
-        key=nested_sampling_run_sort_key,
-    )
+    paths = []
+    for run_dir in glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*")):
+        final = os.path.join(run_dir, "summary.json")
+        if summary_is_complete(final):
+            if not live:
+                paths.append(final)
+            continue
+        live_path = os.path.join(run_dir, LIVE_SUMMARY_NAME)
+        if summary_is_complete(live_path):
+            paths.append(live_path)
+    paths.sort(key=nested_sampling_run_sort_key)
     return paths[:limit] if limit is not None else paths
 
 
@@ -1947,6 +1968,12 @@ def page_status(out_dir, run_name):
             head = f.read(2048)
     except OSError:
         return "outdated"
+    if REPORT_LIVE_RE.search(head):
+        # The page is there, but it was built from a run that was still going -
+        # so it was stale before it finished being written, and once the run
+        # ends the real summary has to replace it without anyone passing
+        # --force. Its own status, because "rebuild me" is not "not there".
+        return "live"
     match = REPORT_VERSION_RE.search(head)
     return "current" if match and match.group(1) == REPORT_VERSION else "outdated"
 
@@ -2002,6 +2029,8 @@ def render_index_entry(summary_path, status):
     duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>' if duration_label else ""
 
     badges = []
+    if summary.get("live"):
+        badges.append('<span class="badge badge-warn">live</span>')
     if is_merged:
         badges.append('<span class="badge badge-ok">merged</span>')
     badges.append(f'<span class="badge">{html.escape(str(summary.get("vla_config", "?")))}</span>')
@@ -2290,10 +2319,22 @@ INDEX_SCRIPT = """
 
 
 def unfinished_run_names():
+    """Runs with no page below, because nothing readable summarises them.
+
+    A run with a live summary is excluded: it has a page, and this section's
+    whole point is the runs that do not. Whether one of those is still going or
+    stopped is a question about the host's processes, which `./ri runs` answers
+    and a report rendered inside a container cannot.
+    """
     names = []
     for path in sorted(glob.glob(os.path.join(NESTED_SAMPLING_DIR, "*")), reverse=True):
-        if os.path.isdir(path) and not summary_is_complete(os.path.join(path, "summary.json")):
-            names.append(os.path.basename(path))
+        if not os.path.isdir(path):
+            continue
+        if summary_is_complete(os.path.join(path, "summary.json")):
+            continue
+        if summary_is_complete(os.path.join(path, LIVE_SUMMARY_NAME)):
+            continue
+        names.append(os.path.basename(path))
     return names
 
 
@@ -2438,12 +2479,13 @@ PAGINATE_SCRIPT = """
 """
 
 
-def write_html_doc(out_path, title, subtitle, body):
+def write_html_doc(out_path, title, subtitle, body, live=False):
     html_doc = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="report-version" content="{REPORT_VERSION}">
+{'<meta name="report-live" content="1">' if live else ''}
 <title>{html.escape(title)}</title>
 <style>{CSS}</style>
 </head>
@@ -2465,6 +2507,9 @@ def parse_args(argv=None):
     parser.add_argument("out_path", nargs="?", help="Output directory for the report pages.")
     parser.add_argument("--limit", type=int, help="Newest N runs (timestamp sort). Omit for all.")
     parser.add_argument("--run", help="One run directory or name under nested-sampling/.")
+    parser.add_argument("--live", action="store_true",
+                        help="Only the runs still going, from the summary.live.json "
+                             "scripts/live_runs.py writes for them.")
     parser.add_argument("--force", action="store_true", help="Rebuild run pages that already exist.")
     parser.add_argument("--upgrade", action="store_true",
                         help="Rebuild pages written by an older report version, leaving up-to-date ones alone.")
@@ -2495,27 +2540,38 @@ def likelihood_task(item):
 
 def write_run_page(item, body, images_body, evaluations_body):
     run_name = item[2]
+    source = os.path.basename(item[0])
+    live = source == LIVE_SUMMARY_NAME
     assert LIKELIHOOD_SLOT not in body, "likelihood slot was never filled in"
+    subtitle = (
+        f"Generated from <code>results/nested-sampling/{html.escape(run_name)}/"
+        f"{source}</code>."
+    )
+    if live:
+        subtitle += (
+            " The run was still going: this is what it had written by then, and "
+            "<code>./ri report --live</code> rebuilds it."
+        )
     write_html_doc(
         item[1],
         title=f"nested-sampling run: {run_name}",
-        subtitle=(
-            f"Generated from <code>results/nested-sampling/{html.escape(run_name)}/"
-            "summary.json</code>."
-        ),
+        subtitle=subtitle,
         body=body,
+        live=live,
     )
     write_html_doc(
         os.path.join(os.path.dirname(item[1]), run_images_page_name(run_name)),
         title=f"nested-sampling images: {run_name}",
         subtitle="One reconstruction per evaluation, best objective first.",
         body=images_body,
+        live=live,
     )
     write_html_doc(
         os.path.join(os.path.dirname(item[1]), run_evaluations_page_name(run_name)),
         title=f"nested-sampling evaluations: {run_name}",
         subtitle="Every evaluation's parameters and metrics, best objective first.",
         body=evaluations_body,
+        live=live,
     )
 
 
@@ -2530,17 +2586,21 @@ def main(argv=None):
         raise SystemExit("refuse: --limit and --run cannot be used together")
     if limit is not None and limit < 1:
         raise SystemExit("--limit must be >= 1")
+    if args.live and (limit is not None or run):
+        raise SystemExit("refuse: --live selects the runs still going, so it "
+                         "cannot be combined with --limit or --run")
     os.makedirs(out_dir, exist_ok=True)
     global image_dir
     image_dir = os.path.join(out_dir, IMAGE_SUBDIR)
 
-    # An explicit --run is a deliberate "rebuild this one" request.
-    force = args.force or bool(run)
+    # An explicit --run is a deliberate "rebuild this one" request, and so is
+    # --live: the run has moved on since whatever is on disk was written.
+    force = args.force or bool(run) or args.live
     skipped = 0
     outdated = 0
     drawing = False
     todo = []
-    for summary_path in nested_sampling_run_paths(limit=limit, run=run):
+    for summary_path in nested_sampling_run_paths(limit=limit, run=run, live=args.live):
         run_name = os.path.basename(os.path.dirname(summary_path))
         page_path = os.path.join(out_dir, run_page_name(run_name))
         status = page_status(out_dir, run_name)
@@ -2551,9 +2611,10 @@ def main(argv=None):
             outdated += 1
             skipped += 1
             continue
+        # A "live" page is never skipped: whatever it shows, the run has moved on.
         todo.append((summary_path, page_path, run_name))
         # Preload matplotlib before forking; defer astropy and PIL until plots run.
-        if status == "missing":
+        if status in ("missing", "live"):
             drawing = True
             load_plot_libs()
 
@@ -2712,6 +2773,64 @@ def _self_check_page_status():
         f.write("<!doctype html><html><head><title>old</title></head></html>")
     assert page_status(tmp_dir, "run-b") == "outdated"
     shutil.rmtree(tmp_dir)
+
+
+def _self_check_live_summary():
+    import shutil
+    import tempfile
+
+    global NESTED_SAMPLING_DIR
+    saved = NESTED_SAMPLING_DIR
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    try:
+        NESTED_SAMPLING_DIR = tmp_dir
+        going = os.path.join(tmp_dir, "wsclean-vlaa-20260101T000000Z")
+        os.makedirs(going)
+        live_path = os.path.join(going, LIVE_SUMMARY_NAME)
+        with open(live_path, "w") as f:
+            json.dump({"algorithm": "wsclean", "live": True, "evaluations": []}, f)
+
+        assert nested_sampling_run_paths() == [live_path], nested_sampling_run_paths()
+        assert nested_sampling_run_paths(live=True) == [live_path]
+        assert resolve_nested_sampling_summary(going) == live_path
+        assert resolve_nested_sampling_summary("wsclean-vlaa-20260101T000000Z") == live_path
+
+        # The finished run's own summary takes the run's single page back, and
+        # the live one it was built from is no longer offered anywhere.
+        final_path = os.path.join(going, "summary.json")
+        with open(final_path, "w") as f:
+            json.dump({"algorithm": "wsclean", "evaluations": []}, f)
+        assert nested_sampling_run_paths() == [final_path], nested_sampling_run_paths()
+        assert nested_sampling_run_paths(live=True) == []
+        assert resolve_nested_sampling_summary(going) == final_path
+
+        # A live page always rebuilds: it was stale when written, and nothing
+        # else would let the finished summary replace it without --force. It is
+        # not "missing" though - the index links it, rather than offering to
+        # generate the page it is already showing.
+        page = os.path.join(tmp_dir, run_page_name("run-a"))
+        write_html_doc(page, "t", "s", "<p>b</p>", live=True)
+        assert page_status(tmp_dir, "run-a") == "live", page_status(tmp_dir, "run-a")
+        write_html_doc(page, "t", "s", "<p>b</p>")
+        assert page_status(tmp_dir, "run-a") == "current", page_status(tmp_dir, "run-a")
+
+        # And it is not one of the runs the index says has no page.
+        assert unfinished_run_names() == [], unfinished_run_names()
+        os.makedirs(os.path.join(tmp_dir, "wsclean-vlaa-20260102T000000Z"))
+        assert unfinished_run_names() == ["wsclean-vlaa-20260102T000000Z"], \
+            unfinished_run_names()
+
+        # The live badge is what tells a reader the numbers are not final, and
+        # the card is a link to the page rather than an offer to build it.
+        card, _, _ = render_index_entry(live_path, "live")
+        assert '<span class="badge badge-warn">live</span>' in card, card
+        assert "Page not generated yet" not in card, card
+        assert f'href="{run_page_name("wsclean-vlaa-20260101T000000Z")}"' in card, card
+        assert '"badge badge-warn">live' in render_nested_sampling_run(
+            live_path, likelihood_html=""), "run page carries the badge too"
+    finally:
+        NESTED_SAMPLING_DIR = saved
+        shutil.rmtree(tmp_dir)
 
 
 def _self_check_torn_summary():
@@ -3408,6 +3527,7 @@ if __name__ == "__main__":
         _self_check_page_status()
         _self_check_index_toolbar()
         _self_check_torn_summary()
+        _self_check_live_summary()
         _self_check_parameter_space_section()
         _self_check_tick_housekeeping()
         _self_check_shared_axes_dedupe()

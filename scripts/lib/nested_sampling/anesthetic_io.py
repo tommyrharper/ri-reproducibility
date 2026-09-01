@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -101,19 +104,89 @@ def _resolve_source_run_dir(run_dir: Path, entry: Any) -> Path:
     )
 
 
+def whole_rows(data: bytes) -> bytes:
+    """The rows of a chain file that were finished being written.
+
+    A run still going appends to these as they are read, so the last row can be
+    half a line - and numpy refuses a file whose column count changes at all,
+    so one torn row loses the whole chain.
+    """
+    lines = data.split(b"\n")
+    lines.pop()  # the tail after the last newline: empty, or a row mid-write
+    rows = [line for line in lines if line.strip()]
+    if not rows:
+        return b""
+    width = len(rows[0].split())
+    return b"\n".join(row for row in rows if len(row.split()) == width) + b"\n"
+
+
+def _copy_chain_files(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for path in sorted(src.iterdir()):
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        # Only the tables: .stats, .paramnames and .prior_info are not rows of
+        # numbers, and nothing appends to them mid-run.
+        (dst / path.name).write_bytes(
+            whole_rows(data) if path.suffix == ".txt" else data
+        )
+
+
+def _scratch_dir(prefix: str) -> Path:
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    atexit.register(shutil.rmtree, path, ignore_errors=True)
+    return path
+
+
+def snapshot_chains(run_dir: Path) -> Path:
+    """Copy a run's chains aside, and return the run directory to read instead.
+
+    Two reasons not to read a live run in place: PolyChord is still writing
+    these files, and a reader that writes its own .paramnames beside the chain
+    root - the sample viewer does - would be writing into a running search.
+    """
+    run_dir = Path(run_dir)
+    if not (run_dir / "chains").is_dir():
+        raise SystemExit(f"No chains/ under {run_dir} yet; the run has not written any.")
+    snapshot = _scratch_dir("ri-live-run-") / run_dir.name
+    _copy_chain_files(run_dir / "chains", snapshot / "chains")
+    for name in ("summary.json", "parameter-space.json"):
+        if (path := run_dir / name).is_file():
+            (snapshot / name).write_bytes(path.read_bytes())
+    return snapshot
+
+
+def snapshot_chain_root(chain_root: Path) -> Path:
+    """The same copy, addressed by chain root rather than run directory."""
+    snapshot = _scratch_dir("ri-live-chains-")
+    _copy_chain_files(chain_root.parent, snapshot)
+    return snapshot / chain_root.name
+
+
 def read_chains_at(chain_root: Path):
     import warnings
 
     from anesthetic import read_chains
 
-    with hide_empty_phys_live_birth(chain_root):
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r"loadtxt: input contained no data:.*_phys_live-birth\.txt",
-                category=UserWarning,
-            )
-            return read_chains(str(chain_root))
+    def read(root: Path):
+        with hide_empty_phys_live_birth(root):
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"loadtxt: input contained no data:.*_phys_live-birth\.txt",
+                    category=UserWarning,
+                )
+                return read_chains(str(root))
+
+    try:
+        return read(chain_root)
+    except ValueError:
+        # What a chain caught mid-write raises, and every caller here can meet
+        # one: the report and the viewer both read runs that are still going.
+        # Retry on a copy with the torn row dropped rather than give up on the
+        # whole chain for one incomplete line.
+        return read(snapshot_chain_root(chain_root))
 
 
 def _mathtext_label(tex: str) -> str:

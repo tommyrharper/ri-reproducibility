@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build report in r2d2 image. `LAST=1`, `RUN=...`, `UPGRADE=1`, and `FORCE=1`
-# select rebuilds; index always rebuilds. Outputs go under reports/.
+# Build report in r2d2 image. `LAST=1`, `RUN=...`, `LIVE=1`, `UPGRADE=1`, and
+# `FORCE=1` select rebuilds; index always rebuilds. Outputs go under reports/.
 # Container cleanup is asynchronous because `docker run --rm` blocks on teardown.
 set -euo pipefail
 
@@ -13,9 +13,15 @@ LIMIT="${LAST:-}"
 RUN_SEL="${RUN:-}"
 FORCE_SEL="${FORCE:-}"
 UPGRADE_SEL="${UPGRADE:-}"
+LIVE_SEL="${LIVE:-}"
 
 if [[ -n "${LIMIT}" && -n "${RUN_SEL}" ]]; then
   echo "refuse: LAST= and RUN= cannot be used together" >&2
+  exit 1
+fi
+
+if [[ -n "${LIVE_SEL}" && ( -n "${LIMIT}" || -n "${RUN_SEL}" ) ]]; then
+  echo "refuse: LIVE= selects the runs still going, so it cannot be used with LAST= or RUN=" >&2
   exit 1
 fi
 
@@ -35,6 +41,12 @@ if [[ -n "${FORCE_SEL}" ]]; then
 fi
 if [[ -n "${UPGRADE_SEL}" ]]; then
   REPORT_ARGS+=(--upgrade)
+fi
+# The summaries themselves are written on the host by scripts/live_runs.py -
+# finding a run in progress needs `ps`, and this container has no host process
+# table - so ./ri report --live runs that first.
+if [[ -n "${LIVE_SEL}" ]]; then
+  REPORT_ARGS+=(--live)
 fi
 
 # The report is matplotlib rasters, not linear algebra: multi-threaded BLAS buys

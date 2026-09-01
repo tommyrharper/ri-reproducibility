@@ -37,6 +37,27 @@ host
 own timer) instead of printing once, so watching a run does not fill the
 terminal with one scrollback entry per poll. Ctrl-C to stop.
 
+## Seeing what it has found so far
+
+This report says whether a run is healthy, not what it is finding. For that:
+
+```bash
+./ri report --live     # an HTML page per live run, marked live in the index
+./ri plot gui --live   # its samples in anesthetic's GUI
+```
+
+Neither waits for the run to finish, and neither disturbs it. A finished run
+writes `summary.json`, which every other reader treats as the marker that it is
+over; a run still going has none, so `./ri report --live` writes what it has so
+far to `summary.live.json` beside it and reports from that. The page is rebuilt
+on every `./ri report`, and the run's own summary replaces it once it finishes.
+
+The GUI reads a copy of the chains rather than the run's, both because
+PolyChord is still appending to them - a row caught half-written would
+otherwise lose the whole chain - and because the viewer writes a `.paramnames`
+of its own next to whatever it opens. Neither view updates on its own: rerun
+for a later picture.
+
 ## Which runs it reports on
 
 With no argument, reports every active run on this host - ranks or `docker exec`

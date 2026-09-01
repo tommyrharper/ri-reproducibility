@@ -252,6 +252,15 @@ check(
 )
 
 check(
+    # The summaries are written on the host because finding a run in progress
+    # reads its process table, which the rendering container does not have.
+    "report --live writes the live summaries before the report is built",
+    ({"LIVE": "1"},
+     [["uv", "run", "scripts/live_runs.py"], ["scripts/generate-report.sh"]]),
+    plan("report", "--live"),
+)
+
+check(
     "serve overrides only what was asked for",
     ({"REPORT_PORT": "9000"}, [["scripts/serve-report.sh"]]),
     plan("serve", "--port", "9000"),
@@ -382,6 +391,20 @@ check(
     "nested plot subcommands dispatch",
     [["uv", "run", "scripts/anesthetic-gui.py", "results/x"]],
     plan("plot", "gui", "results/x")[1],
+)
+
+check(
+    "plot gui --live asks for the run in progress",
+    [["uv", "run", "scripts/anesthetic-gui.py", "--live"]],
+    plan("plot", "gui", "--live")[1],
+)
+
+check(
+    # Neither is dropped: refusing the pair is the viewer's job, and a silently
+    # ignored run argument would plot a different run than the one named.
+    "plot gui --live with a named run leaves both for the viewer to refuse",
+    [["uv", "run", "scripts/anesthetic-gui.py", "--live", "results/x"]],
+    plan("plot", "gui", "--live", "results/x")[1],
 )
 
 check(
