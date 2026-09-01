@@ -88,6 +88,18 @@ jobs:
         env:
           NESTED_SAMPLING_HEALTH_SELF_CHECK: "1"
 
+      # Also shells out to `ps`, through the listing above, and builds the
+      # summary a run in progress has no summary.json for.
+      - name: Check the live-run summaries
+        run: uv run --no-project python3 scripts/live_runs.py
+        env:
+          LIVE_RUNS_SELF_CHECK: "1"
+
+      - name: Check the sample viewer
+        run: uv run --no-project python3 scripts/anesthetic-gui.py
+        env:
+          ANESTHETIC_GUI_SELF_CHECK: "1"
+
       - name: Check the wsclean phase profiler
         run: uv run --no-project python3 scripts/profile-nested-sampling-run.py --self-check
 

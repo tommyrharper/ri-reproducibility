@@ -36,5 +36,25 @@ the complete interface.
 ./ri clean                        # remove generated outputs and repo images
 ```
 
+## Figures and samples
+
+```bash
+./ri plot gui                     # interactive corner plots of the newest run
+./ri plot gui results/nested-sampling/<run>
+./ri plot fits                    # render FITS images to PNG in results/
+./ri plot likelihood              # R2D2 vs WSClean failure-score figures
+```
+
+## Watching the run that is going
+
+```bash
+./ri health results/nested-sampling/<run>   # is it healthy, and where is it
+./ri report --live                # an HTML page per live run, marked live
+./ri plot gui --live              # its samples so far, as a snapshot
+```
+
+Both read what the run has written so far, and neither disturbs it. Rerun
+either one for a later picture; nothing updates on its own.
+
 Details: [nested sampling](nested-sampling.md), [run health](run-health.md),
 [robustness](robustness.md), [performance](nested-sampling-speed.md).

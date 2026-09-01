@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from anesthetic_io import PARAMETER_TEX_LABELS, find_chain_root, load_nested_samples  # noqa: E402
+from anesthetic_io import (  # noqa: E402
+    PARAMETER_TEX_LABELS,
+    find_chain_root,
+    load_nested_samples,
+    snapshot_chains,
+    whole_rows,
+)
+from live_runs import latest_live_run  # noqa: E402
 
 FALLBACK_PARAMETER_SPACE = [
     {"name": "log10_dynamic_range"},
@@ -33,7 +42,16 @@ def parse_args() -> argparse.Namespace:
         help="Run directory, run name, chains/ directory, or PolyChord file root. "
         "Default: most recent completed results/nested-sampling/*/ ",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="The run in progress, rather than the most recent completed one. "
+        "Its chains are a snapshot taken now; close and reopen for a later one.",
+    )
+    args = parser.parse_args()
+    if args.live and args.target:
+        parser.error("--live picks the run in progress, so it takes no run argument")
+    return args
 
 
 def is_completed_run(run_dir: Path) -> bool:
@@ -88,7 +106,14 @@ def write_paramnames(chain_root: Path, parameter_space: list[dict[str, Any]]) ->
 
 def main() -> None:
     args = parse_args()
-    target = resolve_target(Path(args.target)) if args.target else latest_run_dir()
+    if args.live:
+        live_run = latest_live_run()
+        target = snapshot_chains(live_run)
+        print(f"live run: {live_run}")
+    elif args.target:
+        target = resolve_target(Path(args.target))
+    else:
+        target = latest_run_dir()
 
     summary_path = target / "summary.json"
     run_dir = None
@@ -115,6 +140,10 @@ def main() -> None:
             parts.append(" · ".join(meta))
     else:
         parts.append(chain_root.name if chain_root else run_dir.name)
+    if args.live:
+        # The window is the only place this is said, and a corner plot of a
+        # run that is still moving looks exactly like a finished one.
+        parts.append("live snapshot")
     title = " — ".join(parts)
 
     if chain_root is not None:
@@ -144,5 +173,44 @@ def main() -> None:
     plt.show()
 
 
+def self_check() -> None:
+    import tempfile
+
+    # A row caught mid-write is short, and one short row is enough for numpy to
+    # refuse the file - which is the whole reason a live run is read from a
+    # copy rather than in place.
+    assert whole_rows(b"1 2 3\n4 5 6\n") == b"1 2 3\n4 5 6\n"
+    assert whole_rows(b"1 2 3\n4 5 6\n7 8") == b"1 2 3\n4 5 6\n"
+    assert whole_rows(b"1 2 3\n4 5\n6 7 8\n") == b"1 2 3\n6 7 8\n"
+    assert whole_rows(b"") == b""
+    assert whole_rows(b"\n") == b""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "wsclean-vlaa-20260101T000000Z"
+        (run_dir / "chains").mkdir(parents=True)
+        (run_dir / "chains" / "root_dead-birth.txt").write_bytes(b"1 2\n3 4\n5")
+        (run_dir / "chains" / "root.stats").write_bytes(b"log(Z) = -1\n")
+        (run_dir / "parameter-space.json").write_text('[{"name": "channel_count"}]')
+
+        snapshot = snapshot_chains(run_dir)
+        assert snapshot != run_dir and tmp not in str(snapshot), snapshot
+        assert (snapshot / "chains" / "root_dead-birth.txt").read_bytes() == b"1 2\n3 4\n"
+        # Anything that is not a table of rows is copied as it stands.
+        assert (snapshot / "chains" / "root.stats").read_bytes() == b"log(Z) = -1\n"
+        assert load_parameter_space(snapshot) == [{"name": "channel_count"}]
+
+        # The run itself is never written to: the GUI's .paramnames lands in
+        # the copy, beside chains PolyChord is not appending to.
+        write_paramnames(snapshot / "chains" / "root", load_parameter_space(snapshot))
+        assert (snapshot / "chains" / "root.paramnames").is_file()
+        assert not (run_dir / "chains" / "root.paramnames").exists()
+        assert sorted(p.name for p in (run_dir / "chains").iterdir()) == [
+            "root.stats", "root_dead-birth.txt"]
+    print("anesthetic-gui self-check passed")
+
+
 if __name__ == "__main__":
-    main()
+    if os.environ.get("ANESTHETIC_GUI_SELF_CHECK") == "1":
+        self_check()
+    else:
+        main()
