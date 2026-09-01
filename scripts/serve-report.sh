@@ -32,8 +32,11 @@ if [[ "${BIND}" == "127.0.0.1" || "${BIND}" == "localhost" || "${BIND}" == "::1"
   SSH_HOST="${REPORT_SSH_HOST:-$(whoami)@${ADDRESS:-$(hostname)}}"
   echo
   echo "On your local machine:"
-  echo "    ssh -N -L ${PORT}:$(bracketed "${BIND}"):${PORT} ${SSH_HOST}"
+  echo "    ssh -NC -L ${PORT}:$(bracketed "${BIND}"):${PORT} ${SSH_HOST}"
   echo "then open http://localhost:${PORT}/"
+  echo
+  echo "(-C compresses the tunnel; the report is plain HTML and a large"
+  echo " evaluations table drops from ~720K to ~105K over the wire.)"
 else
   echo
   echo "Open http://$(bracketed "${BIND}"):${PORT}/ - the report is unauthenticated,"
