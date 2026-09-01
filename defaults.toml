@@ -95,7 +95,7 @@ NS_WSCLEAN_MGAIN = 0.8
 # threshold; each record's `clean_stop_reason` says which of the two ended it,
 # so the question is now answerable from the summary rather than the logs.
 # Costs imaging time: deconvolution was ~7% of an evaluation at 100.
-NS_WSCLEAN_NITER = 1000
+NS_WSCLEAN_NITER = 10000
 
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
