@@ -1125,7 +1125,33 @@ def render_parameter_space_section(parameter_space):
 NO_IMAGE = '<span class="empty" title="no image retained for this evaluation">—</span>'
 
 
-def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120, off_page=False):
+def paginate(items, page_size, container_html):
+    """Wrap `container_html` (holding page one) with the rest as script text.
+
+    Off-page markup used to ship as hidden DOM, which the browser still had to
+    build: a 2291-row table cost 50,000 nodes on every visit, cache hit or not.
+    Parked in a script element the same rows cost one node until the reader
+    asks for them.
+    """
+    if len(items) <= page_size:
+        return container_html
+    blobs = []
+    for start in range(page_size, len(items), page_size):
+        chunk = "".join(items[start:start + page_size])
+        # Only our own markup could close the script early; escape it anyway.
+        blobs.append(
+            '<script type="text/html" class="pager-page">'
+            + chunk.replace("</script", "<\\/script")
+            + "</script>"
+        )
+    note = (
+        '<noscript><p class="purpose">JavaScript is off, so only the first '
+        f"{page_size} of {len(items)} are shown.</p></noscript>"
+    )
+    return f'<div class="paginated">{container_html}{note}{"".join(blobs)}</div>'
+
+
+def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120):
     if not image_path:
         return NO_IMAGE
     recon_uri = render_fits_image(image_path, figsize=figsize, dpi=dpi)
@@ -1133,8 +1159,7 @@ def render_eval_recon(image_path, eval_id, figsize=(2.8, 2.8), dpi=120, off_page
         return NO_IMAGE
     return (
         f'<figure class="eval-recon">'
-        f'<img {"data-src" if off_page else "src"}="{recon_uri}" '
-        f'alt="eval {html.escape(str(eval_id))} reconstruction">'
+        f'<img src="{recon_uri}" alt="eval {html.escape(str(eval_id))} reconstruction">'
         f'<figcaption>recon</figcaption></figure>'
     )
 
@@ -1161,7 +1186,7 @@ def render_shared_truth_image(image_path, source_flux_jy, figsize=(3.2, 3.2), dp
     )
 
 
-def render_eval_card(ev, parameter_space, run_dirs, metric, is_best, off_page=False):
+def render_eval_card(ev, parameter_space, run_dirs, metric, is_best):
     eval_id = ev.get("eval_id", "?")
     params = ev.get("params") or {}
     image_path = resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
@@ -1172,9 +1197,9 @@ def render_eval_card(ev, parameter_space, run_dirs, metric, is_best, off_page=Fa
         for spec in parameter_space
         if (name := spec.get("name")) and (value := params.get(name)) is not None
     )
-    recon_html = render_eval_recon(image_path, eval_id, off_page=off_page)
+    recon_html = render_eval_recon(image_path, eval_id)
     return f"""
-    <article class="eval-card{best_class}"{" hidden" if off_page else ""}>
+    <article class="eval-card{best_class}">
       <header class="eval-card-header">
         <span class="eval-card-id">#{html.escape(str(eval_id))}</span>
         <span class="eval-card-objective">{metric_label} <strong>{fmt_value(ev.get('objective'))}</strong></span>
@@ -1294,18 +1319,14 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
 
     best_eval_id = best.get("eval_id")
     cards = [
-        render_eval_card(
-            ev,
-            parameter_space,
-            run_dirs,
-            metric,
-            ev.get("eval_id") == best_eval_id,
-            off_page=index >= IMAGES_PER_PAGE,
-        )
-        for index, ev in enumerate(shown)
+        render_eval_card(ev, parameter_space, run_dirs, metric, ev.get("eval_id") == best_eval_id)
+        for ev in shown
     ]
-    cards_html = (
-        f'<div class="eval-gallery" data-page-size="{IMAGES_PER_PAGE}">{"".join(cards)}</div>'
+    cards_html = paginate(
+        cards,
+        IMAGES_PER_PAGE,
+        f'<div class="eval-gallery" data-page-size="{IMAGES_PER_PAGE}"'
+        f' data-item-count="{len(cards)}">{"".join(cards[:IMAGES_PER_PAGE])}</div>',
     )
     note = ""
     if len(shown) != len(evaluations):
@@ -1490,25 +1511,33 @@ def render_eval_table(evaluations, param_names, metric_keys):
         + "<th>objective</th></tr>"
     )
     rows = []
-    for index, ev in enumerate(evaluations):
+    for ev in evaluations:
         params = ev.get("params", {})
         metrics = ev.get("metrics", {})
         rows.append(
-            ("<tr hidden>" if index >= EVALS_PER_PAGE else "<tr>")
+            "<tr>"
             + f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
             + "".join(f"<td>{fmt_value(params.get(name))}</td>" for name in param_names)
             + "".join(f"<td>{fmt_value(metrics.get(key))}</td>" for key in metric_keys)
             + f"<td>{fmt_value(ev.get('objective'))}</td>"
             "</tr>"
         )
-    return f"""
+    # The <script> blobs cannot live inside <table>: the parser would hoist
+    # them out. paginate() puts them after the wrapper instead.
+    return paginate(
+        rows,
+        EVALS_PER_PAGE,
+        f"""
     <div class="eval-table-wrap">
       <table class="eval-table">
         <thead>{header}</thead>
-        <tbody data-page-size="{EVALS_PER_PAGE}">{"".join(rows)}</tbody>
+        <tbody data-page-size="{EVALS_PER_PAGE}" data-item-count="{len(rows)}">
+          {"".join(rows[:EVALS_PER_PAGE])}
+        </tbody>
       </table>
     </div>
-    """
+    """,
+    )
 
 
 def render_run_evaluations_page(summary_path):
@@ -2334,9 +2363,15 @@ PAGINATE_SCRIPT = """
   var boxes = document.querySelectorAll("[data-page-size]");
   Array.prototype.forEach.call(boxes, function (box, boxIndex) {
     var size = parseInt(box.getAttribute("data-page-size"), 10);
-    var items = Array.prototype.slice.call(box.children);
-    if (!(size > 0) || items.length <= size) return;
-    var pages = Math.ceil(items.length / size);
+    var total = parseInt(box.getAttribute("data-item-count"), 10);
+    var group = box.closest(".paginated");
+    if (!(size > 0) || !group) return;
+    // Page one is real markup so it renders without us; the rest is script
+    // text, parsed only when the reader asks for that page.
+    var later = Array.prototype.slice.call(group.querySelectorAll("script.pager-page"));
+    var pages = later.length + 1;
+    if (pages < 2) return;
+    var firstPage = box.innerHTML;
     // Following a link to the images or table page and back is a fresh load
     // each time, so the page a reader was on is remembered for the tab. Private
     // modes and file:// URLs can refuse storage, hence the guards.
@@ -2374,20 +2409,14 @@ PAGINATE_SCRIPT = """
     if (pages > JUMP) addButton("+" + JUMP + " \\u203a\\u203a", JUMP, "forward " + JUMP + " pages");
     addButton("Last \\u00bb", Infinity, "last page");
 
+    var shownPage = null;
     function show() {
-      items.forEach(function (el, i) {
-        el.hidden = Math.floor(i / size) !== page;
-        // Off-page thumbnails ship with their URL parked in data-src, so
-        // revealing a page is what starts those (and only those) fetches.
-        if (!el.hidden) {
-          Array.prototype.forEach.call(el.querySelectorAll("img[data-src]"), function (img) {
-            img.src = img.getAttribute("data-src");
-            img.removeAttribute("data-src");
-          });
-        }
-      });
+      if (shownPage !== page) {
+        box.innerHTML = page === 0 ? firstPage : later[page - 1].textContent;
+        shownPage = page;
+      }
       label.textContent = (page * size + 1) + "\\u2013"
-        + Math.min(items.length, (page + 1) * size) + " of " + items.length
+        + Math.min(total, (page + 1) * size) + " of " + total
         + " \\u00b7 page " + (page + 1) + "/" + pages;
       buttons.forEach(function (button) {
         button.el.disabled = button.delta < 0 ? page === 0 : page === pages - 1;
@@ -2417,7 +2446,6 @@ def write_html_doc(out_path, title, subtitle, body):
 <meta name="report-version" content="{REPORT_VERSION}">
 <title>{html.escape(title)}</title>
 <style>{CSS}</style>
-<noscript><style>[data-page-size] > [hidden] {{ display: revert; }}</style></noscript>
 </head>
 <body>
 <h1>{html.escape(title)}</h1>
@@ -3269,32 +3297,27 @@ def _self_check_pagination():
         assert "eval-table" not in page, page
         assert 'href="r2d2-run-evaluations.html"' in page, page
 
+        # Only page one is real markup; the rest waits as script text, so the
+        # browser never builds thousands of rows it is not showing.
         table_page = render_run_evaluations_page(summary_path)
-        assert f'<tbody data-page-size="{EVALS_PER_PAGE}">' in table_page, table_page
-        hidden_rows = table_page.count("<tr hidden>")
-        assert hidden_rows == count - EVALS_PER_PAGE, hidden_rows
+        assert f'data-page-size="{EVALS_PER_PAGE}"' in table_page, table_page
+        body = table_page[table_page.index("<tbody"):table_page.index("</tbody>")]
+        assert body.count("<tr>") == EVALS_PER_PAGE, body.count("<tr>")
+        blobs = table_page.count('<script type="text/html" class="pager-page">')
+        assert blobs == 1, blobs  # count is one page plus five rows
+        # Every row is still on the page: page one, the blob, and the header.
+        assert table_page.count("<tr>") == count + 1, table_page.count("<tr>")
 
         out_path = os.path.join(tmp_dir, "page.html")
         write_html_doc(out_path, "t", "s", table_page)
         with open(out_path) as f:
             doc = f.read()
-        # The paginator ships with the page and no-JS readers still see every item.
-        assert "[data-page-size]" in doc and "<noscript>" in doc, doc
+        # The paginator ships with the page, and a no-JS reader is told why
+        # only the first page is there.
+        assert "[data-page-size]" in doc, doc
+        assert "JavaScript is off" in doc, doc
     finally:
         shutil.rmtree(tmp_dir)
-
-    # Off-page thumbnails must park their URL in data-src so the browser cannot
-    # fetch them before their page is opened.
-    real_render_fits_image = render_fits_image
-    render_fits_image = lambda *a, **kw: "images/deadbeef.png"
-    try:
-        on_page = render_eval_recon("img.fits", 7)
-        off_page = render_eval_recon("img.fits", 7, off_page=True)
-    finally:
-        render_fits_image = real_render_fits_image
-    assert '<img src="images/deadbeef.png"' in on_page, on_page
-    assert '<img data-src="images/deadbeef.png"' in off_page, off_page
-    assert "src=" not in off_page.replace("data-src=", ""), off_page
 
     assert (EVALS_PER_PAGE, IMAGES_PER_PAGE) == (100, 20)
 
@@ -3347,13 +3370,15 @@ def _self_check_pagination():
         shown = IMAGES_PER_PAGE + 3
         cards = gallery.count('<article class="eval-card')
         assert cards == shown, cards
-        assert "no-image" not in gallery and NO_IMAGE not in gallery, gallery
+        assert NO_IMAGE not in gallery, gallery
         assert f"Showing the {shown} of {shown + 2} evaluations" in gallery, gallery
         assert f"View {shown} evaluation images" in page, page
-        # Pagination still applies to what is left.
+        # Pagination still applies to what is left, and only page one is DOM:
+        # off-page thumbnails cannot be fetched from inside script text.
         assert f'data-page-size="{IMAGES_PER_PAGE}"' in gallery, gallery
-        hidden_cards = gallery.count('class="eval-card" hidden>')
-        assert hidden_cards == shown - IMAGES_PER_PAGE, hidden_cards
+        visible = gallery[gallery.index("eval-gallery"):gallery.index("<noscript>")]
+        assert visible.count("<img ") == IMAGES_PER_PAGE, visible.count("<img ")
+        assert gallery.count('<script type="text/html" class="pager-page">') == 1, gallery
     finally:
         shutil.rmtree(tmp_dir)
 
