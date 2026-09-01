@@ -1715,6 +1715,7 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 }
 .pager {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
   margin: 0.6rem 0;
@@ -2259,19 +2260,31 @@ PAGINATE_SCRIPT = """
     var pages = Math.ceil(items.length / size);
     var page = 0;
 
+    var JUMP = 10;
+
     var bar = document.createElement("nav");
     bar.className = "pager";
-    var prev = document.createElement("button");
-    prev.type = "button";
-    prev.textContent = "\\u2190 Prev";
-    var next = document.createElement("button");
-    next.type = "button";
-    next.textContent = "Next \\u2192";
     var label = document.createElement("span");
     label.className = "pager-label";
-    bar.appendChild(prev);
+    var buttons = [];
+    function addButton(text, delta, title) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.textContent = text;
+      button.title = title;
+      button.addEventListener("click", function () { go(delta); });
+      bar.appendChild(button);
+      buttons.push({ el: button, delta: delta });
+    }
+    // Infinite deltas clamp to the ends in go(); the multi-page jumps only
+    // earn their space once there are more pages than one jump covers.
+    addButton("\\u00ab First", -Infinity, "first page");
+    if (pages > JUMP) addButton("\\u2039\\u2039 \\u2212" + JUMP, -JUMP, "back " + JUMP + " pages");
+    addButton("\\u2190 Prev", -1, "previous page");
     bar.appendChild(label);
-    bar.appendChild(next);
+    addButton("Next \\u2192", 1, "next page");
+    if (pages > JUMP) addButton("+" + JUMP + " \\u203a\\u203a", JUMP, "forward " + JUMP + " pages");
+    addButton("Last \\u00bb", Infinity, "last page");
 
     function show() {
       items.forEach(function (el, i) {
@@ -2286,18 +2299,17 @@ PAGINATE_SCRIPT = """
         }
       });
       label.textContent = (page * size + 1) + "\\u2013"
-        + Math.min(items.length, (page + 1) * size) + " of " + items.length;
-      prev.disabled = page === 0;
-      next.disabled = page === pages - 1;
+        + Math.min(items.length, (page + 1) * size) + " of " + items.length
+        + " \\u00b7 page " + (page + 1) + "/" + pages;
+      buttons.forEach(function (button) {
+        button.el.disabled = button.delta < 0 ? page === 0 : page === pages - 1;
+      });
     }
     function go(delta) {
       page = Math.min(pages - 1, Math.max(0, page + delta));
       show();
       bar.scrollIntoView({ block: "nearest" });
     }
-    prev.addEventListener("click", function () { go(-1); });
-    next.addEventListener("click", function () { go(1); });
-
     // A paginated <tbody> cannot host the bar itself; hang it off the wrapper.
     var anchor = box.closest(".eval-table-wrap") || box;
     anchor.parentNode.insertBefore(bar, anchor);
