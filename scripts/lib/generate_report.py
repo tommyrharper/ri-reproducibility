@@ -35,6 +35,8 @@ RUN_ID_TS_RE = re.compile(r"(\d{8}T\d{6}Z)$")
 # but reveal one page at a time (see PAGINATE_SCRIPT).
 EVALS_PER_PAGE = 100
 IMAGES_PER_PAGE = 20
+# Widest strip that still leaves each bar a visible few pixels in a card.
+MAX_STRIP_BARS = 120
 
 # Hash source so pages detect rendering or CSS changes without a manual version.
 REPORT_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
@@ -1218,22 +1220,40 @@ def render_eval_glance_summary(evaluations, metric, failed_count):
     )
     headline_html = f'<div class="headline">{" · ".join(headline_bits)}</div>'
 
+    # A bar needs a few pixels to be visible at all, so long runs are bucketed
+    # rather than drawn one bar per evaluation: 2000-odd bars used to push the
+    # strip past 11000px wide and scroll the whole page sideways.
+    per_bar = max(1, -(-len(evaluations) // MAX_STRIP_BARS))
     strip_cells = []
-    best_eval_id = best.get("eval_id")
-    for ev in evaluations:
-        eval_id = ev.get("eval_id", "?")
-        objective = float(ev.get("objective", 0))
+    for start in range(0, len(evaluations), per_bar):
+        bucket = evaluations[start:start + per_bar]
+        # Evaluations arrive best first, so a bucket's best is its first entry.
+        head = bucket[0]
+        objective = float(head.get("objective", 0))
         fill = objective_fill(objective, obj_min, obj_max)
-        best_class = " is-best" if eval_id == best_eval_id else ""
-        title = html.escape(f"eval {eval_id}: {fmt_value(objective)}")
+        best_class = " is-best" if start == 0 else ""
+        if per_bar == 1:
+            title = f"eval {head.get('eval_id', '?')}: {fmt_value(objective)}"
+        else:
+            title = (
+                f"{len(bucket)} evaluations, ranked {start + 1}-{start + len(bucket)}"
+                f"; best {fmt_value(objective)}"
+            )
         strip_cells.append(
-            f'<div class="eval-strip-cell{best_class}" style="--fill:{fill:.4f}" title="{title}"></div>'
+            f'<div class="eval-strip-cell{best_class}" style="--fill:{fill:.4f}"'
+            f' title="{html.escape(title)}"></div>'
         )
+    caption = (
+        "Each bar is one evaluation"
+        if per_bar == 1
+        else f"Each bar is the best of up to {per_bar} evaluations"
+    )
     strip_html = (
         '<div class="eval-strip-wrap">'
         f'<div class="eval-strip" aria-label="Evaluation objectives from best to worst">'
         f'{"".join(strip_cells)}</div>'
-        '<p class="eval-strip-label">Each bar is one evaluation (best left); height encodes objective within this run.</p>'
+        f'<p class="eval-strip-label">{caption} (best left); height encodes objective'
+        " within this run.</p>"
         "</div>"
     )
 
@@ -1295,12 +1315,6 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
 
     evaluations = [ev for ev in summary.get("evaluations", []) if "error" not in ev]
     evaluations.sort(key=lambda item: (-float(item.get("objective", 0)), item.get("eval_id", 0)))
-
-    param_names = list(space_names)
-    for ev in evaluations:
-        for key in (ev.get("params") or {}):
-            if key not in param_names:
-                param_names.append(key)
 
     duration_label = format_duration(summary["total_wall_seconds"]) if summary.get("total_wall_seconds") is not None else None
     duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>' if duration_label else ""
@@ -1375,31 +1389,6 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
                     f'<p class="empty">Could not parse log(Z) from {html.escape(os.path.basename(stats_path))}.</p></section>'
                 )
 
-    metric_keys = []
-    for ev in evaluations:
-        for key in (ev.get("metrics") or {}):
-            if key not in metric_keys:
-                metric_keys.append(key)
-
-    eval_header = (
-        "<tr><th>eval</th>"
-        + "".join(f"<th>{html.escape(name)}</th>" for name in param_names)
-        + "".join(f"<th>{html.escape(key)}</th>" for key in metric_keys)
-        + "<th>objective</th></tr>"
-    )
-    eval_rows = []
-    for index, ev in enumerate(evaluations):
-        params = ev.get("params", {})
-        metrics = ev.get("metrics", {})
-        eval_rows.append(
-            ("<tr hidden>" if index >= EVALS_PER_PAGE else "<tr>")
-            + f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
-            + "".join(f"<td>{fmt_value(params.get(name))}</td>" for name in param_names)
-            + "".join(f"<td>{fmt_value(metrics.get(key))}</td>" for key in metric_keys)
-            + f"<td>{fmt_value(ev.get('objective'))}</td>"
-            "</tr>"
-        )
-
     failed = [ev for ev in summary.get("evaluations", []) if "error" in ev]
     failed_html = ""
     if failed:
@@ -1419,26 +1408,23 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
         likelihood_html = likelihood_section(render_likelihood_plot(run_dir, space_names))
 
     evaluations_html = ""
-    if eval_rows:
+    if evaluations:
         glance_summary_html = render_eval_glance_summary(evaluations, metric, len(failed))
-        images_link_html = (
+        # A run's raw table runs to thousands of rows - hundreds of kilobytes
+        # that used to sit between this section and the profiling below it.
+        # Both heavy views live on their own pages so this one stays small.
+        links_html = (
             f'<p class="nav nav-images"><a href="{html.escape(run_images_page_name(run_name))}">'
-            f"View {len(eval_rows)} evaluation images &rarr;</a></p>"
+            f"View {len(evaluations)} evaluation images &rarr;</a>"
+            " &middot; "
+            f'<a href="{html.escape(run_evaluations_page_name(run_name))}">'
+            f"View {len(evaluations)} evaluations (raw table) &rarr;</a></p>"
         )
         evaluations_html = f"""
         <section>
           <h3>Evaluations</h3>
           {glance_summary_html}
-          {images_link_html}
-          <details>
-            <summary>{len(eval_rows)} evaluations (raw table)</summary>
-            <div class="eval-table-wrap">
-              <table class="eval-table">
-                <thead>{eval_header}</thead>
-                <tbody data-page-size="{EVALS_PER_PAGE}">{"".join(eval_rows)}</tbody>
-              </table>
-            </div>
-          </details>
+          {links_html}
           {failed_html}
         </section>
         """
@@ -1464,13 +1450,78 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
       {meta_html}
       {evidence_html}
       {likelihood_html}
-      {evaluations_html}
       {render_profiling(summary)}
+      {evaluations_html}
       {render_parameter_space_section(parameter_space)}
       {fixed_html}
       <p class="manifest-name">{html.escape(rel_summary)}</p>
     </article>
     """
+
+
+def render_eval_table(evaluations, param_names, metric_keys):
+    """The raw evaluations table, first page of rows visible (see PAGINATE_SCRIPT)."""
+    header = (
+        "<tr><th>eval</th>"
+        + "".join(f"<th>{html.escape(name)}</th>" for name in param_names)
+        + "".join(f"<th>{html.escape(key)}</th>" for key in metric_keys)
+        + "<th>objective</th></tr>"
+    )
+    rows = []
+    for index, ev in enumerate(evaluations):
+        params = ev.get("params", {})
+        metrics = ev.get("metrics", {})
+        rows.append(
+            ("<tr hidden>" if index >= EVALS_PER_PAGE else "<tr>")
+            + f"<td>{html.escape(str(ev.get('eval_id', '?')))}</td>"
+            + "".join(f"<td>{fmt_value(params.get(name))}</td>" for name in param_names)
+            + "".join(f"<td>{fmt_value(metrics.get(key))}</td>" for key in metric_keys)
+            + f"<td>{fmt_value(ev.get('objective'))}</td>"
+            "</tr>"
+        )
+    return f"""
+    <div class="eval-table-wrap">
+      <table class="eval-table">
+        <thead>{header}</thead>
+        <tbody data-page-size="{EVALS_PER_PAGE}">{"".join(rows)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_run_evaluations_page(summary_path):
+    """Render one run's raw evaluations table page."""
+    run_dir = os.path.dirname(summary_path)
+    run_name = os.path.basename(run_dir)
+    with open(summary_path) as f:
+        summary = json.load(f)
+
+    evaluations = [ev for ev in summary.get("evaluations", []) if "error" not in ev]
+    evaluations.sort(key=lambda item: (-float(item.get("objective", 0)), item.get("eval_id", 0)))
+
+    param_names = [
+        spec["name"] for spec in summary.get("parameter_space", []) if "name" in spec
+    ]
+    metric_keys = []
+    for ev in evaluations:
+        for key in (ev.get("params") or {}):
+            if key not in param_names:
+                param_names.append(key)
+        for key in (ev.get("metrics") or {}):
+            if key not in metric_keys:
+                metric_keys.append(key)
+
+    nav = (
+        f'<p class="nav"><a href="{html.escape(run_page_name(run_name))}">&larr; Run details</a>'
+        f' &middot; <a href="{html.escape(run_images_page_name(run_name))}">Evaluation images</a>'
+        ' &middot; <a href="index.html">All runs</a></p>'
+    )
+    body = (
+        render_eval_table(evaluations, param_names, metric_keys)
+        if evaluations
+        else '<p class="empty">No evaluations for this run.</p>'
+    )
+    return f'{nav}<article class="card">{body}</article>'
 
 
 def render_run_images_page(summary_path):
@@ -1491,6 +1542,8 @@ def render_run_images_page(summary_path):
     )
     nav = (
         f'<p class="nav"><a href="{html.escape(run_page_name(run_name))}">&larr; Run details</a>'
+        f' &middot; <a href="{html.escape(run_evaluations_page_name(run_name))}">'
+        'Evaluations table</a>'
         ' &middot; <a href="index.html">All runs</a></p>'
     )
     body = images_html or '<p class="empty">No evaluation images for this run.</p>'
@@ -1625,7 +1678,7 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 }
 .eval-glance { margin: 0.75rem 0 1rem; }
 .eval-images { margin: 0.75rem 0; }
-.eval-strip-wrap { margin: 0.75rem 0; }
+.eval-strip-wrap { margin: 0.75rem 0; overflow-x: auto; }
 .eval-strip {
   display: flex; align-items: flex-end; gap: 3px;
   height: 3rem; padding: 0 1px;
@@ -1823,6 +1876,10 @@ def nested_sampling_run_paths(limit=None, run=None):
 
 def run_images_page_name(run_name):
     return run_page_name(run_name)[: -len(".html")] + "-images.html"
+
+
+def run_evaluations_page_name(run_name):
+    return run_page_name(run_name)[: -len(".html")] + "-evaluations.html"
 
 
 def run_page_name(run_name):
@@ -2359,7 +2416,11 @@ def run_body_task(item):
     body = '<p class="nav"><a href="index.html">&larr; All runs</a></p>' + render_nested_sampling_run(
         summary_path, likelihood_html=LIKELIHOOD_SLOT
     )
-    return body, render_run_images_page(summary_path)
+    return (
+        body,
+        render_run_images_page(summary_path),
+        render_run_evaluations_page(summary_path),
+    )
 
 
 def likelihood_task(item):
@@ -2372,7 +2433,7 @@ def likelihood_task(item):
     return render_likelihood_plot(os.path.dirname(summary_path), space_names)
 
 
-def write_run_page(item, body, images_body):
+def write_run_page(item, body, images_body, evaluations_body):
     run_name = item[2]
     assert LIKELIHOOD_SLOT not in body, "likelihood slot was never filled in"
     write_html_doc(
@@ -2389,6 +2450,12 @@ def write_run_page(item, body, images_body):
         title=f"nested-sampling images: {run_name}",
         subtitle="One reconstruction per evaluation, best objective first.",
         body=images_body,
+    )
+    write_html_doc(
+        os.path.join(os.path.dirname(item[1]), run_evaluations_page_name(run_name)),
+        title=f"nested-sampling evaluations: {run_name}",
+        subtitle="Every evaluation's parameters and metrics, best objective first.",
+        body=evaluations_body,
     )
 
 
@@ -2452,11 +2519,12 @@ def main(argv=None):
                 # Use newline output: page writes already emit complete lines.
                 start = time.monotonic()
                 for i, (item, plot, body) in enumerate(zip(todo, plots, bodies), start=1):
-                    page_body, images_body = body.get()
+                    page_body, images_body, evaluations_body = body.get()
                     write_run_page(
                         item,
                         page_body.replace(LIKELIHOOD_SLOT, likelihood_section(plot.get())),
                         images_body,
+                        evaluations_body,
                     )
                     elapsed = time.monotonic() - start
                     eta = format_duration(elapsed / i * (len(todo) - i)) if i < len(todo) else "0s"
@@ -3159,9 +3227,16 @@ def _self_check_pagination():
         with open(summary_path, "w") as f:
             json.dump(summary, f)
 
+        # The raw table lives on its own page: keeping it off the run page is
+        # what stops profiling below it waiting on hundreds of kilobytes.
         page = render_nested_sampling_run(summary_path, likelihood_html="")
-        assert f'<tbody data-page-size="{EVALS_PER_PAGE}">' in page, page
-        assert page.count("<tr hidden>") == count - EVALS_PER_PAGE, page.count("<tr hidden>")
+        assert "eval-table" not in page, page
+        assert 'href="r2d2-run-evaluations.html"' in page, page
+
+        table_page = render_run_evaluations_page(summary_path)
+        assert f'<tbody data-page-size="{EVALS_PER_PAGE}">' in table_page, table_page
+        hidden_rows = table_page.count("<tr hidden>")
+        assert hidden_rows == count - EVALS_PER_PAGE, hidden_rows
 
         images_page = render_run_images_page(summary_path)
         assert f'data-page-size="{IMAGES_PER_PAGE}"' in images_page, images_page
@@ -3192,6 +3267,18 @@ def _self_check_pagination():
     assert "src=" not in off_page.replace("data-src=", ""), off_page
 
     assert (EVALS_PER_PAGE, IMAGES_PER_PAGE) == (100, 20)
+
+    # A bar per evaluation used to widen the strip past any viewport, so long
+    # runs bucket down to a drawable number of bars.
+    many = [{"eval_id": i, "objective": float(1000 - i)} for i in range(1000)]
+    glance = render_eval_glance_summary(many, "snr", 0)
+    bars = glance.count("eval-strip-cell")
+    assert bars <= MAX_STRIP_BARS, bars
+    assert "best of up to 9 evaluations" in glance, glance
+    # Short runs keep one bar each, and their original caption.
+    few = render_eval_glance_summary(many[:MAX_STRIP_BARS], "snr", 0)
+    assert few.count("eval-strip-cell") == MAX_STRIP_BARS, few.count("eval-strip-cell")
+    assert "Each bar is one evaluation" in few, few
 
 
 if __name__ == "__main__":
