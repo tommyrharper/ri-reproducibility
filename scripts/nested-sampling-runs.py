@@ -49,15 +49,50 @@ def read_parameter_space(run_dir: Path) -> list[dict[str, object]]:
     return space if isinstance(space, list) else []
 
 
+# A listing wants two small fields out of summary.json, but the file is mostly
+# its `evaluations` array - tens of megabytes after a long run, and parsing all
+# of it is what made the run table slow to appear. Both writers put these
+# fields above `evaluations`, so read the head instead; SUMMARY_HEAD is far
+# wider than the ~1.7 kB they have ever needed.
+SUMMARY_HEAD = 1 << 16
+SUMMARY_FIELDS = ("metric", "parameter_space")
+
+_DECODER = json.JSONDecoder()
+
+
 def read_summary(run_dir: Path) -> dict[str, object]:
     """The finished run's own record of what it searched and scored. Runs from
     before run.env and parameter-space.json existed, and merged runs which
-    write neither, still carry both here."""
+    write neither, still carry both here.
+
+    Only SUMMARY_FIELDS are promised. A summary that does not lead with them
+    is parsed whole, so a writer that reorders its keys goes back to being slow
+    rather than starts being wrong."""
+    try:
+        with open(run_dir / "summary.json", encoding="utf-8", errors="replace") as f:
+            head = f.read(SUMMARY_HEAD)
+    except OSError:
+        return {}
+    # Past the start of `evaluations` a field of the same name belongs to one
+    # evaluation, not to the run, so the head stops there.
+    if (bulk := head.find('"evaluations"')) > 0:
+        head = head[:bulk]
+    found: dict[str, object] = {}
+    for key in SUMMARY_FIELDS:
+        match = re.search(r'"%s"\s*:\s*' % key, head)
+        if not match:
+            continue
+        try:
+            found[key], _ = _DECODER.raw_decode(head, match.end())
+        except ValueError:  # caught mid-write, or a value the head cut short
+            pass
+    if len(found) == len(SUMMARY_FIELDS):
+        return found
     try:
         summary = json.loads((run_dir / "summary.json").read_text())
     except (OSError, ValueError):  # absent, or caught mid-write
-        return {}
-    return summary if isinstance(summary, dict) else {}
+        return found
+    return summary if isinstance(summary, dict) else found
 
 
 @cache
@@ -319,6 +354,35 @@ def self_check() -> None:
             (legacy / "run.env").write_text("NS_METRIC=snr\n")
             assert {r["name"]: r for r in find_runs(running=set())
                     }[legacy.name]["settings"]["NS_METRIC"] == "snr"
+            # A summary is mostly its `evaluations` array, and a listing must
+            # not pay to parse it: the fields it wants sit above that array,
+            # and a same-named field inside it belongs to one evaluation.
+            bulky = NESTED_SAMPLING_DIR / "r2d2-vlaa-bulky-20251230T000000Z"
+            bulky.mkdir()
+            (bulky / "summary.json").write_text(json.dumps({
+                "metric": "off_source_rms_jy",
+                "parameter_space": [{"name": "channel_count", "min": 1, "max": 8}],
+                "evaluations": [{"metric": "decoy", "parameter_space": "decoy"}
+                                ] * 20000,
+            }, indent=2))
+            assert (bulky / "summary.json").stat().st_size > 4 * SUMMARY_HEAD
+            bulky_run = {r["name"]: r for r in find_runs(running=set())}[bulky.name]
+            assert bulky_run["settings"]["NS_METRIC"] == "off_source_rms_jy", bulky_run
+            assert bulky_run["parameter_space"] == [
+                {"name": "channel_count", "min": 1, "max": 8}], bulky_run
+            assert bulky_run["parameter_space_from_defaults"] is False, bulky_run
+            # Only the head is read, so the bulk below it is never parsed.
+            assert set(read_summary(bulky)) == set(SUMMARY_FIELDS), sorted(read_summary(bulky))
+            # A summary that does not lead with those fields is still read
+            # whole - slower, but never wrong.
+            (bulky / "summary.json").write_text(json.dumps({
+                "evaluations": [{"n": i} for i in range(20000)],
+                "metric": "trailing_metric",
+            }, indent=2))
+            trailing = {r["name"]: r for r in find_runs(running=set())}[bulky.name]
+            assert trailing["settings"]["NS_METRIC"] == "trailing_metric", trailing
+            shutil.rmtree(bulky)
+
             # A torn summary must not break listing any more than a torn space does.
             (legacy / "run.env").unlink()
             (legacy / "summary.json").write_text('{"metric": "tot')
