@@ -42,4 +42,5 @@ fi
 echo
 echo "Ctrl-C to stop."
 
-exec python3 -m http.server "${PORT}" --bind "${BIND}" --directory "${REPORT_DIR}"
+exec python3 "${REPO_ROOT}/scripts/lib/report_server.py" "${PORT}" \
+  --bind "${BIND}" --directory "${REPORT_DIR}"
