@@ -14,15 +14,21 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 IMAGE_PREFIX = "/images/"
 # A year, the longest max-age worth expressing (RFC 9111 suggests capping here).
 IMMUTABLE = "public, max-age=31536000, immutable"
+# Pages are rewritten in place by './ri report', so they cannot be immutable.
+# A minute of freshness is enough to make clicking between a run, its images
+# and its table free, while a reload still revalidates immediately.
+PAGE_CACHE = "max-age=60"
 
 
 class ReportHandler(SimpleHTTPRequestHandler):
+    # The default HTTP/1.0 closes the connection after every file, which over an
+    # ssh tunnel means a fresh round trip per thumbnail. 1.1 keeps it open.
+    protocol_version = "HTTP/1.1"
+
     def end_headers(self):
-        # Pages are rewritten in place by './ri report', so they must revalidate
-        # ("no-cache" still allows a 304, it just forbids using a stale copy).
         self.send_header(
             "Cache-Control",
-            IMMUTABLE if self.path.startswith(IMAGE_PREFIX) else "no-cache",
+            IMMUTABLE if self.path.startswith(IMAGE_PREFIX) else PAGE_CACHE,
         )
         super().end_headers()
 
@@ -59,9 +65,10 @@ def self_check():
             finally:
                 httpd.shutdown()
 
-    assert page.headers["Cache-Control"] == "no-cache", page.headers.items()
+    assert page.headers["Cache-Control"] == PAGE_CACHE, page.headers.items()
     assert image.headers["Cache-Control"] == IMMUTABLE, image.headers.items()
-    print("ok report_server serves images immutable and pages revalidating")
+    assert page.version == 11, page.version  # keep-alive, not a connection per file
+    print("ok report_server serves images immutable and pages briefly fresh")
 
 
 def main(argv=None):

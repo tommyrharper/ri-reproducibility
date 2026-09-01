@@ -1260,8 +1260,23 @@ def render_eval_glance_summary(evaluations, metric, failed_count):
     return f'<div class="eval-glance">{headline_html}{strip_html}</div>'
 
 
+def evaluations_with_images(evaluations, run_dirs):
+    """Only a sample of a run's evaluations keeps its image (prune_run_artefacts)."""
+    return [
+        ev
+        for ev in evaluations
+        if resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
+    ]
+
+
 def render_eval_images(evaluations, metric, run_dirs, parameter_space):
     if not evaluations:
+        return ""
+
+    # A card per imageless evaluation was 90% of this page - 2000-odd cards
+    # holding a dash - so only evaluations that kept an image get one.
+    shown = evaluations_with_images(evaluations, run_dirs)
+    if not shown:
         return ""
 
     best = evaluations[0]
@@ -1287,13 +1302,19 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
             ev.get("eval_id") == best_eval_id,
             off_page=index >= IMAGES_PER_PAGE,
         )
-        for index, ev in enumerate(evaluations)
+        for index, ev in enumerate(shown)
     ]
     cards_html = (
         f'<div class="eval-gallery" data-page-size="{IMAGES_PER_PAGE}">{"".join(cards)}</div>'
     )
+    note = ""
+    if len(shown) != len(evaluations):
+        note = (
+            f'<p class="purpose">Showing the {len(shown)} of {len(evaluations)} evaluations'
+            " that kept an image: the best and worst scorers and a sample in between.</p>"
+        )
 
-    return f'<div class="eval-images">{truth_html}{cards_html}</div>'
+    return f'<div class="eval-images">{truth_html}{note}{cards_html}</div>'
 
 
 def render_nested_sampling_run(summary_path, likelihood_html=None):
@@ -1413,9 +1434,10 @@ def render_nested_sampling_run(summary_path, likelihood_html=None):
         # A run's raw table runs to thousands of rows - hundreds of kilobytes
         # that used to sit between this section and the profiling below it.
         # Both heavy views live on their own pages so this one stays small.
+        image_count = len(evaluations_with_images(evaluations, run_dirs))
         links_html = (
             f'<p class="nav nav-images"><a href="{html.escape(run_images_page_name(run_name))}">'
-            f"View {len(evaluations)} evaluation images &rarr;</a>"
+            f"View {image_count} evaluation images &rarr;</a>"
             " &middot; "
             f'<a href="{html.escape(run_evaluations_page_name(run_name))}">'
             f"View {len(evaluations)} evaluations (raw table) &rarr;</a></p>"
@@ -3202,19 +3224,23 @@ def _self_check_run_page_split():
         assert "eval-gallery" not in page, page
         assert page.index(LIKELIHOOD_SLOT) < page.index("<h3>Evaluations</h3>"), page
         assert 'href="r2d2-run-images.html"' in page, page
-        assert "View 2 evaluation images" in page, page
+        assert "View 0 evaluation images" in page, page
         # The raw table lost its thumbnail column with them.
         assert "<th>image</th>" not in page, page
 
         images_page = render_run_images_page(summary_path)
         assert 'href="r2d2-run.html"' in images_page, images_page
-        assert "eval-gallery" in images_page, images_page
-        assert "#1" in images_page and "#2" in images_page, images_page
+        # Neither evaluation kept an image, so there is nothing to show; a
+        # gallery of dashes is what _self_check_pagination guards against.
+        assert "eval-gallery" not in images_page, images_page
+        assert "No evaluation images" in images_page, images_page
     finally:
         shutil.rmtree(tmp_dir)
 
 
 def _self_check_pagination():
+    global render_fits_image, synthesize_truth_array, image_dir
+
     import shutil
     import tempfile
 
@@ -3248,13 +3274,8 @@ def _self_check_pagination():
         hidden_rows = table_page.count("<tr hidden>")
         assert hidden_rows == count - EVALS_PER_PAGE, hidden_rows
 
-        images_page = render_run_images_page(summary_path)
-        assert f'data-page-size="{IMAGES_PER_PAGE}"' in images_page, images_page
-        hidden_cards = images_page.count('class="eval-card" hidden>')
-        assert hidden_cards == count - IMAGES_PER_PAGE, hidden_cards
-
         out_path = os.path.join(tmp_dir, "page.html")
-        write_html_doc(out_path, "t", "s", images_page)
+        write_html_doc(out_path, "t", "s", table_page)
         with open(out_path) as f:
             doc = f.read()
         # The paginator ships with the page and no-JS readers still see every item.
@@ -3264,7 +3285,6 @@ def _self_check_pagination():
 
     # Off-page thumbnails must park their URL in data-src so the browser cannot
     # fetch them before their page is opened.
-    global render_fits_image
     real_render_fits_image = render_fits_image
     render_fits_image = lambda *a, **kw: "images/deadbeef.png"
     try:
@@ -3277,6 +3297,65 @@ def _self_check_pagination():
     assert "src=" not in off_page.replace("data-src=", ""), off_page
 
     assert (EVALS_PER_PAGE, IMAGES_PER_PAGE) == (100, 20)
+
+    # Only evaluations that kept an image get a card: a dash per imageless
+    # evaluation used to be most of the gallery page's bytes.
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-gallery-")
+    try:
+        run_dir = os.path.join(tmp_dir, "r2d2-run")
+        os.makedirs(os.path.join(run_dir, "evals"))
+        kept = os.path.join(run_dir, "evals", "kept.fits")
+        with open(kept, "wb") as f:
+            f.write(b"not really a fits")
+        summary_path = os.path.join(run_dir, "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump({
+                "algorithm": "r2d2",
+                "metric": "snr",
+                "parameter_space": [],
+                "evaluations": (
+                    [
+                        {
+                            "eval_id": i,
+                            "objective": float(100 - i),
+                            "paths": {"image": "evals/kept.fits"},
+                        }
+                        for i in range(IMAGES_PER_PAGE + 3)
+                    ]
+                    # One with no image at all, one whose image is pruned away.
+                    + [
+                        {"eval_id": 900, "objective": 1.0},
+                        {"eval_id": 901, "objective": 0.5, "paths": {"image": "evals/gone.fits"}},
+                    ]
+                ),
+            }, f)
+
+        real_render, real_truth = render_fits_image, synthesize_truth_array
+        real_image_dir = image_dir
+        render_fits_image = lambda *a, **kw: "images/deadbeef.png"
+        synthesize_truth_array = lambda *a, **kw: None
+        # cached_png() writes under image_dir, which only main() normally sets.
+        image_dir = os.path.join(tmp_dir, "images")
+        os.makedirs(image_dir)
+        try:
+            gallery = render_run_images_page(summary_path)
+            page = render_nested_sampling_run(summary_path, likelihood_html="")
+        finally:
+            render_fits_image, synthesize_truth_array = real_render, real_truth
+            image_dir = real_image_dir
+
+        shown = IMAGES_PER_PAGE + 3
+        cards = gallery.count('<article class="eval-card')
+        assert cards == shown, cards
+        assert "no-image" not in gallery and NO_IMAGE not in gallery, gallery
+        assert f"Showing the {shown} of {shown + 2} evaluations" in gallery, gallery
+        assert f"View {shown} evaluation images" in page, page
+        # Pagination still applies to what is left.
+        assert f'data-page-size="{IMAGES_PER_PAGE}"' in gallery, gallery
+        hidden_cards = gallery.count('class="eval-card" hidden>')
+        assert hidden_cards == shown - IMAGES_PER_PAGE, hidden_cards
+    finally:
+        shutil.rmtree(tmp_dir)
 
     # A bar per evaluation used to widen the strip past any viewport, so long
     # runs bucket down to a drawable number of bars.
