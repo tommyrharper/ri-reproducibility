@@ -71,10 +71,16 @@ commit costs on this machine can be compared with what the last one did:
 ./ri serve              # read the report from a browser on another machine
 ./ri plot gui           # interactive corner plots (needs a display)
 ./ri plot likelihood    # R2D2 vs WSClean overlay
+./ri plot likelihood --last   # ...for the last two directly comparable runs
 ```
 
 `./ri plot likelihood` (`scripts/plot-merged-likelihood-compare.py`) writes
 merged-failure-score figures into `reports/`, included by `latex/notes.tex`.
+`--last` compares the newest R2D2 and WSClean run that agree on VLA config,
+metric, parameter space and sampler effort, merged or not, and leaves those
+included figures alone. Either way the pair is also kept under its own name in
+`reports/likelihood-comparisons/`, which `./ri report` collects onto a page
+linked from the top of the index.
 
 ## 3. Host prerequisites
 

@@ -31,6 +31,8 @@ host_python() { uv run --no-project --python ">=3.11" python "$@"; }
 echo "=== host-side checks ==="
 host_python "${REPO_ROOT}/scripts/profile-nested-sampling-run.py" --self-check
 host_python "${REPO_ROOT}/scripts/lib/report_server.py" --self-check
+# Only the run picking; drawing the figures needs the r2d2 image.
+host_python "${REPO_ROOT}/scripts/plot-merged-likelihood-compare.py" --self-check
 host_python "${REPO_ROOT}/scripts/test_watchdogs.py"
 host_python "${REPO_ROOT}/scripts/test_self_checks.py"
 
