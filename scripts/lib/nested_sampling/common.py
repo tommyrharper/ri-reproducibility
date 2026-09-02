@@ -132,7 +132,6 @@ DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 DEFAULT_WSCLEAN_MGAIN = float(os.environ.get("NS_WSCLEAN_MGAIN") or 0.8)
 
 # Shared image geometry; detailed rationale: docs/nested-sampling.md.
-DEFAULT_IMAGE_DIM = 128
 DEFAULT_SUPER_RESOLUTION = 1.5
 
 # `source_offset_fraction` geometry: docs/parameter-space-proposal.md.
@@ -152,7 +151,7 @@ def image_pixel_size_arcsec(
 
 def source_offset_to_lm(fraction: float, start_frequency_hz: float) -> tuple[float, float]:
     max_proj_baseline_lambda = VLA_A_MAX_BASELINE_M * start_frequency_hz / SPEED_OF_LIGHT_M_S
-    half_width_arcsec = image_pixel_size_arcsec(max_proj_baseline_lambda) * (DEFAULT_IMAGE_DIM / 2.0)
+    half_width_arcsec = image_pixel_size_arcsec(max_proj_baseline_lambda) * (image_dim() / 2.0)
     radius_arcsec = fraction * half_width_arcsec
     angle_rad = math.radians(SOURCE_OFFSET_POSITION_ANGLE_DEG)
     return radius_arcsec * math.sin(angle_rad), radius_arcsec * math.cos(angle_rad)
@@ -171,6 +170,22 @@ def load_defaults() -> dict[str, Any]:
             with path.open("rb") as handle:
                 return tomllib.load(handle)
     raise SystemExit("no defaults.toml found - set REPO_ROOT to the repository root")
+
+
+@cache
+def image_dim() -> int:
+    """Pixels on a side of the image both imagers make.
+
+    defaults.toml is the only place the number is written down - a default
+    here as well would be a second one, and the two would disagree the first
+    time either moved. `NS_IMAGE_DIM` still wins, because that is the contract
+    every other key in defaults.toml is read under (scripts/lib/defaults.sh),
+    and it is what `--interleave NS_IMAGE_DIM 128 32` measures with.
+    """
+    defaults = load_defaults()
+    if "NS_IMAGE_DIM" not in defaults:
+        raise SystemExit("FATAL: defaults.toml defines no NS_IMAGE_DIM, so there is no image size")
+    return int(os.environ.get("NS_IMAGE_DIM") or defaults["NS_IMAGE_DIM"])
 
 
 @cache
@@ -2251,6 +2266,42 @@ def self_check_parameter_toggle() -> None:
     print("parameter toggle self-check passed")
 
 
+def self_check_image_dim() -> None:
+    import tempfile
+
+    assert image_dim() == int(load_defaults()["NS_IMAGE_DIM"]), image_dim()
+
+    saved_dim, saved_root = os.environ.get("NS_IMAGE_DIM"), os.environ.get("REPO_ROOT")
+    try:
+        os.environ["NS_IMAGE_DIM"] = "64"
+        image_dim.cache_clear()
+        assert image_dim() == 64, "NS_IMAGE_DIM has to win, or --interleave measures nothing"
+
+        # defaults.toml is the only place the size is written down, so one
+        # without it has to stop the run rather than quietly pick a number:
+        # the sky a run searches would depend on which caller it came from.
+        del os.environ["NS_IMAGE_DIM"]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "defaults.toml").write_text("NS_NLIVE = 8\n")
+            os.environ["REPO_ROOT"] = tmp
+            load_defaults.cache_clear()
+            image_dim.cache_clear()
+            try:
+                dim = image_dim()
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError(f"defaults.toml without NS_IMAGE_DIM gave {dim}")
+    finally:
+        for name, value in (("NS_IMAGE_DIM", saved_dim), ("REPO_ROOT", saved_root)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        load_defaults.cache_clear()
+        image_dim.cache_clear()
+
+
 def self_check_source_offset() -> None:
     l_arcsec, m_arcsec = source_offset_to_lm(0.0, 1.4e9)
     assert l_arcsec == 0.0 and m_arcsec == 0.0, (l_arcsec, m_arcsec)
@@ -2294,12 +2345,17 @@ def self_check_source_offset() -> None:
 
     from astropy.io import fits
 
+    # The 128 belongs to the recording, not to what this run is configured to
+    # image: the expected pixels are where those reconstructions put the source
+    # in a 128-wide image, and with no CRPIX to read, compute_image_metrics()
+    # takes the centre from the array shape - so another width is another
+    # centre, and these expectations no longer describe anything.
     for l_as, m_as, max_proj_baseline_lambda, expected in (
         (20.529971838368628, 35.5589543020127, 32152.12622557544, (54, 81)),
         (12.833132485007466, 22.22763748429558, 57746.84392542726, (53, 83)),
     ):
         scale = image_pixel_size_arcsec(max_proj_baseline_lambda)
-        image = np.zeros((DEFAULT_IMAGE_DIM, DEFAULT_IMAGE_DIM))
+        image = np.zeros((128, 128))
         image[expected[1], expected[0]] = 1.0
         with tempfile.TemporaryDirectory() as tmp:
             # PrimaryHDU alone writes what R2D2 writes: SIMPLE/BITPIX/NAXIS

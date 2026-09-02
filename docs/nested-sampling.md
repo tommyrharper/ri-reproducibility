@@ -490,13 +490,51 @@ comparing the two imagers on different physics.
 
 Fixed hyperparameters (not searched) on every evaluation:
 
-**WSClean:** `-niter 100`, `-auto-threshold 3.0`, and a `128x128` image,
-recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
+**WSClean:** `-niter 100`, `-auto-threshold 3.0`, and an `NS_IMAGE_DIM`-square
+image, recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
 
-**R2D2:** `128x128` image size (the same footprint as the WSClean run),
+**R2D2:** the same `NS_IMAGE_DIM` image size as the WSClean run,
 `num_iter 25`, `architecture unet`, `num_chans 64`, `ckpt_path
 /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in `summary.json`
 under `r2d2_fixed_hyperparameters`.
+
+### What the image size costs
+
+`defaults.toml` is where the size is written down, and it is the only place:
+`image_dim()` in `common.py` reads it and stops the run if the key is gone
+rather than carrying a default of its own, so changing it there changes it
+everywhere and nothing else needs editing. `NS_IMAGE_DIM` overrides it the
+way the environment overrides every other key in that file, and the size is
+recorded in `run.env` and grouped by in the benchmark ledger, so
+`./ri bench run <imager> --interleave NS_IMAGE_DIM 128 32` measures a change to
+it like any other setting. It is not a search dimension: it also sets the field
+of view (`source_offset_to_lm()` scales the half-width by it), so two sizes are
+two different skies, and the R2D2 checkpoints were trained at one resolution.
+Runs archived before the default moved were scored at 128 - `NS_IMAGE_DIM=128`
+reproduces them.
+
+Median per-evaluation imaging time over the `default` preset on the 20-CPU
+host, four interleaved repeats per arm (`wsclean`) and three (`r2d2`):
+
+| dim | R2D2 image | speed-up | WSClean image | speed-up |
+| --: | ---------: | -------: | ------------: | -------: |
+| 128 |     7451ms |     1.0x |         150ms |     1.0x |
+|  64 |     2584ms |     2.9x |         123ms |     1.2x |
+|  32 |     1411ms |     5.3x |         100ms |     1.5x |
+
+R2D2 fits `0.96s + 0.39ms/pixel` across all three sizes, so the fixed second -
+`docker exec`, the MS-to-`.mat` bridge, the operator norm, and orchestrating 25
+iterations - caps the whole knob at about 7.5x however small the image gets.
+WSClean does not fit a pixel count at all: 16x fewer pixels buys 1.5x, because
+its evaluation is CLEAN iterations and gridding ~3000 visibilities, and neither
+shrinks with the image. Peak memory does not move either (3.46 GB at every
+size, it is the checkpoint), so a smaller image buys no extra R2D2 ranks.
+
+None of that is the wall-clock of a search. The sampler's path changes with the
+likelihood surface: the WSClean arms above took 980 evaluations at 128, 710 at
+64 and 1053 at 32, so the 32 arm finished *slower* (24.8s against 17.7s) while
+each evaluation was 1.5x cheaper. The R2D2 arms happened to stay level (44, 43,
+43), which is what makes its 3.2x and 5.8x whole-run speed-ups real.
 
 ## MS to R2D2 `.mat` bridge
 

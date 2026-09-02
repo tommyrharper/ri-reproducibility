@@ -16,7 +16,6 @@ from typing import Any
 import numpy as np
 
 from common import (
-    DEFAULT_IMAGE_DIM,
     DEFAULT_SUPER_RESOLUTION,
     FAILURE_OBJECTIVE,
     WORKER_DIED,
@@ -27,6 +26,7 @@ from common import (
     cube_to_params,
     gathered_window_fit_stats,
     compute_image_metrics,
+    image_dim,
     image_pixel_size_arcsec,
     convert_ms_to_mat,
     evaluation_scratch_dir,
@@ -98,8 +98,8 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         f"super_resolution: {DEFAULT_SUPER_RESOLUTION}",
         "meas_op_on_gpu: False",
         "meas_dtype: double",
-        f"im_dim_x: {DEFAULT_IMAGE_DIM}",
-        f"im_dim_y: {DEFAULT_IMAGE_DIM}",
+        f"im_dim_x: {image_dim()}",
+        f"im_dim_y: {image_dim()}",
         "data_weighting: True",
         "natural_weight: True",
         "weight_type: briggs",
@@ -593,8 +593,8 @@ def main() -> None:
                 "synchronous": settings.synchronous,
             },
             "r2d2_fixed_hyperparameters": {
-                "im_dim_x": DEFAULT_IMAGE_DIM,
-                "im_dim_y": DEFAULT_IMAGE_DIM,
+                "im_dim_x": image_dim(),
+                "im_dim_y": image_dim(),
                 "num_iter": DEFAULT_R2D2_NUM_ITER,
                 "num_chans": DEFAULT_R2D2_NUM_CHANS,
                 "architecture": DEFAULT_R2D2_ARCHITECTURE,
