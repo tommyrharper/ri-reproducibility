@@ -15,7 +15,6 @@ from typing import Any
 import numpy as np
 
 from common import (
-    DEFAULT_IMAGE_DIM,
     DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_MGAIN,
@@ -32,6 +31,7 @@ from common import (
     cube_to_params,
     gathered_window_fit_stats,
     compute_image_metrics,
+    image_dim,
     image_pixel_size_arcsec,
     is_infrastructure_failure,
     load_evaluations_from_dir,
@@ -133,8 +133,8 @@ def evaluate(
         "-temp-dir",
         str(wsclean_dir),
         "-size",
-        str(DEFAULT_IMAGE_DIM),
-        str(DEFAULT_IMAGE_DIM),
+        str(image_dim()),
+        str(image_dim()),
         "-scale",
         f"{scale_arcsec:.6g}asec",
         "-niter",
@@ -485,7 +485,7 @@ def main() -> None:
                 "niter": DEFAULT_WSCLEAN_NITER,
                 "mgain": DEFAULT_WSCLEAN_MGAIN,
                 "auto_threshold": DEFAULT_WSCLEAN_AUTO_THRESHOLD,
-                "image_dim": DEFAULT_IMAGE_DIM,
+                "image_dim": image_dim(),
                 # `-scale` is derived per evaluation from this and the sampled
                 # sky, not fixed; each record carries its own image_pixel_size_arcsec.
                 "super_resolution": DEFAULT_SUPER_RESOLUTION,

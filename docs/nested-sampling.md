@@ -500,7 +500,10 @@ under `r2d2_fixed_hyperparameters`.
 
 ### What the image size costs
 
-`NS_IMAGE_DIM` is the size, `defaults.toml` holds its default of 32, and it is
+`defaults.toml` is where the size is written down, at 32, and it is the only
+place: `image_dim()` in `common.py` reads it and stops the run if the key is
+gone rather than carrying a default of its own. `NS_IMAGE_DIM` overrides it the
+way the environment overrides every other key in that file, and the size is
 recorded in `run.env` and grouped by in the benchmark ledger, so
 `./ri bench run <imager> --interleave NS_IMAGE_DIM 128 32` measures a change to
 it like any other setting. It is not a search dimension: it also sets the field
