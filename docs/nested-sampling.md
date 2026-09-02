@@ -490,9 +490,8 @@ comparing the two imagers on different physics.
 
 Fixed hyperparameters (not searched) on every evaluation:
 
-**WSClean:** `-niter 100`, `-auto-threshold 3.0`, and an `NS_IMAGE_DIM`-square
+**WSClean:** `-niter 10,000`, `-auto-threshold 3.0`, and an `NS_IMAGE_DIM`-square
 image, recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
-
 **R2D2:** the same `NS_IMAGE_DIM` image size as the WSClean run,
 `num_iter 25`, `architecture unet`, `num_chans 64`, `ckpt_path
 /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in `summary.json`
