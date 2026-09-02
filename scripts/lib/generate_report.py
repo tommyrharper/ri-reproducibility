@@ -1996,23 +1996,97 @@ def run_log_evidence(run_dir, summary):
 ALGORITHM_LABELS = {"r2d2": "R2D2", "wsclean": "WSClean"}
 
 
-def render_index_entry(summary_path, status):
-    """Return the index card, algorithm filter token, and parameter space."""
-    run_dir = os.path.dirname(summary_path)
-    run_name = os.path.basename(run_dir)
+# Bump when index_entry_facts starts reporting something different, so the
+# facts already cached go stale - the key describes the summary file, not the
+# code that read it.
+INDEX_FACTS_VERSION = "1"
+INDEX_FACTS_CACHE = ".index-facts.json"
+
+
+def index_entry_facts(summary_path):
+    """The handful of values an index card needs out of one run's summary.
+
+    A finished run's summary reaches hundreds of MB, nearly all of it the
+    `evaluations` array that a card shows as two counts - so this is the
+    expensive half of an index entry, and the only half worth caching.
+    """
     with open(summary_path) as f:
         summary = json.load(f)
-
-    polychord = summary.get("polychord", {})
     evaluations = summary.get("evaluations", [])
-    succeeded = [ev for ev in evaluations if "error" not in ev]
-    failed_count = len(evaluations) - len(succeeded)
-    parameter_space = summary.get("parameter_space", [])
+    succeeded = sum(1 for ev in evaluations if "error" not in ev)
+    evidence = run_log_evidence(os.path.dirname(summary_path), summary)
+    return {
+        "algorithm": summary.get("algorithm"),
+        "vla_config": summary.get("vla_config"),
+        "metric": summary.get("metric"),
+        "nlive": summary.get("polychord", {}).get("nlive"),
+        "total_wall_seconds": summary.get("total_wall_seconds"),
+        "live": bool(summary.get("live")),
+        "merged": bool(summary.get("merged_from")),
+        "parameter_space": summary.get("parameter_space", []),
+        "succeeded": succeeded,
+        "failed": len(evaluations) - succeeded,
+        "evidence": list(evidence) if evidence else None,
+    }
 
-    algorithm_token = str(summary.get("algorithm") or "").strip().lower()
+
+def index_facts_for(paths, out_dir, force=False):
+    """Facts for every run on the index, reparsing only the summaries that moved.
+
+    The index covers every run on disk no matter how few pages a build was asked
+    to write, so `--last 1` used to reparse every summary under
+    results/nested-sampling/ - gigabytes of JSON that have not changed since the
+    run that wrote them finished. Keyed by size and mtime, so a run still being
+    written is re-read every time; `force` throws the cache away, which is the
+    escape hatch if one is ever wrong.
+    """
+    cache_path = os.path.join(out_dir, INDEX_FACTS_CACHE) if out_dir else None
+    cached = {}
+    if cache_path and not force:
+        try:
+            with open(cache_path) as f:
+                loaded = json.load(f)
+            if loaded.get("version") == INDEX_FACTS_VERSION:
+                cached = loaded.get("runs", {})
+        except (OSError, ValueError):
+            cached = {}
+    runs = {}
+    for path in paths:
+        stamp = file_stamp(path)
+        hit = cached.get(path)
+        runs[path] = {
+            "stamp": stamp,
+            "facts": hit["facts"] if hit and hit.get("stamp") == stamp
+            else index_entry_facts(path),
+        }
+    if cache_path:
+        # Only the runs still on the index are kept, so a deleted run leaves the
+        # cache too. Write-then-rename, like cached_png: an interrupted build
+        # must not leave a truncated cache that every later build then trusts.
+        tmp = f"{cache_path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": INDEX_FACTS_VERSION, "runs": runs}, f)
+        os.replace(tmp, cache_path)
+    return {path: entry["facts"] for path, entry in runs.items()}
+
+
+def render_index_entry(summary_path, status, facts=None):
+    """Return the index card, algorithm filter token, and parameter space."""
+    run_name = os.path.basename(os.path.dirname(summary_path))
+    if facts is None:
+        facts = index_entry_facts(summary_path)
+
+    succeeded_count = facts["succeeded"]
+    failed_count = facts["failed"]
+    parameter_space = facts["parameter_space"]
+    nlive = facts["nlive"]
+    vla_config = facts["vla_config"]
+    metric = facts["metric"]
+
+    algorithm_token = str(facts["algorithm"] or "").strip().lower()
     if algorithm_token in ("", "?"):
         algorithm_token = ""
-    is_merged = bool(summary.get("merged_from"))
+    is_merged = facts["merged"]
     param_names = [spec["name"] for spec in parameter_space if spec.get("name")]
     param_ranges = {
         spec["name"]: format_param_range(spec)
@@ -2020,30 +2094,30 @@ def render_index_entry(summary_path, status):
         if spec.get("name") and format_param_range(spec)
     }
 
-    title_bits = [html.escape(str(summary.get("algorithm", "?")))]
+    title_bits = [html.escape(str(facts["algorithm"] or "?"))]
     ts_label = format_run_id_timestamp(run_name)
     if ts_label:
         title_bits.append(f'<span class="ts">{html.escape(ts_label)}</span>')
 
-    duration_label = format_duration(summary["total_wall_seconds"]) if summary.get("total_wall_seconds") is not None else None
+    duration_label = format_duration(facts["total_wall_seconds"]) if facts["total_wall_seconds"] is not None else None
     duration_html = f'<span class="run-duration">{html.escape(duration_label)}</span>' if duration_label else ""
 
     badges = []
-    if summary.get("live"):
+    if facts["live"]:
         badges.append('<span class="badge badge-warn">live</span>')
     if is_merged:
         badges.append('<span class="badge badge-ok">merged</span>')
-    badges.append(f'<span class="badge">{html.escape(str(summary.get("vla_config", "?")))}</span>')
-    badges.append(f'<span class="badge">nlive {html.escape(str(polychord.get("nlive", "?")))}</span>')
-    if summary.get("metric"):
-        badges.append(f'<span class="badge">{html.escape(str(summary["metric"]))}</span>')
-    badges.append(f'<span class="badge badge-ok">{len(succeeded)} evals</span>')
+    badges.append(f'<span class="badge">{html.escape(str(vla_config if vla_config is not None else "?"))}</span>')
+    badges.append(f'<span class="badge">nlive {html.escape(str(nlive if nlive is not None else "?"))}</span>')
+    if metric:
+        badges.append(f'<span class="badge">{html.escape(str(metric))}</span>')
+    badges.append(f'<span class="badge badge-ok">{succeeded_count} evals</span>')
     if failed_count:
         badges.append(f'<span class="badge badge-warn">{failed_count} failed</span>')
     if status == "outdated":
         badges.append('<span class="badge badge-warn">outdated page</span>')
 
-    evidence = run_log_evidence(run_dir, summary)
+    evidence = facts["evidence"]
     if evidence:
         log_z, log_z_err = evidence
         err_html = f'<span class="delta">± {log_z_err:.4g}</span>' if log_z_err is not None else ""
@@ -2056,11 +2130,11 @@ def render_index_entry(summary_path, status):
     card_attrs = (
         f' data-algorithm="{html.escape(algorithm_token)}"'
         f' data-merged="{"1" if is_merged else "0"}"'
-        f' data-evals="{len(succeeded)}"'
+        f' data-evals="{succeeded_count}"'
         f' data-run-name="{html.escape(run_name)}"'
-        f' data-vla-config="{html.escape(str(summary.get("vla_config", "")))}"'
-        f' data-nlive="{html.escape(str(polychord.get("nlive", "")))}"'
-        f' data-metric="{html.escape(str(summary.get("metric", "")))}"'
+        f' data-vla-config="{html.escape(str(vla_config if vla_config is not None else ""))}"'
+        f' data-nlive="{html.escape(str(nlive if nlive is not None else ""))}"'
+        f' data-metric="{html.escape(str(metric if metric is not None else ""))}"'
         f' data-logz="{logz_attr_value}"'
         f' data-param-names="{html.escape(",".join(param_names))}"'
         f' data-param-ranges="{html.escape(json.dumps(param_ranges))}"'
@@ -2360,18 +2434,20 @@ def render_unfinished_runs():
     )
 
 
-def render_nested_sampling_index(status_for):
+def render_nested_sampling_index(status_for, out_dir=None, force=False):
     paths = nested_sampling_run_paths()
     if not paths:
         return render_unfinished_runs() + (
             '<p class="empty">No nested-sampling runs found under '
             "results/nested-sampling/*/summary.json yet.</p>"
         )
+    facts = index_facts_for(paths, out_dir, force=force)
     entries = []
     algorithm_tokens = []
     param_ranges_by_name = {}
     for p in paths:
-        entry_html, algorithm_token, parameter_space = render_index_entry(p, status_for(p))
+        entry_html, algorithm_token, parameter_space = render_index_entry(
+            p, status_for(p), facts[p])
         entries.append(entry_html)
         if algorithm_token and algorithm_token not in algorithm_tokens:
             algorithm_tokens.append(algorithm_token)
@@ -2663,7 +2739,9 @@ def main(argv=None):
             f"rebuilds every page). Report version <code>{REPORT_VERSION}</code>."
         ),
         body=render_nested_sampling_index(
-            lambda p: page_status(out_dir, os.path.basename(os.path.dirname(p)))
+            lambda p: page_status(out_dir, os.path.basename(os.path.dirname(p))),
+            out_dir,
+            force=args.force,
         ),
     )
     print(f"{written} run page(s) written, {skipped} skipped")
@@ -2957,6 +3035,75 @@ def _self_check_parameter_space_section():
     assert "<td>log10_dynamic_range</td><td>2-3</td><td></td>" in html_out, html_out
     assert "<td>channel_count</td><td>2-6</td><td>integer</td>" in html_out, html_out
     assert render_parameter_space_section([]) == ""
+
+
+def _self_check_index_facts_cache():
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    try:
+        out_dir = os.path.join(tmp_dir, "out")
+        os.makedirs(out_dir)
+
+        def write_summary(name, evaluations):
+            run_dir = os.path.join(tmp_dir, name)
+            os.makedirs(run_dir, exist_ok=True)
+            path = os.path.join(run_dir, "summary.json")
+            with open(path, "w") as f:
+                json.dump({"algorithm": "r2d2", "evaluations": evaluations}, f)
+            return path
+
+        a = write_summary("a", [{"eval_id": 1}, {"eval_id": 2, "error": "boom"}])
+        b = write_summary("b", [{"eval_id": 1}])
+
+        parsed = []
+        real = index_entry_facts
+
+        def counting(path):
+            parsed.append(path)
+            return real(path)
+
+        globals()["index_entry_facts"] = counting
+        try:
+            facts = index_facts_for([a, b], out_dir)
+            assert (facts[a]["succeeded"], facts[a]["failed"]) == (1, 1), facts[a]
+            assert sorted(parsed) == sorted([a, b]), parsed
+
+            # A second build reparses nothing: this is the whole point, and what
+            # made `./ri report --last 1` reparse every summary on disk.
+            parsed.clear()
+            again = index_facts_for([a, b], out_dir)
+            assert again == facts, again
+            assert parsed == [], parsed
+
+            # A summary that changed is reparsed; file_stamp carries mtime_ns,
+            # but rewrite the size too so a coarse clock cannot hide the change.
+            parsed.clear()
+            a = write_summary("a", [{"eval_id": 1}, {"eval_id": 2}, {"eval_id": 3}])
+            moved = index_facts_for([a, b], out_dir)
+            assert parsed == [a], parsed
+            assert moved[a]["succeeded"] == 3, moved[a]
+
+            # --force ignores what is cached, and a run no longer on the index
+            # is dropped rather than kept forever.
+            parsed.clear()
+            index_facts_for([a], out_dir, force=True)
+            assert parsed == [a], parsed
+            with open(os.path.join(out_dir, INDEX_FACTS_CACHE)) as f:
+                assert list(json.load(f)["runs"]) == [a], f.name
+
+            # A cache written by an older facts layout is thrown away, not read.
+            parsed.clear()
+            with open(os.path.join(out_dir, INDEX_FACTS_CACHE), "w") as f:
+                json.dump({"version": "0", "runs": {a: {"stamp": file_stamp(a),
+                                                        "facts": {"nonsense": True}}}}, f)
+            index_facts_for([a], out_dir)
+            assert parsed == [a], parsed
+        finally:
+            globals()["index_entry_facts"] = real
+    finally:
+        shutil.rmtree(tmp_dir)
 
 
 def _self_check_cached_png():
@@ -3526,6 +3673,7 @@ if __name__ == "__main__":
         _self_check_profiling()
         _self_check_page_status()
         _self_check_index_toolbar()
+        _self_check_index_facts_cache()
         _self_check_torn_summary()
         _self_check_live_summary()
         _self_check_parameter_space_section()

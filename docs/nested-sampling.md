@@ -682,6 +682,16 @@ plain client-side JavaScript over the cards already on the page - no rebuild
 or server needed, and it works the same off a `file://` open as it does
 through `./ri serve`.
 
+The index always lists every run on disk, whatever `--last` or `--run`
+narrowed the page build to, so the values on its cards are cached in
+`reports/nested-sampling-report/.index-facts.json`, keyed by each summary's
+size and mtime. Without it a `./ri report --last 1` over a thousand runs
+reparses every `summary.json` under `results/nested-sampling/` - gigabytes of
+JSON, nearly all of it the `evaluations` array that a card shows as two
+counts. `--force` rebuilds the cache from scratch; a change to what
+`index_entry_facts` returns requires incrementing `INDEX_FACTS_VERSION` in
+`scripts/lib/generate_report.py`.
+
 Plots are cached PNGs under
 `reports/nested-sampling-report/images/`; unchanged inputs are skipped. Delete
 the report directory to force a full rebuild. A drawing-code change requires

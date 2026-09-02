@@ -634,7 +634,8 @@ def build_parser():
     report.add_argument("--run", metavar="DIR",
                         help="rebuild just this run's page [RUN]")
     report.add_argument("--force", action="store_true",
-                        help="rebuild every page in scope [FORCE=1]")
+                        help="rebuild every page in scope, and the index's "
+                             "cached run facts with them [FORCE=1]")
     report.add_argument("--upgrade", action="store_true",
                         help="rebuild pages written by an older report version "
                              "[UPGRADE=1]")
