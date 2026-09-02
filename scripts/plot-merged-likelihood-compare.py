@@ -226,6 +226,7 @@ def _self_check_head_and_pairing():
     global NESTED_SAMPLING_DIR
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+
         def run(name, algorithm, nlive, merged=False):
             path = root / name
             (path / "chains").mkdir(parents=True)
