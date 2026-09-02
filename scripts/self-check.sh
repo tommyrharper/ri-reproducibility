@@ -25,8 +25,12 @@ nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 
 # Use uv's pinned Python >=3.11: host `python3` may lack tomllib, which
 # `test_self_checks.py` needs through common.py. `--no-project` keeps checks
-# independent of pyproject.toml.
-host_python() { uv run --no-project --python ">=3.11" python "$@"; }
+# independent of pyproject.toml, and `--isolated` keeps them independent of
+# `.venv` as well - without it, `uv run` picks up whatever a `./ri` invocation
+# left there, so a HOST_RUNNABLE self-check that reaches for numpy passes here
+# and fails in CI, which has no `.venv` to find. These four are stdlib-only by
+# contract; that is the contract this enforces.
+host_python() { uv run --no-project --isolated --python ">=3.11" python "$@"; }
 
 echo "=== host-side checks ==="
 host_python "${REPO_ROOT}/scripts/profile-nested-sampling-run.py" --self-check

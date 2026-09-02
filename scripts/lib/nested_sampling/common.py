@@ -2331,10 +2331,13 @@ def self_check_choice_dimension() -> None:
         load_parameter_space.cache_clear()
         specs = load_parameter_space()
         axis = [s["name"] for s in specs].index("integration_seconds")
+        # A plain list, not an array: cube_to_params() only ever reads
+        # `float(cube[i])`, and a HOST_RUNNABLE self-check has to be stdlib
+        # only - CI runs this suite without numpy installed.
         drawn = []
-        for u in np.linspace(0.0, 1.0, 101):
-            cube = np.full(len(specs), 0.5)
-            cube[axis] = u
+        for step in range(101):
+            cube = [0.5] * len(specs)
+            cube[axis] = step / 100.0
             drawn.append(cube_to_params(cube)["integration_seconds"])
         assert drawn == sorted(drawn), "a choice dimension must stay monotonic in the cube"
         assert set(drawn) == set(values), (sorted(set(drawn)), values)
