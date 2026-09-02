@@ -19,7 +19,7 @@ def main() -> None:
         status = "on" if name in enabled_names else "off"
         box = ("[[receiver_band]]" if spec.get("kind") == "band_start"
                else f"{spec.get('min', '?')} to {spec.get('max', '?')}")
-        pinned = "" if status == "on" else f" (pinned at {spec.get('default', spec.get('min', 0.0))})"
+        pinned = "" if status == "on" else f" (pinned at {spec['default']})"
         rows.append((name, status, box, spec.get("kind", ""), pinned))
 
     name_width = max(len(row[0]) for row in rows)

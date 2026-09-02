@@ -208,6 +208,10 @@ def load_receiver_bands() -> list[dict[str, Any]]:
 def load_all_parameter_specs() -> list[dict[str, Any]]:
     specs = load_defaults()["parameter_space"]
     for spec in specs:
+        if "default" not in spec:
+            raise SystemExit(
+                f"defaults.toml: parameter_space '{spec.get('name', '?')}' has no default"
+            )
         # A pixel box would mean a different fraction of the sky each time
         # NS_IMAGE_DIM moved. Here, not in load_parameter_space(), so a
         # disabled dimension still reports its box.
@@ -466,13 +470,7 @@ def fill_disabled_parameters(raw: dict[str, Any]) -> None:
         name = spec["name"]
         if name in enabled_names or name in raw:
             continue
-        if "default" not in spec and spec.get("kind") == "band_start":
-            raise SystemExit(
-                f"defaults.toml: parameter_space '{name}' is disabled but has no "
-                "`default` - a band_start dimension has no min/max to fall back "
-                "on, so pin it explicitly, e.g. default = 1.4e9"
-            )
-        raw[name] = spec.get("default", spec.get("min", 0.0))
+        raw[name] = spec["default"]
 
 
 def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
@@ -2253,6 +2251,8 @@ def self_check_worker_pool_connect() -> None:
 
 
 def self_check_parameter_space() -> None:
+    for spec in load_all_parameter_specs():
+        assert "default" in spec, spec
     specs = load_parameter_space()
     assert len(specs) == 5, specs
     for spec in specs:
