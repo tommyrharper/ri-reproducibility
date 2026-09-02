@@ -2,6 +2,15 @@
 
 **PolyChord searches this repo's R2D2-RI and WSClean parameter spaces for failure modes**; Docker images, smoke tests, and pinned revisions keep searches runnable and results trustworthy.
 
+**Which R2D2:** the U-Net incarnation (`series: R2D2`, `layers: 1`), from R2D2-RI
+v2.0 - checkpoints `R2D2_A1_T2_Realisation1`, 25 terms. `A1` = U-Net (`A2` =
+U-WDSR), `T2` = the generalized training set. That model is described in
+[arXiv:2503.02554](https://arxiv.org/abs/2503.02554), *not* in the older
+[arXiv:2403.05452](https://arxiv.org/abs/2403.05452) vendored under
+`r2d2-paper/`, which is where `claims/` and `latex/` take their metric
+definitions and published numbers from. Do not compare search output against
+`claims/r2d2_claims.md` as if it were the same model.
+
 `./ri` is the front door - one command for every part of that:
 
 ```bash
