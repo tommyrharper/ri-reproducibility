@@ -246,7 +246,7 @@ name = "integration_seconds"
 min = 1
 max = 10
 kind = "integer"
-default = 120
+default = 10
 enabled = false
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
