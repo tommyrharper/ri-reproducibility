@@ -19,6 +19,7 @@ the complete interface.
 ./ri search r2d2 --metric sigma_res
 ./ri search wsclean --nlive 20 --num-repeats 5 --max-ndead 20
 ./ri search wsclean --then r2d2       # the second starts only if the first finished
+./ri search wsclean --then r2d2 --plot --report   # ...then compare them and rebuild the report
 ./ri resume results/nested-sampling/<run>
 ```
 

@@ -136,6 +136,20 @@ measured against the other one. See
 The chained search claims its own output directory, so `--output-dir` names the
 first one only.
 
+`--plot` and `--report` finish the job off, so a pair left running overnight has
+its comparison waiting in the morning:
+
+```bash
+./ri search wsclean --then r2d2 --nlive 125 --num-repeats 25 --plot --report
+```
+
+`--plot` is `./ri plot likelihood --last` and `--report` is `./ri report`, run in
+that order once every search above them has finished - the report's comparisons
+page collects the figures on disk, so plotting has to come first. After a
+`--then` pair the plotted pair is the two runs just finished; used on a single
+search it is whichever comparable pair is newest, and the plot names the two
+runs it used.
+
 PolyChord likelihood evaluations run in parallel across MPI ranks inside the
 PolyChord container. `NS_MPI_PROCS` sets the rank count (default
 `min(NS_NLIVE, host CPUs)`). Set `NS_MPI_PROCS=1` to disable parallel
