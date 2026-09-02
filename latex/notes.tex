@@ -118,9 +118,10 @@ Dimension & Range & Meaning \\
 \hline
 \hyperref[sec:param-dynamic-range]{\texttt{dynamic\_range}} & $10^3$--$5\times10^5$ & One-Jy source divided by thermal-noise sigma \\
 \hyperref[sec:param-observation-duration]{\texttt{observation\_minutes}} & $20$ sec--$20$ mins & Total requested observing time \\
+\hyperref[sec:param-declination]{\texttt{declination\_deg}} & $-15^\circ$--$75^\circ$ & Declination of the phase centre \\
 \hyperref[sec:param-channel-count]{\texttt{channel\_count}} & $64$--$2048$ & Number of frequency channels \\
-\hyperref[sec:param-frequency-range]{\texttt{start\_frequency\_hz}} & ? & First channel frequency \\
-\hyperref[sec:param-frequency-range]{\texttt{channel\_width\_hz}} & ? & Uniform spacing between channels \\
+\hyperref[sec:param-frequency-range]{\texttt{start\_frequency\_hz}} & $1$--$50$ GHz & First channel frequency \\
+\hyperref[sec:param-frequency-range]{\texttt{channel\_width\_hz}} & $0.1$--$2$ MHz & Uniform spacing between channels \\
 \end{tabular}
 \caption{Nested-sampling parameter dimensions used in the current runs.}
 \label{tab:nested-sampling-parameters}
@@ -393,9 +394,12 @@ Even 64 may computationally infeasible.
 \subsubsection{Frequency Range and Bandwidth}
 \label{sec:param-frequency-range}
 
-Currently unsure which of these bands to use.
-The channel width can then be a set to a maximum of of the full bandwidth available divided by the number of channels.
-I am not sure what would make sense as a minimum channel width.
+I have chose to allow the frequency range to be anywhere from $1$--$50$ GHz.
+Therefore we skip only bands 4 and P.
+I am doing this because there is a gap between bands P and L.
+Thus I am using the largest continuous range available.
+
+The bandwidth is set between $0.1$--$2$ MHz.
 
 \begin{table}[H]
 \centering
