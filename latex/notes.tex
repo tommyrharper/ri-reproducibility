@@ -119,6 +119,7 @@ Dimension & Realistic Range & Proposed Range & Meaning \\
 \hline
 \hyperref[sec:param-dynamic-range]{\texttt{dynamic\_range}} & $10^3$--$5\times10^5$ & $10$--$10^{6}$ & One-Jy source divided by thermal-noise sigma \\
 \hyperref[sec:param-observation-duration]{\texttt{observation\_minutes}} & $20$ sec--$20$ mins & $0.3$--$20$ mins & Total requested observing time \\
+\hyperref[sec:param-integration-seconds]{\texttt{integration\_seconds}} & $5$ msec--$10$ s & $1$--$10$ s & Correlator dump time \\
 \hyperref[sec:param-declination]{\texttt{declination\_deg}} & $-15^\circ$--$75^\circ$ & $-15^\circ$--$75^\circ$ & Declination of the phase centre \\
 \hyperref[sec:param-channel-count]{\texttt{channel\_count}} & $64$--$16384$ & $1$--$8$ & Number of frequency channels \\
 \hyperref[sec:param-frequency-range]{\texttt{start\_frequency\_hz}} & $54$ MHz--$50$ GHz & $1$--$50$ GHz & First channel frequency \\
@@ -380,6 +381,12 @@ VLA dynamic-scheduling timescales, EVLA Memo~232 \cite{faes2024evla232}:
 
 For regular (standard observing) scans, no less than 20~seconds on source after slewing (Static Report Tab) \cite{nrao-vla-obsguide}.
 Suggested search range: 20~s--20~min.
+
+\subsubsection{Integration Time}
+\label{sec:param-integration-seconds}
+
+The correlator dump time sets how densely the $uv$ track is sampled.
+The OSS Time Resolution and Data Rates page \cite{nrao-vla-tim-res} states that ``the maximum recommended integration time for any VLA observing is 10 seconds,'' that ``integration times as short as 5~msec \ldots can be supported,'' and that the default for VLA configuration A is 2 seconds (Table~3.6.1).
 
 \subsubsection{Observation Start Time and Hour-Angle Coverage}
 
