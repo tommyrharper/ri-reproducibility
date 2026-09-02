@@ -309,6 +309,8 @@ PolyChord dimensions for both algorithms:
 | `start_frequency_hz` | a receiver band (see below) | First channel frequency |
 | `channel_width_hz` | `0.5e6` to `2.0e6` | Uniform spacing between channels |
 | `source_offset_fraction` | `0.0` to `0.35` | Source offset from the phase centre, as a fraction of the image half-width |
+| `source_l_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along l, in pixels from the central pixel |
+| `source_m_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along m, in pixels from the central pixel |
 | `declination_deg` | `-30` to `80`, whole degrees | Declination of the phase centre; sets how foreshortened the array and how elliptical the PSF is |
 
 Channel frequencies are represented as a contiguous uniform
@@ -326,9 +328,10 @@ instead of deleting it: `cube_to_params()` fixes it at its `default` (falling
 back to `min` when no `default` is given) rather than drawing it from the
 cube. `source_offset_fraction`, for example, disables back to the old
 hard-coded centred source, because its `min` already is `0.0`.
-`source_offset_fraction` and `declination_deg` both ship disabled, the latter
-because enabling it makes the MS skeletons baked into the MeqTrees image -
-built at +65 - miss for every other declination.
+`source_offset_fraction`, `source_l_pixels`, `source_m_pixels` and
+`declination_deg` all ship disabled, the last because enabling it makes the MS
+skeletons baked into the MeqTrees image - built at +65 - miss for every other
+declination.
 
 Two ways to see and change this without editing the file:
 
@@ -482,11 +485,25 @@ its real baselines) exist. `compute_image_metrics()` places the truth pixel at
 that same offset (`source_pixel()`), so an off-centre evaluation is not scored
 against a source that is not there.
 
+`source_l_pixels` and `source_m_pixels` say the same thing in cartesian: a
+signed offset from the central pixel, against that same nominal pixel size, so
+the pair reaches any pixel rather than the points along one ray. They add to
+`source_offset_fraction`'s offset, each being zero at its own default.
+Enabling one alone leaves the other axis unexercised and gives up the symmetry
+the 30 degree ray was chosen for, so enable both or neither.
+
+`kind = "image_pixels"` in `defaults.toml` takes a `fraction`, not a min/max:
+`load_all_parameter_specs()` resolves the box to `+/-(NS_IMAGE_DIM / 2) *
+fraction`, `+/-8` pixels of the default 32-pixel image. A box in pixels would
+mean a different fraction of the sky each time the image size moved.
+
 Caveat: `ms_to_r2d2_mat.py` writes only `u` and `v` (see the bridge table
 below) - `w` is dropped, so R2D2 sees a coplanar 2-D array while WSClean does
 not. `source_offset_fraction`'s box tops out at 0.35 to stay inside the
 small-field regime that keeps this an acceptable approximation rather than
-comparing the two imagers on different physics.
+comparing the two imagers on different physics. The cartesian boxes ship at
+`fraction = 0.5`, and both axes at maximum sit `0.71` of the half-width out -
+past that limit. Lower `fraction` to `0.25` to stay inside it.
 
 Fixed hyperparameters (not searched) on every evaluation:
 

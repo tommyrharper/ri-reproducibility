@@ -189,6 +189,33 @@ min = 0.0
 max = 0.35
 enabled = false
 
+# Source position as a cartesian (l, m) offset from the central pixel, in
+# pixels. `source_offset_fraction` above only moves along one 30 degree ray;
+# these two axes reach any pixel, giving up that ray's freedom from
+# axis-aligned symmetry.
+#
+# `kind = "image_pixels"` takes `fraction`, not min/max: the box is
+# +/-(NS_IMAGE_DIM / 2) * fraction, so it tracks the image size instead of
+# meaning a different fraction of the sky each time that moves. At 0.5 both
+# axes at maximum sit 0.71 of the half-width out, past the 0.35 small-field
+# limit `ms_to_r2d2_mat.py`'s w-dropping needs; use 0.25 to stay inside it.
+#
+# Continuous, not integer: landing between pixel centres is the
+# pixel-interpolation error a centred source hides.
+[[parameter_space]]
+name = "source_l_pixels"
+kind = "image_pixels"
+fraction = 0.5
+default = 0.0
+enabled = false
+
+[[parameter_space]]
+name = "source_m_pixels"
+kind = "image_pixels"
+fraction = 0.5
+default = 0.0
+enabled = false
+
 # Declination of the phase centre, in whole degrees. The VLA sits at +34, so
 # +65 (the value every archived run was simulated at, and this dimension's
 # `default`) gives a full circular uv track and a near-circular PSF - the
