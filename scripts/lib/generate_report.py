@@ -15,6 +15,10 @@ from pathlib import Path
 
 REPO_ROOT = "/workspace/repo"
 NESTED_SAMPLING_DIR = os.path.join(REPO_ROOT, "results/nested-sampling")
+# Written by scripts/plot-merged-likelihood-compare.py, one PNG per pair of
+# runs it has ever compared; this report collects them onto one page.
+COMPARISONS_DIR = os.path.join(REPO_ROOT, "reports/likelihood-comparisons")
+COMPARISONS_PAGE = "likelihood-comparisons.html"
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nested_sampling"))
 
@@ -1875,6 +1879,20 @@ details summary { cursor: pointer; font-size: 0.9rem; margin-top: 0.5rem; }
 .pager-label { opacity: 0.7; font-variant-numeric: tabular-nums; }
 .likelihood-plot { margin: 0.5rem 0; }
 .likelihood-plot img { max-width: 100%; height: auto; border-radius: 6px; }
+.top-nav { margin: 0 0 1.25rem; }
+.button {
+  display: inline-block;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
+  border-radius: 6px;
+  font-size: 0.9rem;
+  color: inherit;
+  text-decoration: none;
+}
+.button:hover { border-color: color-mix(in srgb, CanvasText 60%, transparent); }
+.comparison-card { margin-bottom: 1.25rem; }
+.comparison-card h2 { font-size: 0.95rem; margin: 0 0 0.75rem; word-break: break-all; }
+.comparison-card figcaption { font-size: 0.8rem; opacity: 0.7; margin-top: 0.3rem; }
 .nav { font-size: 0.9rem; margin: 0 0 1rem; }
 .nav a { color: inherit; opacity: 0.7; text-decoration: none; }
 .nav a:hover { opacity: 1; text-decoration: underline; }
@@ -2494,10 +2512,79 @@ def render_unfinished_runs():
     )
 
 
-def render_nested_sampling_index(status_for, out_dir=None, force=False):
+def likelihood_comparison_pairs(directory=COMPARISONS_DIR):
+    """The comparison figures ./ri plot likelihood has written, newest first.
+
+    They are named `<wsclean run>-vs-<r2d2 run>[-side-by-side].png`, so the two
+    views of one comparison land under one heading rather than as four cards.
+    """
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".png"))
+    except OSError:  # nothing plotted yet
+        return []
+    pairs = {}
+    for name in names:
+        stem = name[: -len(".png")]
+        side = stem.endswith("-side-by-side")
+        stem = stem[: -len("-side-by-side")] if side else stem
+        path = os.path.join(directory, name)
+        entry = pairs.setdefault(stem, {"stem": stem, "mtime": 0.0})
+        entry["side" if side else "overlay"] = path
+        entry["mtime"] = max(entry["mtime"], os.path.getmtime(path))
+    # Newest first, and the name breaks ties so a rebuild keeps the same order.
+    return sorted(pairs.values(), key=lambda entry: (-entry["mtime"], entry["stem"]))
+
+
+def render_likelihood_comparisons(pairs):
+    if not pairs:
+        return (
+            '<p class="empty">No likelihood comparisons yet - '
+            "<code>./ri plot likelihood --last</code> writes one for the last "
+            "two directly comparable runs.</p>"
+        )
+    cards = []
+    for entry in pairs:
+        figures = []
+        for caption, key in (("Overlaid", "overlay"), ("Side by side", "side")):
+            path = entry.get(key)
+            if not path:
+                continue
+            # Keyed on the bytes' identity, so a replotted pair gets a fresh URL
+            # and the old one stays cacheable forever.
+            uri = cached_png(
+                f"likelihood-comparison|{entry['stem']}|{key}|{file_stamp(path)}",
+                lambda path=path: open(path, "rb").read(),
+            )
+            if not uri:
+                continue
+            figures.append(
+                f'<figure class="likelihood-plot"><img src="{html.escape(uri)}" '
+                f'alt="{html.escape(caption)} likelihood comparison">'
+                f"<figcaption>{caption}</figcaption></figure>"
+            )
+        if not figures:
+            continue
+        heading = html.escape(entry["stem"].replace("-vs-", " vs "))
+        cards.append(
+            f'<section class="card comparison-card"><h2>{heading}</h2>'
+            f'{"".join(figures)}</section>'
+        )
+    return "".join(cards)
+
+
+def render_comparisons_button(count):
+    label = f"Likelihood comparisons ({count})" if count else "Likelihood comparisons"
+    return (
+        f'<p class="top-nav"><a class="button" href="{COMPARISONS_PAGE}">'
+        f"{label} &rarr;</a></p>"
+    )
+
+
+def render_nested_sampling_index(status_for, out_dir=None, force=False, comparisons=0):
+    button = render_comparisons_button(comparisons)
     paths = nested_sampling_run_paths()
     if not paths:
-        return render_unfinished_runs() + (
+        return button + render_unfinished_runs() + (
             '<p class="empty">No nested-sampling runs found under '
             "results/nested-sampling/*/summary.json yet.</p>"
         )
@@ -2522,7 +2609,8 @@ def render_nested_sampling_index(status_for, out_dir=None, force=False):
         name: sorted(ranges) for name, ranges in sorted(param_ranges_by_name.items())
     }
     return (
-        render_unfinished_runs()
+        button
+        + render_unfinished_runs()
         + render_index_toolbar(algorithm_tokens, param_ranges_by_name)
         + f'<div id="ns-index-list">{"".join(entries)}</div>'
         + INDEX_SCRIPT
@@ -2787,7 +2875,23 @@ def main(argv=None):
                     eta = format_duration(elapsed / i * (len(todo) - i)) if i < len(todo) else "0s"
                     print(f"[{i}/{len(todo)}] elapsed {format_duration(elapsed)}  eta {eta}")
 
-    # The index is cheap and must reflect every run on disk, so always rebuild it.
+    # Both pages are cheap and must reflect everything on disk, so both always
+    # rebuild - the comparisons page first, since the index links it by count.
+    comparisons = likelihood_comparison_pairs()
+    write_html_doc(
+        os.path.join(out_dir, COMPARISONS_PAGE),
+        title="R2D2 vs WSClean likelihood comparisons",
+        subtitle=(
+            "Every pair <code>./ri plot likelihood</code> has compared, newest "
+            "first, from <code>reports/likelihood-comparisons/</code>. "
+            "<code>./ri plot likelihood --last</code> adds the last two directly "
+            "comparable runs."
+        ),
+        body=(
+            '<p class="top-nav"><a class="button" href="index.html">&larr; All runs</a></p>'
+            + render_likelihood_comparisons(comparisons)
+        ),
+    )
     write_html_doc(
         os.path.join(out_dir, "index.html"),
         title="ri-reproducibility nested-sampling runs",
@@ -2802,6 +2906,7 @@ def main(argv=None):
             lambda p: page_status(out_dir, os.path.basename(os.path.dirname(p))),
             out_dir,
             force=args.force,
+            comparisons=len(comparisons),
         ),
     )
     print(f"{written} run page(s) written, {skipped} skipped")
@@ -3002,6 +3107,40 @@ def _self_check_torn_summary():
     finally:
         NESTED_SAMPLING_DIR = saved
         shutil.rmtree(tmp_dir)
+
+
+def _self_check_likelihood_comparisons():
+    import shutil
+    import tempfile
+
+    global image_dir
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    saved_image_dir = image_dir
+    try:
+        comparisons = os.path.join(tmp_dir, "likelihood-comparisons")
+        os.makedirs(comparisons)
+        image_dir = os.path.join(tmp_dir, IMAGE_SUBDIR)
+        assert likelihood_comparison_pairs(os.path.join(tmp_dir, "absent")) == []
+        for name in ("a-vs-b.png", "a-vs-b-side-by-side.png", "c-vs-d.png"):
+            with open(os.path.join(comparisons, name), "wb") as f:
+                f.write(b"png-" + name.encode())
+        # Newest first: `c-vs-d` was written last, so it leads.
+        os.utime(os.path.join(comparisons, "c-vs-d.png"), (2 << 30, 2 << 30))
+        pairs = likelihood_comparison_pairs(comparisons)
+        assert [entry["stem"] for entry in pairs] == ["c-vs-d", "a-vs-b"], pairs
+        # Both views of one pair are one entry, not two.
+        assert set(pairs[1]) == {"stem", "mtime", "overlay", "side"}, pairs[1]
+        body = render_likelihood_comparisons(pairs)
+        assert body.count("comparison-card") == 2, body
+        assert body.count("<figure") == 3, body
+        assert "c vs d" in body, body
+        assert render_likelihood_comparisons([]).startswith('<p class="empty">')
+        assert COMPARISONS_PAGE in render_comparisons_button(2), render_comparisons_button(2)
+        assert "(2)" in render_comparisons_button(2)
+        assert "(0)" not in render_comparisons_button(0)
+    finally:
+        image_dir = saved_image_dir
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _self_check_index_toolbar():
@@ -3830,6 +3969,7 @@ if __name__ == "__main__":
         _self_check_page_status()
         _self_check_index_toolbar()
         _self_check_index_likelihood_plot()
+        _self_check_likelihood_comparisons()
         _self_check_index_facts_cache()
         _self_check_torn_summary()
         _self_check_live_summary()

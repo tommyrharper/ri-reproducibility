@@ -43,7 +43,11 @@ the complete interface.
 ./ri plot gui results/nested-sampling/<run>
 ./ri plot fits                    # render FITS images to PNG in results/
 ./ri plot likelihood              # R2D2 vs WSClean failure-score figures
+./ri plot likelihood --last       # ...for the last two directly comparable runs
 ```
+
+Every pair is kept in `reports/likelihood-comparisons/`; `./ri report` collects
+them onto a page linked from the top of the index.
 
 ## Watching the run that is going
 

@@ -427,6 +427,18 @@ check(
 )
 
 check(
+    "plot likelihood compares the merged runs by default",
+    [["uv", "run", "scripts/plot-merged-likelihood-compare.py"]],
+    plan("plot", "likelihood")[1],
+)
+
+check(
+    "plot likelihood --last reaches the plotting script",
+    [["uv", "run", "scripts/plot-merged-likelihood-compare.py", "--last"]],
+    plan("plot", "likelihood", "--last")[1],
+)
+
+check(
     "plot gui --live asks for the run in progress",
     [["uv", "run", "scripts/anesthetic-gui.py", "--live"]],
     plan("plot", "gui", "--live")[1],

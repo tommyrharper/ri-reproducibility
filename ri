@@ -260,7 +260,7 @@ def do_plot_fits(args):
 
 
 def do_plot_likelihood(args):
-    return {}, [uv("scripts/plot-merged-likelihood-compare.py")]
+    return {}, [uv("scripts/plot-merged-likelihood-compare.py", *(["--last"] if args.last else []))]
 
 
 def do_plot_gui(args):
@@ -763,8 +763,18 @@ def build_parser():
     plot_likelihood = plot_subs.add_parser(
         "likelihood", parents=[dry_run], help="R2D2 vs WSClean failure-score figures into reports/",
         description="Plot the newest comparable merged R2D2 and WSClean runs against "
-                    "each other, into reports/ where latex/notes.tex includes them from.",
+                    "each other, into reports/ where latex/notes.tex includes them from. "
+                    "Every pair is also kept under its own name in "
+                    "reports/likelihood-comparisons/, which './ri report' collects into "
+                    "a page linked from the top of the index.",
     )
+    plot_likelihood.add_argument(
+        "--last", action="store_true",
+        help="the last two directly comparable runs instead of the merged ones "
+             "only: the newest R2D2 and WSClean run that agree on VLA config, "
+             "metric, parameter space and sampler effort (nlive, num_repeats, "
+             "max_ndead). Writes only reports/likelihood-comparisons/, leaving "
+             "the figures latex/notes.tex includes by name alone")
     plot_likelihood.set_defaults(handler=do_plot_likelihood)
 
     plot_gui = plot_subs.add_parser(
