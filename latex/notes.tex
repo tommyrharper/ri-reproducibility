@@ -121,7 +121,7 @@ Dimension & Range & Meaning \\
 \hyperref[sec:param-declination]{\texttt{declination\_deg}} & $-15^\circ$--$75^\circ$ & Declination of the phase centre \\
 \hyperref[sec:param-channel-count]{\texttt{channel\_count}} & $64$--$2048$ & Number of frequency channels \\
 \hyperref[sec:param-frequency-range]{\texttt{start\_frequency\_hz}} & $1$--$50$ GHz & First channel frequency \\
-\hyperref[sec:param-frequency-range]{\texttt{channel\_width\_hz}} & $0.1$--$2$ MHz & Uniform spacing between channels \\
+\hyperref[sec:param-bandwidth]{\texttt{channel\_width\_hz}} & $0.1$--$2$ MHz & Uniform spacing between channels \\
 \end{tabular}
 \caption{Nested-sampling parameter dimensions used in the current runs.}
 \label{tab:nested-sampling-parameters}
@@ -391,15 +391,13 @@ For WIDAR spectral-line setups, Table~4.2.2 of the OSS gives example Baseline Bo
 In practice, 64 channels is a common modest/default scale for setup exploration, while thousands of channels may be computationally infeasible for the present MeqTrees, R2D2, and CLEAN nested-sampling simulations.
 Even 64 may computationally infeasible.
 
-\subsubsection{Frequency Range and Bandwidth}
+\subsubsection{Frequency Range}
 \label{sec:param-frequency-range}
 
 I have chose to allow the frequency range to be anywhere from $1$--$50$ GHz.
 Therefore we skip only bands 4 and P.
 I am doing this because there is a gap between bands P and L.
 Thus I am using the largest continuous range available.
-
-The bandwidth is set between $0.1$--$2$ MHz.
 
 \begin{table}[H]
 \centering
@@ -418,6 +416,12 @@ Q  & 40--50~GHz \\
 \caption{VLA receiver bands. Recommended calibrator cycle times by configuration are in Table~3.1 \cite{nrao-vla-obsguide}.}
 \label{tab:vla-bands}
 \end{table}
+
+\subsubsection{Bandwidth}
+\label{sec:param-bandwidth}
+
+The searched channel width is $0.1$--$2$~MHz.
+Table~1 (Overall EVLA Performance Goals) of the 2013B Observational Status Summary \cite{nrao-vla-oss2013b} lists the WIDAR correlator's finest frequency resolution as $0.12$~Hz and its coarsest as $2$~MHz.
 
 % \subsubsection{Flagging Fraction}
 
