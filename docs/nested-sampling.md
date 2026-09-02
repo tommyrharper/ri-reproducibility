@@ -309,6 +309,7 @@ PolyChord dimensions for both algorithms:
 | `start_frequency_hz` | a receiver band (see below) | First channel frequency |
 | `channel_width_hz` | `0.5e6` to `2.0e6` | Uniform spacing between channels |
 | `source_offset_fraction` | `0.0` to `0.35` | Source offset from the phase centre, as a fraction of the image half-width |
+| `declination_deg` | `-30` to `80`, whole degrees | Declination of the phase centre; sets how foreshortened the array and how elliptical the PSF is |
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
@@ -325,6 +326,9 @@ instead of deleting it: `cube_to_params()` fixes it at its `default` (falling
 back to `min` when no `default` is given) rather than drawing it from the
 cube. `source_offset_fraction`, for example, disables back to the old
 hard-coded centred source, because its `min` already is `0.0`.
+`source_offset_fraction` and `declination_deg` both ship disabled, the latter
+because enabling it makes the MS skeletons baked into the MeqTrees image -
+built at +65 - miss for every other declination.
 
 Two ways to see and change this without editing the file:
 

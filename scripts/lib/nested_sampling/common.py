@@ -358,6 +358,7 @@ PARAMETER_TEX_LABELS = {
     "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
     "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
     "source_offset_fraction": r"f_{\mathrm{offset}}",
+    "declination_deg": r"\delta\,[\mathrm{deg}]",
     "wsclean_niter": r"N_{\mathrm{iter}}",
     "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
 }
@@ -2003,6 +2004,8 @@ def simulate_measurement_set(
         str(params["source_l_arcsec"]),
         "--source-m-arcsec",
         str(params["source_m_arcsec"]),
+        "--declination-deg",
+        str(params["declination_deg"]),
         "--dynamic-range",
         str(params["dynamic_range"]),
         "--seed",
@@ -2214,19 +2217,25 @@ def self_check_parameter_toggle() -> None:
     saved_off = os.environ.get("NS_DISABLE_PARAMS")
     saved_on = os.environ.get("NS_ENABLE_PARAMS")
     try:
-        os.environ["NS_DISABLE_PARAMS"] = "source_offset_fraction"
+        # Against the file's own enabled set, not against every spec: more than
+        # one dimension ships disabled, and naming an already-disabled one is a
+        # no-op rather than a second removal.
+        os.environ["NS_DISABLE_PARAMS"] = "source_offset_fraction,channel_width_hz"
         os.environ.pop("NS_ENABLE_PARAMS", None)
+        enabled_in_file = [spec for spec in load_all_parameter_specs() if spec.get("enabled", True)]
         load_parameter_space.cache_clear()
         specs = load_parameter_space()
-        assert "source_offset_fraction" not in {spec["name"] for spec in specs}, specs
-        assert len(specs) == len(load_all_parameter_specs()) - 1, specs
+        assert {"source_offset_fraction", "channel_width_hz"}.isdisjoint({spec["name"] for spec in specs}), specs
+        assert len(specs) == len(enabled_in_file) - 1, specs
 
         # A disabled dimension is still one fewer cube dimension for
         # cube_to_params() to draw, and still a params key: pinned at its
-        # `default`/`min`, here 0.0, so it round-trips to a centred source.
+        # `default`/`min`, here 0.0 for the offset and +65 for the declination
+        # every archived run was simulated at.
         raw: dict[str, Any] = {spec["name"]: float(spec.get("min", 0.0)) for spec in specs}
         fill_disabled_parameters(raw)
         assert raw["source_offset_fraction"] == 0.0, raw
+        assert raw["declination_deg"] == 65, raw
 
         os.environ["NS_DISABLE_PARAMS"] = "channel_count"
         os.environ["NS_ENABLE_PARAMS"] = "channel_count"
