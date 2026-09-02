@@ -149,9 +149,17 @@ def image_pixel_size_arcsec(
     return (180.0 / math.pi) * 3600.0 / (super_resolution * 2.0 * max_proj_baseline_lambda)
 
 
+def nominal_pixel_size_arcsec(start_frequency_hz: float) -> float:
+    """Image scale the source position is placed against.
+
+    Nominal: VLA-A's maximum baseline, not the one the simulator records - the
+    position has to reach simulate_point_source_ms.py before the MS exists.
+    """
+    return image_pixel_size_arcsec(VLA_A_MAX_BASELINE_M * start_frequency_hz / SPEED_OF_LIGHT_M_S)
+
+
 def source_offset_to_lm(fraction: float, start_frequency_hz: float) -> tuple[float, float]:
-    max_proj_baseline_lambda = VLA_A_MAX_BASELINE_M * start_frequency_hz / SPEED_OF_LIGHT_M_S
-    half_width_arcsec = image_pixel_size_arcsec(max_proj_baseline_lambda) * (image_dim() / 2.0)
+    half_width_arcsec = nominal_pixel_size_arcsec(start_frequency_hz) * (image_dim() / 2.0)
     radius_arcsec = fraction * half_width_arcsec
     angle_rad = math.radians(SOURCE_OFFSET_POSITION_ANGLE_DEG)
     return radius_arcsec * math.sin(angle_rad), radius_arcsec * math.cos(angle_rad)
@@ -198,7 +206,15 @@ def load_receiver_bands() -> list[dict[str, Any]]:
 
 @cache
 def load_all_parameter_specs() -> list[dict[str, Any]]:
-    return load_defaults()["parameter_space"]
+    specs = load_defaults()["parameter_space"]
+    for spec in specs:
+        # A pixel box would mean a different fraction of the sky each time
+        # NS_IMAGE_DIM moved. Here, not in load_parameter_space(), so a
+        # disabled dimension still reports its box.
+        if spec.get("kind") == "image_pixels":
+            reach = (image_dim() / 2.0) * float(spec["fraction"])
+            spec["min"], spec["max"] = -reach, reach
+    return specs
 
 
 def _param_name_set(env_var: str) -> set[str]:
@@ -373,6 +389,8 @@ PARAMETER_TEX_LABELS = {
     "start_frequency_hz": r"\nu_{\mathrm{start}}\,[\mathrm{Hz}]",
     "channel_width_hz": r"\Delta\nu\,[\mathrm{Hz}]",
     "source_offset_fraction": r"f_{\mathrm{offset}}",
+    "source_l_pixels": r"l\,[\mathrm{px}]",
+    "source_m_pixels": r"m\,[\mathrm{px}]",
     "declination_deg": r"\delta\,[\mathrm{deg}]",
     "wsclean_niter": r"N_{\mathrm{iter}}",
     "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
@@ -461,10 +479,14 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw["dynamic_range"] = 10.0 ** raw.pop("log10_dynamic_range")
     raw["vla_config"] = "VLA.A"
     raw["source_flux_jy"] = 1.0
-    # Keep source_offset_fraction for prior_vector()'s round-trip check.
-    raw["source_l_arcsec"], raw["source_m_arcsec"] = source_offset_to_lm(
+    # Keep the offset dimensions for prior_vector()'s round-trip check. Polar
+    # and cartesian offsets add; each is zero at its own default.
+    pixel_arcsec = nominal_pixel_size_arcsec(raw["start_frequency_hz"])
+    offset_l, offset_m = source_offset_to_lm(
         raw["source_offset_fraction"], raw["start_frequency_hz"]
     )
+    raw["source_l_arcsec"] = offset_l + raw["source_l_pixels"] * pixel_arcsec
+    raw["source_m_arcsec"] = offset_m + raw["source_m_pixels"] * pixel_arcsec
     return raw
 
 
@@ -2398,6 +2420,48 @@ def self_check_source_offset() -> None:
         n = len(load_parameter_space())
         params = cube_to_params(np.full(n, 0.5))
         assert params["source_l_arcsec"] != 0.0 or params["source_m_arcsec"] != 0.0, params
+
+        # The cartesian axes land the source on the pixel they name: the box
+        # is symmetric about 0, so cube 0.5 is the centre and 1.0 the maximum.
+        os.environ["NS_ENABLE_PARAMS"] = "source_l_pixels,source_m_pixels"
+        load_parameter_space.cache_clear()
+        specs = load_parameter_space()
+        n = len(specs)
+        centred = cube_to_params(np.full(n, 0.5))
+        assert centred["source_l_arcsec"] == 0.0 and centred["source_m_arcsec"] == 0.0, centred
+        corner = cube_to_params(np.full(n, 1.0))
+        scale = nominal_pixel_size_arcsec(corner["start_frequency_hz"])
+        by_name = {str(spec["name"]): spec for spec in specs}
+        for axis, arcsec in (("l", corner["source_l_arcsec"]), ("m", corner["source_m_arcsec"])):
+            expected = float(by_name[f"source_{axis}_pixels"]["max"])
+            assert math.isclose(arcsec / scale, expected), (axis, arcsec / scale, expected)
+        # CDELT1 is negative in a real header, so source_pixel() mirrors l:
+        # what is pinned is the distance from the centre.
+        centre = image_dim() // 2
+        header = {"CDELT1": -scale / 3600.0, "CDELT2": scale / 3600.0}
+        sx, sy = source_pixel(
+            header, centre, centre, corner["source_l_arcsec"], corner["source_m_arcsec"],
+            image_dim(), image_dim(),
+        )
+        away = round(float(by_name["source_l_pixels"]["max"]))
+        assert (abs(sx - centre), sy - centre) == (away, away), (sx, sy, away)
+
+        # A fraction of the half-width, so NS_IMAGE_DIM has to move the box.
+        saved_dim = os.environ.get("NS_IMAGE_DIM")
+        try:
+            os.environ["NS_IMAGE_DIM"] = str(image_dim() * 2)
+            for clear in (image_dim, load_all_parameter_specs, load_parameter_space):
+                clear.cache_clear()
+            doubled = {str(spec["name"]): spec for spec in load_all_parameter_specs()}
+            assert float(doubled["source_l_pixels"]["max"]) == 2.0 * away, doubled["source_l_pixels"]
+            assert float(doubled["source_l_pixels"]["min"]) == -2.0 * away, doubled["source_l_pixels"]
+        finally:
+            if saved_dim is None:
+                os.environ.pop("NS_IMAGE_DIM", None)
+            else:
+                os.environ["NS_IMAGE_DIM"] = saved_dim
+            for clear in (image_dim, load_all_parameter_specs, load_parameter_space):
+                clear.cache_clear()
     finally:
         if saved_on is None:
             os.environ.pop("NS_ENABLE_PARAMS", None)
