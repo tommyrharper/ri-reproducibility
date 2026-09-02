@@ -119,8 +119,8 @@ The detailed definitions are given in the linked sections of the search paramete
 Dimension & Default & Realistic Range & Proposed Range & Meaning \\
 \hline
 \hyperref[sec:param-dynamic-range]{\texttt{dynamic\_range}} & $10$ & $10^3$--$5\times10^5$ & $10$--$10^{6}$ & 1-Jy source $\div$ by thermal-noise $\sigma$ \\
-\hyperref[sec:param-source-position]{$l$} & $0$ & $\pm 1$ (image edge) & $\pm 0.5$ & East--west fractional offset from the phase centre \\
-\hyperref[sec:param-source-position]{$m$} & $0$ & $\pm 1$ & $\pm 0.5$ & North--south fractional offset from the phase centre \\
+\hyperref[sec:param-source-position]{$l$} & $0$ & $\pm 1$ (image edge) & $\pm 1$ & East--west fractional offset from the phase centre \\
+\hyperref[sec:param-source-position]{$m$} & $0$ & $\pm 1$ & $\pm 1$ & North--south fractional offset from the phase centre \\
 \hyperref[sec:param-observation-duration]{\texttt{observation\_minutes}} & $0.3$ min & $20$ sec--$20$ mins & $0.3$--$20$ mins & Total requested observing time \\
 \hyperref[sec:param-integration-seconds]{\texttt{integration\_seconds}} & $2$ s & $5$ msec--$10$ s & $1$--$10$ s & Correlator dump time \\
 \hyperref[sec:param-declination]{\texttt{declination\_deg}} & $34^\circ$ & $-15^\circ$--$75^\circ$ & $-15^\circ$--$75^\circ$ & Declination of the phase centre \\
@@ -359,7 +359,7 @@ Both are searched as a fraction of the image half-width: $0$ is on-axis, $\pm 1$
 On the phase centre there is no bandwidth smearing, no time smearing, and no $w$-term.
 Those effects grow with angular distance from the axis, which is why $(l,m)$ belongs in the search.
 A source can realistically lie anywhere in the field of view.
-The proposed box is $\pm 0.5$ on each axis, halfway to the image edge.
+The proposed box is $\pm 1$ on each axis, all the way to the image edge.
 
 \subsection{Observation and Fourier-Sampling Parameters}
 

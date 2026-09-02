@@ -214,14 +214,14 @@ enabled = false
 [[parameter_space]]
 name = "source_l_pixels"
 kind = "image_pixels"
-fraction = 0.5
+fraction = 1
 default = 0.0
 enabled = false
 
 [[parameter_space]]
 name = "source_m_pixels"
 kind = "image_pixels"
-fraction = 0.5
+fraction = 1
 default = 0.0
 enabled = false
 
