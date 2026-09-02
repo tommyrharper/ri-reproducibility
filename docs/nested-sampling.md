@@ -619,7 +619,11 @@ and `./ri search --keep-measurement-sets` retains them for every evaluation.
 Once the run finishes, it keeps the three images above, and the imager's logs,
 only for the 20 worst and 20 best evaluations by objective and one in every 100
 between them, so a finished run holds a few hundred of each rather than one set
-per evaluation; `NS_KEEP_ALL_IMAGES=1` keeps every one. Before a WSClean log is
+per evaluation; `NS_KEEP_ALL_IMAGES=1` keeps every one. That pruning runs when
+the run ends, so a run still going still has every image it has written - the
+report's gallery applies the same 20/20/one-in-100 policy itself rather than
+showing whatever is on disk, which is what keeps `./ri report --live` from
+drawing a card per evaluation. Before a WSClean log is
 dropped, `clean_stop_reason` (`threshold` or `max-iterations`),
 `clean_iterations` and `clean_major_iterations` are read out of it into the
 evaluation's `metrics`, so whether CLEAN converged outlives the log.

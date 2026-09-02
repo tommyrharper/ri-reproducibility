@@ -20,6 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "nes
 
 from common import (  # noqa: E402
     backfill_busy_seconds,
+    evaluation_key,
+    evaluations_keeping_images,
     format_duration,
     format_share,
     profiling_breakdown,
@@ -1291,11 +1293,24 @@ def render_eval_glance_summary(evaluations, metric, failed_count):
 
 
 def evaluations_with_images(evaluations, run_dirs):
-    """Only a sample of a run's evaluations keeps its image (prune_run_artefacts)."""
+    """The evaluations the retention policy shows, whose image is still on disk.
+
+    prune_run_artefacts() applies that policy to the files, but only once a run
+    ends - so trusting the disk to have been pruned bounds this page for a
+    finished run and not at all for any other. A run still going has every
+    image it has ever written, which is what made `./ri report --live` take ten
+    minutes to draw a 46 MB gallery of 87k cards, growing with the run; a
+    finished run started with NS_KEEP_ALL_IMAGES=1 has the same page. The
+    policy is a cheap pure function of the records, so apply it here rather
+    than inferring it from what happens to be on disk.
+    """
+    keep = evaluations_keeping_images(evaluations)
     return [
         ev
         for ev in evaluations
-        if resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
+        # Key first: the point is to stat only the sample, not every evaluation.
+        if evaluation_key(ev) in keep
+        and resolve_eval_path(run_dirs, (ev.get("paths") or {}).get("image"))
     ]
 
 
@@ -1304,7 +1319,7 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
         return ""
 
     # A card per imageless evaluation was 90% of this page - 2000-odd cards
-    # holding a dash - so only evaluations that kept an image get one.
+    # holding a dash - so only the retained sample gets one.
     shown = evaluations_with_images(evaluations, run_dirs)
     if not shown:
         return ""
@@ -1336,8 +1351,8 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
     note = ""
     if len(shown) != len(evaluations):
         note = (
-            f'<p class="purpose">Showing the {len(shown)} of {len(evaluations)} evaluations'
-            " that kept an image: the best and worst scorers and a sample in between.</p>"
+            f'<p class="purpose">Showing {len(shown)} of {len(evaluations)} evaluations:'
+            " the best and worst scorers and a sample in between.</p>"
         )
 
     return f'<div class="eval-images">{truth_html}{note}{cards_html}</div>'
@@ -3532,6 +3547,72 @@ def _self_check_run_page_split():
         shutil.rmtree(tmp_dir)
 
 
+def _self_check_unpruned_gallery():
+    """A run whose images are all still on disk still gets a bounded gallery.
+
+    prune_run_artefacts() only runs when a run ends, so this is every run that
+    `./ri report --live` looks at - and one card and one PNG per evaluation is
+    what made that build take ten minutes.
+    """
+    global render_fits_image, synthesize_truth_array, image_dir
+
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-live-gallery-")
+    try:
+        run_dir = os.path.join(tmp_dir, "r2d2-live")
+        os.makedirs(os.path.join(run_dir, "evals"))
+        image = os.path.join(run_dir, "evals", "kept.fits")
+        with open(image, "wb") as f:
+            f.write(b"not really a fits")
+        count = 500
+        summary_path = os.path.join(run_dir, LIVE_SUMMARY_NAME)
+        with open(summary_path, "w") as f:
+            json.dump({
+                "algorithm": "r2d2",
+                "live": True,
+                "metric": "snr",
+                "parameter_space": [],
+                # Nothing pruned: every evaluation still names an image that is
+                # really there, which is what a run in progress looks like.
+                "evaluations": [
+                    {
+                        "eval_id": i,
+                        "objective": float(count - i),
+                        "paths": {"eval_dir": f"eval-{i:04d}-abc",
+                                  "image": "evals/kept.fits"},
+                    }
+                    for i in range(count)
+                ],
+            }, f)
+
+        real_render, real_truth = render_fits_image, synthesize_truth_array
+        real_image_dir = image_dir
+        render_fits_image = lambda *a, **kw: "images/deadbeef.png"  # noqa: E731
+        synthesize_truth_array = lambda *a, **kw: None  # noqa: E731
+        image_dir = os.path.join(tmp_dir, "images")
+        os.makedirs(image_dir)
+        try:
+            gallery = render_run_images_page(summary_path)
+        finally:
+            render_fits_image, synthesize_truth_array = real_render, real_truth
+            image_dir = real_image_dir
+
+        cards = gallery.count('<article class="eval-card')
+        expected = len(evaluations_keeping_images(
+            [{"eval_id": i, "objective": float(count - i),
+              "paths": {"eval_dir": f"eval-{i:04d}-abc"}} for i in range(count)]
+        ))
+        assert cards == expected, (cards, expected)
+        # The bound is the point: a card each would be 500 of them, and the run
+        # this was found on had 87k.
+        assert cards < count // 4, (cards, count)
+        assert f"Showing {cards} of {count} evaluations" in gallery, gallery
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
 def _self_check_pagination():
     global render_fits_image, synthesize_truth_array, image_dir
 
@@ -3637,7 +3718,7 @@ def _self_check_pagination():
         cards = gallery.count('<article class="eval-card')
         assert cards == shown, cards
         assert NO_IMAGE not in gallery, gallery
-        assert f"Showing the {shown} of {shown + 2} evaluations" in gallery, gallery
+        assert f"Showing {shown} of {shown + 2} evaluations" in gallery, gallery
         assert f"View {shown} evaluation images" in page, page
         # Pagination still applies to what is left, and only page one is DOM:
         # off-page thumbnails cannot be fetched from inside script text.
@@ -3667,6 +3748,7 @@ if __name__ == "__main__":
         _self_check_run_page_name()
         _self_check_run_page_split()
         _self_check_pagination()
+        _self_check_unpruned_gallery()
         _self_check_mplot3d_skip()
         _self_check_cached_png()
         _self_check_render_array_png()
