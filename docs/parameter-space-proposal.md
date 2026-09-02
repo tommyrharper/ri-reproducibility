@@ -100,19 +100,27 @@ and learned reconstructors fail differently here - CLEAN chases the outlier
 into a spurious component, a network may absorb or hallucinate it - which is
 precisely the kind of divergence this repo exists to find.
 
-## 5. Declination of the phase centre
+## 5. Declination of the phase centre - implemented, shipped disabled
 
-Pinned at `Declination=65.0.0` in the makems config - near-optimal for the VLA,
-giving a full circular uv track and a near-circular PSF. Low declination
+Was pinned at `Declination=65.0.0` in the makems config - near-optimal for the
+VLA, giving a full circular uv track and a near-circular PSF. Low declination
 foreshortens the array, produces a highly elliptical beam and much worse
 sidelobes, and it is a routine observing condition rather than an exotic one.
 
-Proposal: `declination_deg` on a **discrete** grid (e.g. -30, 0, 20, 40, 65,
-80). Discrete for the same skeleton-cache reason as 2: `Declination` is part of
-the makems config, and only `StartFreq`/`StepFreq` are excluded from the cache
-key, so a continuous dimension defeats the prebuilt cache. Adding it multiplies
-the prebuild shape count by the number of declinations, so cost the prebuild
-before choosing the grid.
+Now `declination_deg`, `kind = "integer"` over -30 to 80, `enabled = false`
+with `default = 65`. Discrete for the skeleton-cache reason: `Declination` is
+part of the makems config, and only `StartFreq`/`StepFreq` are excluded from
+the cache key, so a continuous dimension would build a fresh skeleton per
+evaluation. Whole degrees rather than a hand-picked grid because
+`kind = "integer"` already exists and a six-value list would be new machinery
+for the same bound.
+
+It is disabled because the skeletons baked into the MeqTrees image
+(`--prebuild-skeletons`) are all at +65: enabling it means every other
+declination pays one makems build per (NTimes, NFrequencies) shape it reaches,
+published to the live cache and reused after that. Extending `prebuild_skeletons()`
+to a declination list multiplies the prebuild shape count by that list's length,
+so cost it before choosing one.
 
 ## 6. A second source, with a flux ratio
 

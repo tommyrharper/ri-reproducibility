@@ -47,6 +47,7 @@ IMAGE_ONLY = {
         "self_check_spectral_window",
     ),
     "simulate_point_source_ms": (
+        "self_check_declination_config",
         "self_check_forest_reuse",
         "self_check_meqserver_restart",
         "self_check_dropped_subtables",

@@ -28,6 +28,10 @@ ANTENNA_TABLE_NAME = "VLAA_ANT"
 TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
 # Shared with prebuild_skeletons(), which enumerates evaluation NTimes.
 DEFAULT_INTEGRATION_SECONDS = 120.0
+# The declination every archived run was simulated at, and the only one the
+# skeletons baked into the image were built for; `declination_deg` in
+# defaults.toml pins back to this while it is disabled.
+DEFAULT_DECLINATION_DEG = 65.0
 SPEED_OF_LIGHT = 299792458.0
 
 # RAM avoids ~0.5s bind-mount fsync cost per run; final ~1MB copy costs ~2ms.
@@ -55,6 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-flux-jy", type=float, default=1.0)
     parser.add_argument("--source-l-arcsec", type=float, default=0.0)
     parser.add_argument("--source-m-arcsec", type=float, default=0.0)
+    parser.add_argument("--declination-deg", type=float, default=DEFAULT_DECLINATION_DEG)
     parser.add_argument("--dynamic-range", type=float, required=True)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args(argv)
@@ -67,6 +72,19 @@ def require_clean_output(output_ms: Path) -> None:
         candidate = output_ms.parent / f"{output_ms.name}{suffix}"
         if candidate.exists():
             raise SystemExit(f"FATAL: makems scratch output already exists: {candidate}")
+
+
+def makems_declination(degrees: float) -> str:
+    """Decimal degrees as the dotted sexagesimal makems hands to casacore's MVAngle.
+
+    Rounded to whole arcseconds, so the string is always three dotted fields:
+    a fractional-second field would be a fourth, which MVAngle reads as
+    something else entirely. `declination_deg` is a whole-degree dimension, so
+    the rounding only bites on a hand-passed `--declination-deg`.
+    """
+    d, rest = divmod(round(abs(degrees) * 3600.0), 3600)
+    m, s = divmod(rest, 60)
+    return f"{'-' if degrees < 0 else ''}{d}.{m}.{s}"
 
 
 def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
@@ -85,7 +103,7 @@ def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
                 "StartTime=2005/02/09/21:21:40",
                 f"StepTime={args.integration_seconds:.8f}",
                 "RightAscension=0:0:0",
-                "Declination=65.0.0",
+                f"Declination={makems_declination(args.declination_deg)}",
                 "NBands=1",
                 f"NFrequencies={args.channel_count}",
                 f"NTimes={n_times}",
@@ -537,6 +555,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
             "start_frequency_hz": args.start_frequency_hz,
             "channel_width_hz": args.channel_width_hz,
             "channel_frequencies_hz": freqs_hz.tolist(),
+            "declination_deg": args.declination_deg,
         },
         "noise": {
             "dynamic_range": args.dynamic_range,
@@ -727,6 +746,31 @@ def self_check_skeleton_prebuild() -> None:
             "a prebuilt shape was not reused by a real evaluation of it"
     use_skeleton_cache(None)
     print("MS skeleton prebuild self-check passed")
+
+
+def self_check_declination_config() -> None:
+    """Declination must reach makems, and must be part of the skeleton cache key."""
+    assert makems_declination(DEFAULT_DECLINATION_DEG) == "65.0.0", makems_declination(DEFAULT_DECLINATION_DEG)
+    assert makems_declination(-30.0) == "-30.0.0", makems_declination(-30.0)
+    assert makems_declination(-0.5) == "-0.30.0", makems_declination(-0.5)
+    assert makems_declination(20.505) == "20.30.18", makems_declination(20.505)
+
+    def cfg_text(dec: str | None) -> str:
+        with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+            ms = Path(scratch) / "sim.ms"
+            argv = ["--output-ms", str(ms), "--observation-minutes", "4.0", "--channel-count", "2",
+                    "--start-frequency-hz", "1.0e9", "--channel-width-hz", "1.0e6", "--dynamic-range", "300"]
+            return write_makems_config(parse_args(argv + (["--declination-deg", dec] if dec else [])), ms).read_text()
+
+    assert "Declination=65.0.0" in cfg_text(None), "the default declination no longer reaches makems"
+    assert "Declination=-30.0.0" in cfg_text("-30"), "--declination-deg does not reach makems"
+    # make_ms_skeleton() keys the cache on the config minus StartFreq/StepFreq,
+    # so a declination that did not show up there would silently reuse +65.
+    def cache_key(text: str) -> list[str]:
+        return [line for line in text.splitlines() if not line.startswith(("StartFreq=", "StepFreq="))]
+
+    assert cache_key(cfg_text(None)) != cache_key(cfg_text("-30")), "declination is outside the skeleton cache key"
+    print("declination config self-check passed")
 
 
 def self_check_forest_reuse() -> None:
@@ -1079,6 +1123,7 @@ if __name__ == "__main__":
             self_check_scratch_root()
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
+            self_check_declination_config()
             self_check_forest_reuse()
             self_check_phase_centre_predict()
             self_check_noise_weighting()
