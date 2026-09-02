@@ -242,6 +242,36 @@ kind = "integer"
 default = 34
 enabled = false
 
+# The correlator dump time, makems' `StepTime`. Fixed at 120 s until now, which
+# welds together the two things a time axis should separate: `NTimes` is
+# `ceil(observation_minutes * 60 / this)`, so the 0.3-20 minute box only ever
+# reaches 1 to 10 time samples, and total track length and visibility count
+# move as one. There is no way to ask for "long track, sparse sampling" against
+# "short track, dense sampling", which are very different uv-coverage regimes.
+# It is also the only parameter time smearing depends on: smearing goes as the
+# dump time times the source's offset in beams, so `observation_minutes` cannot
+# reach it however long the track. See docs/parameter-space-proposal.md,
+# section 2 - and enable `source_offset_fraction` alongside this one, because
+# at the phase centre there is no time smearing to find.
+#
+# `kind = "choice"`: an explicit list, not a box. `StepTime` is inside the MS
+# skeleton cache key and the reachable `NTimes` grows as the dump time shrinks,
+# so the number of distinct skeletons is what has to be bounded. Measured, the
+# baked cache is 80 shapes and 87 MB today; the five values below reach 193
+# (NTimes, dump time) pairs, so 1544 shapes and ~5 GB. That lands in the
+# sidecar's writable layer rather than its 512 MB /dev/shm, and it is built
+# lazily at ~0.05 s a shape rather than baked, so it costs disk and a few
+# minutes spread across a run - but it is why this ships disabled, and why a
+# continuous dimension is not on offer at all.
+# ponytail: `prebuild_skeletons()` still bakes at 120 s only. Extend it to
+# iterate this list if the lazy first-use cost shows up in a real run.
+[[parameter_space]]
+name = "integration_seconds"
+kind = "choice"
+values = [10, 30, 60, 120, 300]
+default = 120
+enabled = false
+
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
 # These are the VLA's; nothing in the code is VLA-specific, so pointing this
 # repo at another telescope is a matter of replacing the list (any number of

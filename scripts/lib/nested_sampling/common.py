@@ -214,6 +214,12 @@ def load_all_parameter_specs() -> list[dict[str, Any]]:
         if spec.get("kind") == "image_pixels":
             reach = (image_dim() / 2.0) * float(spec["fraction"])
             spec["min"], spec["max"] = -reach, reach
+        # A `choice` dimension is its `values` list, but it still reports a box,
+        # so every reader that expects min/max - `./ri params`, the TUI,
+        # self_check_parameter_space - keeps working without a special case.
+        if spec.get("kind") == "choice":
+            spec.setdefault("min", min(spec["values"]))
+            spec.setdefault("max", max(spec["values"]))
     return specs
 
 
@@ -407,6 +413,7 @@ PARAMETER_TEX_LABELS = {
     "source_l_pixels": r"l\,[\mathrm{px}]",
     "source_m_pixels": r"m\,[\mathrm{px}]",
     "declination_deg": r"\delta\,[\mathrm{deg}]",
+    "integration_seconds": r"\tau_{\mathrm{int}}\,[\mathrm{s}]",
     "wsclean_niter": r"N_{\mathrm{iter}}",
     "wsclean_auto_threshold": r"\sigma_{\mathrm{thresh}}",
 }
@@ -478,6 +485,12 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw: dict[str, Any] = {}
     specs = load_parameter_space()
     for i, spec in enumerate(specs):
+        # `choice` takes its values from a list, each with an equal share of the
+        # dimension - the same split `band_start` gives each receiver band.
+        if spec.get("kind") == "choice":
+            values = spec["values"]
+            raw[spec["name"]] = values[min(int(float(cube[i]) * len(values)), len(values) - 1)]
+            continue
         lower, upper = float(spec["min"]), float(spec["max"])
         value = lower + float(cube[i]) * (upper - lower)
         if spec.get("kind") == "integer":
@@ -2058,6 +2071,8 @@ def simulate_measurement_set(
         str(params["source_m_arcsec"]),
         "--declination-deg",
         str(params["declination_deg"]),
+        "--integration-seconds",
+        str(params["integration_seconds"]),
         "--dynamic-range",
         str(params["dynamic_range"]),
         "--seed",
@@ -2301,6 +2316,44 @@ def self_check_parameter_toggle() -> None:
                 os.environ[var] = saved
         load_parameter_space.cache_clear()
     print("parameter toggle self-check passed")
+
+
+def self_check_choice_dimension() -> None:
+    """A `choice` dimension draws from its list, one equal share of the cube each."""
+    spec = next(s for s in load_all_parameter_specs() if s["name"] == "integration_seconds")
+    values = list(spec["values"])
+    # The box every min/max reader falls back on has to be the list's own span.
+    assert (spec["min"], spec["max"]) == (min(values), max(values)), spec
+
+    saved = os.environ.get("NS_ENABLE_PARAMS")
+    try:
+        os.environ["NS_ENABLE_PARAMS"] = "integration_seconds"
+        load_parameter_space.cache_clear()
+        specs = load_parameter_space()
+        axis = [s["name"] for s in specs].index("integration_seconds")
+        drawn = []
+        for u in np.linspace(0.0, 1.0, 101):
+            cube = np.full(len(specs), 0.5)
+            cube[axis] = u
+            drawn.append(cube_to_params(cube)["integration_seconds"])
+        assert drawn == sorted(drawn), "a choice dimension must stay monotonic in the cube"
+        assert set(drawn) == set(values), (sorted(set(drawn)), values)
+        # The top of the cube is the last value, not an index off the end.
+        assert (drawn[0], drawn[-1]) == (values[0], values[-1]), (drawn[0], drawn[-1])
+        counts = [drawn.count(v) for v in values]
+        assert max(counts) - min(counts) <= 1, counts
+    finally:
+        if saved is None:
+            os.environ.pop("NS_ENABLE_PARAMS", None)
+        else:
+            os.environ["NS_ENABLE_PARAMS"] = saved
+        load_parameter_space.cache_clear()
+
+    # Disabled, it pins to the dump time every archived run was simulated at.
+    raw: dict[str, Any] = {}
+    fill_disabled_parameters(raw)
+    assert raw["integration_seconds"] == 120, raw
+    print("choice dimension self-check passed")
 
 
 def self_check_image_dim() -> None:

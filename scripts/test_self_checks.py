@@ -19,6 +19,7 @@ HOST_RUNNABLE = {
         "self_check_clean_convergence",
         "self_check_image_dim",
         "self_check_image_retention",
+        "self_check_choice_dimension",
         "self_check_parameter_space",
         "self_check_parameter_toggle",
         "self_check_profiling",

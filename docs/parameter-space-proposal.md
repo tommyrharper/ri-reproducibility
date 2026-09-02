@@ -57,23 +57,36 @@ is a coplanar 2D operator while WSClean is not. Keep offsets inside the
 small-field regime, or the comparison becomes apples to oranges for a reason
 that has nothing to do with either algorithm.
 
-## 2. Integration time
+## 2. Integration time - implemented, shipped disabled
 
-`DEFAULT_INTEGRATION_SECONDS = 120.0` is fixed, so `observation_minutes` of
-0.3 to 20 yields **1 to 10 time samples**. The time axis of the search is that
-short. Total observing time and visibility count are also welded together:
-there is no way to ask for "long track, sparse sampling" versus "short track,
-dense sampling", which are very different uv-coverage regimes.
+`DEFAULT_INTEGRATION_SECONDS = 120.0` was fixed, so `observation_minutes` of
+0.3 to 20 yielded **1 to 10 time samples**. The time axis of the search was
+that short. Total observing time and visibility count were also welded
+together: there was no way to ask for "long track, sparse sampling" versus
+"short track, dense sampling", which are very different uv-coverage regimes.
 
-Proposal: `integration_seconds` over a small discrete set (e.g. 10, 30, 60,
-120, 300 s). Discrete, not continuous, because `StepTime` is inside the makems
-skeleton cache key and `prebuild_skeletons()` enumerates every `(NTimes,
-NFrequencies)` shape the space can produce - a continuous dimension would make
-every evaluation a fresh ~0.11 s makems run and blow up the baked cache.
-Check the shape count before committing: it is
-`len(integration_options) x n_chan_range x minutes_range`.
+Now `integration_seconds`, `kind = "choice"` over `[10, 30, 60, 120, 300]`,
+`enabled = false` with `default = 120`. Discrete, not continuous, because
+`StepTime` is inside the makems skeleton cache key. A `choice` dimension is
+new machinery this section justified: what has to be bounded is the count of
+distinct skeletons, and `kind = "integer"` over a seconds range would reach
+thousands of dump times rather than five.
+
+The shape-count formula above undercounts, because the reachable `NTimes`
+range itself grows as the dump time shrinks - the true count is a sum over the
+list, not a product. Measured: the baked cache is 80 shapes and 87 MB today;
+these five values reach 193 `(NTimes, dump time)` pairs, so 1544 shapes and
+~5 GB. That lands in the sidecar's writable layer, not its 512 MB `/dev/shm`,
+and is built lazily at ~0.05 s a shape - so it costs disk and a few minutes
+spread across a run rather than failing, but it is why this ships disabled.
+`prebuild_skeletons()` still bakes at 120 s only; extend it to iterate the
+list if the lazy first-use cost shows up in a real run.
 
 Pairs with 1: time smearing needs both a long dump and an off-centre source.
+It is also the *only* way to reach time smearing - smearing goes as the dump
+time times the source's offset in beams, so `observation_minutes` cannot reach
+it however long the track. Enabling this without `source_offset_fraction` (or
+the cartesian pair) buys visibility count and uv sampling density only.
 
 ## 3. Calibration error (antenna-based complex gain corruption)
 
