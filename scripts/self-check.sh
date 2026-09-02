@@ -25,8 +25,9 @@ nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
 
 # Use uv's pinned Python >=3.11: host `python3` may lack tomllib, which
 # `test_self_checks.py` needs through common.py. `--no-project` keeps checks
-# independent of pyproject.toml.
-host_python() { uv run --no-project --python ">=3.11" python "$@"; }
+# independent of pyproject.toml, `--isolated` of the `.venv` a `./ri` run left
+# behind - without it these four look stdlib-only here and fail in CI.
+host_python() { uv run --no-project --isolated --python ">=3.11" python "$@"; }
 
 echo "=== host-side checks ==="
 host_python "${REPO_ROOT}/scripts/profile-nested-sampling-run.py" --self-check

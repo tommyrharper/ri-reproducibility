@@ -57,23 +57,29 @@ is a coplanar 2D operator while WSClean is not. Keep offsets inside the
 small-field regime, or the comparison becomes apples to oranges for a reason
 that has nothing to do with either algorithm.
 
-## 2. Integration time
+## 2. Integration time - implemented, shipped disabled
 
-`DEFAULT_INTEGRATION_SECONDS = 120.0` is fixed, so `observation_minutes` of
-0.3 to 20 yields **1 to 10 time samples**. The time axis of the search is that
-short. Total observing time and visibility count are also welded together:
-there is no way to ask for "long track, sparse sampling" versus "short track,
-dense sampling", which are very different uv-coverage regimes.
+`DEFAULT_INTEGRATION_SECONDS = 120.0` was fixed, so `observation_minutes` of
+0.3 to 20 yielded **1 to 10 time samples**. The time axis of the search was
+that short. Total observing time and visibility count were also welded
+together: there was no way to ask for "long track, sparse sampling" versus
+"short track, dense sampling", which are very different uv-coverage regimes.
 
-Proposal: `integration_seconds` over a small discrete set (e.g. 10, 30, 60,
-120, 300 s). Discrete, not continuous, because `StepTime` is inside the makems
-skeleton cache key and `prebuild_skeletons()` enumerates every `(NTimes,
-NFrequencies)` shape the space can produce - a continuous dimension would make
-every evaluation a fresh ~0.11 s makems run and blow up the baked cache.
-Check the shape count before committing: it is
-`len(integration_options) x n_chan_range x minutes_range`.
+Now `integration_seconds`, `kind = "integer"` over 1 to 10 s - what a modern
+correlator does - `enabled = false` with `default = 120`, so disabling pins to
+what every archived run used rather than into the box.
 
-Pairs with 1: time smearing needs both a long dump and an off-centre source.
+The shape-count formula above undercounts badly: the reachable `NTimes` range
+grows as the dump time shrinks, so it is a sum over the dump times, not a
+product. At 1 s over a 20 minute track `NTimes` is 1200, which is a ~135 MB
+Measurement Set against 512 MB of `/dev/shm`, and 28k skeleton shapes against
+the 80 shapes and 87 MB baked today. Narrow `observation_minutes` before
+enabling this. `prebuild_skeletons()` still bakes at 120 s only.
+
+Pairs with 1, and is the *only* way to reach time smearing: smearing goes as
+dump time x the source's offset in beams, so `observation_minutes` cannot
+reach it however long the track. Without an offset dimension this buys
+visibility count and uv sampling density only.
 
 ## 3. Calibration error (antenna-based complex gain corruption)
 

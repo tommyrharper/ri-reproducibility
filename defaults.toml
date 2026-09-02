@@ -219,27 +219,34 @@ fraction = 0.5
 default = 0.0
 enabled = false
 
-# Declination of the phase centre, in whole degrees. The VLA sits at +34, so
-# +65 (the value every archived run was simulated at, and this dimension's
-# `default`) gives a full circular uv track and a near-circular PSF - the
-# easiest geometry the array has. Low declination foreshortens the array into
-# an elliptical beam with much worse sidelobes, which is a routine observing
-# condition rather than an exotic one. See docs/parameter-space-proposal.md,
-# section 5.
-#
-# Disabled, because `Declination` is part of the makems config and so part of
-# the MS skeleton cache key, while the skeletons baked into the MeqTrees image
-# (`--prebuild-skeletons`) only cover +65: enabling this makes every
-# declination but +65 pay a makems build on first use of each (NTimes,
-# NFrequencies) shape. Whole degrees rather than a continuous axis for the same
-# reason - it bounds how many distinct skeletons a run can want.
+# Declination of the phase centre. +34 is the VLA's latitude and this
+# `default`: overhead transit, the roundest PSF the array gets. Low declination
+# foreshortens it into an elliptical beam with far worse sidelobes. Whole
+# degrees, and disabled, because `Declination` is in the MS skeleton cache key.
+# Proposal doc, section 5.
 [[parameter_space]]
 name = "declination_deg"
 min = -15
 max = 75
-# Integer: continuous declination misses the MS skeleton cache on every draw.
 kind = "integer"
 default = 34
+enabled = false
+
+# Correlator dump time, makems' `StepTime`: `NTimes = ceil(observation_minutes
+# * 60 / this)`, so it trades sampling density against track length. The only
+# dimension time smearing depends on - pair it with `source_offset_fraction`.
+# 1-10 s is what a modern correlator does; `default` stays at the 120 s every
+# archived run used, so disabling pins to today's behaviour rather than into
+# the box. Disabled because a 1 s dump over a 20 minute track is 1200 time
+# samples: a ~135 MB Measurement Set against 512 MB of /dev/shm, and a skeleton
+# cache that no longer fits. Narrow `observation_minutes` before enabling it.
+# Proposal doc, section 2.
+[[parameter_space]]
+name = "integration_seconds"
+min = 1
+max = 10
+kind = "integer"
+default = 120
 enabled = false
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
