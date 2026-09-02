@@ -33,6 +33,9 @@ OUT_SIDE = REPO_ROOT / "reports" / "merged-r2d2-wsclean-likelihood-side-by-side.
 # lot. The two fixed names above stay the merged pair latex/notes.tex includes.
 GALLERY_DIR = REPO_ROOT / "reports" / "likelihood-comparisons"
 PLOT_KW = {"kind": "kde", "ncompress": False}
+# One colour per imager wherever it is drawn, so the two overlay panels differ
+# only in which posterior is on top.
+COLORS = {"WSClean": "C0", "R2D2": "C1"}
 # How a run was executed, not what it searched: two runs differing only in
 # seed, rank count or synchronicity are still directly comparable, so the
 # effort part of the key is these three and not the whole polychord block.
@@ -139,6 +142,37 @@ def pyplot():
     return plt
 
 
+def legend_order(labels):
+    """Labels in a fixed order, whatever order they were drawn in.
+
+    The two overlay panels differ only in which posterior is on top, so a
+    legend that reordered itself with them would read as the colours having
+    swapped. Anything unrecognised keeps its place at the end.
+    """
+    known = [name for name in COLORS if name in labels]
+    return known + [name for name in labels if name not in COLORS]
+
+
+def overlay(under, over, params):
+    """Both posteriors in one corner plot, `over` drawn on top of `under`.
+
+    Whichever is drawn second hides the other where they overlap, so the two
+    orders are two different pictures - hence the pair of panels, and the
+    title saying which one this is.
+    """
+    axes = under.plot_2d(params, label=under.label, color=COLORS[under.label], **PLOT_KW)
+    over.plot_2d(axes, label=over.label, color=COLORS[over.label], **PLOT_KW)
+    fig = axes.iloc[0, 0].figure
+    handles, labels = axes.iloc[-1, 0].get_legend_handles_labels()
+    if handles:
+        by_label = dict(zip(labels, handles))
+        ordered = legend_order(by_label)
+        fig.legend([by_label[name] for name in ordered], ordered, loc="upper right")
+    fig.suptitle(f"{over.label} over {under.label}", y=1.02)
+    fig.tight_layout()
+    return fig
+
+
 def corner(samples, params, color, title):
     axes = samples.plot_2d(params, label=title, color=color, **PLOT_KW)
     fig = axes.iloc[0, 0].figure
@@ -197,19 +231,21 @@ def main(argv=None) -> None:
     if len(params) < 2:
         raise SystemExit("Need at least two shared searched parameters to plot")
 
-    axes = wsclean.plot_2d(params, label="WSClean", color="C0", **PLOT_KW)
-    r2d2.plot_2d(axes, label="R2D2", color="C1", **PLOT_KW)
-    fig = axes.iloc[0, 0].figure
-    handles, labels = axes.iloc[-1, 0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper right")
-    fig.tight_layout()
+    # Both draw orders, because the one on top hides the other where they
+    # overlap: WSClean over R2D2 on the left, R2D2 over WSClean on the right.
+    img_over_r2d2 = fig_to_array(overlay(r2d2, wsclean, params))
+    img_over_wsclean = fig_to_array(overlay(wsclean, r2d2, params))
+    both, axs = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, img in zip(axs, (img_over_r2d2, img_over_wsclean)):
+        ax.imshow(img)
+        ax.axis("off")
+    both.tight_layout(w_pad=0.4)
     for target in overlay_targets:
-        save(fig, target)
-    plt.close(fig)
+        save(both, target)
+    plt.close(both)
 
-    img_w = fig_to_array(corner(wsclean, params, "C0", "WSClean"))
-    img_r = fig_to_array(corner(r2d2, params, "C1", "R2D2"))
+    img_w = fig_to_array(corner(wsclean, params, COLORS["WSClean"], "WSClean"))
+    img_r = fig_to_array(corner(r2d2, params, COLORS["R2D2"], "R2D2"))
     pair, axs = plt.subplots(1, 2, figsize=(14, 7))
     for ax, img in zip(axs, (img_w, img_r)):
         ax.imshow(img)
@@ -243,6 +279,11 @@ def _self_check_head_and_pairing():
         run("r2d2-vlaa-20260102T000000Z", "r2d2", 8)
         # Newer, but no WSClean run shares its effort, so it is not the pair.
         run("r2d2-vlaa-20260103T000000Z", "r2d2", 125)
+
+        # Drawing order flips between the two overlay panels; the legend's does not.
+        assert legend_order(["R2D2", "WSClean"]) == ["WSClean", "R2D2"]
+        assert legend_order(["WSClean", "R2D2"]) == ["WSClean", "R2D2"]
+        assert legend_order(["R2D2", "Other"]) == ["R2D2", "Other"]
 
         head = read_summary_head(root / "r2d2-vlaa-20260102T000000Z" / "summary.json")
         assert head["polychord"]["nlive"] == 8, head
