@@ -118,6 +118,31 @@ check(
     plan("search", "wsclean", "--then", "r2d2")[1],
 )
 
+check(
+    # Plot first: the report's comparisons page collects the figures on disk,
+    # so a report built before the plot would not show it.
+    "--plot and --report follow a --then pair, in that order",
+    [
+        ["scripts/run-nested-sampling.sh"],
+        ["env", "OUTPUT_DIR=", "scripts/run-nested-sampling-r2d2.sh"],
+        ["uv", "run", "scripts/plot-merged-likelihood-compare.py", "--last"],
+        ["scripts/generate-report.sh"],
+    ],
+    plan("search", "wsclean", "--then", "r2d2", "--no-build", "--plot", "--report")[1],
+)
+
+check(
+    "--report without --plot leaves the plotting out",
+    [["scripts/run-nested-sampling.sh"], ["scripts/generate-report.sh"]],
+    plan("search", "wsclean", "--no-build", "--report")[1],
+)
+
+check(
+    "neither flag changes a plain search",
+    [["scripts/run-nested-sampling.sh"]],
+    plan("search", "wsclean", "--no-build")[1],
+)
+
 # --output-dir names the first search's directory. The second has to claim its
 # own, or it would be pointed at a directory the first one has just finished in.
 check(

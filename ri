@@ -117,6 +117,13 @@ def do_search(args):
         # by ns_refuse_live_run. Empty is what the run scripts read as "claim
         # your own", so the chained search names itself the usual way.
         commands.append(["env", "OUTPUT_DIR=", SEARCH_SCRIPT[args.then]])
+    # Both only reached if every search above finished: main() stops at the
+    # first command that fails. --plot before --report, so the report's
+    # comparisons page picks up the figure this run just wrote.
+    if args.plot:
+        commands.append(uv("scripts/plot-merged-likelihood-compare.py", "--last"))
+    if args.report:
+        commands.append(["scripts/generate-report.sh"])
     return env, commands
 
 
@@ -492,6 +499,17 @@ def build_parser():
                              "nowhere else, see docs/nested-sampling-throughput.md")
     search.add_argument("--no-build", action="store_true",
                         help="skip the image builds this search would do first")
+    search.add_argument("--plot", action="store_true",
+                        help="once the search - or the --then pair - has finished, plot "
+                             "the newest directly comparable R2D2 and WSClean runs "
+                             "against each other, the same as './ri plot likelihood "
+                             "--last'. After a --then pair that is the two runs just "
+                             "finished; on its own it is whichever comparable pair is "
+                             "newest, and the plot names the two runs it used")
+    search.add_argument("--report", action="store_true",
+                        help="rebuild the HTML report once the search has finished, the "
+                             "same as './ri report'. Runs after --plot, so a figure "
+                             "just plotted is on the comparisons page")
 
     params = add(
         "params", do_params, "list the parameter space and what is searched",
