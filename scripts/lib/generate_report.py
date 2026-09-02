@@ -2545,7 +2545,10 @@ def render_likelihood_comparisons(pairs):
     cards = []
     for entry in pairs:
         figures = []
-        for caption, key in (("Overlaid", "overlay"), ("Side by side", "side")):
+        for caption, key in (
+            ("Overlaid, both drawing orders", "overlay"),
+            ("Side by side", "side"),
+        ):
             path = entry.get(key)
             if not path:
                 continue

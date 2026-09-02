@@ -70,7 +70,7 @@ commit costs on this machine can be compared with what the last one did:
 ./ri report --last 1    # newest run only
 ./ri serve              # read the report from a browser on another machine
 ./ri plot gui           # interactive corner plots (needs a display)
-./ri plot likelihood    # R2D2 vs WSClean overlay
+./ri plot likelihood    # R2D2 vs WSClean, overlaid both ways and side by side
 ./ri plot likelihood --last   # ...for the last two directly comparable runs
 ```
 
