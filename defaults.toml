@@ -235,11 +235,11 @@ enabled = false
 # reason - it bounds how many distinct skeletons a run can want.
 [[parameter_space]]
 name = "declination_deg"
-min = -30
-max = 80
+min = -15
+max = 75
 # Integer: continuous declination misses the MS skeleton cache on every draw.
 kind = "integer"
-default = 65
+default = 34
 enabled = false
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
