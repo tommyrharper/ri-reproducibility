@@ -24,6 +24,7 @@ write_run_config() {
     printf 'NS_SEED=%q\n' "${NS_SEED}"
     printf 'NS_METRIC=%q\n' "${NS_METRIC}"
     printf 'NS_MPI_PROCS=%q\n' "${NS_MPI_PROCS}"
+    printf 'NS_IMAGE_DIM=%q\n' "${NS_IMAGE_DIM:-128}"
     printf 'NS_RETRIES=%q\n' "${NS_RETRIES}"
     # Persist run settings, including watchdog behavior, for exact resume.
     printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
@@ -175,6 +176,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${NS_STALL_TIMEOUT}" = 3600 ]
     [ "${NS_SYNCHRONOUS}" = 1 ]
     [ "${NS_KEEP_MEASUREMENT_SETS}" = 1 ]
+    [ "${NS_IMAGE_DIM}" = 128 ]
     [ "${NS_IMAGER_IMAGE_ID}" = unknown ]
     [ "${NS_MEQTREES_IMAGE_ID}" = unknown ]
     [ "${NS_POLYCHORD_IMAGE_ID}" = unknown ]
@@ -182,8 +184,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=0 \
     NS_METRIC=total_rms_jy NS_MPI_PROCS=8 R2D2_OMP_THREADS='' \
     NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
-    NS_WSCLEAN_MGAIN=0.9 NS_WSCLEAN_NITER=250 \
+    NS_WSCLEAN_MGAIN=0.9 NS_WSCLEAN_NITER=250 NS_IMAGE_DIM=64 \
     write_run_config "${_dir}" wsclean
+  grep -qx 'NS_IMAGE_DIM=64' "${_dir}/run.env" || {
+    echo "FAIL: NS_IMAGE_DIM not recorded in run.env"; exit 1
+  }
   grep -qx 'NS_WSCLEAN_MGAIN=0.9' "${_dir}/run.env" || {
     echo "FAIL: --mgain not recorded in run.env"; exit 1
   }

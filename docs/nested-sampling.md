@@ -498,6 +498,38 @@ recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
 /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in `summary.json`
 under `r2d2_fixed_hyperparameters`.
 
+### What the image size costs
+
+`NS_IMAGE_DIM` overrides the 128, is recorded in `run.env`, and is one of the
+settings the benchmark ledger groups by, so
+`./ri bench run <imager> --interleave NS_IMAGE_DIM 128 64` measures it. It is a
+knob for probes, not a search dimension: it also sets the field of view
+(`source_offset_to_lm()` scales the half-width by it), so two sizes are two
+different skies, and the R2D2 checkpoints were trained at one resolution.
+
+Median per-evaluation imaging time over the `default` preset on the 20-CPU
+host, four interleaved repeats per arm (`wsclean`) and three (`r2d2`):
+
+| dim | R2D2 image | speed-up | WSClean image | speed-up |
+| --: | ---------: | -------: | ------------: | -------: |
+| 128 |     7451ms |     1.0x |         150ms |     1.0x |
+|  64 |     2584ms |     2.9x |         123ms |     1.2x |
+|  32 |     1411ms |     5.3x |         100ms |     1.5x |
+
+R2D2 fits `0.96s + 0.39ms/pixel` across all three sizes, so the fixed second -
+`docker exec`, the MS-to-`.mat` bridge, the operator norm, and orchestrating 25
+iterations - caps the whole knob at about 7.5x however small the image gets.
+WSClean does not fit a pixel count at all: 16x fewer pixels buys 1.5x, because
+its evaluation is CLEAN iterations and gridding ~3000 visibilities, and neither
+shrinks with the image. Peak memory does not move either (3.46 GB at every
+size, it is the checkpoint), so a smaller image buys no extra R2D2 ranks.
+
+None of that is the wall-clock of a search. The sampler's path changes with the
+likelihood surface: the WSClean arms above took 980 evaluations at 128, 710 at
+64 and 1053 at 32, so the 32 arm finished *slower* (24.8s against 17.7s) while
+each evaluation was 1.5x cheaper. The R2D2 arms happened to stay level (44, 43,
+43), which is what makes its 3.2x and 5.8x whole-run speed-ups real.
+
 ## MS to R2D2 `.mat` bridge
 
 R2D2-RI reads visibilities from a MATLAB `.mat` file via `load_data_to_tensor()`

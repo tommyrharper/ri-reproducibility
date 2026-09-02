@@ -132,7 +132,7 @@ DEFAULT_WSCLEAN_AUTO_THRESHOLD = 3.0
 DEFAULT_WSCLEAN_MGAIN = float(os.environ.get("NS_WSCLEAN_MGAIN") or 0.8)
 
 # Shared image geometry; detailed rationale: docs/nested-sampling.md.
-DEFAULT_IMAGE_DIM = 128
+DEFAULT_IMAGE_DIM = int(os.environ.get("NS_IMAGE_DIM") or 128)
 DEFAULT_SUPER_RESOLUTION = 1.5
 
 # `source_offset_fraction` geometry: docs/parameter-space-proposal.md.
