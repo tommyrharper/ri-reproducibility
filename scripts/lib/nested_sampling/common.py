@@ -214,10 +214,6 @@ def load_all_parameter_specs() -> list[dict[str, Any]]:
         if spec.get("kind") == "image_pixels":
             reach = (image_dim() / 2.0) * float(spec["fraction"])
             spec["min"], spec["max"] = -reach, reach
-        # A box from the list, so min/max readers need no special case.
-        if spec.get("kind") == "choice":
-            spec.setdefault("min", min(spec["values"]))
-            spec.setdefault("max", max(spec["values"]))
     return specs
 
 
@@ -483,11 +479,6 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw: dict[str, Any] = {}
     specs = load_parameter_space()
     for i, spec in enumerate(specs):
-        # Equal share of the dimension per value, as `band_start` gives per band.
-        if spec.get("kind") == "choice":
-            values = spec["values"]
-            raw[spec["name"]] = values[min(int(float(cube[i]) * len(values)), len(values) - 1)]
-            continue
         lower, upper = float(spec["min"]), float(spec["max"])
         value = lower + float(cube[i]) * (upper - lower)
         if spec.get("kind") == "integer":
@@ -2300,6 +2291,9 @@ def self_check_parameter_toggle() -> None:
         fill_disabled_parameters(raw)
         assert raw["source_offset_fraction"] == 0.0, raw
         assert raw["declination_deg"] == 65, raw
+        # `default` outside min/max on purpose: pinned at what every archived
+        # run used, not at an end of the box worth searching.
+        assert raw["integration_seconds"] == 120, raw
 
         os.environ["NS_DISABLE_PARAMS"] = "channel_count"
         os.environ["NS_ENABLE_PARAMS"] = "channel_count"
@@ -2313,44 +2307,6 @@ def self_check_parameter_toggle() -> None:
                 os.environ[var] = saved
         load_parameter_space.cache_clear()
     print("parameter toggle self-check passed")
-
-
-def self_check_choice_dimension() -> None:
-    """A `choice` dimension draws from its list, one equal share of the cube each."""
-    spec = next(s for s in load_all_parameter_specs() if s["name"] == "integration_seconds")
-    values = list(spec["values"])
-    assert (spec["min"], spec["max"]) == (min(values), max(values)), spec
-
-    saved = os.environ.get("NS_ENABLE_PARAMS")
-    try:
-        os.environ["NS_ENABLE_PARAMS"] = "integration_seconds"
-        load_parameter_space.cache_clear()
-        specs = load_parameter_space()
-        axis = [s["name"] for s in specs].index("integration_seconds")
-        # A list, not an array: HOST_RUNNABLE self-checks get no numpy.
-        drawn = []
-        for step in range(101):
-            cube = [0.5] * len(specs)
-            cube[axis] = step / 100.0
-            drawn.append(cube_to_params(cube)["integration_seconds"])
-        assert drawn == sorted(drawn), "a choice dimension must stay monotonic in the cube"
-        assert set(drawn) == set(values), (sorted(set(drawn)), values)
-        # cube 1.0 is the last value, not an index off the end.
-        assert (drawn[0], drawn[-1]) == (values[0], values[-1]), (drawn[0], drawn[-1])
-        counts = [drawn.count(v) for v in values]
-        assert max(counts) - min(counts) <= 1, counts
-    finally:
-        if saved is None:
-            os.environ.pop("NS_ENABLE_PARAMS", None)
-        else:
-            os.environ["NS_ENABLE_PARAMS"] = saved
-        load_parameter_space.cache_clear()
-
-    # Disabled, it pins to the dump time every archived run used.
-    raw: dict[str, Any] = {}
-    fill_disabled_parameters(raw)
-    assert raw["integration_seconds"] == 120, raw
-    print("choice dimension self-check passed")
 
 
 def self_check_image_dim() -> None:

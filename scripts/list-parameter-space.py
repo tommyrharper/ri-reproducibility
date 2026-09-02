@@ -17,12 +17,8 @@ def main() -> None:
     for spec in load_all_parameter_specs():
         name = str(spec["name"])
         status = "on" if name in enabled_names else "off"
-        if spec.get("kind") == "band_start":
-            box = "[[receiver_band]]"
-        elif spec.get("kind") == "choice":
-            box = ", ".join(str(value) for value in spec["values"])
-        else:
-            box = f"{spec.get('min', '?')} to {spec.get('max', '?')}"
+        box = ("[[receiver_band]]" if spec.get("kind") == "band_start"
+               else f"{spec.get('min', '?')} to {spec.get('max', '?')}")
         pinned = "" if status == "on" else f" (pinned at {spec.get('default', spec.get('min', 0.0))})"
         rows.append((name, status, box, spec.get("kind", ""), pinned))
 

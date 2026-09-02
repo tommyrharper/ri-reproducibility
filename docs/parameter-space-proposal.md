@@ -65,18 +65,16 @@ that short. Total observing time and visibility count were also welded
 together: there was no way to ask for "long track, sparse sampling" versus
 "short track, dense sampling", which are very different uv-coverage regimes.
 
-Now `integration_seconds`, `kind = "choice"` over `[10, 30, 60, 120, 300]`,
-`enabled = false` with `default = 120`. A list rather than a box because
-`StepTime` is inside the skeleton cache key: what needs bounding is the
-skeleton count, and `kind = "integer"` over seconds would reach thousands of
-dump times rather than five.
+Now `integration_seconds`, `kind = "integer"` over 1 to 10 s - what a modern
+correlator does - `enabled = false` with `default = 120`, so disabling pins to
+what every archived run used rather than into the box.
 
-The shape-count formula above undercounts - the reachable `NTimes` range grows
-as the dump time shrinks, so it is a sum over the list, not a product.
-Measured: 80 shapes and 87 MB baked today against 1544 and ~5 GB for these
-five. Built lazily on the sidecar's writable layer, so it costs disk and a few
-minutes across a run rather than failing - but it is why this ships disabled.
-`prebuild_skeletons()` still bakes at 120 s only.
+The shape-count formula above undercounts badly: the reachable `NTimes` range
+grows as the dump time shrinks, so it is a sum over the dump times, not a
+product. At 1 s over a 20 minute track `NTimes` is 1200, which is a ~135 MB
+Measurement Set against 512 MB of `/dev/shm`, and 28k skeleton shapes against
+the 80 shapes and 87 MB baked today. Narrow `observation_minutes` before
+enabling this. `prebuild_skeletons()` still bakes at 120 s only.
 
 Pairs with 1, and is the *only* way to reach time smearing: smearing goes as
 dump time x the source's offset in beams, so `observation_minutes` cannot

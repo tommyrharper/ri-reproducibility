@@ -235,13 +235,17 @@ enabled = false
 # Correlator dump time, makems' `StepTime`: `NTimes = ceil(observation_minutes
 # * 60 / this)`, so it trades sampling density against track length. The only
 # dimension time smearing depends on - pair it with `source_offset_fraction`.
-# A list, not a box, because `StepTime` is in the MS skeleton cache key: these
-# five reach 1544 shapes and ~5 GB against the 80 and 87 MB baked into the
-# image, which is why it ships disabled. Proposal doc, section 2.
+# 1-10 s is what a modern correlator does; `default` stays at the 120 s every
+# archived run used, so disabling pins to today's behaviour rather than into
+# the box. Disabled because a 1 s dump over a 20 minute track is 1200 time
+# samples: a ~135 MB Measurement Set against 512 MB of /dev/shm, and a skeleton
+# cache that no longer fits. Narrow `observation_minutes` before enabling it.
+# Proposal doc, section 2.
 [[parameter_space]]
 name = "integration_seconds"
-kind = "choice"
-values = [10, 30, 60, 120, 300]
+min = 1
+max = 10
+kind = "integer"
 default = 120
 enabled = false
 

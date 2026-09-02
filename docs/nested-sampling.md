@@ -326,7 +326,7 @@ PolyChord dimensions for both algorithms:
 | `source_l_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along l, in pixels from the central pixel |
 | `source_m_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along m, in pixels from the central pixel |
 | `declination_deg` | `-30` to `80`, whole degrees | Declination of the phase centre; sets how foreshortened the array and how elliptical the PSF is |
-| `integration_seconds` | one of `10, 30, 60, 120, 300` | Correlator dump time; sets sampling density against track length, and is the only dimension time smearing depends on |
+| `integration_seconds` | `1` to `10`, whole seconds | Correlator dump time; sets sampling density against track length, and is the only dimension time smearing depends on |
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
@@ -347,11 +347,9 @@ hard-coded centred source, because its `min` already is `0.0`.
 `declination_deg` and `integration_seconds` all ship disabled. The last two
 sit inside the MS skeleton cache key, so enabling either misses the skeletons
 baked into the MeqTrees image and rebuilds them lazily during the run.
-
-A dimension can be an explicit list rather than a box: `kind = "choice"` gives
-each of its `values` an equal share of the cube, the way `band_start` splits
-it between receiver bands. `min`/`max` are filled in from the list, so every
-other reader treats it like any other dimension.
+`integration_seconds` also pins to a `default` outside its own box - 120 s,
+what every archived run used - because the searched range is what is worth
+searching, not what the simulator has always done.
 
 Two ways to see and change this without editing the file:
 
