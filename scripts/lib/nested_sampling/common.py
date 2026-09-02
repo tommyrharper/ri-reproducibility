@@ -2345,6 +2345,11 @@ def self_check_source_offset() -> None:
 
     from astropy.io import fits
 
+    # The 128 belongs to the recording, not to what this run is configured to
+    # image: the expected pixels are where those reconstructions put the source
+    # in a 128-wide image, and with no CRPIX to read, compute_image_metrics()
+    # takes the centre from the array shape - so another width is another
+    # centre, and these expectations no longer describe anything.
     for l_as, m_as, max_proj_baseline_lambda, expected in (
         (20.529971838368628, 35.5589543020127, 32152.12622557544, (54, 81)),
         (12.833132485007466, 22.22763748429558, 57746.84392542726, (53, 83)),
