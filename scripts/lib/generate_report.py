@@ -127,8 +127,20 @@ def figure_to_png_bytes(fig, **savefig_kw):
 IMAGE_RENDER_VERSION = "2"
 
 
+def png_name(key):
+    return hashlib.sha1(f"{IMAGE_RENDER_VERSION}|{key}".encode()).hexdigest()[:16] + ".png"
+
+
+def cached_png_uri(key):
+    """The URI a key's PNG already has on disk, or None if it was never drawn."""
+    name = png_name(key)
+    if image_dir and os.path.exists(os.path.join(image_dir, name)):
+        return f"{IMAGE_SUBDIR}/{name}"
+    return None
+
+
 def cached_png(key, render):
-    name = hashlib.sha1(f"{IMAGE_RENDER_VERSION}|{key}".encode()).hexdigest()[:16] + ".png"
+    name = png_name(key)
     path = os.path.join(image_dir, name)
     if not os.path.exists(path):
         data = render()
@@ -306,13 +318,17 @@ def merged_source_run_dirs(summary):
     return dirs
 
 
-def render_likelihood_plot(run_dir, param_names):
+def likelihood_plot_key(run_dir, param_names):
     chains = sorted(glob.glob(os.path.join(run_dir, "chains", "*")))
-    key = "likelihood|{}|{}|{}".format(
+    return "likelihood|{}|{}|{}".format(
         run_dir,
         ",".join(param_names),
         ",".join(f"{os.path.basename(c)}:{file_stamp(c)}" for c in chains),
     )
+
+
+def render_likelihood_plot(run_dir, param_names):
+    key = likelihood_plot_key(run_dir, param_names)
     return cached_png(key, lambda: _render_likelihood_png(run_dir, param_names))
 
 
@@ -1894,6 +1910,13 @@ a.index-entry:hover { border-color: color-mix(in srgb, CanvasText 45%, transpare
 }
 .ns-compare-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
 .ns-compare-header h3 { margin: 0; font-size: 1rem; }
+.ns-compare-plots { display: flex; gap: 0.75rem; overflow-x: auto; margin-top: 0.75rem; }
+.ns-compare-plots figure { margin: 0; flex: 1 1 0; min-width: 220px; }
+.ns-compare-plots img { display: block; width: 100%; height: auto; border-radius: 6px; }
+.ns-compare-plots figcaption {
+  font-size: 0.75rem; opacity: 0.7; margin-top: 0.35rem;
+  text-align: center; word-break: break-all;
+}
 .ns-compare-table-wrap { overflow-x: auto; margin-top: 0.75rem; }
 table.ns-compare-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
 table.ns-compare-table th, table.ns-compare-table td {
@@ -2108,6 +2131,13 @@ def render_index_entry(summary_path, status, facts=None):
         for spec in parameter_space
         if spec.get("name") and format_param_range(spec)
     }
+    # The corner plot the run page already drew, so the compare panel can show
+    # the selected runs' triangles side by side. Looked up, never drawn: the
+    # index is rebuilt on every build, including ones that skip every page.
+    likelihood_uri = cached_png_uri(likelihood_plot_key(
+        os.path.dirname(summary_path),
+        [spec["name"] for spec in parameter_space if "name" in spec],
+    ))
 
     title_bits = [html.escape(str(facts["algorithm"] or "?"))]
     ts_label = format_run_id_timestamp(run_name)
@@ -2153,6 +2183,7 @@ def render_index_entry(summary_path, status, facts=None):
         f' data-logz="{logz_attr_value}"'
         f' data-param-names="{html.escape(",".join(param_names))}"'
         f' data-param-ranges="{html.escape(json.dumps(param_ranges))}"'
+        f' data-likelihood="{html.escape(likelihood_uri or "")}"'
     )
 
     compare_checkbox_html = (
@@ -2362,10 +2393,24 @@ INDEX_SCRIPT = """
       }));
     });
 
+    // Corner plots side by side, in the same column order as the table. A run
+    // whose page has never been built has no plot on disk; it keeps its slot so
+    // the row stays lined up with the table.
+    var plots = selected.map(function (el) {
+      var name = el.dataset.runName || "?";
+      var img = el.dataset.likelihood
+        ? '<img src="' + el.dataset.likelihood + '" alt="corner plot for ' + name + '">'
+        : '<p class="empty">No plot yet</p>';
+      var href = el.getAttribute("href");
+      return "<figure>" + (href ? '<a href="' + href + '">' + img + "</a>" : img)
+        + "<figcaption>" + name + "</figcaption></figure>";
+    }).join("");
+
     comparePanel.hidden = false;
     comparePanel.innerHTML = '<div class="ns-compare-header"><h3>Comparing ' + selected.length
       + " run" + (selected.length === 1 ? "" : "s") + '</h3>'
       + '<button type="button" id="ns-compare-clear">Clear</button></div>'
+      + '<div class="ns-compare-plots">' + plots + "</div>"
       + '<div class="ns-compare-table-wrap"><table class="ns-compare-table"><thead><tr><th></th>'
       + headerCells + "</tr></thead><tbody>" + rows.join("") + "</tbody></table></div>";
 
@@ -3038,6 +3083,35 @@ def _self_check_index_toolbar():
             "channel_count": ["2-6"],
         }, toolbar
     finally:
+        shutil.rmtree(tmp_dir)
+
+
+def _self_check_index_likelihood_plot():
+    """The compare panel's corner plots: looked up on disk, never drawn here."""
+    import shutil
+    import tempfile
+
+    global image_dir
+    tmp_dir = tempfile.mkdtemp(prefix="ns-report-selfcheck-")
+    try:
+        image_dir = os.path.join(tmp_dir, IMAGE_SUBDIR)
+        run_dir = os.path.join(tmp_dir, "r2d2-run")
+        os.makedirs(run_dir)
+        summary_path = os.path.join(run_dir, "summary.json")
+        space = [{"name": "log10_dynamic_range", "min": 2.0, "max": 3.0}]
+        with open(summary_path, "w") as f:
+            json.dump({"algorithm": "r2d2", "evaluations": [], "parameter_space": space}, f)
+
+        # No PNG on disk yet: the card says so rather than pointing at a 404.
+        card, _, _ = render_index_entry(summary_path, "current")
+        assert 'data-likelihood=""' in card, card
+
+        uri = cached_png(likelihood_plot_key(run_dir, ["log10_dynamic_range"]), lambda: b"png")
+        card, _, _ = render_index_entry(summary_path, "current")
+        assert f'data-likelihood="{uri}"' in card, card
+        assert 'class="ns-compare-plots"' in INDEX_SCRIPT, INDEX_SCRIPT
+    finally:
+        image_dir = None
         shutil.rmtree(tmp_dir)
 
 
@@ -3755,6 +3829,7 @@ if __name__ == "__main__":
         _self_check_profiling()
         _self_check_page_status()
         _self_check_index_toolbar()
+        _self_check_index_likelihood_plot()
         _self_check_index_facts_cache()
         _self_check_torn_summary()
         _self_check_live_summary()
