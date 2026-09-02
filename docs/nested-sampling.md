@@ -326,7 +326,7 @@ PolyChord dimensions for both algorithms:
 | `source_l_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along l, in pixels from the central pixel |
 | `source_m_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along m, in pixels from the central pixel |
 | `declination_deg` | `-30` to `80`, whole degrees | Declination of the phase centre; sets how foreshortened the array and how elliptical the PSF is |
-| `integration_seconds` | one of `10, 30, 60, 120, 300` | Correlator dump time; `NTimes` is `ceil(observation_minutes * 60 / this)`, so it sets sampling density against track length, and it is the only dimension time smearing depends on |
+| `integration_seconds` | one of `10, 30, 60, 120, 300` | Correlator dump time; sets sampling density against track length, and is the only dimension time smearing depends on |
 
 Channel frequencies are represented as a contiguous uniform
 `start_frequency_hz` plus `channel_width_hz` grid. Arbitrary per-channel
@@ -345,16 +345,13 @@ cube. `source_offset_fraction`, for example, disables back to the old
 hard-coded centred source, because its `min` already is `0.0`.
 `source_offset_fraction`, `source_l_pixels`, `source_m_pixels`,
 `declination_deg` and `integration_seconds` all ship disabled. The last two
-both sit inside the MS skeleton cache key, so enabling either makes the
-skeletons baked into the MeqTrees image - built at +65 and a 120 s dump - miss
-for every other value, and the cache is rebuilt lazily during the run instead.
+sit inside the MS skeleton cache key, so enabling either misses the skeletons
+baked into the MeqTrees image and rebuilds them lazily during the run.
 
-A dimension can also be an explicit list rather than a box: `kind = "choice"`
-takes its `values` and gives each an equal share of the cube dimension, the
-way `band_start` splits the cube between receiver bands. `integration_seconds`
-uses it because what has to be bounded is the number of distinct MS skeletons,
-not the range. Its `min`/`max` are filled in from the list, so `./ri params`,
-the TUI and the self-checks read it like any other dimension.
+A dimension can be an explicit list rather than a box: `kind = "choice"` gives
+each of its `values` an equal share of the cube, the way `band_start` splits
+it between receiver bands. `min`/`max` are filled in from the list, so every
+other reader treats it like any other dimension.
 
 Two ways to see and change this without editing the file:
 

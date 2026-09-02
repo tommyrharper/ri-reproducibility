@@ -66,27 +66,22 @@ together: there was no way to ask for "long track, sparse sampling" versus
 "short track, dense sampling", which are very different uv-coverage regimes.
 
 Now `integration_seconds`, `kind = "choice"` over `[10, 30, 60, 120, 300]`,
-`enabled = false` with `default = 120`. Discrete, not continuous, because
-`StepTime` is inside the makems skeleton cache key. A `choice` dimension is
-new machinery this section justified: what has to be bounded is the count of
-distinct skeletons, and `kind = "integer"` over a seconds range would reach
-thousands of dump times rather than five.
+`enabled = false` with `default = 120`. A list rather than a box because
+`StepTime` is inside the skeleton cache key: what needs bounding is the
+skeleton count, and `kind = "integer"` over seconds would reach thousands of
+dump times rather than five.
 
-The shape-count formula above undercounts, because the reachable `NTimes`
-range itself grows as the dump time shrinks - the true count is a sum over the
-list, not a product. Measured: the baked cache is 80 shapes and 87 MB today;
-these five values reach 193 `(NTimes, dump time)` pairs, so 1544 shapes and
-~5 GB. That lands in the sidecar's writable layer, not its 512 MB `/dev/shm`,
-and is built lazily at ~0.05 s a shape - so it costs disk and a few minutes
-spread across a run rather than failing, but it is why this ships disabled.
-`prebuild_skeletons()` still bakes at 120 s only; extend it to iterate the
-list if the lazy first-use cost shows up in a real run.
+The shape-count formula above undercounts - the reachable `NTimes` range grows
+as the dump time shrinks, so it is a sum over the list, not a product.
+Measured: 80 shapes and 87 MB baked today against 1544 and ~5 GB for these
+five. Built lazily on the sidecar's writable layer, so it costs disk and a few
+minutes across a run rather than failing - but it is why this ships disabled.
+`prebuild_skeletons()` still bakes at 120 s only.
 
-Pairs with 1: time smearing needs both a long dump and an off-centre source.
-It is also the *only* way to reach time smearing - smearing goes as the dump
-time times the source's offset in beams, so `observation_minutes` cannot reach
-it however long the track. Enabling this without `source_offset_fraction` (or
-the cartesian pair) buys visibility count and uv sampling density only.
+Pairs with 1, and is the *only* way to reach time smearing: smearing goes as
+dump time x the source's offset in beams, so `observation_minutes` cannot
+reach it however long the track. Without an offset dimension this buys
+visibility count and uv sampling density only.
 
 ## 3. Calibration error (antenna-based complex gain corruption)
 

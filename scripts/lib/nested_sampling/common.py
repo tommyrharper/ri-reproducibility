@@ -214,9 +214,7 @@ def load_all_parameter_specs() -> list[dict[str, Any]]:
         if spec.get("kind") == "image_pixels":
             reach = (image_dim() / 2.0) * float(spec["fraction"])
             spec["min"], spec["max"] = -reach, reach
-        # A `choice` dimension is its `values` list, but it still reports a box,
-        # so every reader that expects min/max - `./ri params`, the TUI,
-        # self_check_parameter_space - keeps working without a special case.
+        # A box from the list, so min/max readers need no special case.
         if spec.get("kind") == "choice":
             spec.setdefault("min", min(spec["values"]))
             spec.setdefault("max", max(spec["values"]))
@@ -485,8 +483,7 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw: dict[str, Any] = {}
     specs = load_parameter_space()
     for i, spec in enumerate(specs):
-        # `choice` takes its values from a list, each with an equal share of the
-        # dimension - the same split `band_start` gives each receiver band.
+        # Equal share of the dimension per value, as `band_start` gives per band.
         if spec.get("kind") == "choice":
             values = spec["values"]
             raw[spec["name"]] = values[min(int(float(cube[i]) * len(values)), len(values) - 1)]
@@ -2322,7 +2319,6 @@ def self_check_choice_dimension() -> None:
     """A `choice` dimension draws from its list, one equal share of the cube each."""
     spec = next(s for s in load_all_parameter_specs() if s["name"] == "integration_seconds")
     values = list(spec["values"])
-    # The box every min/max reader falls back on has to be the list's own span.
     assert (spec["min"], spec["max"]) == (min(values), max(values)), spec
 
     saved = os.environ.get("NS_ENABLE_PARAMS")
@@ -2331,9 +2327,7 @@ def self_check_choice_dimension() -> None:
         load_parameter_space.cache_clear()
         specs = load_parameter_space()
         axis = [s["name"] for s in specs].index("integration_seconds")
-        # A plain list, not an array: cube_to_params() only ever reads
-        # `float(cube[i])`, and a HOST_RUNNABLE self-check has to be stdlib
-        # only - CI runs this suite without numpy installed.
+        # A list, not an array: HOST_RUNNABLE self-checks get no numpy.
         drawn = []
         for step in range(101):
             cube = [0.5] * len(specs)
@@ -2341,7 +2335,7 @@ def self_check_choice_dimension() -> None:
             drawn.append(cube_to_params(cube)["integration_seconds"])
         assert drawn == sorted(drawn), "a choice dimension must stay monotonic in the cube"
         assert set(drawn) == set(values), (sorted(set(drawn)), values)
-        # The top of the cube is the last value, not an index off the end.
+        # cube 1.0 is the last value, not an index off the end.
         assert (drawn[0], drawn[-1]) == (values[0], values[-1]), (drawn[0], drawn[-1])
         counts = [drawn.count(v) for v in values]
         assert max(counts) - min(counts) <= 1, counts
@@ -2352,7 +2346,7 @@ def self_check_choice_dimension() -> None:
             os.environ["NS_ENABLE_PARAMS"] = saved
         load_parameter_space.cache_clear()
 
-    # Disabled, it pins to the dump time every archived run was simulated at.
+    # Disabled, it pins to the dump time every archived run used.
     raw: dict[str, Any] = {}
     fill_disabled_parameters(raw)
     assert raw["integration_seconds"] == 120, raw
