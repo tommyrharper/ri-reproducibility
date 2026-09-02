@@ -46,6 +46,21 @@ RESULTS_DIR = "{REPO_ROOT}/results"
 # on a machine with a different core count.
 NS_R2D2_MAX_RANKS = 8
 
+# Pixels on a side of the image both imagers make, and with it the field of
+# view: source_offset_to_lm() in common.py scales the sampled
+# `source_offset_fraction` by half of this, so two sizes are two different
+# skies rather than the same sky at two costs.
+#
+# 32 because R2D2 is what a search waits on and its evaluation is
+# `0.96s + 0.39ms/pixel` - measured over 128/64/32, interleaved, on the
+# 20-thread rig - so 32 images at 1411ms against 128's 7451ms, a 5.3x that
+# 16 would only take to 6.5x against the fixed second. WSClean is not
+# pixel-bound and gets 1.5x from the same change. Runs archived before this
+# were scored at 128; `NS_IMAGE_DIM=128 ./ri search ...` reproduces them, and
+# run.env records what each run used. See "What the image size costs" in
+# docs/nested-sampling.md.
+NS_IMAGE_DIM = 32
+
 # PolyChord sampler settings for the nested-sampling runs.
 # See docs/nested-sampling.md for what each one does.
 NS_NLIVE = 8

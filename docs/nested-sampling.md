@@ -490,22 +490,24 @@ comparing the two imagers on different physics.
 
 Fixed hyperparameters (not searched) on every evaluation:
 
-**WSClean:** `-niter 100`, `-auto-threshold 3.0`, and a `128x128` image,
-recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
+**WSClean:** `-niter 100`, `-auto-threshold 3.0`, and an `NS_IMAGE_DIM`-square
+image, recorded in `summary.json` under `wsclean_fixed_hyperparameters`.
 
-**R2D2:** `128x128` image size (the same footprint as the WSClean run),
+**R2D2:** the same `NS_IMAGE_DIM` image size as the WSClean run,
 `num_iter 25`, `architecture unet`, `num_chans 64`, `ckpt_path
 /checkpoints/R2D2_A1`, and `ckpt_realisations 1`, recorded in `summary.json`
 under `r2d2_fixed_hyperparameters`.
 
 ### What the image size costs
 
-`NS_IMAGE_DIM` overrides the 128, is recorded in `run.env`, and is one of the
-settings the benchmark ledger groups by, so
-`./ri bench run <imager> --interleave NS_IMAGE_DIM 128 64` measures it. It is a
-knob for probes, not a search dimension: it also sets the field of view
-(`source_offset_to_lm()` scales the half-width by it), so two sizes are two
-different skies, and the R2D2 checkpoints were trained at one resolution.
+`NS_IMAGE_DIM` is the size, `defaults.toml` holds its default of 32, and it is
+recorded in `run.env` and grouped by in the benchmark ledger, so
+`./ri bench run <imager> --interleave NS_IMAGE_DIM 128 32` measures a change to
+it like any other setting. It is not a search dimension: it also sets the field
+of view (`source_offset_to_lm()` scales the half-width by it), so two sizes are
+two different skies, and the R2D2 checkpoints were trained at one resolution.
+Runs archived before the default moved were scored at 128 - `NS_IMAGE_DIM=128`
+reproduces them.
 
 Median per-evaluation imaging time over the `default` preset on the 20-CPU
 host, four interleaved repeats per arm (`wsclean`) and three (`r2d2`):
