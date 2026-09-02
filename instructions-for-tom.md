@@ -74,6 +74,6 @@ Measurement params:
 
 Or:
 ```zsh
-./ri search wsclean --then r2d2 --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_jy
+./ri search wsclean --then r2d2 --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_jy --plot --report
 ```
 
