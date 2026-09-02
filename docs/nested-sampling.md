@@ -337,12 +337,12 @@ authoritative copy - this table names them, not their exact ranges.
 
 ### Toggling dimensions on and off
 
-Every `[[parameter_space]]` entry in `defaults.toml` takes `enabled` (default
-true). Setting `enabled = false` pins that dimension out of the search
-instead of deleting it: `cube_to_params()` fixes it at its `default` (falling
-back to `min` when no `default` is given) rather than drawing it from the
-cube. `source_offset_fraction`, for example, disables back to the old
-hard-coded centred source, because its `min` already is `0.0`.
+Every `[[parameter_space]]` entry in `defaults.toml` takes `default` and
+`enabled` (true if omitted). Setting `enabled = false` pins that dimension
+out of the search instead of deleting it: `cube_to_params()` fixes it at
+its `default` rather than drawing it from the cube.
+`source_offset_fraction`, for example, disables back to the old
+hard-coded centred source, because its `default` is `0.0`.
 `source_offset_fraction`, `source_l_pixels`, `source_m_pixels`,
 `declination_deg` and `integration_seconds` all ship disabled. The last two
 sit inside the MS skeleton cache key, so enabling either misses the skeletons

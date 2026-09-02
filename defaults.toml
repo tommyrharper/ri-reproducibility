@@ -136,13 +136,13 @@ NS_STALL_TIMEOUT = 7200
 # `kind = "band_start"` takes its range from the `[[receiver_band]]` list
 # below instead of from `min`/`max`.
 #
-# Every entry also takes `enabled` (default true). Set `enabled = false` to
-# pin a dimension out of the search instead of deleting it: `cube_to_params()`
-# fixes it at its `default` (falling back to `min` when no `default` is
-# given) rather than drawing it from the cube, so disabling a dimension does
-# not require every downstream reader to special-case a missing key. This is
-# the toggle `./ri search --enable-param` / `--disable-param` and `./ri
-# params` also work through - see "Toggling dimensions on and off" in
+# Every entry takes `default` (the pin when the dimension is disabled) and
+# `enabled` (true if omitted). Set `enabled = false` to pin a dimension out
+# of the search instead of deleting it: `cube_to_params()` fixes it at
+# `default` rather than drawing it from the cube, so disabling a dimension
+# does not require every downstream reader to special-case a missing key.
+# This is the toggle `./ri search --enable-param` / `--disable-param` and
+# `./ri params` also work through - see "Toggling dimensions on and off" in
 # docs/nested-sampling.md. Toggling changes PolyChord's dimension count, so
 # it invalidates existing chains the same way reordering does.
 #
@@ -154,26 +154,31 @@ NS_STALL_TIMEOUT = 7200
 name = "log10_dynamic_range"
 min = 1.0
 max = 6.0
+default = 1.0
 
 [[parameter_space]]
 name = "observation_minutes"
 min = 0.3
 max = 20.0
+default = 0.3
 
 [[parameter_space]]
 name = "channel_count"
 min = 1
 max = 8
 kind = "integer"
+default = 1
 
 [[parameter_space]]
 name = "start_frequency_hz"
 kind = "band_start"
+default = 1.0e9
 
 [[parameter_space]]
 name = "channel_width_hz"
 min = 0.1e6
 max = 2.0e6
+default = 0.1e6
 
 # Source offset from the phase centre, as a fraction of the image half-width,
 # at a fixed 30 degree position angle (see docs/parameter-space-proposal.md,
@@ -187,6 +192,7 @@ max = 2.0e6
 name = "source_offset_fraction"
 min = 0.0
 max = 0.35
+default = 0.0
 enabled = false
 
 # Source position as a cartesian (l, m) offset from the central pixel, in
