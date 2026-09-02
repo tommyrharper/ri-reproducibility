@@ -2283,17 +2283,17 @@ def self_check_parameter_toggle() -> None:
         assert {"source_offset_fraction", "channel_width_hz"}.isdisjoint({spec["name"] for spec in specs}), specs
         assert len(specs) == len(enabled_in_file) - 1, specs
 
-        # A disabled dimension is still one fewer cube dimension for
-        # cube_to_params() to draw, and still a params key: pinned at its
-        # `default`/`min`, here 0.0 for the offset and +65 for the declination
-        # every archived run was simulated at.
+        # A disabled dimension is one fewer cube dimension to draw, but still a
+        # params key: simulate_measurement_set() indexes them directly, so a
+        # missing one is a KeyError mid-run. Not asserted by value - defaults.toml
+        # owns those and they get retuned, which is what stops this from being a
+        # second file to edit every time one moves.
         raw: dict[str, Any] = {spec["name"]: float(spec.get("min", 0.0)) for spec in specs}
         fill_disabled_parameters(raw)
+        assert {spec["name"] for spec in load_all_parameter_specs()} <= set(raw), raw
+        # The one value that is a claim rather than a setting: the offset
+        # disables back to the centred source the simulator hard-coded.
         assert raw["source_offset_fraction"] == 0.0, raw
-        assert raw["declination_deg"] == 65, raw
-        # `default` outside min/max on purpose: pinned at what every archived
-        # run used, not at an end of the box worth searching.
-        assert raw["integration_seconds"] == 120, raw
 
         os.environ["NS_DISABLE_PARAMS"] = "channel_count"
         os.environ["NS_ENABLE_PARAMS"] = "channel_count"
