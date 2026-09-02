@@ -202,6 +202,9 @@ enabled = false
 #
 # Continuous, not integer: landing between pixel centres is the
 # pixel-interpolation error a centred source hides.
+#
+# Enabling these alongside `source_offset_fraction` is refused: the offsets
+# add, so one position comes from many draws.
 [[parameter_space]]
 name = "source_l_pixels"
 kind = "image_pixels"

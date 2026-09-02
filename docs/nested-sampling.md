@@ -492,6 +492,10 @@ the pair reaches any pixel rather than the points along one ray. They add to
 Enabling one alone leaves the other axis unexercised and gives up the symmetry
 the 30 degree ray was chosen for, so enable both or neither.
 
+Enabling the polar dimension and either cartesian one together is refused:
+the offsets add, so one sky position comes from many draws and PolyChord
+spends a dimension on a direction the likelihood is flat along.
+
 `kind = "image_pixels"` in `defaults.toml` takes a `fraction`, not a min/max:
 `load_all_parameter_specs()` resolves the box to `+/-(NS_IMAGE_DIM / 2) *
 fraction`, `+/-8` pixels of the default 32-pixel image. A box in pixels would

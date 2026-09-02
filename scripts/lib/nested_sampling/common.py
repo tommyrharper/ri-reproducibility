@@ -237,7 +237,22 @@ def load_parameter_space() -> list[dict[str, Any]]:
             spec.setdefault("min", min(float(band["min"]) for band in bands))
             spec.setdefault("max", max(float(band["max"]) for band in bands))
             check_channel_box_against_bands(specs)
+    check_source_position_dimensions(specs)
     return specs
+
+
+def check_source_position_dimensions(specs: list[dict[str, Any]]) -> None:
+    names = {str(spec["name"]) for spec in specs}
+    pixels = sorted(names & {"source_l_pixels", "source_m_pixels"})
+    if "source_offset_fraction" in names and pixels:
+        raise SystemExit(
+            f"source_offset_fraction and {', '.join(pixels)} are enabled together, and "
+            "their offsets add - so one sky position is reachable from many draws and "
+            "PolyChord would spend a dimension on a direction the likelihood is flat "
+            "along. Enable the cartesian pair or the polar dimension, not both: "
+            "`--disable-param source_offset_fraction`, or `--disable-param "
+            "source_l_pixels --disable-param source_m_pixels`."
+        )
 
 
 def check_channel_box_against_bands(specs: list[dict[str, Any]]) -> None:
@@ -2445,6 +2460,19 @@ def self_check_source_offset() -> None:
         )
         away = round(float(by_name["source_l_pixels"]["max"]))
         assert (abs(sx - centre), sy - centre) == (away, away), (sx, sy, away)
+
+        # Enabled alongside the polar dimension the offsets would add, and
+        # the same position would come from many draws.
+        os.environ["NS_ENABLE_PARAMS"] = "source_offset_fraction,source_l_pixels"
+        load_parameter_space.cache_clear()
+        try:
+            load_parameter_space()
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("polar and cartesian offsets enabled together must abort")
+        os.environ["NS_ENABLE_PARAMS"] = "source_l_pixels,source_m_pixels"
+        load_parameter_space.cache_clear()
 
         # A fraction of the half-width, so NS_IMAGE_DIM has to move the box.
         saved_dim = os.environ.get("NS_IMAGE_DIM")
