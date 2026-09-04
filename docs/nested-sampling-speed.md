@@ -53,6 +53,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | FFTW planner warmed in the zygote parent | `zygote.cpp` | -6.9% on the binary ([FFTW](nested-sampling-fftw-planner.md)) |
 | `schaapcommon` FFTW plan cache | `patches/0004` | -2.7% on the binary ([gridder floor](nested-sampling-gridder-floor.md)) |
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
+| w-gridding turned off | `patches/0006` | -29% on the binary, at 2.3e-5 of the image peak ([gridder floor](nested-sampling-gridder-floor.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
@@ -130,7 +131,6 @@ Two rounds bought run *size* rather than speed - see
 | lever | worth | why not |
 |---|---|---|
 | `-mgain 0.9` | +15-20% evals/s | Not result-preserving for `peak_flux_abs_error_jy` or `sigma_res`, and it is the experiment definition every archived run was scored under. Now `./ri search --mgain 0.9` and `./ri bench run wsclean --interleave NS_WSCLEAN_MGAIN 0.8 0.9`; default still 0.8. [clean loop](nested-sampling-clean-loop.md) |
-| Dropping the w-gridding cube | -29% on the binary | **Closed.** The ignored-`w` phase error exceeds ducc0's own 1e-4 epsilon on 5962 of 5962 evaluations, so no lossless per-evaluation rule can skip it. [run scaling](nested-sampling-run-scaling.md) |
 | Raising the 65W RAPL package limit | ~+26% evals/s | **Closed.** Docker here is rootless, so `--privileged` still maps to an unprivileged user and cannot write it. [power limit](nested-sampling-power-limit.md) |
 | R2D2 at four OpenMP threads | +5-6% evals/s at 8 ranks | Fastest measured explicit setting on this 20-CPU host, but it oversubscribes: the automatic `ceil(cpus / ranks)` has to be right on smaller-rank and larger hosts too. `--omp-threads 4` still asks for it |
 
@@ -252,7 +252,7 @@ Chronological; each page starts where the last stopped.
 | [simulate stage](nested-sampling-simulate-stage.md) | The MeqTrees half, and the confirmation that nothing measurable is left in it. |
 | [shared MS open](nested-sampling-shared-ms-open.md) | `patches/0003`, counted with a 30-line `LD_PRELOAD` shim over `open64` - no rebuild, no profiler. |
 | [FFTW planner](nested-sampling-fftw-planner.md) | 63 transform plans built and thrown away per process. Note the four warmed sizes derive from `DEFAULT_IMAGE_DIM = 128`; a stale list costs the speedup, not a result. |
-| [gridder floor](nested-sampling-gridder-floor.md) | ducc0's own timer tree, and `patches/0004`. Two arms' FITS files never byte-compare equal - the header carries the `-name` path, so compare data blocks. |
+| [gridder floor](nested-sampling-gridder-floor.md) | ducc0's own timer tree, `patches/0004`, and the -29% that `patches/0006` takes by turning w-gridding off. Two arms' FITS files never byte-compare equal - the header carries the `-name` path, so compare data blocks. |
 | [row blocks](nested-sampling-row-blocks.md) | `patches/0005`: 29484 casacore column reads an evaluation down to 27. |
 | [process warm-up](nested-sampling-process-warm-up.md) | The 5 ms before the first visibility - and the unsigned-arithmetic bug that makes WSClean fit its restoring beam on a quarter of the box it means to use. A real failure mode, not result-preserving to fix. |
 | [disk footprint](nested-sampling-disk-footprint.md) | Bytes rather than clock. A run is `~17 x nlive x num_repeats` evaluations, and `evaluations/` needs no sharding. |

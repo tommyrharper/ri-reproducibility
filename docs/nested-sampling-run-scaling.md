@@ -104,14 +104,15 @@ first - the exact sequential-arm false positive
 [the I/O placement page](nested-sampling-io-placement.md) warns about, appearing
 here in a rig that had no A/B intent at all.
 
-## Dropping w-gridding is closed, on the whole parameter space
+## Dropping w-gridding is taken, on the whole parameter space
 
 [The gridder floor](nested-sampling-gridder-floor.md) prices
 `do_wgridding=false` at **-29% on the `wsclean` binary** - by a wide margin the
-biggest number this project has measured - and leaves it as a decision, on the
-strength of one corpus's `w=[6.17:61289.5] lambdas` and a 2.3e-5 median image
-change. The honest per-evaluation criterion is the gridder's own: ignoring `w`
-costs at most a phase error of
+biggest number this project has measured - on the strength of one corpus's
+`w=[6.17:61289.5] lambdas` and a 2.3e-5 median image change. It is taken, as
+`docker/wsclean/patches/0006`, and it is taken for every evaluation because
+there is no lossless subset of it. The honest per-evaluation criterion is the
+gridder's own: ignoring `w` costs at most a phase error of
 
 ```
 2 pi x wmax x |n-1|max        |n-1|max = 1 - sqrt(1 - 2 lmax^2)
@@ -136,9 +137,10 @@ highest-frequency, longest-baseline corner of the space gets near the epsilon -
 where `wmax/maxuvw` is largest too.
 
 There is therefore no lossless per-evaluation rule that would let a patch skip
-the six-plane w-cube on part of a run. The -29% remains available only as a
-science decision about the 2.3e-5 image change, and it should stay documented in
-the gridder-floor page as one.
+the six-plane w-cube on part of a run: `patches/0006` skips it on all of them,
+which makes the -29% a science decision about the 2.3e-5 image change rather
+than an optimisation, and it stays documented in the gridder-floor page as one.
+Runs either side of that patch are not comparable.
 
 ## What actually limits a bigger run
 

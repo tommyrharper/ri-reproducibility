@@ -6,7 +6,8 @@ gridding proper, 23% FFT, 11% corrections, 3% index. There is no slack in it -
 every pass builds a six-plane w-cube for a w-range that spans 0.7% of one
 plane, because `nplanes = (wmax-wmin)/dw + supp` has a kernel-support floor,
 and taking it away is worth -29% on the `wsclean` binary but changes the
-restored image by 2.3e-5 of its peak.** What *was* left is FFTW's planner:
+restored image by 2.3e-5 of its peak - taken, as `patches/0006`.** What *was*
+left is FFTW's planner:
 `docker/wsclean/patches/0004` caches the transform plans `schaapcommon`
 rebuilds on every call, taking a run's 64 plan builds per evaluation to 12,
 worth -2.7% on the binary in an interleaved tmpfs replay and -3.2% over four
@@ -98,7 +99,9 @@ Flipping both to `false`, over 312 interleaved tmpfs replay pairs on the same
 **-29% on the `wsclean` binary, i.e. about a quarter off every evaluation.**
 That is by a wide margin the largest single number this project has measured.
 
-It is not takeable as a default. The restored images are not bit-identical:
+**It is taken, as `docker/wsclean/patches/0006`.** It is the one patch here
+that changes what WSClean computes, and that is the price. The restored images
+are not bit-identical:
 over the same 104 evaluations the largest pixel difference is 2.3e-5 of the
 image peak on the median and 1.2e-4 at worst, and this search scores
 `log10_dynamic_range` out to 1e6. The physics agrees - the maximum w phase the
@@ -106,10 +109,12 @@ approximation drops is `2*pi*wmax*max|n-1|` = 0.026 rad, which is 260x the
 `eps=1e-4` the gridder is otherwise held to, so the two arms are simply two
 different accuracies rather than two implementations of one.
 
-It is recorded here because it is a *decision*, not a dead end: anyone willing
-to image this parameter space at ~1e-4 relative accuracy instead of ~1e-6 buys
-a quarter of the run back, and nobody could have made that trade before
-without this number. Same family as `-wgridder-accuracy 1e-2`
+It was taken because it is a *decision*, not a dead end: imaging this
+parameter space at ~1e-4 relative accuracy instead of ~1e-6 buys a quarter of
+the run back, and nobody could have made that trade before without this
+number. The cost is that runs either side of `patches/0006` are not
+comparable - neither their timings nor their metrics. Same family as
+`-wgridder-accuracy 1e-2`
 ([the evaluation-budget doc](nested-sampling-evaluation-budget.md), +13.8%),
 but a much better rate: 2x the accuracy loss for 2x the speedup.
 
@@ -133,8 +138,8 @@ longest-baseline corner approaches the epsilon, which is also where
 [the run-scaling page](nested-sampling-run-scaling.md) for the percentile table
 and how to recompute it from any archived run's logs.
 
-So the -29% stays exactly what it is above: a decision about accuracy, with no
-lossless subset of it available.
+So the -29% is exactly what it is above: a decision about accuracy taken
+whole, with no lossless subset of it available.
 
 ## 0004: the plans schaapcommon keeps rebuilding
 
@@ -216,7 +221,8 @@ transform shape per process, which is the floor.
 The ranking that comes out of the median table above, for whoever is next:
 
 - **Gridding and degridding, 58%.** Arithmetic, priced above. Only two levers
-  and both are accuracy or pass-count trades: `do_wgridding` (-29%, 2.3e-5),
+  and both are accuracy or pass-count trades: `do_wgridding` (-29%, 2.3e-5,
+  taken as `patches/0006`),
   `-wgridder-accuracy` (+13.8% at 1e-2), `-mgain`
   ([the clean-loop doc](nested-sampling-clean-loop.md), +20% at 0.9).
 - **The reorder, 5.4%.** Taken - the row-at-a-time casacore column reads are
