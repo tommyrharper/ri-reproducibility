@@ -149,12 +149,15 @@ rather than harness work.
 
 ## What is actually left
 
-In descending order of size, with what each costs:
+In descending order of size, with what each costs. Dropping w-gridding used to
+head this list at +29% on the binary; it was taken as `patches/0006`, at the
+cost of 5.4e-3 rad of ignored w-phase at the image corner ([gridder
+floor](nested-sampling-gridder-floor.md)), and the percentages below are from
+before it.
 
 | lever | worth | cost |
 |---|---:|---|
 | raise the host's 65W PL1 to its rated 117W | +26% | root on the box; not reachable from this account |
-| drop w-gridding | +29% on the binary | not result-preserving: 5.4e-3 rad of ignored w-phase at the image corner ([gridder floor](nested-sampling-gridder-floor.md)) |
 | `--mgain 0.9` | +14% to +20% | `peak_flux_abs_error_jy` and `sigma_res` move; changes the experiment definition |
 | `-wgridder-accuracy 1e-2` | +13.8% | 10 mJy of gridding error against a `log10_dynamic_range` that reaches 1e6 |
 | fix schaapcommon's unsigned beam-fit bug | ~4% | changes the restoring beam ([process warm-up](nested-sampling-process-warm-up.md)) |

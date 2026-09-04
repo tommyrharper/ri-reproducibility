@@ -30,8 +30,8 @@ true. The patch directory is part of the `ri.build-inputs` hash in
 Each patch is upstream-shaped - it should be something WSClean would take -
 rather than a change to what WSClean computes. Both properties matter: a patch
 that alters results makes every archived run incomparable, and a patch upstream
-would reject is one this repo carries forever. 0002 is the one exception to the
-first half and is called out as such below.
+would reject is one this repo carries forever. 0002 is the exception to the
+first half and 0006 to the second; both are called out as such below.
 
 `docker/wsclean/src/*.cpp` is the companion directory: source this repo *adds*
 to the tree, copied in by the same Dockerfile line, so a new file does not have
@@ -226,3 +226,47 @@ the measurements are in [the row-block doc](nested-sampling-row-blocks.md).
 Upstream-shaped, and the first patch here that is not a cache of something
 process-global: it changes nothing WSClean computes, only how many times it
 asks casacore for the same bytes.
+
+## 0006: turn w-gridding off
+
+Four `true` arguments to `false` - the `do_wgridding` parameter of ducc0's
+`ms2dirty` and `dirty2ms` in `wgridder/wgridder.h` and
+`wgridder/wgridder_implementation.h`, in both the plain and the `_tuning`
+call. Every gridding and degridding pass then works on a single plane instead
+of the six-plane w-cube ducc0's kernel-support floor otherwise forces, worth
+**-29% on the `wsclean` binary** - about a quarter off every evaluation, and
+by a wide margin the largest single number this project has measured. Why the
+cube exists, the 312-pair interleaved replay behind the number and the physics
+of what is dropped are in
+[the gridder-floor doc](nested-sampling-gridder-floor.md).
+
+**This is the patch that changes what WSClean computes**, and so far the only
+one. Over the same 104-Measurement-Set corpus the largest pixel difference
+against an unpatched build is 2.3e-5 of the image peak on the median and
+1.2e-4 at worst, because the maximum w phase the approximation drops is
+`2*pi*wmax*max|n-1|` = 0.026 rad against the `eps=1e-4` the gridder is
+otherwise held to. It is a science decision, not an optimisation: this
+parameter space images a 128 x 128 field at a scale set by each observation's
+own maximum baseline, so the field of view is always tiny and the w-term
+always negligible, and the search is willing to image it at ~1e-4 relative
+accuracy instead of ~1e-6 to buy a quarter of the run back.
+
+The consequence the rest of the directory is designed to avoid follows:
+**runs from before this patch are not comparable with runs after it.** Timings
+from before it are ~29% slow on the `wsclean` binary and its metrics - the
+`log10_dynamic_range` this search scores out to 1e6 above all - are from a
+different accuracy. Compare across the boundary and you are comparing two
+gridders.
+
+The 2.3e-5 is a fact about *this* parameter space, not about the patch.
+`./ri smoke wsclean` images a 256 arcsec field (256 px at `-scale 1asec`,
+against the search's 128 px at ~0.03 arcsec), which is wide enough for the
+w-term to matter: its restored image moves by 2.5e-3 of the peak and its PSF
+by 1.2e-2. That is the approximation behaving exactly as the physics says, and
+the smoke test asserts nothing about pixel values, so it still passes - but do
+not read a smoke-test image as evidence about the search.
+
+Upstream-shaped only in the trivial sense that it is a one-word change;
+upstream would not take it, because `do_wgridding` is a parameter and turning
+it off unconditionally is wrong for any field wide enough to need it. Revert
+by deleting the patch file - nothing else refers to it.

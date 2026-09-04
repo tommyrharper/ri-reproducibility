@@ -1,0 +1,40 @@
+diff --git a/wgridder/wgridder.h b/wgridder/wgridder.h
+index f6b7050..4a33c98 100644
+--- a/wgridder/wgridder.h
++++ b/wgridder/wgridder.h
+@@ -374,13 +374,13 @@ class WGridder final : public WGridderBase {
+     ducc0::cmav<std::uint8_t, 2> tmask(nullptr, {0, 0});
+     if (!tuning_)
+       ducc0::ms2dirty<NumT, NumT>(uvw2, freq, ms, twgt, tmask, pixel_size_x_,
+-                                  pixel_size_y_, epsilon_, true, n_threads_,
++                                  pixel_size_y_, epsilon_, false, n_threads_,
+                                   tdirty, verbosity_, true, false, sigma_min,
+                                   sigma_max, -l_shift_, -m_shift_);
+     else
+       ducc0::ms2dirty_tuning<NumT, NumT>(
+           uvw2, freq, ms, twgt, tmask, pixel_size_x_, pixel_size_y_, epsilon_,
+-          true, n_threads_, tdirty, verbosity_, true, false, sigma_min,
++          false, n_threads_, tdirty, verbosity_, true, false, sigma_min,
+           sigma_max, -l_shift_, -m_shift_);
+     for (size_t i = 0; i < trimmed_width_ * trimmed_height_; ++i)
+       image_[i] += tdirty.raw(i);
+diff --git a/wgridder/wgridder_implementation.h b/wgridder/wgridder_implementation.h
+index 01086b6..792984e 100644
+--- a/wgridder/wgridder_implementation.h
++++ b/wgridder/wgridder_implementation.h
+@@ -339,13 +339,13 @@ void WGridder<NumT>::PredictVisibilities(
+   cmav<std::uint8_t, 2> tmask(nullptr, {0, 0});
+   if (!tuning_)
+     dirty2ms<NumT, NumT>(wrapped_uvws, wrapped_frequencies, tdirty, twgt, tmask,
+-                         pixel_size_x_, pixel_size_y_, epsilon_, true,
++                         pixel_size_x_, pixel_size_y_, epsilon_, false,
+                          n_threads_, ms, verbosity_, true, false, sigma_min,
+                          sigma_max, -l_shift_, -m_shift_);
+   else
+     dirty2ms_tuning<NumT, NumT>(wrapped_uvws, wrapped_frequencies, tdirty, twgt,
+                                 tmask, pixel_size_x_, pixel_size_y_, epsilon_,
+-                                true, n_threads_, ms, verbosity_, true, false,
++                                false, n_threads_, ms, verbosity_, true, false,
+                                 sigma_min, sigma_max, -l_shift_, -m_shift_);
+ }
+ 
