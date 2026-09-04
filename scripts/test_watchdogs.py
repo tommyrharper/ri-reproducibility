@@ -17,35 +17,92 @@ SLOWEST_SIMULATE_SECONDS = 0.60
 SLOWEST_CONVERT_SECONDS = 1.42
 SLOWEST_PREDICT_SECONDS = 0.34
 
+# Idle single-rank predict against makems' NTimes, measured on the meqtrees
+# image (nchan makes almost no difference: 1200x4 and 1200x8 are 1.82s and
+# 1.88s). The ladder has to hold against the top of this, not against the
+# bottom, which is the whole reason both bounds scale.
+MEASURED_PREDICT_SECONDS = {9: 0.04, 120: 0.20, 300: 0.49, 449: 0.72, 600: 0.97, 897: 1.42, 1200: 1.88}
+# The largest NTimes the parameter space can ask for: 20 minutes at a 1s dump.
+MOST_TIME_SAMPLES = 1200
 
-def predict_wait_seconds() -> float:
+
+def worker_default_predict_wait() -> float:
+    """The bound a worker run straight from the CLI, with no rank sizing it, uses."""
     match = re.search(r"^PREDICT_WAIT_SECONDS = ([\d.]+)$", SIMULATE_SOURCE.read_text(), re.MULTILINE)
     assert match, "PREDICT_WAIT_SECONDS is no longer a plain literal in simulate_point_source_ms.py"
     return float(match.group(1))
 
 
 def check_timeout_ladder() -> None:
-    predict = predict_wait_seconds()
-    assert predict < common.SIMULATE_REPLY_TIMEOUT, (
-        f"the worker's own bound ({predict}s) must expire before the rank's "
-        f"({common.SIMULATE_REPLY_TIMEOUT}s), or the rank kills the worker "
-        "before it can fix itself"
-    )
-    assert common.SIMULATE_REPLY_TIMEOUT > 2 * predict, (
-        f"the rank's bound ({common.SIMULATE_REPLY_TIMEOUT}s) leaves no room for "
-        f"the worker's two attempts at {predict}s"
-    )
-    assert common.SIMULATE_REPLY_TIMEOUT < common.SHELL_REPLY_TIMEOUT <= common.IMAGING_REPLY_TIMEOUT
+    """The ladder has to hold at every shape, not just at the smallest one."""
+    for n_times in (0, 1, *MEASURED_PREDICT_SECONDS, MOST_TIME_SAMPLES):
+        predict = common.predict_wait_seconds(n_times)
+        reply = common.simulate_reply_timeout(n_times)
+        assert predict < reply, (
+            f"at NTimes={n_times} the worker's own bound ({predict}s) must expire "
+            f"before the rank's ({reply}s), or the rank kills the worker before "
+            "it can fix itself"
+        )
+        assert reply > 2 * predict, (
+            f"at NTimes={n_times} the rank's bound ({reply}s) leaves no room for "
+            f"the worker's two attempts at {predict}s"
+        )
+        assert reply < common.SHELL_REPLY_TIMEOUT <= common.IMAGING_REPLY_TIMEOUT, (
+            f"at NTimes={n_times} the rank's bound ({reply}s) is no longer inside "
+            f"the imaging bounds around it"
+        )
 
-    assert predict > 3 * SLOWEST_PREDICT_SECONDS, (
-        f"PREDICT_WAIT_SECONDS={predict}s is too close to the slowest predict "
-        f"on record ({SLOWEST_PREDICT_SECONDS}s)"
+    # The bound never tightens as the job grows, which is what made one slow
+    # point fatal: 15 minutes at a 1s dump measured 1.42s of predict against a
+    # flat 3s bound, and lost the race on a loaded host.
+    for n_times, measured in MEASURED_PREDICT_SECONDS.items():
+        predict = common.predict_wait_seconds(n_times)
+        assert predict > 3 * measured, (
+            f"at NTimes={n_times} the bound ({predict}s) is too close to the "
+            f"measured predict ({measured}s)"
+        )
+
+    # A worker nobody sized - a direct CLI run - still gets today's bound.
+    assert worker_default_predict_wait() <= common.predict_wait_seconds(0)
+
+    assert common.predict_wait_seconds(0) > 3 * SLOWEST_PREDICT_SECONDS, (
+        f"the smallest bound ({common.predict_wait_seconds(0)}s) is too close to "
+        f"the slowest predict on record ({SLOWEST_PREDICT_SECONDS}s)"
     )
     slowest_covered = max(SLOWEST_SIMULATE_SECONDS, SLOWEST_CONVERT_SECONDS)
-    assert common.SIMULATE_REPLY_TIMEOUT > 3 * slowest_covered, (
-        f"SIMULATE_REPLY_TIMEOUT={common.SIMULATE_REPLY_TIMEOUT}s is too close to "
-        f"the slowest stage it covers ({slowest_covered}s, the R2D2 convert)"
+    assert common.simulate_reply_timeout() > 3 * slowest_covered, (
+        f"the smallest rank bound ({common.simulate_reply_timeout()}s) is too close "
+        f"to the slowest stage it covers ({slowest_covered}s, the R2D2 convert)"
     )
+
+
+def check_bounds_scale_with_the_measurement_set() -> None:
+    """The evaluation's shape, not a constant, is what sizes both bounds."""
+    small = {"observation_minutes": 0.3, "integration_seconds": 2}
+    large = {"observation_minutes": 20.0, "integration_seconds": 1}
+    assert common.evaluation_time_samples(small) == 9, common.evaluation_time_samples(small)
+    assert common.evaluation_time_samples(large) == MOST_TIME_SAMPLES, common.evaluation_time_samples(large)
+    # A degenerate observation still asks for one time sample, not zero.
+    assert common.evaluation_time_samples({"observation_minutes": 0.0, "integration_seconds": 10}) == 1
+
+    assert common.predict_wait_seconds(MOST_TIME_SAMPLES) > 3 * common.predict_wait_seconds(9), (
+        f"the worker bound barely moves across the parameter space "
+        f"({common.predict_wait_seconds(9)}s to "
+        f"{common.predict_wait_seconds(MOST_TIME_SAMPLES)}s); it is scalar in all but name"
+    )
+    # The rank's bound carries a deliberately large fixed base, so it grows less
+    # steeply than the worker's. What has to hold is that its headroom never
+    # shrinks: every extra second the worker may spend on its two predicts is a
+    # second the rank has already agreed to wait.
+    for n_times in (*MEASURED_PREDICT_SECONDS, MOST_TIME_SAMPLES):
+        grew = common.simulate_reply_timeout(n_times) - common.simulate_reply_timeout(9)
+        allowed = common.WORKER_PREDICT_ATTEMPTS * (
+            common.predict_wait_seconds(n_times) - common.predict_wait_seconds(9)
+        )
+        assert grew >= allowed, (
+            f"from NTimes=9 to {n_times} the worker gained {allowed}s of predict "
+            f"but the rank only gained {grew}s of patience"
+        )
 
 
 def check_fifo_kill_pattern() -> None:
@@ -73,6 +130,7 @@ def main() -> None:
     for check in (
         common.self_check_worker_timeout,
         check_timeout_ladder,
+        check_bounds_scale_with_the_measurement_set,
         check_fifo_kill_pattern,
         check_worker_died_is_not_a_score,
     ):
