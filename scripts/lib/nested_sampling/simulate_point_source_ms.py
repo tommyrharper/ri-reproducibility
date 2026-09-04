@@ -62,6 +62,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--declination-deg", type=float, default=DEFAULT_DECLINATION_DEG)
     parser.add_argument("--dynamic-range", type=float, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    # On the argv rather than in the worker request, so the command recorded in
+    # metrics.json reproduces the evaluation's bound as well as its parameters.
+    parser.add_argument("--predict-wait-seconds", type=float, default=None)
     return parser.parse_args(argv)
 
 
@@ -286,13 +289,16 @@ def meqserver_session():
     return _MQS
 
 
-# Bound MeqTrees deadlocks so worker can restart its server; 3s is ~30x the
-# slowest recorded simulate and avoids blocking PolyChord's collective.
+# Bound MeqTrees deadlocks so worker can restart its server, without blocking
+# PolyChord's collective. The floor, for a run that does not say otherwise: the
+# predict is linear in NTimes, so a rank asking for a large Measurement Set
+# sends the bound it sized for that shape as --predict-wait-seconds. See
+# predict_wait_seconds() in common.py and docs/robustness.md.
 PREDICT_WAIT_SECONDS = 3.0
 
 
 class MeqserverWedged(RuntimeError):
-    """Predict exceeded PREDICT_WAIT_SECONDS; restart server and retry."""
+    """Predict exceeded its wait; restart server and retry."""
 
 
 def restart_meqserver_session() -> None:
@@ -336,7 +342,18 @@ def point_to_measurement_set(module, output_ms: Path) -> None:
     mssel.output_column = "DATA"
 
 
-def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, l_rad: float, m_rad: float) -> None:
+def run_meqtrees_predict(
+    output_ms: Path,
+    corr_sel: str,
+    source_flux_jy: float,
+    l_rad: float,
+    m_rad: float,
+    wait_seconds: float | None = None,
+) -> None:
+    # None, not the module constant as a default argument: the constant is a
+    # global the self-checks replace, and a default argument would freeze the
+    # value this module was imported with.
+    wait_seconds = PREDICT_WAIT_SECONDS if wait_seconds is None else wait_seconds
     tdlconf = output_ms.parent / "point_source_forest.tdlconf"
     tdlconf.write_text(
         "\n".join(
@@ -366,7 +383,7 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
     # MeqserverWedged.
     for attempt in range(2):
         try:
-            errors = _compile_and_predict(tdlconf, key, output_ms)
+            errors = _compile_and_predict(tdlconf, key, output_ms, wait_seconds)
             break
         except MeqserverWedged as exc:
             # Its own file, not meqtree-pipeliner.log: the retry reopens that
@@ -382,8 +399,9 @@ def run_meqtrees_predict(output_ms: Path, corr_sel: str, source_flux_jy: float, 
         raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
 
 
-def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
+def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds: float | None = None) -> list:
     """Compile and run bounded predict; raise MeqserverWedged on timeout."""
+    wait_seconds = PREDICT_WAIT_SECONDS if wait_seconds is None else wait_seconds
     mqs = meqserver_session()
     from Timba.TDL import Compile, TDLOptions
 
@@ -402,7 +420,7 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
             point_to_measurement_set(module, output_ms)
             print("### reusing the compiled forest; only the Measurement Set changed")
         try:
-            TDLOptions.get_job_func("predict")(mqs, None, wait=PREDICT_WAIT_SECONDS)
+            TDLOptions.get_job_func("predict")(mqs, None, wait=wait_seconds)
         except AttributeError as exc:
             # Timba's meq() ends in `return msg.payload`, and msg is None when
             # the wait expires, so a timeout arrives here as an AttributeError
@@ -410,7 +428,7 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path) -> list:
             # same type is a real bug and is left to propagate.
             if "NoneType" not in str(exc):
                 raise
-            raise MeqserverWedged(f"no reply to the predict in {PREDICT_WAIT_SECONDS}s") from exc
+            raise MeqserverWedged(f"no reply to the predict in {wait_seconds}s") from exc
         # get_error_log() flushes, so each request only sees its own errors.
         errors = mqs.get_error_log()
         for index, (_event, error) in enumerate(errors):
@@ -469,7 +487,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     predicted = meqtrees_predict_needed(args)
     if predicted:
         corr_sel, n_corr = determine_corr_selection(output_ms)
-        run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad)
+        run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad, args.predict_wait_seconds)
 
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:

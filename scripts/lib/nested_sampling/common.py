@@ -76,12 +76,66 @@ def worker_attempts() -> Any:
         yield attempt
 
 
-# Reply bounds turn silent-worker deadlocks into recoverable failures. Keep
-# SIMULATE_REPLY_TIMEOUT above normal simulation/convert latency and below the
-# longer imaging bound; rationale and measurements live in docs/robustness.md.
-SIMULATE_REPLY_TIMEOUT = 10.0
+# Reply bounds turn silent-worker deadlocks into recoverable failures. The two
+# simulate bounds scale with the Measurement Set the request asks for, because
+# the MeqTrees predict they cover is linear in makems' NTimes - measured at
+# 0.0015s per time sample and flat in channels - so a scalar that suits the 9
+# time samples of a default run is two orders of magnitude too tight for the
+# 1200 an `integration_seconds` search can ask for, and turns a merely slow
+# predict into a wedge, a dead worker, and a run that cannot restart past that
+# one point. Rationale and measurements live in docs/robustness.md.
+PREDICT_BASE_SECONDS = 3.0
+PREDICT_SECONDS_PER_TIME_SAMPLE = 0.0015
+# The predict shares its host with 19 other ranks and an imager, so it gets an
+# order of magnitude over the idle measurement before it is called wedged.
+# Lower this and a loaded host starts reporting healthy predicts as deaths.
+PREDICT_CONTENTION_MARGIN = 10.0
+# What a request costs the worker either side of the predict. The makems
+# skeleton is the part that scales - measured at 0.0022s per time sample, and it
+# gets the same contention margin as the predict - and the base covers the rest:
+# the FIFO round trip, the noise, and writing the DATA column.
+#
+# 30s rather than the 10s this replaces because a search that moves
+# `declination_deg` or `integration_seconds` changes the skeleton cache key on
+# every draw - both are in the makems config the key is taken from - so every
+# evaluation now runs a real makems inside this bound instead of copying a
+# cached one. Being generous here is nearly free: the bound is only ever spent
+# in full by a worker that has genuinely died.
+SIMULATE_BASE_SECONDS = 30.0
+SKELETON_SECONDS_PER_TIME_SAMPLE = 0.0022
+# The worker replaces its meqserver once and retries, so the rank has to sit
+# through two of its predict bounds before deciding the worker is gone.
+WORKER_PREDICT_ATTEMPTS = 2
 SHELL_REPLY_TIMEOUT = 300.0
 IMAGING_REPLY_TIMEOUT = 3600.0
+
+
+def evaluation_time_samples(params: dict[str, Any]) -> int:
+    """makems' `NTimes` for these parameters - what both simulate bounds scale on."""
+    return max(1, math.ceil(float(params["observation_minutes"]) * 60.0 / float(params["integration_seconds"])))
+
+
+def predict_wait_seconds(n_times: int = 0) -> float:
+    """How long the worker waits on its meqserver before calling it wedged."""
+    return PREDICT_BASE_SECONDS + PREDICT_CONTENTION_MARGIN * PREDICT_SECONDS_PER_TIME_SAMPLE * n_times
+
+
+def simulate_reply_timeout(n_times: int = 0) -> float:
+    """How long the rank waits on the worker: its two predict attempts, and the rest.
+
+    Derived from what the worker actually does with a request rather than from a
+    multiplier, so the ladder cannot drift: whatever the worker is allowed to
+    spend on its two predicts, the rank is already waiting longer than that.
+
+    `n_times` defaults to the smallest Measurement Set, which is also the right
+    answer for the R2D2 convert requests that share this bound and have no
+    predict in them at all.
+    """
+    return (
+        SIMULATE_BASE_SECONDS
+        + WORKER_PREDICT_ATTEMPTS * predict_wait_seconds(n_times)
+        + PREDICT_CONTENTION_MARGIN * SKELETON_SECONDS_PER_TIME_SAMPLE * n_times
+    )
 
 
 def worker_reply(stream: Any, timeout: float) -> str | None:
@@ -1997,21 +2051,26 @@ def simulate_worker_request(
     platform: str,
     request: dict[str, Any],
     stderr_path: Path,
+    reply_timeout: float | None = None,
 ) -> int:
+    if reply_timeout is None:
+        reply_timeout = simulate_reply_timeout()
     for attempt in worker_attempts():
         worker = simulate_worker(meqtrees_image, platform)
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
             _SIMULATE_WORKERS.pop(meqtrees_image, None)
             continue
-        reply = worker_reply(worker.stdout, SIMULATE_REPLY_TIMEOUT)
+        reply = worker_reply(worker.stdout, reply_timeout)
         if reply:
             return int(json.loads(reply)["returncode"])
         if reply is None:
             worker.kill()
         _SIMULATE_WORKERS.pop(meqtrees_image, None)
-    stderr_path.write_text(
-        f"FATAL: simulate worker gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
-    )
+    # Appended, not written: the last attempt's worker leaves its traceback in
+    # this file, and that is the only thing on disk that says why it died.
+    # Clobbering it left "gave no reply" as the entire record of the failure.
+    with stderr_path.open("a") as note:
+        note.write(f"FATAL: simulate worker gave no reply, {len(WORKER_RETRY_DELAYS)} times\n")
     return WORKER_DIED
 
 
@@ -2032,6 +2091,7 @@ def simulate_measurement_set(
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True)
     ms_path = (scratch or eval_dir) / "sim.ms"
+    n_times = evaluation_time_samples(params)
     sim_stdout = eval_dir / "simulate.stdout.log"
     sim_stderr = eval_dir / "simulate.stderr.log"
     sim_cmd = [
@@ -2063,12 +2123,19 @@ def simulate_measurement_set(
         str(params["dynamic_range"]),
         "--seed",
         str(params["noise_seed"]),
+        # The worker can see neither the 19 ranks it competes with nor the size
+        # of the job it is about to be handed, so the rank that can see both
+        # sizes the bounds here - and the ladder then holds by construction
+        # rather than by two constants in two images agreeing.
+        "--predict-wait-seconds",
+        str(predict_wait_seconds(n_times)),
     ]
     returncode = simulate_worker_request(
         meqtrees_image,
         platform,
         {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)},
         sim_stderr,
+        reply_timeout=simulate_reply_timeout(n_times),
     )
     if returncode != 0:
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
@@ -2152,7 +2219,7 @@ def self_check_worker_timeout() -> None:
     assert worker_send(Worker(None).stdin, "x\n") is True
     assert worker_send(Worker(None, broken_stdin=True).stdin, "x\n") is False
 
-    original = {name: globals()[name] for name in ("simulate_worker", "WORKER_RETRY_DELAYS", "SIMULATE_REPLY_TIMEOUT")}
+    original = {name: globals()[name] for name in ("simulate_worker", "WORKER_RETRY_DELAYS")}
     workers: list[Worker] = []
 
     def spawn(reply: str | None) -> Any:
@@ -2163,13 +2230,14 @@ def self_check_worker_timeout() -> None:
         return worker
 
     try:
+        # No delays and a bound nothing can meet, so the retry path runs in
+        # milliseconds instead of waiting out the real per-request bound.
         globals()["WORKER_RETRY_DELAYS"] = (0.0, 0.0)
-        globals()["SIMULATE_REPLY_TIMEOUT"] = 0.05
 
         globals()["simulate_worker"] = spawn(None)
         with tempfile.TemporaryDirectory() as tmp:
             stderr_path = Path(tmp) / "simulate.stderr.log"
-            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == WORKER_DIED
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path, reply_timeout=0.05) == WORKER_DIED
             assert "gave no reply" in stderr_path.read_text()
         # Every silent worker is killed rather than left holding its meqserver,
         # and each attempt gets a fresh one instead of the corpse.
@@ -2181,7 +2249,7 @@ def self_check_worker_timeout() -> None:
         globals()["simulate_worker"] = spawn('{"returncode": 7}\n')
         with tempfile.TemporaryDirectory() as tmp:
             stderr_path = Path(tmp) / "simulate.stderr.log"
-            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path, reply_timeout=0.05) == 7
             assert not stderr_path.exists()
         assert len(workers) == 1 and not workers[0].killed
 
@@ -2202,7 +2270,7 @@ def self_check_worker_timeout() -> None:
         globals()["simulate_worker"] = spawn_broken_then_answering
         with tempfile.TemporaryDirectory() as tmp:
             stderr_path = Path(tmp) / "simulate.stderr.log"
-            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path) == 7
+            assert simulate_worker_request("meqtrees", "linux/amd64", {"argv": []}, stderr_path, reply_timeout=0.05) == 7
             assert not stderr_path.exists()
         assert len(workers) == 2, len(workers)
         # Nothing to kill: it was already gone, which is why the write failed.

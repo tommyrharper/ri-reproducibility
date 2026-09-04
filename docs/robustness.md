@@ -40,6 +40,12 @@ distinguish is an allocation failure the worker catches (`torch` raising rather
 than the kernel killing), which still arrives as exit 1 and is scored. The
 defence there is not to run at the edge of memory: see `NS_R2D2_MAX_RANKS`.
 
+A dead worker's `simulate.stderr.log` keeps whatever the last attempt's worker
+wrote there - usually a traceback naming what it died of - and the
+`FATAL: simulate worker gave no reply` line is appended after it. It used to
+overwrite that file, which left the one-line summary as the entire record of the
+failure and made a reproducible fault look like an unexplained one.
+
 A dead worker is retried against a freshly started one, waiting longer each
 time (`WORKER_RETRY_DELAYS` in `common.py`, ~51s in total). That is usually
 enough, because the memory the attempt died for is released by its own death.
@@ -102,14 +108,75 @@ Three bounds now stand in the way, each shorter than the one outside it:
 
 | Bound | Where | What it does when it expires |
 |---|---|---|
-| `PREDICT_WAIT_SECONDS` (3s) | `simulate_point_source_ms.py` | The worker kills its own meqserver, starts a fresh one (~0.2s) and retries. The rank never learns anything happened. |
-| `SIMULATE_REPLY_TIMEOUT` (10s) | `common.py` | The rank kills the worker, drops its pooled FIFO slot and retries against a rank-started one. |
+| `predict_wait_seconds()` (3-21s) | `common.py`, sent as `--predict-wait-seconds` | The worker kills its own meqserver, starts a fresh one (~0.2s) and retries. The rank never learns anything happened. |
+| `simulate_reply_timeout()` (36-98s) | `common.py` | The rank kills the worker, drops its pooled FIFO slot and retries against a rank-started one. |
 | `WORKER_RETRY_DELAYS` (5 attempts) | `common.py` | `WORKER_DIED`: the run stops rather than scoring a host fault. |
 
 The ordering is the design. If the worker's own bound ever exceeds the rank's,
 the rank kills the worker before it can fix itself and every deadlock costs a
 killed worker again - so `scripts/test_watchdogs.py` asserts the ladder holds,
 and CI runs it.
+
+### Both simulate bounds scale with the Measurement Set
+
+They used to be two scalars, 3s and 10s, sized against a default run's 9 time
+samples. Enabling `integration_seconds` asks for up to 1200 of them, and the
+predict is linear in that count: 0.04s at NTimes=9, 1.42s at 897, 1.88s at 1200,
+and near enough flat in channels (1200x4 is 1.82s against 1200x8's 1.88s). A
+20-rank run has ~2x that idle figure on top for contention.
+
+So a 15-minute observation at a 1s dump - 897 time samples, 1.42s of predict
+idle - lost the race against a flat 3s bound on a loaded host. That is a slow
+predict, not a wedged one, but the ladder cannot tell the difference: the worker
+replaced its meqserver, timed out again, and exited without replying; the rank
+spent all five attempts the same way and reported `WORKER_DIED`; the restart
+resumed, found that point uncached, re-dispatched it first, and died identically
+with no evaluation scored, which is exactly the case the forward-progress guard
+refuses to retry. One point in the parameter space ended the search, repeatably,
+and `./ri resume` could not get past it.
+
+`predict_wait_seconds(n_times)` is `3.0 + 10 x 0.0015 x n_times`, an order of
+magnitude over the idle measurement at every shape and never below the 3s it
+replaces, so nothing that worked before gets a tighter bound.
+
+`simulate_reply_timeout(n_times)` is built from what the worker actually does
+with a request rather than from a multiplier: a 30s base for the FIFO round
+trip, the noise and the DATA column, plus the makems skeleton at its own
+measured 0.0022s per time sample and the same contention margin, plus the two
+predict bounds the worker is entitled to spend. So the rank is always already
+waiting longer than it has allowed the worker to take, and the ladder cannot
+drift when one of the two is retuned. That is 36s at the small end and 98s at
+1200 time samples.
+
+The base went up from 10s with it, because a search that moves `declination_deg`
+or `integration_seconds` changes the skeleton cache key on every draw - both are
+in the makems config the key is taken from - so every evaluation runs a real
+makems inside this bound rather than copying a cached one.
+
+`timing.simulate_seconds` in `metrics.json` is not this quantity and should not
+be read as one: it is measured around the whole of
+`simulate_measurement_set()`, so it also carries the scratch `rmtree` and the
+evaluation directory's creation, which on a 20-rank run churning `/dev/shm` can
+be tens of seconds on their own. Two verification runs of 2390 and 2089
+evaluations, at up to 1168 time samples, recorded some of those totals well
+above the bound and not one worker death - the request itself was always inside
+it.
+
+The price is paid only by a worker that really has died: five attempts at the
+largest shape is ~9 minutes before the run gives up, against ~1.5 before. That
+is the right direction to be wrong in - a bound that is too tight ends the
+search, and a bound that is too loose costs one rank some minutes, once.
+
+The rank sizes both, from `evaluation_time_samples(params)`, and sends the
+worker's as `--predict-wait-seconds`. The worker cannot size it itself: it sees
+neither the shape it is about to be handed nor the 19 ranks it competes with,
+and `common.py` is deliberately not in the meqtrees runtime image. Passing it on
+the argv rather than in the request JSON keeps the command recorded in
+`metrics.json` a thing that reproduces the evaluation. A worker run straight
+from the CLI with no `--predict-wait-seconds` keeps the 3s default.
+
+`scripts/test_watchdogs.py` asserts the ladder at every shape in the parameter
+space, and that each bound stays at least 3x the predict measured at that shape.
 
 The first layer absorbs nearly all of it: two full 20-rank runs after it was
 added recovered 8 deadlocks between them with no gap above 2s anywhere. The
