@@ -60,14 +60,19 @@ for a later picture.
 
 ## Which runs it reports on
 
-With no argument, reports every active run on this host - ranks or `docker exec`
-clients - and otherwise the newest run. Names search this checkout first, then
+With no argument, reports every active run on this host - ranks here, or a
+Slurm job named after the run - and otherwise the newest run. Names search this checkout first, then
 active foreign runs; foreign resume suggestions use paths. `--all` reports
 every on-disk run here; `--json` selects machine-readable output.
 
-It reads files, runs `ps`/`docker ps`, and samples live-rank CPU (under Docker
-Desktop, forked ranks use `docker top` and a five-second sample). It starts and
-images nothing, exiting 1 when attention is needed.
+It reads files, runs `ps` and `squeue`, and samples live-rank CPU. It starts
+and images nothing, exiting 1 when attention is needed.
+
+On a cluster login node the ranks are on a compute node whose processes this
+host cannot see, so the run's Slurm job (`scripts/lib/slurm.sh` names it after
+the run directory) stands in for them: pending is `QUEUED`, and a running job
+is read from what the run has written to the shared filesystem - `HEALTHY`,
+`STALLED` or `STARTING` by the same rules, with no rank, memory or CPU lines.
 
 ## Status
 
@@ -78,9 +83,10 @@ stop writing:
 |---|---|
 | `FINISHED` | A whole `summary.json` is there. |
 | `STALLED` | Ranks running, but no evaluation in `--stale-seconds` (default 600). The warning says how long until the stall watchdog restarts the run, or that `--stall-timeout 0` turned it off, or that no watchdog is left. |
-| `STARTING` | No ranks yet, but a `docker exec` client is alive, and nothing is in `chains/` yet - a genuine first start. An R2D2 search spends minutes here loading models. |
+| `QUEUED` | No ranks, and the run's Slurm job is pending. |
+| `STARTING` | No ranks yet, but the worker pools are up under a live run script (or the job is running), and nothing is in `chains/` yet - a genuine first start. An R2D2 search spends minutes here loading models. |
 | `RESTARTING` | The same, but `chains/` already has a live-point file or a checkpoint - a self-heal restart mid-search, not a first start. |
-| `STOPPED` | No ranks and no client, however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if there is none; the warning says which. A half-written `summary.json` lands here too, with a warning saying so. |
+| `STOPPED` | No ranks, no pools under a live run script and no job, however recently it wrote. `./ri resume <run>` continues it from its checkpoint, or starts the sampler over if there is none; the warning says which. A half-written `summary.json` lands here too, with a warning saying so. |
 | `HEALTHY` | Ranks running, evaluations landing, nothing warned about. |
 
 A directory with none of `run.env`, `run.log`, `summary.json`, `evaluations/`
@@ -372,13 +378,13 @@ first says "this will happen again". Both are downtime - see **activity**.
 
 **supervision** - a warning when the shell that started the run is gone.
 SIGKILLing a run script does not stop the run: the ranks are children of
-`containerd-shim`, so they keep imaging and every other line stays healthy.
-What dies with the shell is `run_with_retries`, so the run has quietly lost
+`mpirun`, so they keep imaging and every other line stays healthy. What dies
+with the shell is `run_with_retries`, so the run has quietly lost
 restart-from-checkpoint and will end at the first crash it would have survived.
 Nothing else on disk or in the process table shows this. Found through the
-run's `docker exec` client, whose parent is checked for *being* a run script
-rather than for being pid 1, because a reparented orphan lands on whatever
-subreaper the session has.
+run's worker pools (`scripts/lib/start-sidecars.sh`), whose ancestors are
+searched for a run script rather than checked for pid 1, because a reparented
+orphan lands on whatever subreaper the session has.
 
 **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
 `meqserver-wedged.log` lines. **The one a run can pass every other check and
@@ -417,20 +423,11 @@ opens a second before the gap, because `restarts.log` stamps whole seconds
 while evaluation mtimes are fractional. The percentage is of running time, not
 wall clock.
 
-**host** - free memory against the headroom `rank-budget.sh` keeps, free disk
-on the filesystem holding `results/`, and `ri-ns-sidecar-*` containers whose
-launching process is gone. A killed run leaves those holding ~3.4GB per R2D2
-rank. Reported to know about, not to act on: `ns_reap_leaked_sidecars` removes
-them before the next run reads free memory.
-
-The launcher pid is not the whole rule. A run script killed with SIGKILL leaves
-the search going, so on the pid alone a live 16-rank search's containers read
-as leaked and `docker rm -f` would have killed it. Each container carries a
-`ri.run-dir` label naming its run (`sidecar_launch` in
-`scripts/lib/start-sidecars.sh`), and a container whose labelled run still has
-processes is never leaked whatever its pid says. Containers from before the
-label fall back to the pid, as do the per-rank fallback containers `common.py`
-starts.
+**host** - free memory against the headroom `rank-budget.sh` keeps, and free
+disk on the filesystem holding `results/`. Worker pools a killed run left
+holding memory are not listed: Slurm's job cgroup takes them with the job, and
+on a shared box `ns_reap_leaked_sidecars` removes them before the next run
+reads free memory.
 
 **why it stopped** - a stopped run's warning quotes its `run.log`, the only
 place that says *why* rather than *that* it broke. It quotes the last line

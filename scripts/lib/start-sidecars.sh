@@ -1,7 +1,8 @@
 # shellcheck shell=bash  # sourced, so no shebang
 # Start the worker pools as host processes under Apptainer. Requires REPO_ROOT
 # and APPTAINER (scripts/lib/defaults.sh); reads OUTPUT_DIR for the logs.
-# API: sidecar_launch <sif> [apptainer exec flags] -- command...; sidecar_restore.
+# API: sidecar_launch <sif> [apptainer exec flags] -- command...;
+# sidecar_reset_workers and sidecar_restore, both called before each retry.
 #
 # The Docker branch started each pool as a detached container and the ranks
 # `docker exec`ed into it. Here a pool is `apptainer exec <sif> ...` in the
@@ -111,8 +112,38 @@ sidecar_restore() {
   done
 }
 
+_sidecar_kill_tree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    _sidecar_kill_tree "${child}"
+  done
+  kill -KILL "$1" 2>/dev/null || true
+}
+
+# Kill every worker in every pool before a retry; the pools start fresh ones
+# on the same FIFOs. A rank killed mid-request leaves its worker still
+# answering that request, and the retry's rank - on the same FIFO pair - would
+# read the reply as its own: an evaluation scored from files that were never
+# written. (The Docker branch had a restart's ranks start their own workers
+# instead; a rank inside a SIF cannot.) Each worker's pid is beside its FIFOs,
+# and it goes with its children - the meqserver a simulate worker drives.
+sidecar_reset_workers() {
+  local pid_file pid killed=0
+  for pid_file in "${OUTPUT_DIR:-/nonexistent}"/.*-workers/*.pid; do
+    [ -f "${pid_file}" ] || continue
+    pid="$(cat "${pid_file}" 2>/dev/null)" || continue
+    case "${pid}" in '' | *[!0-9]*) continue ;; esac
+    kill -0 "${pid}" 2>/dev/null || continue
+    _sidecar_kill_tree "${pid}"
+    killed=$((killed + 1))
+  done
+  [ "${killed}" -eq 0 ] \
+    || echo "sidecar_reset_workers: killed ${killed} pool worker(s) so the retry starts on fresh ones" >&2
+}
+
 # `bash scripts/lib/start-sidecars.sh --self-check` - the exec line each pool
-# gets, that pools are process groups, and that restore only touches dead ones.
+# gets, that pools are process groups, that restore only touches dead ones and
+# that a reset takes every recorded worker with its children.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   REPO_ROOT="${REPO_ROOT:-$(pwd)}"
@@ -156,6 +187,25 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "${SIDECAR_PIDS[0]}" = "${_live}" ] && [ "${#SIDECAR_PIDS[@]}" = 2 ] \
     || { echo "FAIL: pids after restore: ${SIDECAR_PIDS[*]}"; exit 1; }
   kill -0 "${SIDECAR_PIDS[1]}" || { echo "FAIL: the restored pool is not running"; exit 1; }
+
+  # A reset kills the workers the pid files name, and their children, and
+  # nothing else in the pool.
+  mkdir -p "${_tmp}/.fake-workers"
+  sh -c 'sleep 30 & echo $! >"$1/child"; wait' sh "${_tmp}/.fake-workers" &
+  _worker=$!
+  disown "${_worker}"
+  echo "${_worker}" >"${_tmp}/.fake-workers/0.pid"
+  echo "not-a-pid" >"${_tmp}/.fake-workers/1.pid"
+  sleep 0.3
+  _child="$(cat "${_tmp}/.fake-workers/child")"
+  sidecar_reset_workers 2>&1 | grep -q "killed 1 pool worker" || { echo "FAIL: reset did not report the kill"; exit 1; }
+  sleep 0.2
+  kill -0 "${_worker}" 2>/dev/null && { echo "FAIL: worker ${_worker} survived the reset"; exit 1; }
+  kill -0 "${_child}" 2>/dev/null && { echo "FAIL: the worker's child ${_child} survived the reset"; exit 1; }
+  for _pid in "${SIDECAR_PIDS[@]}"; do
+    kill -0 "${_pid}" || { echo "FAIL: the reset took pool ${_pid} with it"; exit 1; }
+  done
+  [ -z "$(sidecar_reset_workers 2>&1)" ] || { echo "FAIL: a second reset found something to kill"; exit 1; }
 
   # Teardown kills whole groups, children included.
   _sidecar_remove

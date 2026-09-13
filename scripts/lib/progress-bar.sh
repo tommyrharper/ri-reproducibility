@@ -121,8 +121,8 @@ run_with_retries() {
       fi
     fi
     # Re-clamp against current memory: another run may have grown since the
-    # failed attempt. Down costs time; up risks an OOM score. Restarts create
-    # their own workers, so the original FIFO pool does not constrain them.
+    # failed attempt. Down costs time; up risks an OOM score. Never up past
+    # what was asked for, so the pools always have a worker per rank.
     ranks="$(_ns_retry_rank_count "${args[@]}")"
     if [ "${ranks}" = "0" ]; then
       _ns_retry_say "${output_dir}" \
@@ -144,8 +144,11 @@ run_with_retries() {
       done
       args=("${rescaled[@]}")
     fi
-    # Sidecar restore is optional for fixtures; log failures, then let the next
-    # attempt's progress guard stop if the sidecar remains unavailable.
+    # Both hooks are optional for fixtures; log failures, then let the next
+    # attempt's progress guard stop if the pool remains unavailable.
+    if declare -F sidecar_reset_workers >/dev/null; then
+      sidecar_reset_workers 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
+    fi
     if declare -F sidecar_restore >/dev/null; then
       sidecar_restore 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
     fi

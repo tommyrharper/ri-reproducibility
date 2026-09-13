@@ -138,14 +138,16 @@ the containers replaced by processes:
   label the Docker build stamped it with (`ns_image_id`), which the SIF
   keeps.
 
-### Still to port
+### Reading a run from the login node
 
-- `nested-sampling-health.py` still reaches for `docker top` and `docker ps`
-  when host `ps` finds no ranks, and `test_self_heal.sh` (`./ri self-check
-  self-heal`) removes a sidecar container to test recovery. Everything else
-  that only ever read Docker (`./ri shell`, `./ri smoke`, `./ri report`,
-  `./ri plot fits`, `./ri clean`, `./ri disk-usage`) runs its SIF with
-  `apptainer exec` and the same binds the Docker mounts were.
+`./ri health` and `./ri runs` ask `squeue` as well as `ps`: a run whose job is
+pending headlines `QUEUED`, and one whose job is running on a compute node this
+host cannot see is read from what it has written to the shared filesystem
+(`docs/run-health.md`). Everything that only ever read Docker (`./ri shell`,
+`./ri smoke`, `./ri report`, `./ri plot fits`, `./ri clean`, `./ri disk-usage`,
+`./ri self-check self-heal`) runs its SIF with `apptainer exec` and the same
+binds the Docker mounts were; the self-heal check kills a pool's process
+group where it used to remove a container.
 
 ## Slurm facts the scripts depend on
 
