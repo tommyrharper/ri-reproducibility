@@ -98,10 +98,13 @@ On the cluster:
 
 - Apptainer (`apptainer` or `singularity`) and Slurm (`sbatch`, `squeue`);
   CSD3 has both on every node, no module to load.
-- `git` and Python 3 for the stdlib-only `./ri` dispatcher; also there already.
-- [`uv`](https://docs.astral.sh/uv/) for parsing `defaults.toml` and running
-  host-side analysis (`./ri profile`, `./ri plot gui`, `./ri merge`): install
-  it into your home (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+- `git`; also there already.
+- [`uv`](https://docs.astral.sh/uv/) for every host-side Python: install it
+  into your home (`curl -LsSf https://astral.sh/uv/install.sh | sh`), then
+  run `uv sync` once in the checkout on a login node so a job never has to
+  download an interpreter or a package. CSD3's system `python3` is 3.6, too
+  old for the stdlib-only `./ri` dispatcher (3.9+), so `./ri` re-runs itself
+  under uv's Python when it finds an old one; no `module load` needed.
 
 Plus, somewhere else, one machine with Docker to build the images on (section 4).
 

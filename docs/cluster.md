@@ -165,5 +165,7 @@ group where it used to remove a container.
   host) caps an R2D2 job well below a 76-core node; the first whole-node R2D2
   run is where to re-measure it (`docs/nested-sampling-throughput.md`).
 - Load nothing: Apptainer, Slurm and the SIFs are the whole toolchain. `uv`
-  is still needed on the login node for the host-side scripts (`./ri profile`,
-  `./ri merge`, the defaults loader); install it into `~/.local/bin`.
+  is still needed for the host-side scripts (`./ri profile`, `./ri merge`, the
+  defaults loader, and the `bench.py record` step at the end of every job);
+  install it into `~/.local/bin` and `uv sync` once on a login node, since
+  the system `python3` is 3.6 and `./ri` itself re-runs under uv's Python.

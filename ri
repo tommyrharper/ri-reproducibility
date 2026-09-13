@@ -5,10 +5,22 @@ import argparse
 import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# CSD3's system python3 is 3.6 and the parsers below need 3.9, so an old
+# interpreter hands over to uv's before anything else runs (uv is already a
+# prerequisite for every host-side script; README.md section 3).
+if sys.version_info < (3, 9):
+    if shutil.which("uv") and not os.environ.get("RI_PYTHON_REEXEC"):
+        os.environ["RI_PYTHON_REEXEC"] = "1"
+        os.execvp("uv", ["uv", "run", "--no-project", "--python", ">=3.11", "python",
+                         os.path.abspath(__file__), *sys.argv[1:]])
+    sys.exit("./ri needs Python 3.9 or newer: install uv (README.md section 3) "
+             "or `module load` a newer python first.")
 
 IMAGES = ("wsclean", "r2d2", "meqtrees", "polychord")
 
