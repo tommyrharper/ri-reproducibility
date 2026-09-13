@@ -113,8 +113,9 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         f"ckpt_realisations: {DEFAULT_R2D2_CKPT_REALISATIONS}",
         # R2D2's set_common_args() calls torch.set_num_threads() itself, from
         # psutil's CPU affinity, and that overrides the OMP_NUM_THREADS the
-        # worker's `docker exec` sets. Without this every rank asked torch for
-        # all 20 host CPUs, so the 8 default ranks ran 160 threads on 20 cores.
+        # worker pool's `apptainer exec --env` sets. Without this every rank
+        # asked torch for all 20 host CPUs, so the 8 default ranks ran 160
+        # threads on 20 cores.
         f"ncpus: {r2d2_thread_count()}",
         "",
     ]
