@@ -50,6 +50,12 @@ the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 | in-flight Measurement Sets (`NS_SCRATCH_DIR`) | `/dev/shm` on the node | same as on main; nodes have 256GB+ |
 | worker FIFOs | inside the run directory, as on main | one node per run, so a FIFO on Lustre is local to its readers |
 
+`hpc-work` is reached through symlinks (`~/rds/hpc-work` ->
+`/rds/user/<crsid>/hpc-work` -> an `/rds-dN` mount); a checkout addressed by
+either spelling works, since apptainer creates a bind destination the
+container lacks and resolves one it reaches through a bound symlink (checked
+here with `--no-mount tmp` against a symlinked path, FIFO and writes included).
+
 `hpc-work` has a one-million-file quota. Evaluation directories are pruned as
 on main (`prune_evaluation_artefacts`), and `NS_KEEP_MEASUREMENT_SETS` stays 0:
 a Measurement Set is a directory of hundreds of files.
