@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run image checks; the working tree is mounted, but searches use baked copies
-# and need a rebuild. Self-heal uses throwaway searches with rank/memory limits.
+# Run the checks that need the images, inside their SIFs, on the working tree.
+# Self-heal uses throwaway searches with rank/memory limits.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,16 +9,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
 
 TARGET="${1:-all}"
+ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${WSCLEAN_SIF}" "${POLYCHORD_SIF}"
 
-# The repo is mounted at its own host path, the way the sidecars mount it, so
-# paths inside a check mean the same thing they would during a run.
-docker_run() {
-  docker run --rm \
-    --shm-size 512m \
-    --platform "${DOCKER_DEFAULT_PLATFORM}" \
-    -v "${REPO_ROOT}:${REPO_ROOT}" \
-    -w "${REPO_ROOT}" \
-    "$@"
+# The repo is bound at its own host path, the way the pools bind it, so paths
+# inside a check mean the same thing they would during a run. Flags before
+# the SIF are apptainer's (`--env X=1`), as `-e X=1` was docker's.
+image_run() {
+  "${APPTAINER}" exec --pwd "${REPO_ROOT}" --bind "${REPO_ROOT}" "$@"
 }
 
 nested_sampling() { echo "${REPO_ROOT}/scripts/lib/nested_sampling/$1"; }
@@ -39,41 +36,41 @@ host_python "${REPO_ROOT}/scripts/test_self_checks.py"
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "simulate" ]]; then
   echo
-  echo "=== simulate (${MEQTREES_IMAGE}) ==="
-  docker_run --entrypoint python3 "${MEQTREES_IMAGE}" -u "$(nested_sampling simulate_point_source_ms.py)" --self-check
+  echo "=== simulate (${MEQTREES_SIF##*/}) ==="
+  image_run "${MEQTREES_SIF}" python3 -u "$(nested_sampling simulate_point_source_ms.py)" --self-check
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2-serve" ]]; then
   echo
-  echo "=== r2d2 imaging worker (${R2D2_IMAGE}) ==="
-  docker_run --entrypoint python3 "${R2D2_IMAGE}" -u "$(nested_sampling r2d2_serve.py)" --self-check
+  echo "=== r2d2 imaging worker (${R2D2_SIF##*/}) ==="
+  image_run "${R2D2_SIF}" python3 -u "$(nested_sampling r2d2_serve.py)" --self-check
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "zygote" ]]; then
   echo
-  echo "=== wsclean fork server (${WSCLEAN_IMAGE}) ==="
-  docker_run --entrypoint python3 "${WSCLEAN_IMAGE}" -u "${REPO_ROOT}/scripts/test_zygote.py"
+  echo "=== wsclean fork server (${WSCLEAN_SIF##*/}) ==="
+  image_run "${WSCLEAN_SIF}" python3 -u "${REPO_ROOT}/scripts/test_zygote.py"
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "wsclean" ]]; then
   echo
-  echo "=== wsclean sampler (${POLYCHORD_IMAGE}) ==="
-  docker_run -e POLYCHORD_WSCLEAN_SELF_CHECK=1 --entrypoint python3 \
-    "${POLYCHORD_IMAGE}" -u "$(nested_sampling polychord_wsclean.py)"
+  echo "=== wsclean sampler (${POLYCHORD_SIF##*/}) ==="
+  image_run --env POLYCHORD_WSCLEAN_SELF_CHECK=1 \
+    "${POLYCHORD_SIF}" python3 -u "$(nested_sampling polychord_wsclean.py)"
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2" ]]; then
   echo
-  echo "=== r2d2 sampler (${POLYCHORD_IMAGE}) ==="
-  docker_run -e POLYCHORD_R2D2_SELF_CHECK=1 --entrypoint python3 \
-    "${POLYCHORD_IMAGE}" -u "$(nested_sampling polychord_r2d2.py)"
+  echo "=== r2d2 sampler (${POLYCHORD_SIF##*/}) ==="
+  image_run --env POLYCHORD_R2D2_SELF_CHECK=1 \
+    "${POLYCHORD_SIF}" python3 -u "$(nested_sampling polychord_r2d2.py)"
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "report" ]]; then
   echo
-  echo "=== HTML report (${R2D2_IMAGE}) ==="
-  docker_run -e GENERATE_REPORT_SELF_CHECK=1 --entrypoint python3 \
-    "${R2D2_IMAGE}" -u "${REPO_ROOT}/scripts/lib/generate_report.py"
+  echo "=== HTML report (${R2D2_SIF##*/}) ==="
+  image_run --env GENERATE_REPORT_SELF_CHECK=1 \
+    "${R2D2_SIF}" python3 -u "${REPO_ROOT}/scripts/lib/generate_report.py"
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "self-heal" ]]; then

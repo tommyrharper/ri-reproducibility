@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import os
 import resource
+import signal
 import runpy
 import sys
+import time
 import traceback
 import types
 from contextlib import contextmanager
@@ -328,20 +330,29 @@ def serve_pool(fifo_dir: str) -> None:
     # inherited already cost.
     _PEAK_FLOOR = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     children = {}
-    for base in bases:
+
+    def fork(base: str, replacement: bool = False) -> None:
         pid = os.fork()
         if pid:
             children[pid] = base
-            continue
+            return
         status = 0
         try:
             # The child re-opens its own pair inside answer() and wants none of
             # the inherited ends, its own included: holding the request pipe's
             # read end open in two processes would keep a request alive after
-            # the one that should answer it has gone.
+            # the one that should answer it has gone. First thing, before any
+            # pause: a copy of a sibling's ends held here is a reader a rank
+            # can attach to while nobody is there to answer.
             for fds in keeper.values():
                 for fd in fds:
                     os.close(fd)
+            # In the child, so the parent stays at os.wait() and lets go of a
+            # dead worker's ends the moment it dies. The pause bounds the churn
+            # if the replacement cannot serve either (its FIFO directory gone,
+            # say); the rank's own retry waits at least this long.
+            if replacement:
+                time.sleep(1.0)
             answer(base)
         except Exception:
             traceback.print_exc()
@@ -349,15 +360,23 @@ def serve_pool(fifo_dir: str) -> None:
         # _exit, not sys.exit: this child inherited the parent's atexit hooks and
         # stdio buffers and must run neither.
         os._exit(status)
-    while children:
+
+    for base in bases:
+        fork(base)
+    # Serves until killed: a worker that exits - on EOF when its rank goes, or
+    # dying mid-request - is forked again from this warm parent, and the rank
+    # (or the next attempt's rank) reconnects to the same FIFOs.
+    while True:
         pid, _status = os.wait()
         base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
         # them a rank whose worker died would write into a pipe nobody reads
         # and then wait forever for a reply. Closing here gives it the same
-        # broken pipe and empty reply it gets when there is no pool at all.
+        # broken pipe and empty reply it gets when there is no pool at all,
+        # and the replacement's own opens then wait for the rank to come back.
         for fd in keeper.pop(base, ()):
             os.close(fd)
+        fork(base, replacement=True)
 
 
 def serve(fifo_base: str | None = None) -> None:
@@ -369,6 +388,9 @@ def answer(fifo_base: str | None) -> None:
     if fifo_base is None:
         requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
     else:
+        # How the rank kills this worker if it wedges (FifoWorker.kill in
+        # common.py); the pool then forks a replacement.
+        Path(f"{fifo_base}.pid").write_text(f"{os.getpid()}\n")
         # Same order the caller opens them in: opening a FIFO blocks until the
         # other end is opened, so a mismatch here deadlocks both processes.
         requests = open(f"{fifo_base}.in")
@@ -497,9 +519,12 @@ def self_check_serve_pool() -> None:
         for rank in (0, 1):
             os.mkfifo(pool / f"{rank}.in")
             os.mkfifo(pool / f"{rank}.out")
+        # Its own session, so the pool and the workers it forked go together at
+        # the end - the way the run script kills a pool's process group.
         worker = subprocess.Popen(
             [sys.executable, __file__, "--fifo-dir", str(pool)],
             env={**os.environ, "R2D2_IMAGER": str(root / "imager.py"), "R2D2_HOME": str(root)},
+            start_new_session=True,
         )
         deadline = time.monotonic() + 60
         for rank, code in ((0, 3), (1, 0)):
@@ -525,9 +550,36 @@ def self_check_serve_pool() -> None:
                 reply = json.loads(replies.readline())
                 assert reply["returncode"] == code
                 assert reply["peak_memory_bytes"] > 64 * 1024 * 1024, reply
-        assert worker.wait(timeout=30) == 0, "the pool did not exit once every worker saw EOF"
         # The point of forking rather than starting one interpreter per rank.
         assert marker.read_text() == "x\n", f"the warm-up ran more than once: {marker.read_text()!r}"
+        # Both workers saw EOF above; the pool forks replacements on the same
+        # FIFOs rather than exiting, so a rank that comes back is served - and
+        # still by a fork of the one warm-up.
+        base = pool / "1"
+        pid_before = int((pool / "1.pid").read_text())
+        # The replacement records its pid before it opens the FIFOs, and a
+        # connect before that could still land on the worker that is exiting.
+        deadline = time.monotonic() + 30
+        while int((pool / "1.pid").read_text()) == pid_before:
+            assert time.monotonic() < deadline, "rank 1 was not given a replacement worker"
+            time.sleep(0.01)
+        while True:
+            try:
+                write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "the replacement never opened its request pipe"
+                time.sleep(0.01)
+        os.set_blocking(write_fd, True)
+        with os.fdopen(write_fd, "w") as requests, open(f"{base}.out") as replies:
+            request = {"argv": ["5"], "stdout": str(root / "o.log"), "stderr": str(root / "e.log")}
+            requests.write(json.dumps(request) + "\n")
+            requests.flush()
+            assert json.loads(replies.readline())["returncode"] == 5
+        assert marker.read_text() == "x\n", "the replacement was not a fork of the warm parent"
+        assert worker.poll() is None, "the pool exited instead of serving until killed"
+        os.killpg(worker.pid, signal.SIGKILL)
+        worker.wait(timeout=30)
     print("r2d2 serve pool self-check passed")
 
 

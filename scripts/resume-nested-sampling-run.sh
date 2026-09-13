@@ -45,12 +45,10 @@ if [ "${1:-}" = "--self-check" ]; then
   SHORT_RUN="${TMP}/wsclean-selfcheck"
   mkdir -p "${SHORT_RUN}"
   printf 'NS_ALGORITHM=wsclean\nNS_MPI_PROCS=8\n' >"${SHORT_RUN}/run.env"
-  mkdir -p "${TMP}/bin"
-  printf '#!/bin/sh\nexit 0\n' >"${TMP}/bin/docker"
-  chmod +x "${TMP}/bin/docker"
-  # shellcheck disable=SC2031  # the self-check block exits; there is no
-  # enclosing shell for the export to be lost to
-  export PATH="${TMP}/bin:${PATH}"
+  # No SIFs there, so the run script the resume execs into stops at its
+  # image check rather than starting a search - whether or not this host
+  # has apptainer.
+  export SIF_DIR="${TMP}/no-images" APPTAINER=/bin/true
   export NS_RANK_BUDGET_DIR="${TMP}/budget"
 
   OUT="$(NS_AVAILABLE_MB=4900 bash "$0" "${SHORT_RUN}" 2>&1 || true)"
@@ -92,20 +90,10 @@ if [ "${1:-}" = "--self-check" ]; then
     *"(wsclean, 2 evaluations already done, 1 rank)"*) ;;
     *) echo "FAIL: resume must count scored evaluations, got: ${OUT}"; exit 1 ;;
   esac
-  for want in wsclean meqtrees polychord; do
-    case "${OUT}" in
-      *"ri-reproducibility/${want}"*) ;;
-      *) echo "FAIL: a resume must build ${want}, got: ${OUT}"; exit 1 ;;
-    esac
-  done
-
-  OUT="$(NS_NO_BUILD=1 NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
-  for want in wsclean meqtrees polychord; do
-    case "${OUT}" in
-      *"ri-reproducibility/${want}"*)
-        echo "FAIL: --no-build must skip the ${want} build, got: ${OUT}"; exit 1 ;;
-    esac
-  done
+  case "${OUT}" in
+    *"is missing - ./ri images import"*) ;;
+    *) echo "FAIL: the run script must refuse to start without its SIFs, got: ${OUT}"; exit 1 ;;
+  esac
 
   echo '{ "evaluations": [] }' >"${COUNT_RUN}/summary.json"
   OUT="$(NS_NO_BUILD=1 NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
@@ -186,24 +174,14 @@ export OUTPUT_DIR="${RUN_DIR}"
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"
-        MB_PER_RANK="${NS_R2D2_MB_PER_RANK}"
-        IMAGES="r2d2 meqtrees polychord" ;;
+        MB_PER_RANK="${NS_R2D2_MB_PER_RANK}" ;;
   wsclean) RUN_SCRIPT="scripts/run-nested-sampling.sh"
-        MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK}"
-        IMAGES="wsclean meqtrees polychord" ;;
+        MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK}" ;;
   *)
     echo "FATAL: ${RUN_DIR}/run.env has an unknown NS_ALGORITHM=${NS_ALGORITHM}" >&2
     exit 1
     ;;
 esac
-
-# Rebuild images before rank clamping so resume uses current code and memory.
-# NS_NO_BUILD=1 skips this for a deliberately frozen working tree.
-if [ -z "${NS_NO_BUILD:-}" ]; then
-  for image in ${IMAGES}; do
-    scripts/build.sh "${image}"
-  done
-fi
 
 # Re-clamp ranks against current memory; checkpoints resume safely with fewer
 # ranks, but refuse before evaluation 1 if none fits.

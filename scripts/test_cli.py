@@ -89,29 +89,16 @@ check(
 )
 
 check(
-    "a search builds its images, then runs",
-    [
-        ["scripts/build.sh", "r2d2"],
-        ["scripts/build.sh", "meqtrees"],
-        ["scripts/build.sh", "polychord"],
-        ["scripts/run-nested-sampling-r2d2.sh"],
-    ],
+    # No image build in front of it: the SIFs are whatever `./ri images
+    # import` last made, and the run script refuses to start without them.
+    "a search runs its script and nothing else",
+    [["scripts/run-nested-sampling-r2d2.sh"]],
     plan("search", "r2d2")[1],
 )
 
 check(
-    "--no-build skips straight to the run",
-    [["scripts/run-nested-sampling.sh"]],
-    plan("search", "wsclean", "--no-build")[1],
-)
-
-check(
-    "--then runs a second search, building the images both need once",
+    "--then runs a second search after the first",
     [
-        ["scripts/build.sh", "wsclean"],
-        ["scripts/build.sh", "meqtrees"],
-        ["scripts/build.sh", "polychord"],
-        ["scripts/build.sh", "r2d2"],
         ["scripts/run-nested-sampling.sh"],
         ["env", "OUTPUT_DIR=", "scripts/run-nested-sampling-r2d2.sh"],
     ],
@@ -128,19 +115,19 @@ check(
         ["uv", "run", "scripts/plot-merged-likelihood-compare.py", "--last"],
         ["scripts/generate-report.sh"],
     ],
-    plan("search", "wsclean", "--then", "r2d2", "--no-build", "--plot", "--report")[1],
+    plan("search", "wsclean", "--then", "r2d2", "--plot", "--report")[1],
 )
 
 check(
     "--report without --plot leaves the plotting out",
     [["scripts/run-nested-sampling.sh"], ["scripts/generate-report.sh"]],
-    plan("search", "wsclean", "--no-build", "--report")[1],
+    plan("search", "wsclean", "--report")[1],
 )
 
 check(
     "neither flag changes a plain search",
     [["scripts/run-nested-sampling.sh"]],
-    plan("search", "wsclean", "--no-build")[1],
+    plan("search", "wsclean")[1],
 )
 
 # --output-dir names the first search's directory. The second has to claim its
@@ -157,25 +144,15 @@ check(
 )
 
 check(
-    "benchmark --native reaches build and benchmark",
-    {"WSCLEAN_TARGET_CPU": "native"},
-    plan("bench", "run", "wsclean", "--native")[0],
-)
-
-check(
     "benchmark --mpi-procs reaches benchmark",
-    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
-     ["scripts/build.sh", "polychord"],
-     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+    [["uv", "run", "scripts/bench.py", "run", "wsclean",
       "--preset", "default", "--repeat", "1", "--mpi-procs", "16"]],
     plan("bench", "run", "wsclean", "--mpi-procs", "16")[1],
 )
 
 check(
     "benchmark --omp-threads reaches benchmark",
-    [["scripts/build.sh", "r2d2"], ["scripts/build.sh", "meqtrees"],
-     ["scripts/build.sh", "polychord"],
-     ["uv", "run", "scripts/bench.py", "run", "r2d2",
+    [["uv", "run", "scripts/bench.py", "run", "r2d2",
       "--preset", "default", "--repeat", "1", "--omp-threads", "4"]],
     plan("bench", "run", "r2d2", "--omp-threads", "4")[1],
 )
@@ -291,13 +268,6 @@ check(
 )
 
 check(
-    "resume --no-build reaches the script as an environment override",
-    ({"NS_NO_BUILD": "1"},
-     [["scripts/resume-nested-sampling-run.sh", "r2d2-vlaa-20260827T101500Z"]]),
-    plan("resume", "r2d2-vlaa-20260827T101500Z", "--no-build"),
-)
-
-check(
     "report selectors become the script's variables",
     {"LAST": "1", "FORCE": "1"},
     plan("report", "--last", "1", "--force")[0],
@@ -373,12 +343,6 @@ check(
 )
 
 check(
-    "search --native keeps its own build host-optimized",
-    "native",
-    plan("search", "wsclean", "--native")[0]["WSCLEAN_TARGET_CPU"],
-)
-
-check(
     "search without --native leaves WSCLEAN_TARGET_CPU alone",
     False,
     "WSCLEAN_TARGET_CPU" in plan("search", "wsclean")[0],
@@ -415,19 +379,15 @@ check(
 )
 
 check(
-    "bench run builds the imager's images, then measures",
-    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
-     ["scripts/build.sh", "polychord"],
-     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+    "bench run measures the imager",
+    [["uv", "run", "scripts/bench.py", "run", "wsclean",
       "--preset", "default", "--repeat", "3"]],
     plan("bench", "run", "wsclean", "--repeat", "3")[1],
 )
 
 check(
     "bench run passes an interleaved setting through",
-    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
-     ["scripts/build.sh", "polychord"],
-     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+    [["uv", "run", "scripts/bench.py", "run", "wsclean",
       "--preset", "default", "--repeat", "3",
       "--interleave", "NS_WSCLEAN_MGAIN", "0.8", "0.9"]],
     plan("bench", "run", "wsclean", "--repeat", "3",
@@ -436,9 +396,7 @@ check(
 
 check(
     "benchmark allows explicit oversubscription probes",
-    [["scripts/build.sh", "wsclean"], ["scripts/build.sh", "meqtrees"],
-     ["scripts/build.sh", "polychord"],
-     ["uv", "run", "scripts/bench.py", "run", "wsclean",
+    [["uv", "run", "scripts/bench.py", "run", "wsclean",
       "--preset", "default", "--repeat", "1", "--mpi-procs", "21",
       "--allow-oversubscription"]],
     plan("bench", "run", "wsclean", "--mpi-procs", "21",
@@ -495,7 +453,7 @@ check(
 
 dry = subprocess.run(
     [sys.executable, str(CLI_PATH), "--dry-run", "search", "wsclean",
-     "--no-build", "--seed", "7"],
+     "--seed", "7"],
     capture_output=True, text=True, check=True,
 )
 check(

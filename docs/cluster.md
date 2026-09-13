@@ -53,33 +53,65 @@ the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 on main (`prune_evaluation_artefacts`), and `NS_KEEP_MEASUREMENT_SETS` stays 0:
 a Measurement Set is a directory of hundreds of files.
 
-## Runtime design (the port, in order)
+## How a run works here
 
-1. **Sidecars become processes.** `scripts/lib/start-sidecars.sh` starts each
-   worker pool with `apptainer exec <sif> ...` in the background instead of
-   `docker run --detach`; the ranks talk to them over the same FIFOs. There is
-   no container to `exec` into, so the R2D2 and simulate fallbacks in
-   `common.py` that spawned a worker through `docker exec` go away, and a
-   pooled worker that dies is restarted by the shell loop that started it.
-2. **The WSClean fork server joins the FIFO pools.** On main each rank spawns
-   its zygote through `docker exec`; here the run script starts one per rank
-   over a FIFO pair, the way the simulate workers already are, because a rank
-   running inside `polychord.sif` cannot start another SIF.
-3. **PolyChord runs inside its SIF**, `apptainer exec polychord.sif mpirun -np
-   N python3 /opt/ri-nested-sampling/polychord_*.py ...`, on one node.
-   Memory, not cores, still sets `NS_MPI_PROCS`; `rank-budget.sh` reads the
-   Slurm allocation (`SLURM_MEM_PER_NODE`, else `MemAvailable`) instead of
-   `docker info`.
-4. **`./ri search` submits.** Outside an allocation it writes and `sbatch`es a
-   job that runs the same run script; inside one (`SLURM_JOB_ID` set, or
-   `sintr`) it runs in place, which is also how it runs on a plain Linux box
-   with Apptainer. `--account`, `--partition` and `--time` map to `#SBATCH`
-   lines; the run directory, `run.log` and `./ri resume` are unchanged.
-5. **Everything that only read Docker** - `record-environment.sh` (image id
-   from the SIF's labels), `nested-sampling-health.py` (`ps` only, no `docker
-   top`), `generate-report.sh`, `plot-fits.sh`, `smoke-test-*.sh`, `shell.sh`,
-   `self-check.sh`, `clean.sh`, `./ri disk-usage` - runs the same command under
-   `apptainer exec`/`apptainer run`.
+The run scripts (`scripts/run-nested-sampling*.sh`) are the Docker ones with
+the containers replaced by processes:
+
+- **Worker pools are host processes.** `scripts/lib/start-sidecars.sh` starts
+  each pool as `apptainer exec <sif> ...` in the background, in its own
+  process group (`setsid`), so the pool - the container's shell, its workers,
+  their meqservers - is one `kill -- -pgid` at the end. The ranks talk to the
+  workers over the same per-rank FIFO pairs as on `main`. Each pool logs to
+  `workers-<image>.log` in the run directory.
+- **Every worker is kept alive.** A simulate worker or WSClean fork server
+  that dies, or exits because its rank's end of the FIFO closed, is started
+  again by the shell loop around it; the R2D2 pool forks a replacement from
+  its warm parent (`serve_pool`). The rank reconnects to the same FIFOs
+  (`_connect_shell_started_worker` in `common.py`, sixty seconds' grace). A
+  rank kills a wedged worker itself: every worker writes `<rank>.pid` beside
+  its FIFOs, Apptainer shares the host's pid namespace, and
+  `FifoWorker.kill()` walks `/proc` for its children, since `polychord.sif`
+  has no procps. There is no rank-started fallback worker any more - the
+  ranks cannot start a SIF from inside one - so a rank with no pool is a
+  `WorkerDied`, which `run_with_retries` answers by restarting the attempt
+  after `sidecar_restore` has brought a dead pool back.
+- **The WSClean fork server is a pool too** (`.wsclean-workers/`), one
+  `wsclean-zygote` per rank reading its FIFO, where the Docker branch spawned
+  it per rank through `docker exec`.
+- **PolyChord runs inside `polychord.sif`** on one node:
+  `apptainer exec polychord.sif mpirun -np N python3 /opt/ri-nested-sampling/
+  polychord_*.py`. The working tree's `scripts/lib/nested_sampling` is bound
+  over the copy baked into `polychord.sif` and `meqtrees.sif`, so a run
+  executes the code in this checkout - there is no `docker build` here to
+  keep the two in step, and no rebuild after editing them. A change to a
+  Dockerfile, a patch, or the `[[parameter_space]]` the MeqTrees image bakes
+  its MS skeleton cache from still needs the image rebuilt on a Docker host
+  and carried over again.
+- **Memory sets the rank count**, as on `main`; `rank-budget.sh` reads
+  `SLURM_MEM_PER_NODE` inside a job and `MemAvailable` outside one. A pool a
+  SIGKILLed run left behind is reaped by the next run's budget (the pool's
+  shell names its FIFO directory, whose run has no ranks and whose launcher
+  pid in `.launcher.pid` is gone).
+- **Open MPI is told not to read the Slurm allocation** (`OMPI_MCA_ras=^slurm`,
+  `OMPI_MCA_plm=^slurm`): mpirun forks every rank itself on the one node, and
+  a job that asks for cores rather than tasks would otherwise report one slot.
+  Not yet exercised against a real `slurmd`; the first job on CSD3 is the
+  test.
+- `run.env` and the manifests record each image as the `ri.build-inputs`
+  label the Docker build stamped it with (`ns_image_id`), which the SIF
+  keeps.
+
+### Still to port
+
+- `./ri search` submitting an `sbatch` job from outside an allocation
+  (`--account`, `--partition`, `--time`); today it runs in place, which is
+  right inside `sintr` or a job script.
+- Everything that only ever read Docker: `nested-sampling-health.py`
+  (`docker top`), `./ri shell`, `smoke-test-*.sh`, `generate-report.sh`,
+  `plot-fits.sh`, `check-ms-to-r2d2-mat.sh`, `clean.sh`, `./ri disk-usage`,
+  and `test_self_heal.sh` (`./ri self-check self-heal`), which removes a
+  sidecar container to test recovery.
 
 ## Slurm facts the scripts depend on
 

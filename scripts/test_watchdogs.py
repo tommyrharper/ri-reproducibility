@@ -105,21 +105,6 @@ def check_bounds_scale_with_the_measurement_set() -> None:
         )
 
 
-def check_fifo_kill_pattern() -> None:
-    base = Path("/repo/results/nested-sampling/run/.simulate-workers/1")
-    pattern = common.fifo_worker_pgrep_pattern(base)
-
-    argv = f"python3 /opt/ri-nested-sampling/simulate_point_source_ms.py --serve --fifo {base}"
-    assert re.search(pattern, argv), f"{pattern!r} no longer matches the worker argv {argv!r}"
-
-    sibling = argv.replace(str(base), str(base.parent / "12"))
-    assert not re.search(pattern, sibling), f"{pattern!r} also matches rank 12"
-
-    carrier = f"sh -c p=$(pgrep -f '{pattern}') || exit 0; kill -9 $(pgrep -P $p) $p"
-    assert not re.search(pattern, carrier), f"{pattern!r} matches the shell running it"
-    assert not re.search(pattern, f"pgrep -f {pattern}"), f"{pattern!r} matches its own pgrep"
-
-
 def check_worker_died_is_not_a_score() -> None:
     assert common.WORKER_DIED < 0, "WORKER_DIED must not collide with a real exit status"
     assert common.FAILURE_OBJECTIVE > 0
@@ -131,7 +116,6 @@ def main() -> None:
         common.self_check_worker_timeout,
         check_timeout_ladder,
         check_bounds_scale_with_the_measurement_set,
-        check_fifo_kill_pattern,
         check_worker_died_is_not_a_score,
     ):
         check()

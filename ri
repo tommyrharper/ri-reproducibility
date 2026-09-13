@@ -12,12 +12,6 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 IMAGES = ("wsclean", "r2d2", "meqtrees", "polychord")
 
-# The images a search needs built before it can start.
-SEARCH_IMAGES = {
-    "wsclean": ("wsclean", "meqtrees", "polychord"),
-    "r2d2": ("r2d2", "meqtrees", "polychord"),
-}
-
 SEARCH_SCRIPT = {
     "wsclean": "scripts/run-nested-sampling.sh",
     "r2d2": "scripts/run-nested-sampling-r2d2.sh",
@@ -93,23 +87,13 @@ def do_shell(args):
 
 def do_search(args):
     env = env_from(args, SEARCH_ENV)
-    if args.native:
-        # The search builds its images first, and build.sh reads this, so
-        # without it here a search would rebuild the portable WSClean over any
-        # native one `./ri build wsclean --native` had left under the tag.
-        env["WSCLEAN_TARGET_CPU"] = "native"
     if args.enable_param:
         env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
     if args.disable_param:
         env["NS_DISABLE_PARAMS"] = ",".join(args.disable_param)
-    imagers = [args.imager] + ([args.then] if args.then else [])
-    commands = []
-    if not args.no_build:
-        # dict.fromkeys, not a set: the two searches share meqtrees and
-        # polychord, and a build order that changes run to run is not one.
-        commands += [["scripts/build.sh", i]
-                     for i in dict.fromkeys(i for m in imagers for i in SEARCH_IMAGES[m])]
-    commands.append([SEARCH_SCRIPT[args.imager]])
+    # No build in front of it: the SIFs are whatever `./ri images import` last
+    # made, and the run script refuses to start if one is missing.
+    commands = [[SEARCH_SCRIPT[args.imager]]]
     if args.then:
         # main() stops at the first command that fails, so the second search
         # runs only if the first one finished - the reason to chain rather
@@ -202,10 +186,7 @@ def do_tui(args):
 
 
 def do_resume(args):
-    # The build is the resume script's own, because only run.env knows which
-    # images this run needs - unlike ./ri search, where the imager is a flag.
-    env = {"NS_NO_BUILD": "1"} if args.no_build else {}
-    return env, [["scripts/resume-nested-sampling-run.sh", args.run]]
+    return {}, [["scripts/resume-nested-sampling-run.sh", args.run]]
 
 
 def do_report(args):
@@ -244,10 +225,7 @@ def do_bench(args):
 
 
 def do_bench_run(args):
-    # Builds first, exactly as a search does: the images bake the code, so
-    # without it the benchmark times whatever was baked last.
-    env = {"WSCLEAN_TARGET_CPU": "native"} if args.native else {}
-    return env, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
+    return {}, [
         uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
            "--repeat", str(args.repeat),
            *(["--mpi-procs", str(args.mpi_procs)] if args.mpi_procs is not None else []),
@@ -371,8 +349,7 @@ def build_parser():
                        help="WSClean tuned for this exact CPU (WSCLEAN_TARGET_CPU=native) "
                             "rather than the default AVX2 baseline; a little faster and "
                             "SIGILLs anywhere else. Reuses the same image tag, so the "
-                            "next build without it puts the default one back - pass "
-                            "--native to ./ri search too")
+                            "next build without it puts the default one back")
 
     images = add("images", do_images, "carry the images to the cluster as SIF files",
                  description="export: on a Docker host, `docker save` each built image "
@@ -505,12 +482,6 @@ def build_parser():
                              "of searching it; repeatable, and --enable-param wins if a name "
                              "is given to both [NS_DISABLE_PARAMS]. ./ri params lists names "
                              "and current state")
-    search.add_argument("--native", action="store_true",
-                        help="build WSClean for this exact CPU (WSCLEAN_TARGET_CPU=native) "
-                             "rather than the default AVX2 baseline; the binary then runs "
-                             "nowhere else, see docs/nested-sampling-throughput.md")
-    search.add_argument("--no-build", action="store_true",
-                        help="skip the image builds this search would do first")
     search.add_argument("--plot", action="store_true",
                         help="once the search - or the --then pair - has finished, plot "
                              "the newest directly comparable R2D2 and WSClean runs "
@@ -642,17 +613,12 @@ def build_parser():
             "going is refused: a second job over its checkpoint and FIFO\n"
             "directories would corrupt both.\n"
             "\n"
-            "The images the run needs are built first, exactly as ./ri search\n"
-            "does - a run executes the code baked into them, so without it a\n"
-            "resume silently continues on whatever was baked last time. Free\n"
-            "when nothing changed; --no-build skips it."
+            "The run continues on the SIFs under images/ and the code in this\n"
+            "checkout, the same as ./ri search."
         ),
     )
     resume.add_argument("run", metavar="RUN",
                         help="run directory, or its name under results/nested-sampling/")
-    resume.add_argument("--no-build", action="store_true",
-                        help="skip the image builds this resume would do first, so the "
-                             "run continues on the code already baked into them")
 
     # Results
     report = add("report", do_report, "build the HTML run report",
@@ -743,8 +709,6 @@ def build_parser():
                                 "this commit gets smaller (default: %(default)s)")
     bench_run.add_argument("--timeout", type=float, metavar="SECONDS",
                            help="stop the whole benchmark, including its process tree")
-    bench_run.add_argument("--native", action="store_true",
-                           help="build and benchmark WSClean for this exact CPU")
     bench_run.add_argument("--mpi-procs", type=int, metavar="N",
                            help="override MPI worker count for rank-scaling probes")
     bench_run.add_argument("--omp-threads", type=int, metavar="N",

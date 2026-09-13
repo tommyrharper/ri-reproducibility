@@ -21,47 +21,18 @@ _ns_available_mb() {
     printf '%s\n' "${NS_AVAILABLE_MB}"
     return 0
   fi
+  # Inside a Slurm job the cgroup limit is what the OOM killer enforces, and
+  # MemAvailable on a shared node says nothing about it.
+  if [ -n "${SLURM_MEM_PER_NODE:-}" ]; then
+    printf '%s\n' "${SLURM_MEM_PER_NODE}"
+    return 0
+  fi
   if [ -r /proc/meminfo ]; then
     awk '/^MemAvailable:/ { print int($2 / 1024); found = 1 } END { exit !found }' /proc/meminfo
     return
   fi
-  # macOS runs containers in Docker's Linux VM, so use the daemon's memory
-  # minus current container usage rather than host memory.
-  if command -v docker >/dev/null 2>&1; then
-    _ns_docker_available_mb
-    return
-  fi
   # No memory source means no clamping.
   return 1
-}
-
-# `docker stats --format '{{.MemUsage}}'` gives a human string per container
-# ("3.6GiB / 46.95GiB"), not raw bytes, so summing usage across containers
-# means converting each one - pulled out so the self-check can exercise the
-# unit conversion without a live daemon.
-_ns_mem_string_to_mb() {
-  awk '
-    function to_mb(v,   n) {
-      n = v + 0
-      if (v ~ /TiB$/) return n * 1024 * 1024
-      if (v ~ /GiB$/) return n * 1024
-      if (v ~ /MiB$/) return n
-      if (v ~ /KiB$/) return n / 1024
-      return n / 1024 / 1024  # bare bytes
-    }
-    { sum += to_mb($1) }
-    END { printf "%d\n", sum }
-  '
-}
-
-_ns_docker_available_mb() {
-  local total_bytes used_mb
-  total_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null)"
-  [ -n "${total_bytes}" ] && [ "${total_bytes}" -gt 0 ] 2>/dev/null || return 1
-  used_mb="$(docker stats --no-stream --format '{{.MemUsage}}' 2>/dev/null \
-    | awk -F' / ' '{ print $1 }' | _ns_mem_string_to_mb)"
-  [ -n "${used_mb}" ] || used_mb=0
-  printf '%d\n' "$(( total_bytes / 1024 / 1024 - used_mb ))"
 }
 
 # The whole read-decide-reserve in ns_budget_ranks has to be atomic against
@@ -96,7 +67,7 @@ _ns_unlock() {
   fi
 }
 
-# Match host-visible ranks, `mpirun` and `docker exec` processes by their
+# Match host-visible ranks and `mpirun` processes by their
 # `--output-dir`; anchor the path so run-name prefixes do not match. Sidecars
 # use `--fifo-dir` and are excluded because they outlive killed runs.
 ns_run_process_pattern() {
@@ -114,66 +85,63 @@ ns_run_is_live() {
   pgrep -f "$(ns_run_process_pattern "${real}")" >/dev/null 2>&1
 }
 
-# A run killed with SIGKILL leaves its `ri-ns-sidecar-*` containers running,
-# each holding ~3.4GB of warm imaging worker that nothing will ever free. That
-# is the same shape of debris as a stale reservation above, and the rule starts
-# the same way: the launcher's pid is in the container name, so a name whose
-# pid is gone is a candidate. Until now `./ri health` only named them and
-# the FATAL below only suggested looking, which meant the next run was sized
-# against - or refused for - memory a dead run was sitting on.
+# A run killed with SIGKILL leaves its worker pools (start-sidecars.sh)
+# running, each R2D2 one holding ~3.4GB of warm worker per rank that nothing
+# will ever free, so the next run is sized against - or refused for - memory
+# a dead run is sitting on. Slurm's job cgroup makes this moot on the cluster;
+# on a shared box it is the same debris as a stale reservation above.
 #
-# The pid alone is not enough, which is what the `ri.run-dir` label is for. A
-# run script killed with SIGKILL leaves the run itself going - the ranks are
-# children of containerd-shim, not of the shell - so its containers have a dead
-# launcher pid and a live search inside them. Reaping those kills the search,
-# and `./ri health` was handing out the `docker rm -f` line for them. So a
-# container whose labelled run still has processes is never dead, whatever its
-# pid says; the pid rule is the fallback for a container started before the
-# label existed, and for common.py's per-rank fallback containers, which have
-# no run directory to name.
+# A pool is leaked when its run has no ranks *and* the shell that started it
+# is gone. Neither alone is enough: the ranks are dead between retries while
+# the launcher waits to start them again, and the launcher can be SIGKILLed
+# while the ranks it started carry on (they are mpirun's children, not its).
+# Pid reuse only ever makes this skip a pool, never take a live one, which is
+# the direction to be wrong in.
 #
-# The label exempts by run, so a container genuinely leaked by an earlier
-# attempt at a run that is live again would be exempted too. It cannot survive
-# to be: this function runs from ns_budget_ranks, before the new attempt's
-# ranks exist, so the run is not live at the moment the question is asked.
-#
-# Reads `<name><TAB><run dir>` so the rule can be checked without a daemon.
-# Names are `ri-ns-sidecar-<launcher pid>-<n>` (start-sidecars.sh) and
-# `ri-ns-sidecar-<rank pid>-<uuid8>` (common.py's fallback); the pid is in the
-# same position in both. Pid reuse only ever makes this skip a container, never
-# take a live one, which is the direction to be wrong in.
-_ns_dead_sidecar_names() {
-  local line name run_dir pid
-  while IFS= read -r line; do
-    name="${line%%$'\t'*}"
-    run_dir=""
-    [ "${line}" = "${name}" ] || run_dir="${line#*$'\t'}"
-    pid="${name#ri-ns-sidecar-}"
-    pid="${pid%%-*}"
-    case "${pid}" in
+# Reads `<pgid><TAB><launcher pid><TAB><run dir>` per pool so the rule can be
+# checked without any pool running.
+_ns_dead_pools() {
+  local pgid launcher run_dir
+  while IFS=$'\t' read -r pgid launcher run_dir; do
+    case "${pgid}" in
       '' | *[!0-9]*) continue ;;
     esac
     if [ -n "${run_dir}" ] && ns_run_is_live "${run_dir}"; then
       continue
     fi
-    kill -0 "${pid}" 2>/dev/null || printf '%s\n' "${name}"
+    case "${launcher}" in
+      '' | *[!0-9]*) printf '%s\n' "${pgid}"; continue ;;
+    esac
+    kill -0 "${launcher}" 2>/dev/null || printf '%s\n' "${pgid}"
   done
 }
 
+# Every pool on the host: the pool's shell names its FIFO directory, which is
+# `<run dir>/.<worker>-workers`, as its last argument, and start-sidecars.sh
+# leaves the launcher's pid in `<run dir>/.launcher.pid`.
+_ns_pool_table() {
+  local pid pgid args fifo_dir launcher
+  for pid in $(pgrep -f -- '/\.[a-z0-9]*-workers$' 2>/dev/null); do
+    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+    args="$(ps -ww -o args= -p "${pid}" 2>/dev/null)"
+    [ -n "${pgid}" ] && [ -n "${args}" ] || continue
+    fifo_dir="${args##* }"
+    launcher="$(cat "${fifo_dir%/*}/.launcher.pid" 2>/dev/null || true)"
+    printf '%s\t%s\t%s\n' "${pgid}" "${launcher}" "${fifo_dir%/*}"
+  done | sort -u
+}
+
 ns_reap_leaked_sidecars() {
-  local dead
-  command -v docker >/dev/null 2>&1 || return 0
-  dead="$(docker ps --filter name=ri-ns-sidecar \
-      --format '{{.Names}}\t{{.Label "ri.run-dir"}}' 2>/dev/null \
-    | _ns_dead_sidecar_names)"
+  local dead pgid
+  dead="$(_ns_pool_table | _ns_dead_pools | sort -u)"
   [ -n "${dead}" ] || return 0
-  # Said out loud: this is another run's wreckage being removed, and a silent
-  # `docker rm --force` is not something to do on someone else's host.
-  # shellcheck disable=SC2086  # container names cannot contain whitespace
-  echo "NOTE: removing sidecar container(s) left behind by a run that is gone," \
-    "which were holding memory against this run:" ${dead} >&2
-  # shellcheck disable=SC2086  # container names cannot contain whitespace
-  docker rm --force ${dead} >/dev/null 2>&1 || true
+  # Said out loud: this is another run's wreckage being removed.
+  # shellcheck disable=SC2086  # pgids cannot contain whitespace
+  echo "NOTE: killing worker pool(s) left behind by a run that is gone," \
+    "which were holding memory against this run: process group(s)" ${dead} >&2
+  for pgid in ${dead}; do
+    kill -KILL -- "-${pgid}" 2>/dev/null || true
+  done
 }
 
 # Echoes the rank count to use. Never more than requested, never less than 1.
@@ -284,9 +252,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${_ns_self_check_mb}" -gt 0 ]
   fi
 
-  [ "$(printf '3.5GiB\n512MiB\n' | _ns_mem_string_to_mb)" = 4096 ]
-  [ "$(printf '1024KiB\n' | _ns_mem_string_to_mb)" = 1 ]
-
   export NS_AVAILABLE_MB=40960
   clear_reservations() { rm -f "${NS_RANK_BUDGET_DIR}"/[0-9]*; }
 
@@ -319,22 +284,19 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ ! -f "${NS_RANK_BUDGET_DIR}/${PPID}" ]
   clear_reservations
 
-  [ "$(printf 'ri-ns-sidecar-999999-0\nri-ns-sidecar-%s-1\n' "$$" | _ns_dead_sidecar_names)" \
-    = "ri-ns-sidecar-999999-0" ]
-  [ "$(printf 'ri-ns-sidecar-999999-a1b2c3d4\n' | _ns_dead_sidecar_names)" \
-    = "ri-ns-sidecar-999999-a1b2c3d4" ]
-  [ -z "$(printf 'ri-ns-sidecar-notapid-0\nsomething-else\n' | _ns_dead_sidecar_names)" ]
-  [ -z "$(printf '' | _ns_dead_sidecar_names)" ]
+  [ "$(printf '4242\t999999\t\n4343\t%s\t\n' "$$" | _ns_dead_pools)" = 4242 ]
+  [ "$(printf '4242\t\t\n' | _ns_dead_pools)" = 4242 ]
+  [ -z "$(printf 'notapgid\t999999\t\nsomething-else\n' | _ns_dead_pools)" ]
+  [ -z "$(printf '' | _ns_dead_pools)" ]
 
-  # The orphaned run: launcher pid gone, `ri.run-dir` label naming a run that
-  # still has ranks. Reaping these is what killed the search - so the label
-  # wins over the pid. A real process with the real command line, because this
-  # is what pgrep has to see, spelled the way a rank spells it.
+  # The orphaned run: launcher pid gone, run directory that still has ranks.
+  # Reaping these is what would kill the search - so a live run wins over the
+  # pid. A real process with the real command line, because this is what pgrep
+  # has to see, spelled the way a rank spells it.
   _orphan_dir="$(mktemp -d)"
   _orphan_run="${_orphan_dir}/wsclean-vlaa-20260101T000001Z"
   mkdir -p "${_orphan_run}"
-  [ "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}" | _ns_dead_sidecar_names)" \
-    = "ri-ns-sidecar-999999-0" ]
+  [ "$(printf '4242\t999999\t%s\n' "${_orphan_run}" | _ns_dead_pools)" = 4242 ]
   printf 'import time\ntime.sleep(30)\n' >"${_orphan_dir}/polychord_wsclean.py"
   python3 "${_orphan_dir}/polychord_wsclean.py" --output-dir "${_orphan_run}" --nlive 50 &
   _orphan_pid=$!
@@ -344,12 +306,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   done
   ns_run_is_live "${_orphan_run}" \
     || { echo "FAIL: a live rank on this run must be seen"; kill "${_orphan_pid}"; exit 1; }
-  [ -z "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}" | _ns_dead_sidecar_names)" ] \
-    || { echo "FAIL: a live run's sidecar was offered up for removal"
+  [ -z "$(printf '4242\t999999\t%s\n' "${_orphan_run}" | _ns_dead_pools)" ] \
+    || { echo "FAIL: a live run's pool was offered up for killing"
          kill "${_orphan_pid}"; exit 1; }
-  [ "$(printf 'ri-ns-sidecar-999999-0\t%s\n' "${_orphan_run}-other" | _ns_dead_sidecar_names)" \
-    = "ri-ns-sidecar-999999-0" ] \
-    || { echo "FAIL: a dead run's labelled sidecar must still be reaped"
+  [ "$(printf '4242\t999999\t%s\n' "${_orphan_run}-other" | _ns_dead_pools)" = 4242 ] \
+    || { echo "FAIL: a dead run's pool must still be reaped"
          kill "${_orphan_pid}"; exit 1; }
   kill "${_orphan_pid}" 2>/dev/null || true
   wait "${_orphan_pid}" 2>/dev/null || true

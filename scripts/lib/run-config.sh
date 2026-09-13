@@ -1,20 +1,25 @@
 # shellcheck shell=bash  # sourced, so no shebang
 # Save resolved run settings in a source-safe KEY=VALUE file for resume.
 
+# The SIF's build-input label (ns_image_id, scripts/lib/defaults.sh); the
+# self-check runs without defaults.sh and records unknown.
 _run_image_id() {
-  [ -n "${1:-}" ] || { printf '%s\n' unknown; return; }
-  docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || printf '%s\n' unknown
+  if declare -F ns_image_id >/dev/null; then
+    ns_image_id "${1:-}"
+  else
+    printf '%s\n' unknown
+  fi
 }
 
 write_run_config() {
   local output_dir="$1" algorithm="$2"
   local meqtrees_image_id polychord_image_id imager_image_id
-  meqtrees_image_id="$(_run_image_id "${MEQTREES_IMAGE:-}")"
-  polychord_image_id="$(_run_image_id "${POLYCHORD_IMAGE:-}")"
+  meqtrees_image_id="$(_run_image_id "${MEQTREES_SIF:-}")"
+  polychord_image_id="$(_run_image_id "${POLYCHORD_SIF:-}")"
   if [ "${algorithm}" = wsclean ]; then
-    imager_image_id="$(_run_image_id "${WSCLEAN_IMAGE:-}")"
+    imager_image_id="$(_run_image_id "${WSCLEAN_SIF:-}")"
   else
-    imager_image_id="$(_run_image_id "${R2D2_IMAGE:-}")"
+    imager_image_id="$(_run_image_id "${R2D2_SIF:-}")"
   fi
   {
     printf 'NS_ALGORITHM=%q\n' "${algorithm}"
@@ -96,11 +101,12 @@ ns_refuse_live_run() {
 }
 
 # A run directory the containers cannot see is not a run directory. Every
-# container is started with one bind mount, `-v ${REPO_ROOT}:${REPO_ROOT}`
-# (scripts/lib/start-sidecars.sh), so a `--output-dir` outside the repo exists
-# on the host - which is where run.env and the FIFOs land - and separately,
-# emptily, inside each container, which is where PolyChord's chains and the
-# evaluation directories land. Measured on a real `--output-dir /tmp/...`
+# container is started with one bind mount, `--bind ${REPO_ROOT}`
+# (scripts/lib/start-sidecars.sh) - Apptainer adds $HOME and /tmp, but hpc-work
+# is neither - so a `--output-dir` outside the repo exists on the host, which
+# is where run.env and the FIFOs land, and separately, emptily, inside each
+# container, which is where PolyChord's chains and the evaluation directories
+# land. Measured on a real `--output-dir /tmp/...`
 # search: the ranks lost their warm worker pool, fell back to rank-started
 # workers, and evaluation 1 died with `FileNotFoundError: .../evaluations/
 # eval-0001-*/simulate.stdout.log` - two minutes of container startup spent to
