@@ -38,6 +38,7 @@ fi
 # shellcheck source=scripts/lib/slurm.sh
 . "${REPO_ROOT}/scripts/lib/slurm.sh"
 if ns_should_submit; then
+  export OUTPUT_DIR
   ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB_PER_RANK}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
   exit 0

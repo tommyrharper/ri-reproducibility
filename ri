@@ -712,8 +712,9 @@ def build_parser():
 
     bench_run = bench_subs.add_parser(
         "run", parents=[dry_run], help="run the controlled search and record it",
-        description="Build the images, run the search a preset pins the settings "
-                    "of, and add its row. Commit first: a row carries the "
+        description="Run the search a preset pins the settings of, and add its "
+                    "row; on a cluster login node the whole benchmark is one "
+                    "Slurm job. Commit first: a row carries the "
                     "commit it was measured at, and one measured on a dirty "
                     "tree is marked with a trailing +.",
     )

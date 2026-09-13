@@ -19,7 +19,6 @@ and the one after that cannot quietly give it back.
 ./ri bench run r2d2 --preset throughput --repeat 3 --interleave R2D2_OMP_THREADS 2 4
 
 # and the fixed overrides
-./ri bench run wsclean --native --repeat 3                        # host-specific WSClean build
 ./ri bench run wsclean --preset throughput --mpi-procs 16 --repeat 3
 ./ri bench run r2d2 --preset throughput --omp-threads 4 --repeat 3
 ```
@@ -43,8 +42,9 @@ Every search that finishes adds a row, not only `./ri bench run` - an ad-hoc
 `./ri search` lands in a `custom` group beside the controlled one, which is
 where a run at settings you were exploring rather than benchmarking belongs.
 
-`--native` records `WSCLEAN_TARGET_CPU=native` in `run.env` and the row's
-settings, so host-specific binaries cannot be mixed with portable-build rows.
+`WSCLEAN_TARGET_CPU` (set when the WSClean image was built, `native` for a
+host-specific binary) is in `run.env` and the row's settings, so host-specific
+binaries cannot be mixed with portable-build rows.
 On this host, three native default-preset repeats measured 70.2 eval/s median
 versus 70.6 eval/s for the portable baseline: no measurable speedup.
 

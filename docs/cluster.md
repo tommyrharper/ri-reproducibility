@@ -84,8 +84,11 @@ else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
 place. A failed submission (a bad account, say) removes the claimed directory
 again.
 
-`./ri bench run` still runs in place: it times the search itself, so run it
-inside `sintr`.
+`./ri bench run` submits the same way, as one job named `bench-<imager>-<stamp>`
+(its Slurm log under `results/bench/`) that runs the warm-up and every repeat
+in place on one node, so an interleave's arms share a machine. While it runs,
+`./ri runs` and `./ri health` on the login node do not know its searches are
+alive - they have no job of their own - so read the job's `slurm-<id>.out`.
 
 ## How a run works here
 

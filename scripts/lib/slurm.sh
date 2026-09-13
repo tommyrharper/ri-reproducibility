@@ -21,6 +21,9 @@ ns_should_submit() {
 # One node, one task (mpirun forks the ranks), named after the run so squeue
 # and ns_run_is_live can find it, stdout beside the run's own logs. With an
 # explicit NS_MPI_PROCS the job is sized to it; otherwise it takes the node.
+# The job inherits the caller's exported environment and nothing else, so a
+# run script exports OUTPUT_DIR before calling; bench.py submits itself the
+# same way with a directory of its own.
 ns_submit_run() {
   local run_dir="$1" mb_per_rank="$2" cmd size
   shift 2
@@ -34,8 +37,8 @@ ns_submit_run() {
   export SBATCH_PARTITION="${SBATCH_PARTITION:-icelake}"
   export SBATCH_TIMELIMIT="${SBATCH_TIMELIMIT:-36:00:00}"
   echo "Submitting ${run_dir##*/} to Slurm (${SBATCH_PARTITION}, ${SBATCH_TIMELIMIT}," \
-    "${SBATCH_ACCOUNT:-default account}); ./ri runs and squeue -u ${USER:-$(id -un)} track it."
-  OUTPUT_DIR="${run_dir}" sbatch \
+    "${SBATCH_ACCOUNT:-default account}); squeue -u ${USER:-$(id -un)} tracks it."
+  sbatch \
     --job-name "${run_dir##*/}" \
     --chdir "${REPO_ROOT}" \
     --output "${run_dir}/slurm-%j.out" \
@@ -64,6 +67,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_SBATCH=0 ns_should_submit && { echo "FAIL: NS_SBATCH=0 must keep the run in place"; exit 1; }
 
   _run="${_dir}/results/wsclean-vlaa-20260101T000000Z"
+  export OUTPUT_DIR="${_run}"
   _out="$(ns_submit_run "${_run}" 200 scripts/run-nested-sampling.sh)"
   case "${_out}" in
     *"Submitting wsclean-vlaa-20260101T000000Z"*"icelake, 36:00:00"*4242) ;;
