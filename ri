@@ -71,6 +71,10 @@ def do_build(args):
     return env, [["scripts/build.sh", args.target]]
 
 
+def do_images(args):
+    return {}, [["scripts/images.sh", args.action, *([args.dir] if args.dir else [])]]
+
+
 def do_smoke(args):
     if args.target == "ms-to-mat":
         env = {"MS_PATH": args.ms_path} if args.ms_path else {}
@@ -369,6 +373,14 @@ def build_parser():
                             "SIGILLs anywhere else. Reuses the same image tag, so the "
                             "next build without it puts the default one back - pass "
                             "--native to ./ri search too")
+
+    images = add("images", do_images, "carry the images to the cluster as SIF files",
+                 description="export: on a Docker host, `docker save` each built image "
+                             "into DIR (default images/archives). import: on the "
+                             "cluster, build images/<name>.sif from those archives with "
+                             "Apptainer. rsync DIR between the two. See docs/cluster.md.")
+    images.add_argument("action", choices=("export", "import"))
+    images.add_argument("dir", nargs="?", help="archive directory (default: images/archives)")
 
     self_check = add("self-check", do_self_check, "run the checks that need the images",
         description="Runs the host-side checks, then each module's own "

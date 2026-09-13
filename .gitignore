@@ -65,3 +65,6 @@ latex/*.toc
 
 # Go TUI build artefacts
 tui/.build/
+
+# SIF images and their docker-save archives (./ri images)
+images/

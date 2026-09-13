@@ -367,6 +367,12 @@ check(
 )
 
 check(
+    "images import/export dispatch to the SIF script",
+    ([["scripts/images.sh", "export"]], [["scripts/images.sh", "import", "/x"]]),
+    (plan("images", "export")[1], plan("images", "import", "/x")[1]),
+)
+
+check(
     "search --native keeps its own build host-optimized",
     "native",
     plan("search", "wsclean", "--native")[0]["WSCLEAN_TARGET_CPU"],
