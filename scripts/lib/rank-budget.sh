@@ -22,9 +22,15 @@ _ns_available_mb() {
     return 0
   fi
   # Inside a Slurm job the cgroup limit is what the OOM killer enforces, and
-  # MemAvailable on a shared node says nothing about it.
-  if [ -n "${SLURM_MEM_PER_NODE:-}" ]; then
+  # MemAvailable on a shared node says nothing about it. Slurm spells the limit
+  # per node (--mem) or per core (the partition default); `--mem 0` is the
+  # whole node, which MemAvailable below then describes truthfully.
+  if [ -n "${SLURM_MEM_PER_NODE:-}" ] && [ "${SLURM_MEM_PER_NODE}" != 0 ]; then
     printf '%s\n' "${SLURM_MEM_PER_NODE}"
+    return 0
+  fi
+  if [ -n "${SLURM_MEM_PER_CPU:-}" ]; then
+    printf '%s\n' "$((SLURM_MEM_PER_CPU * ${SLURM_CPUS_ON_NODE:-$(nproc)}))"
     return 0
   fi
   if [ -r /proc/meminfo ]; then
@@ -74,10 +80,20 @@ ns_run_process_pattern() {
   printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
 }
 
+# On a cluster the ranks are on a compute node whose processes the login node
+# cannot see, so a run is also live while a Slurm job named after it (slurm.sh)
+# is queued or running - other than the job asking, which is the run itself.
+_ns_slurm_job_live() {
+  command -v squeue >/dev/null 2>&1 || return 1
+  squeue -h -u "${USER:-$(id -un)}" -n "${1##*/}" -o %i 2>/dev/null \
+    | awk -v me="${SLURM_JOB_ID:-}" '$1 != me' | grep -q .
+}
+
 # Whether a job drives `$1`. Check both path spellings because callers may use
 # a symlink; a not-yet-created output directory cannot be live.
 ns_run_is_live() {
   local dir="$1" real
+  _ns_slurm_job_live "${dir}" && return 0
   pgrep -f "$(ns_run_process_pattern "${dir}")" >/dev/null 2>&1 && return 0
   [ -d "${dir}" ] || return 1
   real="$(cd "${dir}" && pwd -P)"
@@ -252,6 +268,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${_ns_self_check_mb}" -gt 0 ]
   fi
 
+  # Slurm's three spellings of the job's memory.
+  [ "$(NS_AVAILABLE_MB='' SLURM_MEM_PER_NODE=8000 _ns_available_mb)" = 8000 ]
+  [ "$(NS_AVAILABLE_MB='' SLURM_MEM_PER_NODE='' SLURM_MEM_PER_CPU=3420 SLURM_CPUS_ON_NODE=4 _ns_available_mb)" = 13680 ]
+  _whole_node="$(NS_AVAILABLE_MB='' SLURM_MEM_PER_NODE=0 SLURM_MEM_PER_CPU='' _ns_available_mb || true)"
+  [ "${_whole_node:-1}" != 0 ]
+
   export NS_AVAILABLE_MB=40960
   clear_reservations() { rm -f "${NS_RANK_BUDGET_DIR}"/[0-9]*; }
 
@@ -314,6 +336,19 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
          kill "${_orphan_pid}"; exit 1; }
   kill "${_orphan_pid}" 2>/dev/null || true
   wait "${_orphan_pid}" 2>/dev/null || true
+
+  # A queued or running Slurm job named after the run makes it live from the
+  # login node, where pgrep sees nothing; the job itself is not its own rival.
+  mkdir -p "${_orphan_dir}/bin"
+  printf '#!/bin/sh\ncase "$*" in *"-n wsclean-vlaa-20260101T000001Z "*) echo 4242 ;; esac\n' \
+    >"${_orphan_dir}/bin/squeue"
+  chmod +x "${_orphan_dir}/bin/squeue"
+  PATH="${_orphan_dir}/bin:${PATH}" ns_run_is_live "${_orphan_run}" \
+    || { echo "FAIL: a Slurm job named after the run must make it live"; exit 1; }
+  PATH="${_orphan_dir}/bin:${PATH}" ns_run_is_live "${_orphan_run}-other" \
+    && { echo "FAIL: another run's job must not make this one live"; exit 1; }
+  PATH="${_orphan_dir}/bin:${PATH}" SLURM_JOB_ID=4242 ns_run_is_live "${_orphan_run}" \
+    && { echo "FAIL: the run's own job must not count as a rival"; exit 1; }
   rm -rf "${_orphan_dir}"
 
   ns_budget_warn_if_over 8 3400 r2d2 2>/dev/null

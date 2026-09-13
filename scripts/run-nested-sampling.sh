@@ -16,6 +16,26 @@ ns_require_sifs "${MEQTREES_SIF}" "${WSCLEAN_SIF}" "${POLYCHORD_SIF}"
 HOST_CPUS="$(nproc)"
 # shellcheck source=scripts/lib/rank-budget.sh
 . "${REPO_ROOT}/scripts/lib/rank-budget.sh"
+# shellcheck source=scripts/lib/run-config.sh
+. "${REPO_ROOT}/scripts/lib/run-config.sh"
+if [ -n "${OUTPUT_DIR:-}" ]; then
+  ns_refuse_live_run "${OUTPUT_DIR}"
+  mkdir -p "${OUTPUT_DIR}"
+  OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
+  ns_refuse_unmounted_run "${OUTPUT_DIR}"
+else
+  OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" wsclean-vlaa-)"
+fi
+# On a cluster login node the search leaves here: the claimed directory and the
+# whole environment go to a Slurm job that runs this script again inside the
+# allocation, where the cores and memory below are the job's (docs/cluster.md).
+# shellcheck source=scripts/lib/slurm.sh
+. "${REPO_ROOT}/scripts/lib/slurm.sh"
+if ns_should_submit; then
+  ns_submit_run "${OUTPUT_DIR}" "${NS_WSCLEAN_MB_PER_RANK}" scripts/run-nested-sampling.sh \
+    || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
+  exit 0
+fi
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -27,16 +47,6 @@ else
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_WSCLEAN_MB_PER_RANK}" wsclean
 fi
 
-# shellcheck source=scripts/lib/run-config.sh
-. "${REPO_ROOT}/scripts/lib/run-config.sh"
-if [ -n "${OUTPUT_DIR:-}" ]; then
-  ns_refuse_live_run "${OUTPUT_DIR}"
-  mkdir -p "${OUTPUT_DIR}"
-  OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
-  ns_refuse_unmounted_run "${OUTPUT_DIR}"
-else
-  OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" wsclean-vlaa-)"
-fi
 write_run_config "${OUTPUT_DIR}" wsclean
 # One FIFO pair per rank per worker kind, under the run directory so the
 # pools and the ranks - all bound to REPO_ROOT - see them at the same path.

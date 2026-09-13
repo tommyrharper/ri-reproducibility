@@ -53,6 +53,40 @@ the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 on main (`prune_evaluation_artefacts`), and `NS_KEEP_MEASUREMENT_SETS` stays 0:
 a Measurement Set is a directory of hundreds of files.
 
+## Starting a search
+
+```bash
+# on a login node:
+export SBATCH_ACCOUNT=MYPROJECT-CPU        # or --account; `mybalance` lists yours
+./ri search r2d2 --nlive 500               # Submitted batch job 12345
+./ri runs                                  # the run, listed as running
+squeue -u $USER                            # the job, named after the run
+./ri resume r2d2-vlaa-20260913T175735Z     # after the 36h cap: another job
+```
+
+`./ri search` and `./ri resume` submit a job when they are run outside a
+Slurm allocation on a host that has `sbatch` (`scripts/lib/slurm.sh`); inside
+`sintr` or a batch script, and on a host without Slurm, they run in place as
+they always did. The run directory is claimed on the login node, so the job is
+named after it, its stdout is `slurm-<jobid>.out` beside `run.log`, and
+`./ri runs`, `./ri resume` and `./ri search --output-dir` treat the run as
+live while a job of that name is queued or running (`squeue`), since the login
+node cannot see the compute node's processes. The job inherits the whole
+environment, so every flag and `NS_*` variable given on the login node, and
+the seed, reach it unchanged.
+
+Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive
+--mem 0`) and the run script sizes the ranks from the allocation; with it the
+job asks for that many cores and the matching memory. `--partition` defaults
+to `icelake` and `--time` to `36:00:00`, the SL2/SL3 cap; both, and anything
+else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
+(`SBATCH_QOS`, `SBATCH_RESERVATION`, ...). `NS_SBATCH=0` forces a run in
+place. A failed submission (a bad account, say) removes the claimed directory
+again.
+
+`./ri bench run` still runs in place: it times the search itself, so run it
+inside `sintr`.
+
 ## How a run works here
 
 The run scripts (`scripts/run-nested-sampling*.sh`) are the Docker ones with
@@ -88,8 +122,10 @@ the containers replaced by processes:
   Dockerfile, a patch, or the `[[parameter_space]]` the MeqTrees image bakes
   its MS skeleton cache from still needs the image rebuilt on a Docker host
   and carried over again.
-- **Memory sets the rank count**, as on `main`; `rank-budget.sh` reads
-  `SLURM_MEM_PER_NODE` inside a job and `MemAvailable` outside one. A pool a
+- **Memory sets the rank count**, as on `main`; `rank-budget.sh` reads the
+  job's limit inside one (`SLURM_MEM_PER_NODE`, or `SLURM_MEM_PER_CPU` times
+  the cores, which is how a partition default is spelled; `--mem 0` means the
+  node, so `MemAvailable`) and `MemAvailable` outside one. A pool a
   SIGKILLed run left behind is reaped by the next run's budget (the pool's
   shell names its FIFO directory, whose run has no ranks and whose launcher
   pid in `.launcher.pid` is gone).
@@ -104,9 +140,6 @@ the containers replaced by processes:
 
 ### Still to port
 
-- `./ri search` submitting an `sbatch` job from outside an allocation
-  (`--account`, `--partition`, `--time`); today it runs in place, which is
-  right inside `sintr` or a job script.
 - Everything that only ever read Docker: `nested-sampling-health.py`
   (`docker top`), `./ri shell`, `smoke-test-*.sh`, `generate-report.sh`,
   `plot-fits.sh`, `check-ms-to-r2d2-mat.sh`, `clean.sh`, `./ri disk-usage`,
@@ -115,13 +148,16 @@ the containers replaced by processes:
 
 ## Slurm facts the scripts depend on
 
-- Submit with `-A <PROJECT>-CPU` (`mybalance` lists yours); SL2/SL3 jobs are
-  capped at 36 hours, so a long search is `./ri resume` across jobs.
+- Submit with `-A <PROJECT>-CPU` (`mybalance` lists yours), which is
+  `SBATCH_ACCOUNT` or `--account` here; SL2/SL3 jobs are capped at 36 hours,
+  so a long search is `./ri resume` across jobs.
 - One node per job. `icelake` is 76 cores x 3.4GB (256GB), `icelake-himem`
   6.8GB per core (512GB); `sapphire` 112 cores, 4.6GB per core. R2D2 needs
   ~3.4GB per rank, so `--mem` sets the rank count, not `-c`.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the
-  run scripts needs no change.
+  run scripts needs no change. `NS_R2D2_MAX_RANKS` (8, from the 20-core
+  host) caps an R2D2 job well below a 76-core node; the first whole-node R2D2
+  run is where to re-measure it (`docs/nested-sampling-throughput.md`).
 - Load nothing: Apptainer, Slurm and the SIFs are the whole toolchain. `uv`
   is still needed on the login node for the host-side scripts (`./ri profile`,
   `./ri merge`, the defaults loader); install it into `~/.local/bin`.

@@ -36,6 +36,14 @@ SEARCH_ENV = (
     ("output_dir", "OUTPUT_DIR"),
 )
 
+# Slurm flags, on search and resume: sbatch reads these variables itself, so
+# they reach the job with no plumbing in between (docs/cluster.md).
+SLURM_ENV = (
+    ("account", "SBATCH_ACCOUNT"),
+    ("partition", "SBATCH_PARTITION"),
+    ("time", "SBATCH_TIMELIMIT"),
+)
+
 
 def env_from(args, pairs):
     """Environment overrides for the flags that were actually given.
@@ -86,7 +94,7 @@ def do_shell(args):
 
 
 def do_search(args):
-    env = env_from(args, SEARCH_ENV)
+    env = env_from(args, SEARCH_ENV + SLURM_ENV)
     if args.enable_param:
         env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
     if args.disable_param:
@@ -186,7 +194,7 @@ def do_tui(args):
 
 
 def do_resume(args):
-    return {}, [["scripts/resume-nested-sampling-run.sh", args.run]]
+    return env_from(args, SLURM_ENV), [["scripts/resume-nested-sampling-run.sh", args.run]]
 
 
 def do_report(args):
@@ -293,6 +301,15 @@ def build_parser():
         help="print the environment and commands instead of running them",
     )
 
+    # The cluster: on a login node search and resume submit a job (docs/cluster.md).
+    slurm = argparse.ArgumentParser(add_help=False)
+    slurm.add_argument("--account", metavar="PROJECT-CPU",
+                       help="Slurm account to charge; `mybalance` lists yours [SBATCH_ACCOUNT]")
+    slurm.add_argument("--partition", metavar="NAME",
+                       help="Slurm partition, default icelake [SBATCH_PARTITION]")
+    slurm.add_argument("--time", metavar="HH:MM:SS",
+                       help="Slurm time limit, default 36:00:00 [SBATCH_TIMELIMIT]")
+
     parser = argparse.ArgumentParser(
         prog="./ri",
         description=(
@@ -323,10 +340,10 @@ def build_parser():
     # No dest: the `record` subcommand has its own `command` positional.
     subs = parser.add_subparsers(metavar="<command>", required=True)
 
-    def add(name, handler, help_text, **kwargs):
+    def add(name, handler, help_text, parents=(), **kwargs):
         description = kwargs.pop("description", help_text)
         sub = subs.add_parser(
-            name, help=help_text, description=description, parents=[dry_run],
+            name, help=help_text, description=description, parents=[dry_run, *parents],
             # Prose is wrapped to the terminal; anything already laid out by
             # hand (the examples above, the search command below) is not.
             formatter_class=(
@@ -392,7 +409,7 @@ def build_parser():
 
     # Searches
     search = add(
-        "search", do_search, "run a nested-sampling search",
+        "search", do_search, "run a nested-sampling search", parents=[slurm],
         description=(
             "Run PolyChord over the VLA.A observing-parameter space, scoring each\n"
             "sample by how badly the imager reconstructs a known 1 Jy point source.\n"
@@ -603,7 +620,7 @@ def build_parser():
     )
 
     resume = add(
-        "resume", do_resume, "continue a run that stopped early",
+        "resume", do_resume, "continue a run that stopped early", parents=[slurm],
         description=(
             "Continue an interrupted run in place, keeping every evaluation it\n"
             "already finished. The run directory records the settings it was\n"

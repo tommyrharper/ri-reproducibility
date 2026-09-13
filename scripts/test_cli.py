@@ -268,6 +268,15 @@ check(
 )
 
 check(
+    "search and resume --account/--partition/--time become sbatch's own variables",
+    ({"SBATCH_ACCOUNT": "PROJ-CPU", "SBATCH_PARTITION": "sapphire", "SBATCH_TIMELIMIT": "12:00:00"},) * 2,
+    (plan("search", "r2d2", "--account", "PROJ-CPU", "--partition", "sapphire",
+          "--time", "12:00:00")[0],
+     plan("resume", "r2d2-vlaa-20260827T101500Z", "--account", "PROJ-CPU",
+          "--partition", "sapphire", "--time", "12:00:00")[0]),
+)
+
+check(
     "report selectors become the script's variables",
     {"LAST": "1", "FORCE": "1"},
     plan("report", "--last", "1", "--force")[0],

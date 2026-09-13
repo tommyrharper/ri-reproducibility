@@ -18,6 +18,30 @@ HOST_CPUS="$(nproc)"
 # Rank count drives memory use; rank-budget.sh clamps it to available memory.
 # shellcheck source=scripts/lib/rank-budget.sh
 . "${REPO_ROOT}/scripts/lib/rank-budget.sh"
+# shellcheck source=scripts/lib/run-config.sh
+. "${REPO_ROOT}/scripts/lib/run-config.sh"
+ns_refuse_missing_checkpoints "${CHECKPOINTS_DIR}" "${R2D2_CKPT_NAME}"
+# Claim the default only after guards, so refused runs leave no empty result;
+# named directories may exist, but not while a job is still in them.
+if [ -n "${OUTPUT_DIR:-}" ]; then
+  ns_refuse_live_run "${OUTPUT_DIR}"
+  mkdir -p "${OUTPUT_DIR}"
+  # Normalize once so containment and recorded paths are consistent.
+  OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
+  ns_refuse_unmounted_run "${OUTPUT_DIR}"
+else
+  OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" r2d2-vlaa-)"
+fi
+# On a cluster login node the search leaves here: the claimed directory and the
+# whole environment go to a Slurm job that runs this script again inside the
+# allocation, where the cores and memory below are the job's (docs/cluster.md).
+# shellcheck source=scripts/lib/slurm.sh
+. "${REPO_ROOT}/scripts/lib/slurm.sh"
+if ns_should_submit; then
+  ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB_PER_RANK}" scripts/run-nested-sampling-r2d2.sh \
+    || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
+  exit 0
+fi
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -46,20 +70,6 @@ if [ -z "${R2D2_OMP_THREADS:-}" ]; then
 fi
 R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}"
 
-# shellcheck source=scripts/lib/run-config.sh
-. "${REPO_ROOT}/scripts/lib/run-config.sh"
-ns_refuse_missing_checkpoints "${CHECKPOINTS_DIR}" "${R2D2_CKPT_NAME}"
-# Claim the default only after guards, so refused runs leave no empty result;
-# named directories may exist, but not while a job is still in them.
-if [ -n "${OUTPUT_DIR:-}" ]; then
-  ns_refuse_live_run "${OUTPUT_DIR}"
-  mkdir -p "${OUTPUT_DIR}"
-  # Normalize once so containment and recorded paths are consistent.
-  OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
-  ns_refuse_unmounted_run "${OUTPUT_DIR}"
-else
-  OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" r2d2-vlaa-)"
-fi
 # Written before anything can go wrong, so that a run which stops - out of
 # memory, Ctrl-C, reboot - still says how to start it again exactly.
 write_run_config "${OUTPUT_DIR}" r2d2
