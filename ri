@@ -285,7 +285,7 @@ def do_clean(args):
 
 
 def do_disk_usage(args):
-    return {}, [["docker", "system", "df", "-v"]]
+    return {}, [["du", "-sh", "images", "results", "reports", "checkpoints", "data"]]
 
 
 # --- argument parsing --------------------------------------------------------
@@ -403,8 +403,8 @@ def build_parser():
                                          "simulating one (MS_PATH)")
 
     shell = add("shell", do_shell, "open a shell inside an image",
-                description="Interactive bash in one of the built images, with this "
-                            "repo's usual mounts.")
+                description="Interactive shell in one of the imported SIFs, with this "
+                            "repo's usual binds.")
     shell.add_argument("image", choices=IMAGES, help="which image to enter")
 
     # Searches
@@ -825,10 +825,10 @@ def build_parser():
                         help="the exact command that was run, recorded verbatim")
 
     add("clean", do_clean, "remove this repo's images and smoke-test output",
-        description="Removes the images built here and the generated smoke-test "
-                    "output. Your data/, checkpoints/, results/ and reports/ are left "
-                    "alone. Run 'docker builder prune' to reclaim build cache.")
-    add("disk-usage", do_disk_usage, "what Docker is using on disk")
+        description="Removes the imported SIFs, their archives and the generated "
+                    "smoke-test output. Your data/, checkpoints/, results/ and "
+                    "reports/ are left alone.")
+    add("disk-usage", do_disk_usage, "what this checkout is using on disk")
 
     return parser
 

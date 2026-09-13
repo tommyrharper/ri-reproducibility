@@ -503,20 +503,6 @@ def r2d2_thread_count() -> int:
     return os.cpu_count() or 1
 
 
-def r2d2_docker_thread_env_flags() -> list[str]:
-    threads = str(r2d2_thread_count())
-    return [
-        "-e",
-        f"OMP_NUM_THREADS={threads}",
-        "-e",
-        f"MKL_NUM_THREADS={threads}",
-        "-e",
-        f"OPENBLAS_NUM_THREADS={threads}",
-        "-e",
-        "OMP_WAIT_POLICY=PASSIVE",
-    ]
-
-
 def fill_disabled_parameters(raw: dict[str, Any]) -> None:
     enabled_names = {spec["name"] for spec in load_parameter_space()}
     for spec in load_all_parameter_specs():
@@ -2624,33 +2610,6 @@ def self_check_spectral_window() -> None:
         assert "no start frequency can hold it" in str(error), error
     else:
         raise AssertionError("a box whose smallest window fits no band should not load")
-
-
-def self_check_r2d2_thread_env() -> None:
-    saved = os.environ.get("R2D2_OMP_THREADS")
-    try:
-        os.environ["R2D2_OMP_THREADS"] = "6"
-        flags = r2d2_docker_thread_env_flags()
-        assert flags == [
-            "-e",
-            "OMP_NUM_THREADS=6",
-            "-e",
-            "MKL_NUM_THREADS=6",
-            "-e",
-            "OPENBLAS_NUM_THREADS=6",
-            "-e",
-            "OMP_WAIT_POLICY=PASSIVE",
-        ]
-        del os.environ["R2D2_OMP_THREADS"]
-        count = r2d2_thread_count()
-        assert count >= 1
-        auto_flags = r2d2_docker_thread_env_flags()
-        assert auto_flags[1] == f"OMP_NUM_THREADS={count}"
-    finally:
-        if saved is None:
-            os.environ.pop("R2D2_OMP_THREADS", None)
-        else:
-            os.environ["R2D2_OMP_THREADS"] = saved
 
 
 def self_check_fits_reader() -> None:

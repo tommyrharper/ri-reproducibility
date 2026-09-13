@@ -48,7 +48,6 @@ from common import (
     self_check_parameter_toggle,
     self_check_profiling,
     self_check_resume_adoption,
-    self_check_r2d2_thread_env,
     self_check_source_offset,
     self_check_spectral_window,
     self_check_worker_pool_connect,
@@ -629,7 +628,6 @@ if __name__ == "__main__":
         self_check_parameter_toggle()
         self_check_spectral_window()
         self_check_lazy_numpy()
-        self_check_r2d2_thread_env()
         self_check_r2d2_config_thread_cap()
         self_check_source_offset()
         self_check_profiling()

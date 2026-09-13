@@ -9,19 +9,21 @@ CONFIG_DIR="${REPO_ROOT}/config/r2d2"
 
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
-# shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
-source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
+# shellcheck source=scripts/lib/r2d2-thread-env.sh
+source "${REPO_ROOT}/scripts/lib/r2d2-thread-env.sh"
 
-mkdir -p "${RESULTS_DIR}/smoke-test-r2d2"
+ns_require_sifs "${R2D2_SIF}"
+mkdir -p "${RESULTS_DIR}/smoke-test-r2d2" "${CHECKPOINTS_DIR}"
 
+# --pwd: the SIF does not keep the image's WORKDIR, and R2D2-RI imports from
+# its checkout (`src`, `data/`) relative to it.
 run() {
-  docker run --rm --platform "${PLATFORM}" \
-    "${R2D2_DOCKER_ENV_FLAGS[@]}" \
-    -v "${CHECKPOINTS_DIR}:/checkpoints:ro" \
-    -v "${RESULTS_DIR}/smoke-test-r2d2:/results" \
-    -v "${CONFIG_DIR}:/workspace/config:ro" \
-    --entrypoint python3 \
-    "${R2D2_IMAGE}" "$@"
+  "${APPTAINER}" exec --pwd /opt/r2d2/R2D2-RI \
+    "${R2D2_ENV_FLAGS[@]}" \
+    --bind "${CHECKPOINTS_DIR}:/checkpoints:ro" \
+    --bind "${RESULTS_DIR}/smoke-test-r2d2:/results" \
+    --bind "${CONFIG_DIR}:/workspace/config:ro" \
+    "${R2D2_SIF}" python3 "$@"
 }
 
 echo "==> [1/5] importing critical third-party Python packages"

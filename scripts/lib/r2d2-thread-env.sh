@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# OpenMP/BLAS thread env for R2D2 docker run invocations.
-# Source this file, then expand "${R2D2_DOCKER_ENV_FLAGS[@]}" in docker run.
+# OpenMP/BLAS thread env for R2D2 `apptainer exec` invocations.
+# Source this file, then expand "${R2D2_ENV_FLAGS[@]}" before the SIF.
 set -euo pipefail
 
 r2d2_thread_count() {
@@ -19,8 +19,10 @@ r2d2_thread_count() {
 
 R2D2_OMP_THREADS="${R2D2_OMP_THREADS:-$(r2d2_thread_count)}"
 # shellcheck disable=SC2034  # expanded by the sourcing script
-R2D2_DOCKER_ENV_FLAGS=(
-  -e "OMP_NUM_THREADS=${R2D2_OMP_THREADS}"
-  -e "MKL_NUM_THREADS=${R2D2_OMP_THREADS}"
-  -e "OPENBLAS_NUM_THREADS=${R2D2_OMP_THREADS}"
+# MPLCONFIGDIR: the image's /opt/matplotlib cache is read-only under Apptainer.
+R2D2_ENV_FLAGS=(
+  --env "MPLCONFIGDIR=${TMPDIR:-/tmp}/ri-matplotlib-${USER:-$(id -u)}"
+  --env "OMP_NUM_THREADS=${R2D2_OMP_THREADS}"
+  --env "MKL_NUM_THREADS=${R2D2_OMP_THREADS}"
+  --env "OPENBLAS_NUM_THREADS=${R2D2_OMP_THREADS}"
 )

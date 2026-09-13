@@ -140,11 +140,12 @@ the containers replaced by processes:
 
 ### Still to port
 
-- Everything that only ever read Docker: `nested-sampling-health.py`
-  (`docker top`), `./ri shell`, `smoke-test-*.sh`, `generate-report.sh`,
-  `plot-fits.sh`, `check-ms-to-r2d2-mat.sh`, `clean.sh`, `./ri disk-usage`,
-  and `test_self_heal.sh` (`./ri self-check self-heal`), which removes a
-  sidecar container to test recovery.
+- `nested-sampling-health.py` still reaches for `docker top` and `docker ps`
+  when host `ps` finds no ranks, and `test_self_heal.sh` (`./ri self-check
+  self-heal`) removes a sidecar container to test recovery. Everything else
+  that only ever read Docker (`./ri shell`, `./ri smoke`, `./ri report`,
+  `./ri plot fits`, `./ri clean`, `./ri disk-usage`) runs its SIF with
+  `apptainer exec` and the same binds the Docker mounts were.
 
 ## Slurm facts the scripts depend on
 
