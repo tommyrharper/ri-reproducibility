@@ -10,9 +10,10 @@ The four environments (WSClean with its patches and fork server, MeqTrees,
 R2D2, PolyChord) are still defined by the Dockerfiles under `docker/`. Nothing
 in them is rebuilt natively on the cluster: MeqTrees only exists as KERN
 Ubuntu packages, and WSClean carries six local patches. They run under
-[Apptainer](https://apptainer.org/), which CSD3 provides on every node with no
-module to load, as `apptainer` (older docs say `singularity`; the scripts
-accept either).
+[Apptainer](https://apptainer.org/), which CSD3's Rocky 8 nodes provide as
+`apptainer` with no module to load (its own docs run `apptainer pull` bare);
+the scripts accept `singularity` too, and if neither is on PATH the CSD3
+module is `singularity/current`.
 
 Verified on a Docker host before any of the runtime was ported: a SIF built
 from a `docker save` archive keeps the image's ENTRYPOINT, ENV and labels;
@@ -61,7 +62,7 @@ export SBATCH_ACCOUNT=MYPROJECT-CPU        # or --account; `mybalance` lists you
 ./ri search r2d2 --nlive 500               # Submitted batch job 12345
 ./ri runs                                  # the run, listed as running
 squeue -u $USER                            # the job, named after the run
-./ri resume r2d2-vlaa-20260913T175735Z     # after the 36h cap: another job
+./ri resume r2d2-vlaa-20260913T175735Z     # after the time limit: another job
 ```
 
 `./ri search` and `./ri resume` submit a job when they are run outside a
@@ -78,7 +79,9 @@ the seed, reach it unchanged.
 Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive
 --mem 0`) and the run script sizes the ranks from the allocation; with it the
 job asks for that many cores and the matching memory. `--partition` defaults
-to `icelake` and `--time` to `36:00:00`, the SL2/SL3 cap; both, and anything
+to `icelake` and `--time` to `12:00:00`, the SL3 cap, which every service
+level accepts; SL1/SL2 accounts can pass `--time 36:00:00`, their own cap,
+and a limit above your level is refused by sbatch. Both, and anything
 else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
 (`SBATCH_QOS`, `SBATCH_RESERVATION`, ...). `NS_SBATCH=0` forces a run in
 place. A failed submission (a bad account, say) removes the claimed directory
@@ -155,10 +158,13 @@ group where it used to remove a container.
 ## Slurm facts the scripts depend on
 
 - Submit with `-A <PROJECT>-CPU` (`mybalance` lists yours), which is
-  `SBATCH_ACCOUNT` or `--account` here; SL2/SL3 jobs are capped at 36 hours,
-  so a long search is `./ri resume` across jobs.
-- One node per job. `icelake` is 76 cores x 3.4GB (256GB), `icelake-himem`
-  6.8GB per core (512GB); `sapphire` 112 cores, 4.6GB per core. R2D2 needs
+  `SBATCH_ACCOUNT` or `--account` here. Wallclock is capped per service
+  level - 36 hours on SL1/SL2, 12 hours on SL3 (`policies.html`) - so a long
+  search is `./ri resume` across jobs.
+- One node per job. `icelake` is 76 cores x 3370MiB (256GB), `icelake-himem`
+  6760MiB per core (512GB); `sapphire` 112 cores x 4580MiB (512GB). A
+  `--mem` above the cores' share is granted by allocating (and charging)
+  more cores. R2D2 needs
   ~3.4GB per rank, so `--mem` sets the rank count, not `-c`.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the
   run scripts needs no change. `NS_R2D2_MAX_RANKS` (8, from the 20-core

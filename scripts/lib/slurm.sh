@@ -10,7 +10,10 @@
 #
 # Account, partition and time limit are sbatch's own SBATCH_* input variables
 # (`./ri search --account X` sets SBATCH_ACCOUNT); the two that have a sane
-# default get one here. There is no default account: `mybalance` lists yours.
+# default get one here. The time defaults to 12 hours, the SL3 cap, because a
+# limit above the caller's service level is refused outright by sbatch and
+# SL1/SL2 can ask for their 36 hours; a run resumes across jobs either way.
+# There is no default account: `mybalance` lists yours.
 
 ns_should_submit() {
   [ -z "${SLURM_JOB_ID:-}" ] && [ "${NS_SBATCH:-1}" = 1 ] && command -v sbatch >/dev/null 2>&1
@@ -35,7 +38,7 @@ ns_submit_run() {
     size=(--exclusive --mem 0)
   fi
   export SBATCH_PARTITION="${SBATCH_PARTITION:-icelake}"
-  export SBATCH_TIMELIMIT="${SBATCH_TIMELIMIT:-36:00:00}"
+  export SBATCH_TIMELIMIT="${SBATCH_TIMELIMIT:-12:00:00}"
   echo "Submitting ${run_dir##*/} to Slurm (${SBATCH_PARTITION}, ${SBATCH_TIMELIMIT}," \
     "${SBATCH_ACCOUNT:-default account}); squeue -u ${USER:-$(id -un)} tracks it."
   sbatch \
@@ -70,10 +73,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   export OUTPUT_DIR="${_run}"
   _out="$(ns_submit_run "${_run}" 200 scripts/run-nested-sampling.sh)"
   case "${_out}" in
-    *"Submitting wsclean-vlaa-20260101T000000Z"*"icelake, 36:00:00"*4242) ;;
+    *"Submitting wsclean-vlaa-20260101T000000Z"*"icelake, 12:00:00"*4242) ;;
     *) echo "FAIL: the submission must say what it did, got: ${_out}"; exit 1 ;;
   esac
-  [ "$(cat "${_dir}/env")" = "${_run} icelake 36:00:00" ] \
+  [ "$(cat "${_dir}/env")" = "${_run} icelake 12:00:00" ] \
     || { echo "FAIL: the job must inherit the run directory and the sbatch defaults, got: $(cat "${_dir}/env")"; exit 1; }
   _args="$(tr '\n' ' ' <"${_dir}/args")"
   for _want in "--job-name wsclean-vlaa-20260101T000000Z" "--chdir ${REPO_ROOT}" \

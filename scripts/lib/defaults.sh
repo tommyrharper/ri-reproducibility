@@ -81,7 +81,7 @@ POLYCHORD_SIF="${SIF_DIR}/polychord.sif"
 #   ns_require_sifs <sif>...
 ns_require_sifs() {
   local sif
-  [ -n "${APPTAINER}" ] || { echo "FATAL: neither apptainer nor singularity is on PATH" >&2; exit 1; }
+  [ -n "${APPTAINER}" ] || { echo "FATAL: neither apptainer nor singularity is on PATH (on CSD3: module load singularity/current)" >&2; exit 1; }
   for sif in "$@"; do
     [ -f "${sif}" ] || { echo "FATAL: ${sif} is missing - ./ri images import (docs/cluster.md)" >&2; exit 1; }
   done

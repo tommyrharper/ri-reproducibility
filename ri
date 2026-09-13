@@ -320,7 +320,7 @@ def build_parser():
     slurm.add_argument("--partition", metavar="NAME",
                        help="Slurm partition, default icelake [SBATCH_PARTITION]")
     slurm.add_argument("--time", metavar="HH:MM:SS",
-                       help="Slurm time limit, default 36:00:00 [SBATCH_TIMELIMIT]")
+                       help="Slurm time limit, default 12:00:00, the SL3 cap; SL1/SL2 may ask 36:00:00 [SBATCH_TIMELIMIT]")
 
     parser = argparse.ArgumentParser(
         prog="./ri",
