@@ -318,7 +318,7 @@ def build_parser():
         ),
         epilog=(
             "Typical session:\n"
-            "  ./ri build                  # the four Docker images (slow, once)\n"
+            "  ./ri images import          # the SIFs, from archives built on a Docker host\n"
             "  ./ri smoke                  # can the imagers actually image?\n"
             "  ./ri search wsclean         # run a search\n"
             "  ./ri report                 # one HTML page per run\n"
@@ -357,9 +357,11 @@ def build_parser():
         return sub
 
     # Images
-    build = add("build", do_build, "build the Docker images",
-                description="Build the Docker images (docker build, so re-running "
-                            "just hits the layer cache).")
+    build = add("build", do_build, "build the Docker images (on a Docker host)",
+                description="Build the Docker images on a Docker host (docker build, so "
+                            "re-running just hits the layer cache), to carry to the "
+                            "cluster with `./ri images export`. Nothing on the cluster "
+                            "builds; see docs/cluster.md.")
     build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES),
                        help="which image to build (default: all)")
     build.add_argument("--native", action="store_true",
@@ -793,7 +795,7 @@ def build_parser():
     plot_gui = plot_subs.add_parser(
         "gui", parents=[dry_run], help="interactive corner plots of a run (needs a display)",
         description="Open the run's samples in anesthetic's GUI. Host-side and needs "
-                    "a display, so not inside Docker or Colima.",
+                    "a display, so not on a compute node.",
     )
     plot_gui.add_argument("run", nargs="?", metavar="RUN",
                           help="run directory, chains/, or PolyChord file root "
