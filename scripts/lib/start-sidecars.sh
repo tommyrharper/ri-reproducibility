@@ -36,10 +36,12 @@ _sidecar_remove() {
 # scratch tmpfs, which the simulator also reads from its environment so that
 # its closing move is a rename rather than a copy - see scratch_root_for() in
 # simulate_point_source_ms.py.
+# Fills SIDECAR_BINDS in place rather than printing lines: macOS bash 3.2 has
+# no mapfile to read them back with.
 sidecar_binds() {
-  printf '%s\n' --bind "${REPO_ROOT}"
+  SIDECAR_BINDS=(--bind "${REPO_ROOT}")
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
-    printf '%s\n' --bind "${NS_SCRATCH_DIR}" --env "NS_SCRATCH_DIR=${NS_SCRATCH_DIR}"
+    SIDECAR_BINDS+=(--bind "${NS_SCRATCH_DIR}" --env "NS_SCRATCH_DIR=${NS_SCRATCH_DIR}")
   fi
 }
 
@@ -56,7 +58,7 @@ _sidecar_start() {
 
 sidecar_launch() {
   local sif="$1" name
-  local -a args=() command=() binds=()
+  local -a args=() command=()
   shift
   while [ "$#" -gt 0 ]; do
     if [ "$1" = "--" ]; then
@@ -75,10 +77,10 @@ sidecar_launch() {
   if [ -n "${OUTPUT_DIR:-}" ]; then
     echo "$$" >"${OUTPUT_DIR}/.launcher.pid"
   fi
-  mapfile -t binds < <(sidecar_binds)
+  sidecar_binds
   local -a run=(
     "${APPTAINER}" exec --pwd "${REPO_ROOT}"
-    "${binds[@]}"
+    "${SIDECAR_BINDS[@]}"
     ${args[@]+"${args[@]}"}
     "${sif}" "${command[@]}"
   )
@@ -168,7 +170,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "$(ps -o pgid= -p "${_pid}" | tr -d ' ')" = "${_pid}" ] \
       || { echo "FAIL: pool ${_pid} is not its own process group"; exit 1; }
   done
-  [ -f "${_tmp}/workers-a.log" ] && [ -f "${_tmp}/workers-b.log" ] \
+  { [ -f "${_tmp}/workers-a.log" ] && [ -f "${_tmp}/workers-b.log" ]; } \
     || { echo "FAIL: pool logs not written beside the run"; exit 1; }
   [ "$(cat "${_tmp}/.launcher.pid")" = "$$" ] || { echo "FAIL: launcher pid not recorded"; exit 1; }
 
@@ -184,7 +186,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   sleep 0.5
   grep -q -- "/img/b.sif python3 serve.py" "${_tmp}/log" || { echo "FAIL: the dead pool was not started again"; exit 1; }
   grep -q -- "/img/a.sif" "${_tmp}/log" && { echo "FAIL: restarted the pool that was still running"; exit 1; }
-  [ "${SIDECAR_PIDS[0]}" = "${_live}" ] && [ "${#SIDECAR_PIDS[@]}" = 2 ] \
+  { [ "${SIDECAR_PIDS[0]}" = "${_live}" ] && [ "${#SIDECAR_PIDS[@]}" = 2 ]; } \
     || { echo "FAIL: pids after restore: ${SIDECAR_PIDS[*]}"; exit 1; }
   kill -0 "${SIDECAR_PIDS[1]}" || { echo "FAIL: the restored pool is not running"; exit 1; }
 

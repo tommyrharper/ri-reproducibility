@@ -140,7 +140,7 @@ _ns_pool_table() {
   for pid in $(pgrep -f -- '/\.[a-z0-9]*-workers$' 2>/dev/null); do
     pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
     args="$(ps -ww -o args= -p "${pid}" 2>/dev/null)"
-    [ -n "${pgid}" ] && [ -n "${args}" ] || continue
+    { [ -n "${pgid}" ] && [ -n "${args}" ]; } || continue
     fifo_dir="${args##* }"
     launcher="$(cat "${fifo_dir%/*}/.launcher.pid" 2>/dev/null || true)"
     printf '%s\t%s\t%s\n' "${pgid}" "${launcher}" "${fifo_dir%/*}"

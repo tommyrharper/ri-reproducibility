@@ -98,7 +98,7 @@ sidecar_launch "${WSCLEAN_SIF}" -- sh -c '
   wait
 ' sh "${WSCLEAN_FIFO_DIR}"
 
-mapfile -t POLYCHORD_BINDS < <(sidecar_binds)
+sidecar_binds
 RUN_COMMAND=(
   env
   REPO_ROOT="${REPO_ROOT}"
@@ -125,7 +125,7 @@ RUN_COMMAND=(
   OMPI_MCA_ras=^slurm
   OMPI_MCA_plm=^slurm
   "${APPTAINER}" exec --pwd "${REPO_ROOT}"
-  "${POLYCHORD_BINDS[@]}"
+  "${SIDECAR_BINDS[@]}"
   --bind "${REPO_ROOT}/scripts/lib/nested_sampling:/opt/ri-nested-sampling"
   "${POLYCHORD_SIF}"
   mpirun

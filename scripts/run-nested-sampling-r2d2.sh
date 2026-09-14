@@ -138,7 +138,7 @@ sidecar_launch "${R2D2_SIF}" \
   --env OMP_WAIT_POLICY=PASSIVE \
   -- python3 "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py" --fifo-dir "${R2D2_FIFO_DIR}"
 
-mapfile -t POLYCHORD_BINDS < <(sidecar_binds)
+sidecar_binds
 RUN_COMMAND=(
   env
   REPO_ROOT="${REPO_ROOT}"
@@ -176,7 +176,7 @@ RUN_COMMAND=(
   R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
   R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-1}"
   "${APPTAINER}" exec --pwd "${REPO_ROOT}"
-  "${POLYCHORD_BINDS[@]}"
+  "${SIDECAR_BINDS[@]}"
   --bind "${REPO_ROOT}/scripts/lib/nested_sampling:/opt/ri-nested-sampling"
   "${POLYCHORD_SIF}"
   mpirun
