@@ -12,8 +12,11 @@ source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
 ns_require_sifs "${MEQTREES_SIF}" "${WSCLEAN_SIF}" "${POLYCHORD_SIF}"
 
-# Inside a Slurm job this is the allocation, not the node.
-HOST_CPUS="$(nproc)"
+# Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
+# OMP_THREAD_LIMIT are dropped because GNU nproc honours them, and CSD3's login
+# environment exports OMP_NUM_THREADS=1, which sbatch carries into the job: a
+# bare nproc there reads 1 on a 76-core node and the run gets one rank.
+HOST_CPUS="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)"
 # shellcheck source=scripts/lib/rank-budget.sh
 . "${REPO_ROOT}/scripts/lib/rank-budget.sh"
 # shellcheck source=scripts/lib/run-config.sh

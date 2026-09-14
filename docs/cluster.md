@@ -30,11 +30,16 @@ thing the Docker design needed `docker exec` for.
 # on any machine with Docker (a laptop, the lab box):
 ./ri build                       # the four images, as on main
 ./ri images export               # docker save -> images/archives/<name>.tar
-rsync -avz images/archives/ login-cpu.hpc.cam.ac.uk:<repo>/images/archives/
+rsync -avz images/archives/ login.hpc.cam.ac.uk:<repo>/images/archives/
 
 # on CSD3, in the same checkout:
 ./ri images import               # apptainer build images/<name>.sif
 ```
+
+The images must be `linux/amd64`: CSD3's CPU and GPU nodes are all x86_64.
+A Linux x86_64 Docker host builds that by default; on Apple Silicon run
+`DOCKER_DEFAULT_PLATFORM=linux/amd64 ./ri build` (emulated, and slow for the
+WSClean and casacore compiles), and `./ri images export` refuses anything else.
 
 `images/` is gitignored. The archives total ~2.1GB (r2d2 is 1.4GB of it) and
 the SIFs the same again; importing all four took 80s on a 20-core box. Import
@@ -46,7 +51,7 @@ the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 
 | what | where | why |
 | --- | --- | --- |
-| this checkout, `images/`, `results/` | `/rds/user/<crsid>/hpc-work/ri-reproducibility` | Lustre, 1TB, shared by every node; home is 50GB NFS |
+| this checkout, `images/`, `results/` | `/rds/user/<crsid>/hpc-work/ri-reproducibility` | Lustre, 1TB, shared by every node; home is 50GB NFS, and CSD3 asks that jobs do no I/O there - a run writes `results/`, its FIFOs and `benchmarks.jsonl` under the checkout, so a checkout in `~` is the wrong place |
 | in-flight Measurement Sets (`NS_SCRATCH_DIR`) | `/dev/shm` on the node | same as on main; nodes have 256GB+ |
 | worker FIFOs | inside the run directory, as on main | one node per run, so a FIFO on Lustre is local to its readers |
 
@@ -92,6 +97,15 @@ else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
 (`SBATCH_QOS`, `SBATCH_RESERVATION`, ...). `NS_SBATCH=0` forces a run in
 place. A failed submission (a bad account, say) removes the claimed directory
 again.
+
+`--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
+skips the queue but is capped at one hour, so without `--time` the limit
+defaults to `01:00:00` under it - enough for a smoke-sized search or to try a
+change on a real node.
+
+`--then`, `--plot` and `--report` are refused on a login node: they wait for
+the search to finish, and there the search only submits its job and returns.
+Run them after the job, or chain them inside an allocation.
 
 `./ri bench run` submits the same way, as one job named `bench-<imager>-<stamp>`
 (its Slurm log under `results/bench/`) that runs the warm-up and every repeat
@@ -149,6 +163,30 @@ the containers replaced by processes:
 - `run.env` and the manifests record each image as the `ri.build-inputs`
   label the Docker build stamped it with (`ns_image_id`), which the SIF
   keeps.
+
+### Being a good citizen on CSD3
+
+The administrators have asked that login-node work stays at a few CPUs for a
+few seconds and that nothing calls a Slurm client command more often than every
+two minutes. What here would otherwise break that:
+
+- `./ri health` and `./ri runs` - and so `./ri tui`, which reruns them every
+  five seconds - share one cached `squeue` answer per user
+  (`scripts/slurm_queue.py`, `~/.cache/ri/`), refreshed at most every 120s
+  (`RI_SQUEUE_TTL`). A submission drops the cache, so a new run shows as queued
+  at once; a job that has just ended can read as live for up to two minutes.
+  `ns_run_is_live` (the guard in front of `./ri resume` and `--output-dir`)
+  still asks directly, once per command.
+- `./ri report` draws with two processes per pool on a login node rather than
+  one per core (`RI_REPORT_WORKERS`).
+- `./ri images import` caps `mksquashfs` at four processors outside a job
+  (`RI_IMPORT_PROCESSORS`); inside `sintr` it uses the allocation.
+- Never poll `squeue` in a loop of your own; `./ri runs` already caches it.
+
+`OMP_NUM_THREADS=1` is exported by CSD3's default login environment and sbatch
+carries it into every job. GNU `nproc` honours it, so the run scripts count
+CPUs with it unset (`env -u OMP_NUM_THREADS nproc`); a bare `nproc` there reads
+1 on a 76-core node, which sized a whole-node job to a single rank.
 
 ### Reading a run from the login node
 

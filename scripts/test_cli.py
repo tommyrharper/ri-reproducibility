@@ -36,6 +36,18 @@ def plan(*argv):
     return args.handler(args)
 
 
+with tempfile.TemporaryDirectory() as _fake_bin:
+    (Path(_fake_bin) / "sbatch").write_text("#!/bin/sh\n")
+    (Path(_fake_bin) / "sbatch").chmod(0o755)
+    check(
+        "a search submits to Slurm only outside a job, with sbatch, unless NS_SBATCH=0",
+        [False, True, False, False],
+        [ri.submits_to_slurm({"PATH": str(Path(_fake_bin) / "none")}),
+         ri.submits_to_slurm({"PATH": _fake_bin}),
+         ri.submits_to_slurm({"PATH": _fake_bin, "SLURM_JOB_ID": "1"}),
+         ri.submits_to_slurm({"PATH": _fake_bin, "NS_SBATCH": "0"})],
+    )
+
 check(
     "search flags become NS_* overrides",
     {"NS_NLIVE": "8", "NS_METRIC": "-snr", "NS_MPI_PROCS": "1"},
@@ -268,12 +280,13 @@ check(
 )
 
 check(
-    "search and resume --account/--partition/--time become sbatch's own variables",
-    ({"SBATCH_ACCOUNT": "PROJ-CPU", "SBATCH_PARTITION": "sapphire", "SBATCH_TIMELIMIT": "12:00:00"},) * 2,
+    "search and resume --account/--partition/--time/--qos become sbatch's own variables",
+    ({"SBATCH_ACCOUNT": "PROJ-CPU", "SBATCH_PARTITION": "sapphire", "SBATCH_TIMELIMIT": "12:00:00",
+      "SBATCH_QOS": "intr"},) * 2,
     (plan("search", "r2d2", "--account", "PROJ-CPU", "--partition", "sapphire",
-          "--time", "12:00:00")[0],
+          "--time", "12:00:00", "--qos", "intr")[0],
      plan("resume", "r2d2-vlaa-20260827T101500Z", "--account", "PROJ-CPU",
-          "--partition", "sapphire", "--time", "12:00:00")[0]),
+          "--partition", "sapphire", "--time", "12:00:00", "--qos", "intr")[0]),
 )
 
 check(

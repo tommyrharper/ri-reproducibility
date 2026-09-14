@@ -117,7 +117,7 @@ built on a Docker host and carried to the cluster as SIF files:
 # on a Docker host (x86-64, to match the cluster):
 ./ri build              # all four; unchanged inputs skip `docker build`
 ./ri images export      # docker save -> images/archives/<name>.tar
-rsync -avz images/archives/ login-cpu.hpc.cam.ac.uk:<repo>/images/archives/
+rsync -avz images/archives/ login.hpc.cam.ac.uk:<repo>/images/archives/
 
 # on the cluster, in the same checkout:
 ./ri images import      # apptainer build images/<name>.sif

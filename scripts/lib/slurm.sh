@@ -38,15 +38,24 @@ ns_submit_run() {
     size=(--exclusive --mem 0)
   fi
   export SBATCH_PARTITION="${SBATCH_PARTITION:-icelake}"
-  export SBATCH_TIMELIMIT="${SBATCH_TIMELIMIT:-12:00:00}"
+  # CSD3's `intr` QoS starts at once but caps a job at one hour, and sbatch
+  # refuses the 12-hour default under it rather than trimming it.
+  if [ "${SBATCH_QOS:-}" = intr ]; then
+    export SBATCH_TIMELIMIT="${SBATCH_TIMELIMIT:-01:00:00}"
+  else
+    export SBATCH_TIMELIMIT="${SBATCH_TIMELIMIT:-12:00:00}"
+  fi
   echo "Submitting ${run_dir##*/} to Slurm (${SBATCH_PARTITION}, ${SBATCH_TIMELIMIT}," \
-    "${SBATCH_ACCOUNT:-default account}); squeue -u ${USER:-$(id -un)} tracks it."
+    "${SBATCH_QOS:+qos ${SBATCH_QOS}, }${SBATCH_ACCOUNT:-default account}); squeue -u ${USER:-$(id -un)} tracks it."
   sbatch \
     --job-name "${run_dir##*/}" \
     --chdir "${REPO_ROOT}" \
     --output "${run_dir}/slurm-%j.out" \
     --nodes 1 --ntasks 1 "${size[@]}" \
-    --wrap "exec ${cmd}"
+    --wrap "exec ${cmd}" || return
+  # The readers' shared squeue cache (scripts/slurm_queue.py) predates this job;
+  # dropped so `./ri runs` lists it as queued straight away.
+  rm -f "${XDG_CACHE_HOME:-${HOME}/.cache}/ri/squeue-${USER:-$(id -un)}.txt"
 }
 
 # `bash scripts/lib/slurm.sh --self-check`: when a run submits, and what it
@@ -61,9 +70,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     "${_dir}" "${_dir}" >"${_dir}/bin/sbatch"
   chmod +x "${_dir}/bin/sbatch"
   REPO_ROOT="${_dir}/repo"
-  unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS SBATCH_PARTITION SBATCH_TIMELIMIT
+  unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS SBATCH_PARTITION SBATCH_TIMELIMIT SBATCH_QOS
 
-  ns_should_submit && { echo "FAIL: no sbatch on PATH, so the run must stay in place"; exit 1; }
+  # A PATH of only the fake: the real cluster has sbatch on its own PATH.
+  PATH="${_dir}/none" ns_should_submit && { echo "FAIL: no sbatch on PATH, so the run must stay in place"; exit 1; }
   export PATH="${_dir}/bin:${PATH}"
   ns_should_submit || { echo "FAIL: sbatch on PATH outside a job means submit"; exit 1; }
   SLURM_JOB_ID=1 ns_should_submit && { echo "FAIL: inside a job the run must stay in place"; exit 1; }
@@ -102,6 +112,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   esac
   [ "$(cat "${_dir}/env")" = "${_run} sapphire 01:00:00" ] \
     || { echo "FAIL: the caller's partition and time must win, got: $(cat "${_dir}/env")"; exit 1; }
+
+  # The intr QoS caps a job at an hour, so without a time that is the default;
+  # a submission also drops the squeue cache so the job is seen at once.
+  unset SBATCH_PARTITION SBATCH_TIMELIMIT
+  export XDG_CACHE_HOME="${_dir}/cache"
+  mkdir -p "${XDG_CACHE_HOME}/ri"
+  touch "${XDG_CACHE_HOME}/ri/squeue-${USER:-$(id -un)}.txt"
+  SBATCH_QOS=intr ns_submit_run "${_run}" 200 scripts/run-nested-sampling.sh >/dev/null
+  [ "$(cat "${_dir}/env")" = "${_run} icelake 01:00:00" ] \
+    || { echo "FAIL: qos intr must default the time to its one-hour cap, got: $(cat "${_dir}/env")"; exit 1; }
+  [ -e "${XDG_CACHE_HOME}/ri/squeue-${USER:-$(id -un)}.txt" ] \
+    && { echo "FAIL: a submission must drop the squeue cache"; exit 1; }
 
   echo "slurm self-check passed"
 fi

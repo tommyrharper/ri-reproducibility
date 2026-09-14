@@ -30,7 +30,7 @@ _ns_available_mb() {
     return 0
   fi
   if [ -n "${SLURM_MEM_PER_CPU:-}" ]; then
-    printf '%s\n' "$((SLURM_MEM_PER_CPU * ${SLURM_CPUS_ON_NODE:-$(nproc)}))"
+    printf '%s\n' "$((SLURM_MEM_PER_CPU * ${SLURM_CPUS_ON_NODE:-$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)}))"
     return 0
   fi
   if [ -r /proc/meminfo ]; then

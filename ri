@@ -54,7 +54,18 @@ SLURM_ENV = (
     ("account", "SBATCH_ACCOUNT"),
     ("partition", "SBATCH_PARTITION"),
     ("time", "SBATCH_TIMELIMIT"),
+    ("qos", "SBATCH_QOS"),
 )
+
+
+def submits_to_slurm(env):
+    """Whether a search started with `env` leaves as a Slurm job at once.
+
+    The same test as ns_should_submit in scripts/lib/slurm.sh: a login node
+    with sbatch, outside an allocation, and not told NS_SBATCH=0.
+    """
+    return (not env.get("SLURM_JOB_ID") and env.get("NS_SBATCH", "1") == "1"
+            and shutil.which("sbatch", path=env.get("PATH")) is not None)
 
 
 def env_from(args, pairs):
@@ -320,7 +331,9 @@ def build_parser():
     slurm.add_argument("--partition", metavar="NAME",
                        help="Slurm partition, default icelake [SBATCH_PARTITION]")
     slurm.add_argument("--time", metavar="HH:MM:SS",
-                       help="Slurm time limit, default 12:00:00, the SL3 cap; SL1/SL2 may ask 36:00:00 [SBATCH_TIMELIMIT]")
+                       help="Slurm time limit, default 12:00:00, the SL3 cap (01:00:00 under --qos intr); SL1/SL2 may ask 36:00:00 [SBATCH_TIMELIMIT]")
+    slurm.add_argument("--qos", metavar="NAME",
+                       help="Slurm quality of service; CSD3's `intr` starts at once but caps the job at one hour [SBATCH_QOS]")
 
     parser = argparse.ArgumentParser(
         prog="./ri",
@@ -866,6 +879,16 @@ def main(argv=None):
         return 0
 
     child_env = {**os.environ, **env}
+    # --then, --plot and --report wait for a search to finish, but on a login
+    # node the search script only submits its job and returns at once: the
+    # second search would be queued alongside the first and the plot and report
+    # would read a run that has not started.
+    if args.handler is do_search and len(commands) > 1 and submits_to_slurm(child_env):
+        print("ERROR: --then, --plot and --report cannot follow a search submitted "
+              "to Slurm from a login node; run them after the job ends, or chain "
+              "them inside an allocation (sintr, or NS_SBATCH=0 in a batch script)",
+              file=sys.stderr)
+        return 2
     for command in commands:
         try:
             result = subprocess.run(command, cwd=REPO_ROOT, env=child_env, check=False)
