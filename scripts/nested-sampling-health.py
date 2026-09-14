@@ -119,23 +119,14 @@ def slurm_jobs() -> dict[str, str]:
     """Run name -> job state for this user's queued and running jobs.
 
     slurm.sh names a job after its run directory, and on a login node the
-    job's processes are on a compute node this host cannot see.
+    job's processes are on a compute node this host cannot see. Asked through
+    slurm_queue.py's shared two-minute cache: `./ri tui` runs this every few
+    seconds, and the cluster asks for no more than one squeue per two minutes.
     """
-    try:
-        out = subprocess.run(
-            ["squeue", "-h", "-u", os.environ.get("USER") or str(os.getuid()),
-             "-o", "%i %T %j"],
-            capture_output=True, text=True, check=True, timeout=20,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    me = os.environ.get("SLURM_JOB_ID")
-    jobs = {}
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0] != me:
-            jobs[parts[2]] = parts[1]
-    return jobs
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from slurm_queue import slurm_jobs as cached_slurm_jobs
+
+    return cached_slurm_jobs()
 
 
 def meminfo_mb(key: str) -> int | None:

@@ -54,6 +54,13 @@ fi
 R2D2_OMP_THREADS="${R2D2_OMP_THREADS:-1}"
 # shellcheck source=scripts/lib/r2d2-thread-env.sh
 source "${REPO_ROOT}/scripts/lib/r2d2-thread-env.sh"
+# A cluster login node is shared, and its administrators allow a few CPUs for a
+# few seconds: outside a Slurm job on a host with sbatch, draw with two
+# processes per pool rather than one per core. Override with RI_REPORT_WORKERS.
+if [[ -z "${RI_REPORT_WORKERS:-}" && -z "${SLURM_JOB_ID:-}" ]] && command -v sbatch >/dev/null 2>&1; then
+  RI_REPORT_WORKERS=2
+fi
+R2D2_ENV_FLAGS+=(--env "RI_REPORT_WORKERS=${RI_REPORT_WORKERS:-}")
 
 # The report reads the repo and writes reports/, at the paths the generator
 # hardcodes; the working tree is bound on top of the baked copy of itself.

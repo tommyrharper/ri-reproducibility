@@ -33,6 +33,14 @@ case "${ACTION}" in
   export)
     mkdir -p "${DIR}"
     for name in "${NAMES[@]}"; do
+      # CSD3 is x86_64 throughout. An Apple Silicon host builds arm64 by
+      # default (defaults.sh follows `uname -m`), and such a SIF only fails
+      # once it is on the cluster; rebuild with DOCKER_DEFAULT_PLATFORM=linux/amd64.
+      arch="$(docker image inspect -f '{{.Architecture}}' "$(tag_of "${name}")")"
+      if [ "${arch}" != amd64 ] && [ -z "${RI_EXPORT_ANY_ARCH:-}" ]; then
+        echo "FATAL: $(tag_of "${name}") is ${arch}, the cluster needs amd64 - DOCKER_DEFAULT_PLATFORM=linux/amd64 ./ri build (RI_EXPORT_ANY_ARCH=1 to export anyway)" >&2
+        exit 1
+      fi
       echo "==> ${DIR}/${name}.tar <- $(tag_of "${name}")"
       docker save "$(tag_of "${name}")" -o "${DIR}/${name}.tar"
     done
@@ -54,7 +62,14 @@ case "${ACTION}" in
         continue
       fi
       echo "==> ${SIF_DIR}/${name}.sif <- ${archive}"
-      "${APPTAINER}" build --force "${SIF_DIR}/${name}.sif" "docker-archive://${archive}"
+      # mksquashfs takes every core by default. A login node is shared and
+      # its administrators allow about four CPUs, so cap it outside a Slurm
+      # job; inside one (sintr) it may have the allocation.
+      squash=()
+      if [ -z "${SLURM_JOB_ID:-}" ]; then
+        squash=(--mksquashfs-args "-processors ${RI_IMPORT_PROCESSORS:-4}")
+      fi
+      nice "${APPTAINER}" build --force ${squash[@]+"${squash[@]}"} "${SIF_DIR}/${name}.sif" "docker-archive://${archive}"
     done
     rm -rf "${APPTAINER_TMPDIR}"
     echo "OK: images in ${SIF_DIR}"

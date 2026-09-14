@@ -36,17 +36,12 @@ def running_run_dirs(ps_output: str | None = None) -> set[str]:
 
 def slurm_job_names() -> set[str]:
     """This user's queued and running jobs, which slurm.sh names after their run
-    directories: on a login node the ranks are on a compute node ps cannot see."""
-    try:
-        out = subprocess.run(
-            ["squeue", "-h", "-u", os.environ.get("USER") or str(os.getuid()), "-o", "%i %j"],
-            capture_output=True, text=True, check=True, timeout=20,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    me = os.environ.get("SLURM_JOB_ID")
-    return {name for job_id, _, name in (line.partition(" ") for line in out.splitlines())
-            if name and job_id != me}
+    directories: on a login node the ranks are on a compute node ps cannot see.
+    Shares slurm_queue.py's two-minute squeue cache with `./ri health`."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from slurm_queue import slurm_jobs
+
+    return set(slurm_jobs())
 
 
 def read_run_env(run_dir: Path) -> dict[str, str]:

@@ -12,9 +12,12 @@ source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
-# Inside a Slurm job this is the allocation, not the node. Rank count comes
-# first because the FIFO setup needs it.
-HOST_CPUS="$(nproc)"
+# Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
+# OMP_THREAD_LIMIT are dropped because GNU nproc honours them, and CSD3's login
+# environment exports OMP_NUM_THREADS=1, which sbatch carries into the job: a
+# bare nproc there reads 1 on a 76-core node and the run gets one rank.
+# Rank count comes first because the FIFO setup needs it.
+HOST_CPUS="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)"
 # Rank count drives memory use; rank-budget.sh clamps it to available memory.
 # shellcheck source=scripts/lib/rank-budget.sh
 . "${REPO_ROOT}/scripts/lib/rank-budget.sh"

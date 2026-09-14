@@ -9,7 +9,8 @@ r2d2_thread_count() {
     return
   fi
   if command -v nproc >/dev/null 2>&1; then
-    nproc
+    # Not the inherited OMP_NUM_THREADS (1 on CSD3), which nproc would echo.
+    env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc
   elif command -v sysctl >/dev/null 2>&1; then
     sysctl -n hw.logicalcpu 2>/dev/null || echo 1
   else
