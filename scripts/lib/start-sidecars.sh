@@ -89,8 +89,9 @@ sidecar_launch() {
   _SIDECAR_COMMANDS+=("$(printf '%q ' "${run[@]}")")
   # The workers' own stderr - a meqserver crash, a torch import error - is the
   # only record of why a pool died, and it lands beside the run.
-  _SIDECAR_LOGS+=("${OUTPUT_DIR:-${TMPDIR:-/tmp}}/workers-${name}.log")
-  _sidecar_start "${run[@]}" >>"${_SIDECAR_LOGS[-1]}" 2>&1
+  local log="${OUTPUT_DIR:-${TMPDIR:-/tmp}}/workers-${name}.log"
+  _SIDECAR_LOGS+=("${log}")
+  _sidecar_start "${run[@]}" >>"${log}" 2>&1
   # INT and TERM as well as EXIT: bash does not run an EXIT trap when it dies
   # on an uncaught signal, so a Ctrl-C or a `timeout` would leave the pools
   # running with no parent - an R2D2 pool holds ~3.4GB per rank of warm
@@ -109,8 +110,9 @@ sidecar_restore() {
     local -a run=()
     eval "run=(${_SIDECAR_COMMANDS[$i]})"
     _sidecar_start "${run[@]}" >>"${_SIDECAR_LOGS[$i]}" 2>&1
-    SIDECAR_PIDS[i]="${SIDECAR_PIDS[-1]}"
-    unset 'SIDECAR_PIDS[-1]'
+    # Spelled out because macOS bash 3.2 has no negative subscripts.
+    SIDECAR_PIDS[i]="${SIDECAR_PIDS[${#SIDECAR_PIDS[@]}-1]}"
+    unset "SIDECAR_PIDS[${#SIDECAR_PIDS[@]}-1]"
   done
 }
 
