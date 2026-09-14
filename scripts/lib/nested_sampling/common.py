@@ -1789,7 +1789,11 @@ _SIMULATE_WORKERS: dict[str, "FifoWorker"] = {}
 def _children_of(pid: int) -> list[int]:
     """A /proc walk rather than pgrep: the ranks run inside polychord.sif,
     which has no procps, and Apptainer shares the host's pid namespace, so
-    the pids are the same ones the pool wrote."""
+    the pids are the same ones the pool wrote. A macOS host running the
+    self-check has no /proc but does have pgrep."""
+    if not os.path.isdir("/proc"):
+        out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+        return [int(child) for child in out.split()]
     children = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -2234,9 +2238,13 @@ def self_check_worker_pool_connect() -> None:
                     except ProcessLookupError:
                         break
                     # Killed but not yet reaped by its parent, which is gone
-                    # too; init will. Zombie is as dead as it gets.
-                    if Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                        break
+                    # too; init will. Zombie is as dead as it gets. Without
+                    # /proc (macOS) launchd reaps it and the kill above fails.
+                    try:
+                        if Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                            break
+                    except FileNotFoundError:
+                        pass
                     assert time.monotonic() < deadline, "the worker's child survived kill()"
                     time.sleep(0.02)
             # No pool at all is a WorkerDied, not a rank-started fallback.
