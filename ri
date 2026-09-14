@@ -5,18 +5,24 @@ import argparse
 import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-IMAGES = ("wsclean", "r2d2", "meqtrees", "polychord")
+# CSD3's system python3 is 3.6 and the parsers below need 3.9, so an old
+# interpreter hands over to uv's before anything else runs (uv is already a
+# prerequisite for every host-side script; README.md section 3).
+if sys.version_info < (3, 9):
+    if shutil.which("uv") and not os.environ.get("RI_PYTHON_REEXEC"):
+        os.environ["RI_PYTHON_REEXEC"] = "1"
+        os.execvp("uv", ["uv", "run", "--no-project", "--python", ">=3.11", "python",
+                         os.path.abspath(__file__), *sys.argv[1:]])
+    sys.exit("./ri needs Python 3.9 or newer: install uv (README.md section 3) "
+             "or `module load` a newer python first.")
 
-# The images a search needs built before it can start.
-SEARCH_IMAGES = {
-    "wsclean": ("wsclean", "meqtrees", "polychord"),
-    "r2d2": ("r2d2", "meqtrees", "polychord"),
-}
+IMAGES = ("wsclean", "r2d2", "meqtrees", "polychord")
 
 SEARCH_SCRIPT = {
     "wsclean": "scripts/run-nested-sampling.sh",
@@ -41,6 +47,25 @@ SEARCH_ENV = (
     ("omp_threads", "R2D2_OMP_THREADS"),
     ("output_dir", "OUTPUT_DIR"),
 )
+
+# Slurm flags, on search and resume: sbatch reads these variables itself, so
+# they reach the job with no plumbing in between (docs/cluster.md).
+SLURM_ENV = (
+    ("account", "SBATCH_ACCOUNT"),
+    ("partition", "SBATCH_PARTITION"),
+    ("time", "SBATCH_TIMELIMIT"),
+    ("qos", "SBATCH_QOS"),
+)
+
+
+def submits_to_slurm(env):
+    """Whether a search started with `env` leaves as a Slurm job at once.
+
+    The same test as ns_should_submit in scripts/lib/slurm.sh: a login node
+    with sbatch, outside an allocation, and not told NS_SBATCH=0.
+    """
+    return (not env.get("SLURM_JOB_ID") and env.get("NS_SBATCH", "1") == "1"
+            and shutil.which("sbatch", path=env.get("PATH")) is not None)
 
 
 def env_from(args, pairs):
@@ -71,6 +96,10 @@ def do_build(args):
     return env, [["scripts/build.sh", args.target]]
 
 
+def do_images(args):
+    return {}, [["scripts/images.sh", args.action, *([args.dir] if args.dir else [])]]
+
+
 def do_smoke(args):
     if args.target == "ms-to-mat":
         env = {"MS_PATH": args.ms_path} if args.ms_path else {}
@@ -88,24 +117,14 @@ def do_shell(args):
 
 
 def do_search(args):
-    env = env_from(args, SEARCH_ENV)
-    if args.native:
-        # The search builds its images first, and build.sh reads this, so
-        # without it here a search would rebuild the portable WSClean over any
-        # native one `./ri build wsclean --native` had left under the tag.
-        env["WSCLEAN_TARGET_CPU"] = "native"
+    env = env_from(args, SEARCH_ENV + SLURM_ENV)
     if args.enable_param:
         env["NS_ENABLE_PARAMS"] = ",".join(args.enable_param)
     if args.disable_param:
         env["NS_DISABLE_PARAMS"] = ",".join(args.disable_param)
-    imagers = [args.imager] + ([args.then] if args.then else [])
-    commands = []
-    if not args.no_build:
-        # dict.fromkeys, not a set: the two searches share meqtrees and
-        # polychord, and a build order that changes run to run is not one.
-        commands += [["scripts/build.sh", i]
-                     for i in dict.fromkeys(i for m in imagers for i in SEARCH_IMAGES[m])]
-    commands.append([SEARCH_SCRIPT[args.imager]])
+    # No build in front of it: the SIFs are whatever `./ri images import` last
+    # made, and the run script refuses to start if one is missing.
+    commands = [[SEARCH_SCRIPT[args.imager]]]
     if args.then:
         # main() stops at the first command that fails, so the second search
         # runs only if the first one finished - the reason to chain rather
@@ -198,10 +217,7 @@ def do_tui(args):
 
 
 def do_resume(args):
-    # The build is the resume script's own, because only run.env knows which
-    # images this run needs - unlike ./ri search, where the imager is a flag.
-    env = {"NS_NO_BUILD": "1"} if args.no_build else {}
-    return env, [["scripts/resume-nested-sampling-run.sh", args.run]]
+    return env_from(args, SLURM_ENV), [["scripts/resume-nested-sampling-run.sh", args.run]]
 
 
 def do_report(args):
@@ -240,10 +256,7 @@ def do_bench(args):
 
 
 def do_bench_run(args):
-    # Builds first, exactly as a search does: the images bake the code, so
-    # without it the benchmark times whatever was baked last.
-    env = {"WSCLEAN_TARGET_CPU": "native"} if args.native else {}
-    return env, [["scripts/build.sh", i] for i in SEARCH_IMAGES[args.imager]] + [
+    return {}, [
         uv("scripts/bench.py", "run", args.imager, "--preset", args.preset,
            "--repeat", str(args.repeat),
            *(["--mpi-procs", str(args.mpi_procs)] if args.mpi_procs is not None else []),
@@ -295,7 +308,7 @@ def do_clean(args):
 
 
 def do_disk_usage(args):
-    return {}, [["docker", "system", "df", "-v"]]
+    return {}, [["du", "-sh", "images", "results", "reports", "checkpoints", "data"]]
 
 
 # --- argument parsing --------------------------------------------------------
@@ -311,6 +324,17 @@ def build_parser():
         help="print the environment and commands instead of running them",
     )
 
+    # The cluster: on a login node search and resume submit a job (docs/cluster.md).
+    slurm = argparse.ArgumentParser(add_help=False)
+    slurm.add_argument("--account", metavar="PROJECT-CPU",
+                       help="Slurm account to charge; `mybalance` lists yours [SBATCH_ACCOUNT]")
+    slurm.add_argument("--partition", metavar="NAME",
+                       help="Slurm partition, default icelake [SBATCH_PARTITION]")
+    slurm.add_argument("--time", metavar="HH:MM:SS",
+                       help="Slurm time limit, default 12:00:00, the SL3 cap (01:00:00 under --qos intr); SL1/SL2 may ask 36:00:00 [SBATCH_TIMELIMIT]")
+    slurm.add_argument("--qos", metavar="NAME",
+                       help="Slurm quality of service; CSD3's `intr` starts at once but caps the job at one hour [SBATCH_QOS]")
+
     parser = argparse.ArgumentParser(
         prog="./ri",
         description=(
@@ -319,7 +343,7 @@ def build_parser():
         ),
         epilog=(
             "Typical session:\n"
-            "  ./ri build                  # the four Docker images (slow, once)\n"
+            "  ./ri images import          # the SIFs, from archives built on a Docker host\n"
             "  ./ri smoke                  # can the imagers actually image?\n"
             "  ./ri search wsclean         # run a search\n"
             "  ./ri report                 # one HTML page per run\n"
@@ -341,10 +365,10 @@ def build_parser():
     # No dest: the `record` subcommand has its own `command` positional.
     subs = parser.add_subparsers(metavar="<command>", required=True)
 
-    def add(name, handler, help_text, **kwargs):
+    def add(name, handler, help_text, parents=(), **kwargs):
         description = kwargs.pop("description", help_text)
         sub = subs.add_parser(
-            name, help=help_text, description=description, parents=[dry_run],
+            name, help=help_text, description=description, parents=[dry_run, *parents],
             # Prose is wrapped to the terminal; anything already laid out by
             # hand (the examples above, the search command below) is not.
             formatter_class=(
@@ -358,17 +382,26 @@ def build_parser():
         return sub
 
     # Images
-    build = add("build", do_build, "build the Docker images",
-                description="Build the Docker images (docker build, so re-running "
-                            "just hits the layer cache).")
+    build = add("build", do_build, "build the Docker images (on a Docker host)",
+                description="Build the Docker images on a Docker host (docker build, so "
+                            "re-running just hits the layer cache), to carry to the "
+                            "cluster with `./ri images export`. Nothing on the cluster "
+                            "builds; see docs/cluster.md.")
     build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES),
                        help="which image to build (default: all)")
     build.add_argument("--native", action="store_true",
                        help="WSClean tuned for this exact CPU (WSCLEAN_TARGET_CPU=native) "
                             "rather than the default AVX2 baseline; a little faster and "
                             "SIGILLs anywhere else. Reuses the same image tag, so the "
-                            "next build without it puts the default one back - pass "
-                            "--native to ./ri search too")
+                            "next build without it puts the default one back")
+
+    images = add("images", do_images, "carry the images to the cluster as SIF files",
+                 description="export: on a Docker host, `docker save` each built image "
+                             "into DIR (default images/archives). import: on the "
+                             "cluster, build images/<name>.sif from those archives with "
+                             "Apptainer. rsync DIR between the two. See docs/cluster.md.")
+    images.add_argument("action", choices=("export", "import"))
+    images.add_argument("dir", nargs="?", help="archive directory (default: images/archives)")
 
     self_check = add("self-check", do_self_check, "run the checks that need the images",
         description="Runs the host-side checks, then each module's own "
@@ -397,13 +430,13 @@ def build_parser():
                                          "simulating one (MS_PATH)")
 
     shell = add("shell", do_shell, "open a shell inside an image",
-                description="Interactive bash in one of the built images, with this "
-                            "repo's usual mounts.")
+                description="Interactive shell in one of the imported SIFs, with this "
+                            "repo's usual binds.")
     shell.add_argument("image", choices=IMAGES, help="which image to enter")
 
     # Searches
     search = add(
-        "search", do_search, "run a nested-sampling search",
+        "search", do_search, "run a nested-sampling search", parents=[slurm],
         description=(
             "Run PolyChord over the VLA.A observing-parameter space, scoring each\n"
             "sample by how badly the imager reconstructs a known 1 Jy point source.\n"
@@ -493,12 +526,6 @@ def build_parser():
                              "of searching it; repeatable, and --enable-param wins if a name "
                              "is given to both [NS_DISABLE_PARAMS]. ./ri params lists names "
                              "and current state")
-    search.add_argument("--native", action="store_true",
-                        help="build WSClean for this exact CPU (WSCLEAN_TARGET_CPU=native) "
-                             "rather than the default AVX2 baseline; the binary then runs "
-                             "nowhere else, see docs/nested-sampling-throughput.md")
-    search.add_argument("--no-build", action="store_true",
-                        help="skip the image builds this search would do first")
     search.add_argument("--plot", action="store_true",
                         help="once the search - or the --then pair - has finished, plot "
                              "the newest directly comparable R2D2 and WSClean runs "
@@ -570,12 +597,13 @@ def build_parser():
             "stalls, how many evaluations scored FAILURE_OBJECTIVE - which\n"
             "PolyChord maximizes, so a broken imager looks like a spectacular\n"
             "discovery - how many self-healed restarts a live run has left\n"
-            "before the next crash leaves it waiting for a ./ri resume, and\n"
-            "any sidecar container left holding memory by a run that is gone.\n"
+            "before the next crash leaves it waiting for a ./ri resume.\n"
             "\n"
-            "Reads files, runs one ps and one docker ps, and samples CPU\n"
+            "Reads files, runs one ps and one squeue, and samples CPU\n"
             "for a second when a run is live, so it costs a busy\n"
-            "host nothing. Exits 1 when something needs attention, and\n"
+            "host nothing. On a login node a run's ranks are on a compute\n"
+            "node this host cannot see: its Slurm job says it is QUEUED\n"
+            "or going, and what it has written says how well. Exits 1 when something needs attention, and\n"
             "says so on the run's headline as a warning count - coloured\n"
             "on a terminal, and never when piped or under NO_COLOR."
         ),
@@ -620,7 +648,7 @@ def build_parser():
     )
 
     resume = add(
-        "resume", do_resume, "continue a run that stopped early",
+        "resume", do_resume, "continue a run that stopped early", parents=[slurm],
         description=(
             "Continue an interrupted run in place, keeping every evaluation it\n"
             "already finished. The run directory records the settings it was\n"
@@ -630,17 +658,12 @@ def build_parser():
             "going is refused: a second job over its checkpoint and FIFO\n"
             "directories would corrupt both.\n"
             "\n"
-            "The images the run needs are built first, exactly as ./ri search\n"
-            "does - a run executes the code baked into them, so without it a\n"
-            "resume silently continues on whatever was baked last time. Free\n"
-            "when nothing changed; --no-build skips it."
+            "The run continues on the SIFs under images/ and the code in this\n"
+            "checkout, the same as ./ri search."
         ),
     )
     resume.add_argument("run", metavar="RUN",
                         help="run directory, or its name under results/nested-sampling/")
-    resume.add_argument("--no-build", action="store_true",
-                        help="skip the image builds this resume would do first, so the "
-                             "run continues on the code already baked into them")
 
     # Results
     report = add("report", do_report, "build the HTML run report",
@@ -716,8 +739,9 @@ def build_parser():
 
     bench_run = bench_subs.add_parser(
         "run", parents=[dry_run], help="run the controlled search and record it",
-        description="Build the images, run the search a preset pins the settings "
-                    "of, and add its row. Commit first: a row carries the "
+        description="Run the search a preset pins the settings of, and add its "
+                    "row; on a cluster login node the whole benchmark is one "
+                    "Slurm job. Commit first: a row carries the "
                     "commit it was measured at, and one measured on a dirty "
                     "tree is marked with a trailing +.",
     )
@@ -731,8 +755,6 @@ def build_parser():
                                 "this commit gets smaller (default: %(default)s)")
     bench_run.add_argument("--timeout", type=float, metavar="SECONDS",
                            help="stop the whole benchmark, including its process tree")
-    bench_run.add_argument("--native", action="store_true",
-                           help="build and benchmark WSClean for this exact CPU")
     bench_run.add_argument("--mpi-procs", type=int, metavar="N",
                            help="override MPI worker count for rank-scaling probes")
     bench_run.add_argument("--omp-threads", type=int, metavar="N",
@@ -798,7 +820,7 @@ def build_parser():
     plot_gui = plot_subs.add_parser(
         "gui", parents=[dry_run], help="interactive corner plots of a run (needs a display)",
         description="Open the run's samples in anesthetic's GUI. Host-side and needs "
-                    "a display, so not inside Docker or Colima.",
+                    "a display, so not on a compute node.",
     )
     plot_gui.add_argument("run", nargs="?", metavar="RUN",
                           help="run directory, chains/, or PolyChord file root "
@@ -832,10 +854,10 @@ def build_parser():
                         help="the exact command that was run, recorded verbatim")
 
     add("clean", do_clean, "remove this repo's images and smoke-test output",
-        description="Removes the images built here and the generated smoke-test "
-                    "output. Your data/, checkpoints/, results/ and reports/ are left "
-                    "alone. Run 'docker builder prune' to reclaim build cache.")
-    add("disk-usage", do_disk_usage, "what Docker is using on disk")
+        description="Removes the imported SIFs, their archives and the generated "
+                    "smoke-test output. Your data/, checkpoints/, results/ and "
+                    "reports/ are left alone.")
+    add("disk-usage", do_disk_usage, "what this checkout is using on disk")
 
     return parser
 
@@ -857,6 +879,16 @@ def main(argv=None):
         return 0
 
     child_env = {**os.environ, **env}
+    # --then, --plot and --report wait for a search to finish, but on a login
+    # node the search script only submits its job and returns at once: the
+    # second search would be queued alongside the first and the plot and report
+    # would read a run that has not started.
+    if args.handler is do_search and len(commands) > 1 and submits_to_slurm(child_env):
+        print("ERROR: --then, --plot and --report cannot follow a search submitted "
+              "to Slurm from a login node; run them after the job ends, or chain "
+              "them inside an allocation (sintr, or NS_SBATCH=0 in a batch script)",
+              file=sys.stderr)
+        return 2
     for command in commands:
         try:
             result = subprocess.run(command, cwd=REPO_ROOT, env=child_env, check=False)

@@ -121,8 +121,8 @@ run_with_retries() {
       fi
     fi
     # Re-clamp against current memory: another run may have grown since the
-    # failed attempt. Down costs time; up risks an OOM score. Restarts create
-    # their own workers, so the original FIFO pool does not constrain them.
+    # failed attempt. Down costs time; up risks an OOM score. Never up past
+    # what was asked for, so the pools always have a worker per rank.
     ranks="$(_ns_retry_rank_count "${args[@]}")"
     if [ "${ranks}" = "0" ]; then
       _ns_retry_say "${output_dir}" \
@@ -144,8 +144,11 @@ run_with_retries() {
       done
       args=("${rescaled[@]}")
     fi
-    # Sidecar restore is optional for fixtures; log failures, then let the next
-    # attempt's progress guard stop if the sidecar remains unavailable.
+    # Both hooks are optional for fixtures; log failures, then let the next
+    # attempt's progress guard stop if the pool remains unavailable.
+    if declare -F sidecar_reset_workers >/dev/null; then
+      sidecar_reset_workers 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
+    fi
     if declare -F sidecar_restore >/dev/null; then
       sidecar_restore 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
     fi
@@ -234,7 +237,7 @@ _ns_stop_watchdog() {
 #
 # Detect hangs that worker timeouts cannot: a stuck rank leaves PolyChord
 # waiting forever. Watch completed evaluations, then kill the run by command
-# line so retry logic can resume it; the `docker exec` client PID is not enough.
+# line so retry logic can resume it; mpirun's PID alone is not enough.
 # Default timeout is twice IMAGING_REPLY_TIMEOUT, well above the measured
 # 23.5s maximum gap; `./ri health` provides the interactive equivalent.
 _ns_stall_watchdog() {
@@ -885,7 +888,7 @@ self_check() {
   fi
 
   # _ns_add_trap must append to an existing trap, not replace it - a naive
-  # `trap ... EXIT` here would silently disable start-sidecars.sh's Docker
+  # `trap ... EXIT` here would silently disable start-sidecars.sh's pool
   # cleanup on exit/Ctrl-C.
   (
     log="${tmp}/trap.log"
@@ -957,12 +960,12 @@ self_check() {
     exit 1
   }
 
-  # Every retry gives the sidecars a chance to come back first. A container
-  # that died takes every later attempt with it - the `docker exec` fails
+  # Every retry gives the worker pools a chance to come back first. A pool
+  # that died takes every later attempt with it - the rank finds no worker
   # instantly and the no-progress guard above then calls the run
   # deterministic - so the hook has to fire once per retry, not once per run.
   # Called by name because start-sidecars.sh is sourced by the run scripts and
-  # not by this file, which keeps the retry loop runnable without docker.
+  # not by this file, which keeps the retry loop runnable without apptainer.
   local hook_dir="${tmp}/hook"
   mkdir -p "${hook_dir}/chains"
   sidecar_restore() { echo r >>"${hook_dir}/restores"; }
@@ -1051,7 +1054,7 @@ self_check() {
   echo fine >"${intact_dir}/chains/r.resume"
   # shellcheck disable=SC2016
   run_with_retries 2 "${intact_dir}" -1 2 -- \
-    sh -c 'echo a >>"$0"/attempts; echo "docker: no such image" >&2; exit 5' \
+    sh -c 'echo a >>"$0"/attempts; echo "FATAL: no such SIF" >&2; exit 5' \
     "${intact_dir}" >/dev/null 2>&1 || true
   [ "$(_ns_count_lines "${intact_dir}/attempts")" = "1" ] || {
     echo "FAIL: unrelated failure retried $(_ns_count_lines "${intact_dir}/attempts") times"; exit 1
@@ -1101,13 +1104,10 @@ self_check() {
   #
   # The fixture is the `progressing` command with an mpirun-shaped tail, and
   # it writes back the arguments it was actually called with: that is the only
-  # place the rewrite is observable. `docker` is stubbed and the reservation
-  # directory is private because `ns_budget_ranks` reaps leaked sidecars and
-  # writes a real reservation - neither belongs in a self-check on a host
-  # other sessions are running searches on.
-  mkdir -p "${tmp}/bin"
-  printf '#!/bin/sh\nexit 0\n' >"${tmp}/bin/docker"
-  chmod +x "${tmp}/bin/docker"
+  # place the rewrite is observable. The reservation directory is private
+  # because `ns_budget_ranks` reaps leaked pools and writes a real
+  # reservation - neither belongs in a self-check on a host other sessions
+  # are running searches on.
   local resize_dir="${tmp}/resize"
   mkdir -p "${resize_dir}/chains"
   # shellcheck disable=SC2016  # $0 and $* are the child `sh`'s, not ours
@@ -1117,9 +1117,9 @@ self_check() {
   status=0
   # 4096MB of headroom plus two R2D2 ranks, against a command asking for 8.
   # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
-  # gets its own budget dir, PATH and free-memory reading and leaks neither
+  # gets its own budget dir and free-memory reading and leaks neither
   (
-    export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
+    export NS_RANK_BUDGET_DIR="${tmp}/budget"
     export NS_AVAILABLE_MB=$((4096 + 2 * 3500))
     run_with_retries 1 "${resize_dir}" -1 2 -- sh -c "${recording}" "${resize_dir}" \
       -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
@@ -1145,9 +1145,9 @@ self_check() {
   mkdir -p "${starved_dir}/chains"
   status=0
   # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
-  # gets its own budget dir, PATH and free-memory reading and leaks neither
+  # gets its own budget dir and free-memory reading and leaks neither
   (
-    export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
+    export NS_RANK_BUDGET_DIR="${tmp}/budget"
     export NS_AVAILABLE_MB=$((4096 + 100))
     run_with_retries 1 "${starved_dir}" -1 2 -- sh -c "${recording}" "${starved_dir}" \
       -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
@@ -1169,9 +1169,9 @@ self_check() {
   mkdir -p "${roomy_dir}/chains"
   status=0
   # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
-  # gets its own budget dir, PATH and free-memory reading and leaks neither
+  # gets its own budget dir and free-memory reading and leaks neither
   (
-    export NS_RANK_BUDGET_DIR="${tmp}/budget" PATH="${tmp}/bin:${PATH}"
+    export NS_RANK_BUDGET_DIR="${tmp}/budget"
     export NS_AVAILABLE_MB=$((4096 + 64 * 3500))
     run_with_retries 1 "${roomy_dir}" -1 2 -- sh -c "${recording}" "${roomy_dir}" \
       -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py

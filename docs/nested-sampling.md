@@ -20,11 +20,12 @@ self-check (`./ri self-check simulate`) verifies exact agreement;
 ## Run it
 
 Both algorithms share `NS_*` and `OUTPUT_DIR` overrides (see "Environment
-overrides"). Each target builds required images, starts one long-lived sidecar
-per image, and runs PolyChord through `docker exec` (see
-[nested-sampling-profiling.md](nested-sampling-profiling.md)).
+overrides"). Each target starts one long-lived worker pool per image under
+Apptainer and runs PolyChord inside `polychord.sif` (see
+[nested-sampling-profiling.md](nested-sampling-profiling.md)); on a cluster
+login node it submits all of that as one Slurm job ([cluster.md](cluster.md)).
 
-Once the containers are up, a status line tracks the search against its
+Once the pools are up, a status line tracks the search against its
 `--max-ndead` budget: elapsed time, dead points done (from PolyChord's own
 `chains/*_dead-birth.txt`, one line per dead point - not the raw evaluation
 count, which is always higher since PolyChord's slice sampler makes several
@@ -844,7 +845,7 @@ until Ctrl-C. Copy the whole directory (`rsync -a`), since pages link to
 
 For an interactive nested-sampling replay (live points vs \(\ln X\), \(\beta\)
 tempering) with human-readable parameter labels, run on the **host** (needs a
-display; not inside Docker/Colima):
+display; not on a compute node):
 
 ```bash
 ./ri plot gui

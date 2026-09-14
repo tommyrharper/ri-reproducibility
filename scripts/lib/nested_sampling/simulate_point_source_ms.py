@@ -147,29 +147,47 @@ def run_makems(output_ms: Path) -> None:
 # Cache by (NTimes, NFrequencies): copy/patch ~0.002s vs makems ~0.05s;
 # shared /dev/shm serves all ranks.
 #
-# ponytail: no eviction - the sidecar ends with the run and the full parameter
-# space is ~20MB. Add an LRU sweep if a longer-lived container reuses one.
+# ponytail: no eviction - the cache ends with the run and the full parameter
+# space is ~20MB. Add an LRU sweep if a longer-lived cache reuses one.
 _SKELETON_DIR: Path | None = None
+_SKELETON_DIR_EXPLICIT = False
 
 # `--prebuild-skeletons` puts default-run shapes here at image build time;
-# see docker/meqtrees/Dockerfile.
+# see docker/meqtrees/Dockerfile. Read-only at run time: under Apptainer the
+# image is, and under Docker it may as well have been.
 BAKED_SKELETON_DIR = Path("/opt/ms-skeletons")
 
 
 def skeleton_dir() -> Path:
+    """Where unseen shapes are built and published: the run's shared MS
+    scratch, which is what the container's own filesystem amounted to under
+    Docker - a fresh cache per run, gone with it."""
     global _SKELETON_DIR
     if _SKELETON_DIR is None:
-        # Baked shapes are a head start; unseen shapes are built and published.
-        _SKELETON_DIR = BAKED_SKELETON_DIR if BAKED_SKELETON_DIR.is_dir() else Path(SCRATCH_ROOT or tempfile.gettempdir()) / "ms-skeletons"
+        root = os.environ.get("NS_SCRATCH_DIR") or SCRATCH_ROOT or tempfile.gettempdir()
+        _SKELETON_DIR = Path(root) / f"ms-skeletons-{os.getuid()}"
         _SKELETON_DIR.mkdir(parents=True, exist_ok=True)
     return _SKELETON_DIR
 
 
 def use_skeleton_cache(directory: Path | None) -> None:
-    global _SKELETON_DIR
+    """Name the one directory to read and publish; None restores the default."""
+    global _SKELETON_DIR, _SKELETON_DIR_EXPLICIT
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)
     _SKELETON_DIR = directory
+    _SKELETON_DIR_EXPLICIT = directory is not None
+
+
+def cached_skeleton(key: str) -> Path:
+    """The entry for `key`: published this run, else baked into the image,
+    else the path to publish it at. Baked shapes are a head start only on the
+    default cache; a directory named with use_skeleton_cache() is on its own."""
+    name = hashlib.sha256(key.encode()).hexdigest()[:32]
+    published = skeleton_dir() / name
+    if not published.exists() and not _SKELETON_DIR_EXPLICIT and (BAKED_SKELETON_DIR / name).is_dir():
+        return BAKED_SKELETON_DIR / name
+    return published
 
 
 def publish_skeleton(built_ms: Path, cached: Path) -> None:
@@ -197,7 +215,7 @@ def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_wi
 
 def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune_unused: bool = False) -> None:
     key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
-    cached = skeleton_dir() / hashlib.sha256(key.encode()).hexdigest()[:32]
+    cached = cached_skeleton(key)
     if not cached.exists():
         run_makems(output_ms)
         publish_skeleton(output_ms, cached)
@@ -1131,7 +1149,7 @@ if __name__ == "__main__":
             # runtime image still carries nothing but the three simulate scripts.
             from common import load_parameter_space
 
-            BAKED_SKELETON_DIR.mkdir(parents=True, exist_ok=True)
+            use_skeleton_cache(BAKED_SKELETON_DIR)
             prebuild_skeletons({spec["name"]: [spec["min"], spec["max"]] for spec in load_parameter_space()})
         elif sys.argv[1:2] == ["--serve"]:
             # `--serve` / `--serve --fifo <base>`; neither takes the simulate

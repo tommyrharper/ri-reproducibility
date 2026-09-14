@@ -2,7 +2,7 @@
 # 22669259f770a0cb3a3191a5d3e8dbad4ae5a70c) for this repo's container
 # paths. Upstream field documentation: see R2D2-RI README.md "Usage and
 # Example". Mounted read-only into the r2d2 container at
-# /workspace/config/R2D2_U-Net.yaml by compose.yaml.
+# /workspace/config/R2D2_U-Net.yaml by scripts/smoke-test-r2d2.sh.
 
 # i/o
 # Note: these are relative to WORKDIR (/opt/r2d2/R2D2-RI) inside the

@@ -1,6 +1,10 @@
 # ri-reproducibility
 
-**PolyChord searches this repo's R2D2-RI and WSClean parameter spaces for failure modes**; Docker images, smoke tests, and pinned revisions keep searches runnable and results trustworthy.
+**PolyChord searches this repo's R2D2-RI and WSClean parameter spaces for failure modes**; container images, smoke tests, and pinned revisions keep searches runnable and results trustworthy.
+
+**This is the `cluster` branch**: it runs on Cambridge's CSD3 under Slurm and
+Apptainer, without Docker. [`docs/cluster.md`](docs/cluster.md) is the
+authority for everything cluster-specific; `main` is the Docker branch.
 
 **Which R2D2:** the U-Net incarnation (`series: R2D2`, `layers: 1`), from R2D2-RI
 v2.0 - checkpoints `R2D2_A1_T2_Realisation1`, 25 terms. `A1` = U-Net (`A2` =
@@ -15,7 +19,7 @@ definitions and published numbers from. Do not compare search output against
 
 ```bash
 ./ri --help            # the whole surface, and --help on every subcommand
-./ri build             # the four Docker images
+./ri images import     # the four images, from archives built on a Docker host
 ./ri search wsclean    # run a search
 ```
 
@@ -33,14 +37,20 @@ reproduction target.
 ## 1. Running a search
 
 ```bash
-cp .env.example .env    # adjust HOST_UID/HOST_GID/paths if needed
-./ri search wsclean     # WSClean search (builds its images first)
+export SBATCH_ACCOUNT=MYPROJECT-CPU   # or --account; `mybalance` lists yours
+./ri search wsclean     # WSClean search, submitted as a Slurm job
 ./ri search r2d2        # R2D2 search (needs checkpoints, section 5)
 
 ./ri search wsclean --nlive 20 --num-repeats 5 --max-ndead 20
 ./ri search r2d2 --metric sigma_res
 NS_NLIVE=20 ./ri search wsclean    # same thing; every flag has a variable
 ```
+
+On a login node `./ri search` and `./ri resume` submit themselves as a job
+named after the run (`squeue -u $USER`); inside an allocation, or on a host
+without Slurm, they run in place. `--account`, `--partition` and `--time` (or
+any `SBATCH_*` variable) shape the job; see
+[`docs/cluster.md`](docs/cluster.md).
 
 Output lands in `results/nested-sampling/<tool>-vlaa-<UTC>/`: one
 directory per likelihood evaluation (the MS, the reconstruction FITS, and
@@ -84,27 +94,43 @@ linked from the top of the index.
 
 ## 3. Host prerequisites
 
-- Docker Desktop (built/verified against Docker 20.10.17 client /
-  Docker Desktop's `desktop-linux` context on macOS).
-- `git`.
-- [`uv`](https://docs.astral.sh/uv/) for parsing `defaults.toml` and running
-  host-side analysis (`./ri profile`, `./ri plot gui`, `./ri merge`).
-- Python 3 for the stdlib-only `./ri` dispatcher.
-- Nothing else.
+On the cluster:
+
+- Apptainer (`apptainer` or `singularity`) and Slurm (`sbatch`, `squeue`);
+  CSD3 has both on every node, no module to load.
+- `git`; also there already.
+- [`uv`](https://docs.astral.sh/uv/) for every host-side Python: install it
+  into your home (`curl -LsSf https://astral.sh/uv/install.sh | sh`), then
+  run `uv sync` once in the checkout on a login node so a job never has to
+  download an interpreter or a package. CSD3's system `python3` is 3.6, too
+  old for the stdlib-only `./ri` dispatcher (3.9+), so `./ri` re-runs itself
+  under uv's Python when it finds an old one; no `module load` needed.
+
+Plus, somewhere else, one machine with Docker to build the images on (section 4).
 
 ## 4. Building the images
 
+The four environments are still defined by the Dockerfiles under `docker/`,
+built on a Docker host and carried to the cluster as SIF files:
+
 ```bash
-./ri build              # all four
-./ri build wsclean     # or r2d2, meqtrees, polychord
+# on a Docker host (x86-64, to match the cluster):
+./ri build              # all four; unchanged inputs skip `docker build`
+./ri images export      # docker save -> images/archives/<name>.tar
+rsync -avz images/archives/ login.hpc.cam.ac.uk:<repo>/images/archives/
+
+# on the cluster, in the same checkout:
+./ri images import      # apptainer build images/<name>.sif
 ```
 
-`./ri search` builds required images first; use this to build ahead of time.
-Unchanged inputs skip `docker build`; `FORCE_BUILD=1` overrides that.
+`./ri search` builds nothing and refuses to start without its SIFs. Editing
+`scripts/lib/nested_sampling/` needs no rebuild (a run binds the working tree
+over the baked copy); a Dockerfile, patch or `[[parameter_space]]` change
+means build, export and import again.
 
-WSClean defaults to portable `x86-64-v3`; use `--native` only when building
-and searching on the same host. See the [throughput guide](docs/nested-sampling-throughput.md)
-for CPU targets, compatibility, and measurements.
+WSClean defaults to portable `x86-64-v3`; `--native` tunes it for the build
+host's CPU, which is only right if that is the compute node's CPU. See the
+[throughput guide](docs/nested-sampling-throughput.md) for CPU targets.
 
 ### Does the imager under test actually run?
 
@@ -117,7 +143,7 @@ for CPU targets, compatibility, and measurements.
 ./ri smoke ms-to-mat    # the MS -> R2D2 .mat bridge, before an R2D2 search
 ```
 
-These verify that images can run their workloads. Run them after rebuilds,
+These verify that images can run their workloads. Run them after an import,
 before searches. `./ri plot fits` renders their FITS output (or supplied
 paths) to PNG using the r2d2 image's astropy + matplotlib.
 
@@ -135,18 +161,20 @@ the direct URL plus exact placement instructions instead of a stack
 trace. See `checkpoints/README.md`. The R2D2 search needs
 `checkpoints/R2D2_A1/R2D2_UNet_N<k>.ckpt`.
 
-## 6. Mounts
+## 6. Binds
 
-Configured via `.env` (copy from `.env.example`), consumed by
-`compose.yaml` and by the `scripts/*.sh` (plain `docker run -v`, reading
-the same variables):
+`scripts/*.sh` bind these into the containers (`apptainer --bind`); the host
+side is set in `defaults.toml` and overridable in the environment:
 
 | Host path (default) | Container path | Purpose |
 |---|---|---|
 | `./data` | `/data` | Measurement Sets, `.mat` files, ground-truth FITS |
-| `./checkpoints` | `/checkpoints` | R2D2 pretrained DNN checkpoints |
-| `./results` | `/results` | Nested-sampling runs, smoke-test output |
+| `./checkpoints` (`CHECKPOINTS_DIR`) | `/checkpoints` | R2D2 pretrained DNN checkpoints |
+| `./results` (`RESULTS_DIR`) | `/results` | Nested-sampling runs, smoke-test output |
 | `./reports` | (host-side only) | Run manifests and the generated HTML report |
+
+Put the checkout, with `images/` and `results/`, on `hpc-work` (Lustre, shared
+by every node), not in the 50GB home; `docs/cluster.md` has the layout.
 
 None of these are baked into an image layer or committed to Git (see
 `.gitignore`) - **with one documented exception**: R2D2-RI's own ~100 MB
@@ -155,14 +183,12 @@ inside the upstream repository, so cloning it at build time unavoidably
 bakes those two files into the `r2d2` image layer. That is upstream's
 packaging decision. See `data/README.md`.
 
-## 7. Apple Silicon and CPU-only notes
+## 7. Architecture and CPU-only notes
 
-- Images use the host architecture (`linux/arm64` on Apple Silicon,
-  `linux/amd64` on x86-64); set `DOCKER_DEFAULT_PLATFORM` only to cross-build.
-- Imagers are CPU-only. R2D2 runs on CPU, and `finufft` builds from source on
-  ARM64; see `docker/r2d2/Dockerfile` for pinned wheels and build packages.
-- Docker Desktop searches use its allocated VM CPU, memory, and mount I/O;
-  native Linux is faster. No GPU or Rosetta support is required.
+- Images are built for the Docker host's architecture; the cluster is x86-64,
+  so build there or set `DOCKER_DEFAULT_PLATFORM=linux/amd64` to cross-build
+  (slow, under QEMU).
+- Imagers are CPU-only. No GPU is required or used.
 
 ## 8. How upstream revisions are pinned
 
@@ -176,24 +202,23 @@ Pinned revisions do not make images bit-exact: casacore fetches unversioned
 IERS/leap-second/ephemeris data at build time; its image SHA-256 is recorded at
 `/opt/casacore-data/WSRT_Measures.ztar.sha256`. The bundled 3c353 example is
 also baked in (section 6). Compare `wall_seconds` within runs, not across
-machines with different Docker resources (section 7).
+machines or partitions.
 
 ## 10. Reclaiming disk space
 
 ```bash
-./ri clean            # this repo's images + generated smoke-test outputs
-./ri disk-usage       # docker system df -v
-docker builder prune  # BuildKit cache (asks first)
-docker system prune   # Docker-wide - affects OTHER projects too, use with care
+./ri clean            # the SIFs, their archives + generated smoke-test outputs
+./ri disk-usage       # du over images/, results/, reports/, checkpoints/, data/
 ```
 
 `./ri clean` leaves `data/`, `checkpoints/`, `results/` and `reports/` alone.
-`docker builder prune -a` before a rebuild forces a fully cold build.
+`hpc-work` has a one-million-file quota as well as 1TB;
+`docs/cleaning-up-old-run-output.md` covers pruning old runs.
 
 ## Troubleshooting
 
-- **Architecture / CUDA / wheels:** clear or match `DOCKER_DEFAULT_PLATFORM`, avoid foreign `--platform`, expect CPU-only images, and check PyPI for `*aarch64*.whl` when ARM64 wheels are missing (`finufft` builds from source).
-- **Stale code / submodules:** rebuild `polychord` and `meqtrees` after editing `scripts/lib/nested_sampling/`; build with `--recurse-submodules`.
-- **WSClean build / CPU failure:** see `docker/wsclean/Dockerfile`; match `WSCLEAN_TARGET_CPU` to the host, or leave it empty for plain x86-64.
-- **Root-owned mounts:** expected on Linux; use `sudo chown -R $(id -u):$(id -g) results/` if needed.
-- **Build OOM / disk:** `BUILD_JOBS=1 ./ri build wsclean` (it otherwise compiles at `nproc`); see section 10 (`R2D2` image is ~3.2 GB before checkpoints).
+- **`FATAL: images/<name>.sif is missing`:** `./ri images import` after rsyncing the archives (section 4).
+- **Stale code:** `scripts/lib/nested_sampling/` is bound from the checkout, so a run is always the code checked out; a Dockerfile or patch change needs build, export, import.
+- **WSClean `Illegal instruction`:** the image was built `--native` on a different CPU; rebuild with the default `x86-64-v3` (`docker/wsclean/Dockerfile`).
+- **Job never starts / refused:** `squeue -u $USER` and the run's `slurm-<jobid>.out`; a bad `--account` fails at submission and removes the claimed run directory.
+- **Build OOM / disk (Docker host):** `BUILD_JOBS=1 ./ri build wsclean` (it otherwise compiles at `nproc`); the archives total ~2.1GB and the SIFs the same again.

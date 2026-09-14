@@ -1771,9 +1771,7 @@ directories:
 
 `GOMP_SPINCOUNT=0` is the same fix by the libgomp-specific lever; `PASSIVE` is
 the portable spelling and is what the run script passes. The R2D2 sidecar
-therefore gets `-e OMP_WAIT_POLICY=PASSIVE` alongside its thread caps, and
-`r2d2_docker_thread_env_flags()` passes it on the fallback path where a rank
-starts its own worker.
+therefore gets `OMP_WAIT_POLICY=PASSIVE` alongside its thread caps.
 
 Note what the table does *not* say. Spinning at 1 thread is as fast as passive
 at 2 because a 1-thread team has nothing to spin; that is iteration 9's "1

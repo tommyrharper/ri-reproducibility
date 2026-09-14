@@ -37,14 +37,14 @@ REPO_GIT_REV="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)" \
   || REPO_GIT_REV="unknown (no commits yet?)"
 REPO_GIT_DIRTY="$(git -C "${REPO_ROOT}" diff --quiet 2>/dev/null && echo false || echo true)"
 
-IMAGE_ID="$(docker image inspect "${IMAGE}" --format '{{.Id}}' 2>/dev/null)" \
-  || IMAGE_ID="unknown"
-IMAGE_DIGEST="$(docker image inspect "${IMAGE}" --format '{{index .RepoDigests 0}}' 2>/dev/null)" \
-  || IMAGE_DIGEST="none-local-build"
-IMAGE_CREATED="$(docker image inspect "${IMAGE}" --format '{{.Created}}' 2>/dev/null)" \
-  || IMAGE_CREATED="unknown"
-CONTAINER_ARCH="$(docker image inspect "${IMAGE}" --format '{{.Architecture}}' 2>/dev/null)" \
-  || CONTAINER_ARCH="unknown"
+# The image is a SIF: its id is the build-input hash the Docker build labelled
+# it with (ns_image_id), its creation time the SIF file's.
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
+IMAGE_ID="$(ns_image_id "${IMAGE}")"
+IMAGE_DIGEST="$(sha256sum "${IMAGE}" 2>/dev/null | cut -d' ' -f1)" || IMAGE_DIGEST="unknown"
+IMAGE_CREATED="$(date -u -r "${IMAGE}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || IMAGE_CREATED="unknown"
+CONTAINER_ARCH="$(uname -m)"
 
 CONFIG_CHECKSUM=""
 if [ -n "${CONFIG_FILE}" ] && [ -f "${REPO_ROOT}/${CONFIG_FILE}" ]; then
@@ -58,8 +58,8 @@ IMAGE_ID="$IMAGE_ID" IMAGE_DIGEST="$IMAGE_DIGEST" IMAGE_CREATED="$IMAGE_CREATED"
 HOST_OS="$(uname -s)" HOST_ARCH="$(uname -m)" HOST_KERNEL="$(uname -r)" \
 CPU_MODEL="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ //' || echo unknown)" \
 CPU_COUNT="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo unknown)" \
-DOCKER_CPUS="$(docker info --format '{{.NCPU}}' 2>/dev/null || echo unknown)" \
-DOCKER_MEM="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo unknown)" \
+SLURM_JOB_ID="${SLURM_JOB_ID:-}" SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST:-}" \
+SLURM_MEM_PER_NODE="${SLURM_MEM_PER_NODE:-}" \
 CONFIG_FILE="$CONFIG_FILE" CONFIG_CHECKSUM="$CONFIG_CHECKSUM" \
 MANIFEST_PATH="$MANIFEST_PATH" \
 python3 - "${COMMAND[@]}" <<'PYEOF'
@@ -85,8 +85,9 @@ manifest = {
         "kernel": os.environ["HOST_KERNEL"],
         "cpu_model": os.environ["CPU_MODEL"],
         "cpu_count": os.environ["CPU_COUNT"],
-        "docker_allocated_cpus": os.environ["DOCKER_CPUS"],
-        "docker_allocated_memory_bytes": os.environ["DOCKER_MEM"],
+        "slurm_job_id": os.environ["SLURM_JOB_ID"] or None,
+        "slurm_nodelist": os.environ["SLURM_JOB_NODELIST"] or None,
+        "slurm_mem_per_node_mb": os.environ["SLURM_MEM_PER_NODE"] or None,
     },
     "config_file": os.environ["CONFIG_FILE"] or None,
     "config_file_sha256": os.environ["CONFIG_CHECKSUM"] or None,

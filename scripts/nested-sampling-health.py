@@ -21,7 +21,9 @@ NESTED_SAMPLING_DIR = Path("results/nested-sampling")
 
 RANK_COMMAND = re.compile(r"\S*python[\d.]*\s+\S*polychord_\w+\.py\b")
 
-DOCKER_EXEC_CLIENT = re.compile(r"\bdocker\s+exec\b")
+# A worker pool's shell names its FIFO directory, `<run dir>/.<worker>-workers`,
+# as its last argument (start-sidecars.sh, and the same rule in rank-budget.sh).
+POOL_COMMAND = re.compile(r"/\.[a-z0-9]+-workers$")
 
 RUN_SCRIPT_COMMAND = re.compile(r"run-nested-sampling[\w-]*\.sh\b")
 
@@ -113,57 +115,18 @@ def process_table() -> list[dict[str, object]]:
     return _parse_ps_rows(out.splitlines())
 
 
-def container_processes(container: str) -> list[dict[str, object]]:
-    try:
-        out = subprocess.run(
-            ["docker", "top", container, "-eo", "pid,ppid,state,etime,time,rss,args"],
-            capture_output=True, text=True, check=True, timeout=20,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return _parse_ps_rows(out.splitlines()[1:])
+def slurm_jobs() -> dict[str, str]:
+    """Run name -> job state for this user's queued and running jobs.
 
+    slurm.sh names a job after its run directory, and on a login node the
+    job's processes are on a compute node this host cannot see. Asked through
+    slurm_queue.py's shared two-minute cache: `./ri tui` runs this every few
+    seconds, and the cluster asks for no more than one squeue per two minutes.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from slurm_queue import slurm_jobs as cached_slurm_jobs
 
-def container_busy_fractions(container: str, pids: list[int]) -> dict[int, float]:
-    if not pids:
-        return {}
-
-    def sample() -> dict[int, float]:
-        return {int(r["pid"]): float(r["cpu_seconds"]) for r in container_processes(container)
-                if r["cpu_seconds"] is not None}
-
-    interval = 5.0
-    before = sample()
-    time.sleep(interval)
-    after = sample()
-    return {pid: (after[pid] - before[pid]) / interval for pid in pids
-            if pid in before and pid in after}
-
-
-def sidecar_containers() -> list[dict[str, object]] | None:
-    try:
-        out = subprocess.run(
-            ["docker", "ps", "--filter", "name=ri-ns-sidecar",
-             "--format", '{{.Names}}\t{{.Image}}\t{{.Label "ri.run-dir"}}'],
-            capture_output=True, text=True, check=True, timeout=20,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return _parse_sidecars(out)
-
-
-def _parse_sidecars(out: str) -> list[dict[str, object]]:
-    containers = []
-    for line in out.splitlines():
-        name, _, rest = line.partition("\t")
-        image, _, run_dir = rest.partition("\t")
-        if not name:
-            continue
-        parts = name.split("-")
-        owner = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
-        containers.append({"name": name, "image": image, "owner_pid": owner,
-                           "run_dir": run_dir or None})
-    return containers
+    return cached_slurm_jobs()
 
 
 def meminfo_mb(key: str) -> int | None:
@@ -707,12 +670,24 @@ def run_processes(run_dir: Path, processes: list[dict[str, object]]) -> list[dic
 
 def supervised(owned: list[dict[str, object]],
                processes: list[dict[str, object]]) -> bool | None:
-    clients = [p for p in owned if DOCKER_EXEC_CLIENT.search(str(p["args"]))]
-    if not clients:
+    pools = [p for p in owned if POOL_COMMAND.search(str(p["args"]))]
+    if not pools:
         return None
-    alive = {int(p["pid"]): str(p["args"]) for p in processes if p["alive"]}
-    return any(RUN_SCRIPT_COMMAND.search(alive.get(int(c.get("ppid", 0) or 0), ""))
-               for c in clients)
+    alive = {int(p["pid"]): p for p in processes if p["alive"]}
+    # A pool's shell sits under the `Apptainer runtime parent` its exec left
+    # behind, and that under the run script; the shell's own subshells are one
+    # hop further down. A run script that is gone leaves the pool on init or
+    # a subreaper, which is not a run script.
+    for pool in pools:
+        pid = int(pool.get("ppid", 0) or 0)
+        for _ in range(4):
+            parent = alive.get(pid)
+            if parent is None:
+                break
+            if RUN_SCRIPT_COMMAND.search(str(parent["args"])):
+                return True
+            pid = int(parent.get("ppid", 0) or 0)
+    return False
 
 
 def own_process_tree(processes: list[dict[str, object]]) -> set[int]:
@@ -792,7 +767,8 @@ def resume_target(run_dir: Path) -> str:
 def describe(run_dir: Path, processes: list[dict[str, object]],
              stale_seconds: float, busy: dict[int, float] | None = None,
              swapped: dict[int, int] | None = None,
-             memory_stall_pct: float | None = None) -> dict[str, object]:
+             memory_stall_pct: float | None = None,
+             jobs: dict[str, str] | None = None) -> dict[str, object]:
     run_env = read_run_env(run_dir)
     dead, checkpoint_time = dead_points(run_dir)
     checkpoint_age = time.time() - checkpoint_time if checkpoint_time else None
@@ -802,22 +778,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
     watched = supervised(owned, processes)
     effective_busy = dict(busy or {})
-    # A run's ranks fork inside its polychord sidecar's own PID namespace,
-    # invisible to host `ps` under Docker Desktop (a separate Linux VM) and
-    # any container not sharing the host's PID namespace generally - which
-    # this repo's containers never do. `watched` already proved the run is
-    # live, so no ranks here means look inside the one container that runs
-    # them rather than conclude there are none.
-    if not ranks and watched:
-        polychord = next((c for c in (sidecar_containers() or [])
-                          if c["run_dir"] == str(run_dir.resolve())
-                          and "polychord" in str(c["image"])), None)
-        if polychord:
-            name = str(polychord["name"])
-            ranks = [p for p in container_processes(name)
-                     if RANK_COMMAND.match(str(p["args"]))]
-            effective_busy.update(
-                container_busy_fractions(name, [int(p["pid"]) for p in ranks]))
+    job = (slurm_jobs() if jobs is None else jobs).get(run_dir.resolve().name)
     spinning = spinning_ranks(ranks, effective_busy)
     # RSS, so shared pages are counted once per process holding them. The
     # imager workers are separate containers with separate model copies, so on
@@ -845,13 +806,23 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     complete = summary_is_complete(run_dir)
 
     # Finished and dead runs both stop writing, while new runs may not have
-    # written yet. `watched` is the sole startup signal: it tracks a live
-    # `docker exec` client, including the gap while self-healing restarts it.
+    # written yet. `watched` is the startup signal: the worker pools are up
+    # before the ranks and stay up between self-healed restarts, for as long
+    # as the run script is alive.
     run_stage = stage(run_dir)
     if complete:
         status = "finished"
     elif ranks:
         status = "stalled" if idle is not None and idle > stale_seconds else "healthy"
+    elif job == "PENDING":
+        status = "queued"
+    elif job is not None:
+        # The job is running on a compute node whose processes this login
+        # node cannot see; the run directory is on the shared filesystem, so
+        # what it has written says whether the run is moving.
+        status = ("starting" if run_stage == "starting up"
+                  else "stalled" if idle is not None and idle > stale_seconds
+                  else "healthy")
     elif watched is not None:
         # A run whose ranks vanished mid-search and whose client is already
         # back is a self-heal restart, not a fresh start - `run_stage` is
@@ -1091,27 +1062,8 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     }
 
 
-def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
-    alive = {int(p["pid"]) for p in processes if p["alive"]}
-    containers = sidecar_containers()
-    leaked = []
-    if containers is not None:
-        # A container whose labelled run still has ranks is in use however dead
-        # its launcher pid is - that is the orphaned run, and the whole reason
-        # the label exists. `live_run_directories` is the same set the default
-        # report is built from, so the two can never disagree.
-        running = {str(d) for d in live_run_directories(processes)}
-        leaked = [c for c in containers
-                  if c["owner_pid"] is not None and c["owner_pid"] not in alive
-                  and str(c.get("run_dir") or "") not in running]
+def host_report() -> dict[str, object]:
     warnings = []
-    if leaked:
-        warnings.append(
-            f"{len(leaked)} sidecar container(s) outlived the run that started them, "
-            "holding ~3.4GB per R2D2 rank. The next run frees them before it sizes "
-            "itself (scripts/lib/rank-budget.sh); to have the memory now: "
-            "docker rm -f " + " ".join(str(c["name"]) for c in leaked)
-        )
     memory = meminfo_mb("MemAvailable")
     if memory is not None and memory < HEADROOM_MB:
         warnings.append(
@@ -1152,8 +1104,6 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
         "disk_total_bytes": space[1] if space is not None else None,
         "cores": os.cpu_count(),
         "load_average": load_average(),
-        "sidecars": containers,
-        "leaked_sidecars": leaked,
         "warnings": warnings,
     }
 
@@ -1168,7 +1118,7 @@ def host_report(processes: list[dict[str, object]]) -> dict[str, object]:
 # these hard to see.
 GREEN, YELLOW, RED, CYAN = "32", "33", "31", "36"
 STATUS_COLORS = {"healthy": GREEN, "finished": GREEN, "starting": CYAN,
-                 "restarting": CYAN, "stalled": RED, "stopped": RED}
+                 "restarting": CYAN, "queued": CYAN, "stalled": RED, "stopped": RED}
 
 
 def use_color() -> bool:
@@ -1530,11 +1480,6 @@ def render_host(host: dict[str, object]) -> None:
     print(f"  {'disk':<9} " + ("unknown" if space is None
                                else f"{float(space) / 1024 ** 3:.0f}GB free of "
                                     f"{float(host['disk_total_bytes']) / 1024 ** 3:.0f}GB"))
-    sidecars = host["sidecars"]
-    if sidecars is None:
-        print(f"  {'sidecars':<9} unknown (docker did not answer)")
-    else:
-        print(f"  {'sidecars':<9} {len(sidecars)} running, {len(host['leaked_sidecars'])} leaked")
     for warning in host["warnings"]:
         print(f"  {paint('WARNING', YELLOW)}   {warning}")
 
@@ -1561,16 +1506,22 @@ def run_directories() -> list[Path]:
                   key=started_at, reverse=True)
 
 
-def live_run_directories(processes: list[dict[str, object]]) -> list[Path]:
+def live_run_directories(processes: list[dict[str, object]],
+                         jobs: dict[str, str] | None = None) -> list[Path]:
     live = {Path(match.group(1)) for p in processes
             if RANK_COMMAND.search(str(p["args"]))
             for match in [re.search(r"--output-dir\s+(\S+)", str(p["args"]))]
             if match and Path(match.group(1)).is_dir()}
+    # ponytail: a job's run is looked for under results/ only; a named
+    # --output-dir elsewhere is not listed until it has ranks here.
+    live.update(NESTED_SAMPLING_DIR / name for name in (slurm_jobs() if jobs is None else jobs)
+                if (NESTED_SAMPLING_DIR / name).is_dir())
     return sorted(live, key=started_at, reverse=True)
 
 
-def default_directories(processes: list[dict[str, object]] | None = None) -> list[Path]:
-    live = live_run_directories(processes or [])
+def default_directories(processes: list[dict[str, object]] | None = None,
+                        jobs: dict[str, str] | None = None) -> list[Path]:
+    live = live_run_directories(processes or [], jobs)
     if live:
         return live
     runs = run_directories()
@@ -1644,12 +1595,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def report_once(args: argparse.Namespace) -> int:
     processes = process_table()
+    jobs = slurm_jobs()
     if args.all:
         directories = run_directories()
     elif args.run:
         directories = [resolve(args.run, processes)]
     else:
-        directories = default_directories(processes)
+        directories = default_directories(processes, jobs)
     # One sample interval for every run being reported, not one each: only a
     # run with live processes is sampled at all, and there is rarely more than
     # one. A report over finished runs costs nothing. Everything the run owns
@@ -1659,9 +1611,9 @@ def report_once(args: argparse.Namespace) -> int:
         [int(p["pid"]) for d in directories for p in run_processes(d, processes)])
     # Before the runs, not after: the host's memory-pressure reading is what
     # decides whether a run's paged-out pages are costing it anything.
-    host = host_report(processes)
+    host = host_report()
     runs = [describe(d, processes, args.stale_seconds, busy,
-                     memory_stall_pct=host["memory_stall_percent"])
+                     memory_stall_pct=host["memory_stall_percent"], jobs=jobs)
             for d in directories]
 
     if args.json:
@@ -1689,20 +1641,12 @@ def self_check() -> None:
         return sink.getvalue()
 
     global NESTED_SAMPLING_DIR, process_table, cpu_busy_fractions, meminfo_mb, \
-        pressure, use_color, sidecar_containers, container_processes, \
-        container_busy_fractions
+        pressure, use_color, slurm_jobs
     saved = NESTED_SAMPLING_DIR
     now = time.time()
-    # Saved before being stubbed below, so the direct test of its own
-    # arithmetic further down can still reach the real implementation.
-    real_container_busy_fractions = container_busy_fractions
-    # No sidecar, anywhere, unless a block below says otherwise: describe()
-    # only reaches for `docker top` when host `ps` found no ranks on a watched
-    # run, which is most of the fixtures below, and the real ones would shell
-    # out to an actual `docker ps`/`docker top` this suite must never touch.
-    sidecar_containers = lambda: []  # noqa: E731
-    container_processes = lambda name: []  # noqa: E731
-    container_busy_fractions = lambda name, pids: {}  # noqa: E731
+    # No Slurm job anywhere unless a block below says otherwise: the real one
+    # would ask the squeue of whatever host runs this suite.
+    slurm_jobs = lambda: {}  # noqa: E731
 
     def write_eval(run: Path, index: int, mtime: float, objective: float = 0.008,
                    wedges: int = 0, wall_seconds: float | None = None,
@@ -1801,24 +1745,30 @@ def self_check() -> None:
             assert run_processes(named, self_named + [stranger]) == [stranger]
 
             # A run whose shell was SIGKILLed keeps going - the ranks are
-            # children of containerd-shim - and loses only the thing no other
-            # number here can see: `run_with_retries`. The parent is matched
-            # on being a run script rather than on being pid 1, because a
-            # reparented orphan lands on whatever subreaper the session has.
-            client = {"pid": -8, "ppid": -9, "alive": True, "elapsed_seconds": 1.0,
+            # mpirun's children, not the shell's - and loses only the thing no
+            # other number here can see: `run_with_retries`. The pool shell's
+            # ancestors are searched for a run script rather than checked for
+            # pid 1, because a reparented orphan lands on whatever subreaper
+            # the session has; the `Apptainer runtime parent` in between is
+            # what apptainer exec leaves behind.
+            client = {"pid": -8, "ppid": -7, "alive": True, "elapsed_seconds": 1.0,
                       "cpu_seconds": 1.0, "rss_mb": 5,
-                      "args": f"/usr/bin/docker exec c mpirun python3 "
-                              f"polychord_wsclean.py --output-dir {marker}"}
+                      "args": f"/usr/bin/sh -c for fifo in ... sh {marker}/.wsclean-workers"}
+            starter = {"pid": -7, "ppid": -9, "alive": True, "elapsed_seconds": 1.0,
+                       "cpu_seconds": 1.0, "rss_mb": 5,
+                       "args": "Apptainer runtime parent: wsclean.sif"}
             shell = {"pid": -9, "ppid": 1, "alive": True, "elapsed_seconds": 1.0,
                      "cpu_seconds": 1.0, "rss_mb": 5,
                      "args": "bash scripts/run-nested-sampling.sh"}
-            assert supervised([client], [client, shell]) is True
-            assert supervised([client], [client]) is False
-            assert supervised([client], [client, {**shell, "alive": False}]) is False
-            assert supervised([client], [client, {**shell, "args": "systemd --user"}]) is False
-            # Nothing to ask of a run with no client: a stopped run has none,
+            assert supervised([client], [client, starter, shell]) is True
+            assert supervised([client], [client, starter]) is False
+            assert supervised([client], [client, shell]) is False
+            assert supervised([client], [client, starter, {**shell, "alive": False}]) is False
+            assert supervised([client], [client, starter, {**shell, "args": "systemd --user"}]) is False
+            # Nothing to ask of a run with no pool: a stopped run has none,
             # and answering False there would warn about every finished run.
-            assert supervised([stranger], [stranger, shell]) is None
+            rank_only = {**stranger, "args": f"python3 polychord_wsclean.py --output-dir {marker}"}
+            assert supervised([rank_only], [rank_only, shell]) is None
 
             # `[[dd-]hh:]mm:ss` in every form ps prints it.
             assert _clock_seconds("00:12") == 12
@@ -1841,24 +1791,24 @@ def self_check() -> None:
                       "args": f"python3 polychord_r2d2.py --output-dir {live.resolve()}"}
                      for i in range(4)]
 
-            # mpirun and the host-side `docker exec` both carry the whole rank
-            # command line in their own arguments; neither is a rank.
+            # mpirun carries the whole rank command line in its own arguments
+            # and is not a rank.
             not_ranks = [
                 {"pid": 90, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 1.0,
                  "rss_mb": 5,
                  "args": f"mpirun -np 4 python3 polychord_r2d2.py --output-dir {live.resolve()}"},
+                # The pool's apptainer: no run directory, so no run memory.
                 {"pid": 91, "ppid": 89, "alive": True, "elapsed_seconds": 100.0,
                  "cpu_seconds": 1.0, "rss_mb": 5,
-                 "args": f"/usr/bin/docker exec c mpirun python3 polychord_r2d2.py "
-                         f"--output-dir {live.resolve()}"},
+                 "args": "Apptainer runtime parent: r2d2.sif"},
                 # Supervising shell: no run directory, so no run memory.
                 {"pid": 89, "ppid": 1, "alive": True, "elapsed_seconds": 100.0,
                  "cpu_seconds": 1.0, "rss_mb": 5,
                  "args": "bash scripts/run-nested-sampling-r2d2.sh"},
-                # Sidecar imager: not a rank; its --fifo-dir path still carries
+                # Pool imager: not a rank; its --fifo-dir path still carries
                 # run memory, so footprint scans all matching processes.
-                {"pid": 92, "alive": True, "elapsed_seconds": 100.0, "cpu_seconds": 90.0,
-                 "rss_mb": 3300,
+                {"pid": 92, "ppid": 91, "alive": True, "elapsed_seconds": 100.0,
+                 "cpu_seconds": 90.0, "rss_mb": 3300,
                  "args": f"python3 r2d2_serve.py --fifo-dir {live.resolve()}/.r2d2-workers"},
             ]
             # PolyChord writes the dead-point count every ~nlive points, so it
@@ -1952,10 +1902,10 @@ def self_check() -> None:
             assert "./ri resume r2d2-vlaa-20260101T000000Z" in orphaned["warnings"][0]
 
             # The imager worker is 3.3GB of the run and none of its ranks:
-            # 4 ranks at 10MB, mpirun and docker exec at 5MB each, worker 3300.
-            assert report["processes"] == 7, report
-            assert report["resident_mb"] == 3350, report
-            assert "3.3GB resident over 7 processes" in aged, aged
+            # 4 ranks at 10MB, mpirun at 5MB, worker 3300.
+            assert report["processes"] == 6, report
+            assert report["resident_mb"] == 3345, report
+            assert "3.3GB resident over 6 processes" in aged, aged
             # CPU is sampled over the same processes, so a busy worker shows as
             # a busy core even while every rank sits in a collective.
             with_cpu = io_capture(describe(live, not_ranks + ranks,
@@ -1976,7 +1926,7 @@ def self_check() -> None:
             # pid outside the run does not count towards it.
             spread = with_swap({92: 1000, 100: 100, 999: 5000})
             assert spread["swapped_mb"] == 1100, spread
-            assert "3.3GB resident (+1.1GB swapped out) over 7 processes" \
+            assert "3.3GB resident (+1.1GB swapped out) over 6 processes" \
                 in io_capture(spread), io_capture(spread)
 
             # The worker holds 3300MB resident, so 3000MB out is a squeeze it
@@ -1989,7 +1939,7 @@ def self_check() -> None:
             # resident against 2.9GB swapped was the live 16-rank R2D2 search.
             parked = with_swap({92: 3400})
             assert parked["processes_paged_out"] == 1, parked
-            assert ("1 of this run's 7 processes is mostly on disk rather than in "
+            assert ("1 of this run's 6 processes is mostly on disk rather than in "
                     "memory (3.3GB swapped against 3.2GB resident)"
                     in io_capture(parked)), io_capture(parked)
 
@@ -2027,9 +1977,9 @@ def self_check() -> None:
             assert not any("on disk" in w for w in trivial["warnings"]), trivial
 
             # Two of them, and the loudest is the one named.
-            both = with_swap({92: 3400, 91: 900})
+            both = with_swap({92: 3400, 90: 900})
             assert both["processes_paged_out"] == 2, both
-            assert ("2 of this run's 7 processes are mostly on disk rather than in "
+            assert ("2 of this run's 6 processes are mostly on disk rather than in "
                     "memory (worst: 3.3GB swapped" in io_capture(both)), io_capture(both)
 
             # The sampler's own view: what PolyChord has found, and how much
@@ -2525,15 +2475,16 @@ def self_check() -> None:
             just_died = describe(live, [], 600.0)
             assert just_died["status"] == "stopped", just_died
             assert any("./ri resume" in w for w in just_died["warnings"]), just_died
-            # ...and no ranks *yet* is neither. A live `docker exec` client is
-            # the run saying it has started, and every second of that used to
-            # headline STOPPED and offer `./ri resume` on a run that was fine.
-            # The mtimes here are already past stale_seconds, so only the
-            # client can tell the two apart. `live` already has evaluations
-            # and a checkpoint (RESTARTING, a self-heal mid-search); a run
-            # with nothing of its own written yet is a genuine first start
-            # (STARTING) and the case the whole rule exists for.
-            exec_client = [p for p in not_ranks if p["pid"] == 91]
+            # ...and no ranks *yet* is neither. A worker pool under a live run
+            # script is the run saying it has started, and every second of
+            # that used to headline STOPPED and offer `./ri resume` on a run
+            # that was fine. The mtimes here are already past stale_seconds,
+            # so only the pool can tell the two apart. `live` already has
+            # evaluations and a checkpoint (RESTARTING, a self-heal
+            # mid-search); a run with nothing of its own written yet is a
+            # genuine first start (STARTING) and the case the whole rule
+            # exists for.
+            exec_client = [p for p in not_ranks if p["pid"] in (91, 92)]
             launcher = [p for p in not_ranks if p["pid"] == 89]
             restarting = describe(live, exec_client + launcher, 5.0)
             assert restarting["status"] == "restarting", restarting
@@ -2543,10 +2494,9 @@ def self_check() -> None:
             fresh = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260106T000000Z"
             fresh.mkdir()
             (fresh / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=4\n")
-            fresh_client = [dict(exec_client[0],
-                                 args=f"/usr/bin/docker exec c mpirun python3 "
-                                      f"polychord_r2d2.py --output-dir "
-                                      f"{fresh.resolve()}")]
+            fresh_client = [dict(p, args=str(p["args"]).replace(str(live.resolve()),
+                                                                 str(fresh.resolve())))
+                            for p in exec_client]
             # An R2D2 search spends minutes here while its workers load their
             # models, with no chains/ of its own yet - the STARTING case.
             starting = describe(fresh, fresh_client + launcher, 5.0)
@@ -2557,36 +2507,27 @@ def self_check() -> None:
             dead_start = describe(fresh, launcher, 5.0)
             assert dead_start["status"] == "stopped", dead_start
             assert any("./ri resume" in w for w in dead_start["warnings"]), dead_start
-            # `live`'s ranks fork inside its own container, exactly the case
-            # host `ps` can never see (Docker Desktop, or any container not
-            # sharing the host's PID namespace - every container this repo
-            # starts). Without the `docker top` fallback this is what stayed
-            # RESTARTING forever, `ranks` empty, even while the run kept
-            # landing evaluations right up to a clean finish.
-            container_ranks = [
-                {"pid": 501 + i, "ppid": 500, "alive": True, "elapsed_seconds": 30.0,
-                 "cpu_seconds": 5.0, "rss_mb": 10,
-                 "args": "python3 /opt/ri-nested-sampling/polychord_r2d2.py "
-                         f"--output-dir {live.resolve()}"}
-                for i in range(4)
-            ]
+            # On a login node the job is on a compute node whose processes
+            # this host cannot see, so squeue is what says the run is going,
+            # and what it has written to the shared filesystem says how well.
             try:
-                sidecar_containers = lambda: [  # noqa: E731
-                    {"name": "ri-ns-sidecar-1-2",
-                     "image": "ri-reproducibility/polychord:lite",
-                     "owner_pid": 1, "run_dir": str(live.resolve())}]
-                container_processes = lambda name: container_ranks  # noqa: E731
-                via_container = describe(live, exec_client + launcher, 5.0)
-                assert via_container["status"] in ("healthy", "stalled"), via_container
-                assert via_container["ranks"] == 4, via_container
-                # A sidecar for some other run, or none at all, leaves `ranks`
-                # exactly as empty as it was before this fallback existed.
-                sidecar_containers = lambda: []  # noqa: E731
-                still_restarting = describe(live, exec_client + launcher, 5.0)
-                assert still_restarting["status"] == "restarting", still_restarting
+                slurm_jobs = lambda: {live.name: "RUNNING"}  # noqa: E731
+                remote = describe(live, [], 5.0)
+                assert remote["status"] == "stalled", remote
+                assert not any("./ri resume" in w for w in remote["warnings"]), remote
+                assert describe(live, [], 1e9)["status"] == "healthy"
+                assert default_directories([]) == [live]
+                slurm_jobs = lambda: {live.name: "PENDING"}  # noqa: E731
+                queued = describe(live, [], 5.0)
+                assert queued["status"] == "queued", queued
+                assert queued["warnings"] == [], queued
+                assert io_capture(queued).splitlines()[0].endswith("  QUEUED"), queued
+                slurm_jobs = lambda: {fresh.name: "RUNNING"}  # noqa: E731
+                assert describe(fresh, [], 5.0)["status"] == "starting"
+                # The job asking is the run itself, never a sign it is queued.
+                assert describe(live, [], 5.0)["status"] == "stopped"
             finally:
-                sidecar_containers = lambda: []  # noqa: E731
-                container_processes = lambda name: []  # noqa: E731
+                slurm_jobs = lambda: {}  # noqa: E731
             shutil.rmtree(fresh)
             # A stalled run's count can still move; a stopped one's cannot, so
             # only the first may say where it will move to.
@@ -2671,26 +2612,6 @@ def self_check() -> None:
                 spinner.wait()
             assert sampled.get(spinner.pid, 0) > 0.5, sampled
             assert sampled.get(os.getpid(), 1) < 0.5, sampled
-
-            # container_busy_fractions samples `docker top`'s own cumulative
-            # TIME twice, five seconds apart - a real wait, like the spin
-            # check above, to prove the arithmetic against a real clock
-            # rather than trust the division by eye.
-            assert real_container_busy_fractions("c", []) == {}
-            calls = {"n": 0}
-
-            def fake_container_processes(_name: str) -> list[dict[str, object]]:
-                calls["n"] += 1
-                seconds = 0.0 if calls["n"] == 1 else 2.0
-                return [{"pid": 501, "ppid": 500, "alive": True, "elapsed_seconds": 5.0,
-                         "cpu_seconds": seconds, "rss_mb": 10, "args": "python3 x"}]
-
-            try:
-                container_processes = fake_container_processes
-                fractions = real_container_busy_fractions("c", [501])
-            finally:
-                container_processes = lambda name: []  # noqa: E731
-            assert abs(fractions[501] - 0.4) < 1e-9, fractions
 
             # A run that has gone serial: still landing evaluations, so never
             # idle long enough to look stalled, but at a fraction of its own
@@ -3160,65 +3081,12 @@ def self_check() -> None:
             assert fast_report["stall_threshold_seconds"] == MIN_STALL_GAP_SECONDS
             assert fast_report["stall_count"] == 0, fast_report
 
-            # The three columns docker is asked for, in order. An unlabelled
-            # container (started before the label existed) keeps None rather
-            # than borrowing the image as its run directory.
-            assert _parse_sidecars(
-                "ri-ns-sidecar-7-0\timg:a\t/runs/one\nri-ns-sidecar-8-0\timg:b\t\n") == [
-                {"name": "ri-ns-sidecar-7-0", "image": "img:a", "owner_pid": 7,
-                 "run_dir": "/runs/one"},
-                {"name": "ri-ns-sidecar-8-0", "image": "img:b", "owner_pid": 8,
-                 "run_dir": None},
-            ]
-
-            # A sidecar whose launcher is gone is memory nobody will free.
-            processes = [{"pid": 4242, "alive": True, "elapsed_seconds": 1.0,
-                          "cpu_seconds": 0.0, "rss_mb": 0, "args": "sh"}]
-            live_container = {"name": "ri-ns-sidecar-4242-0", "image": "i", "owner_pid": 4242}
-            leaked = {"name": "ri-ns-sidecar-9999-0", "image": "i", "owner_pid": 9999}
-            original = sidecar_containers
-            orphan_home = tempfile.mkdtemp()
-            try:
-                sidecar_containers = lambda: [live_container, leaked]  # noqa: E731
-                host = host_report(processes)
-                assert host["leaked_sidecars"] == [leaked], host
-                assert any("docker rm -f ri-ns-sidecar-9999-0" in w for w in host["warnings"])
-                # A zombie launcher is a dead one, however well `kill -0` does.
-                zombie = [dict(processes[0], pid=9999, alive=False)]
-                assert host_report(zombie)["leaked_sidecars"] == [live_container, leaked]
-                sidecar_containers = lambda: None  # noqa: E731
-                assert host_report(processes)["leaked_sidecars"] == []
-
-                # The orphaned run: the shell that launched the containers was
-                # killed, so the pid is gone, but its ranks are still imaging
-                # inside them. Naming these is what would have had somebody
-                # `docker rm -f` a live 16-rank search - the label is what
-                # keeps them off the list.
-                # Outside NESTED_SAMPLING_DIR: every glob there treats a
-                # subdirectory as a run, which silently reorders the
-                # newest-run assertions below.
-                orphan_run = Path(orphan_home) / "wsclean-vlaa-20260104T010000Z"
-                orphan_run.mkdir()
-                orphaned = {"name": "ri-ns-sidecar-9999-0", "image": "i",
-                            "owner_pid": 9999, "run_dir": str(orphan_run)}
-                rank = {"pid": 5151, "alive": True, "elapsed_seconds": 1.0,
-                        "cpu_seconds": 0.0, "rss_mb": 0,
-                        "args": f"python3 /opt/ri-nested-sampling/polychord_wsclean.py "
-                                f"--output-dir {orphan_run}"}
-                sidecar_containers = lambda: [orphaned]  # noqa: E731
-                assert host_report(processes + [rank])["leaked_sidecars"] == []
-                # The same container once its ranks are gone is debris again -
-                # the label exempts a run that is running, not a run that ran.
-                assert host_report(processes)["leaked_sidecars"] == [orphaned]
-            finally:
-                sidecar_containers = original
-                shutil.rmtree(orphan_home, ignore_errors=True)
-
             # Host swap, against the real /proc/meminfo: reported and never
             # warned on, because swap in use may date from days ago and cost
             # nothing since - what is actionable is whose pages are out there,
             # and that is the per-run warning above. The line is suppressed
             # entirely on a host with no swap rather than printing 0.0 of 0.0.
+            host = host_report()
             with_swap_host = dict(host, swap_total_mb=32768, swap_used_mb=5222)
             rendered_host = io.StringIO()
             with contextlib.redirect_stdout(rendered_host):
@@ -3233,7 +3101,7 @@ def self_check() -> None:
             # SwapTotal minus SwapFree, in that direction: reporting the free
             # half as "used" would read as a host under pressure on an idle
             # one, and as an idle one under pressure.
-            real = host_report([])
+            real = host_report()
             total, free = meminfo_mb("SwapTotal"), meminfo_mb("SwapFree")
             assert real["swap_total_mb"] == total, real
             assert real["swap_used_mb"] == (None if total is None or free is None
@@ -3292,21 +3160,21 @@ def self_check() -> None:
             live_load = load_average()
             assert live_load is not None and len(live_load) == 3, live_load
             assert all(v >= 0.0 for v in live_load), live_load
-            assert host_report([])["load_average"] is not None
+            assert host_report()["load_average"] is not None
 
             original_pressure = pressure
             try:
                 pressure = lambda r: thrashing if r == "memory" else calm  # noqa: E731
-                thrashed = host_report([])
+                thrashed = host_report()
                 assert thrashed["memory_stall_percent"] == 30.0, thrashed
                 assert any("30% of the last five minutes stalled on memory" in w
                            for w in thrashed["warnings"]), thrashed
                 pressure = lambda r: calm  # noqa: E731
                 assert not any("stalled on memory" in w
-                               for w in host_report([])["warnings"])
+                               for w in host_report()["warnings"])
                 # No PSI is not "no pressure": nothing is claimed either way.
                 pressure = lambda r: None  # noqa: E731
-                assert host_report([])["memory_stall_percent"] is None
+                assert host_report()["memory_stall_percent"] is None
             finally:
                 pressure = original_pressure
 
@@ -3360,11 +3228,13 @@ def self_check() -> None:
             # `live` is the oldest directory here and the only one running, and
             # it is the run the report exists to be about. `ranks` carry its
             # --output-dir; `processes` (a bare `sh`) carry nobody's.
+            processes = [{"pid": 4242, "alive": True, "elapsed_seconds": 1.0,
+                          "cpu_seconds": 0.0, "rss_mb": 0, "args": "sh"}]
             assert resolve(None, ranks).name == live.name
             assert resolve(None, processes).name == newest.name
             # Ranks, not every process carrying the run directory: a killed
-            # run's sidecar workers outlive it holding ~3.4GB each, and
-            # defaulting to a dead run because it leaked containers would show
+            # run's pool workers outlive it holding ~3.4GB each, and
+            # defaulting to a dead run because it leaked them would show
             # the wrong run for exactly as long as nobody reaped them.
             leftover = [p for p in not_ranks if "r2d2_serve.py" in str(p["args"])]
             assert leftover and resolve(None, leftover).name == newest.name
@@ -3455,8 +3325,8 @@ def self_check() -> None:
                 assert orphan_abroad["supervised"] is False, orphan_abroad
                 assert f"./ri resume {foreign.resolve()} after it does" \
                     in orphan_abroad["warnings"][0], orphan_abroad["warnings"]
-            # mpirun and the host-side `docker exec` carry --output-dir too and
-            # are not ranks, but they do count: a run that has started and has
+            # mpirun carries --output-dir too and is not a rank, but it does
+            # count: a run that has started and has
             # no ranks yet is a run, and on an R2D2 search that is minutes of
             # sixteen workers loading ~3.4GB models each. Leaving it off the
             # default report is what makes another session's "12GB available"
@@ -3481,15 +3351,14 @@ def self_check() -> None:
             # And the whole thing renders and scores. Into a sink, because what
             # is checked is that both forms run and reach the right exit status,
             # not what they print. The host is stubbed healthy: whether the
-            # machine running the check happens to be short of memory or to be
-            # holding a leaked container is not what is under test.
+            # machine running the check happens to be short of memory is not
+            # what is under test.
             import contextlib
             import io
 
             original_memory, original_table = meminfo_mb, process_table
             original_cpu = cpu_busy_fractions
             try:
-                sidecar_containers = lambda: []  # noqa: E731
                 meminfo_mb = lambda key: HEADROOM_MB * 2  # noqa: E731
                 with contextlib.redirect_stdout(io.StringIO()):
                     assert main(["--all", "--json"]) == 1
@@ -3523,7 +3392,6 @@ def self_check() -> None:
                              if line and not line[0].isspace()]
                 assert headlines == [fast.name, live.name, "host"], sink.getvalue()
             finally:
-                sidecar_containers = original
                 meminfo_mb = original_memory
                 process_table = original_table
                 cpu_busy_fractions = original_cpu
