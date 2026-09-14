@@ -49,7 +49,12 @@ _sidecar_start() {
   # `$!` is the process group only because a non-interactive bash puts a
   # background job in its own group and setsid then execs rather than forks;
   # the self-check below asserts it.
-  setsid "$@" </dev/null &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" </dev/null &
+  else
+    # macOS has no setsid; the same two calls it makes, then the same pid.
+    python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null &
+  fi
   SIDECAR_PIDS+=("$!")
   # Not a job this shell reports on or waits for; the pools outlive every
   # command it runs and are killed as groups.
