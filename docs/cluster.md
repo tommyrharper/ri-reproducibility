@@ -275,6 +275,14 @@ Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 | CPU, 8 ranks | 1.1 | 2.47s | 0.64s |
 | GPU, 8 ranks | 1.8 | 1.19s | 0.78s |
 | GPU, 16 ranks | 1.5 | 1.56s | 0.37s |
+| GPU, 8 ranks, `./ri build r2d2-cuda` image | 3.1 | 0.85s | 0.61s |
+
+The first three rows ran on an equivalent image made on the cluster from
+`r2d2.sif` with pip (same torch, same wheel index); the last on the image the
+Dockerfile builds, whose other packages resolved afresh. Its objective agreed
+with the CPU run to the same 4.9e-6 over 34 shared evaluations. The 1.8 -> 3.1
+gap between the two GPU images is one run each on a shared node and is not
+explained; roughly 2-3x the CPU rate is what these support.
 
 Over the 30 evaluations the CPU and GPU runs shared exact parameters for, the
 objective (`total_rms_jy`) agreed to 4.9e-6 relative and every metric to
