@@ -23,6 +23,9 @@ if sys.version_info < (3, 9):
              "or `module load` a newer python first.")
 
 IMAGES = ("wsclean", "r2d2", "meqtrees", "polychord")
+# Built only on request (`./ri build r2d2-cuda`), not by `all`: 2.5GB more of
+# CUDA libraries that only an R2D2_DEVICE=cuda run uses.
+OPTIONAL_IMAGES = ("r2d2-cuda",)
 
 SEARCH_SCRIPT = {
     "wsclean": "scripts/run-nested-sampling.sh",
@@ -45,6 +48,7 @@ SEARCH_ENV = (
     ("retries", "NS_RETRIES"),
     ("stall_timeout", "NS_STALL_TIMEOUT"),
     ("omp_threads", "R2D2_OMP_THREADS"),
+    ("device", "R2D2_DEVICE"),
     ("output_dir", "OUTPUT_DIR"),
 )
 
@@ -387,8 +391,9 @@ def build_parser():
                             "re-running just hits the layer cache), to carry to the "
                             "cluster with `./ri images export`. Nothing on the cluster "
                             "builds; see docs/cluster.md.")
-    build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES),
-                       help="which image to build (default: all)")
+    build.add_argument("target", nargs="?", default="all", choices=("all", *IMAGES, *OPTIONAL_IMAGES),
+                       help="which image to build (default: all four; r2d2-cuda "
+                            "only when named, for --device cuda)")
     build.add_argument("--native", action="store_true",
                        help="WSClean tuned for this exact CPU (WSCLEAN_TARGET_CPU=native) "
                             "rather than the default AVX2 baseline; a little faster and "
@@ -432,7 +437,7 @@ def build_parser():
     shell = add("shell", do_shell, "open a shell inside an image",
                 description="Interactive shell in one of the imported SIFs, with this "
                             "repo's usual binds.")
-    shell.add_argument("image", choices=IMAGES, help="which image to enter")
+    shell.add_argument("image", choices=(*IMAGES, *OPTIONAL_IMAGES), help="which image to enter")
 
     # Searches
     search = add(
@@ -505,6 +510,10 @@ def build_parser():
                              "[NS_KEEP_MEASUREMENT_SETS], see docs/nested-sampling-ms-open.md")
     search.add_argument("--omp-threads", type=int,
                         help="per-rank R2D2 OpenMP/BLAS threads [R2D2_OMP_THREADS]")
+    search.add_argument("--device", choices=("cpu", "cuda"),
+                        help="where R2D2's U-Net runs; cuda needs images/r2d2-cuda.sif and, "
+                             "from a login node, a -GPU --account: the job goes to the ampere "
+                             "partition with one GPU [R2D2_DEVICE]")
     search.add_argument("--retries", type=int, metavar="N",
                         help="times a search that died after scoring evaluations "
                              "restarts itself from its checkpoint, counting only "

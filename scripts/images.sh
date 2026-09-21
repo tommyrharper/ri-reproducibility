@@ -20,19 +20,34 @@ SIF_DIR="${REPO_ROOT}/images"
 
 # Docker tags as scripts/build.sh names them.
 NAMES=(wsclean r2d2 meqtrees polychord)
+# Carried when present, skipped when not: only a GPU run needs it.
+OPTIONAL_NAMES=(r2d2-cuda)
 tag_of() {
   case "$1" in
     wsclean) echo ri-reproducibility/wsclean:v3.7 ;;
     r2d2) echo ri-reproducibility/r2d2:cpu ;;
+    r2d2-cuda) echo ri-reproducibility/r2d2:cuda ;;
     meqtrees) echo ri-reproducibility/meqtrees:kern-10 ;;
     polychord) echo ri-reproducibility/polychord:lite ;;
   esac
 }
 
+is_optional() {
+  local optional
+  for optional in "${OPTIONAL_NAMES[@]}"; do
+    [ "$1" = "${optional}" ] && return 0
+  done
+  return 1
+}
+
 case "${ACTION}" in
   export)
     mkdir -p "${DIR}"
-    for name in "${NAMES[@]}"; do
+    for name in "${NAMES[@]}" "${OPTIONAL_NAMES[@]}"; do
+      if is_optional "${name}" && ! docker image inspect "$(tag_of "${name}")" >/dev/null 2>&1; then
+        echo "==> $(tag_of "${name}") not built, skipping (./ri build ${name} for --device cuda)"
+        continue
+      fi
       # CSD3 is x86_64 throughout. An Apple Silicon host builds arm64 by
       # default (defaults.sh follows `uname -m`), and such a SIF only fails
       # once it is on the cluster; rebuild with DOCKER_DEFAULT_PLATFORM=linux/amd64.
@@ -54,8 +69,11 @@ case "${ACTION}" in
     export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SIF_DIR}/.tmp}"
     export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${SIF_DIR}/.cache}"
     mkdir -p "${SIF_DIR}" "${APPTAINER_TMPDIR}" "${APPTAINER_CACHEDIR}"
-    for name in "${NAMES[@]}"; do
+    for name in "${NAMES[@]}" "${OPTIONAL_NAMES[@]}"; do
       archive="${DIR}/${name}.tar"
+      if is_optional "${name}" && [ ! -f "${archive}" ]; then
+        continue
+      fi
       [ -f "${archive}" ] || { echo "FATAL: ${archive} not found - run 'images export' on the Docker host and rsync ${DIR}/" >&2; exit 1; }
       if [ -f "${SIF_DIR}/${name}.sif" ] && [ ! "${archive}" -nt "${SIF_DIR}/${name}.sif" ]; then
         echo "==> ${SIF_DIR}/${name}.sif is newer than its archive, skipping"

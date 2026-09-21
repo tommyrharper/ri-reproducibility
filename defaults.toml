@@ -46,6 +46,19 @@ RESULTS_DIR = "{REPO_ROOT}/results"
 # on a machine with a different core count.
 NS_R2D2_MAX_RANKS = 8
 
+# Where R2D2's U-Net runs: "cpu", or "cuda" for one A100 on CSD3's ampere
+# partition (`./ri search r2d2 --device cuda`; docs/cluster.md, "R2D2 on a
+# GPU"). Only the network moves: the measurement operator, simulation and
+# scoring stay on the CPU. Needs images/r2d2-cuda.sif.
+R2D2_DEVICE = "cpu"
+# NS_R2D2_MAX_RANKS for R2D2_DEVICE=cuda: the ranks share one A100 and the 32
+# cores CSD3 allows per GPU. Measured on gpu-q-23 (nlive 16, max-ndead 48, one
+# run each): 8 ranks 1.8 evaluations/s, 16 ranks 1.5 - at 16 each rank has half
+# the cores for the CPU side of imaging, which grew from 1.19s to 1.56s.
+# ponytail: one short run per arm; re-measure with --mpi-procs N and a longer
+# --max-ndead before trusting a change (docs/cluster.md, "R2D2 on a GPU").
+NS_R2D2_CUDA_MAX_RANKS = 8
+
 # Pixels on a side of the image both imagers make, and with it the field of
 # view: source_offset_to_lm() in common.py scales the sampled
 # `source_offset_fraction` by half of this, so two sizes are two different

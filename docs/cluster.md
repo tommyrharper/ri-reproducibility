@@ -245,6 +245,51 @@ host cannot see is read from what it has written to the shared filesystem
 binds the Docker mounts were; the self-heal check kills a pool's process
 group where it used to remove a container.
 
+## R2D2 on a GPU
+
+`./ri search r2d2 --device cuda --account WBARKER-SL3-GPU` runs R2D2's U-Net
+on one A100: from a login node the job goes to the `ampere` partition with
+`--gres gpu:1` and the 32 cores CSD3 allows per GPU (charged in GPU hours, so
+the cores come free), and the R2D2 worker pool starts from
+`images/r2d2-cuda.sif` with `apptainer exec --nv`. A `-CPU` account is refused
+before anything is submitted, and inside a job without a GPU the run stops
+before it starts rather than scoring every evaluation as a failure. WSClean has
+no GPU path; `--device` only means something to `r2d2`.
+
+Only the network moves (`patch_cuda_network` in `r2d2_serve.py`). Upstream's
+own switch, `meas_op_on_gpu`, would also move the measurement operator - the
+NUFFTs, the operator norm and this repo's FINUFFT plan cache - which gains
+nothing at these image sizes and needs cufinufft. Instead the worker keeps each
+checkpoint's weights on the GPU once, and upstream's single U-Net call gets its
+three image tensors on the GPU and hands the result back as the CPU tensor the
+rest of upstream expects. TF32 is off, so the GPU does the CPU's float32
+arithmetic. The pool still forks its workers from one warm parent: the parent
+never touches CUDA, and each worker makes its own context on its first request
+(a context made before a fork is unusable in the child).
+
+Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
+48`), CPU and GPU on the same 32-core allocation:
+
+| arm | evaluations/s | R2D2 imaging, median | simulate, median |
+| --- | ---: | ---: | ---: |
+| CPU, 8 ranks | 1.1 | 2.47s | 0.64s |
+| GPU, 8 ranks | 1.8 | 1.19s | 0.78s |
+| GPU, 16 ranks | 1.5 | 1.56s | 0.37s |
+
+Over the 30 evaluations the CPU and GPU runs shared exact parameters for, the
+objective (`total_rms_jy`) agreed to 4.9e-6 relative and every metric to
+1.3e-4 (off-source RMS, the smallest quantity) - float32 rounding between two
+convolution implementations. The GPU sat at 0-50% utilisation with ~29GB in use
+for 8 workers (~3.6GB each, the 25 checkpoints' weights), so what is left of the
+imaging stage is its CPU side; `NS_R2D2_CUDA_MAX_RANKS` (8) is set from the
+table and is worth re-measuring on a longer run.
+
+The image: `./ri build r2d2-cuda` on the Docker host builds
+`ri-reproducibility/r2d2:cuda` from the same Dockerfile with
+`torch==2.13.0+cu130` (CSD3's A100 driver is 595, CUDA 13.2), `./ri images
+export` carries it when it exists (~4GB) and `./ri images import` makes
+`images/r2d2-cuda.sif`. It is not part of `./ri build all`.
+
 ## Slurm facts the scripts depend on
 
 - Submit with `-A <PROJECT>-CPU` (`mybalance` lists yours), which is

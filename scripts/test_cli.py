@@ -49,6 +49,12 @@ with tempfile.TemporaryDirectory() as _fake_bin:
     )
 
 check(
+    "search --device reaches the R2D2 run script",
+    {"R2D2_DEVICE": "cuda"},
+    plan("search", "r2d2", "--device", "cuda")[0],
+)
+
+check(
     "search flags become NS_* overrides",
     {"NS_NLIVE": "8", "NS_METRIC": "-snr", "NS_MPI_PROCS": "1"},
     plan("search", "wsclean", "--nlive", "8", "--metric=-snr", "--mpi-procs", "1")[0],

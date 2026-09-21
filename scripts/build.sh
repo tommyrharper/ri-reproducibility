@@ -65,6 +65,19 @@ build_r2d2() {
     -f docker/r2d2/Dockerfile
 }
 
+# The same Dockerfile with the CUDA 13.0 torch wheel, for R2D2_DEVICE=cuda on
+# CSD3's A100s. Pinned to the version the CPU image resolved to and the GPU
+# path was measured with, so the two images differ only in torch's build.
+build_r2d2_cuda() {
+  local torch="torch==2.13.0+cu130" index=https://download.pytorch.org/whl/cu130
+  build_image ri-reproducibility/r2d2:cuda \
+    "$(inputs_hash "${PLATFORM} ${torch} ${index}" docker/r2d2/Dockerfile docker/r2d2/patches)" \
+    -f docker/r2d2/Dockerfile \
+    --build-arg TORCH_INDEX_URL="${index}" \
+    --build-arg TORCH_EXTRA_INDEX_URL=https://pypi.org/simple \
+    --build-arg TORCH_SPEC="${torch}"
+}
+
 build_meqtrees() {
   build_image ri-reproducibility/meqtrees:kern-10 \
     "$(inputs_hash "${PLATFORM}" docker/meqtrees/Dockerfile \
@@ -85,8 +98,9 @@ build_polychord() {
 case "${TARGET}" in
   wsclean) build_wsclean ;;
   r2d2) build_r2d2 ;;
+  r2d2-cuda) build_r2d2_cuda ;;
   meqtrees) build_meqtrees ;;
   polychord) build_polychord ;;
   all) build_wsclean && build_r2d2 && build_meqtrees && build_polychord ;;
-  *) echo "usage: $0 [all|wsclean|r2d2|meqtrees|polychord]" >&2; exit 1 ;;
+  *) echo "usage: $0 [all|wsclean|r2d2|r2d2-cuda|meqtrees|polychord]" >&2; exit 1 ;;
 esac

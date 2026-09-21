@@ -16,6 +16,14 @@
 ARG R2D2_GIT_URL=https://github.com/basp-group/R2D2-RI.git
 ARG R2D2_GIT_COMMIT=22669259f770a0cb3a3191a5d3e8dbad4ae5a70c
 ARG PYTHON_VERSION=3.10
+# Which torch: the CPU wheel by default. `./ri build r2d2-cuda` passes the CUDA
+# 13.0 wheel instead (TORCH_INDEX_URL=.../cu130, TORCH_SPEC=torch==2.13.0+cu130,
+# PyPI as the extra index its nvidia-* and cuda-* dependencies come from) and
+# tags the result ri-reproducibility/r2d2:cuda, for R2D2_DEVICE=cuda on CSD3's
+# A100s (driver 595, CUDA 13.2). Nothing else in the image differs.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_EXTRA_INDEX_URL=
+ARG TORCH_SPEC="torch>=2.0.0"
 
 ##############################################################################
 # Stage: build - compiler toolchain needed only to build the venv and
@@ -25,6 +33,9 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS build
 
 ARG R2D2_GIT_URL
 ARG R2D2_GIT_COMMIT
+ARG TORCH_INDEX_URL
+ARG TORCH_EXTRA_INDEX_URL
+ARG TORCH_SPEC
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
@@ -68,7 +79,8 @@ RUN pip install --upgrade pip "cmake>=3.25"
 # project's "no CUDA in the default image" requirement. Installing the
 # matching "+cpu" wheel first satisfies requirements.txt's `torch>=2.0.0`
 # without pip pulling the CUDA variant back in.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0.0"
+RUN pip install --index-url "${TORCH_INDEX_URL}" \
+      ${TORCH_EXTRA_INDEX_URL:+--extra-index-url "${TORCH_EXTRA_INDEX_URL}"} "${TORCH_SPEC}"
 
 RUN pip install -r requirements.txt
 

@@ -10,6 +10,15 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 # shellcheck source=scripts/lib/progress-bar.sh
 source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
+# R2D2_DEVICE=cuda runs the U-Net on a GPU: the CUDA build of the R2D2 image,
+# `--nv` on its pool, and on a login node a job on the ampere partition with
+# one GPU (slurm.sh). Everything else about the run is the same.
+case "${R2D2_DEVICE:=cpu}" in
+  cpu) ;;
+  cuda) R2D2_SIF="${R2D2_CUDA_SIF}" ;;
+  *) echo "FATAL: R2D2_DEVICE must be cpu or cuda, got '${R2D2_DEVICE}'" >&2; exit 1 ;;
+esac
+export R2D2_DEVICE
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
@@ -42,7 +51,10 @@ fi
 . "${REPO_ROOT}/scripts/lib/slurm.sh"
 if ns_should_submit; then
   export OUTPUT_DIR
-  ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB_PER_RANK}" scripts/run-nested-sampling-r2d2.sh \
+  if [ "${R2D2_DEVICE}" = cuda ]; then
+    NS_SLURM_GPUS=1
+  fi
+  NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB_PER_RANK}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
   exit 0
 fi
@@ -50,6 +62,18 @@ fi
 # job's own environment rather than the login node's (slurm.sh).
 export OUTPUT_DIR
 ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling-r2d2.sh
+# On a node without a GPU every worker would fail its first request, and a
+# failed evaluation is scored rather than fatal - so it is checked here, once,
+# before anything starts.
+if [ "${R2D2_DEVICE}" = cuda ]; then
+  if ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c \
+      'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
+    echo "FATAL: R2D2_DEVICE=cuda but no GPU is visible here - submit from a login node (it asks for one), or sintr -p ampere --gres=gpu:1" >&2
+    rmdir "${OUTPUT_DIR}" 2>/dev/null || true
+    exit 1
+  fi
+  NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
+fi
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -136,7 +160,13 @@ sidecar_launch "${MEQTREES_SIF}" \
 # fell 17-22% (10 of 10 interleaved A/B pairs). Do not translate this into a
 # lower R2D2_OMP_THREADS - passive 2 threads matches 1 thread here and the
 # checkpointed UNet passes, which this parameter space cannot run, want them.
+R2D2_POOL_FLAGS=()
+if [ "${R2D2_DEVICE}" = cuda ]; then
+  R2D2_POOL_FLAGS=(--nv)
+fi
 sidecar_launch "${R2D2_SIF}" \
+  ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
+  --env R2D2_DEVICE="${R2D2_DEVICE}" \
   --bind "${CHECKPOINTS_DIR}:/checkpoints:ro" \
   --env OMP_NUM_THREADS="${R2D2_OMP_THREADS}" \
   --env MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \

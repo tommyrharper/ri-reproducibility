@@ -107,6 +107,69 @@ def patch_checkpoint_loading() -> None:
         optimiser.get_DNNs = get_DNNs
 
 
+def r2d2_device() -> str:
+    """Where the U-Net runs: `cpu` (the default) or `cuda` (R2D2_DEVICE)."""
+    return os.environ.get("R2D2_DEVICE", "cpu").strip().lower() or "cpu"
+
+
+# Per worker process, keyed by (id of the cached checkpoint dict, iteration):
+# that iteration's weights, already on the GPU.
+_CUDA_WEIGHTS: dict[tuple[int, int], dict] = {}
+
+
+def patch_cuda_network() -> None:
+    """Run R2D2's U-Net passes on the GPU and leave everything else on the CPU.
+
+    Upstream has one switch, `meas_op_on_gpu`, and it moves the measurement
+    operator too - the NUFFTs, the operator norm and this file's FINUFFT plan
+    cache, none of which gain from a GPU at 128x128 and ~3000 visibilities, and
+    whose GPU path needs cufinufft. The U-Net is what the phase profiler put at
+    98% of imaging time (docs/nested-sampling-speed.md), and upstream calls it
+    in exactly one place, `model.forward`, with the weights assigned by
+    `load_net` just before. So those two are replaced in `optimiser.R2D2`:
+    `load_net` assigns weights that are already on the GPU (each worker copies
+    each iteration's once, then reuses them), and `forward` takes its three
+    image tensors to the GPU and brings the result back, so the residual and
+    everything after it see the CPU tensor they always did.
+
+    Patched in the pool's parent, which must never initialise CUDA itself: a
+    CUDA context does not survive fork, so each forked worker makes its own on
+    its first request. TF32 is turned off so the GPU computes the same float32
+    convolutions the CPU does, rather than a faster, 10-bit-mantissa version.
+    """
+    import torch
+
+    optimiser = sys.modules["optimiser.R2D2"]
+    upstream_forward = optimiser.forward
+    device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    def load_net(net, cur_iter, layers, dnn_dict):
+        if layers != 1:
+            raise NotImplementedError("R2D2_DEVICE=cuda supports layers: 1 (R2D2), not R3D3")
+        key = (id(dnn_dict), int(cur_iter))
+        weights = _CUDA_WEIGHTS.get(key)
+        if weights is None:
+            weights = {".".join(name.split(".")[1:]): tensor.to(device)
+                       for name, tensor in dnn_dict[f"N{cur_iter}"].items()}
+            _CUDA_WEIGHTS[key] = weights
+        net.load_state_dict(weights, assign=True)
+        return net
+
+    def to_gpu(tensor):
+        return tensor.to(device, non_blocking=True) if isinstance(tensor, torch.Tensor) else tensor
+
+    def forward(layers, i, net, res_n, output_n, mean, eps=1e-110, dirty=None, PSF=None,
+                input_order="res_rec"):
+        output = upstream_forward(layers, i, net, to_gpu(res_n), to_gpu(output_n), to_gpu(mean),
+                                  eps, to_gpu(dirty), to_gpu(PSF), input_order)
+        return output.to(res_n.device)
+
+    optimiser.load_net = load_net
+    optimiser.forward = forward
+
+
 def warm_imports() -> None:
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
@@ -128,6 +191,8 @@ def warm_imports() -> None:
             patch_op_norm()
             patch_nufft_plans()
             patch_checkpoint_loading()
+            if r2d2_device() == "cuda":
+                patch_cuda_network()
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
             if checkpoint_path.is_dir():
                 # Load before fork: tensor pages stay shared until a child
