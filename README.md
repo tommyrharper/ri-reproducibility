@@ -101,8 +101,9 @@ On the cluster:
 - `git`; also there already.
 - [`uv`](https://docs.astral.sh/uv/) for every host-side Python: install it
   into your home (`curl -LsSf https://astral.sh/uv/install.sh | sh`), then
-  run `uv sync` once in the checkout on a login node so a job never has to
-  download an interpreter or a package. CSD3's system `python3` is 3.6, too
+  put a copy, its Python and the `.venv` under hpc-work once on a login node
+  (docs/cluster.md, "A job's environment"): a job runs nothing from `/home`,
+  and never downloads an interpreter or a package. CSD3's system `python3` is 3.6, too
   old for the stdlib-only `./ri` dispatcher (3.9+), so `./ri` re-runs itself
   under uv's Python when it finds an old one; no `module load` needed.
 

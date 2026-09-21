@@ -53,6 +53,7 @@ the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 | --- | --- | --- |
 | this checkout, `images/`, `results/` | `/rds/user/<crsid>/hpc-work/ri-reproducibility` | Lustre, 1TB, shared by every node; home is 50GB NFS, and CSD3 asks that jobs do no I/O there - a run writes `results/`, its FIFOs and `benchmarks.jsonl` under the checkout, so a checkout in `~` is the wrong place |
 | in-flight Measurement Sets (`NS_SCRATCH_DIR`) | `/dev/shm` on the node | same as on main; nodes have 256GB+ |
+| a job's `uv`, uv's Pythons (which `.venv` points into), `XDG_CACHE_HOME`, `HOME` | `hpc-work/.local/bin`, `hpc-work/.local/share/uv/python`, `hpc-work/.cache`, `hpc-work/.ri-job/home` | a job runs nothing from `/home` (below) |
 | worker FIFOs | inside the run directory, as on main | one node per run, so a FIFO on Lustre is local to its readers |
 
 `hpc-work` is reached through symlinks (`~/rds/hpc-work` ->
@@ -83,9 +84,50 @@ they always did. The run directory is claimed on the login node, so the job is
 named after it, its stdout is `slurm-<jobid>.out` beside `run.log`, and
 `./ri runs`, `./ri resume` and `./ri search --output-dir` treat the run as
 live while a job of that name is queued or running (`squeue`), since the login
-node cannot see the compute node's processes. The job inherits the whole
-environment, so every flag and `NS_*` variable given on the login node, and
-the seed, reach it unchanged.
+node cannot see the compute node's processes. Every flag and `NS_*`
+variable given on the login node, and the seed, reach the job unchanged -
+but nothing else of the login node's environment does (next section).
+
+## A job's environment
+
+A job does no I/O on `/home` and runs nothing from a Nix store, although the
+interactive tooling on a CSD3 account may well live there (a nix-portable
+store, uv's own install, dotfiles). `ns_submit_run` submits with
+`--export=NIL` - not `NONE`, which on this Slurm rebuilds the environment by
+running the login shell, `~/.bashrc` and all, on the compute node - and the
+job starts in `scripts/lib/job-env.sh`, which:
+
+- empties the environment down to `SLURM_*`, however the job was submitted;
+- sources the run's settings, saved by the login node as
+  `.job-settings.env` in the run directory: `NS_*`, `R2D2_*`, `RI_*`, the
+  image and output directories, as physical paths (`~/rds/hpc-work` is
+  spelled through `/home`);
+- builds the rest from nothing: `module purge`, then `module load
+  rhel8/slurm` (`RI_JOB_MODULES` to change it); the base OS's `bash`,
+  `python3`, `gcc` and `apptainer`; `uv` from `hpc-work/.local/bin`, with only
+  uv's own Pythons under `hpc-work/.local/share/uv/python`; `HOME`,
+  `XDG_CACHE_HOME`, `UV_CACHE_DIR` and `APPTAINER_CACHEDIR` under hpc-work;
+- sets `APPTAINER_HOME` too: apptainer mounts the passwd home (`/home/<crsid>`)
+  into every container whatever `$HOME` says, so without it every worker
+  could read and write NFS home;
+- refuses to start (`FATAL`, in the job's `slurm-<id>.out`) if any tool, the
+  `.venv` interpreter, or a path any variable names resolves into `/home` or
+  contains `/nix/store/`, and otherwise prints what each tool resolved to.
+
+Once per account, on a login node, from the checkout:
+
+```bash
+W=/rds/user/$USER/hpc-work
+install -D -m 755 "$(command -v uv)" "$W/.local/bin/uv"   # a standalone uv, not a Nix-built one
+export UV_PYTHON_INSTALL_DIR=$W/.local/share/uv/python    # also in ~/.bashrc, so ./ri agrees
+"$W/.local/bin/uv" python install "$(cat .python-version)"
+rm -rf .venv && "$W/.local/bin/uv" sync
+bash scripts/lib/job-env.sh --check                       # the job's environment, checked here
+```
+
+`--check` builds exactly what a job would get, with the settings this shell
+would hand it, and says `nothing resolves into /home or a Nix store` or what
+does. `bash scripts/lib/job-env.sh --self-check` tests the check itself.
 
 Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive
 --mem 0`) and the run script sizes the ranks from the allocation; with it the
@@ -183,8 +225,9 @@ two minutes. What here would otherwise break that:
   (`RI_IMPORT_PROCESSORS`); inside `sintr` it uses the allocation.
 - Never poll `squeue` in a loop of your own; `./ri runs` already caches it.
 
-`OMP_NUM_THREADS=1` is exported by CSD3's default login environment and sbatch
-carries it into every job. GNU `nproc` honours it, so the run scripts count
+`OMP_NUM_THREADS=1` is exported by CSD3's default login environment
+(`rhel8/global`), which a job no longer inherits or loads - but `sintr` and a
+hand-written batch script still see it. GNU `nproc` honours it, so the run scripts count
 CPUs with it unset (`env -u OMP_NUM_THREADS nproc`); a bare `nproc` there reads
 1 on a 76-core node, which sized a whole-node job to a single rank.
 
@@ -214,8 +257,10 @@ group where it used to remove a container.
   run scripts needs no change. `NS_R2D2_MAX_RANKS` (8, from the 20-core
   host) caps an R2D2 job well below a 76-core node; the first whole-node R2D2
   run is where to re-measure it (`docs/nested-sampling-throughput.md`).
-- Load nothing: Apptainer, Slurm and the SIFs are the whole toolchain. `uv`
-  is still needed for the host-side scripts (`./ri profile`, `./ri merge`, the
-  defaults loader, and the `bench.py record` step at the end of every job);
-  install it into `~/.local/bin` and `uv sync` once on a login node, since
-  the system `python3` is 3.6 and `./ri` itself re-runs under uv's Python.
+- Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
+  whole toolchain, and a job purges the rest (above). `uv` is still needed for
+  the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,
+  and the `bench.py record` step at the end of every job); a job runs the copy
+  in `hpc-work/.local/bin` and uv's Python under hpc-work (the setup above),
+  since the system `python3` is 3.6 and `./ri` itself re-runs under uv's
+  Python.

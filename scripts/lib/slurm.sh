@@ -5,8 +5,10 @@
 # before sizing anything: inside an allocation (sintr, a batch script) and on a
 # host with no Slurm they carry on in place; on a login node they hand the
 # same command to sbatch and leave. The job runs the script again with the
-# whole environment (NS_*, OUTPUT_DIR, SBATCH_*), so it resolves the same
-# settings the login node would have, against the allocation's cores and memory.
+# run's settings (NS_*, R2D2_*, OUTPUT_DIR, ...; scripts/lib/job-env.sh), so it
+# resolves the same settings the login node would have, against the
+# allocation's cores and memory - and with nothing else of the login node's
+# environment, which on CSD3 reaches into /home.
 #
 # Account, partition and time limit are sbatch's own SBATCH_* input variables
 # (`./ri search --account X` sets SBATCH_ACCOUNT); the two that have a sane
@@ -24,13 +26,22 @@ ns_should_submit() {
 # One node, one task (mpirun forks the ranks), named after the run so squeue
 # and ns_run_is_live can find it, stdout beside the run's own logs. With an
 # explicit NS_MPI_PROCS the job is sized to it; otherwise it takes the node.
-# The job inherits the caller's exported environment and nothing else, so a
-# run script exports OUTPUT_DIR before calling; bench.py submits itself the
-# same way with a directory of its own.
+# The job starts from an empty environment (`--export=NIL`) in
+# scripts/lib/job-env.sh, which builds its own and sources the caller's run
+# settings from `.job-settings.env` in the run directory, so a run script
+# exports OUTPUT_DIR before calling; bench.py submits itself the same way with
+# a directory of its own. sbatch still reads SBATCH_* from this shell. Paths
+# are physical: the job's REPO_ROOT is, and the settings' directories are.
 ns_submit_run() {
-  local run_dir="$1" mb_per_rank="$2" cmd size
+  local run_dir="$1" mb_per_rank="$2" cmd size repo="${REPO_ROOT}" settings phys
   shift 2
-  printf -v cmd '%q ' "$@"
+  phys="$(cd "${repo}" 2>/dev/null && pwd -P)" && repo="${phys}"
+  phys="$(cd "${run_dir}" 2>/dev/null && pwd -P)" && run_dir="${phys}"
+  settings="${run_dir}/.job-settings.env"
+  # shellcheck source=scripts/lib/job-env.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/job-env.sh"
+  ns_write_job_settings "${settings}" || return
+  printf -v cmd '%q ' /bin/bash "${repo}/scripts/lib/job-env.sh" "${settings}" "$@"
   if [ -n "${NS_MPI_PROCS:-}" ]; then
     size=(--cpus-per-task "${NS_MPI_PROCS}"
           --mem "$((NS_MPI_PROCS * mb_per_rank + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
@@ -48,8 +59,9 @@ ns_submit_run() {
   echo "Submitting ${run_dir##*/} to Slurm (${SBATCH_PARTITION}, ${SBATCH_TIMELIMIT}," \
     "${SBATCH_QOS:+qos ${SBATCH_QOS}, }${SBATCH_ACCOUNT:-default account}); squeue -u ${USER:-$(id -un)} tracks it."
   sbatch \
+    --export=NIL \
     --job-name "${run_dir##*/}" \
-    --chdir "${REPO_ROOT}" \
+    --chdir "${repo}" \
     --output "${run_dir}/slurm-%j.out" \
     --nodes 1 --ntasks 1 "${size[@]}" \
     --wrap "exec ${cmd}" || return
@@ -70,6 +82,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     "${_dir}" "${_dir}" >"${_dir}/bin/sbatch"
   chmod +x "${_dir}/bin/sbatch"
   REPO_ROOT="${_dir}/repo"
+  mkdir -p "${REPO_ROOT}"
   unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS SBATCH_PARTITION SBATCH_TIMELIMIT SBATCH_QOS
 
   # A PATH of only the fake: the real cluster has sbatch on its own PATH.
@@ -80,7 +93,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   NS_SBATCH=0 ns_should_submit && { echo "FAIL: NS_SBATCH=0 must keep the run in place"; exit 1; }
 
   _run="${_dir}/results/wsclean-vlaa-20260101T000000Z"
-  export OUTPUT_DIR="${_run}"
+  mkdir -p "${_run}"
+  export OUTPUT_DIR="${_run}" NS_NLIVE=8 UNRELATED=1
   _out="$(ns_submit_run "${_run}" 200 scripts/run-nested-sampling.sh)"
   case "${_out}" in
     *"Submitting wsclean-vlaa-20260101T000000Z"*"icelake, 12:00:00"*4242) ;;
@@ -89,14 +103,23 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "$(cat "${_dir}/env")" = "${_run} icelake 12:00:00" ] \
     || { echo "FAIL: the job must inherit the run directory and the sbatch defaults, got: $(cat "${_dir}/env")"; exit 1; }
   _args="$(tr '\n' ' ' <"${_dir}/args")"
-  for _want in "--job-name wsclean-vlaa-20260101T000000Z" "--chdir ${REPO_ROOT}" \
+  for _want in "--export=NIL" "--job-name wsclean-vlaa-20260101T000000Z" "--chdir ${REPO_ROOT}" \
                "--output ${_run}/slurm-%j.out" "--nodes 1 --ntasks 1 --exclusive --mem 0" \
-               "--wrap exec scripts/run-nested-sampling.sh"; do
+               "--wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling.sh"; do
     case "${_args}" in
       *"${_want}"*) ;;
       *) echo "FAIL: sbatch was not given '${_want}': ${_args}"; exit 1 ;;
     esac
   done
+
+  # The job gets the run's settings and nothing else of this shell.
+  if ! grep -qx "export NS_NLIVE=8" "${_run}/.job-settings.env" \
+     || ! grep -qx "export OUTPUT_DIR=${_run}" "${_run}/.job-settings.env"; then
+    echo "FAIL: the run's settings must be saved for the job: $(cat "${_run}/.job-settings.env")"; exit 1
+  fi
+  grep -q UNRELATED "${_run}/.job-settings.env" \
+    && { echo "FAIL: only run settings may reach the job: $(cat "${_run}/.job-settings.env")"; exit 1; }
+  unset UNRELATED
 
   # An explicit rank count sizes the job instead of taking the node, and the
   # caller's partition and time are left alone.
@@ -104,7 +127,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     ns_submit_run "${_run}" 3500 scripts/run-nested-sampling-r2d2.sh >/dev/null
   _args="$(tr '\n' ' ' <"${_dir}/args")"
   case "${_args}" in
-    *"--nodes 1 --ntasks 1 --cpus-per-task 4 --mem 18096 --wrap exec scripts/run-nested-sampling-r2d2.sh"*) ;;
+    *"--nodes 1 --ntasks 1 --cpus-per-task 4 --mem 18096 --wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling-r2d2.sh"*) ;;
     *) echo "FAIL: NS_MPI_PROCS must size the job, got: ${_args}"; exit 1 ;;
   esac
   case "${_args}" in
