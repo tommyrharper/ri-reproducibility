@@ -256,8 +256,16 @@ def do_run(args: argparse.Namespace) -> int:
 
     Goes through ./ri search rather than the run script, so a benchmark run is
     the documented `NS_NLIVE=8 ./ri search wsclean` form and nothing about how
-    a search starts is written down twice. ./ri bench run has already built.
+    a search starts is written down twice.
+
+    On a cluster login node the whole benchmark is one Slurm job instead: the
+    warm-up and every repeat have to meet the same node, and an interleave is
+    only an interleave if its arms share a machine. Inside the job (SLURM_JOB_ID
+    is set) the searches run in place, one after the other.
     """
+    if (not os.environ.get("SLURM_JOB_ID") and os.environ.get("NS_SBATCH", "1") == "1"
+            and shutil.which("sbatch")):
+        return submit(args)
     env = {**os.environ, **preset_settings(args.preset, args.imager)}
     if args.allow_oversubscription:
         env["NS_MPI_OVERSUBSCRIBE"] = "1"
@@ -269,7 +277,7 @@ def do_run(args: argparse.Namespace) -> int:
     # drifts by more than most effects are worth, so the two settings alternate
     # run by run rather than running as two blocks.
     setting, arms = (args.interleave[0], args.interleave[1:]) if args.interleave else (None, [None])
-    command = ["./ri", "search", args.imager, "--no-build"]
+    command = ["./ri", "search", args.imager]
     # One unrecorded search first, to leave the host in the state every
     # recorded row is measured in. The first search after an idle spell
     # measured 8-16% faster than the ones behind it here: the package spends a
@@ -297,6 +305,34 @@ def do_run(args: argparse.Namespace) -> int:
         if returncode:
             return returncode
     return 0
+
+
+def submit(args: argparse.Namespace) -> int:
+    """Hand this same command to sbatch through slurm.sh, sized like a search.
+
+    The job is named bench-<imager>-<stamp> and keeps its Slurm log under
+    results/bench/; the searches it runs claim their own directories under
+    results/nested-sampling as usual. `./ri bench run` sets NS_MPI_PROCS
+    only per search, so the job takes a whole node unless --mpi-procs asks for
+    less, the same rule `./ri search` follows.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    job_dir = REPO_ROOT / "results" / "bench" / f"bench-{args.imager}-{stamp}"
+    job_dir.mkdir(parents=True)
+    env = {**os.environ, "REPO_ROOT": str(REPO_ROOT)}
+    if args.mpi_procs is not None:
+        env["NS_MPI_PROCS"] = str(args.mpi_procs)
+    script = (". scripts/lib/defaults.sh; . scripts/lib/rank-budget.sh; . scripts/lib/slurm.sh; "
+              'mb="${NS_WSCLEAN_MB_PER_RANK}"; [ "$1" = r2d2 ] && mb="${NS_R2D2_MB_PER_RANK}"; '
+              'ns_submit_run "$2" "${mb}" "${@:3}"')
+    returncode = subprocess.run(
+        ["bash", "-c", script, "bench", args.imager, str(job_dir),
+         "uv", "run", "scripts/bench.py", *sys.argv[1:]],
+        cwd=REPO_ROOT, env=env,
+    ).returncode
+    if returncode:  # a refused submission (a bad account, say) leaves nothing behind
+        job_dir.rmdir()
+    return returncode
 
 
 # --- reading -----------------------------------------------------------------

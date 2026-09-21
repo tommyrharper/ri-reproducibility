@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import os
 import resource
+import signal
 import runpy
 import sys
+import time
 import traceback
 import types
 from contextlib import contextmanager
@@ -105,6 +107,69 @@ def patch_checkpoint_loading() -> None:
         optimiser.get_DNNs = get_DNNs
 
 
+def r2d2_device() -> str:
+    """Where the U-Net runs: `cpu` (the default) or `cuda` (R2D2_DEVICE)."""
+    return os.environ.get("R2D2_DEVICE", "cpu").strip().lower() or "cpu"
+
+
+# Per worker process, keyed by (id of the cached checkpoint dict, iteration):
+# that iteration's weights, already on the GPU.
+_CUDA_WEIGHTS: dict[tuple[int, int], dict] = {}
+
+
+def patch_cuda_network() -> None:
+    """Run R2D2's U-Net passes on the GPU and leave everything else on the CPU.
+
+    Upstream has one switch, `meas_op_on_gpu`, and it moves the measurement
+    operator too - the NUFFTs, the operator norm and this file's FINUFFT plan
+    cache, none of which gain from a GPU at 128x128 and ~3000 visibilities, and
+    whose GPU path needs cufinufft. The U-Net is what the phase profiler put at
+    98% of imaging time (docs/nested-sampling-speed.md), and upstream calls it
+    in exactly one place, `model.forward`, with the weights assigned by
+    `load_net` just before. So those two are replaced in `optimiser.R2D2`:
+    `load_net` assigns weights that are already on the GPU (each worker copies
+    each iteration's once, then reuses them), and `forward` takes its three
+    image tensors to the GPU and brings the result back, so the residual and
+    everything after it see the CPU tensor they always did.
+
+    Patched in the pool's parent, which must never initialise CUDA itself: a
+    CUDA context does not survive fork, so each forked worker makes its own on
+    its first request. TF32 is turned off so the GPU computes the same float32
+    convolutions the CPU does, rather than a faster, 10-bit-mantissa version.
+    """
+    import torch
+
+    optimiser = sys.modules["optimiser.R2D2"]
+    upstream_forward = optimiser.forward
+    device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    def load_net(net, cur_iter, layers, dnn_dict):
+        if layers != 1:
+            raise NotImplementedError("R2D2_DEVICE=cuda supports layers: 1 (R2D2), not R3D3")
+        key = (id(dnn_dict), int(cur_iter))
+        weights = _CUDA_WEIGHTS.get(key)
+        if weights is None:
+            weights = {".".join(name.split(".")[1:]): tensor.to(device)
+                       for name, tensor in dnn_dict[f"N{cur_iter}"].items()}
+            _CUDA_WEIGHTS[key] = weights
+        net.load_state_dict(weights, assign=True)
+        return net
+
+    def to_gpu(tensor):
+        return tensor.to(device, non_blocking=True) if isinstance(tensor, torch.Tensor) else tensor
+
+    def forward(layers, i, net, res_n, output_n, mean, eps=1e-110, dirty=None, PSF=None,
+                input_order="res_rec"):
+        output = upstream_forward(layers, i, net, to_gpu(res_n), to_gpu(output_n), to_gpu(mean),
+                                  eps, to_gpu(dirty), to_gpu(PSF), input_order)
+        return output.to(res_n.device)
+
+    optimiser.load_net = load_net
+    optimiser.forward = forward
+
+
 def warm_imports() -> None:
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
@@ -126,6 +191,8 @@ def warm_imports() -> None:
             patch_op_norm()
             patch_nufft_plans()
             patch_checkpoint_loading()
+            if r2d2_device() == "cuda":
+                patch_cuda_network()
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
             if checkpoint_path.is_dir():
                 # Load before fork: tensor pages stay shared until a child
@@ -328,20 +395,29 @@ def serve_pool(fifo_dir: str) -> None:
     # inherited already cost.
     _PEAK_FLOOR = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     children = {}
-    for base in bases:
+
+    def fork(base: str, replacement: bool = False) -> None:
         pid = os.fork()
         if pid:
             children[pid] = base
-            continue
+            return
         status = 0
         try:
             # The child re-opens its own pair inside answer() and wants none of
             # the inherited ends, its own included: holding the request pipe's
             # read end open in two processes would keep a request alive after
-            # the one that should answer it has gone.
+            # the one that should answer it has gone. First thing, before any
+            # pause: a copy of a sibling's ends held here is a reader a rank
+            # can attach to while nobody is there to answer.
             for fds in keeper.values():
                 for fd in fds:
                     os.close(fd)
+            # In the child, so the parent stays at os.wait() and lets go of a
+            # dead worker's ends the moment it dies. The pause bounds the churn
+            # if the replacement cannot serve either (its FIFO directory gone,
+            # say); the rank's own retry waits at least this long.
+            if replacement:
+                time.sleep(1.0)
             answer(base)
         except Exception:
             traceback.print_exc()
@@ -349,15 +425,23 @@ def serve_pool(fifo_dir: str) -> None:
         # _exit, not sys.exit: this child inherited the parent's atexit hooks and
         # stdio buffers and must run neither.
         os._exit(status)
-    while children:
+
+    for base in bases:
+        fork(base)
+    # Serves until killed: a worker that exits - on EOF when its rank goes, or
+    # dying mid-request - is forked again from this warm parent, and the rank
+    # (or the next attempt's rank) reconnects to the same FIFOs.
+    while True:
         pid, _status = os.wait()
         base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
         # them a rank whose worker died would write into a pipe nobody reads
         # and then wait forever for a reply. Closing here gives it the same
-        # broken pipe and empty reply it gets when there is no pool at all.
+        # broken pipe and empty reply it gets when there is no pool at all,
+        # and the replacement's own opens then wait for the rank to come back.
         for fd in keeper.pop(base, ()):
             os.close(fd)
+        fork(base, replacement=True)
 
 
 def serve(fifo_base: str | None = None) -> None:
@@ -369,6 +453,9 @@ def answer(fifo_base: str | None) -> None:
     if fifo_base is None:
         requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
     else:
+        # How the rank kills this worker if it wedges (FifoWorker.kill in
+        # common.py); the pool then forks a replacement.
+        Path(f"{fifo_base}.pid").write_text(f"{os.getpid()}\n")
         # Same order the caller opens them in: opening a FIFO blocks until the
         # other end is opened, so a mismatch here deadlocks both processes.
         requests = open(f"{fifo_base}.in")
@@ -497,9 +584,12 @@ def self_check_serve_pool() -> None:
         for rank in (0, 1):
             os.mkfifo(pool / f"{rank}.in")
             os.mkfifo(pool / f"{rank}.out")
+        # Its own session, so the pool and the workers it forked go together at
+        # the end - the way the run script kills a pool's process group.
         worker = subprocess.Popen(
             [sys.executable, __file__, "--fifo-dir", str(pool)],
             env={**os.environ, "R2D2_IMAGER": str(root / "imager.py"), "R2D2_HOME": str(root)},
+            start_new_session=True,
         )
         deadline = time.monotonic() + 60
         for rank, code in ((0, 3), (1, 0)):
@@ -525,9 +615,36 @@ def self_check_serve_pool() -> None:
                 reply = json.loads(replies.readline())
                 assert reply["returncode"] == code
                 assert reply["peak_memory_bytes"] > 64 * 1024 * 1024, reply
-        assert worker.wait(timeout=30) == 0, "the pool did not exit once every worker saw EOF"
         # The point of forking rather than starting one interpreter per rank.
         assert marker.read_text() == "x\n", f"the warm-up ran more than once: {marker.read_text()!r}"
+        # Both workers saw EOF above; the pool forks replacements on the same
+        # FIFOs rather than exiting, so a rank that comes back is served - and
+        # still by a fork of the one warm-up.
+        base = pool / "1"
+        pid_before = int((pool / "1.pid").read_text())
+        # The replacement records its pid before it opens the FIFOs, and a
+        # connect before that could still land on the worker that is exiting.
+        deadline = time.monotonic() + 30
+        while int((pool / "1.pid").read_text()) == pid_before:
+            assert time.monotonic() < deadline, "rank 1 was not given a replacement worker"
+            time.sleep(0.01)
+        while True:
+            try:
+                write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "the replacement never opened its request pipe"
+                time.sleep(0.01)
+        os.set_blocking(write_fd, True)
+        with os.fdopen(write_fd, "w") as requests, open(f"{base}.out") as replies:
+            request = {"argv": ["5"], "stdout": str(root / "o.log"), "stderr": str(root / "e.log")}
+            requests.write(json.dumps(request) + "\n")
+            requests.flush()
+            assert json.loads(replies.readline())["returncode"] == 5
+        assert marker.read_text() == "x\n", "the replacement was not a fork of the warm parent"
+        assert worker.poll() is None, "the pool exited instead of serving until killed"
+        os.killpg(worker.pid, signal.SIGKILL)
+        worker.wait(timeout=30)
     print("r2d2 serve pool self-check passed")
 
 

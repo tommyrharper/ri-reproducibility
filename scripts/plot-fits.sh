@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Render FITS images to PNG with astropy + matplotlib in the R2D2 image.
+# Render FITS images to PNG with astropy + matplotlib in the R2D2 SIF.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
-# shellcheck source=scripts/lib/r2d2-docker-thread-env.sh
-source "${REPO_ROOT}/scripts/lib/r2d2-docker-thread-env.sh"
+# shellcheck source=scripts/lib/r2d2-thread-env.sh
+source "${REPO_ROOT}/scripts/lib/r2d2-thread-env.sh"
 
 if [ "$#" -gt 0 ]; then
   targets=("$@")
@@ -36,12 +36,12 @@ else
   fi
 fi
 
-docker run --rm --platform "${PLATFORM}" \
-  "${R2D2_DOCKER_ENV_FLAGS[@]}" \
-  -v "${RESULTS_DIR}:/results" \
-  -v "${REPO_ROOT}:/workspace/repo:ro" \
-  --entrypoint python3 \
-  "${R2D2_IMAGE}" -c "
+ns_require_sifs "${R2D2_SIF}"
+mkdir -p "${RESULTS_DIR}"
+"${APPTAINER}" exec "${R2D2_ENV_FLAGS[@]}" \
+  --bind "${RESULTS_DIR}:/results" \
+  --bind "${REPO_ROOT}:/workspace/repo:ro" \
+  "${R2D2_SIF}" python3 -c "
 import sys, os
 import numpy as np
 from astropy.io import fits

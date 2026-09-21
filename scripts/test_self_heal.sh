@@ -72,7 +72,7 @@ echo "self-heal: starting a wsclean search in ${OUT}"
 # --retries 1 rather than the default 2, so the run finishing also proves the
 # first retry was the one that did it.
 "${REPO_ROOT}/ri" search wsclean \
-  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 --no-build \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 \
   --output-dir "${OUT}" >"${OUT}.log" 2>&1 &
 SEARCH_PID=$!
 
@@ -153,7 +153,7 @@ echo "self-heal: killed at ${before} evaluations, recovered and finished at ${af
 # Any value has to clear this search's own gaps, which are milliseconds.
 echo "self-heal: starting a second wsclean search in ${HUNG_OUT}"
 NS_STALL_POLL_SECONDS=2 "${REPO_ROOT}/ri" search wsclean \
-  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 --no-build \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 \
   --stall-timeout 20 --output-dir "${HUNG_OUT}" >"${HUNG_OUT}.log" 2>&1 &
 SEARCH_PID=$!
 
@@ -201,7 +201,7 @@ echo "self-heal: hung at ${hung_before} evaluations, recovered and finished at $
 # Scenario three: retries disabled, then resume a stopped run through every health route.
 echo "self-heal: starting a third wsclean search in ${RESUME_OUT}"
 "${REPO_ROOT}/ri" search wsclean \
-  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 0 --no-build \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 0 \
   --output-dir "${RESUME_OUT}" >"${RESUME_OUT}.log" 2>&1 &
 SEARCH_PID=$!
 
@@ -319,7 +319,7 @@ echo "self-heal: killed unretried at ${resume_before} evaluations, resumed by ha
 # restarts.log never written.
 echo "self-heal: starting a fourth wsclean search in ${WORKER_OUT}"
 "${REPO_ROOT}/ri" search wsclean \
-  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 --no-build \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 \
   --output-dir "${WORKER_OUT}" >"${WORKER_OUT}.log" 2>&1 &
 SEARCH_PID=$!
 
@@ -332,32 +332,17 @@ worker_before="$(completed_evals "${WORKER_OUT}")"
 [ "${worker_before}" -ge "${KILL_AFTER_EVALS}" ] \
   || fail "only ${worker_before} evaluations after 120s; see ${WORKER_OUT}.log"
 
-# Found by this run's own `ri.run-dir` label, so no other search on this host
-# can be caught in it - and killed from inside the container, because the
-# workers are the `sh` processes on the far end of each rank's `docker exec`
-# and there is nothing on the host to signal but the client. Every rank's
-# worker at once: which of the three is idle at this instant is a race, and a
-# rank killed mid-request already had a covered path (its reply never comes).
-worker_sidecar="$(docker ps --filter "label=ri.run-dir=${WORKER_OUT}" \
-  --format '{{.Names}}\t{{.Image}}' | grep -i wsclean | cut -f1)"
-[ -n "${worker_sidecar}" ] || fail "no wsclean sidecar labelled for ${WORKER_OUT}"
-echo "self-heal: killing every wsclean worker in ${worker_sidecar} at ${worker_before} evaluations"
-# /proc rather than pkill: the wsclean image ships no procps. `$$` is this
-# `sh`, which is itself named sh and would otherwise kill itself first.
-# `wsclean-zygote` as well as `sh`: since the fork server landed
-# (docs/nested-sampling-wsclean-zygote.md) the imaging worker is a zygote and
-# not a shell, so matching only `sh` quietly made this check kill nothing.
-docker exec "${worker_sidecar}" sh -c \
-  'killed=0
-   for d in /proc/[0-9]*; do
-     p="${d#/proc/}"
-     comm="$(cat "${d}/comm" 2>/dev/null)"
-     case "${comm}" in sh|wsclean-zygote) ;; *) continue ;; esac
-     [ "${p}" != "$$" ] || continue
-     kill -9 "${p}" && killed=$((killed+1))
-   done
-   [ "${killed}" -gt 0 ] || { echo "no workers to kill" >&2; exit 1; }' \
-  || fail "could not kill the workers in ${worker_sidecar}"
+# The workers are host processes here, one wsclean-zygote per rank under the
+# run's own pool (start-sidecars.sh), each pid in the FIFO directory - so no
+# other search on this host can be caught in it. Every rank's worker at once:
+# which of the three is idle at this instant is a race, and a rank killed
+# mid-request already had a covered path (its reply never comes). The pool's
+# loop starts a replacement the moment one dies.
+worker_pids="$(cat "${WORKER_OUT}"/.wsclean-workers/*.pid 2>/dev/null | tr '\n' ' ')"
+[ -n "${worker_pids}" ] || fail "no wsclean workers recorded for ${WORKER_OUT}"
+echo "self-heal: killing every wsclean worker (${worker_pids}) at ${worker_before} evaluations"
+# shellcheck disable=SC2086  # pids are whitespace-separated on purpose
+kill -9 ${worker_pids} || fail "could not kill the workers ${worker_pids}"
 
 wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
   || fail "the search neither finished nor died within ${RECOVER_TIMEOUT_SECONDS}s of losing its workers; see ${WORKER_OUT}.log"
@@ -376,16 +361,16 @@ worker_after="$(completed_evals "${WORKER_OUT}")"
 
 echo "self-heal: workers killed at ${worker_before} evaluations, retried in place and finished at ${worker_after}"
 
-# Scenario five: the container the workers live in is removed while the run is
+# Scenario five: the whole pool the workers live in is killed while the run is
 # using it. Unlike scenario four this cannot be absorbed inside the evaluation -
 # there is nowhere to start a replacement worker - so the run does die and does
 # spend a restart. What is being checked is that the restart lands somewhere:
-# before `sidecar_restore`, every attempt after the removal `docker exec`ed
-# into a name that no longer existed and scored nothing, so the run stopped for
-# good at exit 1 with no summary.json.
+# before `sidecar_restore`, every attempt after the removal wrote into FIFOs
+# nothing read and scored nothing, so the run stopped for good at exit 1 with
+# no summary.json.
 echo "self-heal: starting a fifth wsclean search in ${SIDECAR_OUT}"
 "${REPO_ROOT}/ri" search wsclean \
-  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 --no-build \
+  --nlive 20 --num-repeats 2 --mpi-procs 3 --retries 1 \
   --output-dir "${SIDECAR_OUT}" >"${SIDECAR_OUT}.log" 2>&1 &
 SEARCH_PID=$!
 
@@ -398,12 +383,14 @@ sidecar_before="$(completed_evals "${SIDECAR_OUT}")"
 [ "${sidecar_before}" -ge "${KILL_AFTER_EVALS}" ] \
   || fail "only ${sidecar_before} evaluations after 120s; see ${SIDECAR_OUT}.log"
 
-# This run's own label again, so no other search on this host is touched.
-sidecar_name="$(docker ps --filter "label=ri.run-dir=${SIDECAR_OUT}" \
-  --format '{{.Names}}\t{{.Image}}' | grep -i wsclean | cut -f1)"
-[ -n "${sidecar_name}" ] || fail "no wsclean sidecar labelled for ${SIDECAR_OUT}"
-echo "self-heal: removing the sidecar ${sidecar_name} at ${sidecar_before} evaluations"
-docker rm --force "${sidecar_name}" >/dev/null || fail "could not remove ${sidecar_name}"
+# This run's own pool again, found by its FIFO directory, so no other search
+# on this host is touched. The pool is one process group (start-sidecars.sh):
+# the container's shell, the per-rank loops and every worker go together,
+# which is what the OOM killer taking the pool, or a node reboot, looks like.
+sidecar_pgid="$(ps -o pgid= -p "$(pgrep -f -- "${SIDECAR_OUT}/.wsclean-workers\$" | head -1)" | tr -d ' ')"
+[ -n "${sidecar_pgid}" ] || fail "no wsclean pool running for ${SIDECAR_OUT}"
+echo "self-heal: killing the wsclean pool (process group ${sidecar_pgid}) at ${sidecar_before} evaluations"
+kill -KILL -- "-${sidecar_pgid}" || fail "could not kill process group ${sidecar_pgid}"
 
 wait_for_exit "${SEARCH_PID}" "${RECOVER_TIMEOUT_SECONDS}" \
   || fail "the search neither finished nor died within ${RECOVER_TIMEOUT_SECONDS}s of losing its sidecar; see ${SIDECAR_OUT}.log"
@@ -436,7 +423,7 @@ torn_before="$(completed_evals "${SIDECAR_OUT}")"
 rm -f "${SIDECAR_OUT}/summary.json"
 truncate -s "$(( $(wc -c <"${resume_file}") / 2 ))" "${resume_file}"
 echo "self-heal: truncating ${resume_file##*/} and resuming at ${torn_before} evaluations"
-"${REPO_ROOT}/ri" resume "${SIDECAR_OUT}" --no-build >"${SIDECAR_OUT}.torn.log" 2>&1 \
+"${REPO_ROOT}/ri" resume "${SIDECAR_OUT}" >"${SIDECAR_OUT}.torn.log" 2>&1 \
   || fail "an unreadable checkpoint stopped the run for good; see ${SIDECAR_OUT}.torn.log"
 [ -f "${SIDECAR_OUT}/summary.json" ] || fail "the resume finished with no summary.json"
 # The checkpoint was moved, not deleted: it is the only record of where the
@@ -471,7 +458,7 @@ case "${summary_health}" in
   *"summary.json is half written"*"./ri resume"*) ;;
   *) fail "./ri health called a torn summary a finished run: ${summary_health}" ;;
 esac
-"${REPO_ROOT}/ri" resume "${SIDECAR_OUT}" --no-build >"${SIDECAR_OUT}.summary.log" 2>&1 \
+"${REPO_ROOT}/ri" resume "${SIDECAR_OUT}" >"${SIDECAR_OUT}.summary.log" 2>&1 \
   || fail "a torn summary.json could not be repaired; see ${SIDECAR_OUT}.summary.log"
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${SIDECAR_OUT}/summary.json" \
   || fail "the resume left a summary.json that still does not parse"

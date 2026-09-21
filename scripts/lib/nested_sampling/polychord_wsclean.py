@@ -56,8 +56,8 @@ from common import (
     self_check_worker_pool_connect,
     self_check_worker_timeout,
     sidecar_command,
-    sidecar_worker,
     zygote_run,
+    zygote_worker,
     simulate_measurement_set,
     simulate_worker,
     stable_seed,
@@ -370,16 +370,12 @@ def main() -> None:
     if mpi_rank() == 0:
         write_json_atomic(output_dir / "parameter-space.json", load_parameter_space())
 
-    def warm_wsclean() -> None:
-        sidecar_command(args.wsclean_image)
-        sidecar_worker(args.wsclean_image, args.platform, [ZYGOTE_COMMAND])
-
-    # Before `import pypolychord`, so the rank's sidecar attachments come up
+    # Before `import pypolychord`, so the rank's pool attachments come up
     # while the sampler is still loading. Joined just below, right before the
     # first evaluation can ask for one.
     warm = prewarm(
         lambda: simulate_worker(args.meqtrees_image, args.platform),
-        warm_wsclean,
+        lambda: zygote_worker(args.wsclean_image),
     )
 
     import pypolychord

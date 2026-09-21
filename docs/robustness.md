@@ -340,8 +340,7 @@ the reason into `run.log` and kills the run, turning the hang into the crash
 a multi-day search is exactly what somebody starts under `nohup`.
 
 The kill is by command line rather than by the pid the run script holds: that
-pid is the `docker exec` client, and the ranks are children of
-`containerd-shim`. `ns_run_process_pattern` builds the pattern, anchored on the
+pid is `apptainer exec`, and the ranks are children of `mpirun`. `ns_run_process_pattern` builds the pattern, anchored on the
 run's own `--output-dir` so another search on the host is untouched.
 
 **The default is 7200s, deliberately far above anything legitimate.**
@@ -382,22 +381,36 @@ paths drop the worker and retry. Measured on a real search whose workers were
 killed at 10 evaluations: before, the job aborted and spent a restart to reach
 the same 54 evaluations; after, it finished with no restart at all.
 
-## A sidecar container that went away
+## A rank that died mid-request
 
-The same reproduction with the *container* removed (`docker rm -f`, an OOM kill
-of its main process, a daemon restart) ends cleanly as `WORKER_DIED`, but there
-is nowhere to start a replacement worker, so the run dies. That part is
-correct; what was not is that it could not be restarted either. The containers
-were started once, in front of `run_with_retries`, so every attempt after the
-removal `docker exec`ed into a name that no longer existed, scored nothing, and
+The pools outlive the ranks, and a rank SIGKILLed while its worker was
+simulating leaves that worker still answering. The retry's rank connects to
+the same FIFO pair and reads that reply as its own: an evaluation scored from
+a `simulation.json` that was never written, which was the first thing
+`./ri self-check self-heal` found under Apptainer. The Docker branch never saw
+it because a restarted rank there abandoned the pool and started its own
+worker; a rank inside a SIF cannot start one. So `sidecar_reset_workers`
+(`scripts/lib/start-sidecars.sh`), called by `run_with_retries` before each
+retry, kills every worker the pools' pid files name - with its children, the
+meqserver a simulate worker drives - and the pools' loops start fresh ones on
+empty pipes. The line saying how many it killed is teed into `run.log`.
+
+## A worker pool that went away
+
+The same reproduction with the whole *pool* killed (its process group, which is
+what an OOM kill of the pool's shell or a node reboot looks like) ends cleanly
+as `WORKER_DIED`, but there is nowhere to start a replacement worker, so the
+run dies. That part is correct; what was not is that it could not be restarted
+either. The pools were started once, in front of `run_with_retries`, so every
+attempt after the removal wrote into FIFOs nothing read, scored nothing, and
 the anti-spin guard stopped the run for good at exit 1 with no `summary.json`.
 
-`sidecar_launch` in `scripts/lib/start-sidecars.sh` now keeps each container's
-own `docker run` arguments, and `sidecar_restore` - called before each retry -
-starts any container that is gone again under the same name. Only missing
-containers are touched, so an ordinary restart costs one `docker inspect` each,
-and the line naming a container it had to start again is teed into `run.log`.
-Re-launching is safe because the containers hold no run state.
+`sidecar_launch` in `scripts/lib/start-sidecars.sh` keeps each pool's own
+`apptainer exec` command, and `sidecar_restore` - called before each retry -
+starts any pool whose process group is gone again. Only missing pools are
+touched, so an ordinary restart costs one `kill -0` each, and the line naming a
+pool it had to start again is teed into `run.log`. Re-launching is safe because
+the pools hold no run state.
 
 ## Finding and resuming a run that stopped
 
@@ -497,8 +510,8 @@ in the six ways that recover through different machinery:
 | `SIGKILL` after 8 evaluations (fewer than `--nlive`, so before any checkpoint) | Restarts itself, records the kill, keeps the evaluations, writes `summary.json`, and `./ri health` says nothing on its headline |
 | `SIGSTOP` on one rank | Only the stall watchdog can notice; run with `--stall-timeout 20` and a 2s poll so it costs a minute rather than two hours |
 | `SIGKILL` on a search started with `--retries 0` | Does *not* recover on its own: `./ri health` must headline it `STOPPED` and name `./ri resume <run>`, and that command - taken from the report and typed verbatim - must continue the search rather than begin one |
-| `SIGKILL` on every worker, from inside the sidecar | Costs nothing: absorbed inside the evaluation, so `restarts.log` is never written |
-| `docker rm --force` on a sidecar | Costs a restart: the run dies and `sidecar_restore` is what lets the retry fix it |
+| `SIGKILL` on every worker in the pool | Costs nothing: absorbed inside the evaluation, so `restarts.log` is never written |
+| `SIGKILL` on the pool's whole process group | Costs a restart: the run dies and `sidecar_restore` is what lets the retry fix it |
 | A truncated `chains/*.resume`, then a truncated `summary.json`, on the finished run | `./ri resume` finishes both, keeps the torn checkpoint as `*.resume.unreadable`, and leaves the evaluation count unchanged - nothing imaged twice |
 
 ~5 minutes and ~0.6GB, so it is safe to run beside another search.

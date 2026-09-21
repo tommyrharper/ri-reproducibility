@@ -6,7 +6,7 @@ the complete interface.
 ## Setup and checks
 
 ```bash
-./ri build                         # build all images
+./ri images import                 # the SIFs, from archives built on a Docker host
 ./ri smoke                         # smoke-test both imagers
 ./ri self-check                    # host and image checks
 ./ri --dry-run search wsclean      # preview commands without running them

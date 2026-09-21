@@ -27,8 +27,21 @@ def running_run_dirs(ps_output: str | None = None) -> set[str]:
             ).stdout
         except (OSError, subprocess.CalledProcessError):
             return set()
-    return {match.group(1).rstrip("/") for line in ps_output.splitlines()
-            if (match := RUN_COMMAND.search(line))}
+    running = {match.group(1).rstrip("/") for line in ps_output.splitlines()
+               if (match := RUN_COMMAND.search(line))}
+    running.update(str((NESTED_SAMPLING_DIR / name).resolve()) for name in slurm_job_names()
+                   if (NESTED_SAMPLING_DIR / name).is_dir())
+    return running
+
+
+def slurm_job_names() -> set[str]:
+    """This user's queued and running jobs, which slurm.sh names after their run
+    directories: on a login node the ranks are on a compute node ps cannot see.
+    Shares slurm_queue.py's two-minute squeue cache with `./ri health`."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from slurm_queue import slurm_jobs
+
+    return set(slurm_jobs())
 
 
 def read_run_env(run_dir: Path) -> dict[str, str]:
@@ -296,8 +309,10 @@ def self_check() -> None:
     import shutil
     import tempfile
 
-    global NESTED_SAMPLING_DIR, running_run_dirs
+    global NESTED_SAMPLING_DIR, running_run_dirs, slurm_job_names
     saved = NESTED_SAMPLING_DIR
+    # Never the squeue of whatever host runs this suite.
+    slurm_job_names = lambda: set()  # noqa: E731
     try:
         with tempfile.TemporaryDirectory() as tmp:
             NESTED_SAMPLING_DIR = Path(tmp)
@@ -477,7 +492,6 @@ def self_check() -> None:
             ps_output = "\n".join([
                 rank,
                 f"mpirun --allow-run-as-root -np 16 {rank}",
-                f"/usr/bin/docker exec -e NS_MPI_PROCS=16 c mpirun -np 16 {rank}",
                 f"python3 /repo/scripts/lib/nested_sampling/r2d2_serve.py --fifo-dir {done.resolve()}/.r2d2-workers",
                 "python3 /repo/scripts/nested-sampling-health.py",
             ])

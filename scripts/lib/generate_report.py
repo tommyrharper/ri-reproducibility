@@ -2852,7 +2852,11 @@ def main(argv=None):
         # 3.4ms of a rebuild that has nothing to do.
         import multiprocessing
 
-        workers = min(len(todo), os.cpu_count() or 1)
+        # RI_REPORT_WORKERS caps it; generate-report.sh sets 2 on a cluster login
+        # node, whose shared CPUs are not this report's to take (there are two
+        # pools, so that is four processes).
+        cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+        workers = min(len(todo), int(os.environ.get("RI_REPORT_WORKERS") or 0) or cpus or 1)
         if drawing:
             try:
                 import anesthetic  # noqa: F401

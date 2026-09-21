@@ -18,10 +18,11 @@ MS_DIR_NAME="JVLA-MultiBand-S1_C5-minimal.ms"
 FIXTURE_DIR="${REPO_ROOT}/results/.smoke-test-fixtures/wsclean"
 OUTPUT_DIR="${REPO_ROOT}/results/smoke-test-wsclean"
 
+ns_require_sifs "${WSCLEAN_SIF}"
 mkdir -p "${FIXTURE_DIR}" "${OUTPUT_DIR}"
 
 echo "==> [1/3] wsclean --version"
-docker run --rm --platform "${PLATFORM}" "${WSCLEAN_IMAGE}" --version
+"${APPTAINER}" exec "${WSCLEAN_SIF}" wsclean --version
 
 echo "==> [2/3] fetching + verifying test Measurement Set fixture"
 if [ ! -d "${FIXTURE_DIR}/${MS_DIR_NAME}" ]; then
@@ -42,11 +43,10 @@ WSCLEAN_ARGS=()
 while IFS= read -r line; do
   WSCLEAN_ARGS+=("${line}")
 done < <(grep -v '^[[:space:]]*#' "${ARGS_FILE}" | grep -v '^[[:space:]]*$')
-docker run --rm --platform "${PLATFORM}" \
-  -v "${FIXTURE_DIR}:/data:ro" \
-  -v "${OUTPUT_DIR}:/results" \
-  --entrypoint wsclean \
-  "${WSCLEAN_IMAGE}" \
+"${APPTAINER}" exec \
+  --bind "${FIXTURE_DIR}:/data:ro" \
+  --bind "${OUTPUT_DIR}:/results" \
+  "${WSCLEAN_SIF}" wsclean \
   -name /results/smoke \
   -temp-dir /results \
   "${WSCLEAN_ARGS[@]}" \

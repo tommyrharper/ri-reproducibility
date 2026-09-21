@@ -7,12 +7,11 @@ import math
 import os
 import re
 import select
-import shlex
+import signal
 import subprocess
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache, lru_cache
@@ -504,20 +503,6 @@ def r2d2_thread_count() -> int:
     return os.cpu_count() or 1
 
 
-def r2d2_docker_thread_env_flags() -> list[str]:
-    threads = str(r2d2_thread_count())
-    return [
-        "-e",
-        f"OMP_NUM_THREADS={threads}",
-        "-e",
-        f"MKL_NUM_THREADS={threads}",
-        "-e",
-        f"OPENBLAS_NUM_THREADS={threads}",
-        "-e",
-        "OMP_WAIT_POLICY=PASSIVE",
-    ]
-
-
 def fill_disabled_parameters(raw: dict[str, Any]) -> None:
     enabled_names = {spec["name"] for spec in load_parameter_space()}
     for spec in load_all_parameter_specs():
@@ -568,99 +553,25 @@ def stable_seed(global_seed: int, key: str) -> int:
     return (global_seed + int(key[:8], 16)) % (2**31 - 1)
 
 
-# Usually pre-started by start-sidecars.sh; missing images start on first use.
-_SIDECAR_CONTAINERS: dict[str, str] = json.loads(os.environ.get("NS_SIDECARS", "{}"))
-_IMAGE_ENTRYPOINTS: dict[str, list[str]] = {}
-
-
-def sidecar_container(image: str, platform: str, extra_args: list[str] | None = None) -> str:
-    if image not in _SIDECAR_CONTAINERS:
-        repo_root = os.environ.get("REPO_ROOT", os.getcwd())
-        # The shared MS scratch tmpfs, when the run script made one; see
-        # evaluation_scratch_dir().
-        scratch = os.environ.get("NS_SCRATCH_DIR", "")
-        scratch_mount = ["-v", f"{scratch}:{scratch}"] if scratch else []
-        name = f"ri-ns-sidecar-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        subprocess.run(
-            [
-                "docker", "run", "--detach", "--rm", "--name", name,
-                # No network needed; "none" keeps loopback for meqserver and avoids
-                # rootless Docker's bridge setup.
-                "--network", "none",
-                # MS and makems caches live in /dev/shm.
-                "--shm-size", "512m",
-                "--platform", platform,
-                "-v", f"{repo_root}:{repo_root}",
-                *scratch_mount,
-                *(extra_args or []),
-                "--entrypoint", "sleep", image, "infinity",
-            ],
-            stdout=subprocess.DEVNULL,
-            check=True,
-        )
-        # ponytail: a SIGKILLed rank can leak this container; reap labelled sidecars.
-        atexit.register(
-            subprocess.run,
-            ["docker", "rm", "--force", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        _SIDECAR_CONTAINERS[image] = name
-    return _SIDECAR_CONTAINERS[image]
-
-
-def sidecar_exec(
-    image: str,
-    platform: str,
-    workdir: Path,
-    prefix: list[str] | None = None,
-    interactive: bool = False,
-) -> list[str]:
-    return [
-        "docker", "exec",
-        *(["--interactive"] if interactive else []),
-        "--workdir", str(workdir),
-        sidecar_container(image, platform),
-        *sidecar_command(image, prefix),
-    ]
-
-
 def sidecar_command(image: str, prefix: list[str] | None = None) -> list[str]:
-    if image not in _IMAGE_ENTRYPOINTS:
-        inspected = subprocess.run(
-            ["docker", "inspect", "--format", "{{json .Config.Entrypoint}}", image],
-            stdout=subprocess.PIPE,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        entrypoint = json.loads(inspected)
-        if not entrypoint:
-            raise SystemExit(f"FATAL: {image} has no ENTRYPOINT to run inside a sidecar")
-        _IMAGE_ENTRYPOINTS[image] = entrypoint
-    return [*(prefix or []), *_IMAGE_ENTRYPOINTS[image]]
-
-
-_SIDECAR_WORKERS: dict[tuple[str, str], subprocess.Popen] = {}
-
-
-def sidecar_worker(image: str, platform: str, argv: list[str]) -> subprocess.Popen:
-    key = (image, argv[0])
-    if key not in _SIDECAR_WORKERS:
-        worker = subprocess.Popen(
-            # Bypass image ENTRYPOINT; each request names its evaluation directory.
-            ["docker", "exec", "--interactive", sidecar_container(image, platform), *argv],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        # Container teardown is registered by sidecar_container().
-        atexit.register(worker.terminate)
-        _SIDECAR_WORKERS[key] = worker
-    return _SIDECAR_WORKERS[key]
+    """The WSClean image's entrypoint, as the zygote wants argv[0] spelled."""
+    return [*(prefix or []), "wsclean"]
 
 
 ZYGOTE_COMMAND = "wsclean-zygote"
+
+_ZYGOTE_WORKERS: dict[str, "FifoWorker"] = {}
+
+
+def zygote_worker(image: str) -> "FifoWorker":
+    """This rank's WSClean fork server, one of the pool the run script started."""
+    if image not in _ZYGOTE_WORKERS:
+        worker = _connect_shell_started_worker("NS_WSCLEAN_FIFO_DIR")
+        if worker is None:
+            raise WorkerDied(f"no {ZYGOTE_COMMAND} pool for rank {mpi_rank()} under NS_WSCLEAN_FIFO_DIR")
+        atexit.register(worker.terminate)
+        _ZYGOTE_WORKERS[image] = worker
+    return _ZYGOTE_WORKERS[image]
 
 
 def zygote_run(
@@ -676,9 +587,9 @@ def zygote_run(
     request = "\t".join(fields) + "\n"
     started = time.perf_counter()
     for attempt in worker_attempts():
-        zygote = sidecar_worker(image, platform, [ZYGOTE_COMMAND])
+        zygote = zygote_worker(image)
         if not worker_send(zygote.stdin, request):
-            _SIDECAR_WORKERS.pop((image, ZYGOTE_COMMAND), None)
+            _forget(_ZYGOTE_WORKERS, image)
             continue
         reply = worker_reply(zygote.stdout, SHELL_REPLY_TIMEOUT)
         if reply:
@@ -691,7 +602,7 @@ def zygote_run(
             )
         if reply is None:
             zygote.kill()
-        _SIDECAR_WORKERS.pop((image, ZYGOTE_COMMAND), None)
+        _forget(_ZYGOTE_WORKERS, image)
     stderr_path.write_text(
         f"FATAL: {image} {ZYGOTE_COMMAND} gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
@@ -1872,62 +1783,95 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     return record
 
 
-_SIMULATE_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
+_SIMULATE_WORKERS: dict[str, "FifoWorker"] = {}
 
 
-# Set when a pooled worker had to be killed. Its FIFO pair died with it, so
-# reconnecting can only find a corpse, and the ENXIO wait below would be pure
-# delay in front of a retry that has to fall back to a rank-started worker
-# anyway. Per rank, because each rank is its own process.
-_FIFO_POOL_ABANDONED = False
+def _children_of(pid: int) -> list[int]:
+    """A /proc walk rather than pgrep: the ranks run inside polychord.sif,
+    which has no procps, and Apptainer shares the host's pid namespace, so
+    the pids are the same ones the pool wrote. A macOS host running the
+    self-check has no /proc but does have pgrep."""
+    if not os.path.isdir("/proc"):
+        out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout
+        return [int(child) for child in out.split()]
+    children = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path("/proc", entry, "stat").read_text()
+        except OSError:
+            continue
+        # `pid (comm) state ppid ...`; comm may hold spaces and parentheses.
+        if int(stat.rsplit(")", 1)[1].split()[1]) == pid:
+            children.append(int(entry))
+    return children
 
 
-def fifo_worker_pgrep_pattern(base: Path) -> str:
-    return f"serve --fif[o] {base}$"
+def _kill_process_tree(pid: int) -> None:
+    """SIGKILL `pid` and its children - the worker and the meqserver it drives."""
+    for victim in (*_children_of(pid), pid):
+        try:
+            os.kill(victim, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 class FifoWorker:
-    def __init__(self, write_fd: int, reply_path: Path, container: str, base: Path) -> None:
+    def __init__(self, write_fd: int, reply_path: Path, base: Path) -> None:
         self.stdin = os.fdopen(write_fd, "w")
         # Opening a FIFO blocks until the other end is open, so this must be the
         # same order serve() uses - request pipe first, reply pipe second.
         self.stdout = reply_path.open("r")
-        self.container = container
         self.base = base
 
     def terminate(self) -> None:
-        self.stdin.close()
+        """Let go of both ends.
 
-    def kill(self) -> None:
-        """Kill wedged worker and its meqserver inside the sidecar."""
-        global _FIFO_POOL_ABANDONED
-        _FIFO_POOL_ABANDONED = True
-        pattern = fifo_worker_pgrep_pattern(self.base)
-        subprocess.run(
-            [
-                "docker", "exec", self.container, "sh", "-c",
-                f"p=$(pgrep -f {shlex.quote(pattern)}) || exit 0;"
-                " kill -9 $(pgrep -P $p) $p 2>/dev/null || true",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        Both, not just the request end: a write end held open past the worker's
+        death keeps the pipe's buffer alive for the replacement to read, and a
+        request nobody was there to take would then be answered twice - once
+        for the retry that resends it, and once more into the next request's
+        reply. Closed, the replacement starts from an empty pipe.
+        """
         for stream in (self.stdin, self.stdout):
             try:
                 stream.close()
             except OSError:
                 pass
 
+    def kill(self) -> None:
+        """Kill a wedged worker; the pool starts a fresh one on the same FIFOs."""
+        try:
+            pid = int(Path(f"{self.base}.pid").read_text())
+        except (OSError, ValueError):
+            pid = 0
+        if pid > 0:
+            _kill_process_tree(pid)
+        self.terminate()
 
-def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWorker | None:
-    """Attach to this rank's pre-warmed worker, or return None if unavailable."""
+
+def _forget(workers: dict[str, "FifoWorker"], key: str) -> None:
+    """Drop a dead or wedged worker so the next attempt reconnects to the pool."""
+    worker = workers.pop(key, None)
+    if worker is not None:
+        worker.terminate()
+
+
+# The pools come up alongside the ranks: a SIF to start, torch or Timba to
+# import, and on a cluster node every rank's worker doing it off the same
+# filesystem at once. A missing pool is only ever paid for in full.
+POOL_CONNECT_SECONDS = 60.0
+
+
+def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
+    """Attach to this rank's pooled worker, or return None if it never appears."""
     fifo_dir = os.environ.get(fifo_dir_var)
-    if not fifo_dir or _FIFO_POOL_ABANDONED:
+    if not fifo_dir:
         return None
     base = Path(fifo_dir) / str(mpi_rank())
-    # Nonblocking open returns ENXIO until worker starts; timeout falls back.
-    deadline = time.monotonic() + 10.0
+    # Nonblocking open returns ENXIO until the worker opens its end.
+    deadline = time.monotonic() + POOL_CONNECT_SECONDS
     while True:
         try:
             write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
@@ -1937,56 +1881,29 @@ def _connect_shell_started_worker(fifo_dir_var: str, container: str) -> FifoWork
             time.sleep(0.002)
             continue
         os.set_blocking(write_fd, True)
-        return FifoWorker(write_fd, Path(f"{base}.out"), container, base)
+        return FifoWorker(write_fd, Path(f"{base}.out"), base)
 
 
-def simulate_worker(meqtrees_image: str, platform: str) -> subprocess.Popen | FifoWorker:
-    """Keep one warm simulator worker per rank to avoid repeated startup cost."""
+def simulate_worker(meqtrees_image: str, platform: str) -> FifoWorker:
+    """This rank's warm simulator worker, one of the pool the run script started."""
     if meqtrees_image not in _SIMULATE_WORKERS:
-        worker = _connect_shell_started_worker(
-            "NS_SIMULATE_FIFO_DIR", sidecar_container(meqtrees_image, platform)
-        )
+        worker = _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR")
         if worker is None:
-            repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
-            worker = subprocess.Popen(
-                [*sidecar_exec(meqtrees_image, platform, repo_root, interactive=True), "--serve"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-        # The container itself is torn down by sidecar_container()'s own atexit
-        # hook, which is registered first and so runs last.
+            raise WorkerDied(f"no simulate worker for rank {mpi_rank()} under NS_SIMULATE_FIFO_DIR")
         atexit.register(worker.terminate)
         _SIMULATE_WORKERS[meqtrees_image] = worker
     return _SIMULATE_WORKERS[meqtrees_image]
 
 
-_R2D2_WORKERS: dict[str, "subprocess.Popen | FifoWorker"] = {}
+_R2D2_WORKERS: dict[str, "FifoWorker"] = {}
 
 
-def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> "subprocess.Popen | FifoWorker":
-    """Return this rank's long-lived R2D2 worker, creating it once per image."""
+def r2d2_worker(r2d2_image: str, platform: str, checkpoints_dir: str) -> FifoWorker:
+    """This rank's long-lived R2D2 worker, one of the pool the run script started."""
     if r2d2_image not in _R2D2_WORKERS:
-        container = sidecar_container(r2d2_image, platform, ["-v", f"{checkpoints_dir}:/checkpoints:ro"])
-        worker = _connect_shell_started_worker("NS_R2D2_FIFO_DIR", container)
+        worker = _connect_shell_started_worker("NS_R2D2_FIFO_DIR")
         if worker is None:
-            repo_root = Path(os.environ.get("REPO_ROOT", os.getcwd()))
-            worker = subprocess.Popen(
-                [
-                    "docker", "exec", "--interactive",
-                    *r2d2_docker_thread_env_flags(),
-                    container,
-                    "python3",
-                    # Read live off the repo bind mount: the R2D2 image bakes in
-                    # no copy of this repo's scripts, so nothing to rebuild.
-                    str(repo_root / "scripts" / "lib" / "nested_sampling" / "r2d2_serve.py"),
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-        # The container itself is torn down by sidecar_container()'s own atexit
-        # hook, which is registered first and so runs last.
+            raise WorkerDied(f"no R2D2 worker for rank {mpi_rank()} under NS_R2D2_FIFO_DIR")
         atexit.register(worker.terminate)
         _R2D2_WORKERS[r2d2_image] = worker
     return _R2D2_WORKERS[r2d2_image]
@@ -2006,7 +1923,7 @@ def run_r2d2_imaging(
     for attempt in worker_attempts():
         worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
-            _R2D2_WORKERS.pop(r2d2_image, None)
+            _forget(_R2D2_WORKERS, r2d2_image)
             continue
         reply = worker_reply(worker.stdout, IMAGING_REPLY_TIMEOUT)
         if reply:
@@ -2017,12 +1934,10 @@ def run_r2d2_imaging(
                 peak_memory_bytes=answer["peak_memory_bytes"],
             )
         if reply is None:
-            # ponytail: this kills the `docker exec`
-            # client and leaves the worker wedged in the sidecar.
             worker.kill()
         # The worker died or went silent mid-request; drop it so the next
-        # attempt starts a fresh one instead of inheriting the corpse.
-        _R2D2_WORKERS.pop(r2d2_image, None)
+        # attempt reconnects to the one the pool starts in its place.
+        _forget(_R2D2_WORKERS, r2d2_image)
     stderr_path.write_text(
         f"FATAL: r2d2 worker gave no reply, {len(WORKER_RETRY_DELAYS)} times\n"
     )
@@ -2058,14 +1973,14 @@ def simulate_worker_request(
     for attempt in worker_attempts():
         worker = simulate_worker(meqtrees_image, platform)
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
-            _SIMULATE_WORKERS.pop(meqtrees_image, None)
+            _forget(_SIMULATE_WORKERS, meqtrees_image)
             continue
         reply = worker_reply(worker.stdout, reply_timeout)
         if reply:
             return int(json.loads(reply)["returncode"])
         if reply is None:
             worker.kill()
-        _SIMULATE_WORKERS.pop(meqtrees_image, None)
+        _forget(_SIMULATE_WORKERS, meqtrees_image)
     # Appended, not written: the last attempt's worker leaves its traceback in
     # this file, and that is the only thing on disk that says why it died.
     # Clobbering it left "gave no reply" as the entire record of the failure.
@@ -2282,6 +2197,7 @@ def self_check_worker_timeout() -> None:
 
 
 def self_check_worker_pool_connect() -> None:
+    import subprocess
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -2291,29 +2207,65 @@ def self_check_worker_pool_connect() -> None:
         # O_RDWR is the one open mode a FIFO never blocks on, and it puts the
         # reader on .in and the writer on .out that a live worker would.
         ends = [os.open(f"{base}.in", os.O_RDWR), os.open(f"{base}.out", os.O_RDWR)]
+        # A stand-in for the pooled worker and the meqserver it drives, so the
+        # kill path can be seen to take both.
+        stand_in = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
+        Path(f"{base}.pid").write_text(f"{stand_in.pid}\n")
         original = dict(os.environ)
         try:
             os.environ["NS_SIMULATE_FIFO_DIR"] = tmp
             os.environ["NS_R2D2_FIFO_DIR"] = tmp
-            # The run script already started these; naming them here keeps the
-            # check off docker entirely.
-            _SIDECAR_CONTAINERS["meqtrees-self-check"] = "self-check"
-            _SIDECAR_CONTAINERS["r2d2-self-check"] = "self-check"
-            for worker in (
+            os.environ["NS_WSCLEAN_FIFO_DIR"] = tmp
+            workers = [
                 simulate_worker("meqtrees-self-check", "linux/amd64"),
                 r2d2_worker("r2d2-self-check", "linux/amd64", "/checkpoints"),
-            ):
+                zygote_worker("wsclean-self-check"),
+            ]
+            for worker in workers:
                 assert isinstance(worker, FifoWorker), type(worker)
                 atexit.unregister(worker.terminate)
+            deadline = time.monotonic() + 5
+            while not _children_of(stand_in.pid):
+                assert time.monotonic() < deadline, "the stand-in never started its child"
+                time.sleep(0.02)
+            grandchildren = _children_of(stand_in.pid)
+            workers[0].kill()
+            assert stand_in.wait(timeout=5) == -signal.SIGKILL, stand_in.returncode
+            for child in grandchildren:
+                while True:
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        break
+                    # Killed but not yet reaped by its parent, which is gone
+                    # too; init will. Zombie is as dead as it gets. Without
+                    # /proc (macOS) launchd reaps it and the kill above fails.
+                    try:
+                        if Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                            break
+                    except FileNotFoundError:
+                        pass
+                    assert time.monotonic() < deadline, "the worker's child survived kill()"
+                    time.sleep(0.02)
+            # No pool at all is a WorkerDied, not a rank-started fallback.
+            _SIMULATE_WORKERS.pop("meqtrees-self-check", None)
+            del os.environ["NS_SIMULATE_FIFO_DIR"]
+            try:
+                simulate_worker("meqtrees-self-check", "linux/amd64")
+            except WorkerDied:
+                pass
+            else:
+                raise AssertionError("a rank without a pool must not pretend to have a worker")
         finally:
-            for image in ("meqtrees-self-check", "r2d2-self-check"):
-                _SIDECAR_CONTAINERS.pop(image, None)
             _SIMULATE_WORKERS.pop("meqtrees-self-check", None)
             _R2D2_WORKERS.pop("r2d2-self-check", None)
+            _ZYGOTE_WORKERS.pop("wsclean-self-check", None)
             os.environ.clear()
             os.environ.update(original)
             for fd in ends:
                 os.close(fd)
+            if stand_in.poll() is None:
+                stand_in.kill()
 
     print("worker pool connect self-check passed")
 
@@ -2532,8 +2484,12 @@ def self_check_source_offset() -> None:
             header, centre, centre, corner["source_l_arcsec"], corner["source_m_arcsec"],
             image_dim(), image_dim(),
         )
+        # source_pixel() clamps to the image, and the grid is not symmetric
+        # about its centre pixel: `centre` pixels lie below it and one fewer
+        # above, so at `fraction = 1` the box's top edge is one pixel past the
+        # last row and lands on it.
         away = round(float(by_name["source_l_pixels"]["max"]))
-        assert (abs(sx - centre), sy - centre) == (away, away), (sx, sy, away)
+        assert (abs(sx - centre), sy - centre) == (min(away, centre), min(away, image_dim() - 1 - centre)), (sx, sy, away)
 
         # Enabled alongside the polar dimension the offsets would add, and
         # the same position would come from many draws.
@@ -2662,33 +2618,6 @@ def self_check_spectral_window() -> None:
         assert "no start frequency can hold it" in str(error), error
     else:
         raise AssertionError("a box whose smallest window fits no band should not load")
-
-
-def self_check_r2d2_thread_env() -> None:
-    saved = os.environ.get("R2D2_OMP_THREADS")
-    try:
-        os.environ["R2D2_OMP_THREADS"] = "6"
-        flags = r2d2_docker_thread_env_flags()
-        assert flags == [
-            "-e",
-            "OMP_NUM_THREADS=6",
-            "-e",
-            "MKL_NUM_THREADS=6",
-            "-e",
-            "OPENBLAS_NUM_THREADS=6",
-            "-e",
-            "OMP_WAIT_POLICY=PASSIVE",
-        ]
-        del os.environ["R2D2_OMP_THREADS"]
-        count = r2d2_thread_count()
-        assert count >= 1
-        auto_flags = r2d2_docker_thread_env_flags()
-        assert auto_flags[1] == f"OMP_NUM_THREADS={count}"
-    finally:
-        if saved is None:
-            os.environ.pop("R2D2_OMP_THREADS", None)
-        else:
-            os.environ["R2D2_OMP_THREADS"] = saved
 
 
 def self_check_fits_reader() -> None:
