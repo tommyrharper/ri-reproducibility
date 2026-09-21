@@ -40,6 +40,10 @@ if ns_should_submit; then
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
   exit 0
 fi
+# Inside an allocation it did not submit (sintr), the run carries on in the
+# job's own environment rather than the login node's (slurm.sh).
+export OUTPUT_DIR
+ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling.sh
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"

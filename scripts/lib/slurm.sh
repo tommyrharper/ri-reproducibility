@@ -70,6 +70,28 @@ ns_submit_run() {
   rm -f "${XDG_CACHE_HOME:-${HOME}/.cache}/ri/squeue-${USER:-$(id -un)}.txt"
 }
 
+# ns_enter_job_env <run dir> <command...>
+#
+# A run started inside an allocation it did not submit - `sintr`, a batch
+# script of the caller's own - carries that shell's environment, which is the
+# login node's, /home and all. So it hands itself to job-env.sh the way a
+# submitted job starts, with the run's settings saved beside it, once:
+# job-env.sh exports RI_JOB_ENV. Outside an allocation this does nothing;
+# NS_JOB_ENV=0 keeps the caller's environment. Callers export OUTPUT_DIR first.
+ns_enter_job_env() {
+  local run_dir="$1" repo="${REPO_ROOT}" phys
+  shift
+  [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${RI_JOB_ENV:-}" ] && [ "${NS_JOB_ENV:-1}" = 1 ] || return 0
+  phys="$(cd "${repo}" 2>/dev/null && pwd -P)" && repo="${phys}"
+  phys="$(cd "${run_dir}" 2>/dev/null && pwd -P)" && run_dir="${phys}"
+  # shellcheck source=scripts/lib/job-env.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/job-env.sh"
+  ns_write_job_settings "${run_dir}/.job-settings.env" || return
+  echo "Inside Slurm job ${SLURM_JOB_ID}: carrying on in the job's own environment (scripts/lib/job-env.sh; NS_JOB_ENV=0 to skip)."
+  cd "${repo}" || return
+  exec /bin/bash "${repo}/scripts/lib/job-env.sh" "${run_dir}/.job-settings.env" "$@"
+}
+
 # `bash scripts/lib/slurm.sh --self-check`: when a run submits, and what it
 # submits, against a fake sbatch that records its arguments and environment.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
@@ -147,6 +169,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     || { echo "FAIL: qos intr must default the time to its one-hour cap, got: $(cat "${_dir}/env")"; exit 1; }
   [ -e "${XDG_CACHE_HOME}/ri/squeue-${USER:-$(id -un)}.txt" ] \
     && { echo "FAIL: a submission must drop the squeue cache"; exit 1; }
+
+  # Inside an allocation it did not submit, a run re-execs itself under
+  # job-env.sh once; anywhere else it carries on.
+  mkdir -p "${REPO_ROOT}/scripts/lib"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >"%s/entered"\n' "${_dir}" >"${REPO_ROOT}/scripts/lib/job-env.sh"
+  ( unset SLURM_JOB_ID; ns_enter_job_env "${_run}" scripts/run-nested-sampling.sh; echo stayed ) | grep -qx stayed \
+    || { echo "FAIL: outside an allocation a run must carry on in place"; exit 1; }
+  ( SLURM_JOB_ID=5 RI_JOB_ENV=1 ns_enter_job_env "${_run}" x; echo stayed ) | grep -qx stayed \
+    || { echo "FAIL: a run already under job-env.sh must not re-enter it"; exit 1; }
+  ( SLURM_JOB_ID=5 NS_JOB_ENV=0 ns_enter_job_env "${_run}" x; echo stayed ) | grep -qx stayed \
+    || { echo "FAIL: NS_JOB_ENV=0 must keep the caller's environment"; exit 1; }
+  ( SLURM_JOB_ID=5 ns_enter_job_env "${_run}" scripts/run-nested-sampling.sh; echo stayed ) >/dev/null
+  [ "$(tr '\n' ' ' <"${_dir}/entered")" = "${_run}/.job-settings.env scripts/run-nested-sampling.sh " ] \
+    || { echo "FAIL: sintr must re-enter the run under job-env.sh, got: $(cat "${_dir}/entered" 2>/dev/null)"; exit 1; }
 
   echo "slurm self-check passed"
 fi

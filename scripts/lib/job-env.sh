@@ -192,6 +192,8 @@ _ri_job_env_main() {
   # shellcheck disable=SC1090
   . "${settings}" || { echo "job-env: cannot read ${settings}" >&2; exit 1; }
   _ri_job_env_build || exit 1
+  # A run script inside the job knows not to hand itself over again (slurm.sh).
+  export RI_JOB_ENV=1
   cd "${REPO_ROOT_PHYS}" || exit 1
   if ! ri_job_env_check; then
     echo "FATAL: the job's environment reaches /home or a Nix store; see above." >&2

@@ -80,7 +80,8 @@ squeue -u $USER                            # the job, named after the run
 `./ri search` and `./ri resume` submit a job when they are run outside a
 Slurm allocation on a host that has `sbatch` (`scripts/lib/slurm.sh`); inside
 `sintr` or a batch script, and on a host without Slurm, they run in place as
-they always did. The run directory is claimed on the login node, so the job is
+they always did - inside an allocation, in the job's own environment rather
+than the calling shell's (`ns_enter_job_env`; next section). The run directory is claimed on the login node, so the job is
 named after it, its stdout is `slurm-<jobid>.out` beside `run.log`, and
 `./ri runs`, `./ri resume` and `./ri search --output-dir` treat the run as
 live while a job of that name is queued or running (`squeue`), since the login
@@ -97,7 +98,9 @@ store, uv's own install, dotfiles). `ns_submit_run` submits with
 running the login shell, `~/.bashrc` and all, on the compute node - and the
 job starts in `scripts/lib/job-env.sh`, which:
 
-- empties the environment down to `SLURM_*`, however the job was submitted;
+- empties the environment down to `SLURM_*`, however the job was submitted -
+  and a run started by hand inside `sintr` or a batch script of your own
+  re-execs itself through it too, once (`NS_JOB_ENV=0` keeps the shell's);
 - sources the run's settings, saved by the login node as
   `.job-settings.env` in the run directory: `NS_*`, `R2D2_*`, `RI_*`, the
   image and output directories, as physical paths (`~/rds/hpc-work` is
