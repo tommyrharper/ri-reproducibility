@@ -77,3 +77,34 @@ Or:
 ./ri search wsclean --then r2d2 --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_jy --plot --report
 ```
 
+# csd3 instructions/notes
+
+Commands that submit themselves as a Slurm job (by default via sbatch)
+```bash
+./ri search wsclean|r2d2
+./ri resume <run>
+./ri bench run
+```
+To run them as interactive (runs instantly but you only have 1 hour):
+```bash
+./ri search wsclean|r2d2 --qos=intr
+```
+
+Commands I can happily run on the login node:
+```bash
+./ri smoke wsclean|r2d2
+./ri images import
+./ri shell
+./ri self-check
+./ri tui
+```
+
+Commands I should run ONLY in `sintr`:
+```bash
+./ri self-check self-heal
+```
+
+## login node resources
+
+- 4 CPU cores
+- 20 GB RAM
