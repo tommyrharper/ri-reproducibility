@@ -79,6 +79,19 @@ Or:
 
 # csd3 instructions/notes
 
+## quick run search commands
+
+Don't run two at the same time.
+```zsh
+./ri search wsclean --account WBARKER-SL3-CPU --qos intr --time 00:15:00 --nlive 8 --mpi-procs 4
+./ri search r2d2 --device cuda --account WBARKER-SL3-GPU --qos intr --time 00:15:00 --nlive 8 --mpi-procs 4
+# Checking progress (a minute or two apart, not in a loop):
+./ri runs   # the run shows as queued/running, then finished
+./ri health # is it progressing, and are evaluations scoring
+```
+
+## important csd3 notes
+
 Commands that submit themselves as a Slurm job (by default via sbatch)
 ```bash
 ./ri search wsclean|r2d2
