@@ -108,6 +108,9 @@ NS_KEEP_MEASUREMENT_SETS = 0
 # docs/nested-sampling-clean-loop.md for the per-metric cost and
 # docs/nested-sampling-evaluation-floor.md for why nothing cheaper is left.
 NS_WSCLEAN_MGAIN = 0.8
+# Most Measurement Set skeletons one run caches in /dev/shm before it stops
+# adding more; see publish_skeleton() in simulate_point_source_ms.py.
+NS_MS_SKELETON_CACHE_MAX = 512
 
 # CLEAN's minor-iteration budget per major cycle, WSClean's `-niter`. At the
 # old value of 100 roughly four evaluations in five stopped on `maximum number

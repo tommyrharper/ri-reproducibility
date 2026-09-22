@@ -2051,14 +2051,6 @@ def simulate_measurement_set(
         reply_timeout=simulate_reply_timeout(n_times),
     )
     if returncode != 0:
-        # The meqserver's own error text is only in these, beside the MS in
-        # scratch, which is gone once the evaluation is.
-        if scratch is not None:
-            import shutil
-
-            for name in ("meqtree-pipeliner.log", "meqserver-wedged.log", "makems.log"):
-                if (scratch / name).is_file():
-                    shutil.copy2(scratch / name, eval_dir / name)
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
 

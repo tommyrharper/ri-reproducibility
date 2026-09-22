@@ -147,8 +147,11 @@ def run_makems(output_ms: Path) -> None:
 # Cache by (NTimes, NFrequencies): copy/patch ~0.002s vs makems ~0.05s;
 # shared /dev/shm serves all ranks.
 #
-# ponytail: no eviction - the cache ends with the run and the full parameter
-# space is ~20MB. Add an LRU sweep if a longer-lived cache reuses one.
+# Capped at NS_MS_SKELETON_CACHE_MAX shapes, then stops publishing: the default
+# 5-parameter space has under 100 shapes (~20MB), but with integration_seconds
+# and declination_deg searched nearly every evaluation is a new shape. Uncapped,
+# a 112-rank run put 138GB in /dev/shm in 25 minutes and WSClean then died of
+# bad_alloc (docs/csd3-experiments.md, E5).
 _SKELETON_DIR: Path | None = None
 _SKELETON_DIR_EXPLICIT = False
 
@@ -191,6 +194,10 @@ def cached_skeleton(key: str) -> Path:
 
 
 def publish_skeleton(built_ms: Path, cached: Path) -> None:
+    limit = int(os.environ.get("NS_MS_SKELETON_CACHE_MAX", "512"))
+    # Staging directories are mkdtemp's `tmp*`; published shapes are hex names.
+    if sum(1 for name in os.listdir(skeleton_dir()) if not name.startswith("tmp")) >= limit:
+        return
     staging = Path(tempfile.mkdtemp(dir=skeleton_dir()))
     try:
         shutil.copytree(built_ms, staging / "ms", symlinks=True)
@@ -609,9 +616,16 @@ def simulate(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
-        cfg = write_makems_config(args, scratch_ms)
-        make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
-        metadata = fill_point_source_visibilities(args, scratch_ms)
+        try:
+            cfg = write_makems_config(args, scratch_ms)
+            make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
+            metadata = fill_point_source_visibilities(args, scratch_ms)
+        except BaseException:
+            # The meqserver's error text is only in these, and the temporary
+            # directory is about to take them with it.
+            for log in Path(scratch).glob("*.log"):
+                shutil.copy2(log, final_ms.parent / log.name)
+            raise
         metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
             destination = final_ms.parent / produced.name
