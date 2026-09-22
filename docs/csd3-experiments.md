@@ -48,3 +48,24 @@ Jobs of increasing size on CSD3, to catch bugs before a long run and to set
 | E9 end | | | Cut at the 40-min limit with 10,211 evaluations, 0 failures, ndead 180, and no `summary.json`, so resumable |
 | bug | resume brought a GPU run back on the CPU | E10 | `run.env` never recorded `R2D2_DEVICE`, so `./ri resume` of a GPU run defaulted to `cpu`: with a `-GPU` account sbatch refused it (partition icelake), and with a `-CPU` account it would have carried on quietly on the CPU. Fixed: `write_run_config` records it. Runs recorded before the fix resume with `R2D2_DEVICE=cuda ./ri resume <run>` |
 | E10 | resume E9 in a new job | ampere, intr, 15 min, `R2D2_DEVICE=cuda ./ri resume` | job 36029471, resumed from 10,211 evaluations |
+| E10 result | | | Resumed from the checkpoint at 10,211 evaluations and added ~2,800 more (13,014) with 0 failures before its own 15-min limit. Startup costs ~5 min: 16 workers read 25 checkpoints each (~56GB) off Lustre before the GPU sees anything |
+
+## Where the rank caps landed
+
+| setting | was | now | measured |
+| --- | ---: | ---: | --- |
+| `NS_R2D2_MAX_RANKS` (CPU) | 8 | 56 | sapphire, 112 cores: 8 ranks 2.9 evals/s, 16 5.6, 32 9.4, 56 12.0 |
+| `NS_R2D2_CUDA_MAX_RANKS` (GPU) | 8 | 16 | one A100: 8 ranks 2.5 evals/s, 16 4.6; 24+ exceed the card's memory |
+
+Both were measured on a 20-thread rig where 8 ranks saturated the cores. The
+CPU figure was still rising at 56, so it is the best measured rather than a
+plateau; the GPU one is bounded by 3.56GiB of checkpoints per worker.
+
+## Notes for the next run
+
+- A GPU run recorded before `R2D2_DEVICE` reached `run.env` resumes with
+  `R2D2_DEVICE=cuda ./ri resume <run>`.
+- WSClean at 112 ranks (a whole sapphire node) is where worker startup
+  contention bites; R2D2's 56-rank cap leaves headroom on the same node.
+- A 10-hour WSClean run does not fit the file quota even with the new bounds
+  (~60k evaluations an hour); R2D2 does.
