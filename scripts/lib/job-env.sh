@@ -227,7 +227,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 
       # A tool that only looks allowed: a symlink into the forbidden tree.
       PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >"${_tmp}/out" 2>&1 \
-        && { echo "FAIL: python3 symlinked into the forbidden tree must fail the check:"; cat "${_tmp}/out"; exit 1; }
+        && { echo "FAIL: python3 symlinked into the forbidden tree must fail the check:"; cat "${_tmp}/out"; set -x; _ri_is_forbidden "${_tmp}/ok/bin/python3"; _ri_forbidden_prefixes; exit 1; }
       PATH="${_tmp}/home/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a forbidden PATH entry must fail the check"; exit 1; }
       NS_SCRATCH_DIR="${_tmp}/home/scratch" PATH=/usr/bin:/bin ri_job_env_check >/dev/null 2>&1 \
