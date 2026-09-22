@@ -115,6 +115,9 @@ NS_MS_SKELETON_CACHE_MAX = 512
 # MS it has written open and so pins it in /dev/shm; see NS_MEQSERVER_RECYCLE
 # in simulate_point_source_ms.py.
 NS_MEQSERVER_RECYCLE = 20
+# Failed evaluations per run that keep their Measurement Set and images; the rest
+# keep logs and metrics. A failure storm once filled the one-million-file quota.
+NS_KEEP_FAILED_ARTEFACTS = 20
 
 # CLEAN's minor-iteration budget per major cycle, WSClean's `-niter`. At the
 # old value of 100 roughly four evaluations in five stopped on `maximum number

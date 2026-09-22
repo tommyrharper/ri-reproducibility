@@ -1346,14 +1346,34 @@ def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
     return Path(root) / eval_dir.name if root else None
 
 
+def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
+    """One of the run's NS_KEEP_FAILED_ARTEFACTS slots for a failure's MS and
+    images. A failure storm otherwise keeps hundreds of files per failure: one
+    in docs/csd3-experiments.md (E5, E6) filled the one-million-file quota."""
+    slots = eval_dir.parent / ".failed-artefacts-kept"
+    slots.mkdir(exist_ok=True)
+    for index in range(int(os.environ.get("NS_KEEP_FAILED_ARTEFACTS", "20"))):
+        try:
+            (slots / str(index)).mkdir()
+            return True
+        except FileExistsError:
+            continue
+    return False
+
+
 def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
     import shutil
 
-    keeping = "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+    failed = "error" in record
+    keeping = os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0" or (
+        failed and claim_failed_artefacts_slot(eval_dir))
     scratch = evaluation_scratch_dir(eval_dir)
     if scratch is not None and scratch.is_dir():
-        if keeping:
+        if keeping or failed:
             for produced in scratch.iterdir():
+                # Past its slots a failure still keeps its logs, not its MS.
+                if not keeping and produced.is_dir():
+                    continue
                 destination = eval_dir / produced.name
                 if destination.is_dir():
                     shutil.rmtree(destination)
