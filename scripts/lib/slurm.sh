@@ -110,7 +110,8 @@ ns_enter_job_env() {
 # submits, against a fake sbatch that records its arguments and environment.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
-  _dir="$(mktemp -d)"
+  # Physical: ns_submit_run resolves symlinks, and macOS TMPDIR is one (/var -> /private/var).
+  _dir="$(cd "$(mktemp -d)" && pwd -P)"
   trap 'rm -rf "${_dir}"' EXIT
   mkdir -p "${_dir}/bin"
   # shellcheck disable=SC2016  # the $vars are for the fake sbatch's own sh

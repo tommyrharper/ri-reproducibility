@@ -326,6 +326,7 @@ PolyChord dimensions for both algorithms:
 | `source_offset_fraction` | `0.0` to `0.35` | Source offset from the phase centre, as a fraction of the image half-width |
 | `source_l_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along l, in pixels from the central pixel |
 | `source_m_pixels` | `+/-(NS_IMAGE_DIM / 2) * 0.5` | Source position along m, in pixels from the central pixel |
+| `source_count` | `1` to `5`, whole sources | Point sources in the truth sky; the first is the one the position dimensions place, the rest sit at fixed pixels, so N is N - 1 plus one more |
 | `declination_deg` | `-30` to `80`, whole degrees | Declination of the phase centre; sets how foreshortened the array and how elliptical the PSF is |
 | `integration_seconds` | `1` to `10`, whole seconds | Correlator dump time; sets sampling density against track length, and is the only dimension time smearing depends on |
 

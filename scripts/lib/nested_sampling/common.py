@@ -463,6 +463,7 @@ PARAMETER_TEX_LABELS = {
     "source_offset_fraction": r"f_{\mathrm{offset}}",
     "source_l_pixels": r"l\,[\mathrm{px}]",
     "source_m_pixels": r"m\,[\mathrm{px}]",
+    "source_count": r"N_{\mathrm{src}}",
     "declination_deg": r"\delta\,[\mathrm{deg}]",
     "integration_seconds": r"\tau_{\mathrm{int}}\,[\mathrm{s}]",
     "wsclean_niter": r"N_{\mathrm{iter}}",
@@ -541,6 +542,24 @@ def cube_to_params(cube: np.ndarray, track: bool = False) -> dict[str, Any]:
     raw["source_l_arcsec"] = offset_l + raw["source_l_pixels"] * pixel_arcsec
     raw["source_m_arcsec"] = offset_m + raw["source_m_pixels"] * pixel_arcsec
     return raw
+
+
+# Fixed rather than sampled, so a count of N is the sky of N - 1 plus one more
+# source instead of a new layout per evaluation.
+EXTRA_SOURCE_SEED = 20260922
+# Of the image half-width, so no extra source sits on the edge.
+EXTRA_SOURCE_REACH = 0.8
+
+
+def extra_source_offsets_arcsec(params: dict[str, Any]) -> list[tuple[float, float]]:
+    """(l, m) of every source after the first, which the position dimensions place."""
+    count = int(params["source_count"]) - 1
+    if count <= 0:
+        return []
+    reach = image_dim() / 2.0 * EXTRA_SOURCE_REACH
+    pixels = np.random.default_rng(EXTRA_SOURCE_SEED).uniform(-reach, reach, (count, 2))
+    pixel_arcsec = nominal_pixel_size_arcsec(params["start_frequency_hz"])
+    return [(float(l) * pixel_arcsec, float(m) * pixel_arcsec) for l, m in pixels]
 
 
 def params_key(params: dict[str, Any]) -> str:
@@ -698,14 +717,16 @@ def source_pixel(
 
 
 @lru_cache(maxsize=64)
-def off_source_mask(shape: tuple[int, int], sx: int, sy: int) -> np.ndarray:
-    """Pixels more than 5 px from the source, cached: one mask serves a run.
+def off_source_mask(shape: tuple[int, int], pixels: tuple[tuple[int, int], ...]) -> np.ndarray:
+    """Pixels more than 5 px from every source, cached: one mask serves a run.
 
-    Every evaluation of a search asks for the same handful of (shape, source)
+    Every evaluation of a search asks for the same handful of (shape, sources)
     combinations, and building one costs more than the reduction it feeds.
     """
     yy, xx = np.ogrid[:shape[0], :shape[1]]
-    mask = (yy - sy) ** 2 + (xx - sx) ** 2 > 25
+    mask = np.ones(shape, dtype=bool)
+    for sx, sy in pixels:
+        mask &= (yy - sy) ** 2 + (xx - sx) ** 2 > 25
     mask.setflags(write=False)  # callers share this array; none may edit it
     return mask
 
@@ -720,6 +741,7 @@ def compute_image_metrics(
     source_l_arcsec: float = 0.0,
     source_m_arcsec: float = 0.0,
     pixel_size_arcsec: float | None = None,
+    extra_sources_arcsec: list[tuple[float, float]] | tuple = (),
 ) -> dict[str, float]:
     image, header = load_fits_2d(image_path)
 
@@ -741,28 +763,35 @@ def compute_image_metrics(
     cy = int(round(float(header.get("CRPIX2", y_size / 2.0 + 1.0)) - 1.0))
     cx = max(0, min(x_size - 1, cx))
     cy = max(0, min(y_size - 1, cy))
-    sx, sy = source_pixel(header, cx, cy, source_l_arcsec, source_m_arcsec, x_size, y_size)
+    # Truth flux per pixel; two sources can land on one.
+    truth: dict[tuple[int, int], float] = {}
+    for l_arcsec, m_arcsec in [(source_l_arcsec, source_m_arcsec), *extra_sources_arcsec]:
+        pixel = source_pixel(header, cx, cy, l_arcsec, m_arcsec, x_size, y_size)
+        truth[pixel] = truth.get(pixel, 0.0) + source_flux_jy
 
-    off_rms = rms(image[off_source_mask(image.shape, sx, sy)])
+    off_rms = rms(image[off_source_mask(image.shape, tuple(truth))])
     peak = float(np.nanmax(np.abs(image)))
     snr = peak / off_rms if off_rms > 0 else float("inf")
     log_snr = math.log10(snr) if math.isfinite(snr) and snr > 0 else 99.0
-    peak_flux_error = abs(float(image[sy, sx]) - source_flux_jy)
+    # The worst-recovered source, which is the only one there is at one source.
+    peak_flux_error = max(abs(float(image[sy, sx]) - flux) for (sx, sy), flux in truth.items())
 
-    # The residual differs at one pixel only. Mutate the already-owned float64
-    # array for the two residual reductions, avoiding another full-image copy.
-    source_value = image[sy, sx]
+    # The residual differs at the source pixels only. Mutate the already-owned
+    # float64 array for the two residual reductions, avoiding a full-image copy.
+    source_values = {(sx, sy): image[sy, sx] for sx, sy in truth}
     try:
-        image[sy, sx] -= source_flux_jy
+        for (sx, sy), flux in truth.items():
+            image[sy, sx] -= flux
         if np.isnan(image).any():
             total_rms = rms(image)
             residual_norm = float(np.linalg.norm(image))
         else:
             residual_norm = float(np.sqrt(np.dot(image.ravel(), image.ravel())))
             total_rms = residual_norm / math.sqrt(image.size)
-        relative_l2_error = residual_norm / max(abs(source_flux_jy), 1e-12)
+        relative_l2_error = residual_norm / max(math.hypot(*truth.values()), 1e-12)
     finally:
-        image[sy, sx] = source_value
+        for (sx, sy), value in source_values.items():
+            image[sy, sx] = value
 
     metrics = {
         "snr": float(snr),
@@ -2030,6 +2059,11 @@ def simulate_measurement_set(
         str(params["source_l_arcsec"]),
         "--source-m-arcsec",
         str(params["source_m_arcsec"]),
+        *(
+            arg
+            for l_arcsec, m_arcsec in extra_source_offsets_arcsec(params)
+            for arg in ("--extra-source-arcsec", str(l_arcsec), str(m_arcsec))
+        ),
         "--declination-deg",
         str(params["declination_deg"]),
         "--integration-seconds",
@@ -2274,7 +2308,7 @@ def self_check_parameter_space() -> None:
     for spec in load_all_parameter_specs():
         assert "default" in spec, spec
     specs = load_parameter_space()
-    assert len(specs) == 5, specs
+    assert len(specs) == 6, specs
     for spec in specs:
         assert spec["name"] in PARAMETER_TEX_LABELS, spec
         assert float(spec["min"]) < float(spec["max"]), spec
@@ -2447,6 +2481,24 @@ def self_check_source_offset() -> None:
                 pass
             else:
                 raise AssertionError("a header-less image with no pixel_size_arcsec must raise")
+
+    # Extra sources: none at one source, a prefix of the next count's layout,
+    # and each one scored where it was placed.
+    at = {"start_frequency_hz": 1.4e9}
+    assert extra_source_offsets_arcsec({**at, "source_count": 1}) == []
+    three = extra_source_offsets_arcsec({**at, "source_count": 4})
+    assert extra_source_offsets_arcsec({**at, "source_count": 3}) == three[:2], three
+    header = {"CDELT1": -1.0 / 3600.0, "CDELT2": 1.0 / 3600.0}
+    image = np.zeros((128, 128))
+    for l_as, m_as in [(0.0, 0.0), *three[:2]]:
+        image[source_pixel(header, 64, 64, l_as, m_as, 128, 128)[::-1]] += 1.0
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "multi.fits"
+        fits.PrimaryHDU(image).writeto(path)
+        perfect = compute_image_metrics(path, 1.0, 0.0, 0, pixel_size_arcsec=1.0, extra_sources_arcsec=three[:2])
+        assert perfect["total_rms_jy"] == 0.0 and perfect["peak_flux_abs_error_jy"] == 0.0, perfect
+        missed = compute_image_metrics(path, 1.0, 0.0, 0, pixel_size_arcsec=1.0, extra_sources_arcsec=three)
+        assert missed["peak_flux_abs_error_jy"] == 1.0, missed
 
     # A cube with everything at 0.5 fixes the offset fraction at its box's
     # midpoint; band_start's own resolution can move start_frequency_hz, so
@@ -2681,9 +2733,10 @@ def self_check_metric_resolution() -> None:
     residual = np.array([1.0, -2.0, 3.0])
     dirty = np.array([4.0, 5.0, -6.0])
     assert sigma_res(residual, dirty) == np.linalg.norm(residual) / np.linalg.norm(dirty)
-    assert off_source_mask((8, 8), 4, 4) is off_source_mask((8, 8), 4, 4)
+    assert off_source_mask((8, 8), ((4, 4),)) is off_source_mask((8, 8), ((4, 4),))
     # One cached mask is handed to every caller, so none of them may write it.
-    assert not off_source_mask((8, 8), 4, 4).flags.writeable
+    assert not off_source_mask((8, 8), ((4, 4),)).flags.writeable
+    assert off_source_mask((32, 32), ((6, 6), (20, 20))).sum() == 32 * 32 - 2 * 81
 
     expr_fn, _ = resolve_metric("log_snr + 0.1 * wall_seconds")
     assert expr_fn(sample) == sample["log_snr"] + 0.1 * sample["wall_seconds"]

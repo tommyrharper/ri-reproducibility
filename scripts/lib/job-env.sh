@@ -56,7 +56,8 @@ ns_write_job_settings() {
 
 _ri_forbidden_prefixes() {
   local home
-  home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+  # No getent on macOS; `|| true` so a caller's `set -e` does not end here.
+  home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)" || true
   tr -s ' ' '\n' <<<"${RI_JOB_FORBIDDEN:-/home /nix ${home}}"
 }
 
@@ -76,8 +77,9 @@ _ri_is_forbidden() {
 # it uses, and every value it carries, against /home and Nix stores. Prints
 # what it checked; returns 1 after listing every problem.
 ri_job_env_check() {
-  local bad=0 tool path real var entry required
-  local -
+  local bad=0 tool path real var entry required glob=+f
+  # Not `local -`, which bash 3.2 (macOS) lacks.
+  case "$-" in *f*) glob=-f ;; esac
   set -f  # the value split below must not glob
   required=" ${RI_JOB_REQUIRED_TOOLS:-bash uv apptainer} "
   for tool in bash sh env python3 gcc uv apptainer sbatch squeue; do
@@ -134,6 +136,7 @@ ri_job_env_check() {
   done < <(compgen -e)
 
   [ "${bad}" = 0 ] && echo "job-env: nothing resolves into /home or a Nix store"
+  set "${glob}"
   return "${bad}"
 }
 
@@ -215,7 +218,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       ;;
     --self-check)
       set -e
-      _tmp="$(mktemp -d)"
+      # Physical: readlink -f resolves macOS TMPDIR (/var -> /private/var).
+      _tmp="$(cd "$(mktemp -d)" && pwd -P)"
       trap 'rm -rf "${_tmp}"' EXIT
       mkdir -p "${_tmp}/home/bin" "${_tmp}/ok/bin" "${_tmp}/work" "${_tmp}/run"
       printf '#!/bin/sh\necho fake\n' >"${_tmp}/home/bin/python3"
@@ -225,8 +229,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       REPO_ROOT_PHYS="${_tmp}/repo"
 
       # A tool that only looks allowed: a symlink into the forbidden tree.
-      PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
-        && { echo "FAIL: python3 symlinked into the forbidden tree must fail the check"; exit 1; }
+      PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >"${_tmp}/out" 2>&1 \
+        && { echo "FAIL: python3 symlinked into the forbidden tree must fail the check:"; cat "${_tmp}/out"; exit 1; }
       PATH="${_tmp}/home/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a forbidden PATH entry must fail the check"; exit 1; }
       NS_SCRATCH_DIR="${_tmp}/home/scratch" PATH=/usr/bin:/bin ri_job_env_check >/dev/null 2>&1 \
@@ -238,7 +242,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a binary carrying Nix store paths must fail the check"; exit 1; }
       rm "${_tmp}/ok/bin/gcc" "${_tmp}/ok/bin/python3"
-      env -u NS_SCRATCH_DIR PATH=/usr/bin:/bin bash -c ". '${BASH_SOURCE[0]}'; REPO_ROOT_PHYS='${_tmp}/repo' ri_job_env_check" >/dev/null \
+      # A clean environment: the caller's may carry Nix (LOCALE_ARCHIVE_*).
+      env -i PATH=/usr/bin:/bin RI_JOB_FORBIDDEN="${RI_JOB_FORBIDDEN}" RI_JOB_REQUIRED_TOOLS=bash \
+        RI_JOB_CHECK_PYTHON=0 bash -c ". '${BASH_SOURCE[0]}'; REPO_ROOT_PHYS='${_tmp}/repo' ri_job_env_check" >/dev/null \
         || { echo "FAIL: the base OS alone must pass the check"; exit 1; }
 
       # Settings: only the run's knobs, directories as physical paths.
