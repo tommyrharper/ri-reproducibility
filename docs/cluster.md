@@ -234,6 +234,29 @@ hand-written batch script still see it. GNU `nproc` honours it, so the run scrip
 CPUs with it unset (`env -u OMP_NUM_THREADS nproc`); a bare `nproc` there reads
 1 on a 76-core node, which sized a whole-node job to a single rank.
 
+### What a long run needs here
+
+`hpc-work` allows a million files, and an evaluation used to keep 10-15 until
+the run ended, so a run at CSD3 rates reached the quota within hours and every
+rank then died on `mkdir`. Four bounds keep a long run inside it, all in
+`defaults.toml` (`docs/csd3-experiments.md` has the measurements):
+
+- `NS_KEEP_DETAIL_EVERY` (100): a successful evaluation is stripped to its
+  `metrics.json` as the run goes, unless it is among its rank's 20 lowest or
+  highest objectives - which is what the end-of-run image policy needs - or one
+  of the 1 in 100 kept whole, which `./ri profile` reads.
+- `NS_KEEP_FAILED_ARTEFACTS` (20): failures per run that keep their Measurement
+  Set and images; the rest keep logs and metrics.
+- `NS_MS_SKELETON_CACHE_MAX` (512): MS skeletons cached in `/dev/shm`. A
+  parameter space that varies `integration_seconds` or `declination_deg` makes
+  nearly every evaluation a new shape, and the cache had no bound.
+- `NS_MEQSERVER_RECYCLE` (20): predicts before a simulate worker replaces its
+  meqserver, which holds every MS it has written open and so pins it in tmpfs.
+
+A failure storm is worse here than slow: `FAILURE_OBJECTIVE` is the likelihood
+PolyChord maximises, so thousands of infrastructure failures took over the live
+points and the run "converged" on them.
+
 ### Reading a run from the login node
 
 `./ri health` and `./ri runs` ask `squeue` as well as `ps`: a run whose job is
