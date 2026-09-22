@@ -23,8 +23,8 @@ _ns_available_mb() {
   fi
   # Inside a Slurm job the cgroup limit is what the OOM killer enforces, and
   # MemAvailable on a shared node says nothing about it. Slurm spells the limit
-  # per node (--mem) or per core (the partition default); `--mem 0` is the
-  # whole node, which MemAvailable below then describes truthfully.
+  # per node (--mem) or per core (the partition default, and what a whole-node
+  # --exclusive job gets); `--mem 0`, the whole node, falls through to MemAvailable.
   if [ -n "${SLURM_MEM_PER_NODE:-}" ] && [ "${SLURM_MEM_PER_NODE}" != 0 ]; then
     printf '%s\n' "${SLURM_MEM_PER_NODE}"
     return 0

@@ -132,8 +132,8 @@ bash scripts/lib/job-env.sh --check                       # the job's environmen
 would hand it, and says `nothing resolves into /home or a Nix store` or what
 does. `bash scripts/lib/job-env.sh --self-check` tests the check itself.
 
-Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive
---mem 0`) and the run script sizes the ranks from the allocation; with it the
+Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive`;
+CSD3 refuses `--mem 0`) and the run script sizes the ranks from the allocation; with it the
 job asks for that many cores and the matching memory. `--partition` defaults
 to `icelake` and `--time` to `12:00:00`, the SL3 cap, which every service
 level accepts; SL1/SL2 accounts can pass `--time 36:00:00`, their own cap,
@@ -195,8 +195,8 @@ the containers replaced by processes:
   and carried over again.
 - **Memory sets the rank count**, as on `main`; `rank-budget.sh` reads the
   job's limit inside one (`SLURM_MEM_PER_NODE`, or `SLURM_MEM_PER_CPU` times
-  the cores, which is how a partition default is spelled; `--mem 0` means the
-  node, so `MemAvailable`) and `MemAvailable` outside one. A pool a
+  the cores, which is how a partition default and a whole-node `--exclusive` job are
+  spelled) and `MemAvailable` outside one. A pool a
   SIGKILLed run left behind is reaped by the next run's budget (the pool's
   shell names its FIFO directory, whose run has no ranks and whose launcher
   pid in `.launcher.pid` is gone).

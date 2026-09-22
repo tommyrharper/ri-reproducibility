@@ -2026,12 +2026,10 @@ def simulate_measurement_set(
         str(params["channel_width_hz"]),
         "--source-flux-jy",
         str(params["source_flux_jy"]),
-        "--source-l-arcsec",
-        str(params["source_l_arcsec"]),
-        "--source-m-arcsec",
-        str(params["source_m_arcsec"]),
-        "--declination-deg",
-        str(params["declination_deg"]),
+        # `=` because argparse reads a separate "-7.4e-06" as an option, not a value.
+        f"--source-l-arcsec={params['source_l_arcsec']}",
+        f"--source-m-arcsec={params['source_m_arcsec']}",
+        f"--declination-deg={params['declination_deg']}",
         "--integration-seconds",
         str(params["integration_seconds"]),
         "--dynamic-range",
@@ -2053,6 +2051,14 @@ def simulate_measurement_set(
         reply_timeout=simulate_reply_timeout(n_times),
     )
     if returncode != 0:
+        # The meqserver's own error text is only in these, beside the MS in
+        # scratch, which is gone once the evaluation is.
+        if scratch is not None:
+            import shutil
+
+            for name in ("meqtree-pipeliner.log", "meqserver-wedged.log", "makems.log"):
+                if (scratch / name).is_file():
+                    shutil.copy2(scratch / name, eval_dir / name)
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
 

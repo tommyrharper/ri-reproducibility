@@ -60,7 +60,9 @@ ns_submit_run() {
     size=(--cpus-per-task "${NS_MPI_PROCS}"
           --mem "$((NS_MPI_PROCS * mb_per_rank + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
   else
-    size=(--exclusive --mem 0)
+    # Not --mem 0: CSD3's sbatch refuses it. --exclusive already brings every
+    # core's default memory, i.e. the node.
+    size=(--exclusive)
   fi
   export SBATCH_PARTITION="${SBATCH_PARTITION:-icelake}"
   # CSD3's `intr` QoS starts at once but caps a job at one hour, and sbatch
@@ -140,7 +142,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     || { echo "FAIL: the job must inherit the run directory and the sbatch defaults, got: $(cat "${_dir}/env")"; exit 1; }
   _args="$(tr '\n' ' ' <"${_dir}/args")"
   for _want in "--export=NIL" "--job-name wsclean-vlaa-20260101T000000Z" "--chdir ${REPO_ROOT}" \
-               "--output ${_run}/slurm-%j.out" "--nodes 1 --ntasks 1 --exclusive --mem 0" \
+               "--output ${_run}/slurm-%j.out" "--nodes 1 --ntasks 1 --exclusive --wrap" \
                "--wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling.sh"; do
     case "${_args}" in
       *"${_want}"*) ;;

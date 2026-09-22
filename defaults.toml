@@ -32,19 +32,13 @@ CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
 R2D2_CKPT_NAME = "R2D2_A1"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
-# Most concurrent R2D2 evaluations worth running, before the memory clamp in
-# scripts/lib/rank-budget.sh has its say. R2D2 is core-bound, not rank-bound:
-# measured on the 20-thread rig, paired and interleaved, throughput is flat
-# from 8 ranks (0.878, 0.917 evaluations/second) to 15 (0.898, 0.916) while
-# per-rank memory takes the run from 28GB to 53GB - per-evaluation work doubles
-# and the total does not move. Without this cap the derived rank count is
-# whatever memory allows, which buys nothing and spends the headroom a long run
-# needs. WSClean has no equivalent: it is 200MB a rank and scales to one rank
-# per core. See docs/nested-sampling-throughput.md.
-# ponytail: one number measured on one host, not a live probe. Re-measure with
-# `./ri search r2d2 --nlive 40 --num-repeats 2 --max-ndead 40 --mpi-procs N`
-# on a machine with a different core count.
-NS_R2D2_MAX_RANKS = 8
+# Most concurrent R2D2 evaluations worth running on the CPU, before the memory
+# clamp in scripts/lib/rank-budget.sh has its say. Measured on a whole CSD3
+# sapphire node (112 cores, 6-7 min per arm): 8 ranks 2.9 evaluations/s, 16
+# 5.6, 32 9.4, 56 12.0 - still rising, so the cap is the best measured rather
+# than a plateau. The 20-thread rig this was once measured on saturated at 8
+# (docs/nested-sampling-throughput.md). docs/csd3-experiments.md, E4.
+NS_R2D2_MAX_RANKS = 56
 
 # Where R2D2's U-Net runs: "cpu", or "cuda" for one A100 on CSD3's ampere
 # partition (`./ri search r2d2 --device cuda`; docs/cluster.md, "R2D2 on a
@@ -52,12 +46,14 @@ NS_R2D2_MAX_RANKS = 8
 # scoring stay on the CPU. Needs images/r2d2-cuda.sif.
 R2D2_DEVICE = "cpu"
 # NS_R2D2_MAX_RANKS for R2D2_DEVICE=cuda: the ranks share one A100 and the 32
-# cores CSD3 allows per GPU. Measured on gpu-q-23 (nlive 16, max-ndead 48, one
-# run each): 8 ranks 1.8 evaluations/s, 16 ranks 1.5 - at 16 each rank has half
-# the cores for the CPU side of imaging, which grew from 1.19s to 1.56s.
-# ponytail: one short run per arm; re-measure with --mpi-procs N and a longer
-# --max-ndead before trusting a change (docs/cluster.md, "R2D2 on a GPU").
-NS_R2D2_CUDA_MAX_RANKS = 8
+# cores CSD3 allows per GPU. Measured (E3): 8 ranks 2.5 evaluations/s, 16 4.6,
+# with no failures; 24 and up run the card out of memory (see below).
+NS_R2D2_CUDA_MAX_RANKS = 16
+# GPU memory one R2D2 worker takes: all 25 checkpoints plus its CUDA context,
+# measured 3.56GiB (docs/csd3-experiments.md, E3). The run clamps ranks to what
+# 95% of the card holds - 19 on an 80GB A100 - and refuses an explicit
+# --mpi-procs above it: past it workers die of CUDA OOM.
+NS_R2D2_CUDA_MB_PER_RANK = 4096
 
 # Pixels on a side of the image both imagers make, and with it the field of
 # view: source_offset_to_lm() in common.py scales the sampled
