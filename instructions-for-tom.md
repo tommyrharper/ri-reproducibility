@@ -77,3 +77,8 @@ Or:
 ./ri search wsclean --then r2d2 --nlive=125 --num-repeats=25 --max-ndead=-1 --metric=total_rms_jy --plot --report
 ```
 
+## important branches
+
+- personal macos/hetzner ubuntu branch name: main
+- university csd3 custler branch name: cluster
+
