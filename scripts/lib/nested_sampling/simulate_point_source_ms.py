@@ -293,6 +293,7 @@ def redirect_fds(out_path: Path, err_path: Path | None = None):
 
 
 _MQS = None
+_PREDICTS_SINCE_RESTART = 0
 
 # The forest currently loaded into the meqserver, keyed on the tdlconf text
 # with the MS name removed - see run_meqtrees_predict().
@@ -331,8 +332,10 @@ def restart_meqserver_session() -> None:
     global _MQS
     from Timba.Apps import meqserver
 
+    global _PREDICTS_SINCE_RESTART
     pid = getattr(_MQS, "serv_pid", None)
     _MQS = None
+    _PREDICTS_SINCE_RESTART = 0
     _FOREST.clear()
     # default_mqs() hands back its own module global whenever that is already a
     # meqserver, so clearing it is what makes a restart possible at all.
@@ -420,6 +423,14 @@ def run_meqtrees_predict(
             if attempt:
                 raise
             restart_meqserver_session()
+    # The meqserver keeps every MS it has predicted into open after the rank
+    # deletes it, so a tmpfs scratch never gets that memory back: 13MB an
+    # evaluation in the 9-parameter space, 96GB over a 112-rank node in 20
+    # minutes (docs/csd3-experiments.md, E6). Replacing it closes them.
+    global _PREDICTS_SINCE_RESTART
+    _PREDICTS_SINCE_RESTART += 1
+    if _PREDICTS_SINCE_RESTART >= int(os.environ.get("NS_MEQSERVER_RECYCLE", "20")):
+        restart_meqserver_session()
     if errors:
         raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
 

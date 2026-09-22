@@ -111,6 +111,10 @@ NS_WSCLEAN_MGAIN = 0.8
 # Most Measurement Set skeletons one run caches in /dev/shm before it stops
 # adding more; see publish_skeleton() in simulate_point_source_ms.py.
 NS_MS_SKELETON_CACHE_MAX = 512
+# Predicts before a simulate worker replaces its meqserver, which holds every
+# MS it has written open and so pins it in /dev/shm; see NS_MEQSERVER_RECYCLE
+# in simulate_point_source_ms.py.
+NS_MEQSERVER_RECYCLE = 20
 
 # CLEAN's minor-iteration budget per major cycle, WSClean's `-niter`. At the
 # old value of 100 roughly four evaluations in five stopped on `maximum number
