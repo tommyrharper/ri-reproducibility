@@ -1799,8 +1799,108 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         timing["ended_epoch"] = time.time()
         _EVALUATION_STARTED_EPOCH = None
     prune_evaluation_artefacts(eval_dir, record)
+    retain_evaluation_detail(eval_dir, record)
     write_json_atomic(eval_dir / "metrics.json", record)
     return record
+
+
+# Keeping every evaluation's logs and images until a run ends costs 10-15 files
+# an evaluation, and CSD3's hpc-work allows a million: a 112-rank run reaches it
+# within hours (docs/csd3-experiments.md). So as it goes, each rank strips a
+# successful evaluation to its metrics.json unless it is one of that rank's
+# IMAGE_KEEP_ENDS lowest or highest objectives so far - the run's own are always
+# among those, so prune_run_artefacts() still finds them - or one of the 1 in
+# NS_KEEP_DETAIL_EVERY kept whole, which `./ri profile` reads its logs from.
+_LOWEST: list[tuple[float, str]] = []
+_HIGHEST: list[tuple[float, str]] = []
+
+
+def _keeps_detail(key: str) -> bool:
+    import hashlib
+
+    every = int(os.environ.get("NS_KEEP_DETAIL_EVERY", "100"))
+    return every <= 1 or int(hashlib.sha256(key.encode()).hexdigest(), 16) % every == 0
+
+
+def _strip_to_record(eval_dir: Path) -> None:
+    import shutil
+
+    for entry in eval_dir.iterdir():
+        if entry.name == "metrics.json":
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
+def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> None:
+    import heapq
+
+    if (os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
+            or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+            or "error" in record or record.get("objective") is None
+            or _keeps_detail(eval_dir.name)):
+        return
+    key, objective = eval_dir.name, float(record["objective"])
+    evicted = set()
+    heapq.heappush(_LOWEST, (-objective, key))
+    heapq.heappush(_HIGHEST, (objective, key))
+    if len(_LOWEST) > IMAGE_KEEP_ENDS:
+        evicted.add(heapq.heappop(_LOWEST)[1])
+    if len(_HIGHEST) > IMAGE_KEEP_ENDS:
+        evicted.add(heapq.heappop(_HIGHEST)[1])
+    evicted -= {k for _, k in _LOWEST} | {k for _, k in _HIGHEST}
+    for name in evicted:
+        _strip_to_record(eval_dir.parent / name)
+    if key in evicted:
+        for image_key in RETAINED_IMAGE_KEYS:
+            (record.get("paths") or {}).pop(image_key, None)
+
+
+
+def self_check_streaming_retention() -> None:
+    import tempfile
+
+    global IMAGE_KEEP_ENDS
+    saved = IMAGE_KEEP_ENDS, os.environ.get("NS_KEEP_DETAIL_EVERY")
+    IMAGE_KEEP_ENDS = 3
+    os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
+    _LOWEST.clear()
+    _HIGHEST.clear()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            evaluations = Path(tmp)
+            objectives = {}
+            for index in range(300):
+                eval_dir = evaluations / f"eval-{index:04d}"
+                (eval_dir / "wsclean").mkdir(parents=True)
+                (eval_dir / "wsclean" / "recon-image.fits").write_text("x")
+                (eval_dir / "wsclean.stdout.log").write_text("x")
+                objective = ((index * 7919) % 300) / 10
+                objectives[eval_dir.name] = objective
+                record = {"objective": objective,
+                          "paths": {"image": str(eval_dir / "wsclean" / "recon-image.fits")}}
+                write_evaluation_record(eval_dir, record)
+                if not (eval_dir / "wsclean").exists():
+                    assert "image" not in record["paths"], "a stripped record still names its image"
+            ordered = sorted(objectives, key=objectives.get)
+            must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
+            for key in objectives:
+                kept = sorted(p.name for p in (evaluations / key).iterdir())
+                if key in must:
+                    assert kept == ["metrics.json", "wsclean", "wsclean.stdout.log"], (key, kept)
+                else:
+                    assert kept == ["metrics.json"], (key, kept)
+    finally:
+        IMAGE_KEEP_ENDS = saved[0]
+        if saved[1] is None:
+            os.environ.pop("NS_KEEP_DETAIL_EVERY", None)
+        else:
+            os.environ["NS_KEEP_DETAIL_EVERY"] = saved[1]
+        _LOWEST.clear()
+        _HIGHEST.clear()
+    print("streaming retention self-check passed")
 
 
 _SIMULATE_WORKERS: dict[str, "FifoWorker"] = {}

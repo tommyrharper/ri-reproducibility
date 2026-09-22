@@ -23,6 +23,7 @@ HOST_RUNNABLE = {
         "self_check_parameter_toggle",
         "self_check_profiling",
         "self_check_resume_adoption",
+        "self_check_streaming_retention",
         "self_check_worker_pool_connect",
         "self_check_worker_timeout",
     ),

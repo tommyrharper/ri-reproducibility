@@ -409,9 +409,20 @@ def run_meqtrees_predict(
     # no longer a stuck server but something this worker cannot fix, so it goes
     # back to the rank as a dead worker rather than a failed evaluation - see
     # MeqserverWedged.
+    #
+    # Errors from a predict get the same one retry on a fresh meqserver: on
+    # CSD3 they came from a newly compiled forest in a new server ("node
+    # 'VisDataMux' not found"), and every failing evaluation replayed alone
+    # succeeded (docs/csd3-experiments.md). Parameters that really break the
+    # predict fail again and are scored as before.
     for attempt in range(2):
         try:
             errors = _compile_and_predict(tdlconf, key, output_ms, wait_seconds)
+            if errors and not attempt:
+                with (output_ms.parent / "meqserver-wedged.log").open("a") as note:
+                    note.write(f"attempt 1: {len(errors)} predict error(s): {errors!r}\n")
+                restart_meqserver_session()
+                continue
             break
         except MeqserverWedged as exc:
             # Its own file, not meqtree-pipeliner.log: the retry reopens that
@@ -452,6 +463,9 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
             # previous entry rather than adding to it.
             _FOREST.clear()
             _FOREST[key] = module
+            # The compiled selector can still name the MS an earlier compile
+            # read (the warm-up's, gone), whatever the tdlconf says.
+            point_to_measurement_set(module, output_ms)
         else:
             point_to_measurement_set(module, output_ms)
             print("### reusing the compiled forest; only the Measurement Set changed")

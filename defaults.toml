@@ -118,6 +118,10 @@ NS_MEQSERVER_RECYCLE = 20
 # Failed evaluations per run that keep their Measurement Set and images; the rest
 # keep logs and metrics. A failure storm once filled the one-million-file quota.
 NS_KEEP_FAILED_ARTEFACTS = 20
+# 1 in this many successful evaluations keeps its logs and images while a run
+# goes; the rest keep metrics.json only, bar each rank's lowest and highest
+# objectives (retain_evaluation_detail in common.py). 1 keeps everything.
+NS_KEEP_DETAIL_EVERY = 100
 
 # CLEAN's minor-iteration budget per major cycle, WSClean's `-niter`. At the
 # old value of 100 roughly four evaluations in five stopped on `maximum number
