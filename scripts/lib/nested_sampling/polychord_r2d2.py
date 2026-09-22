@@ -26,6 +26,7 @@ from common import (
     cube_to_params,
     gathered_window_fit_stats,
     compute_image_metrics,
+    extra_source_offsets_arcsec,
     image_dim,
     image_pixel_size_arcsec,
     convert_ms_to_mat,
@@ -239,6 +240,7 @@ def evaluate(
             residual_dirty_path=residual_dirty_path if "sigma_res" in args.metric else None,
             source_l_arcsec=params["source_l_arcsec"],
             source_m_arcsec=params["source_m_arcsec"],
+            extra_sources_arcsec=extra_source_offsets_arcsec(params),
             pixel_size_arcsec=scale_arcsec,
         )
         objective = objective_from_metrics(metrics)
