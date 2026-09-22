@@ -1944,6 +1944,7 @@ class FifoWorker:
         # same order serve() uses - request pipe first, reply pipe second.
         self.stdout = reply_path.open("r")
         self.base = base
+        self.fresh = True
 
     def terminate(self) -> None:
         """Let go of both ends.
@@ -1980,8 +1981,14 @@ def _forget(workers: dict[str, "FifoWorker"], key: str) -> None:
 
 # The pools come up alongside the ranks: a SIF to start, torch or Timba to
 # import, and on a cluster node every rank's worker doing it off the same
-# filesystem at once. A missing pool is only ever paid for in full.
-POOL_CONNECT_SECONDS = 60.0
+# filesystem at once. A missing pool is only ever paid for in full. A worker
+# opens its FIFO only after its warm-up, and on a 112-rank CSD3 node all of them
+# warm up at once, after every restart too: 60s was not enough (E5, E8 in
+# docs/csd3-experiments.md), and a rank that gives up aborts the whole run.
+POOL_CONNECT_SECONDS = float(os.environ.get("NS_POOL_CONNECT_SECONDS", "300"))
+# Added to a newly connected worker's first reply bound, for the same reason:
+# the bounds below are sized for a warm worker on a quiet node.
+WORKER_FIRST_REPLY_SLACK = float(os.environ.get("NS_WORKER_FIRST_REPLY_SLACK", "120"))
 
 
 def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
@@ -2095,8 +2102,9 @@ def simulate_worker_request(
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
             _forget(_SIMULATE_WORKERS, meqtrees_image)
             continue
-        reply = worker_reply(worker.stdout, reply_timeout)
+        reply = worker_reply(worker.stdout, reply_timeout + (WORKER_FIRST_REPLY_SLACK if getattr(worker, "fresh", False) else 0))
         if reply:
+            worker.fresh = False
             return int(json.loads(reply)["returncode"])
         if reply is None:
             worker.kill()
