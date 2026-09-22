@@ -215,7 +215,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       ;;
     --self-check)
       set -e
-      _tmp="$(mktemp -d)"
+      # Physical: readlink -f resolves macOS TMPDIR (/var -> /private/var).
+      _tmp="$(cd "$(mktemp -d)" && pwd -P)"
       trap 'rm -rf "${_tmp}"' EXIT
       mkdir -p "${_tmp}/home/bin" "${_tmp}/ok/bin" "${_tmp}/work" "${_tmp}/run"
       printf '#!/bin/sh\necho fake\n' >"${_tmp}/home/bin/python3"
@@ -238,7 +239,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a binary carrying Nix store paths must fail the check"; exit 1; }
       rm "${_tmp}/ok/bin/gcc" "${_tmp}/ok/bin/python3"
-      env -u NS_SCRATCH_DIR PATH=/usr/bin:/bin bash -c ". '${BASH_SOURCE[0]}'; REPO_ROOT_PHYS='${_tmp}/repo' ri_job_env_check" >/dev/null \
+      # A clean environment: the caller's may carry Nix (LOCALE_ARCHIVE_*).
+      env -i PATH=/usr/bin:/bin RI_JOB_FORBIDDEN="${RI_JOB_FORBIDDEN}" RI_JOB_REQUIRED_TOOLS=bash \
+        RI_JOB_CHECK_PYTHON=0 bash -c ". '${BASH_SOURCE[0]}'; REPO_ROOT_PHYS='${_tmp}/repo' ri_job_env_check" >/dev/null \
         || { echo "FAIL: the base OS alone must pass the check"; exit 1; }
 
       # Settings: only the run's knobs, directories as physical paths.
