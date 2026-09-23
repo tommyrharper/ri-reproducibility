@@ -2579,10 +2579,13 @@ def self_check_source_offset() -> None:
     # only the sign and non-zero-ness of the offset are pinned here. Forced on
     # rather than read from defaults.toml: this dimension is toggled off and on
     # between runs, and the arithmetic above it still has to be right on the
-    # runs that enable it.
+    # runs that enable it. The other representation is forced off each time,
+    # since the two must not be enabled together.
     saved_on = os.environ.get("NS_ENABLE_PARAMS")
+    saved_off = os.environ.get("NS_DISABLE_PARAMS")
     try:
         os.environ["NS_ENABLE_PARAMS"] = "source_offset_fraction"
+        os.environ["NS_DISABLE_PARAMS"] = "source_l_pixels,source_m_pixels"
         load_parameter_space.cache_clear()
         n = len(load_parameter_space())
         params = cube_to_params(np.full(n, 0.5))
@@ -2591,6 +2594,7 @@ def self_check_source_offset() -> None:
         # The cartesian axes land the source on the pixel they name: the box
         # is symmetric about 0, so cube 0.5 is the centre and 1.0 the maximum.
         os.environ["NS_ENABLE_PARAMS"] = "source_l_pixels,source_m_pixels"
+        os.environ["NS_DISABLE_PARAMS"] = "source_offset_fraction"
         load_parameter_space.cache_clear()
         specs = load_parameter_space()
         n = len(specs)
@@ -2647,10 +2651,11 @@ def self_check_source_offset() -> None:
             for clear in (image_dim, load_all_parameter_specs, load_parameter_space):
                 clear.cache_clear()
     finally:
-        if saved_on is None:
-            os.environ.pop("NS_ENABLE_PARAMS", None)
-        else:
-            os.environ["NS_ENABLE_PARAMS"] = saved_on
+        for var, saved in (("NS_ENABLE_PARAMS", saved_on), ("NS_DISABLE_PARAMS", saved_off)):
+            if saved is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = saved
         load_parameter_space.cache_clear()
     print("source offset self-check passed")
 

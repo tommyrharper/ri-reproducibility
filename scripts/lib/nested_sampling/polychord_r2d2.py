@@ -109,6 +109,10 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         f"architecture: {DEFAULT_R2D2_ARCHITECTURE}",
         "prune: True",
         "sigma_res_tol: 1e-4",
+        # Only read against a ground truth (`gdth_file`) or across several
+        # realisations, neither used here. Unset, imager.py estimates it from
+        # the operator norm: 0.38s of a 1.8s request on CSD3.
+        "target_dynamic_range: 0.0",
         f"ckpt_path: {R2D2_CKPT_PATH}",
         f"ckpt_realisations: {DEFAULT_R2D2_CKPT_REALISATIONS}",
         # R2D2's set_common_args() calls torch.set_num_threads() itself, from

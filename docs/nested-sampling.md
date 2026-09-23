@@ -191,11 +191,11 @@ process that imports torch once, forks a worker per pair, and opens every pair
 before it starts importing so the ranks do not wait for it (see "R2D2 imaging runs in a long-lived
 worker", "The workers are started by the container, not by the ranks" and "The
 ranks attach to the pool before the warm-up" in
-[nested-sampling-profiling.md](nested-sampling-profiling.md)). That process also
-patches R2D2's `MeasOp.get_op_norm` to solve the operator norm with Lanczos
-rather than upstream's power iteration - the same quantity, ~3.5x fewer NUFFT
-pairs and ~3e-6 relative accuracy instead of ~1e-4, and no longer a different
-answer on every run (see "The operator norm is solved with Lanczos" there) - and
+[nested-sampling-profiling.md](nested-sampling-profiling.md)). The run's
+`r2d2_config.yaml` sets `target_dynamic_range`, which R2D2 only reads against a
+ground truth, so `imager.py` never solves for the operator norm
+([csd3-speed.md](csd3-speed.md), round 4). That process builds the U-Net once
+per worker rather than once per request, and
 it gives each measurement operator one FINUFFT plan per transform type instead
 of the one-plan-per-transform `pytorch_finufft` builds, worth ~30% of a warm
 imaging request (see "Each measurement operator keeps its FINUFFT plans"). Its

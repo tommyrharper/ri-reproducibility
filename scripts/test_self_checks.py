@@ -29,8 +29,8 @@ HOST_RUNNABLE = {
     ),
     "r2d2_serve": (
         "self_check_checkpoint_cache",
-        "self_check_lanczos_largest_eigenvalue",
         "self_check_lazy_utils",
+        "self_check_net_reuse",
         "self_check_nufft_plan_reuse",
         "self_check_serve_fifo",
         "self_check_serve_pool",

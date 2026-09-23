@@ -127,3 +127,55 @@ hashes the CPU model. Older CSD3 rows keep the shared id `39edb438`.
 
 Next: WSClean is now 42% of a short WSClean run and R2D2 is 70% of an R2D2
 run. In a long run the R2D2 share will be higher still.
+
+## Round 4: R2D2 request overhead
+
+`./ri profile --r2d2-phases` on round 3's R2D2 bench run: the 25 R2D2
+iterations (model update plus residual) took 0.37s of a 1.35s imaging request.
+Most of the request was spent around the algorithm, not in it.
+
+Probe: `scripts/probe_r2d2_request.py`, `.mat` files from 24 of the 48 round-1 parameter sets, imaged serially by
+one warm worker (`warm_imports()` as the pool runs it), 2 threads, under
+cProfile, icelake 8368Q. Output on RDS, as in a run.
+
+| per request | before | after |
+| --- | ---: | ---: |
+| U-Net forwards (~15 of them) | 0.47s | 0.46s |
+| operator norm (Lanczos, ~21 NUFFT pairs) | 0.38s | - |
+| other NUFFTs (dirty image, residuals) | ~0.2s | 0.22s |
+| U-Net built with random weights | 0.17s | once per worker |
+| FITS writes (4 files on RDS) | 0.28s | 0.23s |
+| **request, mean of 23 warm** | **1.81s** | **1.10s (-39%)** |
+
+- `imager.py` computes `target_dynamic_range` from the operator norm when the
+  config leaves it unset. R2D2 reads that value only against a ground truth
+  (`gdth_file`) or across several checkpoint realisations. We use neither, so
+  the config now sets it and the solve never runs. This also removes the Lanczos
+  patch, its upsampling plumbing and its self-check from `r2d2_serve.py`.
+- `create_net_imaging` Kaiming-initialises a fresh U-Net every request. Each
+  iteration's `load_net` then strictly assigns a checkpoint over every weight.
+  `patch_net_reuse()` builds the net once per worker.
+
+All 24 model images are bit-identical to before. 95 of the 96 output files are
+too; one residual differs by 1.1e-16, which is FINUFFT's adjoint summation
+order (see the nufft self-check).
+
+End to end, `./ri bench run r2d2 --mpi-procs 8 --omp-threads 2 --repeat 3`,
+both arms in one icelake job (the recipe from round 3; baseline `c6784f5`),
+identical log(Z):
+
+| | before | after | change |
+| --- | ---: | ---: | ---: |
+| evals/s (3 repeats) | 2.32 / 2.37 / 2.40 | 2.74 / 2.83 / 2.87 | **+19%** |
+| R2D2 per eval | 1.55s | 1.23s | -0.32s |
+
+The ranges do not overlap, and the baseline's last two repeats ran after the
+new arm had finished, which flatters the baseline. The saving is under half the
+serial probe's 0.7s. Two likely reasons: 32 R2D2 threads plus simulate workers
+shared 36 cores, and these draws ran all 25 iterations where the probe's
+averaged 15.
+
+Next: the FITS writes are ~0.23s of the 1.1s. They go to the evaluation
+directory on RDS/Lustre (open, stat and unlink are 5-15ms each there) and are
+then mostly deleted. Writing them to the `/dev/shm` scratch and moving only the
+retained ones should remove most of that.

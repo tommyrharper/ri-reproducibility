@@ -51,7 +51,7 @@ def peak_memory_bytes() -> int:
 _UTILS_SUBMODULES = ("args", "data", "evaluate", "io", "meas_op", "misc", "util_model", "noise", "util_training")
 _CHECKPOINT_CACHE: dict[tuple[int, str], dict] = {}
 _NORMALIZED_CHECKPOINT_CACHE: dict[int, tuple[dict, dict]] = {}
-_NUFFT_PLAN_CACHE: dict[tuple[int, tuple[int, ...], str, float], object] = {}
+_NUFFT_PLAN_CACHE: dict[tuple[int, tuple[int, ...], str], object] = {}
 
 
 def install_lazy_utils() -> None:
@@ -105,6 +105,28 @@ def patch_checkpoint_loading() -> None:
     optimiser = sys.modules.get("optimiser.R2D2")
     if optimiser is not None:
         optimiser.get_DNNs = get_DNNs
+
+
+_NETS: dict[str, object] = {}
+
+
+def patch_net_reuse() -> None:
+    """Build R2D2's U-Net once per worker instead of once per request.
+
+    Upstream builds it with random Kaiming weights, then every iteration's
+    `load_net` assigns a checkpoint's over all of them (strict, so none
+    survive). The random init alone was 0.17s of a 1.8s request on CSD3.
+    """
+    optimiser = sys.modules["optimiser.R2D2"]
+    create = optimiser.create_net_imaging
+
+    def create_net_imaging(*args, **kwargs):
+        key = repr((args, sorted(kwargs.items())))
+        if key not in _NETS:
+            _NETS[key] = create(*args, **kwargs)
+        return _NETS[key]
+
+    optimiser.create_net_imaging = create_net_imaging
 
 
 def r2d2_device() -> str:
@@ -188,9 +210,9 @@ def warm_imports() -> None:
             interop_threads = int(os.environ.get("R2D2_INTEROP_THREADS", "0"))
             if interop_threads:
                 torch.set_num_interop_threads(max(1, interop_threads))
-            patch_op_norm()
             patch_nufft_plans()
             patch_checkpoint_loading()
+            patch_net_reuse()
             if r2d2_device() == "cuda":
                 patch_cuda_network()
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
@@ -200,33 +222,12 @@ def warm_imports() -> None:
                 sys.modules["utils"].get_DNNs(
                     int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path)
                 )
-            # `create_meas_op` imports this backend lazily; preload it after
-            # patching the operator norm.
+            # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
             )
         except Exception:
             traceback.print_exc()
-
-
-# FINUFFT's upsampling factor for the operator-norm matvecs only; the imaging
-# transforms keep upstream's 2.0. `get_op_norm` produces one number, the
-# `1/sqrt(2L)` target-dynamic-range heuristic, and the Lanczos solve that
-# produces it already stops at a 1e-3 relative tolerance - against which 1.25
-# costs nothing measurable: over 12 real operators from this parameter space the
-# eigenvalue moves 7.3e-8 at worst and the application count is unchanged at
-# 19.7 (the per-transform error is 5.1e-6, and averaging over a 128x128
-# eigenvector is what turns it into 1e-8).
-#
-# What it buys is the FFT: 1.25 makes the padded grid 160x160 instead of
-# 256x256, measured at 0.598ms per forward/adjoint pair against 0.893ms solo and
-# - because that FFT is what saturates memory bandwidth - a whole imaging
-# request at 51ms against 69ms with eight of them running at once. Over those 12
-# operators the whole solve is 18.1ms at 1.25, 21.4ms at 1.5 and 26.0ms at 2.0.
-# Loosening `eps` instead is nearly free here (0.829ms per pair at 1e-3 against
-# 0.893ms at 1e-6): with ~3000 visibilities against 128x128 modes this transform
-# is FFT-bound, not spreading-bound.
-OP_NORM_UPSAMPFAC = 1.25
 
 
 def patch_nufft_plans() -> None:
@@ -247,13 +248,11 @@ def patch_nufft_plans() -> None:
         if plans is None:
             plans = {}
             setattr(self, "_ri_nufft_plans", plans)
-        upsampfac = getattr(self, "_ri_upsampfac", 2.0)
-        key = (nufft_type, upsampfac)
-        if key not in plans:
+        if nufft_type not in plans:
             points = np.ascontiguousarray(self._traj.detach().numpy())
             shape = tuple(int(size) for size in self._img_size)
             dtype = torch.empty(0, dtype=self._dtype_meas).numpy().dtype
-            cache_key = (nufft_type, shape, dtype.str, upsampfac)
+            cache_key = (nufft_type, shape, dtype.str)
             made = _NUFFT_PLAN_CACHE.get(cache_key)
             if made is None:
                 made = finufft.Plan(
@@ -266,15 +265,15 @@ def patch_nufft_plans() -> None:
                     eps=1e-6,
                     isign=-1,
                     dtype=dtype,
-                    upsampfac=upsampfac,
+                    upsampfac=2.0,
                     modeord=0,
                 )
                 _NUFFT_PLAN_CACHE[cache_key] = made
             # Workers process one request at a time, so one shared plan can be
             # retargeted for each new operator without concurrent users.
             made.setpts(points[0], points[1])
-            plans[key] = made
-        return plans[key]
+            plans[nufft_type] = made
+        return plans[nufft_type]
 
     @torch.inference_mode()
     def _GA(self, x: torch.Tensor) -> torch.Tensor:
@@ -297,79 +296,6 @@ def patch_nufft_plans() -> None:
 
     MeasOpPytorchFinufft._GA = _GA
     MeasOpPytorchFinufft._AtGt = _AtGt
-
-
-def lanczos_largest_eigenvalue(matvec, size: int, dtype, v0=None, max_restarts: int = 100):
-    """Return largest eigenpair; caller falls back on non-convergence."""
-    import numpy as np
-    from scipy.sparse.linalg import LinearOperator, eigsh
-
-    operator = LinearOperator((size, size), matvec=matvec, dtype=dtype)
-    if v0 is None:
-        v0 = np.ones(size, dtype=dtype)
-    eigenvalues, eigenvectors = eigsh(
-        operator,
-        k=1,
-        which="LA",
-        ncv=8,
-        tol=1e-3,
-        maxiter=max_restarts,
-        v0=v0,
-        return_eigenvectors=True,
-    )
-    return float(eigenvalues[0]), np.ascontiguousarray(eigenvectors[:, 0], dtype=dtype)
-
-
-# Reuse the first converged eigenvector for every operator in this worker.
-# Operators share a dominant subspace, so this cuts real solves from 19.6ms to
-# 14.0ms (24-operator median) while keeping eigenvalue variation below 4e-6,
-# far below ARPACK's 1e-3 tolerance. Freeze the first vector: rolling starts
-# have the same mean cost but a worse 25-application maximum versus 17.
-_reused_start_vector = None
-
-
-def patch_op_norm() -> None:
-    """Patch `MeasOp.get_op_norm` with the cached Lanczos implementation."""
-    import numpy as np
-    import torch
-    from ri_measurement_operator.pysrc.measOperator.meas_op import MeasOp
-    from scipy.sparse.linalg import ArpackNoConvergence
-
-    power_iteration = MeasOp.get_op_norm
-
-    @torch.inference_mode()
-    def get_op_norm(self, compute_flag=False, rel_tol=1e-5, max_iter=500, verbose=False):
-        if self._op_norm is not None and not compute_flag:
-            return self._op_norm
-        size = tuple(self._img_size)
-        dtype = torch.empty(0, dtype=self._dtype).numpy().dtype
-
-        def matvec(vector):
-            image = torch.from_numpy(np.ascontiguousarray(vector, dtype=dtype))
-            image = image.to(self._device).view(1, 1, *size)
-            return self.adjoint_op(self.forward_op(image)).reshape(-1).cpu().numpy()
-
-        global _reused_start_vector
-        length = int(np.prod(size))
-        v0 = _reused_start_vector
-        if v0 is not None and (v0.size != length or v0.dtype != dtype):
-            v0 = None
-
-        # The Lanczos matvecs run on a coarser FINUFFT upsampling grid than the
-        # imaging transforms do; see OP_NORM_UPSAMPFAC.
-        self._ri_upsampfac = OP_NORM_UPSAMPFAC
-        try:
-            self._op_norm, eigenvector = lanczos_largest_eigenvalue(matvec, length, dtype, v0)
-        except ArpackNoConvergence:
-            self._op_norm = None
-            return power_iteration(self, True, rel_tol, max_iter, verbose)
-        finally:
-            self._ri_upsampfac = 2.0
-        if _reused_start_vector is None:
-            _reused_start_vector = eigenvector
-        return self._op_norm
-
-    MeasOp.get_op_norm = get_op_norm
 
 
 def serve_pool(fifo_dir: str) -> None:
@@ -648,63 +574,6 @@ def self_check_serve_pool() -> None:
     print("r2d2 serve pool self-check passed")
 
 
-def self_check_lanczos_largest_eigenvalue() -> None:
-    try:
-        import numpy as np
-    except ImportError:
-        print("r2d2 op-norm self-check skipped: no numpy")
-        return
-    try:
-        import scipy.sparse.linalg  # noqa: F401
-    except ImportError:
-        print("r2d2 op-norm self-check skipped: no scipy")
-        return
-
-    size = 400
-    # Eigenvalues 1.0, 0.999, 0.998, ...: the ratio a power iteration converges
-    # at, mirroring what the measurement operator's spectrum looks like.
-    spectrum = 1.0 - 0.001 * np.arange(size)
-    rng = np.random.default_rng(0)
-    basis = np.linalg.qr(rng.standard_normal((size, size)))[0]
-    matrix = (basis * spectrum) @ basis.T
-    largest, eigenvector = lanczos_largest_eigenvalue(lambda v: matrix @ v, size, np.float64)
-
-    # A neighbouring operator, the way one evaluation's is a neighbour of the
-    # last one's: `matrix`'s converged eigenvector must start it in fewer
-    # applications than `ones` does, which is the whole point of reusing it.
-    nudged = matrix + 1e-3 * (basis * np.roll(spectrum, 1)) @ basis.T
-    counts = {}
-    for label, start in (("ones", None), ("reused", eigenvector)):
-        applied = [0]
-
-        def count(v, applied=applied):
-            applied[0] += 1
-            return nudged @ v
-
-        counts[label] = (lanczos_largest_eigenvalue(count, size, np.float64, start)[0], applied[0])
-    assert counts["reused"][1] < counts["ones"][1], counts
-    assert abs(counts["reused"][0] - counts["ones"][0]) / counts["ones"][0] < 1e-3, counts
-
-    # The same 1e-5 relative-change test upstream uses, for the comparison the
-    # patch exists to make.
-    vector = np.ones(size) / np.sqrt(size)
-    previous, applications = 1.0, 0
-    while applications < 500:
-        vector = matrix @ vector
-        value = float(np.linalg.norm(vector))
-        applications += 1
-        if abs(value - previous) / previous < 1e-5:
-            break
-        previous, vector = value, vector / value
-    assert abs(value - 1.0) > 1e-4, f"the power iteration was accurate in {applications}; pick a harder spectrum"
-    # Against the power iteration rather than against an absolute number: this
-    # spectrum is the worst case the patch is aimed at, and `tol` is a knob that
-    # trades applications for accuracy, so what has to hold is the comparison
-    # the patch exists to win, not whichever digit today's `tol` happens to hit.
-    assert abs(largest - 1.0) < abs(value - 1.0) / 10, (largest, value)
-    print("r2d2 op-norm self-check passed")
-
-
 def self_check_nufft_plan_reuse() -> None:
     sys.path.insert(0, str(IMAGER.parent))
     try:
@@ -748,15 +617,8 @@ def self_check_nufft_plan_reuse() -> None:
     batch = torch.cat((visibilities, -visibilities), dim=0)
     assert torch.allclose(patched.adjoint_op(batch), upstream.adjoint_op(batch), rtol=1e-12, atol=0.0)
 
-    # `get_op_norm` runs its matvecs on OP_NORM_UPSAMPFAC plans; the imaging
-    # transforms must still come off the 2.0 ones afterwards. Cheap to get
-    # wrong - one missed restore and every later transform silently changes.
-    patch_op_norm()
-    assert patched.get_op_norm(True) > 0.0
-    assert torch.equal(patched.forward_op(image), visibilities), "the op-norm plan leaked into imaging"
-    assert set(patched._ri_nufft_plans) == {(1, OP_NORM_UPSAMPFAC), (1, 2.0), (2, OP_NORM_UPSAMPFAC), (2, 2.0)}
     assert torch.allclose(second.forward_op(image), expected_second, rtol=1e-12, atol=0.0)
-    assert patched._ri_nufft_plans[(2, 2.0)] is second._ri_nufft_plans[(2, 2.0)]
+    assert patched._ri_nufft_plans[2] is second._ri_nufft_plans[2]
     print("r2d2 nufft plan self-check passed")
 
 
@@ -841,9 +703,27 @@ def self_check_checkpoint_cache() -> None:
     print("r2d2 checkpoint cache self-check passed")
 
 
+def self_check_net_reuse() -> None:
+    calls = []
+    optimiser = types.ModuleType("optimiser.R2D2")
+    optimiser.create_net_imaging = lambda **kwargs: calls.append(kwargs) or object()
+    sys.modules["optimiser.R2D2"] = optimiser
+    _NETS.clear()
+    try:
+        patch_net_reuse()
+        first = optimiser.create_net_imaging(layers=1, num_chans=64, architecture="unet", device="cpu")
+        assert optimiser.create_net_imaging(layers=1, num_chans=64, architecture="unet", device="cpu") is first
+        assert optimiser.create_net_imaging(layers=1, num_chans=32, architecture="unet", device="cpu") is not first
+        assert len(calls) == 2, calls
+    finally:
+        _NETS.clear()
+        del sys.modules["optimiser.R2D2"]
+    print("r2d2 net reuse self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
-        self_check_lanczos_largest_eigenvalue()
+        self_check_net_reuse()
         self_check_nufft_plan_reuse()
         self_check_lazy_utils()
         self_check_checkpoint_cache()
