@@ -128,7 +128,7 @@ def figure_to_png_bytes(fig, **savefig_kw):
 
 # Bump when a change to the drawing code should retire the PNGs already on
 # disk - keys describe the inputs, not how they were drawn.
-IMAGE_RENDER_VERSION = "2"
+IMAGE_RENDER_VERSION = "3"
 
 
 def png_name(key):
