@@ -95,7 +95,9 @@ means - the commit, the machine, and the settings the run used.
 Rows are grouped by **machine, imager and settings**, and only rows in one
 group are ever compared. The machine id is derived from `/etc/machine-id` (the
 `IOPlatformUUID` on macOS), so it survives a reboot, a rename and a fresh
-checkout, and a laptop's rows can never pool with a server's. `NS_SEED` is not
+checkout, and a laptop's rows can never pool with a server's. Inside a Slurm
+job it also hashes the CPU model, since a cluster's nodes share one
+machine-id. `NS_SEED` is not
 part of the grouping - it changes which points are drawn, not the
 configuration being measured, and it is random per run, so in the key every
 ad-hoc search would be a group of one.

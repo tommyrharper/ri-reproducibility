@@ -88,7 +88,20 @@ def machine_id() -> str:
             if "IOPlatformUUID" in line and '"' in line:
                 raw = line.rsplit('"', 2)[-2]
                 break
+    # Cluster nodes boot one image and share its machine-id, so there the
+    # machine is the node class: CSD3's icelake and ampere rows must not pool.
+    if raw and os.environ.get("SLURM_JOB_ID"):
+        raw += "|" + cpu_model()
     return hashlib.sha256((raw or platform.node()).encode()).hexdigest()[:8]
+
+
+def cpu_model() -> str:
+    try:
+        text = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return platform.processor()
+    return next((line.split(":", 1)[1].strip() for line in text.splitlines()
+                 if line.startswith("model name")), "")
 
 
 def available_cpu_count() -> int:
@@ -513,6 +526,15 @@ def self_check() -> None:
 
     assert machine_id() == machine_id(), "machine id must be stable"
     assert len(machine_id()) == 8, machine_id()
+    saved = os.environ.pop("SLURM_JOB_ID", None)
+    try:
+        outside = machine_id()
+        os.environ["SLURM_JOB_ID"] = "1"
+        assert machine_id() != outside or not cpu_model(), "a Slurm node's id must carry its CPU model"
+    finally:
+        os.environ.pop("SLURM_JOB_ID", None)
+        if saved is not None:
+            os.environ["SLURM_JOB_ID"] = saved
 
     median, error = stat([10.0, 12.0])
     assert median == 11.0 and abs(error - 0.657) < 1e-3, (median, error)
