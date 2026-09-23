@@ -53,6 +53,7 @@ the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 | --- | --- | --- |
 | this checkout, `images/`, `results/` | `/rds/user/<crsid>/hpc-work/ri-reproducibility` | Lustre, 1TB, shared by every node; home is 50GB NFS, and CSD3 asks that jobs do no I/O there - a run writes `results/`, its FIFOs and `benchmarks.jsonl` under the checkout, so a checkout in `~` is the wrong place |
 | in-flight Measurement Sets (`NS_SCRATCH_DIR`) | `/dev/shm` on the node | same as on main; nodes have 256GB+ |
+| makems observations kept across runs (`NS_OBSERVATION_CACHE_DIR`) | `hpc-work/.cache/ri/ms-observations/<meqtrees image id>` | up to 183MB per image; saves ~0.33s/eval ([csd3-speed.md](csd3-speed.md), round 6) |
 | a job's `uv`, uv's Pythons (which `.venv` points into), `XDG_CACHE_HOME`, `HOME` | `hpc-work/.local/bin`, `hpc-work/.local/share/uv/python`, `hpc-work/.cache`, `hpc-work/.ri-job/home` | a job runs nothing from `/home` (below) |
 | worker FIFOs | inside the run directory, as on main | one node per run, so a FIFO on Lustre is local to its readers |
 

@@ -20,6 +20,17 @@ if [ -z "${NS_SCRATCH_DIR:-}" ] && [ -w /dev/shm ]; then
 fi
 export NS_SCRATCH_DIR="${NS_SCRATCH_DIR:-}"
 
+# makems observations kept across runs (load_observation() in
+# simulate_point_source_ms.py), per meqtrees image. Empty turns it off.
+if [ -z "${NS_OBSERVATION_CACHE_DIR+set}" ] && [ -n "${MEQTREES_SIF:-}" ] && declare -F ns_image_id >/dev/null; then
+  _meqtrees_id="$(ns_image_id "${MEQTREES_SIF}")"
+  if [ "${_meqtrees_id}" != unknown ]; then
+    NS_OBSERVATION_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ri/ms-observations/${_meqtrees_id}"
+    mkdir -p "${NS_OBSERVATION_CACHE_DIR}" 2>/dev/null || NS_OBSERVATION_CACHE_DIR=""
+  fi
+fi
+export NS_OBSERVATION_CACHE_DIR="${NS_OBSERVATION_CACHE_DIR:-}"
+
 _sidecar_remove() {
   local pid
   for pid in ${SIDECAR_PIDS[@]+"${SIDECAR_PIDS[@]}"}; do
@@ -42,6 +53,9 @@ sidecar_binds() {
   SIDECAR_BINDS=(--bind "${REPO_ROOT}")
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
     SIDECAR_BINDS+=(--bind "${NS_SCRATCH_DIR}" --env "NS_SCRATCH_DIR=${NS_SCRATCH_DIR}")
+  fi
+  if [ -n "${NS_OBSERVATION_CACHE_DIR:-}" ]; then
+    SIDECAR_BINDS+=(--bind "${NS_OBSERVATION_CACHE_DIR}" --env "NS_OBSERVATION_CACHE_DIR=${NS_OBSERVATION_CACHE_DIR}")
   fi
 }
 

@@ -226,3 +226,37 @@ Next: in these short benches simulate is still ~0.4s/eval, about a quarter of
 R2D2's evaluation and 70% of WSClean's. That is round 2's observation cache
 starting cold in every run. A long run warms it (0.09s), but a cache that
 outlives the run would give short runs the same.
+
+## Round 6: observation cache that outlives the run
+
+Round 2's cache lived in the run's scratch, so every run started cold and a
+short one paid makems for nearly every evaluation. `save_observation()` now
+also publishes to `NS_OBSERVATION_CACHE_DIR`, and `load_observation()` reads
+from it when the run's copy is missing or too short. `start-sidecars.sh`
+points it at `$XDG_CACHE_HOME/ri/ms-observations/<meqtrees image id>`, since
+makems and the image's IERS tables decide the rows; set it empty to turn it
+off. `self_check_observation_prefix` now also runs a second "run" with a fresh
+run cache and checks served entries against makems bit for bit.
+
+Every (declination, integration) of the 9-param space at the longest
+observation (20 min) is 910 observations, 183MB, built in 38s by 34 processes
+each running `run_makems` + `save_observation` on one icelake node. That is what a long history of runs converges to.
+
+End to end, both arms at once in one icelake job, steady-state retention
+(`NS_IMAGE_KEEP_ENDS=0 NS_KEEP_DETAIL_EVERY=1000000`), identical log(Z). "off"
+sets `NS_OBSERVATION_CACHE_DIR=` (round 5 behaviour); "full" points it at the
+prefilled cache:
+
+| | off | full | change |
+| --- | ---: | ---: | ---: |
+| WSClean evals/s (16 ranks) | 8.95 / 9.40 / 9.42 | 19.0 / 20.4 / 20.5 | **+115%** |
+| WSClean `simulate` | 385-394ms | 66-74ms | -82% |
+| R2D2 evals/s (8 ranks x 2 threads) | 2.93 / 2.96 / 2.88 | 3.52 / 3.43 / 3.55 | **+20%** |
+| R2D2 `simulate` | 398-403ms | 69-71ms | -83% |
+
+The "full" WSClean arm finished first, so the "off" arm's last repeats ran
+alone: the gain is if anything understated.
+
+Without a prefill the cache fills as runs go: each run adds the observations
+it drew, at the longest length it drew. Next: prefill it once per meqtrees
+image (38s on a node) so the first run is warm too.

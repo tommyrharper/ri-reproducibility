@@ -305,13 +305,6 @@ def save_observation(ms_path: Path, cfg_text: str) -> None:
             and np.all(cols["INTERVAL"] == interval) and np.all(cols["EXPOSURE"] == exposure)
             and time_range[0, 1] == time_range[0, 0] + n_times * interval):
         return
-    destination = _observation_path(cfg_text)
-    try:
-        with np.load(destination) as cached:
-            if len(cached["time"]) >= n_times:
-                return
-    except (OSError, ValueError, KeyError):
-        pass
 
     def write(path: Path) -> None:
         with path.open("wb") as out:
@@ -319,17 +312,47 @@ def save_observation(ms_path: Path, cfg_text: str) -> None:
                      interval=interval, exposure=exposure, time_range_start=time_range[0, 0],
                      **{f"FIELD_{c}": v for c, v in dirs.items()})
 
-    _atomic_publish(write, destination)
+    for destination in (_observation_path(cfg_text), _persistent_observation_path(cfg_text)):
+        if destination is not None and _observation_times(destination) < n_times:
+            try:
+                _atomic_publish(write, destination)
+            except OSError:
+                pass  # a persistent cache that went away costs only its speed-up
+
+
+# The run's cache starts empty, so a short run pays makems for nearly every
+# evaluation (docs/csd3-speed.md, round 6). Observations also go to
+# NS_OBSERVATION_CACHE_DIR, which outlives the run; the launcher keys it on
+# the meqtrees image id, since makems and its IERS tables decide the rows.
+def _persistent_observation_path(cfg_text: str) -> Path | None:
+    root = os.environ.get("NS_OBSERVATION_CACHE_DIR")
+    return Path(root) / _observation_path(cfg_text).name if root else None
+
+
+def _observation_times(path: Path) -> int:
+    try:
+        with np.load(path) as cached:
+            return len(cached["time"])
+    except (OSError, ValueError, KeyError):
+        return 0
 
 
 def load_observation(cfg_text: str, n_times: int) -> dict | None:
-    try:
-        with np.load(_observation_path(cfg_text)) as cached:
-            if len(cached["time"]) < n_times:
-                return None
-            return {k: cached[k] for k in cached.files}
-    except (OSError, ValueError, KeyError):
-        return None
+    local = _observation_path(cfg_text)
+    for source in (local, _persistent_observation_path(cfg_text)):
+        if source is None:
+            continue
+        try:
+            with np.load(source) as cached:
+                if len(cached["time"]) < n_times:
+                    continue
+                observation = {k: cached[k] for k in cached.files}
+        except (OSError, ValueError, KeyError):
+            continue
+        if source != local and _observation_times(local) < n_times:
+            _atomic_publish(lambda path: shutil.copyfile(source, path), local)
+        return observation
+    return None
 
 
 def one_timestep_template(cfg_text: str, args: argparse.Namespace, scratch: Path) -> Path:
@@ -945,10 +968,15 @@ def self_check_observation_prefix() -> None:
     # (declination, integration, NTimes, channels, served from the cache)
     steps = [(34, 2, 10, 1, False), (34, 2, 4, 3, True), (34, 2, 20, 8, False), (34, 2, 15, 2, True),
              (34, 2, 20, 4, True), (-15, 7, 3, 3, False), (-15, 7, 1, 3, True), (75, 2, 5, 1, False)]
+    # A second run, with a fresh run cache: served from the persistent one.
+    steps += [(34, 2, 20, 1, True), (-15, 7, 4, 2, False), (75, 2, 5, 2, True)]
+    saved_env = os.environ.get("NS_OBSERVATION_CACHE_DIR")
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch_dir:
         scratch = Path(scratch_dir)
-        use_skeleton_cache(scratch / "cache")
+        os.environ["NS_OBSERVATION_CACHE_DIR"] = str(scratch / "persistent")
+        (scratch / "persistent").mkdir()
         for i, (dec, step, n_times, n_chan, served) in enumerate(steps):
+            use_skeleton_cache(scratch / ("cache" if i < 8 else "cache2"))
             got = simulate_with(scratch, f"prefix{i}", dec, step, n_times, n_chan, prefix=True)
             log = (got.parent / "makems.log").read_text()
             assert ("extended a cached observation" in log) == served, f"step {i}: cache use was not {served}: {log}"
@@ -962,6 +990,10 @@ def self_check_observation_prefix() -> None:
                     same = (left[column] is None and right[column] is None) if left[column] is None or right[column] is None \
                         else np.array_equal(left[column], right[column])
                     assert same, f"step {i}: {sub or 'MAIN'}.{column} differs from a makems build"
+    if saved_env is None:
+        os.environ.pop("NS_OBSERVATION_CACHE_DIR")
+    else:
+        os.environ["NS_OBSERVATION_CACHE_DIR"] = saved_env
     use_skeleton_cache(None)
     print("observation prefix self-check passed")
 
