@@ -133,7 +133,7 @@ NS_KEEP_DETAIL_EVERY = 100
 # threshold; each record's `clean_stop_reason` says which of the two ended it,
 # so the question is now answerable from the summary rather than the logs.
 # Costs imaging time: deconvolution was ~7% of an evaluation at 100.
-NS_WSCLEAN_NITER = 10000
+NS_WSCLEAN_NITER = 100000
 
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
@@ -239,14 +239,14 @@ name = "source_l_pixels"
 kind = "image_pixels"
 fraction = 1
 default = 0.0
-enabled = false
+enabled = true
 
 [[parameter_space]]
 name = "source_m_pixels"
 kind = "image_pixels"
 fraction = 1
 default = 0.0
-enabled = false
+enabled = true
 
 # Declination of the phase centre. +34 is the VLA's latitude and this
 # `default`: overhead transit, the roundest PSF the array gets. Low declination
@@ -259,7 +259,7 @@ min = -15
 max = 75
 kind = "integer"
 default = 34
-enabled = false
+enabled = true
 
 # Correlator dump time, makems' `StepTime`: `NTimes = ceil(observation_minutes
 # * 60 / this)`, so it trades sampling density against track length. The only
@@ -276,7 +276,7 @@ min = 1
 max = 10
 kind = "integer"
 default = 2
-enabled = false
+enabled = true
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
 # These are the VLA's; nothing in the code is VLA-specific, so pointing this
