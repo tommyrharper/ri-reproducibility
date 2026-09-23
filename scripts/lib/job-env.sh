@@ -208,7 +208,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     --check)
       # From a login node: the environment a job would get, with the settings
       # this shell would hand it, checked the same way.
-      _tmp="$(mktemp -d)"
+      _tmp="$(cd "$(mktemp -d)" && pwd -P)"
       trap 'rm -rf "${_tmp}"' EXIT
       ns_write_job_settings "${_tmp}/settings" || exit 1
       /bin/bash "${BASH_SOURCE[0]}" "${_tmp}/settings" /bin/true
@@ -216,6 +216,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     --self-check)
       set -e
       _tmp="$(mktemp -d)"
+      # Physical: the check resolves what it finds, and macOS hands out
+      # temporary directories under /var, a symlink to /private/var, so a
+      # forbidden tree named logically would never match.
+      _tmp="$(cd "${_tmp}" && pwd -P)"
       trap 'rm -rf "${_tmp}"' EXIT
       mkdir -p "${_tmp}/home/bin" "${_tmp}/ok/bin" "${_tmp}/work" "${_tmp}/run"
       printf '#!/bin/sh\necho fake\n' >"${_tmp}/home/bin/python3"
