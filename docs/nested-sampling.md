@@ -198,7 +198,10 @@ ground truth, so `imager.py` never solves for the operator norm
 per worker rather than once per request, and
 it gives each measurement operator one FINUFFT plan per transform type instead
 of the one-plan-per-transform `pytorch_finufft` builds, worth ~30% of a warm
-imaging request (see "Each measurement operator keeps its FINUFFT plans"). Its
+imaging request (see "Each measurement operator keeps its FINUFFT plans"). Each
+iteration's residual then skips the NUFFTs altogether: `A^H A` is applied as an
+FFT convolution with a kernel one NUFFT builds per request
+([csd3-speed.md](csd3-speed.md), round 10). Its
 warm-up runs `imager.py`'s own import block - the file under a run name that is
 not `__main__` - plus the NUFFT backend `create_meas_op` imports lazily, and
 makes `utils` resolve its submodules on demand so the imaging path never pays

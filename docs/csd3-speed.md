@@ -425,3 +425,62 @@ saving is a fixed tail, so its share falls as runs grow. For the 71k run's
 final chain of ~75 heavy evaluations: ~26s each as run, ~12s with rounds 1-8
 (0.6s simulate + ~11s R2D2 at 1 thread), ~2.5s with this round. That is a
 projected ~15 minutes down to ~3. This projection is not measured end to end.
+
+## Round 10: residuals without NUFFTs
+
+A fresh profile of a round-9 run (24 ranks x 1 thread, async) put the R2D2
+request at 93% of an evaluation. At 1 thread a typical request is ~1.2s: the
+U-Net ~0.7s, and ~33 FINUFFT executes at ~11ms each, ~0.36s. Every R2D2
+iteration computes its residual as `adjoint_op(forward_op(model))`, a type-2
+then a type-1 NUFFT over every visibility, so that cost is linear in rows. On
+the heavy corner the posterior converges on (~380k rows) it is ~80% of a 14s
+request.
+
+For a real image x, `Re(A^H A x)` is x correlated with
+`g(d) = sum_k w_k^2 exp(+i k.d)` for offsets d in `[-(N-1), N-1]^2`. One
+type-1 NUFFT onto 2N x 2N modes builds g (the Toeplitz embedding). Each
+application after that is a 64x64 real FFT pair, independent of the visibility
+count. The PSF is the same operator on a dirac.
+
+Change: `patch_normal_operator()` in `r2d2_serve.py`. For the duration of
+`R2D2.run`, `forward_op` defers and `adjoint_op` applies the convolution.
+`get_psf` uses it too. The kernel is built once per request at FINUFFT eps
+1e-9. Operators it cannot represent (GPU, complex images, preconditioning,
+complex weights) stay on upstream's NUFFTs. The dirty image is unchanged.
+
+Per request, one warm worker at 1 thread on an icelake node (`scripts/probe_r2d2_request.py`,
+first request excluded):
+
+| set | before | after | FINUFFT executes |
+| --- | ---: | ---: | ---: |
+| 24 typical (from the 71k run) | 1.16-1.18s | 0.80s (-32%) | 796 -> 48 |
+| 6 heavy (1s integration, 7 channels) | 13.7-13.9s | 2.43s (-82%) | 318 -> 12 |
+
+Not bit-identical, at the level of upstream's own NUFFT error (eps 1e-6 per
+transform). Across those 30 requests: identical iteration counts in every
+request, model images within 1.2e-6 of their peak, residual RMS within 1.5e-6
+relative. The PSF and dirty normalisation move by <6e-7 through the PSF peak.
+Kernel eps 1e-12 instead of 1e-9 moves results by <4e-7 more and costs
+6ms (typical) to 0.12s (heavy) more per request.
+`self_check_normal_operator` checks the convolution against upstream's
+operator (3.4e-7 of peak) and that a preconditioned operator is refused.
+
+End to end, round 9's production shape (24 ranks x 1 thread on 24 icelake
+CPUs, async, nlive 25, 15 repeats, 40 dead points, seed 4242), against
+bd0aa6e in two jobs, orders base/new/new/base and new/base/base/new:
+
+| | base | new |
+| --- | ---: | ---: |
+| PolyChord wall, warm | 88s, 90s, 91s | 44s, 48s, 50s |
+| PolyChord wall, first run in the job (cold) | 105s | 73s |
+| R2D2 per eval, warm | 1.47-1.52s | 0.81-0.93s |
+| evals/s, warm | 8.1, 8.3, 8.5 | 15.4, 15.8, 16.8 |
+| log(Z) | -0.00195 | -0.00195 |
+
+About -45% wall, ~1.9x throughput. The saving per evaluation grows with its
+visibility count, so long runs, whose posterior sits in the heavy corner, gain
+more than this short one.
+Worker idle in these short runs is still 30-40%: nlive 25 caps concurrency at
+~18 of 23 workers mid-run, plus the prior-to-sampling transition and the tail.
+The 71k run was 88.5% busy, so this is a short-run artefact.
+The U-Net is now ~85% of a typical request and the remaining target.

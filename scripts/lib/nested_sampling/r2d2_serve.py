@@ -211,6 +211,7 @@ def warm_imports() -> None:
             if interop_threads:
                 torch.set_num_interop_threads(max(1, interop_threads))
             patch_nufft_plans()
+            patch_normal_operator()
             patch_checkpoint_loading()
             patch_net_reuse()
             if r2d2_device() == "cuda":
@@ -300,6 +301,96 @@ def patch_nufft_plans() -> None:
 
     MeasOpPytorchFinufft._GA = _GA
     MeasOpPytorchFinufft._AtGt = _AtGt
+
+
+# Kernel accuracy. Built once per request, so it can be far tighter than the
+# 1e-6 of the NUFFT pairs it replaces.
+NORMAL_KERNEL_EPS = 1e-9
+
+
+class _Deferred:
+    def __init__(self, image):
+        self.image = image
+
+
+def normal_operator(op):
+    """Re(A^H A) of `op` as a 2N x 2N FFT convolution, or None if unsupported.
+
+    With x real, A^H A x (upstream's adjoint of its forward, weights applied
+    in both) is x correlated with g(d) = sum_k w_k^2 exp(+i k.d), d in
+    [-(N-1), N-1]^2. One type-1 NUFFT onto 2N modes gives g, after which each
+    application is two tiny FFTs instead of two NUFFTs over every visibility.
+    """
+    import finufft
+    import numpy as np
+    import torch
+
+    if hasattr(op, "_ri_normal"):
+        return op._ri_normal
+    op._ri_normal = None
+    weight, precond = op._data_weight, op._precond_weight
+    if (str(op._device or "cpu") != "cpu" or not op._real_flag or not torch.all(precond == 1)
+            or torch.any(weight.imag != 0)):
+        return None
+    points = op._traj.detach().to(torch.float64).numpy()
+    strengths = np.ascontiguousarray(
+        np.broadcast_to(weight.real.to(torch.float64).numpy() ** 2, (*weight.shape[:-1], points.shape[-1]))
+        .reshape(-1, points.shape[-1])[0], dtype=np.complex128)
+    rows, cols = (int(size) for size in op._img_size)
+    # modeord 0 puts mode m at index m + N, so ifftshift puts d at index d mod 2N.
+    kernel = finufft.nufft2d1(points[0], points[1], strengths, (2 * rows, 2 * cols),
+                              eps=NORMAL_KERNEL_EPS, isign=-1, modeord=0,
+                              nthreads=torch.get_num_threads())
+    spectrum = np.fft.rfft2(np.fft.ifftshift(kernel.real))
+    dtype = op._dtype
+
+    def apply(x):
+        padded = np.zeros((2 * rows, 2 * cols))
+        padded[:rows, :cols] = x.detach().reshape(rows, cols).to(torch.float64).numpy()
+        out = np.fft.irfft2(np.fft.rfft2(padded) * spectrum, s=padded.shape)[:rows, :cols]
+        return torch.from_numpy(np.ascontiguousarray(out)).reshape(x.shape).to(dtype)
+
+    op._ri_normal = apply
+    return apply
+
+
+def patch_normal_operator() -> None:
+    """Replace R2D2's per-iteration adjoint(forward(model)) with `normal_operator`.
+
+    `R2D2.run` uses the operator only in that one expression, so for the run
+    forward_op defers and adjoint_op applies the convolution. The PSF is the
+    same operator on a dirac.
+    """
+    import torch
+    from ri_measurement_operator.pysrc.measOperator.meas_op_nufft_pytorch_finufft import (
+        MeasOpPytorchFinufft,
+    )
+
+    R2D2 = sys.modules["optimiser.R2D2"].R2D2
+    upstream_run, upstream_psf = R2D2.run, MeasOpPytorchFinufft.get_psf
+
+    def get_psf(self):
+        apply = normal_operator(self)
+        if apply is None:
+            return upstream_psf(self)
+        dirac = torch.zeros(1, 1, *self._img_size, dtype=self._dtype)
+        dirac[0, 0, self._img_size[0] // 2, self._img_size[1] // 2] = 1.0
+        return apply(dirac)
+
+    def run(self):
+        op = self._meas_op
+        apply = normal_operator(op) if isinstance(op, MeasOpPytorchFinufft) else None
+        if apply is None:
+            return upstream_run(self)
+        op.forward_op = _Deferred
+        op.adjoint_op = lambda deferred: apply(deferred.image)
+        try:
+            return upstream_run(self)
+        finally:
+            del op.forward_op, op.adjoint_op
+
+    MeasOpPytorchFinufft.get_psf = get_psf
+    R2D2.run = run
 
 
 def serve_pool(fifo_dir: str) -> None:
@@ -626,6 +717,42 @@ def self_check_nufft_plan_reuse() -> None:
     print("r2d2 nufft plan self-check passed")
 
 
+def self_check_normal_operator() -> None:
+    sys.path.insert(0, str(IMAGER.parent))
+    try:
+        import torch
+        from ri_measurement_operator.pysrc.measOperator.meas_op_nufft_pytorch_finufft import (
+            MeasOpPytorchFinufft,
+        )
+    except ImportError:
+        print("r2d2 normal operator self-check skipped: no R2D2 measurement operator")
+        return
+
+    torch.manual_seed(0)
+    count = 5000
+    points = (torch.rand(1, 1, count, dtype=torch.float64) - 0.5) * 6.0
+    weights = torch.rand(1, 1, count, dtype=torch.float64) + 0.5
+    image = torch.randn(1, 1, 24, 20, dtype=torch.float32)
+    for natural in (torch.ones(1, 1), weights):
+        op = MeasOpPytorchFinufft(u=points, v=points.flip(-1) * 0.7, img_size=(24, 20),
+                                  natural_weight=natural, image_weight=weights.sqrt(), dtype=torch.float64)
+        expected = op.adjoint_op(op.forward_op(image))
+        dirac = torch.zeros(1, 1, 24, 20, dtype=torch.float64)
+        dirac[0, 0, 12, 10] = 1.0
+        expected_psf = op.adjoint_op(op.forward_op(dirac))
+        apply = normal_operator(op)
+        got = apply(image)
+        assert got.shape == expected.shape and got.dtype == expected.dtype, (got.shape, got.dtype)
+        # Upstream's two NUFFTs at eps 1e-6 are the error here, not the kernel.
+        for result, reference in ((got, expected), (apply(dirac), expected_psf)):
+            error = float((result - reference).abs().max() / reference.abs().max())
+            assert error < 1e-5, error
+    op._precond_weight = torch.full((1, 1), 2.0, dtype=torch.complex128)
+    del op._ri_normal
+    assert normal_operator(op) is None, "a preconditioned operator must stay on upstream's NUFFTs"
+    print("r2d2 normal operator self-check passed")
+
+
 def self_check_lazy_utils() -> None:
     import tempfile
 
@@ -729,6 +856,7 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_net_reuse()
         self_check_nufft_plan_reuse()
+        self_check_normal_operator()
         self_check_lazy_utils()
         self_check_checkpoint_cache()
         self_check_serve_reply_stream()
