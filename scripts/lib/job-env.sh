@@ -101,6 +101,9 @@ ri_job_env_check() {
   local bad=0 tool path real var entry required
   local -
   set -f  # the value split below must not glob
+  # bash remembers where it last found a command, and this runs with a PATH
+  # built moments ago: without this, `command -v` can answer from the old one.
+  hash -r 2>/dev/null || true
   required=" ${RI_JOB_REQUIRED_TOOLS:-bash uv apptainer} "
   for tool in bash sh env python3 gcc uv apptainer sbatch squeue; do
     if ! path="$(command -v "${tool}")"; then
@@ -251,8 +254,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       REPO_ROOT_PHYS="${_tmp}/repo"
 
       # A tool that only looks allowed: a symlink into the forbidden tree.
-      PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
-        && { echo "FAIL: python3 symlinked into the forbidden tree must fail the check"; exit 1; }
+      if _seen="$(PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check 2>&1)"; then
+        echo "FAIL: python3 symlinked into the forbidden tree must fail the check"
+        echo "  forbidden: ${_tmp}/home"
+        echo "  link: $(ls -l "${_tmp}/ok/bin/python3")"
+        echo "  resolved: $(PATH="${_tmp}/ok/bin:/usr/bin:/bin" _ri_realpath "${_tmp}/ok/bin/python3")"
+        echo "  check said: ${_seen}"
+        exit 1
+      fi
       PATH="${_tmp}/home/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a forbidden PATH entry must fail the check"; exit 1; }
       NS_SCRATCH_DIR="${_tmp}/home/scratch" PATH=/usr/bin:/bin ri_job_env_check >/dev/null 2>&1 \
