@@ -1334,6 +1334,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 PRUNED_ARTEFACTS = (
     ("sim.ms", "measurement_set"),
     ("VLAA_ANT", None),
+    ("makems.cfg", None),
     ("r2d2_data.mat", "mat"),
     ("wsclean/recon-model.fits", None),
     ("wsclean/recon-psf.fits", None),
@@ -1361,38 +1362,63 @@ def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
     return False
 
 
-def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
+def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> bool:
+    """Delete the artefacts no reader needs; True if this evaluation keeps them."""
     import shutil
 
     failed = "error" in record
     keeping = os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0" or (
         failed and claim_failed_artefacts_slot(eval_dir))
-    scratch = evaluation_scratch_dir(eval_dir)
-    if scratch is not None and scratch.is_dir():
-        if keeping or failed:
-            for produced in scratch.iterdir():
-                # Past its slots a failure still keeps its logs, not its MS.
-                if not keeping and produced.is_dir():
-                    continue
-                destination = eval_dir / produced.name
-                if destination.is_dir():
-                    shutil.rmtree(destination)
-                shutil.move(str(produced), destination)
-            if (eval_dir / "sim.ms").exists() and "measurement_set" in record.get("paths", {}):
-                record["paths"]["measurement_set"] = str(eval_dir / "sim.ms")
-            if (eval_dir / "r2d2_data.mat").exists() and "mat" in record.get("paths", {}):
-                record["paths"]["mat"] = str(eval_dir / "r2d2_data.mat")
-        shutil.rmtree(scratch, ignore_errors=True)
     if keeping:
-        return
+        return True
+    work = evaluation_scratch_dir(eval_dir) or eval_dir
     for name, path_key in PRUNED_ARTEFACTS:
-        target = eval_dir / name
+        target = work / name
         if target.is_dir():
             shutil.rmtree(target, ignore_errors=True)
         else:
             target.unlink(missing_ok=True)
         if path_key:
             record.get("paths", {}).pop(path_key, None)
+    return False
+
+
+def publish_evaluation_scratch(eval_dir: Path, record: dict[str, Any], kept: bool,
+                               files_only: bool = False) -> None:
+    """Move what an evaluation wrote to scratch beside its record, if it is kept.
+
+    Everything an evaluation writes goes to tmpfs scratch because on CSD3's
+    Lustre each file created costs 25-40ms and each unlink ~10ms, and most
+    evaluations are stripped to metrics.json straight after scoring
+    (docs/csd3-speed.md, round 5). Records name the final paths either way.
+    """
+    import shutil
+
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is None or not scratch.is_dir():
+        return
+    if kept:
+        for produced in scratch.iterdir():
+            if files_only and produced.is_dir():
+                continue
+            destination = eval_dir / produced.name
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            shutil.move(str(produced), destination, copy_function=shutil.copyfile)
+    shutil.rmtree(scratch, ignore_errors=True)
+    paths = record.get("paths") or {}
+    for key, value in paths.items():
+        if isinstance(value, str) and Path(value).is_relative_to(scratch):
+            paths[key] = str(eval_dir / Path(value).relative_to(scratch))
+
+
+def salvage_evaluation_logs(eval_dir: Path) -> None:
+    """Keep a dead evaluation's logs: its scratch goes with the job, and a dead
+    worker's stderr is the only record of why it died."""
+    try:
+        publish_evaluation_scratch(eval_dir, {}, kept=True, files_only=True)
+    except OSError:
+        pass
 
 
 # A finished run keeps every image for the IMAGE_KEEP_ENDS worst and best
@@ -1798,8 +1824,9 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         timing["started_epoch"] = _EVALUATION_STARTED_EPOCH
         timing["ended_epoch"] = time.time()
         _EVALUATION_STARTED_EPOCH = None
-    prune_evaluation_artefacts(eval_dir, record)
-    retain_evaluation_detail(eval_dir, record)
+    keeping = prune_evaluation_artefacts(eval_dir, record)
+    kept = retain_evaluation_detail(eval_dir, record) or keeping
+    publish_evaluation_scratch(eval_dir, record, kept)
     write_json_atomic(eval_dir / "metrics.json", record)
     return record
 
@@ -1834,14 +1861,15 @@ def _strip_to_record(eval_dir: Path) -> None:
             entry.unlink(missing_ok=True)
 
 
-def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> None:
+def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
+    """False if this evaluation is stripped to its record."""
     import heapq
 
     if (os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
             or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
             or "error" in record or record.get("objective") is None
             or _keeps_detail(eval_dir.name)):
-        return
+        return True
     key, objective = eval_dir.name, float(record["objective"])
     evicted = set()
     heapq.heappush(_LOWEST, (-objective, key))
@@ -1856,6 +1884,7 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> None:
     if key in evicted:
         for image_key in RETAINED_IMAGE_KEYS:
             (record.get("paths") or {}).pop(image_key, None)
+    return key not in evicted
 
 
 
@@ -1866,33 +1895,56 @@ def self_check_streaming_retention() -> None:
     saved = IMAGE_KEEP_ENDS, os.environ.get("NS_KEEP_DETAIL_EVERY")
     IMAGE_KEEP_ENDS = 3
     os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
-    _LOWEST.clear()
-    _HIGHEST.clear()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            evaluations = Path(tmp)
-            objectives = {}
-            for index in range(300):
-                eval_dir = evaluations / f"eval-{index:04d}"
-                (eval_dir / "wsclean").mkdir(parents=True)
-                (eval_dir / "wsclean" / "recon-image.fits").write_text("x")
-                (eval_dir / "wsclean.stdout.log").write_text("x")
-                objective = ((index * 7919) % 300) / 10
-                objectives[eval_dir.name] = objective
-                record = {"objective": objective,
-                          "paths": {"image": str(eval_dir / "wsclean" / "recon-image.fits")}}
-                write_evaluation_record(eval_dir, record)
-                if not (eval_dir / "wsclean").exists():
-                    assert "image" not in record["paths"], "a stripped record still names its image"
-            ordered = sorted(objectives, key=objectives.get)
-            must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
-            for key in objectives:
-                kept = sorted(p.name for p in (evaluations / key).iterdir())
-                if key in must:
-                    assert kept == ["metrics.json", "wsclean", "wsclean.stdout.log"], (key, kept)
-                else:
-                    assert kept == ["metrics.json"], (key, kept)
+        # Same outcome whether an evaluation writes beside its record or in
+        # scratch that is published only if it is kept.
+        for scratch_root in (None, "scratch"):
+            _LOWEST.clear()
+            _HIGHEST.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                evaluations = Path(tmp) / "evaluations"
+                if scratch_root:
+                    os.environ["NS_SCRATCH_DIR"] = str(Path(tmp) / scratch_root)
+                objectives = {}
+                for index in range(300):
+                    eval_dir = evaluations / f"eval-{index:04d}"
+                    eval_dir.mkdir(parents=True)
+                    work = evaluation_scratch_dir(eval_dir) or eval_dir
+                    (work / "wsclean").mkdir(parents=True)
+                    (work / "wsclean" / "recon-image.fits").write_text("x")
+                    (work / "wsclean.stdout.log").write_text("x")
+                    objective = ((index * 7919) % 300) / 10
+                    objectives[eval_dir.name] = objective
+                    record = {"objective": objective,
+                              "paths": {"image": str(work / "wsclean" / "recon-image.fits")}}
+                    write_evaluation_record(eval_dir, record)
+                    assert not (Path(tmp) / "scratch" / eval_dir.name).exists(), "scratch outlived scoring"
+                    if not (eval_dir / "wsclean").exists():
+                        assert "image" not in record["paths"], "a stripped record still names its image"
+                    else:
+                        assert record["paths"]["image"] == str(eval_dir / "wsclean" / "recon-image.fits")
+                ordered = sorted(objectives, key=objectives.get)
+                must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
+                for key in objectives:
+                    kept = sorted(p.name for p in (evaluations / key).iterdir())
+                    if key in must:
+                        assert kept == ["metrics.json", "wsclean", "wsclean.stdout.log"], (key, kept)
+                    else:
+                        assert kept == ["metrics.json"], (key, kept)
+
+                # A dead worker's logs outlive its scratch; its MS does not.
+                eval_dir = evaluations / "eval-9999-died"
+                eval_dir.mkdir()
+                work = evaluation_scratch_dir(eval_dir) or eval_dir
+                (work / "sim.ms").mkdir(parents=True)
+                (work / "simulate.stderr.log").write_text("Traceback")
+                salvage_evaluation_logs(eval_dir)
+                assert (eval_dir / "simulate.stderr.log").read_text() == "Traceback"
+                if scratch_root:
+                    assert not (eval_dir / "sim.ms").exists() and not work.exists()
+            os.environ.pop("NS_SCRATCH_DIR", None)
     finally:
+        os.environ.pop("NS_SCRATCH_DIR", None)
         IMAGE_KEEP_ENDS = saved[0]
         if saved[1] is None:
             os.environ.pop("NS_KEEP_DETAIL_EVERY", None)
@@ -2133,15 +2185,16 @@ def simulate_measurement_set(
 
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True)
-    ms_path = (scratch or eval_dir) / "sim.ms"
+    work = scratch or eval_dir
+    ms_path = work / "sim.ms"
     n_times = evaluation_time_samples(params)
-    sim_stdout = eval_dir / "simulate.stdout.log"
-    sim_stderr = eval_dir / "simulate.stderr.log"
+    sim_stdout = work / "simulate.stdout.log"
+    sim_stderr = work / "simulate.stderr.log"
     sim_cmd = [
         "--output-ms",
         str(ms_path),
         "--metadata-json",
-        str(eval_dir / "simulation.json"),
+        str(work / "simulation.json"),
         "--vla-config",
         params["vla_config"],
         "--observation-minutes",
@@ -2185,7 +2238,7 @@ def simulate_measurement_set(
 
 def convert_ms_to_mat(
     argv: list[str],
-    eval_dir: Path,
+    work_dir: Path,
     meqtrees_image: str,
     platform: str,
 ) -> int:
@@ -2195,10 +2248,10 @@ def convert_ms_to_mat(
         {
             "action": "convert",
             "argv": argv,
-            "stdout": str(eval_dir / "convert.stdout.log"),
-            "stderr": str(eval_dir / "convert.stderr.log"),
+            "stdout": str(work_dir / "convert.stdout.log"),
+            "stderr": str(work_dir / "convert.stderr.log"),
         },
-        eval_dir / "convert.stderr.log",
+        work_dir / "convert.stderr.log",
     )
 
 

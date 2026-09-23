@@ -46,6 +46,10 @@ wrote there - usually a traceback naming what it died of - and the
 overwrite that file, which left the one-line summary as the entire record of the
 failure and made a reproducible fault look like an unexplained one.
 
+With a scratch tmpfs every log is written there, so before the run aborts
+`salvage_evaluation_logs()` moves the dead evaluation's logs beside its
+record; the scratch goes with the job.
+
 A dead worker is retried against a freshly started one, waiting longer each
 time (`WORKER_RETRY_DELAYS` in `common.py`, ~51s in total). That is usually
 enough, because the memory the attempt died for is released by its own death.

@@ -29,7 +29,6 @@ from common import (
     image_dim,
     image_pixel_size_arcsec,
     convert_ms_to_mat,
-    evaluation_scratch_dir,
     load_evaluations_from_dir,
     load_parameter_space,
     mark_evaluation_start,
@@ -37,6 +36,7 @@ from common import (
     params_key,
     prewarm,
     prune_run_artefacts,
+    salvage_evaluation_logs,
     prior_vector,
     r2d2_thread_count,
     r2d2_worker,
@@ -157,7 +157,10 @@ def evaluate(
     # `-scale`, from the same recorded baseline, so the two score the same sky
     # - see image_pixel_size_arcsec() in common.py. Read here rather than after
     # the convert because the convert needs this file's noise sigma too.
-    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    # Everything below is written beside the MS: tmpfs scratch when the run
+    # has one, which publish_evaluation_scratch() empties at scoring.
+    work_dir = ms_path.parent
+    simulation = json.loads((work_dir / "simulation.json").read_text())
     if "max_proj_baseline_lambda" not in simulation["observation"]:
         raise SystemExit(
             "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
@@ -165,8 +168,7 @@ def evaluate(
         )
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
-    # Keep conversion output beside the MS when run uses tmpfs scratch.
-    mat_path = (evaluation_scratch_dir(eval_dir) or eval_dir) / "r2d2_data.mat"
+    mat_path = work_dir / "r2d2_data.mat"
     # Convert in simulate worker; passing noise sigma once avoids a 31% fill cost.
     convert_cmd = [
         "--ms-path", str(ms_path),
@@ -174,7 +176,7 @@ def evaluate(
         "--noise-sigma-jy", repr(float(simulation["noise"]["complex_sigma_jy"])),
     ]
     convert_start = time.perf_counter()
-    convert_returncode = convert_ms_to_mat(convert_cmd, eval_dir, args.meqtrees_image, args.platform)
+    convert_returncode = convert_ms_to_mat(convert_cmd, work_dir, args.meqtrees_image, args.platform)
     convert_seconds = time.perf_counter() - convert_start
     if convert_returncode == WORKER_DIED:
         raise WorkerDied(f"simulate worker died converting evaluation {eval_id} ({eval_dir})")
@@ -189,13 +191,13 @@ def evaluate(
             "timing": {"simulate_seconds": simulate_seconds, "convert_seconds": convert_seconds},
         })
 
-    r2d2_dir = eval_dir / "r2d2"
+    r2d2_dir = work_dir / "r2d2"
     r2d2_dir.mkdir()
-    config_path = eval_dir / "r2d2_config.yaml"
+    config_path = work_dir / "r2d2_config.yaml"
     write_r2d2_config(config_path, str(mat_path), str(r2d2_dir))
 
-    r2d2_stdout = eval_dir / "r2d2.stdout.log"
-    r2d2_stderr = eval_dir / "r2d2.stderr.log"
+    r2d2_stdout = work_dir / "r2d2.stdout.log"
+    r2d2_stderr = work_dir / "r2d2.stderr.log"
     # `imager.py` argv for this rank's long-lived R2D2 worker (see
     # run_r2d2_imaging): a fresh `docker run` of this image cost ~2.4s warm, of
     # which ~1.8s was container start plus torch and R2D2 imports.
@@ -277,7 +279,7 @@ def evaluate(
         "paths": {
             "eval_dir": str(eval_dir),
             "measurement_set": str(ms_path),
-            "simulation_metadata": str(eval_dir / "simulation.json"),
+            "simulation_metadata": str(work_dir / "simulation.json"),
             "mat": str(mat_path),
             "image": str(image_path),
             "dirty": str(dirty_path),
@@ -532,6 +534,7 @@ def main() -> None:
             except WorkerDied as exc:
                 # No honest likelihood exists for an evaluation the host never
                 # ran, and any value invented here would steer the sampler.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(str(exc))
             except (Exception, SystemExit):
                 # Anything else is a bug in this file, and a bug here used to
@@ -540,6 +543,7 @@ def main() -> None:
                 # only and every other rank waits forever in a collective that
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(traceback.format_exc())
             cache[key] = float(record["objective"])
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)

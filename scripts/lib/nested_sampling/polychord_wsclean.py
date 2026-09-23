@@ -41,6 +41,7 @@ from common import (
     params_key,
     prewarm,
     prune_run_artefacts,
+    salvage_evaluation_logs,
     prior_vector,
     resolve_metric,
     self_check_fits_reader,
@@ -114,7 +115,10 @@ def evaluate(
     # R2D2 sizes its pixels from the data; WSClean has to be told. Reading the
     # figure the simulator recorded keeps the two imaging the same sky - see
     # image_pixel_size_arcsec() in common.py.
-    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    # Everything below is written beside the MS: tmpfs scratch when the run
+    # has one, which publish_evaluation_scratch() empties at scoring.
+    work_dir = ms_path.parent
+    simulation = json.loads((work_dir / "simulation.json").read_text())
     if "max_proj_baseline_lambda" not in simulation["observation"]:
         raise SystemExit(
             "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
@@ -122,10 +126,10 @@ def evaluate(
         )
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
-    wsclean_dir = eval_dir / "wsclean"
+    wsclean_dir = work_dir / "wsclean"
     wsclean_dir.mkdir()
-    wsclean_stdout = eval_dir / "wsclean.stdout.log"
-    wsclean_stderr = eval_dir / "wsclean.stderr.log"
+    wsclean_stdout = work_dir / "wsclean.stdout.log"
+    wsclean_stderr = work_dir / "wsclean.stderr.log"
     wsclean_cmd = [
         *sidecar_command(args.wsclean_image),
         "-name",
@@ -159,7 +163,7 @@ def evaluate(
           if os.environ.get("NS_WSCLEAN_LOG_TIME", "1") != "0" else []),
     ]
     # zygote wait4() supplies exact child wall time and peak RSS.
-    run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
+    run_result = zygote_run(args.wsclean_image, args.platform, work_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = run_result.peak_memory_bytes
     image_binary_seconds = run_result.binary_seconds
     if is_infrastructure_failure(run_result.returncode):
@@ -228,7 +232,7 @@ def evaluate(
         "paths": {
             "eval_dir": str(eval_dir),
             "measurement_set": str(ms_path),
-            "simulation_metadata": str(eval_dir / "simulation.json"),
+            "simulation_metadata": str(work_dir / "simulation.json"),
             "image": str(image_path),
             "dirty": str(dirty_path),
             "residual": str(residual_dirty_path),
@@ -412,6 +416,7 @@ def main() -> None:
             except WorkerDied as exc:
                 # No honest likelihood exists for an evaluation the host never
                 # ran, and any value invented here would steer the sampler.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(str(exc))
             except (Exception, SystemExit):
                 # Anything else is a bug in this file, and a bug here used to
@@ -420,6 +425,7 @@ def main() -> None:
                 # only and every other rank waits forever in a collective that
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(traceback.format_exc())
             cache[key] = float(record["objective"])
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)

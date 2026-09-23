@@ -179,3 +179,50 @@ Next: the FITS writes are ~0.23s of the 1.1s. They go to the evaluation
 directory on RDS/Lustre (open, stat and unlink are 5-15ms each there) and are
 then mostly deleted. Writing them to the `/dev/shm` scratch and moving only the
 retained ones should remove most of that.
+
+## Round 5: evaluation files on tmpfs
+
+The run directory is on RDS, which is Lustre. Single-file costs from a compute
+node, 40 repeats each:
+
+| op | RDS | `/dev/shm`, `/local` |
+| --- | ---: | ---: |
+| create + write 8KB | 42ms | 0.04ms |
+| create empty | 25ms | 0.02ms |
+| rename / unlink | 11ms | 0.02ms |
+| mkdir | 4ms | 0.02ms |
+| 4 FITS via astropy + 2 mkdirs (R2D2's output) | 212ms | 7ms |
+
+An evaluation wrote ~14 files to its RDS directory: 6-8 logs,
+`simulation.json`, `r2d2_config.yaml`, 4-5 FITS. Then, beyond its rank's 20
+best and worst so far and 1 in 100, it deleted all but `metrics.json`. So
+nearly every evaluation of a long run paid for ~14 creates and ~13 unlinks and
+kept nothing.
+
+Now everything an evaluation writes goes to the scratch tmpfs
+(`NS_SCRATCH_DIR`) beside its MS. At scoring, `publish_evaluation_scratch()`
+moves it to the evaluation directory only if the retention policy keeps it,
+and rewrites the record's paths. A dead worker's logs are moved before the
+run aborts (`salvage_evaluation_logs()`). `self_check_streaming_retention`
+runs with and without scratch and asserts the same result.
+
+End to end, both arms in one icelake job (baseline `3b778c8`), identical
+log(Z). "Steady state" sets `NS_IMAGE_KEEP_ENDS=0 NS_KEEP_DETAIL_EVERY=1000000`.
+Without that, a 50-eval bench keeps every evaluation, which a long run does not:
+
+| | before | after | change |
+| --- | ---: | ---: | ---: |
+| R2D2 steady state, evals/s (8 ranks x 2 threads) | 2.74 / 2.78 / 2.80 | 3.03 / 3.21 / 2.95 | **+10%** |
+| R2D2 per eval (stage sum) | 1.81s | 1.60s | -0.21s |
+| WSClean steady state, evals/s (16 ranks) | 7.47 / 7.66 / 7.34 | 8.90 / 9.00 / 8.75 | **+19%** |
+| WSClean `image_binary` | 310ms | 158ms | -49% |
+| R2D2 defaults, all kept, evals/s | 2.76 / 2.80 | 2.79 / 2.86 | +1% |
+
+WSClean gains most because its binary wrote five FITS and its reorder files
+to RDS. With every evaluation kept, the moves cost about what the direct
+writes did, so a short run neither gains nor loses.
+
+Next: in these short benches simulate is still ~0.4s/eval, about a quarter of
+R2D2's evaluation and 70% of WSClean's. That is round 2's observation cache
+starting cold in every run. A long run warms it (0.09s), but a cache that
+outlives the run would give short runs the same.
