@@ -745,7 +745,8 @@ def memoize_matplotlib_alias_maps():
             return normalize(kw, alias_mapping)
         to_canonical = cache.get(cls)
         if to_canonical is None:
-            to_canonical = cache[cls] = {
+            # matplotlib >= 3.11 stores the inverted map as _alias_to_prop.
+            to_canonical = cache[cls] = getattr(cls, "_alias_to_prop", None) or {
                 alias: canonical
                 for canonical, aliases in getattr(cls, "_alias_map", {}).items()
                 for alias in aliases
@@ -865,6 +866,24 @@ def share_anesthetic_axes_subclasses():
     return True
 
 
+LIKELIHOOD_INCHES_PER_PARAM = 1.5
+
+
+# anesthetic's MaxNLocator(prune='both') still keeps ticks hugging a panel
+# edge (+-15 on a +-16 range), whose labels then collide with the neighbour's.
+def keep_ticks_off_panel_edges(grid, margin=0.05):
+    from matplotlib.axes import Axes
+    from matplotlib.ticker import FixedLocator, MaxNLocator
+
+    for ax in grid.to_numpy().ravel():
+        if not isinstance(ax, Axes):
+            continue
+        for axis, (lo, hi) in ((ax.xaxis, ax.get_xlim()), (ax.yaxis, ax.get_ylim())):
+            pad = margin * (hi - lo)
+            inner = MaxNLocator(3).tick_values(lo + pad, hi - pad)
+            axis.set_major_locator(FixedLocator([t for t in inner if lo + pad <= t <= hi - pad]))
+
+
 def _render_likelihood_png(run_dir, param_names):
     load_plot_libs()
     try:
@@ -897,6 +916,10 @@ def _render_likelihood_png(run_dir, param_names):
         try:
             grid = samples.plot_2d(plot_params, kind=kind, **extra)
             fig = grid.iloc[0, 0].figure
+            # Default figsize crams many params until axis labels overlap.
+            side = max(6.4, LIKELIHOOD_INCHES_PER_PARAM * len(plot_params))
+            fig.set_size_inches(side, side)
+            keep_ticks_off_panel_edges(grid)
             fig.tight_layout()
             return figure_to_png_bytes(fig, bbox_inches=tight_bbox(fig))
         except Exception:
@@ -3232,6 +3255,20 @@ def _self_check_index_toolbar():
         shutil.rmtree(tmp_dir)
 
 
+def _self_check_ticks_off_panel_edges():
+    load_plot_libs()
+    from anesthetic.plot import make_2d_axes
+
+    fig, grid = make_2d_axes(["l", "m"])
+    for ax in grid.to_numpy().ravel():
+        ax.set_xlim(-16, 16)
+        ax.set_ylim(-16, 16)
+    keep_ticks_off_panel_edges(grid)
+    ticks = list(grid.iloc[1, 0].get_xticks())
+    assert ticks == [-10, 0, 10], ticks
+    plt.close(fig)
+
+
 def _self_check_index_likelihood_plot():
     """The compare panel's corner plots: looked up on disk, never drawn here."""
     import shutil
@@ -3976,6 +4013,7 @@ if __name__ == "__main__":
         _self_check_page_status()
         _self_check_index_toolbar()
         _self_check_index_likelihood_plot()
+        _self_check_ticks_off_panel_edges()
         _self_check_likelihood_comparisons()
         _self_check_index_facts_cache()
         _self_check_torn_summary()
