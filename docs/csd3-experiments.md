@@ -45,7 +45,7 @@ Jobs of increasing size on CSD3, to catch bugs before a long run and to set
 | bug | runs die of worker startup contention at 112 ranks | E8 FAILED at 18.5 min, retries used up | Each worker death came right after a start or restart (evaluation 80, then 10632 and 13032 right after restarts at 10631 and 13031). A worker opens its FIFO only after warming up, and on a restart all 112 warm up at once: the rank's 60s connect wait (E5's `no simulate worker for rank 78`) and 30s-plus reply bound ran out, and killing a slow worker only restarts a cold one. Fixed: connect wait 300s (`NS_POOL_CONNECT_SECONDS`) and 120s extra on a newly connected worker's first reply (`NS_WORKER_FIRST_REPLY_SLACK`). A dead worker is still caught, only later |
 | E9 | R2D2 GPU medium, all fixes | ampere 1 A100 + 32 cores, 16 ranks (new default), nlive 150, repeats 15, ndead -1, intr, 40 min | Clean so far: 1715 evaluations, 0 failed, ~4.5 evals/s once live points were generated. Files ~2.07 per evaluation after each rank's first 40 |
 | BIG (gpu) | cancelled before it ran | as below but `--device cuda`, 16 ranks | Slurm estimated its start five days out: a 10.5h GPU job on SL3 waits for a whole A100 |
-| BIG | the ~10-hour run | worktree `bigrun` pinned at `cb59233` (so later edits cannot reach it mid-run) plus the 9-param config; R2D2 on CPU, sapphire, `--mpi-procs 24`, nlive 150, repeats 15, ndead -1, 10:30:00; job 36031480, run `r2d2-vlaa-20260922T174616Z`, started at once on cpu-r-5 | running |
+| BIG | the ~10-hour run | worktree `bigrun` pinned at `cb59233` (so later edits cannot reach it mid-run) plus the 9-param config; R2D2 on CPU, sapphire, `--mpi-procs 24`, nlive 150, repeats 15, ndead -1, 10:30:00; job 36031480, run `r2d2-vlaa-20260922T174616Z`, started at once on cpu-r-5 | **converged in 6h20m**: 71,395 evaluations, 2 failed (0.003%), no crashes and no retries, 1373 dead points, log(Z) 0.0172 +/- 0.0004, 4.1 evaluations/s, ~225k files. `summary.json` written normally |
 
 24 ranks rather than the 56 cap is the file quota, not throughput: ~7
 evaluations/s for 10.5 hours is ~265k evaluations and ~560k files, against
@@ -74,3 +74,17 @@ plateau; the GPU one is bounded by 3.56GiB of checkpoints per worker.
   contention bites; R2D2's 56-rank cap leaves headroom on the same node.
 - A 10-hour WSClean run does not fit the file quota even with the new bounds
   (~60k evaluations an hour); R2D2 does.
+
+## What the big run showed
+
+- The fixes hold at length: 71,395 evaluations over 6h20m with 2 failures and
+  no worker deaths, against E5's 4189 failures in 25 minutes.
+- Both remaining failures are `node 'VisDataMux' not found` that failed its
+  retry too - 0.003%, from 2.2% before the retry fix. A third attempt, or
+  compiling into a server proved ready, would likely remove them.
+- They are still the run's top-ranked evaluations: `FAILURE_OBJECTIVE` (100)
+  outranks every real score, so any infrastructure failure that survives the
+  retries lands at the top of the failure map. Worth separating from a genuine
+  imager failure before the results are read.
+- It converged well inside its 10.5-hour limit, so the resume path (E10) was
+  not needed here - but a longer or larger search will need it.
