@@ -363,4 +363,65 @@ the end of run falls from ~88 minutes to ~7, and a resume starts evaluating
 Still open from the same run: PolyChord's own tail. From 22:50 to 23:37,
 concurrency fell from ~23 workers to ~1, and each evaluation took 18-28s instead of
 4-6s (sampled from every 20th evaluation id). That is the last ~15% of wall
-time, spent almost idle.
+time, spent almost idle. Round 9 takes it on.
+
+## Round 9: idle cores in the final chains
+
+All 71,395 records of the same run, binned by end time (10 min bins):
+
+| minutes | evals | concurrency | s/eval | simulate | R2D2 | kilo-timesteps x channels |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0-250 (typical bin) | ~2,500-3,500 | 22.7 | 4-6 | 1.5-2.3s | 2.2-3.5s | 0.5-0.9 |
+| 250-260 | 1,810 | 16.7 | 5.6 | 2.2s | 3.2s | 0.7 |
+| 260-270 | 165 | 3.0 | 11.0 | 4.3s | 6.5s | 2.2 |
+| 270-289 | 44 | 1.0 | 26 | 7.8s | 18s | 7.0 |
+
+The last ~30 minutes were one rank finishing one chain. PolyChord waits for every
+worker's chain once it stops handing out seeds. Eval ids 3248-3304 of one rank
+ran back to back, ~75 evaluations (`<nlike>` 62-75 per dead point). That chain sat
+in the expensive corner the posterior had converged on (1s integration,
+7 channels, ~380k rows) and imaged on the 1 thread a 24-rank run gives each
+rank, while 23 cores idled.
+
+The same six parameter sets on an icelake node with the current code:
+simulate is 0.60s (rounds 1-6), and the R2D2 request scales with threads:
+
+| `ncpus` | 1 | 2 | 4 | 12 | 24 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| heavy request | 10.4-11.0s | 5.5s | 3.4s | 2.1s | 1.28-1.36s |
+
+Change: each rank touches `$NS_SCRATCH_DIR/.busy/<pid>` for the duration of
+an evaluation (`mark_evaluation_start` to `write_evaluation_record`).
+`r2d2_thread_count()` writes `ncpus = max(R2D2_OMP_THREADS,
+R2D2_MAX_THREADS // evaluations in flight)` into the request's config.
+`R2D2_MAX_THREADS` defaults to the host CPUs in async runs. In synchronous
+runs it defaults to `R2D2_OMP_THREADS` (off), because of the next paragraph.
+R2D2 hands `ncpus` to torch. The sidecar's FINUFFT plans now take
+`nthreads` from torch and are cached per count, because FINUFFT's own
+OpenMP runtime stays at the sidecar's `OMP_NUM_THREADS`. Each record carries
+`r2d2_threads`.
+
+Not bit-identical: 1 thread is reproducible run to run, but 2 or 24 threads
+move the model and residual images by up to 4e-7 relative, and the RMS
+objective by <1e-7 relative. Dirty images and PSFs are unchanged. A
+synchronous run keeps its fixed-seed repeatability. An async run already
+depends on scheduling for its evaluation order.
+
+End to end, production shape: 24 ranks x 1 thread on 24 icelake CPUs, async,
+nlive 25, 15 repeats, 40 dead points, seed 4242, run in the order
+base/new/new/base in one job against 8d03534:
+
+| | base | new |
+| --- | ---: | ---: |
+| PolyChord wall | 144s (cold first run), 111s | 93s, 91s |
+| tail (concurrency < 11 until the end) | 52s, 37s | 21s, 14s |
+| R2D2 per eval in the tail | 1.81s, 1.83s | 1.00s, 0.86s |
+| evals/s | 5.1, 6.7 | 7.9, 8.4 |
+| log(Z) | -0.00195 | -0.00195 |
+
+In those runs, 85% of evaluations got 1 thread and the rest 2-24, in dips as
+well as at the end. The run is -17% wall against the warm baseline, but the
+saving is a fixed tail, so its share falls as runs grow. For the 71k run's
+final chain of ~75 heavy evaluations: ~26s each as run, ~12s with rounds 1-8
+(0.6s simulate + ~11s R2D2 at 1 thread), ~2.5s with this round. That is a
+projected ~15 minutes down to ~3. This projection is not measured end to end.

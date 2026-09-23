@@ -499,9 +499,19 @@ class DockerRunResult:
 
 def r2d2_thread_count() -> int:
     override = os.environ.get("R2D2_OMP_THREADS")
-    if override:
-        return max(1, int(override))
-    return os.cpu_count() or 1
+    base = max(1, int(override)) if override else os.cpu_count() or 1
+    # Spread the job's CPUs over the evaluations in flight. A run's final
+    # chain otherwise images alone on one thread while every other core idles:
+    # the last ~30 of the 71k-evaluation run's 289 minutes (docs/csd3-speed.md, round 9).
+    ceiling = int(os.environ.get("R2D2_MAX_THREADS") or 0)
+    busy_dir = _busy_dir()
+    if ceiling <= base or busy_dir is None:
+        return base
+    try:
+        busy = len(os.listdir(busy_dir))
+    except FileNotFoundError:
+        busy = 0
+    return max(base, ceiling // max(1, busy))
 
 
 def fill_disabled_parameters(raw: dict[str, Any]) -> None:
@@ -1841,9 +1851,23 @@ def self_check_clean_convergence() -> None:
     print("clean convergence self-check passed")
 
 
+def _busy_dir() -> Path | None:
+    root = os.environ.get("NS_SCRATCH_DIR", "")
+    return Path(root) / ".busy" if root else None
+
+
+def _busy_marker() -> Path | None:
+    busy_dir = _busy_dir()
+    return busy_dir / str(os.getpid()) if busy_dir else None
+
+
 def mark_evaluation_start() -> None:
     global _EVALUATION_STARTED_EPOCH
     _EVALUATION_STARTED_EPOCH = time.time()
+    marker = _busy_marker()
+    if marker is not None:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
 
 
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
@@ -1853,6 +1877,9 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         timing["started_epoch"] = _EVALUATION_STARTED_EPOCH
         timing["ended_epoch"] = time.time()
         _EVALUATION_STARTED_EPOCH = None
+        marker = _busy_marker()
+        if marker is not None:
+            marker.unlink(missing_ok=True)
     keeping = prune_evaluation_artefacts(eval_dir, record)
     kept = retain_evaluation_detail(eval_dir, record) or keeping
     publish_evaluation_scratch(eval_dir, record, kept)

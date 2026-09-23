@@ -6,6 +6,7 @@ the checkpoints at /checkpoints:
 MATS_DIR holds one subdirectory per evaluation with its r2d2_data.mat. EXTRA
 appends lines to the config (e.g. `target_dynamic_range: 0.0`). OUT_ROOT puts
 the outputs elsewhere (e.g. tmpfs, as a run's scratch does since round 5).
+NCPUS sets the config's ncpus (default OMP_NUM_THREADS), as a rank does since round 9.
 """
 import cProfile, io, os, pstats, runpy, sys, time
 from pathlib import Path
@@ -40,7 +41,7 @@ sigma_res_tol: 1e-4
 {os.environ.get("EXTRA","")}
 ckpt_path: /checkpoints/R2D2_A1
 ckpt_realisations: 1
-ncpus: {os.environ.get('OMP_NUM_THREADS','1')}
+ncpus: {os.environ.get('NCPUS', os.environ.get('OMP_NUM_THREADS','1'))}
 """)
     sys.argv = [str(r.IMAGER), "--config", str(cfg), "--ckpt_path", "/checkpoints/R2D2_A1"]
     t = time.perf_counter()

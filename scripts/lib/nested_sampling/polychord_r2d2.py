@@ -90,7 +90,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> None:
+def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> int:
+    threads = r2d2_thread_count()
     lines = [
         f"data_file: {data_file}",
         f"output_path: {output_path}",
@@ -122,10 +123,11 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         # worker pool's `apptainer exec --env` sets. Without this every rank
         # asked torch for all 20 host CPUs, so the 8 default ranks ran 160
         # threads on 20 cores.
-        f"ncpus: {r2d2_thread_count()}",
+        f"ncpus: {threads}",
         "",
     ]
     config_path.write_text("\n".join(lines))
+    return threads
 
 
 def evaluate(
@@ -196,7 +198,7 @@ def evaluate(
     r2d2_dir = work_dir / "r2d2"
     r2d2_dir.mkdir()
     config_path = work_dir / "r2d2_config.yaml"
-    write_r2d2_config(config_path, str(mat_path), str(r2d2_dir))
+    r2d2_threads = write_r2d2_config(config_path, str(mat_path), str(r2d2_dir))
 
     r2d2_stdout = work_dir / "r2d2.stdout.log"
     r2d2_stderr = work_dir / "r2d2.stderr.log"
@@ -276,6 +278,7 @@ def evaluate(
         "eval_id": eval_id,
         "params": params,
         "image_pixel_size_arcsec": scale_arcsec,
+        "r2d2_threads": r2d2_threads,
         "metrics": metrics,
         "objective": objective,
         "paths": {
@@ -303,21 +306,46 @@ def evaluate(
 
 
 def self_check_r2d2_config_thread_cap() -> None:
-    """`ncpus` must reach the config, or torch takes every host CPU per rank."""
+    """`ncpus` must reach the config, or torch takes every host CPU per rank.
+    Under R2D2_MAX_THREADS it grows as the evaluations in flight fall."""
     import tempfile
 
-    saved = os.environ.get("R2D2_OMP_THREADS")
+    names = ("R2D2_OMP_THREADS", "R2D2_MAX_THREADS", "NS_SCRATCH_DIR")
+    saved = {name: os.environ.pop(name, None) for name in names}
     os.environ["R2D2_OMP_THREADS"] = "3"
     try:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "r2d2_config.yaml"
-            write_r2d2_config(config, "/data.mat", tmp)
-            assert "ncpus: 3" in config.read_text().splitlines()
+
+            def ncpus() -> int:
+                write_r2d2_config(config, "/data.mat", tmp)
+                return int(next(line for line in config.read_text().splitlines()
+                                if line.startswith("ncpus: "))[len("ncpus: "):])
+
+            assert ncpus() == 3
+            os.environ["R2D2_MAX_THREADS"] = "24"
+            assert ncpus() == 3, "adaptive threads without a scratch dir"
+            os.environ["NS_SCRATCH_DIR"] = str(Path(tmp) / "scratch")
+            mark_evaluation_start()
+            assert ncpus() == 24, "one evaluation in flight should get every CPU"
+            busy = Path(tmp) / "scratch" / ".busy"
+            for pid in range(1, 5):
+                (busy / f"other-{pid}").touch()
+            assert ncpus() == 4, "five in flight share 24 CPUs"
+            for pid in range(5, 12):
+                (busy / f"other-{pid}").touch()
+            assert ncpus() == 3, "never below R2D2_OMP_THREADS"
+            eval_dir = Path(tmp) / "eval-1"
+            eval_dir.mkdir()
+            write_evaluation_record(eval_dir, {"eval_id": 1, "objective": 0.0})
+            drain_record_writes()
+            assert not (busy / str(os.getpid())).exists(), "scoring must clear the busy marker"
     finally:
-        if saved is None:
-            del os.environ["R2D2_OMP_THREADS"]
-        else:
-            os.environ["R2D2_OMP_THREADS"] = saved
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def self_check_worker_death_is_not_scored() -> None:

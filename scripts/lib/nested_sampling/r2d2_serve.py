@@ -252,7 +252,10 @@ def patch_nufft_plans() -> None:
             points = np.ascontiguousarray(self._traj.detach().numpy())
             shape = tuple(int(size) for size in self._img_size)
             dtype = torch.empty(0, dtype=self._dtype_meas).numpy().dtype
-            cache_key = (nufft_type, shape, dtype.str)
+            # The request's `ncpus`, which R2D2 hands torch.set_num_threads().
+            # FINUFFT's own OpenMP runtime would stay at OMP_NUM_THREADS.
+            nthreads = torch.get_num_threads()
+            cache_key = (nufft_type, shape, dtype.str, nthreads)
             made = _NUFFT_PLAN_CACHE.get(cache_key)
             if made is None:
                 made = finufft.Plan(
@@ -267,6 +270,7 @@ def patch_nufft_plans() -> None:
                     dtype=dtype,
                     upsampfac=2.0,
                     modeord=0,
+                    nthreads=nthreads,
                 )
                 _NUFFT_PLAN_CACHE[cache_key] = made
             # Workers process one request at a time, so one shared plan can be

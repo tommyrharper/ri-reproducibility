@@ -115,6 +115,14 @@ if [ -z "${R2D2_OMP_THREADS:-}" ]; then
   fi
 fi
 R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}"
+# Ceiling for r2d2_thread_count() in common.py, which splits it over the
+# evaluations in flight. Async only: any count but 1 moves R2D2's output by
+# ~1e-7, so a synchronous run would stop repeating itself from its seed.
+if [ "${NS_SYNCHRONOUS}" = 0 ]; then
+  R2D2_MAX_THREADS="${R2D2_MAX_THREADS:-${HOST_CPUS}}"
+else
+  R2D2_MAX_THREADS="${R2D2_OMP_THREADS}"
+fi
 
 # Written before anything can go wrong, so that a run which stops - out of
 # memory, Ctrl-C, reboot - still says how to start it again exactly.
@@ -225,6 +233,7 @@ RUN_COMMAND=(
   OMPI_MCA_ras=^slurm
   OMPI_MCA_plm=^slurm
   R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
+  R2D2_MAX_THREADS="${R2D2_MAX_THREADS}"
   R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-1}"
   "${APPTAINER}" exec --pwd "${REPO_ROOT}"
   "${SIDECAR_BINDS[@]}"
