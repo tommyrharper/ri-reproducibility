@@ -73,6 +73,20 @@ if [ "${R2D2_DEVICE}" = cuda ]; then
     exit 1
   fi
   NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
+  # Each worker holds all 25 checkpoints on the GPU. Past what the card holds,
+  # workers die with CUDA OOM and their evaluations score as failures - a
+  # silent fake worst case - so an explicit rank count over it is refused.
+  gpu_mb="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+  if [ -n "${gpu_mb}" ]; then
+    gpu_ranks="$((gpu_mb * 95 / 100 / NS_R2D2_CUDA_MB_PER_RANK))"
+    if [ -n "${NS_MPI_PROCS:-}" ] && [ "${NS_MPI_PROCS}" -gt "${gpu_ranks}" ]; then
+      echo "FATAL: ${NS_MPI_PROCS} R2D2 workers need ~$((NS_MPI_PROCS * NS_R2D2_CUDA_MB_PER_RANK))MB of GPU memory; this GPU has ${gpu_mb}MB, enough for ${gpu_ranks} (NS_R2D2_CUDA_MB_PER_RANK)" >&2
+      exit 1
+    fi
+    if [ "${NS_R2D2_MAX_RANKS}" -gt "${gpu_ranks}" ]; then
+      NS_R2D2_MAX_RANKS="${gpu_ranks}"
+    fi
+  fi
 fi
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then

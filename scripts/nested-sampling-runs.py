@@ -125,12 +125,48 @@ def default_parameter_space() -> list[dict[str, object]]:
         return []
 
 
+def summary_evaluation_count(run_dir: Path) -> int | None:
+    """The run's own count, out of summary.json's head, or None if absent.
+
+    A converged run holds one directory per evaluation - 71k of them after six
+    hours - and stat-ing them all took `./ri runs` past ten minutes on Lustre.
+    Summaries written before this field fall back to the scan below."""
+    try:
+        with open(run_dir / "summary.json", encoding="utf-8", errors="replace") as f:
+            head = f.read(SUMMARY_HEAD)
+    except OSError:
+        return None
+    if (bulk := head.find('"evaluations"')) > 0:
+        head = head[:bulk]
+    match = re.search(r'"evaluation_count"\s*:\s*(\d+)', head)
+    return int(match.group(1)) if match else None
+
+
+def logged_evaluation_count(run_dir: Path) -> int | None:
+    """Scored evaluations from the run's own log, or None if it has none yet.
+
+    One line per scored evaluation, so one sequential read against a stat per
+    evaluation directory: 214s of stats over 13k evaluations on Lustre, where
+    the log is milliseconds. Matched the directory scan exactly on the 13k and
+    71k runs it was measured against."""
+    try:
+        with open(run_dir / "run.log", "rb") as log:
+            return sum(1 for line in log if b'"eval_id"' in line)
+    except OSError:
+        return None
+
+
 def count_evaluations(run_dir: Path) -> int:
     """How many evaluations this run has actually scored.
 
     os.scandir rather than Path.glob: this is the busiest loop in a listing -
     one stat per evaluation directory, thousands of them on a long run - and
     glob spends as much again building a Path for every entry it walks."""
+    counted = summary_evaluation_count(run_dir)
+    if counted is None:
+        counted = logged_evaluation_count(run_dir)
+    if counted is not None:
+        return counted
     try:
         with os.scandir(run_dir / "evaluations") as entries:
             return sum(1 for e in entries if e.name.startswith("eval-")

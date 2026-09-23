@@ -132,8 +132,8 @@ bash scripts/lib/job-env.sh --check                       # the job's environmen
 would hand it, and says `nothing resolves into /home or a Nix store` or what
 does. `bash scripts/lib/job-env.sh --self-check` tests the check itself.
 
-Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive
---mem 0`) and the run script sizes the ranks from the allocation; with it the
+Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive`;
+CSD3 refuses `--mem 0`) and the run script sizes the ranks from the allocation; with it the
 job asks for that many cores and the matching memory. `--partition` defaults
 to `icelake` and `--time` to `12:00:00`, the SL3 cap, which every service
 level accepts; SL1/SL2 accounts can pass `--time 36:00:00`, their own cap,
@@ -195,8 +195,8 @@ the containers replaced by processes:
   and carried over again.
 - **Memory sets the rank count**, as on `main`; `rank-budget.sh` reads the
   job's limit inside one (`SLURM_MEM_PER_NODE`, or `SLURM_MEM_PER_CPU` times
-  the cores, which is how a partition default is spelled; `--mem 0` means the
-  node, so `MemAvailable`) and `MemAvailable` outside one. A pool a
+  the cores, which is how a partition default and a whole-node `--exclusive` job are
+  spelled) and `MemAvailable` outside one. A pool a
   SIGKILLed run left behind is reaped by the next run's budget (the pool's
   shell names its FIFO directory, whose run has no ranks and whose launcher
   pid in `.launcher.pid` is gone).
@@ -233,6 +233,29 @@ two minutes. What here would otherwise break that:
 hand-written batch script still see it. GNU `nproc` honours it, so the run scripts count
 CPUs with it unset (`env -u OMP_NUM_THREADS nproc`); a bare `nproc` there reads
 1 on a 76-core node, which sized a whole-node job to a single rank.
+
+### What a long run needs here
+
+`hpc-work` allows a million files, and an evaluation used to keep 10-15 until
+the run ended, so a run at CSD3 rates reached the quota within hours and every
+rank then died on `mkdir`. Four bounds keep a long run inside it, all in
+`defaults.toml` (`docs/csd3-experiments.md` has the measurements):
+
+- `NS_KEEP_DETAIL_EVERY` (100): a successful evaluation is stripped to its
+  `metrics.json` as the run goes, unless it is among its rank's 20 lowest or
+  highest objectives - which is what the end-of-run image policy needs - or one
+  of the 1 in 100 kept whole, which `./ri profile` reads.
+- `NS_KEEP_FAILED_ARTEFACTS` (20): failures per run that keep their Measurement
+  Set and images; the rest keep logs and metrics.
+- `NS_MS_SKELETON_CACHE_MAX` (512): MS skeletons cached in `/dev/shm`. A
+  parameter space that varies `integration_seconds` or `declination_deg` makes
+  nearly every evaluation a new shape, and the cache had no bound.
+- `NS_MEQSERVER_RECYCLE` (20): predicts before a simulate worker replaces its
+  meqserver, which holds every MS it has written open and so pins it in tmpfs.
+
+A failure storm is worse here than slow: `FAILURE_OBJECTIVE` is the likelihood
+PolyChord maximises, so thousands of infrastructure failures took over the live
+points and the run "converged" on them.
 
 ### Reading a run from the login node
 

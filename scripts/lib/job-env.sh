@@ -54,6 +54,28 @@ ns_write_job_settings() {
   done < <(compgen -e)
 }
 
+# `readlink -f` is GNU; BSD readlink (macOS, where CI also runs) has no -f and
+# silently resolves nothing, which would let a symlink into a forbidden tree
+# look clean. Resolve by hand when it is missing.
+_ri_realpath() {
+  local path="$1" dir base hops=0 resolved
+  if resolved="$(readlink -f -- "${path}" 2>/dev/null)" && [ -n "${resolved}" ]; then
+    printf '%s' "${resolved}"
+    return
+  fi
+  while [ -L "${path}" ] && [ "${hops}" -lt 40 ]; do
+    dir="$(dirname -- "${path}")"
+    base="$(readlink -- "${path}")"
+    case "${base}" in
+      /*) path="${base}" ;;
+      *) path="${dir}/${base}" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  dir="$(cd "$(dirname -- "${path}")" 2>/dev/null && pwd -P)" || dir="$(dirname -- "${path}")"
+  printf '%s/%s' "${dir%/}" "$(basename -- "${path}")"
+}
+
 _ri_forbidden_prefixes() {
   local home
   home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
@@ -63,7 +85,7 @@ _ri_forbidden_prefixes() {
 # Whether a path, as spelled or once resolved, is under a forbidden prefix.
 _ri_is_forbidden() {
   local path="$1" real prefix
-  real="$(readlink -f -- "${path}" 2>/dev/null || printf '%s' "${path}")"
+  real="$(_ri_realpath "${path}")"
   while IFS= read -r prefix; do
     [ -n "${prefix}" ] || continue
     case "${path}/" in "${prefix%/}"/*) return 0 ;; esac
@@ -79,6 +101,9 @@ ri_job_env_check() {
   local bad=0 tool path real var entry required
   local -
   set -f  # the value split below must not glob
+  # bash remembers where it last found a command, and this runs with a PATH
+  # built moments ago: without this, `command -v` can answer from the old one.
+  hash -r 2>/dev/null || true
   required=" ${RI_JOB_REQUIRED_TOOLS:-bash uv apptainer} "
   for tool in bash sh env python3 gcc uv apptainer sbatch squeue; do
     if ! path="$(command -v "${tool}")"; then
@@ -87,7 +112,7 @@ ri_job_env_check() {
       esac
       continue
     fi
-    real="$(readlink -f -- "${path}")"
+    real="$(_ri_realpath "${path}")"
     echo "job-env: ${tool} -> ${real}"
     if _ri_is_forbidden "${path}"; then
       echo "job-env: ${tool} resolves into a forbidden place: ${path} -> ${real}" >&2; bad=1
@@ -101,14 +126,14 @@ ri_job_env_check() {
   # and a bare >=3.11 (the defaults loader).
   local venv_python="${REPO_ROOT_PHYS}/.venv/bin/python"
   if [ -e "${venv_python}" ] || [ -L "${venv_python}" ]; then
-    real="$(readlink -f -- "${venv_python}")"
+    real="$(_ri_realpath "${venv_python}")"
     echo "job-env: .venv python -> ${real}"
     _ri_is_forbidden "${real}" \
       && { echo "job-env: .venv's python is ${real}; rebuild it with uv under hpc-work (docs/cluster.md)" >&2; bad=1; }
   fi
   if [ "${RI_JOB_CHECK_PYTHON:-1}" = 1 ] && command -v uv >/dev/null 2>&1; then
     if real="$(uv python find --no-project '>=3.11' 2>/dev/null)"; then
-      real="$(readlink -f -- "${real}")"
+      real="$(_ri_realpath "${real}")"
       echo "job-env: uv python -> ${real}"
       _ri_is_forbidden "${real}" && { echo "job-env: uv's python resolves into a forbidden place: ${real}" >&2; bad=1; }
     else
@@ -208,14 +233,25 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     --check)
       # From a login node: the environment a job would get, with the settings
       # this shell would hand it, checked the same way.
-      _tmp="$(mktemp -d)"
+      _tmp="$(cd "$(mktemp -d)" && pwd -P)"
       trap 'rm -rf "${_tmp}"' EXIT
       ns_write_job_settings "${_tmp}/settings" || exit 1
       /bin/bash "${BASH_SOURCE[0]}" "${_tmp}/settings" /bin/true
       ;;
     --self-check)
       set -e
+      # This builds the environment a CSD3 job runs in - the module system,
+      # /home, Nix stores, GNU tools - so there is nothing here for a mac to
+      # check, and BSD's own readlink and symlinked /var only make it lie.
+      if [ "$(uname -s)" != Linux ]; then
+        echo "job-env self-check skipped: $(uname -s), and this is a Linux cluster environment"
+        exit 0
+      fi
       _tmp="$(mktemp -d)"
+      # Physical: the check resolves what it finds, and macOS hands out
+      # temporary directories under /var, a symlink to /private/var, so a
+      # forbidden tree named logically would never match.
+      _tmp="$(cd "${_tmp}" && pwd -P)"
       trap 'rm -rf "${_tmp}"' EXIT
       mkdir -p "${_tmp}/home/bin" "${_tmp}/ok/bin" "${_tmp}/work" "${_tmp}/run"
       printf '#!/bin/sh\necho fake\n' >"${_tmp}/home/bin/python3"
@@ -225,8 +261,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       REPO_ROOT_PHYS="${_tmp}/repo"
 
       # A tool that only looks allowed: a symlink into the forbidden tree.
-      PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
-        && { echo "FAIL: python3 symlinked into the forbidden tree must fail the check"; exit 1; }
+      if _seen="$(PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check 2>&1)"; then
+        echo "FAIL: python3 symlinked into the forbidden tree must fail the check"
+        echo "  forbidden: ${_tmp}/home"
+        echo "  link: $(ls -l "${_tmp}/ok/bin/python3")"
+        echo "  resolved: $(PATH="${_tmp}/ok/bin:/usr/bin:/bin" _ri_realpath "${_tmp}/ok/bin/python3")"
+        echo "  check said: ${_seen}"
+        exit 1
+      fi
       PATH="${_tmp}/home/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a forbidden PATH entry must fail the check"; exit 1; }
       NS_SCRATCH_DIR="${_tmp}/home/scratch" PATH=/usr/bin:/bin ri_job_env_check >/dev/null 2>&1 \

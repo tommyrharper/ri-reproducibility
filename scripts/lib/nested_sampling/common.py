@@ -1346,14 +1346,34 @@ def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
     return Path(root) / eval_dir.name if root else None
 
 
+def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
+    """One of the run's NS_KEEP_FAILED_ARTEFACTS slots for a failure's MS and
+    images. A failure storm otherwise keeps hundreds of files per failure: one
+    in docs/csd3-experiments.md (E5, E6) filled the one-million-file quota."""
+    slots = eval_dir.parent / ".failed-artefacts-kept"
+    slots.mkdir(exist_ok=True)
+    for index in range(int(os.environ.get("NS_KEEP_FAILED_ARTEFACTS", "20"))):
+        try:
+            (slots / str(index)).mkdir()
+            return True
+        except FileExistsError:
+            continue
+    return False
+
+
 def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
     import shutil
 
-    keeping = "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+    failed = "error" in record
+    keeping = os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0" or (
+        failed and claim_failed_artefacts_slot(eval_dir))
     scratch = evaluation_scratch_dir(eval_dir)
     if scratch is not None and scratch.is_dir():
-        if keeping:
+        if keeping or failed:
             for produced in scratch.iterdir():
+                # Past its slots a failure still keeps its logs, not its MS.
+                if not keeping and produced.is_dir():
+                    continue
                 destination = eval_dir / produced.name
                 if destination.is_dir():
                     shutil.rmtree(destination)
@@ -1779,8 +1799,108 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         timing["ended_epoch"] = time.time()
         _EVALUATION_STARTED_EPOCH = None
     prune_evaluation_artefacts(eval_dir, record)
+    retain_evaluation_detail(eval_dir, record)
     write_json_atomic(eval_dir / "metrics.json", record)
     return record
+
+
+# Keeping every evaluation's logs and images until a run ends costs 10-15 files
+# an evaluation, and CSD3's hpc-work allows a million: a 112-rank run reaches it
+# within hours (docs/csd3-experiments.md). So as it goes, each rank strips a
+# successful evaluation to its metrics.json unless it is one of that rank's
+# IMAGE_KEEP_ENDS lowest or highest objectives so far - the run's own are always
+# among those, so prune_run_artefacts() still finds them - or one of the 1 in
+# NS_KEEP_DETAIL_EVERY kept whole, which `./ri profile` reads its logs from.
+_LOWEST: list[tuple[float, str]] = []
+_HIGHEST: list[tuple[float, str]] = []
+
+
+def _keeps_detail(key: str) -> bool:
+    import hashlib
+
+    every = int(os.environ.get("NS_KEEP_DETAIL_EVERY", "100"))
+    return every <= 1 or int(hashlib.sha256(key.encode()).hexdigest(), 16) % every == 0
+
+
+def _strip_to_record(eval_dir: Path) -> None:
+    import shutil
+
+    for entry in eval_dir.iterdir():
+        if entry.name == "metrics.json":
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
+def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> None:
+    import heapq
+
+    if (os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
+            or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+            or "error" in record or record.get("objective") is None
+            or _keeps_detail(eval_dir.name)):
+        return
+    key, objective = eval_dir.name, float(record["objective"])
+    evicted = set()
+    heapq.heappush(_LOWEST, (-objective, key))
+    heapq.heappush(_HIGHEST, (objective, key))
+    if len(_LOWEST) > IMAGE_KEEP_ENDS:
+        evicted.add(heapq.heappop(_LOWEST)[1])
+    if len(_HIGHEST) > IMAGE_KEEP_ENDS:
+        evicted.add(heapq.heappop(_HIGHEST)[1])
+    evicted -= {k for _, k in _LOWEST} | {k for _, k in _HIGHEST}
+    for name in evicted:
+        _strip_to_record(eval_dir.parent / name)
+    if key in evicted:
+        for image_key in RETAINED_IMAGE_KEYS:
+            (record.get("paths") or {}).pop(image_key, None)
+
+
+
+def self_check_streaming_retention() -> None:
+    import tempfile
+
+    global IMAGE_KEEP_ENDS
+    saved = IMAGE_KEEP_ENDS, os.environ.get("NS_KEEP_DETAIL_EVERY")
+    IMAGE_KEEP_ENDS = 3
+    os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
+    _LOWEST.clear()
+    _HIGHEST.clear()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            evaluations = Path(tmp)
+            objectives = {}
+            for index in range(300):
+                eval_dir = evaluations / f"eval-{index:04d}"
+                (eval_dir / "wsclean").mkdir(parents=True)
+                (eval_dir / "wsclean" / "recon-image.fits").write_text("x")
+                (eval_dir / "wsclean.stdout.log").write_text("x")
+                objective = ((index * 7919) % 300) / 10
+                objectives[eval_dir.name] = objective
+                record = {"objective": objective,
+                          "paths": {"image": str(eval_dir / "wsclean" / "recon-image.fits")}}
+                write_evaluation_record(eval_dir, record)
+                if not (eval_dir / "wsclean").exists():
+                    assert "image" not in record["paths"], "a stripped record still names its image"
+            ordered = sorted(objectives, key=objectives.get)
+            must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
+            for key in objectives:
+                kept = sorted(p.name for p in (evaluations / key).iterdir())
+                if key in must:
+                    assert kept == ["metrics.json", "wsclean", "wsclean.stdout.log"], (key, kept)
+                else:
+                    assert kept == ["metrics.json"], (key, kept)
+    finally:
+        IMAGE_KEEP_ENDS = saved[0]
+        if saved[1] is None:
+            os.environ.pop("NS_KEEP_DETAIL_EVERY", None)
+        else:
+            os.environ["NS_KEEP_DETAIL_EVERY"] = saved[1]
+        _LOWEST.clear()
+        _HIGHEST.clear()
+    print("streaming retention self-check passed")
 
 
 _SIMULATE_WORKERS: dict[str, "FifoWorker"] = {}
@@ -1824,6 +1944,7 @@ class FifoWorker:
         # same order serve() uses - request pipe first, reply pipe second.
         self.stdout = reply_path.open("r")
         self.base = base
+        self.fresh = True
 
     def terminate(self) -> None:
         """Let go of both ends.
@@ -1860,8 +1981,14 @@ def _forget(workers: dict[str, "FifoWorker"], key: str) -> None:
 
 # The pools come up alongside the ranks: a SIF to start, torch or Timba to
 # import, and on a cluster node every rank's worker doing it off the same
-# filesystem at once. A missing pool is only ever paid for in full.
-POOL_CONNECT_SECONDS = 60.0
+# filesystem at once. A missing pool is only ever paid for in full. A worker
+# opens its FIFO only after its warm-up, and on a 112-rank CSD3 node all of them
+# warm up at once, after every restart too: 60s was not enough (E5, E8 in
+# docs/csd3-experiments.md), and a rank that gives up aborts the whole run.
+POOL_CONNECT_SECONDS = float(os.environ.get("NS_POOL_CONNECT_SECONDS", "300"))
+# Added to a newly connected worker's first reply bound, for the same reason:
+# the bounds below are sized for a warm worker on a quiet node.
+WORKER_FIRST_REPLY_SLACK = float(os.environ.get("NS_WORKER_FIRST_REPLY_SLACK", "120"))
 
 
 def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
@@ -1975,8 +2102,9 @@ def simulate_worker_request(
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
             _forget(_SIMULATE_WORKERS, meqtrees_image)
             continue
-        reply = worker_reply(worker.stdout, reply_timeout)
+        reply = worker_reply(worker.stdout, reply_timeout + (WORKER_FIRST_REPLY_SLACK if getattr(worker, "fresh", False) else 0))
         if reply:
+            worker.fresh = False
             return int(json.loads(reply)["returncode"])
         if reply is None:
             worker.kill()
@@ -2026,12 +2154,10 @@ def simulate_measurement_set(
         str(params["channel_width_hz"]),
         "--source-flux-jy",
         str(params["source_flux_jy"]),
-        "--source-l-arcsec",
-        str(params["source_l_arcsec"]),
-        "--source-m-arcsec",
-        str(params["source_m_arcsec"]),
-        "--declination-deg",
-        str(params["declination_deg"]),
+        # `=` because argparse reads a separate "-7.4e-06" as an option, not a value.
+        f"--source-l-arcsec={params['source_l_arcsec']}",
+        f"--source-m-arcsec={params['source_m_arcsec']}",
+        f"--declination-deg={params['declination_deg']}",
         "--integration-seconds",
         str(params["integration_seconds"]),
         "--dynamic-range",

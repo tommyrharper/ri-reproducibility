@@ -46,6 +46,10 @@ write_run_config() {
         printf 'WSCLEAN_TARGET_CPU=%q\n' "${WSCLEAN_TARGET_CPU}"
       fi
     fi
+    # Without it `./ri resume` brought a GPU run back on the CPU.
+    if [ "${algorithm}" = r2d2 ]; then
+      printf 'R2D2_DEVICE=%q\n' "${R2D2_DEVICE:-cpu}"
+    fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
     fi

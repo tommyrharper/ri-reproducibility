@@ -147,8 +147,11 @@ def run_makems(output_ms: Path) -> None:
 # Cache by (NTimes, NFrequencies): copy/patch ~0.002s vs makems ~0.05s;
 # shared /dev/shm serves all ranks.
 #
-# ponytail: no eviction - the cache ends with the run and the full parameter
-# space is ~20MB. Add an LRU sweep if a longer-lived cache reuses one.
+# Capped at NS_MS_SKELETON_CACHE_MAX shapes, then stops publishing: the default
+# 5-parameter space has under 100 shapes (~20MB), but with integration_seconds
+# and declination_deg searched nearly every evaluation is a new shape. Uncapped,
+# a 112-rank run put 138GB in /dev/shm in 25 minutes and WSClean then died of
+# bad_alloc (docs/csd3-experiments.md, E5).
 _SKELETON_DIR: Path | None = None
 _SKELETON_DIR_EXPLICIT = False
 
@@ -191,6 +194,10 @@ def cached_skeleton(key: str) -> Path:
 
 
 def publish_skeleton(built_ms: Path, cached: Path) -> None:
+    limit = int(os.environ.get("NS_MS_SKELETON_CACHE_MAX", "512"))
+    # Staging directories are mkdtemp's `tmp*`; published shapes are hex names.
+    if sum(1 for name in os.listdir(skeleton_dir()) if not name.startswith("tmp")) >= limit:
+        return
     staging = Path(tempfile.mkdtemp(dir=skeleton_dir()))
     try:
         shutil.copytree(built_ms, staging / "ms", symlinks=True)
@@ -286,6 +293,7 @@ def redirect_fds(out_path: Path, err_path: Path | None = None):
 
 
 _MQS = None
+_PREDICTS_SINCE_RESTART = 0
 
 # The forest currently loaded into the meqserver, keyed on the tdlconf text
 # with the MS name removed - see run_meqtrees_predict().
@@ -324,8 +332,10 @@ def restart_meqserver_session() -> None:
     global _MQS
     from Timba.Apps import meqserver
 
+    global _PREDICTS_SINCE_RESTART
     pid = getattr(_MQS, "serv_pid", None)
     _MQS = None
+    _PREDICTS_SINCE_RESTART = 0
     _FOREST.clear()
     # default_mqs() hands back its own module global whenever that is already a
     # meqserver, so clearing it is what makes a restart possible at all.
@@ -399,9 +409,20 @@ def run_meqtrees_predict(
     # no longer a stuck server but something this worker cannot fix, so it goes
     # back to the rank as a dead worker rather than a failed evaluation - see
     # MeqserverWedged.
+    #
+    # Errors from a predict get the same one retry on a fresh meqserver: on
+    # CSD3 they came from a newly compiled forest in a new server ("node
+    # 'VisDataMux' not found"), and every failing evaluation replayed alone
+    # succeeded (docs/csd3-experiments.md). Parameters that really break the
+    # predict fail again and are scored as before.
     for attempt in range(2):
         try:
             errors = _compile_and_predict(tdlconf, key, output_ms, wait_seconds)
+            if errors and not attempt:
+                with (output_ms.parent / "meqserver-wedged.log").open("a") as note:
+                    note.write(f"attempt 1: {len(errors)} predict error(s): {errors!r}\n")
+                restart_meqserver_session()
+                continue
             break
         except MeqserverWedged as exc:
             # Its own file, not meqtree-pipeliner.log: the retry reopens that
@@ -413,6 +434,14 @@ def run_meqtrees_predict(
             if attempt:
                 raise
             restart_meqserver_session()
+    # The meqserver keeps every MS it has predicted into open after the rank
+    # deletes it, so a tmpfs scratch never gets that memory back: 13MB an
+    # evaluation in the 9-parameter space, 96GB over a 112-rank node in 20
+    # minutes (docs/csd3-experiments.md, E6). Replacing it closes them.
+    global _PREDICTS_SINCE_RESTART
+    _PREDICTS_SINCE_RESTART += 1
+    if _PREDICTS_SINCE_RESTART >= int(os.environ.get("NS_MEQSERVER_RECYCLE", "20")):
+        restart_meqserver_session()
     if errors:
         raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
 
@@ -434,6 +463,9 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
             # previous entry rather than adding to it.
             _FOREST.clear()
             _FOREST[key] = module
+            # The compiled selector can still name the MS an earlier compile
+            # read (the warm-up's, gone), whatever the tdlconf says.
+            point_to_measurement_set(module, output_ms)
         else:
             point_to_measurement_set(module, output_ms)
             print("### reusing the compiled forest; only the Measurement Set changed")
@@ -609,9 +641,16 @@ def simulate(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
-        cfg = write_makems_config(args, scratch_ms)
-        make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
-        metadata = fill_point_source_visibilities(args, scratch_ms)
+        try:
+            cfg = write_makems_config(args, scratch_ms)
+            make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
+            metadata = fill_point_source_visibilities(args, scratch_ms)
+        except BaseException:
+            # The meqserver's error text is only in these, and the temporary
+            # directory is about to take them with it.
+            for log in Path(scratch).glob("*.log"):
+                shutil.copy2(log, final_ms.parent / log.name)
+            raise
         metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
             destination = final_ms.parent / produced.name
