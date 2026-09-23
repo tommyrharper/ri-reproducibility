@@ -90,13 +90,17 @@ def makems_declination(degrees: float) -> str:
     return f"{'-' if degrees < 0 else ''}{d}.{m}.{s}"
 
 
+def n_times_of(args: argparse.Namespace) -> int:
+    return max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds)))
+
+
 def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
     output_ms.parent.mkdir(parents=True, exist_ok=True)
     antenna_dst = output_ms.parent / ANTENNA_TABLE_NAME
     if not antenna_dst.exists():
         shutil.unpack_archive(Cattery_VLA_A, output_ms.parent)
 
-    n_times = max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds)))
+    n_times = n_times_of(args)
     cfg = output_ms.parent / "makems.cfg"
     cfg.write_text(
         "\n".join(
@@ -220,8 +224,12 @@ def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_wi
         spw.putcol("TOTAL_BANDWIDTH", np.array([n_chan * channel_width_hz]))
 
 
+def skeleton_key(cfg_text: str) -> str:
+    return "\n".join(line for line in cfg_text.splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
+
+
 def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune_unused: bool = False) -> None:
-    key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
+    key = skeleton_key(cfg.read_text())
     cached = cached_skeleton(key)
     if not cached.exists():
         run_makems(output_ms)
@@ -231,6 +239,151 @@ def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune
     shutil.copytree(cached, output_ms, symlinks=True, ignore=ignore)
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
     (output_ms.parent / "makems.log").write_text(f"reused a cached makems skeleton for:\n{key}\n")
+
+
+# With declination_deg and integration_seconds searched, the whole-shape cache
+# above almost never hits, and makems spends ~3ms a timestep converting antenna
+# positions to J2000 UVW (docs/csd3-speed.md, round 2). But timestep k of an
+# observation does not depend on its length, so one makems build per
+# (declination, integration) serves every shorter observation: a one-timestep
+# template for the channel count, extended with the cached rows. A row's UVW is
+# makems' per-antenna UVW (relative to antenna 0) of ANTENNA2 minus ANTENNA1,
+# which is what is cached; save_observation() refuses anything it cannot
+# rebuild bit for bit.
+def _config_key(cfg_text: str, dropped: tuple[str, ...]) -> str:
+    key = "\n".join(line for line in cfg_text.splitlines() if not line.startswith(dropped))
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
+def _observation_path(cfg_text: str) -> Path:
+    directory = skeleton_dir() / "observations"
+    directory.mkdir(exist_ok=True)
+    return directory / (_config_key(cfg_text, ("StartFreq=", "StepFreq=", "NFrequencies=", "NTimes=")) + ".npz")
+
+
+def _template_path(cfg_text: str) -> Path:
+    directory = skeleton_dir() / "templates"
+    directory.mkdir(exist_ok=True)
+    return directory / _config_key(cfg_text, ("StartFreq=", "StepFreq=", "NTimes=", "Declination=", "StepTime="))
+
+
+def _atomic_publish(write, destination: Path) -> None:
+    staging = Path(tempfile.mkdtemp(dir=destination.parent))
+    try:
+        write(staging / "entry")
+        try:
+            os.replace(staging / "entry", destination)
+        except OSError:
+            pass  # another rank published this directory first
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def save_observation(ms_path: Path, cfg_text: str) -> None:
+    with table(str(ms_path), ack=False) as ms:
+        cols = {c: ms.getcol(c) for c in ("TIME", "TIME_CENTROID", "UVW", "ANTENNA1", "ANTENNA2", "INTERVAL", "EXPOSURE")}
+    with table(str(ms_path / "FIELD"), ack=False) as field:
+        dirs = {c: field.getcol(c) for c in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME")}
+    with table(str(ms_path / "OBSERVATION"), ack=False) as obs:
+        time_range = obs.getcol("TIME_RANGE")
+    n_rows = len(cols["TIME"])
+    a1, a2 = cols["ANTENNA1"], cols["ANTENNA2"]
+    n_base = int(np.count_nonzero(cols["TIME"] == cols["TIME"][0]))
+    n_times = n_rows // n_base
+    if n_base * n_times != n_rows or not (np.array_equal(a1, np.tile(a1[:n_base], n_times))
+                                           and np.array_equal(a2, np.tile(a2[:n_base], n_times))):
+        return
+    uvw = cols["UVW"].reshape(n_times, n_base, 3)
+    first = a1[:n_base] == 0
+    antenna_uvw = np.zeros((n_times, int(max(a1.max(), a2.max())) + 1, 3))
+    antenna_uvw[:, a2[:n_base][first]] = uvw[:, first]
+    per_time = {c: cols[c].reshape(n_times, n_base)[:, 0] for c in ("TIME", "TIME_CENTROID")}
+    interval, exposure = cols["INTERVAL"][0], cols["EXPOSURE"][0]
+    rebuilt = antenna_uvw[:, a2[:n_base]] - antenna_uvw[:, a1[:n_base]]
+    if not (np.array_equal(rebuilt, uvw)
+            and all(np.array_equal(np.repeat(per_time[c], n_base), cols[c]) for c in per_time)
+            and np.all(cols["INTERVAL"] == interval) and np.all(cols["EXPOSURE"] == exposure)
+            and time_range[0, 1] == time_range[0, 0] + n_times * interval):
+        return
+    destination = _observation_path(cfg_text)
+    try:
+        with np.load(destination) as cached:
+            if len(cached["time"]) >= n_times:
+                return
+    except (OSError, ValueError, KeyError):
+        pass
+
+    def write(path: Path) -> None:
+        with path.open("wb") as out:
+            np.savez(out, time=per_time["TIME"], time_centroid=per_time["TIME_CENTROID"], antenna_uvw=antenna_uvw,
+                     interval=interval, exposure=exposure, time_range_start=time_range[0, 0],
+                     **{f"FIELD_{c}": v for c, v in dirs.items()})
+
+    _atomic_publish(write, destination)
+
+
+def load_observation(cfg_text: str, n_times: int) -> dict | None:
+    try:
+        with np.load(_observation_path(cfg_text)) as cached:
+            if len(cached["time"]) < n_times:
+                return None
+            return {k: cached[k] for k in cached.files}
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def one_timestep_template(cfg_text: str, args: argparse.Namespace, scratch: Path) -> Path:
+    template = _template_path(cfg_text)
+    if not template.exists():
+        one = argparse.Namespace(**vars(args))
+        one.observation_minutes = args.integration_seconds / 120.0  # NTimes=1
+        with tempfile.TemporaryDirectory(dir=scratch) as build:
+            ms = Path(build) / Path(args.output_ms).name
+            write_makems_config(one, ms)
+            run_makems(ms)
+            _atomic_publish(lambda path: shutil.copytree(ms, path, symlinks=True), template)
+    return template
+
+
+def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace) -> None:
+    shutil.copytree(template, output_ms, symlinks=True, ignore=shutil.ignore_patterns(*UNUSED_SUBTABLES))
+    with table(str(output_ms), readonly=False, ack=False) as ms:
+        a1, a2 = ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2")
+        n_base = len(a1)
+        ms.addrows((n_times - 1) * n_base)
+        antenna_uvw = observation["antenna_uvw"][:n_times]
+        ms.putcol("UVW", (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3))
+        ms.putcol("ANTENNA1", np.tile(a1, n_times))
+        ms.putcol("ANTENNA2", np.tile(a2, n_times))
+        ms.putcol("TIME", np.repeat(observation["time"][:n_times], n_base))
+        ms.putcol("TIME_CENTROID", np.repeat(observation["time_centroid"][:n_times], n_base))
+        ms.putcol("INTERVAL", np.full(n_times * n_base, observation["interval"]))
+        ms.putcol("EXPOSURE", np.full(n_times * n_base, observation["exposure"]))
+    with table(str(output_ms / "FIELD"), readonly=False, ack=False) as field:
+        for column in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME"):
+            field.putcol(column, observation[f"FIELD_{column}"])
+    start = observation["time_range_start"]
+    with table(str(output_ms / "OBSERVATION"), readonly=False, ack=False) as obs:
+        obs.putcol("TIME_RANGE", np.array([[start, start + n_times * observation["interval"]]]))
+    patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
+
+
+def make_ms(cfg: Path, output_ms: Path, args: argparse.Namespace) -> None:
+    """Build the evaluation's MS skeleton, running makems only for an
+    observation no earlier evaluation has covered."""
+    cfg_text = cfg.read_text()
+    if cached_skeleton(skeleton_key(cfg_text)).exists():
+        make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
+        return
+    n_times = n_times_of(args)
+    observation = load_observation(cfg_text, n_times)
+    if observation is None:
+        make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
+        save_observation(output_ms, cfg_text)
+        return
+    template = one_timestep_template(cfg_text, args, output_ms.parent)
+    extend_template(template, observation, output_ms, n_times, args)
+    (output_ms.parent / "makems.log").write_text(f"extended a cached observation to {n_times} timesteps\n")
 
 
 def prebuild_skeletons(space: dict) -> None:
@@ -602,7 +755,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
             "max_proj_baseline_lambda": max_proj_baseline_lambda,
             "requested_minutes": args.observation_minutes,
             "integration_seconds": args.integration_seconds,
-            "time_samples": max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds))),
+            "time_samples": n_times_of(args),
             "channel_count": args.channel_count,
             "start_frequency_hz": args.start_frequency_hz,
             "channel_width_hz": args.channel_width_hz,
@@ -626,8 +779,7 @@ def simulate(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
         try:
-            cfg = write_makems_config(args, scratch_ms)
-            make_ms_skeleton(cfg, scratch_ms, args, prune_unused=True)
+            make_ms(write_makems_config(args, scratch_ms), scratch_ms, args)
             metadata = fill_point_source_visibilities(args, scratch_ms)
         except BaseException:
             # The meqserver's error text is only in these, and the temporary
@@ -760,6 +912,58 @@ def self_check_skeleton_cache() -> None:
                         assert np.array_equal(values, expected), f"{sub or 'MAIN'}.{column} differs after a cached skeleton reuse"
     use_skeleton_cache(None)
     print("MS skeleton cache self-check passed")
+
+
+def self_check_observation_prefix() -> None:
+    """An MS extended from a cached observation must be the MS makems writes."""
+    def values(ms: Path, sub: str) -> dict:
+        with table(str(ms / sub if sub else ms), readonly=True, ack=False) as t:
+            out = {"__keywords": repr(t.getkeywords()) if sub else None, "__rows": t.nrows()}
+            for column in t.colnames():
+                try:
+                    out[column] = np.asarray(t.getcol(column))
+                except RuntimeError:
+                    out[column] = None  # optional array column left unset by makems
+            return out
+
+    def simulate_with(scratch: Path, name: str, dec: int, step: int, n_times: int, n_chan: int, prefix: bool) -> Path:
+        ms = scratch / name / "sim.ms"
+        args = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", repr(n_times * step / 60.0 - 0.001),
+            "--integration-seconds", str(step), "--channel-count", str(n_chan), f"--declination-deg={dec}",
+            "--start-frequency-hz", "1.0374e9", "--channel-width-hz", "1.3331e6", "--dynamic-range", "300",
+            f"--source-l-arcsec={0.2 * dec}", "--source-m-arcsec=-0.1",
+        ])
+        cfg = write_makems_config(args, ms)
+        if prefix:
+            make_ms(cfg, ms, args)
+        else:
+            run_makems(ms)
+        fill_point_source_visibilities(args, ms)
+        return ms
+
+    # (declination, integration, NTimes, channels, served from the cache)
+    steps = [(34, 2, 10, 1, False), (34, 2, 4, 3, True), (34, 2, 20, 8, False), (34, 2, 15, 2, True),
+             (34, 2, 20, 4, True), (-15, 7, 3, 3, False), (-15, 7, 1, 3, True), (75, 2, 5, 1, False)]
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch_dir:
+        scratch = Path(scratch_dir)
+        use_skeleton_cache(scratch / "cache")
+        for i, (dec, step, n_times, n_chan, served) in enumerate(steps):
+            got = simulate_with(scratch, f"prefix{i}", dec, step, n_times, n_chan, prefix=True)
+            log = (got.parent / "makems.log").read_text()
+            assert ("extended a cached observation" in log) == served, f"step {i}: cache use was not {served}: {log}"
+            expected = simulate_with(scratch, f"makems{i}", dec, step, n_times, n_chan, prefix=False)
+            with table(str(got), ack=False) as left, table(str(expected), ack=False) as right:
+                assert repr(left.getdminfo()) == repr(right.getdminfo()), f"step {i}: storage layout differs"
+            for sub in ("", "SPECTRAL_WINDOW", "ANTENNA", "FIELD", "DATA_DESCRIPTION", "POLARIZATION", "OBSERVATION"):
+                left, right = values(got, sub), values(expected, sub)
+                assert left.keys() == right.keys(), f"step {i}: {sub or 'MAIN'} columns differ"
+                for column in left:
+                    same = (left[column] is None and right[column] is None) if left[column] is None or right[column] is None \
+                        else np.array_equal(left[column], right[column])
+                    assert same, f"step {i}: {sub or 'MAIN'}.{column} differs from a makems build"
+    use_skeleton_cache(None)
+    print("observation prefix self-check passed")
 
 
 def self_check_skeleton_prebuild() -> None:
@@ -1142,6 +1346,7 @@ if __name__ == "__main__":
             self_check_scratch_root()
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
+            self_check_observation_prefix()
             self_check_declination_config()
             self_check_forest_reuse()
             self_check_analytic_predict()

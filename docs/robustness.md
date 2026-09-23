@@ -149,8 +149,9 @@ drift when one of the two is retuned. That is 36s at the small end and 98s at
 
 The base went up from 10s with it, because a search that moves `declination_deg`
 or `integration_seconds` changes the skeleton cache key on every draw - both are
-in the makems config the key is taken from - so every evaluation runs a real
-makems inside this bound rather than copying a cached one.
+in the makems config the key is taken from - so an evaluation runs a real
+makems inside this bound unless an earlier one at its declination and
+integration was at least as long (`make_ms()`, [CSD3 speed](csd3-speed.md)).
 
 `timing.simulate_seconds` in `metrics.json` is not this quantity and should not
 be read as one: it is measured around the whole of

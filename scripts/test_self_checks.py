@@ -54,6 +54,7 @@ IMAGE_ONLY = {
         "self_check_meqserver_restart",
         "self_check_dropped_subtables",
         "self_check_noise_weighting",
+        "self_check_observation_prefix",
         "self_check_predict_timeout_recovery",
         "self_check_scratch_root",
         "self_check_serve_fifo",

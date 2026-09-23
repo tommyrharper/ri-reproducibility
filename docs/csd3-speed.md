@@ -56,3 +56,38 @@ worker-seconds per evaluation, i.e. ~+25% evals/s for R2D2 on CPU and ~+45%
 for WSClean.
 
 Next: `makems` is now ~90% of simulate.
+
+## Round 2: makems only for unseen observations
+
+makems costs ~0.07s plus ~3.3ms a timestep: it converts all 27 antenna
+positions to J2000 UVW every timestep. Timestep k of an observation does not
+depend on its length, so the rows of a short observation are, bit for bit, the
+first rows of a long one at the same declination and integration.
+
+`make_ms()` caches, per (declination, integration), makems' per-antenna UVW
+(relative to antenna 0) and the per-timestep times in an `.npz` beside the
+skeleton cache. A later evaluation no longer than the cached one copies a
+one-timestep template for its channel count, `addrows`, and writes UVW, TIME,
+ANTENNA1/2, INTERVAL, EXPOSURE, the FIELD directions and OBSERVATION.TIME_RANGE.
+A miss runs makems as before, then caches what it built (13ms), replacing a
+shorter entry. `save_observation()` refuses to cache anything it cannot rebuild
+bit for bit. `self_check_observation_prefix()` compares every column of MAIN
+and the kept subtables, and the storage layout, with a fresh makems build after
+the fill, over 8 hit/miss/grow steps.
+
+Same probe and 48 parameter sets, icelake 8368Q. "Warm" first caches each set's
+(declination, integration) at 20 minutes, the steady state of a long run:
+
+| | cold cache | warm cache |
+| --- | ---: | ---: |
+| `makems` | 0.607s | 0.013s (templates: one per channel count) |
+| extend template | - | 0.023s |
+| fill | 0.047s | 0.048s |
+| **simulate total** | **0.679s / 0.475s median** | **0.088s / 0.056s median** |
+
+The hit rate grows with run length. Replaying uniform prior draws (the worst
+case: a converging run revisits a narrower region) through the cache, the
+share of timesteps still built by makems is 94% at 500 evaluations, 75% at
+2,000, 37% at 10,000 and 9.5% at 71,395, the size of the last big R2D2 run.
+There are 910 (declination, integration) keys; at full coverage the cache is
+~200MB of `/dev/shm`.

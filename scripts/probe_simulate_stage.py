@@ -2,9 +2,11 @@
 
 Inside meqtrees.sif, with the working tree bound over /opt/ri-nested-sampling
 and NS_SCRATCH_DIR set:
-    python3 scripts/probe_simulate_stage.py PARAMS.jsonl [time|compare]
-PARAMS.jsonl holds one evaluation's metrics.json "params" per line. `compare`
-drops the noise and reports the analytic predict's distance from DATA.
+    python3 scripts/probe_simulate_stage.py PARAMS.jsonl [time|warm|compare]
+PARAMS.jsonl holds one evaluation's metrics.json "params" per line. `warm`
+first caches each set's observation at 20 minutes, the steady state of a long
+run. `compare` drops the noise and reports the analytic predict's distance
+from DATA.
 """
 import json
 import math
@@ -37,7 +39,7 @@ def wrap(name):
 
 
 for n in ["write_makems_config", "run_makems", "publish_skeleton", "patch_spectral_window", "make_ms_skeleton",
-          "determine_corr_selection", "run_meqtrees_predict", "_compile_and_predict", "restart_meqserver_session",
+          "save_observation", "load_observation", "one_timestep_template", "extend_template",
           "fill_point_source_visibilities"]:
     wrap(n)
 
@@ -69,6 +71,12 @@ def main():
     t0 = time.perf_counter()
     s.warm_up()
     print(f"warm_forest {time.perf_counter() - t0:.2f}s", flush=True)
+    if mode == "warm":
+        for p in params:
+            with tempfile.TemporaryDirectory(dir=root) as d:
+                a = s.parse_args(argv({**p, "observation_minutes": 20.0}, Path(d) / "sim.ms"))
+                s.make_ms(s.write_makems_config(a, Path(a.output_ms)), Path(a.output_ms), a)
+        print(f"warmed in {time.perf_counter() - t0:.1f}s", flush=True)
     T.clear()
     rows = []
     for i, p in enumerate(params):
