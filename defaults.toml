@@ -225,6 +225,17 @@ fraction = 1
 default = 0.0
 enabled = false
 
+# Point sources in the truth sky, all `source_flux_jy`. The first is the one
+# the position dimensions above place; the rest sit at fixed pixels drawn from
+# a constant seed (extra_source_offsets_arcsec() in common.py), so a count of
+# N is the sky of N - 1 plus one more source.
+[[parameter_space]]
+name = "source_count"
+min = 1
+max = 5
+kind = "integer"
+default = 1
+
 # Declination of the phase centre. +34 is the VLA's latitude and this
 # `default`: overhead transit, the roundest PSF the array gets. Low declination
 # foreshortens it into an elliptical beam with far worse sidelobes. Whole

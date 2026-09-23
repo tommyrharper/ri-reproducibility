@@ -201,6 +201,9 @@ def render_fits_image(path, figsize=(4, 4), dpi=130):
     )
 
 
+SOURCE_LAYOUT_PARAMS = {"source_offset_fraction", "source_l_pixels", "source_m_pixels", "source_count"}
+
+
 def synthesize_truth_array(image_path, source_flux_jy):
     load_render_libs()
     data, header = fits.getdata(image_path, header=True)
@@ -1355,7 +1358,10 @@ def render_eval_images(evaluations, metric, run_dirs, parameter_space):
     )
     truth_image_path = resolve_eval_path(run_dirs, (truth_ref_ev.get("paths") or {}).get("image"))
     truth_source_flux_jy = float((truth_ref_ev.get("params") or {}).get("source_flux_jy", 1.0))
-    truth_html = render_shared_truth_image(truth_image_path, truth_source_flux_jy)
+    # The synthesized truth is one centred source, so it is only shared when
+    # no dimension moves or adds sources.
+    moves_sources = {str(spec.get("name")) for spec in parameter_space or []} & SOURCE_LAYOUT_PARAMS
+    truth_html = "" if moves_sources else render_shared_truth_image(truth_image_path, truth_source_flux_jy)
 
     best_eval_id = best.get("eval_id")
     cards = [

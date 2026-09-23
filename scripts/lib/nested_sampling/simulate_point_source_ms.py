@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a noisy VLA Measurement Set for a single point source."""
+"""Create a noisy VLA Measurement Set for one or more point sources."""
 
 from __future__ import annotations
 
@@ -59,6 +59,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-flux-jy", type=float, default=1.0)
     parser.add_argument("--source-l-arcsec", type=float, default=0.0)
     parser.add_argument("--source-m-arcsec", type=float, default=0.0)
+    parser.add_argument(
+        "--extra-source-arcsec", nargs=2, type=float, action="append", default=[], metavar=("L", "M"),
+        help="Another --source-flux-jy source at this (l, m); repeatable",
+    )
     parser.add_argument("--declination-deg", type=float, default=DEFAULT_DECLINATION_DEG)
     parser.add_argument("--dynamic-range", type=float, required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -349,6 +353,7 @@ def run_meqtrees_predict(
     l_rad: float,
     m_rad: float,
     wait_seconds: float | None = None,
+    extra_lm_rad: list[tuple[float, float]] | tuple = (),
 ) -> None:
     # None, not the module constant as a default argument: the constant is a
     # global the self-checks replace, and a default argument would freeze the
@@ -364,6 +369,9 @@ def run_meqtrees_predict(
                 f"source_flux_jy = {source_flux_jy!r}",
                 f"source_l_rad = {l_rad!r}",
                 f"source_m_rad = {m_rad!r}",
+                # Always written, as "none" when empty: TDLOptions.config.read()
+                # merges, so a missing key keeps the previous compile's sources.
+                "extra_sources_lm_rad = " + (";".join(f"{l!r} {m!r}" for l, m in extra_lm_rad) or "none"),
                 "",
             ]
         )
@@ -464,7 +472,7 @@ UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STA
 
 
 def meqtrees_predict_needed(args: argparse.Namespace) -> bool:
-    return bool(args.source_l_arcsec or args.source_m_arcsec)
+    return bool(args.source_l_arcsec or args.source_m_arcsec or args.extra_source_arcsec)
 
 
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -480,14 +488,17 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
         freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
 
-    # ponytail: this simulator supports one unpolarized point source; full Stokes
-    # models and multi-source dynamic-range stress cases are a follow-up ceiling.
-    # A source at the phase centre predicts a constant, so the meqserver is
-    # not asked for it - see phase_centre_visibility().
+    # ponytail: unpolarized equal-flux point sources only; full Stokes models
+    # and per-source fluxes are a follow-up ceiling.
+    # A lone source at the phase centre predicts a constant, so the meqserver
+    # is not asked for it - see phase_centre_visibility().
     predicted = meqtrees_predict_needed(args)
     if predicted:
         corr_sel, n_corr = determine_corr_selection(output_ms)
-        run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad, args.predict_wait_seconds)
+        extra_lm_rad = [(math.radians(l / 3600.0), math.radians(m / 3600.0)) for l, m in args.extra_source_arcsec]
+        run_meqtrees_predict(
+            output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad, args.predict_wait_seconds, extra_lm_rad
+        )
 
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
@@ -563,6 +574,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
             "flux_jy": args.source_flux_jy,
             "l_arcsec": args.source_l_arcsec,
             "m_arcsec": args.source_m_arcsec,
+            "extra_lm_arcsec": args.extra_source_arcsec,
         },
         "observation": {
             "max_proj_baseline_lambda": max_proj_baseline_lambda,
@@ -845,6 +857,32 @@ def self_check_phase_centre_predict() -> None:
                 f"MeqTrees predicts more than the phase-centre constant at {(n_chan, minutes, start_hz, width_hz, flux)}"
     _FOREST.clear()
     print("phase-centre predict self-check passed")
+
+
+def self_check_multi_source_predict() -> None:
+    """Extra sources must add to the prediction, each where it was placed."""
+    a, b, c = (1e-5, 2e-5), (-3e-5, 1e-5), (2e-5, -4e-5)
+
+    def predict(scratch: Path, name: str, first: tuple[float, float], extras: list) -> np.ndarray:
+        ms = scratch / name / "sim.ms"
+        built = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", "4.0",
+            "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+            "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(built, ms), ms, built)
+        corr_sel, _ = determine_corr_selection(ms)
+        run_meqtrees_predict(ms, corr_sel, 1.0, *first, extra_lm_rad=extras)
+        with table(str(ms), readonly=True, ack=False) as opened:
+            return np.asarray(opened.getcol("DATA"), dtype=np.complex128)
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        together = predict(Path(scratch), "abc", a, [b, c])
+        apart = sum(predict(Path(scratch), f"one-{i}", lm, []) for i, lm in enumerate((a, b, c)))
+        # The extras-less compile after an extras one is the stale-config case.
+        assert np.allclose(together, apart, atol=1e-5), np.abs(together - apart).max()
+    _FOREST.clear()
+    print("multi-source predict self-check passed")
 
 
 def self_check_noise_weighting() -> None:
@@ -1144,6 +1182,7 @@ if __name__ == "__main__":
             self_check_declination_config()
             self_check_forest_reuse()
             self_check_phase_centre_predict()
+            self_check_multi_source_predict()
             self_check_noise_weighting()
             self_check_dropped_subtables()
             self_check_meqserver_restart()
