@@ -113,6 +113,9 @@ ns_enter_job_env() {
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   _dir="$(mktemp -d)"
+  # Physical: ns_submit_run resolves the paths it passes, and macOS hands out
+  # temporary directories under /var, a symlink to /private/var.
+  _dir="$(cd "${_dir}" && pwd -P)"
   trap 'rm -rf "${_dir}"' EXIT
   mkdir -p "${_dir}/bin"
   # shellcheck disable=SC2016  # the $vars are for the fake sbatch's own sh
