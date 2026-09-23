@@ -240,6 +240,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       ;;
     --self-check)
       set -e
+      # This builds the environment a CSD3 job runs in - the module system,
+      # /home, Nix stores, GNU tools - so there is nothing here for a mac to
+      # check, and BSD's own readlink and symlinked /var only make it lie.
+      if [ "$(uname -s)" != Linux ]; then
+        echo "job-env self-check skipped: $(uname -s), and this is a Linux cluster environment"
+        exit 0
+      fi
       _tmp="$(mktemp -d)"
       # Physical: the check resolves what it finds, and macOS hands out
       # temporary directories under /var, a symlink to /private/var, so a
