@@ -260,3 +260,59 @@ alone: the gain is if anything understated.
 Without a prefill the cache fills as runs go: each run adds the observations
 it drew, at the longest length it drew. Next: prefill it once per meqtrees
 image (38s on a node) so the first run is warm too.
+
+## Round 7: record writes off the rank's critical path
+
+Production runs are async (`NS_SYNCHRONOUS=0`), so this round measured that mode:
+`./ri search wsclean` with 16 ranks, nlive 150 and steady-state retention, on 16
+icelake CPUs, sampling per-process CPU from `/proc` every 10s:
+
+- The node is CPU-bound. simulate workers use ~3.8 cores and WSClean ~9, out of 16.
+  The 16 PolyChord ranks together use 1.25 cores, and rank 0 does not spin in MPI (0.00).
+- Workers spent 85% of wall inside `evaluate()`. After `ended_epoch`, each
+  evaluation still wrote its `metrics.json` (create, write, rename) to Lustre,
+  ~50ms by round 5's numbers, with the rank idle throughout.
+
+`write_records_in_background()` now hands that write to one thread per rank.
+Records are serialized on the rank's own thread, and a failed write re-raises
+there. The queue drains after `run_polychord` (before rank 0 reads the records
+back), at exit, and in `abort_run` (bounded). `_strip_to_record` now skips
+`metrics.json.partial`, so evicting an older evaluation cannot delete a write
+that is in flight. See robustness.md for what a kill can lose.
+
+A/B against `f96ff4b`, both arms in one 36-CPU icelake job and each pinned to
+its own 18 CPUs with `taskset`, halves swapped every round. Async, so the
+evaluation mix differs between arms. "Outside" is worker wall time not spent in
+an evaluation, per evaluation:
+
+| round | base outside | new outside | base util | new util | base evals/s | new evals/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 45.6ms | 14.7ms | 0.915 | 0.955 | 28.0 (cold) | 46.1 |
+| 2 | 27.7ms | 15.0ms | 0.900 | 0.942 | 53.9 | 58.0 |
+| 3 | 30.2ms | 10.9ms | 0.902 | 0.943 | 48.5 | 79.1 |
+
+The saved 15-30ms/eval is 6-10% of a ~250ms WSClean evaluation, and ~2% of
+R2D2's 1.35s (too small to show end to end). evals/s mostly tracks which half an
+arm ran on: busy time per eval was 179-244ms on one half and 250-311ms on the
+other. So use the utilisation and outside-time columns, not evals/s.
+
+Dead ends this round, none of them bit-exact or worth it:
+
+- R2D2 request at 1 thread (production shape: 24 ranks x 1 on sapphire) is
+  1.64s. U-Net forwards are 0.81s (conv2d 0.6s) and NUFFTs 0.43s.
+  `scripts/probe_r2d2_request.py` (now with `OUT_ROOT` for tmpfs outputs).
+- U-Net per forward, cycling the 25 checkpoints: 43.7ms, and 41.8ms with one
+  checkpoint reused, so weights missing cache cost little. The 2x2 and 4x4 layers
+  (1024 channels) take ~16ms, and are bound by weight bandwidth.
+  `torch.utils.mkldnn.to_mkldnn` prepacking: 78ms and not bit-identical.
+  channels_last: 42.3ms against 42.6ms, not bit-identical. Keeping one net per
+  checkpoint, instead of `load_state_dict` per iteration, saves ~1.2ms per
+  forward (~1% of a request).
+- FINUFFT 2.5.1 options (`spread_sort`, `kerevalmeth`, `fftw`, `nthreads`)
+  timed on the real points of 3 requests. All but `spread_sort=0` on type 1 are
+  bit-identical, and none is a consistent win: per-call times varied 2-3x on the
+  shared node.
+- Warm simulate (`PROFILE=1 scripts/probe_simulate_stage.py`, 48 sets) is
+  ~70ms: `rng.normal` 32ms, casacore `putcol` 21ms, phase ramp 16ms. The noise
+  draws cover all 4 correlations and fix the seeded stream, so drawing fewer
+  would change every noise sample.

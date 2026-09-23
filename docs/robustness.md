@@ -244,6 +244,12 @@ startup in every restart and every `./ri resume`. Records are now written
 `metrics.json.partial` and renamed into place, so the window is closed for new
 runs and the tolerance covers the runs already on disk.
 
+A run writes records on a background thread per rank (`write_records_in_background`,
+~50ms a record on CSD3's Lustre). A kill can therefore lose the last record or
+two a rank had queued. Those evaluations have no `metrics.json`, so the next
+attempt re-runs them with the same seed. A failed write re-raises on the rank's
+own thread at its next record, and `abort_run` waits up to 30s for the queue.
+
 ### Half a `summary.json` is not a finished run
 
 The same window one level out. `summary.json` is written once, after PolyChord

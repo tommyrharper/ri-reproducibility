@@ -4,7 +4,8 @@ Inside r2d2.sif, with the working tree bound over /opt/ri-nested-sampling and
 the checkpoints at /checkpoints:
     python3 scripts/probe_r2d2_request.py MATS_DIR N
 MATS_DIR holds one subdirectory per evaluation with its r2d2_data.mat. EXTRA
-appends lines to the config (e.g. `target_dynamic_range: 0.0`).
+appends lines to the config (e.g. `target_dynamic_range: 0.0`). OUT_ROOT puts
+the outputs elsewhere (e.g. tmpfs, as a run's scratch does since round 5).
 """
 import cProfile, io, os, pstats, runpy, sys, time
 from pathlib import Path
@@ -15,7 +16,7 @@ r.warm_imports()
 prof = cProfile.Profile()
 walls = []
 for d in sorted(root.iterdir())[:n]:
-    out = d / "out"; out.mkdir(exist_ok=True)
+    out = Path(os.environ.get("OUT_ROOT", d)) / d.name / "out"; out.mkdir(parents=True, exist_ok=True)
     cfg = d / "cfg.yaml"
     cfg.write_text(f"""data_file: {d/'r2d2_data.mat'}
 output_path: {out}

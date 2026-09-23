@@ -6,8 +6,11 @@ and NS_SCRATCH_DIR set:
 PARAMS.jsonl holds one evaluation's metrics.json "params" per line. `warm`
 first caches each set's observation at 20 minutes, the steady state of a long
 run. `compare` drops the noise and reports the analytic predict's distance
-from DATA.
+from DATA. PROFILE=1 adds a cProfile of the timed simulate() calls.
 """
+import cProfile
+import io
+import pstats
 import json
 import math
 import os
@@ -78,6 +81,7 @@ def main():
                 s.make_ms(s.write_makems_config(a, Path(a.output_ms)), Path(a.output_ms), a)
         print(f"warmed in {time.perf_counter() - t0:.1f}s", flush=True)
     T.clear()
+    prof = cProfile.Profile() if os.environ.get("PROFILE") else None
     rows = []
     for i, p in enumerate(params):
         with tempfile.TemporaryDirectory(dir=root) as d:
@@ -88,7 +92,11 @@ def main():
             before = dict(T)
             t = time.perf_counter()
             with s.redirect_fds(Path(d) / "o.log"):
+                if prof:
+                    prof.enable()
                 s.simulate(a)
+                if prof:
+                    prof.disable()
             wall = time.perf_counter() - t
             steps = {k: round(T[k] - before.get(k, 0.0), 4) for k in T}
             with table(str(out), ack=False) as tb:
@@ -109,6 +117,10 @@ def main():
     for k in keys:
         vals = [r.get(k, 0.0) for r in rows]
         print(f"{k:32s} mean {np.mean(vals):10.4f} median {np.median(vals):10.4f}")
+    if prof:
+        out = io.StringIO()
+        pstats.Stats(prof, stream=out).sort_stats("tottime").print_stats(30)
+        print(out.getvalue())
 
 
 main()

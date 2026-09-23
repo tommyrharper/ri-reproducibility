@@ -163,6 +163,7 @@ class WorkerDied(RuntimeError):
 
 def abort_run(message: str) -> None:
     print(f"FATAL: {message}", file=sys.stderr, flush=True)
+    drain_record_writes(timeout=30.0)
     try:
         from mpi4py import MPI
 
@@ -1318,10 +1319,16 @@ def self_check_resume_adoption() -> None:
 
 def write_json_atomic(path: Path, payload: Any) -> None:
     """Write JSON through a same-directory temporary file, then replace `path` atomically."""
+    _write_text_atomic(path, _json_text(payload))
+
+
+def _json_text(payload: Any) -> str:
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
     partial = path.with_name(path.name + ".partial")
-    with partial.open("w") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+    partial.write_text(text)
     partial.replace(path)
 
 
@@ -1827,8 +1834,49 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     keeping = prune_evaluation_artefacts(eval_dir, record)
     kept = retain_evaluation_detail(eval_dir, record) or keeping
     publish_evaluation_scratch(eval_dir, record, kept)
-    write_json_atomic(eval_dir / "metrics.json", record)
+    if _RECORD_WRITER is None:
+        write_json_atomic(eval_dir / "metrics.json", record)
+    else:
+        for done in [future for future in _RECORD_WRITES if future.done()]:
+            _RECORD_WRITES.remove(done)
+            done.result()  # a failed write raises here, on the rank's own thread
+        _RECORD_WRITES.append(_RECORD_WRITER.submit(
+            _write_text_atomic, eval_dir / "metrics.json", _json_text(record)))
     return record
+
+
+# A record write (create, write, rename) costs ~50ms on CSD3's Lustre, a fifth
+# of a WSClean evaluation, and the rank sat idle through it. A run hands it to
+# one thread per rank instead; whatever reads the records back drains it first.
+_RECORD_WRITER: Any = None
+_RECORD_WRITES: list[Any] = []
+
+
+def write_records_in_background() -> None:
+    global _RECORD_WRITER
+    from concurrent.futures import ThreadPoolExecutor
+
+    if _RECORD_WRITER is None:
+        _RECORD_WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="record-writer")
+        atexit.register(drain_record_writes)
+
+
+def drain_record_writes(timeout: float | None = None) -> None:
+    """Wait for queued record writes; back to writing inline. Raises the first
+    failed write, unless `timeout` is set (abort paths, which must not hang)."""
+    global _RECORD_WRITER
+    import concurrent.futures
+
+    writer, _RECORD_WRITER = _RECORD_WRITER, None
+    if writer is None:
+        return
+    pending = list(_RECORD_WRITES)
+    _RECORD_WRITES.clear()
+    concurrent.futures.wait(pending, timeout=timeout)
+    writer.shutdown(wait=timeout is None)
+    if timeout is None:
+        for future in pending:
+            future.result()
 
 
 # Keeping every evaluation's logs and images until a run ends costs 10-15 files
@@ -1853,7 +1901,8 @@ def _strip_to_record(eval_dir: Path) -> None:
     import shutil
 
     for entry in eval_dir.iterdir():
-        if entry.name == "metrics.json":
+        # The record, or its .partial while the record writer is on it.
+        if entry.name.startswith("metrics.json"):
             continue
         if entry.is_dir():
             shutil.rmtree(entry, ignore_errors=True)
@@ -1897,14 +1946,17 @@ def self_check_streaming_retention() -> None:
     os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
     try:
         # Same outcome whether an evaluation writes beside its record or in
-        # scratch that is published only if it is kept.
-        for scratch_root in (None, "scratch"):
+        # scratch that is published only if it is kept, and whether records
+        # are written inline or by the run's background writer.
+        for scratch_root, background in ((None, False), ("scratch", False), ("scratch", True)):
             _LOWEST.clear()
             _HIGHEST.clear()
             with tempfile.TemporaryDirectory() as tmp:
                 evaluations = Path(tmp) / "evaluations"
                 if scratch_root:
                     os.environ["NS_SCRATCH_DIR"] = str(Path(tmp) / scratch_root)
+                if background:
+                    write_records_in_background()
                 objectives = {}
                 for index in range(300):
                     eval_dir = evaluations / f"eval-{index:04d}"
@@ -1923,6 +1975,7 @@ def self_check_streaming_retention() -> None:
                         assert "image" not in record["paths"], "a stripped record still names its image"
                     else:
                         assert record["paths"]["image"] == str(eval_dir / "wsclean" / "recon-image.fits")
+                drain_record_writes()
                 ordered = sorted(objectives, key=objectives.get)
                 must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
                 for key in objectives:
@@ -1931,6 +1984,21 @@ def self_check_streaming_retention() -> None:
                         assert kept == ["metrics.json", "wsclean", "wsclean.stdout.log"], (key, kept)
                     else:
                         assert kept == ["metrics.json"], (key, kept)
+                    written = json.loads((evaluations / key / "metrics.json").read_text())
+                    assert written["objective"] == objectives[key], (key, written)
+
+                if background:
+                    # A write that fails in the background still fails the run.
+                    write_records_in_background()
+                    blocked = evaluations / "eval-blocked"
+                    (blocked / "metrics.json.partial").mkdir(parents=True)
+                    write_evaluation_record(blocked, {"objective": 1.0})
+                    try:
+                        drain_record_writes()
+                    except IsADirectoryError:
+                        pass
+                    else:
+                        raise AssertionError("a failed background record write was lost")
 
                 # A dead worker's logs outlive its scratch; its MS does not.
                 eval_dir = evaluations / "eval-9999-died"
@@ -1944,6 +2012,7 @@ def self_check_streaming_retention() -> None:
                     assert not (eval_dir / "sim.ms").exists() and not work.exists()
             os.environ.pop("NS_SCRATCH_DIR", None)
     finally:
+        drain_record_writes(timeout=0)
         os.environ.pop("NS_SCRATCH_DIR", None)
         IMAGE_KEEP_ENDS = saved[0]
         if saved[1] is None:

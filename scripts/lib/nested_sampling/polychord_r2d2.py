@@ -24,6 +24,7 @@ from common import (
     adopt_completed_evaluations,
     cube_like_from_theta,
     cube_to_params,
+    drain_record_writes,
     gathered_window_fit_stats,
     compute_image_metrics,
     image_dim,
@@ -60,6 +61,7 @@ from common import (
     write_evaluation_record,
     write_json_atomic,
     write_polychord_paramnames,
+    write_records_in_background,
 )
 
 DEFAULT_R2D2_NUM_ITER = 25
@@ -574,8 +576,11 @@ def main() -> None:
     write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
+    write_records_in_background()
     pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start
+    # Before the collective below, so rank 0 reads every rank's records.
+    drain_record_writes()
     # Collective, so every rank calls it before rank 0 goes on alone.
     window_fit_stats = gathered_window_fit_stats()
 
