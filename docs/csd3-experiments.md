@@ -88,3 +88,9 @@ plateau; the GPU one is bounded by 3.56GiB of checkpoints per worker.
   imager failure before the results are read.
 - It converged well inside its 10.5-hour limit, so the resume path (E10) was
   not needed here - but a longer or larger search will need it.
+- Evaluations get dearer as the search homes in: first 2000 simulate 1.45s,
+  image 1.94s (9.9 min observations, 6s integration); last 2000 1.75s and
+  2.66s (12.1 min, 4s), i.e. larger Measurement Sets, which is the search
+  working. The tail is also far less parallel - the last 2000 evaluations took
+  39 minutes, 0.86/s against the run's 4.1/s - so a rate read near the end of a
+  run is not the run's throughput.
