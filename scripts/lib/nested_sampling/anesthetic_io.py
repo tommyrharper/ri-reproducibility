@@ -196,11 +196,20 @@ def _mathtext_label(tex: str) -> str:
     return f"${tex}$"
 
 
+# Plotting raw Hz makes matplotlib add a 1e10 offset text that collides with
+# the axis label, so plots read these in scaled units.
+PLOT_UNITS = {
+    "start_frequency_hz": (1e9, r"\nu_{\mathrm{start}}\,[\mathrm{GHz}]"),
+    "channel_width_hz": (1e6, r"\Delta\nu\,[\mathrm{MHz}]"),
+}
+
+
 def label_chain_samples(samples, param_names: list[str]):
     import numpy as np
     import pandas as pd
 
     new_tuples = []
+    scales = {}
     for col in samples.columns:
         name = None
         if isinstance(col, tuple):
@@ -211,10 +220,15 @@ def label_chain_samples(samples, param_names: list[str]):
             elif col[0] in param_names:
                 name = col[0]
         if name is not None:
-            new_tuples.append((name, _mathtext_label(PARAMETER_TEX_LABELS.get(name, name))))
+            scale, tex = PLOT_UNITS.get(name, (None, PARAMETER_TEX_LABELS.get(name, name)))
+            if scale is not None:
+                scales[len(new_tuples)] = scale
+            new_tuples.append((name, _mathtext_label(tex)))
         else:
             new_tuples.append(col)
     labelled = samples.copy()
+    for i, scale in scales.items():
+        labelled.iloc[:, i] = labelled.iloc[:, i] / scale
     labelled.columns = pd.MultiIndex.from_tuples(new_tuples, names=samples.columns.names)
     return labelled
 
