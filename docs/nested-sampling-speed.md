@@ -7,6 +7,8 @@ Current operating points on this host, from `./ri bench`:
 | WSClean | **109** | 34.5 MB | 20 x 1 |
 | R2D2 | **0.91** | 3.47 GB | 15 x 2 |
 
+For the 9-parameter space on CSD3, see [csd3-speed.md](csd3-speed.md).
+
 Thirty-three profiling rounds got there. Values in the tables below are
 per-round baselines, except the two figures above; pre-round-18 rates are
 historical and roughly half the current rate.

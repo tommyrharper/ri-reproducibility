@@ -489,11 +489,18 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
     return errors
 
 
-def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
-    """Return constant Stokes-I visibilities for a phase-centre source."""
-    model = np.zeros(n_corr, dtype=np.complex64)
-    model[0] = model[-1] = source_flux_jy
-    return model
+def point_source_visibilities(
+    uvw: np.ndarray, freqs_hz: np.ndarray, source_flux_jy: float, l_rad: float, m_rad: float, n_corr: int
+) -> np.ndarray:
+    """Stokes-I point source at (l, m): what the Meow forest predicts, to float32
+    rounding, at ~1/30 of its cost. self_check_analytic_predict() is the guard."""
+    n_minus_1 = math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0
+    delay_m = uvw @ np.array([l_rad, m_rad, n_minus_1])
+    vis = source_flux_jy * np.exp((2j * math.pi / SPEED_OF_LIGHT) * np.outer(delay_m, freqs_hz))
+    data = np.zeros((len(uvw), len(freqs_hz), n_corr), dtype=np.complex64)
+    data[:, :, 0] = vis
+    data[:, :, -1] = vis
+    return data
 
 
 # makems writes the full MSv2 subtable set, and casacore attaches every subtable
@@ -503,18 +510,13 @@ def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
 # unpolarised point-source simulation depends on, so they are dropped once the
 # visibilities are written - not in the cached skeleton, because casacore
 # refuses to open an MS that is missing any of them and the MeqTrees predict
-# needs it opened that way. An evaluation that runs no predict never copies them
-# out of the skeleton at all (make_ms_skeleton()'s `prune_unused`); the delete
-# below is what covers the one that does, and stays unconditional because it
-# already tolerates them being absent. Worth -13.8% on the wsclean binary and +14.9%
+# (now only self_check_analytic_predict()'s) needs it opened that way. Runs
+# never copy them out of the skeleton (make_ms_skeleton()'s `prune_unused`);
+# the delete below covers a fresh makems build. Worth -13.8% on the wsclean binary and +14.9%
 # evaluations per second for the first five, and FEED another ~3%, with
 # bit-identical images; see docs/nested-sampling-ms-open.md. The six that
 # stay were each tried and each kills WSClean, so this list is complete.
 UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
-
-
-def meqtrees_predict_needed(args: argparse.Namespace) -> bool:
-    return bool(args.source_l_arcsec or args.source_m_arcsec)
 
 
 def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -532,34 +534,16 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
 
     # ponytail: this simulator supports one unpolarized point source; full Stokes
     # models and multi-source dynamic-range stress cases are a follow-up ceiling.
-    # A source at the phase centre predicts a constant, so the meqserver is
-    # not asked for it - see phase_centre_visibility().
-    predicted = meqtrees_predict_needed(args)
-    if predicted:
-        corr_sel, n_corr = determine_corr_selection(output_ms)
-        run_meqtrees_predict(output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad, args.predict_wait_seconds)
-
+    # The MeqTrees predict this replaced was half the stage on CSD3 (0.79s of
+    # 1.51s in the 9-parameter space); docs/csd3-speed.md.
     rng = np.random.default_rng(args.seed)
     with table(str(output_ms), readonly=False, ack=False) as ms:
-        if predicted:
-            data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
-            _, n_chan, data_n_corr = data.shape
-            if data_n_corr != n_corr:
-                raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
-        else:
-            # Every value in DATA is about to be overwritten with the same
-            # constant, so the skeleton's zeros are not read back: only the
-            # shape is wanted, and one row of it costs 0.05ms against 0.38ms
-            # for the whole column. determine_corr_selection()'s separate open
-            # of the same table goes with it (another 0.43ms) - its correlation
-            # count comes from this probe, and its `corr_sel` string is only
-            # ever handed to a predict this path does not run.
-            _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
-            data = np.empty((ms.nrows(), n_chan, n_corr), dtype=np.complex64)
-            data[:] = phase_centre_visibility(args.source_flux_jy, n_corr)
-        uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
+        # One row for the shape: DATA is about to be overwritten whole.
+        _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
         if n_chan != len(freqs_hz):
             raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
+        uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
+        data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr)
 
         if noise_sigma_jy:
             per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
@@ -608,7 +592,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
         "measurement_set": str(output_ms),
         "vla_config": args.vla_config,
         "antenna_table_source": str(Cattery_VLA_A),
-        "visibility_engine": "MeqTrees Meow point-source RIME predict (meqtree-pipeliner.py) plus seeded thermal-noise fill",
+        "visibility_engine": "analytic point-source RIME (checked against the MeqTrees Meow predict) plus seeded thermal-noise fill",
         "source": {
             "flux_jy": args.source_flux_jy,
             "l_arcsec": args.source_l_arcsec,
@@ -643,7 +627,7 @@ def simulate(args: argparse.Namespace) -> None:
         scratch_ms = Path(scratch) / final_ms.name
         try:
             cfg = write_makems_config(args, scratch_ms)
-            make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
+            make_ms_skeleton(cfg, scratch_ms, args, prune_unused=True)
             metadata = fill_point_source_visibilities(args, scratch_ms)
         except BaseException:
             # The meqserver's error text is only in these, and the temporary
@@ -664,8 +648,9 @@ def simulate(args: argparse.Namespace) -> None:
     print(json.dumps(metadata, indent=2))
 
 
-def warm_forest() -> None:
-    """Prewarm forest and first predict before FIFO requests arrive."""
+def warm_up() -> None:
+    """Build one skeleton before FIFO requests arrive, so makems and casacore
+    are warm for the first evaluation."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         ms = Path(scratch) / "sim.ms"
         args = parse_args([
@@ -674,8 +659,6 @@ def warm_forest() -> None:
             "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
         ])
         make_ms_skeleton(write_makems_config(args, ms), ms, args)
-        corr_sel, _ = determine_corr_selection(ms)
-        run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
 
 
 def handle_request(request: dict) -> None:
@@ -692,20 +675,15 @@ def handle_request(request: dict) -> None:
 
 def serve(fifo_base: str | None = None) -> None:
     """Serve JSON requests over stdin/stdout or a shared FIFO pair."""
-    # meqserver_session() is otherwise first called inside request one, so every
-    # rank paid ~0.3s of Timba import and meqserver startup in front of its first
-    # evaluation - and because PolyChord asks all ranks for their initial live
-    # points at once, all of it landed on the wall clock. Nothing has been asked
-    # of this worker yet, so starting the server here instead overlaps it with
-    # the caller's own sampler startup. Under redirect_fds because Timba prints
-    # to fd 1 on startup, which is the stdin path's reply pipe.
-    with redirect_fds(Path(os.devnull)):
-        try:
-            meqserver_session()
-            if fifo_base is not None:
-                warm_forest()
-        except Exception:
-            traceback.print_exc()
+    # Nothing has been asked of this worker yet, so warming up here overlaps
+    # with the caller's own sampler startup. Under redirect_fds because makems
+    # prints to fd 1, which is the stdin path's reply pipe.
+    if fifo_base is not None:
+        with redirect_fds(Path(os.devnull)):
+            try:
+                warm_up()
+            except Exception:
+                traceback.print_exc()
     if fifo_base is None:
         requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
     else:
@@ -719,23 +697,6 @@ def serve(fifo_base: str | None = None) -> None:
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             try:
                 handle_request(request)
-            except MeqserverWedged:
-                # Past what this worker can fix - it has already replaced its
-                # meqserver once for this request. Die instead of answering, so
-                # the rank sees the worker death it already knows how to retry
-                # (common.py's WORKER_DIED) rather than an exit status, which it
-                # would score as a failure of these parameters. The parameters
-                # did nothing wrong, and a host fault the sampler chases is the
-                # one outcome FAILURE_OBJECTIVE must never be spent on.
-                #
-                # os._exit() because Timba's octopussy event thread is not a
-                # daemon, so a normal exit blocks joining it forever - the same
-                # trap stop_meqserver_session() exists to avoid, and it cannot
-                # help here because it needs a server that answers.
-                traceback.print_exc()
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(1)
             except Exception:
                 traceback.print_exc()
                 returncode = 1
@@ -880,28 +841,48 @@ def self_check_forest_reuse() -> None:
     print("forest reuse self-check passed")
 
 
-def self_check_phase_centre_predict() -> None:
-    """The constant phase_centre_visibility() writes must be what MeqTrees predicts."""
-    cases = ((1, 0.3, 5.4e10, 2.0e6, 1.0), (8, 20.0, 5.4e7, 0.1e6, 1.0), (5, 7.3, 1.4e9, 1.1e6, 2.5))
+def self_check_analytic_predict() -> None:
+    """point_source_visibilities() must be what MeqTrees predicts, on and off
+    the phase centre, across the searched shapes and declinations."""
+    cases = (
+        # n_chan, minutes, integration s, declination, start Hz, width Hz, flux, l", m"
+        (1, 0.3, 120.0, 65.0, 5.4e10, 2.0e6, 1.0, 0.0, 0.0),
+        (8, 20.0, 120.0, 65.0, 5.4e7, 0.1e6, 1.0, 0.0, 0.0),
+        (5, 7.3, 120.0, 65.0, 1.4e9, 1.1e6, 2.5, 0.0, 0.0),
+        (2, 9.6, 3.0, 1.0, 4.36e10, 6.4e5, 1.0, -0.152, -0.193),
+        (6, 13.5, 6.0, 37.0, 4.27e10, 1.04e6, 1.0, 0.190, 0.212),
+        (4, 30.0, 1.0, -15.0, 9.6e9, 1.4e6, 1.0, 0.212, -0.491),
+        (3, 5.0, 10.0, 75.0, 1.1e9, 2.0e6, 1.0, -3.0, 5.0),
+    )
+    worst = 0.0
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
-        for index, (n_chan, minutes, start_hz, width_hz, flux) in enumerate(cases):
-            ms = Path(scratch) / f"phase-centre-{index}" / "sim.ms"
+        for index, (n_chan, minutes, step, dec, start_hz, width_hz, flux, l_as, m_as) in enumerate(cases):
+            ms = Path(scratch) / f"predict-{index}" / "sim.ms"
             built = parse_args([
                 "--output-ms", str(ms), "--observation-minutes", str(minutes),
+                "--integration-seconds", str(step), f"--declination-deg={dec}",
                 "--channel-count", str(n_chan), "--start-frequency-hz", repr(start_hz),
                 "--channel-width-hz", repr(width_hz), "--dynamic-range", "300",
                 "--source-flux-jy", repr(flux),
             ])
             make_ms_skeleton(write_makems_config(built, ms), ms, built)
             corr_sel, n_corr = determine_corr_selection(ms)
-            run_meqtrees_predict(ms, corr_sel, flux, 0.0, 0.0)
+            l_rad, m_rad = math.radians(l_as / 3600.0), math.radians(m_as / 3600.0)
+            run_meqtrees_predict(ms, corr_sel, flux, l_rad, m_rad, wait_seconds=300.0)
             with table(str(ms), readonly=True, ack=False) as opened:
                 predicted = np.asarray(opened.getcol("DATA"))
-            expected = np.broadcast_to(phase_centre_visibility(flux, n_corr), predicted.shape)
-            assert np.array_equal(predicted, expected), \
-                f"MeqTrees predicts more than the phase-centre constant at {(n_chan, minutes, start_hz, width_hz, flux)}"
+                uvw = opened.getcol("UVW")
+            with table(str(ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
+                freqs_hz = spw.getcol("CHAN_FREQ")[0]
+            analytic = point_source_visibilities(uvw, freqs_hz, flux, l_rad, m_rad, n_corr)
+            if not (l_as or m_as):
+                assert np.array_equal(predicted, analytic), f"phase-centre constant differs from MeqTrees in case {index}"
+            # One float32 ulp at |V| = flux, per component: rounding, not physics.
+            error = float(np.abs(predicted - analytic).max()) / flux
+            worst = max(worst, error)
+            assert error < 2.5e-7, f"analytic predict differs from MeqTrees by {error:.3g} in case {index}"
     _FOREST.clear()
-    print("phase-centre predict self-check passed")
+    print(f"analytic predict self-check passed (worst |MeqTrees - analytic| / flux = {worst:.3g})")
 
 
 def self_check_noise_weighting() -> None:
@@ -1091,43 +1072,6 @@ def self_check_predict_timeout_recovery() -> None:
     print("predict timeout recovery self-check passed")
 
 
-def self_check_wedge_kills_worker() -> None:
-    """A wedged worker must die as WORKER_DIED, not answer with a status."""
-    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
-        ms = Path(scratch) / "sim.ms"
-        # A worker whose predicts can never succeed, without a knob in the
-        # production path: the bound is set in the child before serve() runs.
-        bootstrap = (
-            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
-            "import simulate_point_source_ms as s; s.PREDICT_WAIT_SECONDS = 0.001; s.serve()"
-        )
-        worker = subprocess.Popen(
-            [sys.executable, "-c", bootstrap],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        request = {
-            # Offset, so the request actually reaches the meqserver: a source at
-            # the phase centre never asks it for anything (see
-            # phase_centre_visibility()) and a wedged worker would answer it.
-            "argv": [
-                "--output-ms", str(ms), "--observation-minutes", "4.0",
-                "--channel-count", "2", "--start-frequency-hz", "1.0e9",
-                "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
-                "--source-l-arcsec", "0.5",
-            ],
-            "stdout": str(Path(scratch) / "out.log"),
-            "stderr": str(Path(scratch) / "err.log"),
-        }
-        worker.stdin.write(json.dumps(request) + "\n")
-        worker.stdin.flush()
-        reply = worker.stdout.readline()
-        assert reply == "", f"a wedged worker answered instead of dying: {reply!r}"
-        assert worker.wait(timeout=300) != 0, "a wedged worker must not exit successfully"
-    print("wedge kills worker self-check passed")
-
-
 def self_check_serve_reply_stream() -> None:
     """A worker's stdout must carry replies only, never meqserver startup chatter."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
@@ -1200,12 +1144,11 @@ if __name__ == "__main__":
             self_check_skeleton_prebuild()
             self_check_declination_config()
             self_check_forest_reuse()
-            self_check_phase_centre_predict()
+            self_check_analytic_predict()
             self_check_noise_weighting()
             self_check_dropped_subtables()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()
-            self_check_wedge_kills_worker()
             self_check_serve_reply_stream()
             self_check_serve_fifo()
         else:

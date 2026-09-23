@@ -94,11 +94,10 @@ evaluations. The worker stays alive, the predict never completes, and no reply
 is written - so this is not a worker that died, and nothing watching for a
 death sees it.
 
-A source at the phase centre no longer runs a predict at all - its visibility
-is a constant that `phase_centre_visibility()` writes directly (see
-[nested-sampling-throughput.md](nested-sampling-throughput.md)) - so a default
-run cannot reach any of this. Everything below still stands, and is what an
-`--enable-param source_offset_fraction` run depends on.
+No run reaches a meqserver any more: `point_source_visibilities()` computes
+the predict analytically ([csd3-speed.md](csd3-speed.md)), and only
+`self_check_analytic_predict()` still runs MeqTrees. What is below describes the
+machinery that self-check still uses.
 
 It used to stop the whole run. Timba's `wait=True` means wait *indefinitely*,
 so the rank blocked forever and, because PolyChord keeps every rank in the same

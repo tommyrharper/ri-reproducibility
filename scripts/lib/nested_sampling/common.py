@@ -2400,7 +2400,7 @@ def self_check_parameter_space() -> None:
     for spec in load_all_parameter_specs():
         assert "default" in spec, spec
     specs = load_parameter_space()
-    assert len(specs) == 5, specs
+    assert len(specs) == sum(spec.get("enabled", True) for spec in load_all_parameter_specs()), specs
     for spec in specs:
         assert spec["name"] in PARAMETER_TEX_LABELS, spec
         assert float(spec["min"]) < float(spec["max"]), spec
