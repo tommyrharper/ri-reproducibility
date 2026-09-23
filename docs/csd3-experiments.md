@@ -94,3 +94,4 @@ plateau; the GPU one is bounded by 3.56GiB of checkpoints per worker.
   working. The tail is also far less parallel - the last 2000 evaluations took
   39 minutes, 0.86/s against the run's 4.1/s - so a rate read near the end of a
   run is not the run's throughput.
+| bug | `./ri runs` unusable after a long run | 71k and 13k evaluation runs | Counting evaluations stat-ed every evaluation directory: 214s per 13k on Lustre, and the listing timed out past ten minutes. Fixed: a finished run carries `evaluation_count` in its summary's head, and a live one is counted from the one line per evaluation in `run.log` (exact on both runs measured); the directory scan is the last resort. The listing went from 6m42s to 1.1s |

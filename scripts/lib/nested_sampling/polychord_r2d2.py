@@ -603,6 +603,9 @@ def main() -> None:
                 "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
             },
             "parameter_space": load_parameter_space(),
+            # Before the bulk, so a listing reads it out of the head rather
+            # than stat-ing every evaluation directory.
+            "evaluation_count": len(all_evaluations),
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
