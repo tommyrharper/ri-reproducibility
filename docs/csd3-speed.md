@@ -316,3 +316,51 @@ Dead ends this round, none of them bit-exact or worth it:
   ~70ms: `rng.normal` 32ms, casacore `putcol` 21ms, phase ramp 16ms. The noise
   draws cover all 4 correlations and fix the seeded stream, so drawing fewer
   would change every noise sample.
+
+## Round 8: reading records back after the run
+
+The 71,395-evaluation R2D2 run (job 36031480, sapphire, 24 ranks) spent 88
+minutes, 23% of its 6h20m job, after PolyChord returned. PolyChord returned at
+~23:37 (`total_wall_seconds` 17,331). `run.log`'s last write, `summary.json`,
+was at 01:05. In between, rank 0 read every record back
+(`load_evaluations_from_dir`) and pruned (`prune_run_artefacts`), one Lustre
+round trip at a time, while all 24 cores sat idle. `./ri resume` pays the
+same read on every rank before its first evaluation
+(`adopt_completed_evaluations`).
+
+Per-record cost on an icelake node, reading that run
+(3000-6000 records per row):
+
+| step | serial | 32 threads |
+| --- | ---: | ---: |
+| `glob("eval-*/metrics.json")`, per directory | 18.9ms | - |
+| read one `metrics.json` (cold) | 85.8ms | 1.98ms (64 threads: 1.18ms) |
+| prune's `is_dir` + 10 `is_file` per stripped record | 26.4ms | 4.3ms |
+
+The glob was the surprise. `listdir` of the 71k names takes 0.15s, but the
+glob opens every directory to find `metrics.json`: 22 minutes on its own.
+
+Change: `read_evaluation_records()` lists the names once and reads
+`<name>/metrics.json` directly on a 32-thread pool (`RECORD_READ_THREADS`). A
+missing file is an in-flight evaluation, as before. The summary load and resume
+adoption both use it. `prune_run_artefacts` runs its per-record work on the
+same size of pool. Each record touches only its own paths.
+
+Measured on the same node:
+
+| | before | after |
+| --- | ---: | ---: |
+| load all 71,395 records | ~2h (serial estimate), 88 min end of run incl. prune | 122.5s |
+| prune, 3000 real records | 85.4s (28.5ms each) | 13.0s (4.3ms each) |
+| load, same 3000 | 17.5s | 2.5s |
+
+Outputs are identical: the new loader returned the same 71,395 records, in
+the same order, as the `evaluations` the old code wrote into that run's
+`summary.json`. Old and new prune leave identical records. For a run that size,
+the end of run falls from ~88 minutes to ~7, and a resume starts evaluating
+~1.5h sooner.
+
+Still open from the same run: PolyChord's own tail. From 22:50 to 23:37,
+concurrency fell from ~23 workers to ~1, and each evaluation took 18-28s instead of
+4-6s (sampled from every 20th evaluation id). That is the last ~15% of wall
+time, spent almost idle.

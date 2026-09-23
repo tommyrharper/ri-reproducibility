@@ -334,9 +334,8 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   more cores. R2D2 needs
   ~3.4GB per rank, so `--mem` sets the rank count, not `-c`.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the
-  run scripts needs no change. `NS_R2D2_MAX_RANKS` (8, from the 20-core
-  host) caps an R2D2 job well below a 76-core node; the first whole-node R2D2
-  run is where to re-measure it (`docs/nested-sampling-throughput.md`).
+  run scripts needs no change. `NS_R2D2_MAX_RANKS` (56) caps an R2D2 job;
+  it was measured on a whole sapphire node (`docs/csd3-experiments.md`, E4).
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
   whole toolchain, and a job purges the rest (above). `uv` is still needed for
   the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,

@@ -1187,9 +1187,9 @@ def worker_procs(mpi_procs: int) -> int:
 def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
     try:
         record = json.loads(metrics_path.read_text())
-    except FileNotFoundError:
-        # An evaluation that was still in flight. The ordinary case on every
-        # resume, and not worth a word.
+    except (FileNotFoundError, NotADirectoryError):
+        # An evaluation that was still in flight (or a stray eval-* file).
+        # The ordinary case on every resume, and not worth a word.
         return None
     except (OSError, ValueError):
         record = None
@@ -1199,13 +1199,28 @@ def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
     return record
 
 
+# Concurrent record reads. On CSD3's Lustre a cold metrics.json read is ~86ms
+# and globbing eval-*/metrics.json another ~19ms per directory, so reading a
+# 71k-evaluation run back serially took ~2h; 32 threads read one every ~2ms.
+RECORD_READ_THREADS = 32
+
+
+def read_evaluation_records(evaluations_dir: Path) -> list[tuple[Path, dict[str, Any] | None]]:
+    """(eval dir, record or None) for every eval-* entry, in name order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        names = sorted(name for name in os.listdir(evaluations_dir) if name.startswith("eval-"))
+    except FileNotFoundError:
+        return []
+    eval_dirs = [evaluations_dir / name for name in names]
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        records = pool.map(lambda eval_dir: read_evaluation_record(eval_dir / "metrics.json"), eval_dirs)
+        return list(zip(eval_dirs, records))
+
+
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for metrics_path in sorted(evaluations_dir.glob("eval-*/metrics.json")):
-        record = read_evaluation_record(metrics_path)
-        if record is not None:
-            records.append(record)
-    return records
+    return [record for _, record in read_evaluation_records(evaluations_dir) if record is not None]
 
 
 def adopt_completed_evaluations(
@@ -1216,11 +1231,10 @@ def adopt_completed_evaluations(
     import shutil
 
     adopted = 0
-    for eval_dir in sorted(evaluations_dir.glob("eval-*")):
-        if not eval_dir.is_dir():
-            continue
-        record = read_evaluation_record(eval_dir / "metrics.json")
+    for eval_dir, record in read_evaluation_records(evaluations_dir):
         if record is None:
+            if not eval_dir.is_dir():
+                continue
             # ignore_errors because every rank runs this, and they are all
             # removing the same directories at the same moment.
             shutil.rmtree(eval_dir, ignore_errors=True)
@@ -1574,11 +1588,16 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
     is what lets the report fall back to its placeholder. Set
     NS_KEEP_ALL_IMAGES=1 to keep everything.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     if os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0":
         return 0
     keep = evaluations_keeping_images(records)
-    removed = 0
-    for record in records:
+
+    # Each record's own paths only, so records can go concurrently (see
+    # RECORD_READ_THREADS: ~26ms of Lustre stats per record serially).
+    def prune(record: dict[str, Any]) -> int:
+        removed = 0
         paths = record.get("paths") or {}
         retained = evaluation_key(record) in keep
         for key in RETAINED_IMAGE_KEYS:
@@ -1596,17 +1615,20 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
             paths.pop(key, None)
             removed += 1
         if retained or "error" in record:
-            continue
+            return removed
         eval_dir = Path(paths.get("eval_dir") or "")
         local = evaluations_dir / eval_dir.name if eval_dir.name else None
         if local is None or not local.is_dir():
-            continue
+            return removed
         for name in PRUNED_EVALUATION_LOGS:
             log = local / name
             if log.is_file():
                 log.unlink()
                 removed += 1
-    return removed
+        return removed
+
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        return sum(pool.map(prune, records))
 
 
 
