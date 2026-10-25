@@ -1312,3 +1312,68 @@ as controls. Use a derived SIF in a `SIF_DIR` of symlinks instead.
 
 **To ship on CSD3:** rebuild `meqtrees.sif` on a Docker host and import it.
 Until then, runs draw with numpy, and results are the same either way.
+
+## Round 27: two fewer full-column writes in simulate (and AVX-512, no)
+
+**Profile.** With round 26's C noise, simulate at a 1k-timestep-channel
+shape (200 timesteps x 5 channels, 70,200 rows) takes 60ms solo on one
+pinned icelake core (`/dev/shm` scratch, warm observation cache, 30 calls).
+Timing every casacore call shows that the main table's scalar columns cost
+more than DATA: `putcol` of TIME, TIME_CENTROID, INTERVAL and EXPOSURE (all
+IncrementalStMan) at 2.0-2.5ms each, and ANTENNA1/2 (StandardStMan) at
+1.9ms each, against 3.2ms for the 11MB DATA column. The rest is noise
+(~17ms), the phase ramp (~10ms), 6 table open/close pairs (~5ms) and the
+copy of the one-timestep template (~2.6ms). Every call also unpacked the
+VLA antenna tarball (~1ms), which only makems reads.
+
+**Change.** IncrementalStMan carries the last row's value into rows that
+`addrows` adds, which is already how FIELD_ID, SCAN_NUMBER and the other
+untouched ISM columns get their values. `extend_template()` now writes
+INTERVAL and EXPOSURE on the template's one timestep (351 rows) before
+`addrows`, instead of over all rows after it. That stays right when the
+template was built with a different integration time, because its value is
+overwritten before the rows are added. The antenna table is now unpacked by
+`run_makems()`, so evaluations that extend a cached observation leave no
+`VLAA_ANT` in their directory.
+
+**Stage.** Every column of every table in the MS hashes the same before and
+after the change, over 10 shapes, one of them an extension of a template
+built at 3s for a 7s observation. Interleaved, 6 rounds of 30 calls each:
+60.0-61.5ms before, 55.3-57.1ms after (-4.7ms, -8%).
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242, ABBA.
+Both arms use `/dev/shm/r26/sifs-fast`, which is round 26's `meqtrees.sif`
+with fastnoise plus the 0001-0009 `wsclean.sif`. The base arm runs from a
+`git worktree` at HEAD (`.probe/r27ab.sh`). Fits are from
+`.probe/fit16.py`:
+
+| arm | evals | simulate @1k | `wsclean` @1k | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| base | 6734 | 83.0ms | 222.7ms | 0.09550 +/- 0.00168 |
+| new | 7959 | 77.6ms | 226.3ms | 0.09411 +/- 0.00210 |
+| new | 7831 | 75.1ms | 215.6ms | 0.09478 +/- 0.00199 |
+| base | 6743 | 81.5ms | 220.7ms | 0.09555 +/- 0.00162 |
+| base, synchronous, 150 dead | 3415 | 84.9ms | 224.3ms | 0.09424 +/- 0.00279 |
+| new, synchronous, 150 dead | 3415 | 76.8ms | 220.6ms | 0.09424 +/- 0.00279 |
+
+Simulate is 6-8ms (7-10%) faster and the arms do not overlap. That is about
+2% of WSClean worker time, which is below what evals/s can resolve here (it
+spread from 66 to 90 across these runs). In the synchronous pair, log(Z) and
+every chain file are identical (`phys_live.txt` once sorted). The change is
+in the bind-mounted `nested_sampling` directory, so it ships with no
+rebuild. R2D2's `--mat-only` path never extends an MS, so it is unaffected.
+
+**Negative: an AVX-512 WSClean.** The patched tree (0001-0009) was built
+with `-DTARGET_CPU=icelake-server` instead of the shipped `x86-64-v3`.
+Gridding and degridding are ~31% of the binary's samples. On round 24's
+six real-draw MSs, pinned, 10 interleaved rounds took 885.6ms against
+906.6ms (-2.3%), and 6 of 24 FITS data blocks differ. It would also not run
+on the ampere nodes' AMD EPYC CPUs, which have no AVX-512. Not pursued.
+
+**Next.** What remains in simulate: TIME/TIME_CENTROID/ANTENNA1/2 writes
+(~9ms solo). These could be cut by caching the extended main table's
+scalar storage-manager files per (declination, integration, NTimes), but
+that only pays if those shapes repeat. Also the second main-table open, and
+the phase ramp's complex `exp`. For WSClean, the gridding kernels are ~31%,
+and the Wgridder constructor, `CacheMeta`, `CalculateWeightsImplementation`
+and `ApplyWeightsAndCorrections` are ~3-4% each.

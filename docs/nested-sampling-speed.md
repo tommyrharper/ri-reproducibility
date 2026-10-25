@@ -60,6 +60,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Reordered part files mapped, not read row by row | `patches/0008` | -6.0% on the binary solo, ~10% in 38-rank CSD3 searches, byte-identical ([csd3-speed](csd3-speed.md), round 24) |
 | ducc0 `scanData` fast path for uniform weights | `patches/0009` | -2.5% on the binary solo, ~4.5% in 38-rank CSD3 searches, byte-identical ([csd3-speed](csd3-speed.md), round 25) |
 | Thermal noise drawn in C, numpy's PCG64 stream bit for bit | `docker/meqtrees/src/fastnoise.c` | -26% (-28ms) on simulate in 38-rank CSD3 searches, chains identical ([csd3-speed](csd3-speed.md), round 26) |
+| INTERVAL/EXPOSURE set on the template before `addrows`; antenna table unpacked only for makems | `simulate_point_source_ms.py` | -7% (-6 to -8ms) on simulate in 38-rank CSD3 searches, chains identical ([csd3-speed](csd3-speed.md), round 27) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

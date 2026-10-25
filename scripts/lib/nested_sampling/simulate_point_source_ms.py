@@ -103,10 +103,6 @@ def n_times_of(args: argparse.Namespace) -> int:
 
 def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
     output_ms.parent.mkdir(parents=True, exist_ok=True)
-    antenna_dst = output_ms.parent / ANTENNA_TABLE_NAME
-    if not antenna_dst.exists():
-        shutil.unpack_archive(Cattery_VLA_A, output_ms.parent)
-
     n_times = n_times_of(args)
     cfg = output_ms.parent / "makems.cfg"
     cfg.write_text(
@@ -135,6 +131,10 @@ def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
 
 
 def run_makems(output_ms: Path) -> None:
+    # Unpacked only here: makems is the one reader, and most evaluations
+    # extend a cached observation without running it.
+    if not (output_ms.parent / ANTENNA_TABLE_NAME).exists():
+        shutil.unpack_archive(Cattery_VLA_A, output_ms.parent)
     log_path = output_ms.parent / "makems.log"
     with log_path.open("w") as log:
         subprocess.run(
@@ -380,6 +380,11 @@ def extend_template(template: Path, observation: dict, output_ms: Path, n_times:
     with table(str(output_ms), readonly=False, ack=False) as ms:
         a1, a2 = ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2")
         n_base = len(a1)
+        # INTERVAL and EXPOSURE are IncrementalStMan columns, which carry the
+        # last row's value into added rows: set on the template's rows, they
+        # cover the whole table for ~4ms less than a putcol over every row.
+        ms.putcol("INTERVAL", np.full(n_base, observation["interval"]))
+        ms.putcol("EXPOSURE", np.full(n_base, observation["exposure"]))
         ms.addrows((n_times - 1) * n_base)
         antenna_uvw = observation["antenna_uvw"][:n_times]
         ms.putcol("UVW", (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3))
@@ -387,8 +392,6 @@ def extend_template(template: Path, observation: dict, output_ms: Path, n_times:
         ms.putcol("ANTENNA2", np.tile(a2, n_times))
         ms.putcol("TIME", np.repeat(observation["time"][:n_times], n_base))
         ms.putcol("TIME_CENTROID", np.repeat(observation["time_centroid"][:n_times], n_base))
-        ms.putcol("INTERVAL", np.full(n_times * n_base, observation["interval"]))
-        ms.putcol("EXPOSURE", np.full(n_times * n_base, observation["exposure"]))
     with table(str(output_ms / "FIELD"), readonly=False, ack=False) as field:
         for column in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME"):
             field.putcol(column, observation[f"FIELD_{column}"])
