@@ -1900,3 +1900,45 @@ goes in a 146s run:
 **Consequence for measurement.** Compare short benchmarks only with each
 other (same `NS_MAX_NDEAD`). To read steady throughput, take evaluations
 per second over the middle of the run, not `evals_per_s`. No code change.
+
+## Round 38 (diagnostic): PolyChord's root is not a large-run bottleneck
+
+**Question.** Does PolyChord's own work on rank 0 (dispatching points,
+clustering, writing `.resume`, `_dead-birth.txt` and posteriors every
+`update_files` = nlive dead points) grow into a bottleneck at production
+sizes? None of the earlier rounds measured it apart from the imagers.
+
+**Method.** A toy search in the shipped `polychord.sif`: the same settings as
+`polychord_wsclean.py` (9 dimensions, 15 repeats, async, seed 4242,
+`write_resume`), 37 ranks on cpu-q-166 (load ~30), and a likelihood that only
+sleeps for a fixed time. Each worker logs the gap between the end of one
+likelihood call and the start of the next, which is time spent waiting on
+the root. 36 workers sleeping *t* seconds set the ceiling at 36/*t* evals/s.
+
+| nlive | dead | sleep | evals | evals/s (ceiling) | mean wait | waits > 0.1s |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1000 | 1500 | 250ms | 41,541 | 141.5 (144) | 0.14ms | none over 0.26s |
+| 1000 | 1500 | 20ms | 41,472 | 1,744 (1,800) | 0.11ms | none over 0.23s |
+| 1000 | 1500 | 5ms | 41,591 | 6,615 (7,200) | 0.20ms | none over 0.25s |
+| 4000 | 20000 | 5ms | 731,612 | 6,492 (7,200) | 0.33ms | 144, 1.8-2.7s each |
+| same, chains on /rds | | | 732,082 | 6,448 | 0.35ms | 144, 1.8-2.7s each |
+| same, posteriors/equals/cluster_posteriors off | | | 732,822 | 6,552 | 0.28ms | 108, 1.4-2.2s each |
+
+**Result.** The root keeps up with ~6,500 evals/s, ~50x what a 38-rank
+WSClean search asks of it (~120) and ~200x for R2D2. Its only visible cost is
+a whole-run pause at each `update_files` write: ~2s at nlive 4000 and 20k
+dead, growing slowly with the dead count (1.8s on the first write, 2.7s on
+the last). Chains on Lustre instead of `/dev/shm` make no difference, and
+the posterior files are only ~20% of the pause, so it is mostly the
+`.resume` dump (70MB here) and clustering. Real evaluations are ~50x slower
+than the toy's, so the same nlive dead points take ~25 minutes of WSClean
+searching between writes, and a 2-3s pause per write is ~0.1-0.2% of the
+run. Turning the posterior outputs off would save a fifth of that, so there
+is nothing here worth changing. `update_files` and the posterior settings
+stay at PolyChord's defaults.
+
+**Consequence.** Worker idle time in a real search (round 37's middle deficit,
+13-16%) is not PolyChord's root. It is on the rank side: streaming retention
+(round 35) plus the evaluation itself. Large runs will scale on the
+evaluation cost. There is no benchmarks.jsonl row, because a toy likelihood
+is not a search.

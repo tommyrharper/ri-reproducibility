@@ -69,6 +69,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Meta records copied at their fixed size (no store-forwarding stall per row) | `patches/0011` | -1.0% (-1.6ms) on WSClean at 37-way in a controlled driver (two 16-arm interleaved sets, 7 of 8 ABBA blocks); in-run unresolved; byte-identical ([csd3-speed](csd3-speed.md), round 33) |
 | Unseen observations built once at the search's longest observation, not once per new longest draw | `simulate_point_source_ms.py`, `common.py` | +88% evals/s with a warm observation cache (simulate 157 -> 59ms) and +21% cold, 38-rank CSD3 WSClean searches; log(Z) and chains identical in a synchronous pair ([csd3-speed](csd3-speed.md), round 34) |
 | Ranks stop claiming failed-artefact slots once all 20 are taken | `common.py` | ~36ms less rank main-thread time per failed evaluation with 36 ranks failing at once (~15% of a WSClean evaluation in a failure storm); stage timing only, scoring untouched ([csd3-speed](csd3-speed.md), round 36) |
+| (diagnostic) PolyChord's root measured with a sleeping toy likelihood: keeps up with ~6,500 evals/s at nlive 4000/20k dead, ~50x a WSClean search's demand; its only cost is a ~2-3s pause per `update_files` write (~0.1-0.2% of a real run) | none | no change ([csd3-speed](csd3-speed.md), round 38) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
