@@ -1,0 +1,87 @@
+diff --git a/external/schaapcommon/external/ducc0/wgridder/wgridder.h b/external/schaapcommon/external/ducc0/wgridder/wgridder.h
+--- a/external/schaapcommon/external/ducc0/wgridder/wgridder.h
++++ b/external/schaapcommon/external/ducc0/wgridder/wgridder.h
+@@ -696,6 +696,68 @@ template<typename Tcalc, typename Tacc, typename Tms, typename Timg, typename Tm
+       checkShape(ms_in.shape(), {nrow,nchan});
+       checkShape(mask.shape(), {nrow,nchan});
+ 
++      // ri: the index depends only on the visibility mask, the baselines and
++      // the scalars below, and a WSClean run grids the same rows on every
++      // major cycle, so reuse the last one when all of them match exactly.
++      // Single-threaded only, where the index is built in a fixed order and
++      // the reused one is byte-identical to a rebuilt one. Grid and degrid
++      // passes share it: the index does not depend on the direction.
++      struct IndexCache
++        {
++        bool valid=false;
++        vector<double> scalars;
++        vector<uint8_t> mask;
++        vector<double> coords;
++        vector<RowchanRange> ranges;
++        vector<pair<Uvwidx, size_t>> blockstart;
++        vector<rangeset<int>> uranges, vranges;
++        };
++      thread_local IndexCache cache;
++      const bool use_cache = (nthreads==1);
++      vector<double> key_scalars;
++      if (use_cache)
++        {
++        key_scalars = {double(nrow), double(nchan), double(nu), double(nv),
++          double(supp), double(nsafe), ushift, vshift, double(maxiu0),
++          double(maxiv0), pixsize_x, pixsize_y, wshift, xdw, dw, wmin,
++          double(nplanes), double(do_wgridding), double(nvis),
++          double(max_allowed)};
++        for (size_t ch=0; ch<nchan; ++ch) key_scalars.push_back(bl.ffact(ch));
++        bool hit = cache.valid
++          && (cache.scalars.size()==key_scalars.size())
++          && (memcmp(cache.scalars.data(), key_scalars.data(), key_scalars.size()*sizeof(double))==0)
++          && (cache.mask.size()==nrow*nchan);
++        for (size_t irow=0; hit && irow<nrow; ++irow)
++          {
++          auto c = bl.baseCoord(irow);
++          const double xyz[3] = {c.u, c.v, c.w};
++          hit = (memcmp(&cache.coords[3*irow], xyz, sizeof(xyz))==0)
++             && (memcmp(&cache.mask[irow*nchan], &lmask(irow,0), nchan)==0);
++          }
++        if (hit)
++          {
++          ranges = cache.ranges;
++          blockstart = cache.blockstart;
++          uranges = cache.uranges;
++          vranges = cache.vranges;
++          lmask.dealloc();
++          timers.pop();
++          return;
++          }
++        cache.valid = false;
++        cache.scalars = key_scalars;
++        cache.mask.resize(nrow*nchan);
++        cache.coords.resize(3*nrow);
++        for (size_t irow=0; irow<nrow; ++irow)
++          {
++          auto c = bl.baseCoord(irow);
++          cache.coords[3*irow] = c.u;
++          cache.coords[3*irow+1] = c.v;
++          cache.coords[3*irow+2] = c.w;
++          memcpy(&cache.mask[irow*nchan], &lmask(irow,0), nchan);
++          }
++        }
++
+       size_t ntiles_u = (nu>>log2tile) + 3;
+       size_t ntiles_v = (nv>>log2tile) + 3;
+       size_t nwmin = do_wgridding ? nplanes-supp+3 : 1;
+@@ -919,6 +981,14 @@ timers.pop();
+             }
+           }
+         }
++      if (use_cache)
++        {
++        cache.ranges = ranges;
++        cache.blockstart = blockstart;
++        cache.uranges = uranges;
++        cache.vranges = vranges;
++        cache.valid = true;
++        }
+       timers.pop();
+       }
+ 

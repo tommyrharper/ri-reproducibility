@@ -56,6 +56,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | `schaapcommon` FFTW plan cache | `patches/0004` | -2.7% on the binary ([gridder floor](nested-sampling-gridder-floor.md)) |
 | Measurement Set read in row blocks | `patches/0005` | -2.2% on the binary ([row blocks](nested-sampling-row-blocks.md)) |
 | w-gridding turned off | `patches/0006` | -29% on the binary, at 2.3e-5 of the image peak ([gridder floor](nested-sampling-gridder-floor.md)) |
+| ducc0 gridder index reused across passes | `patches/0007` | -7.4% on the binary solo, 8-10% in 38-rank CSD3 searches, byte-identical ([csd3-speed](csd3-speed.md), round 23) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

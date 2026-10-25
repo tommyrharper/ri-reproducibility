@@ -1049,3 +1049,89 @@ the cost, and any faster generator changes the noise.
 Next: WSClean's simulate (~90ms at 36 ranks) still needs the MS. What is
 left there is noise ~20ms, the skeleton copy and fill, and the
 visibility `exp`, and each of those levers changes bits (round 15).
+
+## Round 23: WSClean reuses ducc0's gridder index (patch 0007)
+
+**Profile.** A 38-rank WSClean search (nlive 150, 150 dead points, async,
+seed 4242), read with `./ri profile --phases` over 56 logged evaluations:
+
+| phase | ms/eval | passes/eval | ms each |
+| --- | ---: | ---: | ---: |
+| Gridding | 43.9 | 4.68 | 9.4 |
+| Loading data in memory | 33.9 | 4.68 | 7.2 |
+| Predicting | 25.7 | 2.68 | 9.6 |
+| Reordering | 20.7 | 1.00 | 20.7 |
+| Loading metadata | 11.9 | 2.68 | 4.4 |
+
+A median evaluation here grids ~40k rows x 5 channels (200k visibilities),
+against 4,914 on the Hetzner host. So ducc0's per-pass bookkeeping is no
+longer small. `perf record` on one evaluation's `wsclean`, run 6 times pinned
+to one CPU, with symbols from the SIF's own `/opt` and `/lib` copied out and
+passed as `--symfs`: of the binary's CPU, the gridding and degridding kernels
+take ~27%, ducc0's index build (`countRanges`) ~11%, its `scanData` ~5%, and
+the reordered-file row reads plus weighting ~9%.
+
+**Change.** `docker/wsclean/patches/0007` caches the last index built by
+`countRanges` and reuses it when the visibility mask, the baselines, the
+frequencies and every scalar the index depends on match byte for byte (see
+[the patches doc](nested-sampling-wsclean-patches.md)). It applies only to
+single-threaded gridding (`-j 1`, which the search uses), where the index is
+deterministic.
+
+**Building it without Docker.** This node can build and A/B a WSClean patch
+on its own, in ~5 minutes. Nothing here needs root or a Docker host:
+
+```sh
+export APPTAINER_CACHEDIR=/dev/shm/c APPTAINER_TMPDIR=/dev/shm/t
+apptainer build --fakeroot --sandbox /dev/shm/build docker://debian:bookworm-slim
+apptainer exec --fakeroot --writable /dev/shm/build apt-get install -y g++ cmake ...  # the Dockerfile's build list
+# copy /opt/casacore out of wsclean.sif into the sandbox, then clone v3.7,
+# git apply the patches and cmake -DPORTABLE=OFF -DTARGET_CPU=x86-64-v3 (84s with 30 jobs)
+apptainer build --fakeroot wsclean.sif idx.def  # Bootstrap: localimage, %files over /opt/wsclean/bin
+```
+
+A run picks the new image up from a `SIF_DIR` that holds it plus symlinks to
+the other three SIFs. A derived SIF keeps its parent's `ri.build-inputs`
+label, so both arms get the same image id in `benchmarks.jsonl`. Tell them
+apart with the row's `note`. The base binary built this way gives output
+byte-identical to the shipped `wsclean.sif` and the same solo time
+(189.0 vs 189.5ms median).
+
+**Evidence.**
+
+- Byte-identity: the restored, model, residual and PSF FITS data blocks match
+  the shipped binary's for 6 Measurement Sets taken from real draws
+  (17k-202k rows, 3-4 major cycles). That is 24 of 24.
+- Solo, pinned, 20 interleaved rounds on one MS: 175.0ms median against
+  189.0 (local base) and 189.5 (shipped), -7.4%.
+- In-run, 38 ranks, nlive 150, 300 dead points, async, seed 4242, ABBA order.
+  Binary time is fitted per run as `a + b x timestep-channels` and read at
+  1k (`.probe/fit16.py`), as in round 16:
+
+| arm | evals | whole-run evals/s | simulate @1k | `wsclean` @1k | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| base | 6637 | 51.6 | 112.0ms | 268.8ms | 0.09574 +/- 0.00162 |
+| 0007 | 6692 | 77.6 | 112.2ms | 245.3ms | 0.09549 +/- 0.00159 |
+| 0007 | 6712 | 61.6 | 113.3ms | 252.2ms | 0.09527 +/- 0.00160 |
+| base | 6788 | 52.5 | 108.9ms | 277.7ms | 0.09549 +/- 0.00164 |
+| base, synchronous, 150 dead | 3415 | 23.9 | 111.0ms | 273.1ms | 0.09424 +/- 0.00279 |
+| 0007, synchronous, 150 dead | 3415 | 24.9 | 110.0ms | 246.3ms | 0.09424 +/- 0.00279 |
+
+The `wsclean` binary is 8-10% faster in every pair, and the arms do not
+overlap. Simulate does not change. At ~300ms of worker time per evaluation
+that is ~7-8% of WSClean throughput. Whole-run evals/s follows the tail
+(round 14) and is not the measure. The synchronous pair is identical: same
+log(Z), and every dead-point, prior and equal-weights chain file is
+byte-identical. Only `phys_live.txt` differs, in its line order, not its
+contents.
+
+**To ship on CSD3:** the patch only takes effect once `wsclean.sif` is
+rebuilt on a Docker host (`./ri build wsclean`, `./ri images export`) and
+imported here. `./ri search` uses whatever SIF is in `SIF_DIR`.
+
+Next: `scanData` (~5%) runs on every pass only to rebuild the mask the cache
+compares against. Skipping it needs the mask proven unchanged some other way.
+The reordered-file row reads ("Loading data in memory" and "Loading
+metadata", ~46ms/eval in-run at 7.4 passes) are three small `istream` reads
+per row. Reading each part into memory once per process is upstream-shaped
+and would keep results byte-identical.

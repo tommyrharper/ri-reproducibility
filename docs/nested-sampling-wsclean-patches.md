@@ -270,3 +270,30 @@ Upstream-shaped only in the trivial sense that it is a one-word change;
 upstream would not take it, because `do_wgridding` is a parameter and turning
 it off unconditionally is wrong for any field wide enough to need it. Revert
 by deleting the patch file - nothing else refers to it.
+
+## 0007: reuse ducc0's gridder index across passes
+
+ducc0 builds a tile index (`countRanges()` in
+`external/schaapcommon/external/ducc0/wgridder/wgridder.h`) on every gridding
+and degridding pass, and a WSClean evaluation makes ~7 passes over the same
+rows: PSF, then one grid and one degrid per major cycle. The index depends
+only on the visibility mask `scanData()` has just built, the baselines, the
+channel frequencies and the gridder's scalars (grid size, kernel support,
+shifts, pixel sizes, visibility count). The patch keeps the last index in a
+`thread_local` cache, keyed on all of those compared byte for byte, and
+reuses it when they match. Grid and degrid share the entry, because the index
+does not depend on the direction. The cache only works with one ducc0
+thread (`-j 1`, as the search runs). There the index is built in a fixed
+order, so a reused index is byte-identical to a rebuilt one. With more
+threads the patch does nothing.
+
+At CSD3's 9-parameter sizes (~40k rows x 5 channels for a median
+evaluation), `countRanges` was ~11% of the `wsclean` binary's CPU in `perf`.
+The patch measured -7.4% on the binary solo and ~-9% in 38-rank searches,
+with the restored, model, residual and PSF data blocks byte-identical and
+log(Z) identical in a synchronous pair. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 23.
+
+Upstream-shaped: it changes nothing ducc0 computes. Upstream ducc0 would
+more likely expose the index as a reusable object than hide a cache in the
+constructor.
