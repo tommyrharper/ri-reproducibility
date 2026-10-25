@@ -336,7 +336,7 @@ def submit(args: argparse.Namespace) -> int:
     if args.mpi_procs is not None:
         env["NS_MPI_PROCS"] = str(args.mpi_procs)
     script = (". scripts/lib/defaults.sh; . scripts/lib/rank-budget.sh; . scripts/lib/slurm.sh; "
-              'mb="${NS_WSCLEAN_MB_PER_RANK}"; [ "$1" = r2d2 ] && mb="${NS_R2D2_MB_PER_RANK}"; '
+              'mb="${NS_WSCLEAN_MB_PER_RANK}"; [ "$1" = r2d2 ] && mb="${NS_R2D2_MB}"; '
               'ns_submit_run "$2" "${mb}" "${@:3}"')
     returncode = subprocess.run(
         ["bash", "-c", script, "bench", args.imager, str(job_dir),

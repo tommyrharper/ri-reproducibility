@@ -54,7 +54,7 @@ if ns_should_submit; then
   if [ "${R2D2_DEVICE}" = cuda ]; then
     NS_SLURM_GPUS=1
   fi
-  NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB_PER_RANK}" scripts/run-nested-sampling-r2d2.sh \
+  NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
   exit 0
 fi
@@ -101,11 +101,11 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_MPI_PROCS}" -gt "${NS_R2D2_MAX_RANKS}" ]; then
     NS_MPI_PROCS="${NS_R2D2_MAX_RANKS}"
   fi
-  NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2)"
+  NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2)"
 else
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
-  ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB_PER_RANK}" r2d2
+  ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2
 fi
 
 if [ -z "${R2D2_OMP_THREADS:-}" ]; then

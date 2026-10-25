@@ -334,8 +334,9 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
 - One node per job. `icelake` is 76 cores x 3370MiB (256GB), `icelake-himem`
   6760MiB per core (512GB); `sapphire` 112 cores x 4580MiB (512GB). A
   `--mem` above the cores' share is granted by allocating (and charging)
-  more cores. R2D2 needs
-  ~3.4GB per rank, so `--mem` sets the rank count, not `-c`.
+  more cores. R2D2 needs ~4.2GB once plus
+  ~0.4GB per rank (the workers share the checkpoints after the fork;
+  `docs/csd3-speed.md`, round 18), so on CPU nodes the cores set the rank count.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the
   run scripts needs no change. `NS_R2D2_MAX_RANKS` (56) caps an R2D2 job;
   it was measured on a whole sapphire node (`docs/csd3-experiments.md`, E4).

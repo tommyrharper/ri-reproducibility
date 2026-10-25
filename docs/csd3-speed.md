@@ -867,3 +867,67 @@ Next, in order:
    becomes one rank per CPU.
 2. Cap `R2D2_MAX_THREADS` (e.g. 16, or one socket) and A/B the tail.
 3. On a whole node, test ranks above the 56 cap, up to one per CPU.
+
+## Round 18: R2D2 memory is shared, so the default is one rank per CPU
+
+All on cpu-q-553 (this job's 38 CPUs, 128GB) at `d7afc57` plus this change.
+nlive 150, 15 repeats, 150 dead points, async, seed 4242 (`.probe/r18.sh`,
+windows from `.probe/r17an.py`, tails from `.probe/tail18.py`).
+
+**The old default against 38 x 1, interleaved.** With 3,500MB a rank the
+budget clamped a default run to 35 ranks x 2 threads (70 threads on 38 CPUs):
+
+| arm | run | steady evals/s (30-90s) | wall | log(Z) |
+| --- | --- | --- | ---: | --- |
+| old default, 35 x 2 | 1 | 26.6, 26.6 | 194s | 0.01481 +/- 0.00337 |
+| 38 x 1 | 2 | 31.9, 31.9 | 149s | 0.01468 +/- 0.00340 |
+| old default, 35 x 2 | 3 | 26.5, 27.4 | 164s | 0.01467 +/- 0.00343 |
+| 38 x 1 | 4 | 30.9, 29.6 | 141s | 0.01465 +/- 0.00342 |
+
+So one rank per CPU is ~15% faster at steady state, with 36.9 of 37 workers
+busy against 33.9 of 34. log(Z) agrees in every run.
+
+**Memory.** Peak RSS of the job's cgroup (`total_rss` in `memory.stat`,
+which counts a page shared after a fork once), sampled every 5s:
+
+| ranks | peak RSS |
+| ---: | ---: |
+| 8 | 7.7GB |
+| 35 | 19.1GB |
+| 38 | 18.2, 19.1, 21.0GB |
+
+That is ~4.2GB paid once (the pool parent's checkpoints, which every
+worker shares after the fork) plus 0.35-0.44GB a rank. The 5.8GB of
+checkpoint files also sit in the cgroup's page cache, which is reclaimable.
+The old 3,500MB a rank came from the Hetzner host, where each rank held its
+own copy.
+
+**The change.** `rank-budget.sh` now takes memory as `SHARED+PER`:
+`NS_R2D2_SHARED_MB` 8000 plus `NS_R2D2_MB_PER_RANK` 600 (both rounded up
+from the table, `NS_R2D2_MB` joins them). `ns_budget_ranks`,
+`ns_budget_warn_if_over`, the retry re-sizing and `ns_submit_run`'s `--mem`
+count the shared part once. A default run on this half node now takes 38
+ranks at 1 thread (needing 30.8GB, against the 21GB measured), and the
+`--mpi-procs 38` OOM warning is gone. A whole 76-core node still stops at
+`NS_R2D2_MAX_RANKS` (56). WSClean is unchanged (one number is `PER`). A
+default run on the new code: 38 x 1, steady 30.5 and 29.7 evals/s, log(Z)
+0.01452 +/- 0.00351.
+
+**The tail is now the larger cost in short runs.** After 95% of a run's
+evaluations, the last few run with round 9's adaptive threads, up to 38 each.
+Over five uncapped 38 x 1 runs that tail took 33, 44, 57, 113 and 119s, and
+single late requests took up to 25s. With `R2D2_MAX_THREADS=16` (two runs,
+interleaved with two of the uncapped ones) it took 38 and 45s, with no late
+request over 4.2s. This matches round 17's lone-request table, where 16
+threads beat 38. So whole-run wall times in this 3k-evaluation shape are
+noisy: 141-225s for 38 x 1 against 164-194s for 35 x 2. In a production run
+the tail is a fixed minute or two, and the steady state is what scales. Two
+capped runs is not enough to ship the cap, so it is the next A/B.
+
+Next, in order:
+
+1. A/B `R2D2_MAX_THREADS=16` (or one socket) against the uncapped tail, with
+   at least five runs an arm, since the uncapped tail is bimodal (33-57s or
+   113-119s).
+2. On a whole node, test ranks above the 56 cap, up to one per CPU. Memory
+   no longer limits it (76 ranks is ~54GB by the model above).

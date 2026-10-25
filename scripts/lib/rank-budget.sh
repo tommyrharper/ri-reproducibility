@@ -1,12 +1,19 @@
 # shellcheck shell=bash  # sourced, so no shebang
 # Clamp rank count to memory; reservations prevent concurrent overcommit.
-# Source this, then call `ns_budget_ranks <requested> <MB per rank> <label>`.
+# Source this, then call `ns_budget_ranks <requested> <memory> <label>`, where
+# <memory> is MB per rank, or `SHARED+PER` for a run whose ranks share SHARED MB.
 # NS_RANK_BUDGET_DIR and NS_AVAILABLE_MB override state for checks.
 # ponytail: a fixed MB-per-rank measured on one host, not a live measurement.
 # Re-measure after a material change to the imaging stack's resident set.
 
-# Rounded-up warm-worker RSS estimates from this repo's images.
-NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-3500}"
+# Rounded-up warm-worker RSS estimates from this repo's images. R2D2's pool
+# parent loads the checkpoints once and forks every rank's worker from it, so
+# the run pays them once (SHARED) and each rank only its own working set
+# (docs/csd3-speed.md, round 18).
+NS_R2D2_SHARED_MB="${NS_R2D2_SHARED_MB:-8000}"
+NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-600}"
+# shellcheck disable=SC2034  # read by the scripts that source this
+NS_R2D2_MB="${NS_R2D2_SHARED_MB}+${NS_R2D2_MB_PER_RANK}"
 NS_WSCLEAN_MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK:-200}"
 
 # Left free for the OS, the page cache and the non-worker parts of a run.
@@ -15,6 +22,13 @@ NS_RANK_BUDGET_HEADROOM_MB="${NS_RANK_BUDGET_HEADROOM_MB:-4096}"
 # torch to import and the first evaluations to reach a steady resident set;
 # short enough that a later run is sized from MemAvailable instead.
 NS_RANK_BUDGET_RESERVE_SECONDS="${NS_RANK_BUDGET_RESERVE_SECONDS:-60}"
+
+# MB that <ranks> ranks of <memory> (`PER` or `SHARED+PER`) need.
+ns_mb_for_ranks() {
+  local ranks="$1" memory="$2" shared=0
+  case "${memory}" in *+*) shared="${memory%%+*}" memory="${memory#*+}" ;; esac
+  printf '%s\n' "$((shared + ranks * memory))"
+}
 
 _ns_available_mb() {
   if [ -n "${NS_AVAILABLE_MB:-}" ]; then
@@ -162,7 +176,7 @@ ns_reap_leaked_sidecars() {
 
 # Echoes the rank count to use. Never more than requested, never less than 1.
 ns_budget_ranks() {
-  local requested="$1" mb_per_rank="$2" label="$3"
+  local requested="$1" memory="$2" label="$3" shared mb_per_rank
   local dir="${NS_RANK_BUDGET_DIR:-${TMPDIR:-/tmp}/ri-ns-rank-budget-$(id -u)}"
   local available reserved=0 budget affordable now entry pid expiry mb
 
@@ -206,7 +220,9 @@ ns_budget_ranks() {
     reserved=$((reserved + mb))
   done
 
-  budget=$((available - reserved - NS_RANK_BUDGET_HEADROOM_MB))
+  shared="$(ns_mb_for_ranks 0 "${memory}")"
+  mb_per_rank="$(($(ns_mb_for_ranks 1 "${memory}") - shared))"
+  budget=$((available - reserved - NS_RANK_BUDGET_HEADROOM_MB - shared))
   affordable=$((budget / mb_per_rank))
 
   if [ "${affordable}" -lt "${requested}" ]; then
@@ -215,7 +231,8 @@ ns_budget_ranks() {
       # sampling the OOM killer instead of the algorithm.
       echo "FATAL: not enough free memory for a single ${label} rank:" \
         "${available}MB available, ${reserved}MB reserved by other runs," \
-        "${NS_RANK_BUDGET_HEADROOM_MB}MB headroom, ${mb_per_rank}MB needed per rank." \
+        "${NS_RANK_BUDGET_HEADROOM_MB}MB headroom, ${shared}MB shared and" \
+        "${mb_per_rank}MB per rank needed." \
         "Sidecars left by a dead run were already removed, so this is memory" \
         "something live is holding: wait for the other runs to finish," \
         "or see ./ri health." >&2
@@ -226,12 +243,12 @@ ns_budget_ranks() {
     # be its own surprise, and this is the line that explains a slow run.
     echo "NOTE: ${label} ranks ${requested} -> ${affordable}" \
       "(${available}MB available, ${reserved}MB reserved by other runs," \
-      "${mb_per_rank}MB per rank)" >&2
+      "${shared}MB shared + ${mb_per_rank}MB per rank)" >&2
     requested="${affordable}"
   fi
 
   printf '%s %s\n' "$((now + NS_RANK_BUDGET_RESERVE_SECONDS))" \
-    "$((requested * mb_per_rank))" >"${dir}/$$"
+    "$(ns_mb_for_ranks "${requested}" "${memory}")" >"${dir}/$$"
   _ns_unlock "${dir}"
 
   printf '%s\n' "${requested}"
@@ -240,14 +257,15 @@ ns_budget_ranks() {
 # Warn, but obey: an explicit NS_MPI_PROCS is the caller saying they know
 # better than the guard, and that is theirs to decide.
 ns_budget_warn_if_over() {
-  local requested="$1" mb_per_rank="$2" label="$3"
-  local available
+  local requested="$1" memory="$2" label="$3"
+  local available needed
   ns_reap_leaked_sidecars
   _ns_available_mb >/dev/null 2>&1 || return 0
   available="$(_ns_available_mb)"
-  if [ "$((requested * mb_per_rank))" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
+  needed="$(ns_mb_for_ranks "${requested}" "${memory}")"
+  if [ "${needed}" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
     echo "WARNING: ${label} was asked for ${requested} ranks," \
-      "~$((requested * mb_per_rank))MB, with only ${available}MB available." \
+      "~${needed}MB, with only ${available}MB available." \
       "An evaluation the OOM killer takes is never scored, so this costs the" \
       "run rather than the result: the attempt is retried against a fresh" \
       "worker and then the run stops, to be picked up with ./ri resume" \
@@ -350,6 +368,19 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   PATH="${_orphan_dir}/bin:${PATH}" SLURM_JOB_ID=4242 ns_run_is_live "${_orphan_run}" \
     && { echo "FAIL: the run's own job must not count as a rival"; exit 1; }
   rm -rf "${_orphan_dir}"
+
+  # Shared memory is paid once: 40960 - 4096 headroom - 8000 shared = 28864,
+  # 72 ranks of 400, where 3400 a rank would allow 10.
+  [ "$(ns_mb_for_ranks 3 8000+400)" = 9200 ]
+  [ "$(ns_mb_for_ranks 3 400)" = 1200 ]
+  [ "$(ns_budget_ranks 100 8000+400 r2d2 2>/dev/null)" = 72 ]
+  [ "$(awk '{print $2}' "${NS_RANK_BUDGET_DIR}/$$")" = 36800 ]
+  clear_reservations
+  NS_AVAILABLE_MB=12000 ns_budget_ranks 1 8000+400 r2d2 >/dev/null 2>&1 && {
+    echo "FAIL: one rank granted when the shared 8000MB does not fit"; exit 1
+  }
+  clear_reservations
+  [ -n "$(ns_budget_warn_if_over 2 40000+1 r2d2 2>&1)" ]
 
   ns_budget_warn_if_over 8 3400 r2d2 2>/dev/null
   [ -n "$(ns_budget_warn_if_over 20 3400 r2d2 2>&1)" ]

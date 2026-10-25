@@ -21,7 +21,7 @@ ns_should_submit() {
   [ -z "${SLURM_JOB_ID:-}" ] && [ "${NS_SBATCH:-1}" = 1 ] && command -v sbatch >/dev/null 2>&1
 }
 
-# ns_submit_run <run dir> <MB per rank> <command...>
+# ns_submit_run <run dir> <memory> <command...>, memory as rank-budget.sh spells it
 #
 # One node, one task (mpirun forks the ranks), named after the run so squeue
 # and ns_run_is_live can find it, stdout beside the run's own logs. With an
@@ -36,7 +36,7 @@ ns_should_submit() {
 # a directory of its own. sbatch still reads SBATCH_* from this shell. Paths
 # are physical: the job's REPO_ROOT is, and the settings' directories are.
 ns_submit_run() {
-  local run_dir="$1" mb_per_rank="$2" cmd size repo="${REPO_ROOT}" settings phys
+  local run_dir="$1" memory="$2" shared=0 cmd size repo="${REPO_ROOT}" settings phys
   shift 2
   # A -CPU project has no GPU hours, and sbatch's own refusal does not say so.
   if [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
@@ -57,8 +57,9 @@ ns_submit_run() {
     size=(--gres "gpu:${NS_SLURM_GPUS}" --cpus-per-task "$((32 * NS_SLURM_GPUS))")
     export SBATCH_PARTITION="${SBATCH_PARTITION:-ampere}"
   elif [ -n "${NS_MPI_PROCS:-}" ]; then
+    case "${memory}" in *+*) shared="${memory%%+*}" memory="${memory#*+}" ;; esac
     size=(--cpus-per-task "${NS_MPI_PROCS}"
-          --mem "$((NS_MPI_PROCS * mb_per_rank + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
+          --mem "$((shared + NS_MPI_PROCS * memory + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
   else
     # Not --mem 0: CSD3's sbatch refuses it. --exclusive already brings every
     # core's default memory, i.e. the node.
@@ -161,14 +162,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   grep -q UNRELATED "${_run}/.job-settings.env" \
     && { echo "FAIL: only run settings may reach the job: $(cat "${_run}/.job-settings.env")"; exit 1; }
   unset UNRELATED
-
-  # An explicit rank count sizes the job instead of taking the node, and the
-  # caller's partition and time are left alone.
+  # An explicit rank count sizes the job (shared memory once, plus per rank)
+  # instead of taking the node, and the caller's partition and time are left alone.
   SBATCH_PARTITION=sapphire SBATCH_TIMELIMIT=01:00:00 NS_MPI_PROCS=4 \
-    ns_submit_run "${_run}" 3500 scripts/run-nested-sampling-r2d2.sh >/dev/null
+    ns_submit_run "${_run}" 8000+600 scripts/run-nested-sampling-r2d2.sh >/dev/null
   _args="$(tr '\n' ' ' <"${_dir}/args")"
   case "${_args}" in
-    *"--nodes 1 --ntasks 1 --cpus-per-task 4 --mem 18096 --wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling-r2d2.sh"*) ;;
+    *"--nodes 1 --ntasks 1 --cpus-per-task 4 --mem 14496 --wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling-r2d2.sh"*) ;;
     *) echo "FAIL: NS_MPI_PROCS must size the job, got: ${_args}"; exit 1 ;;
   esac
   case "${_args}" in

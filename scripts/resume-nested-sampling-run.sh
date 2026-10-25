@@ -174,7 +174,7 @@ export OUTPUT_DIR="${RUN_DIR}"
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"
-        MB_PER_RANK="${NS_R2D2_MB_PER_RANK}" ;;
+        MB_PER_RANK="${NS_R2D2_MB}" ;;
   wsclean) RUN_SCRIPT="scripts/run-nested-sampling.sh"
         MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK}" ;;
   *)

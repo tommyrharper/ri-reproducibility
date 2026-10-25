@@ -170,7 +170,7 @@ _ns_retry_rank_count() {
   for arg in "$@"; do
     case "${prev}" in -np) current="${arg}" ;; esac
     case "${arg}" in
-      *polychord_r2d2.py) mb="${NS_R2D2_MB_PER_RANK}" label=r2d2 ;;
+      *polychord_r2d2.py) mb="${NS_R2D2_MB}" label=r2d2 ;;
       *polychord_wsclean.py) mb="${NS_WSCLEAN_MB_PER_RANK}" label=wsclean ;;
     esac
     prev="${arg}"
@@ -1115,12 +1115,13 @@ self_check() {
     mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
     echo "$*" >>"$0"/attempts; exit 5'
   status=0
-  # 4096MB of headroom plus two R2D2 ranks, against a command asking for 8.
+  # 4096MB of headroom, R2D2's shared memory and two of its ranks, against a
+  # command asking for 8.
   # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
   # gets its own budget dir and free-memory reading and leaks neither
   (
     export NS_RANK_BUDGET_DIR="${tmp}/budget"
-    export NS_AVAILABLE_MB=$((4096 + 2 * 3500))
+    export NS_AVAILABLE_MB=$((4096 + NS_R2D2_SHARED_MB + 2 * NS_R2D2_MB_PER_RANK))
     run_with_retries 1 "${resize_dir}" -1 2 -- sh -c "${recording}" "${resize_dir}" \
       -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
   ) >/dev/null 2>&1 || status=$?
