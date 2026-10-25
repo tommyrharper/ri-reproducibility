@@ -39,6 +39,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def write_r2d2_mat(
+    mat_path: Path,
+    vis: np.ndarray,
+    uvw: np.ndarray,
+    freqs_hz: np.ndarray,
+    row_weight: np.ndarray,
+    noise_sigma_jy: float,
+) -> None:
+    """The .mat from arrays in memory: `vis` is one correlation, rows x channels.
+    The simulator calls this directly with what it just wrote to the MS, which
+    skips re-reading it (docs/csd3-speed.md, round 13)."""
+    n_chan = vis.shape[1]
+    u_lambda = (uvw[:, 0, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
+    v_lambda = (uvw[:, 1, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
+    y = np.asarray(vis, dtype=np.complex128).reshape(-1)
+    # Convert MS inverse-variance weights to R2D2 nW, applying simulated sigma.
+    nW = np.repeat(np.sqrt(np.asarray(row_weight, dtype=np.float64)) / noise_sigma_jy, n_chan)
+
+    mat_path.parent.mkdir(parents=True, exist_ok=True)
+    savemat(
+        str(mat_path),
+        {
+            "u": u_lambda.reshape(-1, 1),
+            "v": v_lambda.reshape(-1, 1),
+            "y": y.reshape(-1, 1),
+            "nW": nW.reshape(-1, 1),
+        },
+        # Small per-evaluation MAT; compression costs more CPU than its I/O saves.
+        do_compression=False,
+    )
+
+
 def ms_to_r2d2_mat(
     ms_path: Path,
     mat_path: Path,
@@ -63,29 +95,10 @@ def ms_to_r2d2_mat(
     with table(str(ms_path / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
         freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
 
+    write_r2d2_mat(mat_path, vis, uvw, freqs_hz, weight[:, corr_index], noise_sigma_jy)
     n_rows, n_chan = vis.shape
-    row_weight = weight[:, corr_index]
-
-    u_lambda = (uvw[:, 0, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
-    v_lambda = (uvw[:, 1, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
-    y = vis.reshape(-1)
-    # Convert MS inverse-variance weights to R2D2 nW, applying simulated sigma.
-    nW = np.repeat(np.sqrt(row_weight) / noise_sigma_jy, n_chan)
-
-    mat_path.parent.mkdir(parents=True, exist_ok=True)
-    savemat(
-        str(mat_path),
-        {
-            "u": u_lambda.reshape(-1, 1),
-            "v": v_lambda.reshape(-1, 1),
-            "y": y.reshape(-1, 1),
-            "nW": nW.reshape(-1, 1),
-        },
-        # Small per-evaluation MAT; compression costs more CPU than its I/O saves.
-        do_compression=False,
-    )
     return {
-        "visibility_count": int(y.size),
+        "visibility_count": int(vis.size),
         "channel_count": int(n_chan),
         "row_count": int(n_rows),
         "corr_index": int(corr_index),

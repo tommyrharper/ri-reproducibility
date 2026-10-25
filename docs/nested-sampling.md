@@ -585,11 +585,12 @@ each evaluation was 1.5x cheaper. The R2D2 arms happened to stay level (44, 43,
 
 R2D2-RI reads visibilities from a MATLAB `.mat` file via `load_data_to_tensor()`
 in the upstream `src/utils.py`. The nested-sampling simulator produces a CASA
-Measurement Set (`sim.ms`) that WSClean consumes directly. The R2D2 run adds
-`scripts/lib/nested_sampling/ms_to_r2d2_mat.py`, which the rank's simulate
-worker runs in-process inside the MeqTrees sidecar (python3-casacore plus
-scipy), and which writes the minimal field set R2D2 loads without flag
-metadata:
+Measurement Set (`sim.ms`) that WSClean consumes directly. For the R2D2 run
+the simulate request also writes `r2d2_data.mat` (`--mat-path`) from the arrays
+it just put in the MS, through `write_r2d2_mat()` in
+`scripts/lib/nested_sampling/ms_to_r2d2_mat.py`; that script still converts any
+MS standalone. Either way the file holds the minimal field set R2D2 loads,
+without flag metadata:
 
 | Field | Meaning |
 |---|---|
@@ -597,7 +598,7 @@ metadata:
 | `y` | Complex visibilities for correlation index 0 (parallel-hand Stokes I) |
 | `nW` | `sqrt(WEIGHT)` from the MS, divided by `--noise-sigma-jy` |
 
-The simulator leaves `WEIGHT` at makems' 1.0 rather than writing `1/sigma^2` into every row - it is one number for the whole MS, and writing it was a third of the simulate stage. `polychord_r2d2.py` passes the sigma from the evaluation's `simulation.json` (`noise.complex_sigma_jy`) as `--noise-sigma-jy`, so `nW` comes out exactly where the column used to put it. The default of 1.0 takes `WEIGHT` at face value, which is what a Measurement Set carrying real weights wants.
+The simulator leaves `WEIGHT` at makems' 1.0 rather than writing `1/sigma^2` into every row - it is one number for the whole MS, and writing it was a third of the simulate stage. The simulator applies its own sigma (recorded as `noise.complex_sigma_jy` in `simulation.json`; the standalone script takes it as `--noise-sigma-jy`), so `nW` comes out exactly where the column used to put it. The default of 1.0 takes `WEIGHT` at face value, which is what a Measurement Set carrying real weights wants.
 
 Imaging weights are generated inside R2D2 when `data_weighting: True` in the
 per-evaluation YAML config. The converter does not replicate the bundled

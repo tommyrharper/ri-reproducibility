@@ -615,3 +615,50 @@ never writes it. If simulate wrote the `.mat` itself from the arrays it
 already holds, with the WEIGHT it knows, most of the remaining
 25-170ms/eval would go, along with one worker round trip. That is the next
 small R2D2 target. Its byte-identity check is the same as above.
+
+## Round 13: simulate writes the `.mat`
+
+**Change.** Round 12's next target. The R2D2 run used to send each
+evaluation's simulate worker two requests: simulate (write the MS), then
+convert (open the MS again, read DATA, UVW, WEIGHT and the SPW, write
+`r2d2_data.mat`). Now `simulate_measurement_set(..., r2d2_mat=True)` adds
+`--mat-path`, and the simulator writes the `.mat` from the arrays it just put
+in the MS: the complex64 DATA (correlation 0), the UVW it read, its own
+frequencies and noise sigma, and WEIGHT = 1.0, which makems leaves there and
+`self_check_noise_weighting` asserts. `write_r2d2_mat()` in
+`ms_to_r2d2_mat.py` is the one writer for both paths. The script still
+converts any MS standalone. The convert request, its worker action and
+`convert_ms_to_mat()` are gone, and so is the `convert` stage in new runs'
+records. Reports already handle a missing stage.
+
+**Stage timing.** `.probe/mat13.py` in `meqtrees.sif`, run in-process on
+the round-1 parameter sets. Each set gets an untimed warm-up run of both
+arms, then 2 timed repeats with old and new alternating. The old arm is
+simulate plus `ms_to_r2d2_mat()`. The new arm is simulate with `--mat-path`.
+Neither arm includes the worker round trip that the change also removes:
+
+| sets | old (simulate + convert) | new (simulate --mat-path) | paired saving | `.mat` arrays |
+| --- | ---: | ---: | ---: | --- |
+| 48 typical, 96 pairs | 69.1ms mean / 49.2 median | 50.3 / 34.0 | 18.8ms | identical, 96/96 |
+| 6 heavy, 12 pairs | 753.8ms / 753.8 | 649.3 / 670.7 | 104.4ms | identical, 12/12 |
+
+"Identical" means that `u`, `v`, `y` and `nW` match in dtype and byte for
+byte. `self_check_noise_weighting` now checks the same thing on every
+`./ri self-check simulate`.
+
+**End to end.** Production shape (24x1, async, nlive 25, 40 dead points,
+seed 4242, steady-state retention) on cpu-q-553, with arms in the order
+new/base/base/new. Base is `81bec61` unpacked with `git archive`.
+
+| arm | evals/s | simulate | convert | simulate + convert | R2D2 | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| new (first in job, cold) | 12.9 | 110.1ms | - | 110.1ms | 954ms | -0.00195 |
+| base | 14.2 | 93.8 | 32.3 | 126.1 | 860 | -0.00195 |
+| base | 16.0 | 86.3 | 29.2 | 115.5 | 883 | -0.00195 |
+| new | 16.1 | 104.3 | - | 104.3 | 887 | -0.00195 |
+
+With 24 ranks running at once, the warm in-run saving is 11-22ms of worker
+time per evaluation, ~1.5% of a ~1s evaluation. That is too small to show in
+evals/s at the ~5% spread of short runs, so the stage timing
+above is the evidence. log(Z) is the same in all four runs. The R2D2
+request is now ~88% of worker time per evaluation, and simulate is ~10%.

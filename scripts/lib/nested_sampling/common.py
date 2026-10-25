@@ -2292,6 +2292,7 @@ def simulate_measurement_set(
     eval_dir: Path,
     meqtrees_image: str,
     platform: str,
+    r2d2_mat: bool = False,
 ) -> tuple[Path, list[str], subprocess.CalledProcessError | None]:
     eval_dir.mkdir(parents=True, exist_ok=False)
     scratch = evaluation_scratch_dir(eval_dir)
@@ -2342,6 +2343,10 @@ def simulate_measurement_set(
         "--predict-wait-seconds",
         str(predict_wait_seconds(n_times)),
     ]
+    if r2d2_mat:
+        # Written by the simulate request itself, beside the MS: a separate
+        # convert request re-read the MS for 25ms typical, 170ms heavy (round 13).
+        sim_cmd += ["--mat-path", str(work / "r2d2_data.mat")]
     returncode = simulate_worker_request(
         meqtrees_image,
         platform,
@@ -2352,25 +2357,6 @@ def simulate_measurement_set(
     if returncode != 0:
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
-
-
-def convert_ms_to_mat(
-    argv: list[str],
-    work_dir: Path,
-    meqtrees_image: str,
-    platform: str,
-) -> int:
-    return simulate_worker_request(
-        meqtrees_image,
-        platform,
-        {
-            "action": "convert",
-            "argv": argv,
-            "stdout": str(work_dir / "convert.stdout.log"),
-            "stderr": str(work_dir / "convert.stderr.log"),
-        },
-        work_dir / "convert.stderr.log",
-    )
 
 
 def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:

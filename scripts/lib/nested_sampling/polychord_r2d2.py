@@ -29,7 +29,6 @@ from common import (
     compute_image_metrics,
     image_dim,
     image_pixel_size_arcsec,
-    convert_ms_to_mat,
     load_evaluations_from_dir,
     load_parameter_space,
     mark_evaluation_start,
@@ -140,7 +139,9 @@ def evaluate(
     # Open interval lets profiler separate PolyChord time from idle time.
     mark_evaluation_start()
     sim_start = time.perf_counter()
-    ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
+    ms_path, sim_cmd, sim_error = simulate_measurement_set(
+        params, eval_dir, args.meqtrees_image, args.platform, r2d2_mat=True
+    )
     simulate_seconds = time.perf_counter() - sim_start
     # Dead worker is host failure, not an algorithm score.
     if sim_error is not None and sim_error.returncode == WORKER_DIED:
@@ -159,8 +160,7 @@ def evaluate(
     # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
     # have to be told the cell size it used. Same figure WSClean is handed as
     # `-scale`, from the same recorded baseline, so the two score the same sky
-    # - see image_pixel_size_arcsec() in common.py. Read here rather than after
-    # the convert because the convert needs this file's noise sigma too.
+    # - see image_pixel_size_arcsec() in common.py.
     # Everything below is written beside the MS: tmpfs scratch when the run
     # has one, which publish_evaluation_scratch() empties at scoring.
     work_dir = ms_path.parent
@@ -172,28 +172,9 @@ def evaluate(
         )
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
+    # The simulate request wrote it from the arrays it put in the MS
+    # (--mat-path), so there is no convert stage any more.
     mat_path = work_dir / "r2d2_data.mat"
-    # Convert in simulate worker; passing noise sigma once avoids a 31% fill cost.
-    convert_cmd = [
-        "--ms-path", str(ms_path),
-        "--mat-path", str(mat_path),
-        "--noise-sigma-jy", repr(float(simulation["noise"]["complex_sigma_jy"])),
-    ]
-    convert_start = time.perf_counter()
-    convert_returncode = convert_ms_to_mat(convert_cmd, work_dir, args.meqtrees_image, args.platform)
-    convert_seconds = time.perf_counter() - convert_start
-    if convert_returncode == WORKER_DIED:
-        raise WorkerDied(f"simulate worker died converting evaluation {eval_id} ({eval_dir})")
-    if convert_returncode != 0:
-        return write_evaluation_record(eval_dir, {
-            "eval_id": eval_id,
-            "params": params,
-            "objective": FAILURE_OBJECTIVE,
-            "error": f"ms_to_r2d2_mat failed with exit {convert_returncode}",
-            "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
-            "commands": {"simulate": sim_cmd, "ms_to_r2d2_mat": convert_cmd},
-            "timing": {"simulate_seconds": simulate_seconds, "convert_seconds": convert_seconds},
-        })
 
     r2d2_dir = work_dir / "r2d2"
     r2d2_dir.mkdir()
@@ -230,7 +211,6 @@ def evaluate(
             "peak_memory_bytes": peak_memory_bytes,
             "timing": {
                 "simulate_seconds": simulate_seconds,
-                "convert_seconds": convert_seconds,
                 "image_container_seconds": run_result.wall_seconds,
             },
         })
@@ -267,7 +247,6 @@ def evaluate(
             },
             "timing": {
                 "simulate_seconds": simulate_seconds,
-                "convert_seconds": convert_seconds,
                 "image_container_seconds": run_result.wall_seconds,
                 "metrics_seconds": metrics_seconds,
             },
@@ -292,12 +271,10 @@ def evaluate(
         },
         "commands": {
             "simulate": sim_cmd,
-            "ms_to_r2d2_mat": convert_cmd,
             "r2d2": r2d2_cmd,
         },
         "timing": {
             "simulate_seconds": simulate_seconds,
-            "convert_seconds": convert_seconds,
             "image_container_seconds": run_result.wall_seconds,
             "metrics_seconds": metrics_seconds,
         },
@@ -352,7 +329,6 @@ def self_check_worker_death_is_not_scored() -> None:
     """A dead worker must stop the run, not become its best point."""
     import tempfile
 
-    original_convert = globals()["convert_ms_to_mat"]
     original_run_r2d2 = globals()["run_r2d2_imaging"]
     original_simulate = globals()["simulate_measurement_set"]
 
@@ -361,10 +337,11 @@ def self_check_worker_death_is_not_scored() -> None:
         eval_dir: Path,
         meqtrees_image: str,
         platform: str,
+        r2d2_mat: bool = False,
     ) -> tuple[Path, list[str], None]:
         eval_dir.mkdir(parents=True, exist_ok=False)
-        # A real simulate always leaves this, and evaluate() reads it before the
-        # convert for the cell size and the noise sigma; a stub without one
+        # A real simulate always leaves this, and evaluate() reads it for the
+        # cell size; a stub without one
         # takes the run out on FileNotFoundError before reaching what is being
         # checked here.
         (eval_dir / "simulation.json").write_text(
@@ -389,7 +366,6 @@ def self_check_worker_death_is_not_scored() -> None:
     )
     try:
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["convert_ms_to_mat"] = lambda *a, **k: 0
 
         globals()["run_r2d2_imaging"] = imaging(WORKER_DIED)
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,7 +390,9 @@ def self_check_worker_death_is_not_scored() -> None:
 
         # The same split applies to a dead simulate worker.
         globals()["run_r2d2_imaging"] = imaging(0)
-        globals()["convert_ms_to_mat"] = lambda *a, **k: WORKER_DIED
+        globals()["simulate_measurement_set"] = lambda params, eval_dir, *a, **k: (
+            eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(WORKER_DIED, ["simulate"])
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             try:
@@ -425,7 +403,6 @@ def self_check_worker_death_is_not_scored() -> None:
                 raise AssertionError("a dead simulate worker was scored instead of stopping the run")
     finally:
         globals()["simulate_measurement_set"] = original_simulate
-        globals()["convert_ms_to_mat"] = original_convert
         globals()["run_r2d2_imaging"] = original_run_r2d2
 
 
@@ -433,7 +410,6 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_convert = globals()["convert_ms_to_mat"]
     original_run_r2d2 = globals()["run_r2d2_imaging"]
     original_simulate = globals()["simulate_measurement_set"]
 
@@ -442,6 +418,7 @@ def self_check_failure_record_persistence() -> None:
         eval_dir: Path,
         meqtrees_image: str,
         platform: str,
+        r2d2_mat: bool = False,
     ) -> tuple[Path, list[str], subprocess.CalledProcessError]:
         eval_dir.mkdir(parents=True, exist_ok=False)
         return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
@@ -462,11 +439,11 @@ def self_check_failure_record_persistence() -> None:
             eval_dir: Path,
             meqtrees_image: str,
             platform: str,
+            r2d2_mat: bool = False,
         ) -> tuple[Path, list[str], None]:
             eval_dir.mkdir(parents=True, exist_ok=False)
             # A real simulate always leaves this behind, and evaluate() reads it
-            # for the cell size R2D2's images carry no header for and for the
-            # noise sigma the .mat convert needs.
+            # for the cell size R2D2's images carry no header for.
             (eval_dir / "simulation.json").write_text(
                 json.dumps({
                     "observation": {"max_proj_baseline_lambda": 1.0e5},
@@ -475,9 +452,6 @@ def self_check_failure_record_persistence() -> None:
             )
             return eval_dir / "sim.ms", ["simulate"], None
 
-        def successful_convert(*args: Any, **kwargs: Any) -> int:
-            return 0
-
         def successful_r2d2(*args: Any, **kwargs: Any) -> argparse.Namespace:
             return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
 
@@ -485,7 +459,6 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["convert_ms_to_mat"] = successful_convert
         globals()["run_r2d2_imaging"] = successful_r2d2
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
@@ -504,7 +477,6 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["convert_ms_to_mat"] = original_convert
         globals()["run_r2d2_imaging"] = original_run_r2d2
         globals()["simulate_measurement_set"] = original_simulate
 

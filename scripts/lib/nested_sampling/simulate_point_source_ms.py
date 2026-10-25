@@ -65,6 +65,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # On the argv rather than in the worker request, so the command recorded in
     # metrics.json reproduces the evaluation's bound as well as its parameters.
     parser.add_argument("--predict-wait-seconds", type=float, default=None)
+    # The R2D2 PoC's .mat, written from the arrays this run just put in the MS
+    # instead of a second worker request reading them back (round 13).
+    parser.add_argument("--mat-path", default=None, help="Also write R2D2's .mat (correlation 0) here")
     return parser.parse_args(argv)
 
 
@@ -757,6 +760,15 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     for unused in UNUSED_SUBTABLES:
         shutil.rmtree(output_ms / unused, ignore_errors=True)
 
+    if args.mat_path:
+        # Imported here, not at module scope: the WSClean PoC never asks for a
+        # .mat and its worker should not pay for scipy. WEIGHT is makems' 1.0
+        # (above), and DATA is the complex64 column itself, so this is the file
+        # ms_to_r2d2_mat.py would have read back - array for array.
+        from ms_to_r2d2_mat import write_r2d2_mat
+
+        write_r2d2_mat(Path(args.mat_path), data[:, :, 0], uvw, freqs_hz, np.ones(len(uvw)), noise_sigma_jy)
+
     # The longest projected baseline in wavelengths, which is what both imagers
     # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
     # image_pixel_size_arcsec() in common.py), and the WSClean runner reads this
@@ -837,15 +849,8 @@ def warm_up() -> None:
 
 
 def handle_request(request: dict) -> None:
-    """Run one simulation or conversion request."""
-    if request.get("action") == "convert":
-        # Imported on first use, not at module scope: only the R2D2 PoC
-        # converts, and the WSClean PoC's worker should not pay for scipy.
-        from ms_to_r2d2_mat import main as convert
-
-        convert(request["argv"])
-    else:
-        simulate(parse_args(request["argv"]))
+    """Run one simulation request."""
+    simulate(parse_args(request["argv"]))
 
 
 def serve(fifo_base: str | None = None) -> None:
@@ -1138,7 +1143,7 @@ def self_check_noise_weighting() -> None:
                     "--observation-minutes", "4.0", "--channel-count", "2",
                     "--start-frequency-hz", "1.0e9", "--channel-width-hz", "1.0e6",
                     "--source-flux-jy", "1.0", "--dynamic-range", repr(dynamic_range),
-                    "--seed", "42",
+                    "--seed", "42", "--mat-path", str(ms.parent / "direct.mat"),
                 ]))
             with table(str(ms), readonly=True, ack=False) as opened:
                 weight = np.asarray(opened.getcol("WEIGHT"), dtype=np.float64)
@@ -1148,6 +1153,12 @@ def self_check_noise_weighting() -> None:
             mat = ms.parent / "r2d2_data.mat"
             ms_to_r2d2_mat(ms, mat, noise_sigma_jy=sigma)
             nW = np.asarray(loadmat(str(mat))["nW"], dtype=np.float64)
+            # --mat-path must write the file the convert reads back, array for array.
+            direct, converted = loadmat(str(ms.parent / "direct.mat")), loadmat(str(mat))
+            for key in ("u", "v", "y", "nW"):
+                assert direct[key].dtype == converted[key].dtype and np.array_equal(
+                    direct[key].view(np.uint8), converted[key].view(np.uint8)
+                ), f"--mat-path {key} differs from ms_to_r2d2_mat's"
             expected = np.sqrt(1.0 / (sigma * sigma))
             assert np.allclose(nW, expected, rtol=0.0, atol=0.0), \
                 f"nW is {nW.min()}..{nW.max()}, not the {expected} the WEIGHT column used to carry"
