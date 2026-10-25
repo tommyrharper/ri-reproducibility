@@ -1,6 +1,7 @@
 # Search speed on CSD3
 
-Speed work for the 9-parameter space on CSD3. Newest round last.
+Speed work for the 9-parameter space on CSD3. Newest round last. From round 30 on, a round's number is the gnhf iteration
+whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
@@ -1445,7 +1446,7 @@ passes and `reserve` `metadata_buffer`, and could map the model file with
 `MAP_POPULATE`, or keep it and zero it instead of recreating it each major
 cycle. All of these are bookkeeping changes that cannot alter the output.
 
-## Round 29: map each reordered file once per evaluation (patch 0010)
+## Round 30: map each reordered file once per evaluation (patch 0010)
 
 **Profile.** After round 28, `perf record -e page-faults -d` on the zygote
 driver (MS 4) attributed the remaining ~6k faults per evaluation to
@@ -1511,7 +1512,7 @@ so apply with `patch -p1 -N` in order, from a clean tree. And `apt-get install` 
 `update-ca-certificates` runs under `--fakeroot`. Finish it with
 `dpkg --configure -a`.
 
-## Round 30: the fill shares extend_template's table open
+## Round 31: the fill shares extend_template's table open
 
 **Profile.** With a host-built `fastnoise.so` bound over `/opt/ri-lib`, the
 48 real parameter sets of `.probe/params.jsonl` (`scripts/probe_simulate_stage.py`,
@@ -1560,7 +1561,7 @@ identical. The module is bind-mounted, so this ships with no rebuild. R2D2's
 TIME_CENTROID and ANTENNA1/2 writes (~7ms), the DATA write, and the closes.
 The phase ramp's complex `exp` and noise (with `fastnoise.so`) are ~7ms each.
 
-## Round 31: the phase ramp in C (`phase_ramp_c64`)
+## Round 32: the phase ramp in C (`phase_ramp_c64`)
 
 **Profile.** With noise in C (round 26), the predict
 `flux * np.exp((2j * pi / c) * np.outer(delay, freqs))` is the largest
@@ -1591,7 +1592,7 @@ arms ran from this tree. They differed only in the meqtrees SIF:
 (new), with the 0001-0010 `wsclean.sif`. Both shared one
 `NS_OBSERVATION_CACHE_DIR` in `/dev/shm`.
 
-That cache started empty, and round 30's fit (`.probe/fit16.py`) is
+That cache started empty, and round 31's fit (`.probe/fit16.py`) is
 dominated by makems misses: 279, 166, 129 and 140ms over the first four
 runs as the cache warmed. `.probe/fit32.py` refits simulate after dropping
 evaluations more than 50ms off the line (155-1041 per run, all misses).
@@ -1604,7 +1605,7 @@ Simulate at 1k timestep-channels, trimmed:
 
 That is -10.5ms (-17%) on simulate, with no overlap, and about 3.5% of
 WSClean worker time (WSClean @1k: 206-213ms in both arms). It is twice
-the solo saving, as rounds 27 and 30 were. In the synchronous pair, log(Z) is
+the solo saving, as rounds 27 and 31 were. In the synchronous pair, log(Z) is
 0.09424 +/- 0.00279 in both arms. Every chain file is identical except
 `phys_live.txt`, which holds the same 186 rows in a different order. It
 takes effect once `meqtrees.sif` is rebuilt on a Docker host and imported.
@@ -1616,7 +1617,7 @@ short run. Between 4% and 15% of evaluations hit makems in the first runs
 on a fresh cache, at hundreds of ms each. Compare arms on a shared,
 pre-warmed cache, and fit with outliers trimmed.
 
-## Round 32: 32KB StandardStMan buckets in the one-timestep template
+## Round 33: 32KB StandardStMan buckets in the one-timestep template
 
 **Profile.** Per casacore call on the extend path, solo with `fastnoise.so`
 (`.probe/colprof31.py` over `scripts/probe_simulate_stage.py`, 48 sets,
@@ -1664,7 +1665,7 @@ trimmed (`.probe/fit32.py`):
 | base | 93.3, 94.9ms | 94.2, 94.0ms | log(Z) 0.09424 +/- 0.00279 |
 | 32KB SSM | 89.4, 87.4ms | 88.1, 88.9ms | log(Z) 0.09424 +/- 0.00279 |
 
-That is -5.7ms (-6.1%) on simulate with no overlap. As in rounds 27, 30 and
+That is -5.7ms (-6.1%) on simulate with no overlap. As in rounds 27, 31 and
 31, it is larger than the solo saving. WSClean @1k was 210-212ms (base) and
 204-214ms (new). In the synchronous pair every chain file is identical
 except `phys_live.txt`, which holds the same rows in a different order. The
@@ -1676,7 +1677,7 @@ the synchronous pair's means were 134.5ms (base, first) against 98.2ms. On
 this RDS, `fit32.py` read ~10 metrics.json a second, about 50 minutes for 8
 runs. Fit in the background, or read the files in parallel.
 
-## Round 33: meta records copied at their fixed size (patch 0011)
+## Round 35: meta records copied at their fixed size (patch 0011)
 
 **Profile.** `perf record` of the 0001-0010 binary, solo and pinned, on the
 largest real-draw MS from round 24 (`-size 32 32`, five runs) put
@@ -1733,9 +1734,9 @@ on a new node produced a binary with the same md5 as iteration 34's. The
 37-way driver resolves 1% where in-run fits cannot, but needs ~25s an arm.
 Shorter arms drift with load on the other half of the node.
 
-## Round 34: unseen observations built once, at the horizon
+## Round 36: unseen observations built once, at the horizon
 
-**Profile.** Rounds 26-33 fitted simulate with makems misses trimmed, so
+**Profile.** Rounds 26-35 fitted simulate with makems misses trimmed, so
 the fits never showed how big the misses are. A worker instrumented to log
 every request (removed afterwards; layered `meqtrees.sif` with
 `fastnoise.so`, 38 ranks, nlive 150, 300 dead, async) found the mean
@@ -1791,21 +1792,21 @@ instead of continuing to miss logarithmically.
 In a synchronous pair (150 dead, cold caches) log(Z) is 0.09424 +/- 0.00279
 in both arms, and every chain file is identical (`phys_live.txt` and
 `clusters/` once sorted) except `.resume`. There two rows differ in their
-last column by ~1e-11, the same signature round 33 traced to one evaluation
+last column by ~1e-11, the same signature round 35 traced to one evaluation
 built by makems in one arm and from the template in the other, which this
 change makes more common.
 
 **Learned.** A mean that trims outliers hides the outliers: the trimmed
-fits of rounds 31-33 were stable to 1.5ms while 83-94% of simulate time
+fits of rounds 32-35 were stable to 1.5ms while 83-94% of simulate time
 sat in the trimmed tail. The shipped `meqtrees.sif` still predates
-`fastnoise.so` (rounds 26 and 31): solo with numpy, noise is 23ms of a
+`fastnoise.so` (rounds 26 and 32): solo with numpy, noise is 23ms of a
 53ms simulate against 7.6ms of 34ms with the library, so rebuilding the
 image is worth ~20ms an evaluation on top of this round. A host-built
 `fastnoise.so` (RHEL gcc 8.5, `-O2 -ffp-contract=off`) passes both
 agreement checks inside the image and layers in with an 8-second
 `apptainer build --fakeroot`.
 
-## Round 35 (negative): streaming retention on the record-writer thread
+## Round 37 (negative): streaming retention on the record-writer thread
 
 **Profile.** Warm 38-rank WSClean, nlive 150, 300 dead: busy markers show
 only ~25-33 of 37 workers evaluating mid-run. Sampling
@@ -1831,7 +1832,7 @@ resumed it); sample `/proc/<pid>/syscall` or use perf. PolyChord's root
 rank is 83.5% `mca_btl_vader` in perf - the documented MPI spin, not a
 master bottleneck.
 
-## Round 36: ranks stop claiming failed-artefact slots once they are full
+## Round 38: ranks stop claiming failed-artefact slots once they are full
 
 **Profile.** Every failed evaluation calls `claim_failed_artefacts_slot()`
 on the rank's main thread. Once the run's `NS_KEEP_FAILED_ARTEFACTS` (20)
@@ -1860,9 +1861,9 @@ and the chains cannot change. Not run end to end: there is no failure
 injection hook, and a search that fails often enough to show 15% needs a
 failing region of the parameter space. No image rebuild is needed.
 
-## Round 37 (diagnostic): where a short benchmark's idle workers go
+## Round 39 (diagnostic): where a short benchmark's idle workers go
 
-**Question.** Round 35's cold run r37p-1 lost 66s of 235s to three gaps
+**Question.** Round 37's cold run r37p-1 lost 66s of 235s to three gaps
 where no rank was evaluating, and the cause was not found. This round reran
 it to catch one: two cold 38-rank WSClean searches (nlive 150, 15 repeats,
 300 dead, seed 4242, an empty `/dev/shm` observation cache per run, shipped
@@ -1870,7 +1871,7 @@ SIFs, cpu-q-166 with load ~21). A 2Hz watcher counted the scratch
 `.busy` markers and dumped every rank's state after 2s at zero.
 
 **Result.** Neither run had a gap (54.1 and 45.9 evals/s, rows `r39c-1/2`).
-The watcher fired only after PolyChord had finished. Round 35's gaps are
+The watcher fired only after PolyChord had finished. Round 37's gaps are
 still unexplained and did not recur in 2 of 2 runs, so they are rare at
 most. The busy-marker counts (37 workers) show where the idle worker time
 goes in a 146s run:
@@ -1890,10 +1891,10 @@ goes in a 146s run:
   production run of hours does not. `idle_fraction` in `benchmarks.jsonl`
   does not show this (0.005 here), because it counts wall time with *any*
   worker busy.
-- The middle deficit is round 35's streaming-retention Lustre work. It too
+- The middle deficit is round 37's streaming-retention Lustre work. It too
   shrinks as a run grows.
 - Cold-cache misses at 1s integration (1200 timesteps at the 20-minute
-  horizon) cost 5.6-5.8s of simulate under load, against round 34's 3.9s
+  horizon) cost 5.6-5.8s of simulate under load, against round 36's 3.9s
   solo. One 6s-integration miss took 10.7s, which is unexplained (200
   timesteps should be ~0.7s). The misses are spread through the run, not
   bunched at the end.
@@ -1902,7 +1903,7 @@ goes in a 146s run:
 other (same `NS_MAX_NDEAD`). To read steady throughput, take evaluations
 per second over the middle of the run, not `evals_per_s`. No code change.
 
-## Round 38 (diagnostic): PolyChord's root is not a large-run bottleneck
+## Round 40 (diagnostic): PolyChord's root is not a large-run bottleneck
 
 **Question.** Does PolyChord's own work on rank 0 (dispatching points,
 clustering, writing `.resume`, `_dead-birth.txt` and posteriors every
@@ -1938,13 +1939,13 @@ run. Turning the posterior outputs off would save a fifth of that, so there
 is nothing here worth changing. `update_files` and the posterior settings
 stay at PolyChord's defaults.
 
-**Consequence.** Worker idle time in a real search (round 37's middle deficit,
+**Consequence.** Worker idle time in a real search (round 39's middle deficit,
 13-16%) is not PolyChord's root. It is on the rank side: streaming retention
-(round 35) plus the evaluation itself. Large runs will scale on the
+(round 37) plus the evaluation itself. Large runs will scale on the
 evaluation cost. There is no benchmarks.jsonl row, because a toy likelihood
 is not a search.
 
-## Round 39: round 28's malloc threshold was below WSClean's buffers
+## Round 41: round 28's malloc threshold was below WSClean's buffers
 
 **Profile.** The 0001-0011 zygote, rebuilt in a fakeroot sandbox, was driven
 solo through six real-draw MSs (3-19MB, kept by a 6-rank search) with
@@ -1985,7 +1986,7 @@ per arm, both at once, each with its own cold observation cache, the base
 arm a `git worktree` at HEAD) gives log(Z) 0.0947290581121557 +/-
 0.00262747 in both arms, and every chain file is identical, `.resume`
 included. That pair is not a speed comparison. At 38 ranks a 3% WSClean gain is
-~2% of worker time, below what an in-run fit resolves (round 33).
+~2% of worker time, below what an in-run fit resolves (round 35).
 
 **Learned.** A glibc tunable can do nothing and say nothing about it, and
 here the reason was the allocation size, not glibc. Check
@@ -1994,11 +1995,11 @@ threshold. The remaining ~1.6k faults per request are first touches in a
 fresh fork child, which a fork server cannot avoid: pre-faulting in the
 zygote turns them into copy-on-write faults.
 
-## Round 40: a host-built `fastnoise.so` for a `meqtrees.sif` without one
+## Round 42: a host-built `fastnoise.so` for a `meqtrees.sif` without one
 
-**Profile.** The shipped `meqtrees.sif` (21 Sep) predates rounds 26 and 31,
+**Profile.** The shipped `meqtrees.sif` (21 Sep) predates rounds 26 and 32,
 so it has no `/opt/ri-lib/fastnoise.so`, and every search on the cluster has
-drawn thermal noise and the phase ramp with numpy. Round 34 measured the
+drawn thermal noise and the phase ramp with numpy. Round 36 measured the
 gap solo (~20ms of simulate) but left the fix to an image rebuild, which
 needs a Docker host.
 
@@ -2031,7 +2032,7 @@ the next two. Base is `NS_FASTNOISE_DIR=` (numpy):
 Warm: simulate is 32-33ms shorter (-37 to -41%) and each evaluation costs
 11-12% less worker time. evals/s rose 6% and 16%; an async run's evaluation
 count varies, so read ms/eval rather than evals/s here. Cold: -25ms of
-simulate, which makems misses swamp. The saving is larger than round 34's
+simulate, which makems misses swamp. The saving is larger than round 36's
 solo 20ms because numpy's draws compete for memory bandwidth at 36-way.
 
 In a synchronous pair (150 dead, warm caches) log(Z) is 0.09441 +/-
@@ -2040,17 +2041,17 @@ once sorted), `.resume` included. That is expected, because the library
 reproduces numpy's stream bit for bit.
 
 **Learned.** Check what a shipped image actually contains before trusting
-an earlier round's gain: rounds 26 and 31 were measured on layered SIFs, and
+an earlier round's gain: rounds 26 and 32 were measured on layered SIFs, and
 production never had them. Small C helpers that the simulator loads by
 path and checks on load can be built on the host and bound in, so they
 need no image rebuild.
 
-## Round 41: the shipped `wsclean.sif` had none of rounds 23-33
+## Round 43: the shipped `wsclean.sif` had none of rounds 23-35
 
 **Profile.** The binaries in the shipped `wsclean.sif` (imported 21 Sep) are
 dated 4 Sep, the day patch 0006 landed. So patches 0007-0011 (rounds 23, 24,
 25, 29 and 33) were measured on layered test SIFs and never reached a cluster
-run, just as round 40 found for `fastnoise.so`.
+run, just as round 42 found for `fastnoise.so`.
 
 **Change.** `scripts/patch-wsclean-sif.sh` (`./ri images patch-wsclean`)
 turns round 23's manual recipe into one command, run on a compute node:
@@ -2086,7 +2087,7 @@ cold for the first pair. Both used the host-built `fastnoise.so` from round
 | sync, 150 dead | 0001-0011 | 3094 | 29.0 | 39.9ms | 141.6ms | 182.6 |
 
 In every pair the WSClean binary is 32-53ms shorter (-16 to -27%), more than
-rounds 23-33's in-run estimates added together, because those were measured
+rounds 23-35's in-run estimates added together, because those were measured
 at 37-38-way and here two 18-rank searches share the node. With warm caches,
 worker time per evaluation falls by 14-23%. The synchronous pair, which
 controls for evaluation count, runs 11% faster end to end (120.0 -> 106.8s).
@@ -2095,7 +2096,7 @@ tail (round 14), so read ms/eval instead.
 
 In the synchronous pair log(Z) is 0.09441 +/- 0.00264 in both arms, and every
 chain file is identical (`phys_live*.txt` once sorted), including `.resume`
-and `clusters/`. That is consistent with rounds 23-33, where each patch was
+and `clusters/`. That is consistent with rounds 23-35, where each patch was
 shown byte-identical on its own.
 
 **To ship:** run `./ri images patch-wsclean` once in a compute-node job. It
@@ -2108,7 +2109,7 @@ export, import) gets the same result.
 by `bench.py` ("not recording ... outside results/nested-sampling"). Move
 the run there and `scripts/bench.py record <dir>` adds the row afterwards.
 
-## Round 42: TIME and TIME_CENTROID out of the IncrementalStMan
+## Round 45: TIME and TIME_CENTROID out of the IncrementalStMan
 
 **Profile.** At a warm cache with `fastnoise.so` (48 real sets, one pinned
 core), `extend_template` has a median of 17.8ms. Per evaluation, the putcols
@@ -2174,12 +2175,12 @@ fresh pool. A resumed run is not given a benchmark row.
 
 ## Round 47: a rank's extremes wait in tmpfs, not on Lustre
 
-**Profile.** Round 42 found that a tree on Lustre costs ~20% of whole-run
-evals/s. Round 35 had already caught one Lustre cost on the rank's main
+**Profile.** Round 45 found that a tree on Lustre costs ~20% of whole-run
+evals/s. Round 37 had already caught one Lustre cost on the rank's main
 thread: streaming retention publishes each evaluation that enters the rank's
 top or bottom 20 objectives so far from tmpfs scratch to `evaluations/`
 (~0.3s: mkdir and file creates on Lustre), and strips it again once it is
-evicted. Round 35 called this a short-benchmark artefact, but the count is
+evicted. Round 37 called this a short-benchmark artefact, but the count is
 ~40 ln(k) for a rank with k evaluations, so it grows with the rank count.
 Replaying the 71,393 objectives of the longest R2D2 run
 (`r2d2-vlaa-20260922T174616Z`) through per-rank heaps, with evaluations dealt
@@ -2237,7 +2238,7 @@ are compared.
 prune, both async pair-c arms keep the same number of FITS images (94).
 
 **Learned.**
-- Round 35's "negligible in production" was wrong for WSClean. A rank's
+- Round 37's "negligible in production" was wrong for WSClean. A rank's
   extremes so far grow as ~40 ln(k) per rank, so the fraction of evaluations
   published grows with the rank count, to 13% at 36 ranks and 23% at 72.
 - A cost on the rank's main thread shows only in whole-run evals/s, not in

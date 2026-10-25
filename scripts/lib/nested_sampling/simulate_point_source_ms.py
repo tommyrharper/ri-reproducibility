@@ -74,7 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mat-only", action="store_true", help="With --mat-path: write no MS when its observation is cached")
     # The search's longest observation. An uncached (declination, integration)
     # is then built once at that length, not once per new longest draw
-    # (docs/csd3-speed.md, round 34).
+    # (docs/csd3-speed.md, round 36).
     parser.add_argument("--observation-horizon-minutes", type=float, default=0.0)
     return parser.parse_args(argv)
 
@@ -386,9 +386,9 @@ def _template_dminfo(dminfo: dict) -> dict:
     """makems' StandardStMan bucket is 256 bytes, 32 rows of ANTENNA1/2, so
     every extended evaluation's addrows and two putcols walked ~1000 buckets
     through a 2-bucket cache. Same values, 32KB buckets: -2.3ms solo
-    (docs/csd3-speed.md, round 32). TIME and TIME_CENTROID move into it from
+    (docs/csd3-speed.md, round 33). TIME and TIME_CENTROID move into it from
     makems' IncrementalStMan, whose putcol compares every row with the last:
-    -3ms solo, same values (round 42)."""
+    -3ms solo, same values (round 45)."""
     ssm = next(m for m in dminfo.values() if m["TYPE"] == "StandardStMan" and "ANTENNA1" in m["COLUMNS"])
     ssm["SPEC"]["BUCKETSIZE"] = 32768
     for key, manager in list(dminfo.items()):

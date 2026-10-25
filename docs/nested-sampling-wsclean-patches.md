@@ -357,7 +357,7 @@ lasts exactly one evaluation.
 Solo, it halves the binary's minor faults (6.0k to 3.5k on MS 4). In a
 37-way concurrent driver it takes 1.7% off WSClean wall time. All 24 FITS
 data blocks are byte-identical. The measurements are in
-[csd3-speed.md](csd3-speed.md), round 29.
+[csd3-speed.md](csd3-speed.md), round 30.
 
 Not upstream-shaped as it stands: a long-lived WSClean process with many
 parts would keep every temporary file's pages until it exits.
@@ -377,6 +377,6 @@ end of the file, so the bytes read and the return value are unchanged.
 
 Over six real-draw MSs the FITS data blocks are byte-identical (24 of 24),
 and WSClean is 1.0% faster with 37 copies running at once. The measurements
-are in [csd3-speed.md](csd3-speed.md), round 33.
+are in [csd3-speed.md](csd3-speed.md), round 35.
 
 Upstream-shaped: it changes only how bytes are copied.

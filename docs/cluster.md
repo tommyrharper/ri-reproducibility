@@ -55,7 +55,7 @@ cores). It compiles WSClean in an `apptainer --fakeroot` sandbox against the
 SIF's own casacore, layers the result over the SIF, and keeps the old one as
 `wsclean.sif.orig`. The derived SIF keeps the old `ri.build-inputs` label and
 adds `ri.wsclean-patches` (a hash of the patches), so `benchmarks.jsonl`
-gives both the same image id. See [csd3-speed](csd3-speed.md), round 41.
+gives both the same image id. See [csd3-speed](csd3-speed.md), round 43.
 
 ## Where things live on CSD3
 
@@ -64,7 +64,7 @@ gives both the same image id. See [csd3-speed](csd3-speed.md), round 41.
 | this checkout, `images/`, `results/` | `/rds/user/<crsid>/hpc-work/ri-reproducibility` | Lustre, 1TB, shared by every node; home is 50GB NFS, and CSD3 asks that jobs do no I/O there - a run writes `results/`, its FIFOs and `benchmarks.jsonl` under the checkout, so a checkout in `~` is the wrong place |
 | in-flight Measurement Sets (`NS_SCRATCH_DIR`) | `/dev/shm` on the node | same as on main; nodes have 256GB+ |
 | makems observations kept across runs (`NS_OBSERVATION_CACHE_DIR`) | `hpc-work/.cache/ri/ms-observations/<meqtrees image id>` | up to 183MB per image; saves ~0.33s/eval ([csd3-speed.md](csd3-speed.md), round 6) |
-| a host-built `fastnoise.so` for a `meqtrees.sif` without one (`NS_FASTNOISE_DIR`) | `hpc-work/.cache/ri/fastnoise/<hash of source + gcc>` | ~20ms/eval of simulate ([csd3-speed.md](csd3-speed.md), round 40); like the row above, under `RI_WORK_DIR` (else the checkout's parent) even with `NS_JOB_ENV=0` |
+| a host-built `fastnoise.so` for a `meqtrees.sif` without one (`NS_FASTNOISE_DIR`) | `hpc-work/.cache/ri/fastnoise/<hash of source + gcc>` | ~20ms/eval of simulate ([csd3-speed.md](csd3-speed.md), round 42); like the row above, under `RI_WORK_DIR` (else the checkout's parent) even with `NS_JOB_ENV=0` |
 | a job's `uv`, uv's Pythons (which `.venv` points into), `XDG_CACHE_HOME`, `HOME` | `hpc-work/.local/bin`, `hpc-work/.local/share/uv/python`, `hpc-work/.cache`, `hpc-work/.ri-job/home` | a job runs nothing from `/home` (below) |
 | worker FIFOs | inside the run directory, as on main | one node per run, so a FIFO on Lustre is local to its readers |
 

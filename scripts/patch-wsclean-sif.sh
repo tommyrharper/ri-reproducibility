@@ -13,7 +13,7 @@
 # existing SIF, so casacore is not rebuilt, and writes a `Bootstrap: localimage`
 # SIF whose /opt/wsclean is replaced. The old SIF is kept as OUT.orig.
 # Run it on a compute node: the build takes ~2 minutes with 30 jobs.
-# See docs/csd3-speed.md, round 41.
+# See docs/csd3-speed.md, round 43.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

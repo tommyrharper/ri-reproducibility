@@ -93,7 +93,7 @@ void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
    * correlations 0 and n_corr - 1 of a (rows, chans, n_corr) array. numpy's
    * complex exp is libm's cexp, which for a zero real part is sincos of the
    * imaginary part times exp(0) = 1; ~1.8x faster than numpy, which goes
-   * through complex128 temporaries (docs/csd3-speed.md, round 31). */
+   * through complex128 temporaries (docs/csd3-speed.md, round 32). */
   ptrdiff_t last = 2 * (n_corr - 1);
   for (ptrdiff_t r = 0; r < n_rows; r++) {
     for (ptrdiff_t c = 0; c < n_chan; c++) {

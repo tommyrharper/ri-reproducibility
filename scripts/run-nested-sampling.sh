@@ -98,7 +98,7 @@ sidecar_launch "${MEQTREES_SIF}" \
 # less kernel time per evaluation at 38 ranks (docs/csd3-speed.md, round 28).
 # The thresholds are 2^62, not 1GB: WSClean sizes each pass's buffers from the
 # machine's RAM (47-110GB virtual on a CSD3 node), so at 1GB they were still
-# mmapped per pass and faulted in again (round 39).
+# mmapped per pass and faulted in again (round 41).
 # shellcheck disable=SC2016
 sidecar_launch "${WSCLEAN_SIF}" -- sh -c '
   for fifo in "$1"/*.in; do

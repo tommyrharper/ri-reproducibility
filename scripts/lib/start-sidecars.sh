@@ -38,7 +38,7 @@ export NS_OBSERVATION_CACHE_DIR="${NS_OBSERVATION_CACHE_DIR:-}"
 
 # A meqtrees.sif built before docker/meqtrees/src/fastnoise.c has no
 # /opt/ri-lib/fastnoise.so, and the simulator then draws noise with numpy:
-# ~20ms more per evaluation (docs/csd3-speed.md, round 40). Such an image is
+# ~20ms more per evaluation (docs/csd3-speed.md, round 42). Such an image is
 # given a host-built copy, cached per source and compiler, so a cluster need
 # not wait for a rebuild. The simulator checks it against numpy on load and
 # falls back if it disagrees. Empty NS_FASTNOISE_DIR turns this off.

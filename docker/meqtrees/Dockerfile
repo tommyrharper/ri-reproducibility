@@ -4,7 +4,7 @@
 
 # The simulator's thermal-noise filler: numpy's PCG64 normal() stream, bit for
 # bit, ~2.9x faster than numpy draws it (docs/csd3-speed.md, round 26), and its
-# point-source phase ramp, ~1.8x faster than numpy and as exact (round 31). Built
+# point-source phase ramp, ~1.8x faster than numpy and as exact (round 32). Built
 # against the same base as the runtime so it links the same libm; the
 # simulator checks it against numpy on load and falls back if it disagrees.
 FROM ubuntu:24.04 AS fastnoise

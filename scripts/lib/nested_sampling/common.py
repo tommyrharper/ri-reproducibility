@@ -1395,7 +1395,7 @@ def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
     in docs/csd3-experiments.md (E5, E6) filled the one-million-file quota.
     Slots are never freed, so once a rank finds them full it stops asking:
     otherwise every later failure costs ~21 contended Lustre mkdirs on the
-    rank's main thread (~36ms with 36 ranks; docs/csd3-speed.md, round 36)."""
+    rank's main thread (~36ms with 36 ranks; docs/csd3-speed.md, round 38)."""
     slots = eval_dir.parent / ".failed-artefacts-kept"
     if slots in _FAILED_ARTEFACT_SLOTS_FULL:
         return False
