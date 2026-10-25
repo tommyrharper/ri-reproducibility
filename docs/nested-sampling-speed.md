@@ -63,6 +63,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | INTERVAL/EXPOSURE set on the template before `addrows`; antenna table unpacked only for makems | `simulate_point_source_ms.py` | -7% (-6 to -8ms) on simulate in 38-rank CSD3 searches, chains identical ([csd3-speed](csd3-speed.md), round 27) |
 | WSClean zygote runs with glibc malloc tunables (no mmap/trim of large blocks) | `run-nested-sampling.sh` | -2.9% WSClean wall at 38-way in a controlled driver (kernel time 29 -> 23ms); ~-1% in-run, unresolved; chains identical ([csd3-speed](csd3-speed.md), round 28) |
 | Each reordered file mapped once per evaluation, not once per pass | `patches/0010` | -2.2% (-4.6ms) on WSClean in 38-rank CSD3 searches (8 runs, ABBA+BAAB, no overlap); faults halved solo; byte-identical, chains identical ([csd3-speed](csd3-speed.md), round 29) |
+| Simulate's fill writes in `extend_template()`'s table open (no reopen, no UVW/CHAN_FREQ/FLAG read-back) | `simulate_point_source_ms.py` | -6.3% (-6.4ms) on simulate in 38-rank CSD3 searches (8 runs, no overlap); MSs byte-identical, chains identical ([csd3-speed](csd3-speed.md), round 30) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

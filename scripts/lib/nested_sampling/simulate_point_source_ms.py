@@ -375,7 +375,11 @@ def one_timestep_template(cfg_text: str, args: argparse.Namespace, scratch: Path
     return template
 
 
-def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace) -> None:
+def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace,
+                    fill: bool = False) -> tuple | None:
+    """With `fill`, also writes the visibilities while the table is open and
+    returns fill_point_source_visibilities()'s (data, uvw, freqs_hz)."""
+    filled = None
     shutil.copytree(template, output_ms, symlinks=True, ignore=shutil.ignore_patterns(*UNUSED_SUBTABLES))
     with table(str(output_ms), readonly=False, ack=False) as ms:
         a1, a2 = ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2")
@@ -387,11 +391,17 @@ def extend_template(template: Path, observation: dict, output_ms: Path, n_times:
         ms.putcol("EXPOSURE", np.full(n_base, observation["exposure"]))
         ms.addrows((n_times - 1) * n_base)
         antenna_uvw = observation["antenna_uvw"][:n_times]
-        ms.putcol("UVW", (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3))
+        uvw = (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3)
+        ms.putcol("UVW", uvw)
         ms.putcol("ANTENNA1", np.tile(a1, n_times))
         ms.putcol("ANTENNA2", np.tile(a2, n_times))
         ms.putcol("TIME", np.repeat(observation["time"][:n_times], n_base))
         ms.putcol("TIME_CENTROID", np.repeat(observation["time_centroid"][:n_times], n_base))
+        if fill:
+            # patch_spectral_window()'s CHAN_FREQ and the UVW just written, both
+            # float64 columns that read back unchanged: no reopen, no getcol.
+            freqs_hz = channel_frequencies(args)
+            filled = (write_visibilities(ms, uvw, freqs_hz, args), uvw, freqs_hz)
     with table(str(output_ms / "FIELD"), readonly=False, ack=False) as field:
         for column in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME"):
             field.putcol(column, observation[f"FIELD_{column}"])
@@ -399,24 +409,33 @@ def extend_template(template: Path, observation: dict, output_ms: Path, n_times:
     with table(str(output_ms / "OBSERVATION"), readonly=False, ack=False) as obs:
         obs.putcol("TIME_RANGE", np.array([[start, start + n_times * observation["interval"]]]))
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
+    return filled
 
 
-def make_ms(cfg: Path, output_ms: Path, args: argparse.Namespace) -> None:
+def make_ms(cfg: Path, output_ms: Path, args: argparse.Namespace, fill: bool = False) -> tuple | None:
     """Build the evaluation's MS skeleton, running makems only for an
-    observation no earlier evaluation has covered."""
+    observation no earlier evaluation has covered. With `fill`, an extended
+    observation also gets its visibilities, returned as extend_template() does;
+    None means fill_point_source_visibilities() still has to write them."""
     cfg_text = cfg.read_text()
     if cached_skeleton(skeleton_key(cfg_text)).exists():
         make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
-        return
+        return None
     n_times = n_times_of(args)
     observation = load_observation(cfg_text, n_times)
     if observation is None:
         make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
         save_observation(output_ms, cfg_text)
-        return
+        return None
     template = one_timestep_template(cfg_text, args, output_ms.parent)
-    extend_template(template, observation, output_ms, n_times, args)
+    filled = extend_template(template, observation, output_ms, n_times, args, fill)
     (output_ms.parent / "makems.log").write_text(f"extended a cached observation to {n_times} timesteps\n")
+    return filled
+
+
+def make_and_fill_ms(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
+    filled = make_ms(write_makems_config(args, output_ms), output_ms, args, fill=True)
+    return fill_point_source_visibilities(args, output_ms, filled)
 
 
 def prebuild_skeletons(space: dict) -> None:
@@ -780,50 +799,67 @@ def noise_sigma_of(args: argparse.Namespace) -> float:
     return args.source_flux_jy / args.dynamic_range
 
 
-def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
+def channel_frequencies(args: argparse.Namespace) -> np.ndarray:
+    """The CHAN_FREQ patch_spectral_window() writes."""
+    return args.start_frequency_hz + (np.arange(args.channel_count) + 0.5) * args.channel_width_hz
+
+
+def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    """Fill the open, writable main table `ms` and drop UNUSED_SUBTABLES'
+    keywords; returns the DATA written."""
     noise_sigma_jy = noise_sigma_of(args)
     l_rad = math.radians(args.source_l_arcsec / 3600.0)
     m_rad = math.radians(args.source_m_arcsec / 3600.0)
-
-    with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
-        freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
-
     # ponytail: this simulator supports one unpolarized point source; full Stokes
     # models and multi-source dynamic-range stress cases are a follow-up ceiling.
     # The MeqTrees predict this replaced was half the stage on CSD3 (0.79s of
     # 1.51s in the 9-parameter space); docs/csd3-speed.md.
     rng = np.random.default_rng(args.seed)
-    with table(str(output_ms), readonly=False, ack=False) as ms:
-        # One row for the shape: DATA is about to be overwritten whole.
-        _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
-        if n_chan != len(freqs_hz):
-            raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
-        uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
-        data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr)
+    # One row for the shape: DATA is about to be overwritten whole.
+    _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
+    if n_chan != len(freqs_hz):
+        raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
+    data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr)
 
-        if noise_sigma_jy:
-            add_complex_noise(rng, data, noise_sigma_jy / math.sqrt(2.0))
+    if noise_sigma_jy:
+        add_complex_noise(rng, data, noise_sigma_jy / math.sqrt(2.0))
 
-        ms.putcol("DATA", data)
-        for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
-            if optional_col in ms.colnames():
-                ms.putcol(optional_col, data)
-        if "FLAG" in ms.colnames():
-            ms.putcol("FLAG", np.zeros(ms.getcol("FLAG").shape, dtype=bool))
-        # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
-        # noise is one sigma for every row and channel, so the pair carried a
-        # single number written to every row - and they are variable-shaped
-        # IncrementalStMan columns, the slowest thing in the whole stage to
-        # write (a TaQL UPDATE, the cheapest of the three ways tried, was 31% of
-        # it). The number itself is in this evaluation's simulation.json as
-        # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
-        # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
-        # weight of 1.0 images identically to a uniform 1/sigma^2.
+    ms.putcol("DATA", data)
+    for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
+        if optional_col in ms.colnames():
+            ms.putcol(optional_col, data)
+    if "FLAG" in ms.colnames():
+        # FLAG is DATA's shape in an MS.
+        ms.putcol("FLAG", np.zeros(data.shape, dtype=bool))
+    # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
+    # noise is one sigma for every row and channel, so the pair carried a
+    # single number written to every row - and they are variable-shaped
+    # IncrementalStMan columns, the slowest thing in the whole stage to
+    # write (a TaQL UPDATE, the cheapest of the three ways tried, was 31% of
+    # it). The number itself is in this evaluation's simulation.json as
+    # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
+    # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
+    # weight of 1.0 images identically to a uniform 1/sigma^2.
 
-        attached = ms.getkeywords()
-        for unused in UNUSED_SUBTABLES:
-            if unused in attached:
-                ms.removekeyword(unused)
+    attached = ms.getkeywords()
+    for unused in UNUSED_SUBTABLES:
+        if unused in attached:
+            ms.removekeyword(unused)
+    return data
+
+
+def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path,
+                                   filled: tuple | None = None) -> dict[str, object]:
+    """`filled` is make_ms(fill=True)'s result, when it wrote the visibilities."""
+    noise_sigma_jy = noise_sigma_of(args)
+    if filled is None:
+        with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
+            freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
+        with table(str(output_ms), readonly=False, ack=False) as ms:
+            uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
+            data = write_visibilities(ms, uvw, freqs_hz, args)
+    else:
+        data, uvw, freqs_hz = filled
     # After the close, so casacore is never holding a table whose files are gone.
     for unused in UNUSED_SUBTABLES:
         shutil.rmtree(output_ms / unused, ignore_errors=True)
@@ -909,7 +945,7 @@ def write_mat_only(args: argparse.Namespace, output_ms: Path) -> dict[str, objec
         antenna_uvw = observation["antenna_uvw"][:n_times]
         uvw = (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3)
     # patch_spectral_window()'s CHAN_FREQ, again a float64 column read back as is.
-    freqs_hz = args.start_frequency_hz + (np.arange(args.channel_count) + 0.5) * args.channel_width_hz
+    freqs_hz = channel_frequencies(args)
 
     vis = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, math.radians(args.source_l_arcsec / 3600.0),
                                     math.radians(args.source_m_arcsec / 3600.0), 1)[:, :, 0]
@@ -937,8 +973,7 @@ def simulate(args: argparse.Namespace) -> None:
         try:
             metadata = write_mat_only(args, scratch_ms) if args.mat_only else None
             if metadata is None:
-                make_ms(write_makems_config(args, scratch_ms), scratch_ms, args)
-                metadata = fill_point_source_visibilities(args, scratch_ms)
+                metadata = make_and_fill_ms(args, scratch_ms)
         except BaseException:
             # The meqserver's error text is only in these, and the temporary
             # directory is about to take them with it.
@@ -1086,12 +1121,12 @@ def self_check_observation_prefix() -> None:
             "--start-frequency-hz", "1.0374e9", "--channel-width-hz", "1.3331e6", "--dynamic-range", "300",
             f"--source-l-arcsec={0.2 * dec}", "--source-m-arcsec=-0.1",
         ])
-        cfg = write_makems_config(args, ms)
         if prefix:
-            make_ms(cfg, ms, args)
+            make_and_fill_ms(args, ms)
         else:
+            write_makems_config(args, ms)
             run_makems(ms)
-        fill_point_source_visibilities(args, ms)
+            fill_point_source_visibilities(args, ms)
         return ms
 
     # (declination, integration, NTimes, channels, served from the cache)

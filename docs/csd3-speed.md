@@ -1510,3 +1510,52 @@ top-level repo applied 0001-0003 and then failed on 0004's submodule paths,
 so apply with `patch -p1 -N` in order, from a clean tree. And `apt-get install` can drop out while
 `update-ca-certificates` runs under `--fakeroot`. Finish it with
 `dpkg --configure -a`.
+
+## Round 30: the fill shares extend_template's table open
+
+**Profile.** With a host-built `fastnoise.so` bound over `/opt/ri-lib`, the
+48 real parameter sets of `.probe/params.jsonl` (`scripts/probe_simulate_stage.py`,
+warm observation cache, one pinned core) take 36.9ms each. Timing every
+casacore call (`.probe/colprof31.py`, run as `python3 .probe/colprof31.py scripts/probe_simulate_stage.py ...`) gives, per call: 8 table closes
+2.4ms, TIME and TIME_CENTROID 2.0ms each, DATA 1.9ms, ANTENNA1/2 1.5ms each,
+two main-table opens 1.0ms, two SPECTRAL_WINDOW opens 0.65ms, `addrows`
+0.9ms, and a read back of UVW (0.5ms) and FLAG (0.26ms, only for its shape).
+On a cache hit, `extend_template()` writes the main table and closes it, and
+then `fill_point_source_visibilities()` opens it again, and opens
+SPECTRAL_WINDOW to read back CHAN_FREQ, which `patch_spectral_window()` has
+just written.
+
+**Change.** `make_and_fill_ms()` asks `make_ms(fill=True)` to write the
+visibilities inside `extend_template()`'s open, from the UVW it has just
+computed and the CHAN_FREQ formula (`channel_frequencies()`, also used by
+`--mat-only`). Both are float64 columns that read back unchanged, so the
+values are the same. FLAG's zeros take DATA's shape. The skeleton and fresh
+`makems` paths still fill as before.
+
+**Stage.** Over 96 simulated MSs (each set at 20 minutes, then at its own
+length, which extends the cached observation), every file is byte-identical
+to HEAD except `table.lock`, where the open counters differ. `./ri
+self-check simulate` passes. Interleaved, 6 rounds per arm: 36.8-37.1ms
+before, 33.2-35.1ms after (-3.5ms, -9.5%).
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242, both
+arms on `/dev/shm/r30/sifs-mc` (the shipped `meqtrees.sif`, so numpy noise,
+and the 0001-0010 `wsclean.sif`). The base arm is a `git worktree` at HEAD
+(`.probe/r31ab.sh`). Both sets ran ABBA. Per-run simulate fit at 1k
+timestep-channels (`.probe/fit16.py`):
+
+| arm | set 1 | set 2 | synchronous, 150 dead |
+| --- | --- | --- | ---: |
+| base | 102.6, 102.6ms | 102.2, 102.2ms | 104.3ms |
+| fused | 93.9, 96.2ms | 97.3, 96.4ms | 97.0ms |
+
+-6.4ms (-6.3%) on simulate, with no overlap, which is about 2% of a
+WSClean evaluation. It is larger than solo, as round 27's was, because the
+opens and closes cost more with 38 ranks at once. In the synchronous pair,
+log(Z) is 0.09424 +/- 0.00279 in both arms and every chain file is
+identical. The module is bind-mounted, so this ships with no rebuild. R2D2's
+`--mat-only` path never opens an MS, so it is unaffected.
+
+**Next.** What is left of simulate solo is mostly casacore: the TIME,
+TIME_CENTROID and ANTENNA1/2 writes (~7ms), the DATA write, and the closes.
+The phase ramp's complex `exp` and noise (with `fastnoise.so`) are ~7ms each.
