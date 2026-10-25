@@ -336,3 +336,28 @@ every chain file identical in a synchronous pair. The measurements are in
 [csd3-speed.md](csd3-speed.md), round 25.
 
 Upstream-shaped: it changes nothing ducc0 computes.
+
+## 0010: map each reordered file once per process
+
+Every gridding and degridding pass builds its own `ReorderedMsProvider` and
+`ReorderedMsReader`s, and each one used to `mmap` the model, meta, part
+and weight files again and `munmap` them on destruction. On the search's
+Measurement Sets that is 9 model mappings and 16 of each part file per
+evaluation, and every new mapping faults all of its pages in again. The
+model file faults worst, because writes to a shared mapping get no
+fault-around. The patch keeps one mapping per (device, inode, size) in a
+process-wide cache inside `MappedFile` (`system/mappedfile.h`) and never
+unmaps before exit. The mapping is `MAP_SHARED`, so every user sees the same
+bytes it saw before. A file that is removed and recreated
+(`ResetModelColumn`, which only runs with facets) gets a new inode, because
+an inode that is still mapped cannot be reused. Every evaluation is a fresh
+fork of the zygote, and the zygote maps none of these files, so the cache
+lasts exactly one evaluation.
+
+Solo, it halves the binary's minor faults (6.0k to 3.5k on MS 4). In a
+37-way concurrent driver it takes 1.7% off WSClean wall time. All 24 FITS
+data blocks are byte-identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 29.
+
+Not upstream-shaped as it stands: a long-lived WSClean process with many
+parts would keep every temporary file's pages until it exits.

@@ -1444,3 +1444,69 @@ evaluation. A WSClean patch could reuse one `uvw`/visibility buffer across
 passes and `reserve` `metadata_buffer`, and could map the model file with
 `MAP_POPULATE`, or keep it and zero it instead of recreating it each major
 cycle. All of these are bookkeeping changes that cannot alter the output.
+
+## Round 29: map each reordered file once per evaluation (patch 0010)
+
+**Profile.** After round 28, `perf record -e page-faults -d` on the zygote
+driver (MS 4) attributed the remaining ~6k faults per evaluation to
+addresses. The largest groups were the reordered temporary files:
+`ReorderedMsProvider` and `ReorderedMsReader` are built afresh for each of
+the ~7 gridding and degridding passes, and each one `mmap`s the model,
+meta, part and weight files again and `munmap`s them on destruction, so
+every pass faults the same pages in again. The model file is the worst
+case, because writes into a shared mapping get no fault-around.
+
+**Change.** Patch 0010 (`system/mappedfile.h`) keeps one `MAP_SHARED`
+mapping per (device, inode, size) in a process-wide cache and never unmaps
+before exit. Because the mapping is shared, every reader sees the same bytes
+as before. Each evaluation is a fresh fork of a zygote that maps none of
+these files, so the cache lives for exactly one evaluation.
+[nested-sampling-wsclean-patches.md](nested-sampling-wsclean-patches.md)
+covers the inode argument.
+
+Rejected on the way, each measured with the driver: `MAP_POPULATE` on the
+old per-pass mappings (-1k faults, but sys time unchanged), and
+`malloc_trim(0)` in the zygote before each fork (no change, so the faults
+are not copy-on-write of the parent's freed heap).
+
+**Driver** (zygote driver from round 28, MS 4, 20 requests, ABBA, with
+round 28's malloc tunables in both arms, on cpu-q-133):
+
+| arm | solo wall | solo sys | solo faults | 37-way wall | 37-way sys | 37-way faults |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0001-0009 | 98.5ms | 11.0ms | 6.5k | 130.1ms | 23.3ms | 6.0k |
+| + 0010 | 94.5ms | 8.0ms | 3.1k | 128.9ms | 20.5ms | 5.0k |
+| + 0010 | 95.5ms | 8.5ms | 3.9k | 128.5ms | 19.9ms | 4.7k |
+| 0001-0009 | 96.6ms | 12.0ms | 5.6k | 131.6ms | 23.9ms | 6.1k |
+
+All 24 FITS data blocks over the six real-draw MSs are byte-identical.
+
+**In-run** (cpu-q-226, 38 ranks, nlive 150, 300 dead points, async, seed
+4242, `.probe/r30ab.sh`). Both arms are derived SIFs built from one
+sandbox tree, 0001-0009 (`/dev/shm/r30/sifs-s9`) and the same plus 0010
+(`sifs-mc`), with the shipped `meqtrees.sif` in both. Per-run `wsclean` fit
+at 1k timestep-channels (`.probe/fit16.py`):
+
+| arm | ABBA | BAAB |
+| --- | --- | --- |
+| 0001-0009 | 212.6, 214.6ms | 215.7, 211.4ms |
+| + 0010 | 209.1, 209.9ms | 210.8, 206.2ms |
+
+The means are 213.6ms and 209.0ms: -4.6ms (-2.2%), with no overlap across
+the eight runs, matching the driver. In a synchronous pair (150 dead) the
+fits were 212.0 and 211.7ms, so it is not resolved there. log(Z) is 0.09424
++/- 0.00279 in both arms of that pair, and every chain file is identical
+(`phys_live.txt` and `clusters/` once sorted). End-to-end evals/s spread
+from 55 to 97 across these runs because of load on the other half of the
+node, so only the stage fits resolve an effect this size.
+
+It takes effect once `wsclean.sif` is rebuilt on a Docker host and
+imported.
+
+**Rebuilding the sandbox.** /dev/shm does not survive a move to another
+node. Round 23's recipe rebuilt the sandbox in ~6 minutes, with two
+catches. With the host's git, `git apply` of the whole series from the
+top-level repo applied 0001-0003 and then failed on 0004's submodule paths,
+so apply with `patch -p1 -N` in order, from a clean tree. And `apt-get install` can drop out while
+`update-ca-certificates` runs under `--fakeroot`. Finish it with
+`dpkg --configure -a`.

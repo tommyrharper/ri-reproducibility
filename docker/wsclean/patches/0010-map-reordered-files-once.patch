@@ -1,0 +1,129 @@
+diff --git a/system/mappedfile.h b/system/mappedfile.h
+index 6b7d243..487b495 100644
+--- a/system/mappedfile.h
++++ b/system/mappedfile.h
+@@ -9,6 +9,9 @@
+ #include <fcntl.h>
+ 
+ #include <filesystem>
++#include <map>
++#include <mutex>
++#include <tuple>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -25,11 +28,9 @@ class MappedFile {
+   MappedFile(const MappedFile&) = delete;
+   MappedFile(MappedFile&& source) noexcept
+       : reserved_size_(source.reserved_size_),
+-        memory_map_(source.memory_map_),
+-        file_descriptor_(source.file_descriptor_) {
++        memory_map_(source.memory_map_) {
+     source.reserved_size_ = 0;
+     source.memory_map_ = nullptr;
+-    source.file_descriptor_ = -1;
+   }
+ 
+   MappedFile& operator=(MappedFile&& rhs) noexcept {
+@@ -51,57 +52,70 @@ class MappedFile {
+    */
+   MappedFile(const std::string& filename, size_t reserved_size)
+       : reserved_size_(reserved_size) {
+-    file_descriptor_ = open(filename.c_str(), O_RDWR);
+-    if (file_descriptor_ == -1)
++    const int file_descriptor = open(filename.c_str(), O_RDWR);
++    if (file_descriptor == -1)
+       throw std::runtime_error("Error opening file '" + filename + "'");
+     if (reserved_size_ != 0) {
+-#ifdef MAP_NORESERVE
+-      memory_map_ = reinterpret_cast<char*>(
+-          mmap(nullptr, reserved_size_, PROT_READ | PROT_WRITE,
+-               MAP_SHARED | MAP_NORESERVE, file_descriptor_, 0));
+-#else
+-      memory_map_ = reinterpret_cast<char*>(
+-          mmap(nullptr, reserved_size_, PROT_READ | PROT_WRITE, MAP_SHARED,
+-               file_descriptor_, 0));
+-#endif
+-      if (memory_map_ == MAP_FAILED) {
+-        memory_map_ = nullptr;
+-        close(file_descriptor_);
+-        file_descriptor_ = -1;
+-        const std::string msg = aocommon::system::GetErrorString(errno);
+-        throw std::runtime_error(
+-            std::string("Error creating memory map for file '" + filename +
+-                        "': "
+-                        "mmap() returned MAP_FAILED with error message: ") +
+-            msg);
++      // Every gridding pass constructs its own providers and readers, so the
++      // same files used to be mapped (and their pages faulted in) once per
++      // pass. Map each file once per process instead: the mapping is shared,
++      // so every user sees the same data either way. A recreated file has a
++      // new inode, and a still-mapped inode cannot be reused.
++      struct stat status;
++      if (fstat(file_descriptor, &status) != 0) {
++        close(file_descriptor);
++        throw std::runtime_error("Error reading status of file '" + filename +
++                                 "'");
++      }
++      const Key key(status.st_dev, status.st_ino, reserved_size_);
++      std::lock_guard<std::mutex> lock(CacheMutex());
++      auto iterator = Cache().find(key);
++      if (iterator == Cache().end()) {
++        char* memory_map = reinterpret_cast<char*>(
++            mmap(nullptr, reserved_size_, PROT_READ | PROT_WRITE,
++                 MAP_SHARED | MAP_NORESERVE, file_descriptor, 0));
++        if (memory_map == MAP_FAILED) {
++          close(file_descriptor);
++          const std::string msg = aocommon::system::GetErrorString(errno);
++          throw std::runtime_error(
++              std::string("Error creating memory map for file '" + filename +
++                          "': "
++                          "mmap() returned MAP_FAILED with error message: ") +
++              msg);
++        }
++        iterator = Cache().emplace(key, memory_map).first;
+       }
++      memory_map_ = iterator->second;
+     }
++    close(file_descriptor);
+   }
+ 
+   ~MappedFile() { Close(); }
+ 
+-  void Close() {
+-    if (memory_map_ != nullptr) {
+-      if (reserved_size_ != 0) munmap(memory_map_, reserved_size_);
+-    }
+-    if (file_descriptor_ != -1) {
+-      close(file_descriptor_);
+-    }
+-  }
++  // Mappings stay in the process-wide cache until exit.
++  void Close() { memory_map_ = nullptr; }
+ 
+   char* Data() { return memory_map_; }
+   const char* Data() const { return memory_map_; }
+ 
+  private:
++  using Key = std::tuple<dev_t, ino_t, size_t>;
++  static std::map<Key, char*>& Cache() {
++    static std::map<Key, char*> cache;
++    return cache;
++  }
++  static std::mutex& CacheMutex() {
++    static std::mutex mutex;
++    return mutex;
++  }
++
+   friend void swap(MappedFile& lhs, MappedFile& rhs) noexcept {
+     std::swap(lhs.reserved_size_, rhs.reserved_size_);
+     std::swap(lhs.memory_map_, rhs.memory_map_);
+-    std::swap(lhs.file_descriptor_, rhs.file_descriptor_);
+   }
+ 
+   size_t reserved_size_;
+   char* memory_map_ = nullptr;
+-  int file_descriptor_ = -1;
+ };
+ 
+ }  // namespace wsclean
