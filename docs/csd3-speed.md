@@ -982,3 +982,70 @@ old. A dead run still counts its leftover directories as "abandoned".
 
 Next: on a whole node, test ranks above the 56 cap, up to one per CPU
 (round 18).
+
+## Round 21: R2D2's simulate writes no MS
+
+**Profile.** At `4b951f3` a default R2D2 run (38 x 1) spent ~120-130ms of
+worker time per evaluation in simulate, ~10% of an evaluation. Since round 13
+that request writes `r2d2_data.mat` itself, and nothing in an R2D2 run opens
+the MS after that. Most evaluations copy a cached skeleton (baked into
+`meqtrees.sif` or published earlier in the run) and patch, fill and prune it.
+The rest extend a cached observation. All of that work fed only the `.mat`.
+
+**Change.** In R2D2 runs the simulate request now passes `--mat-only`
+(`common.py`), unless `NS_KEEP_MEASUREMENT_SETS=1`. `write_mat_only()` in
+`simulate_point_source_ms.py` reads UVW from the cached skeleton (read-only,
+no copy), or rebuilds it from the cached observation as `extend_template()`
+does. It takes the channel frequencies from `patch_spectral_window()`'s
+formula and draws the same noise stream over the full (row, channel,
+correlation) shape, then adds only correlation 0. When neither cache holds
+the observation it falls back to the full MS path, because that makems build
+is what fills the caches. The WSClean path does not change.
+`self_check_mat_only` runs a cache miss, a skeleton hit and an
+observation-prefix hit, and checks each `.mat` against the full path byte for
+byte, plus the metadata.
+
+**Stage timing.** `.probe/mat21.py` ran in `meqtrees.sif` on round 15's
+48 parameter sets: an untimed warm-up of both arms, then timed repeats with
+the arm order alternating. "Base" is `simulate --mat-path`, "new" is the
+prototype that became `write_mat_only()`.
+
+| load | base | new | saving | `.mat` |
+| --- | ---: | ---: | ---: | --- |
+| 1 process, 2 x 48 | 45.9ms | 34.0ms | 11.9ms | `u`, `v`, `y`, `nW` identical, 96/96 |
+| 36 at once, 3 x 48 each | 75.2ms (median of 36) | 50.6ms | 23.3-25.4ms in every copy | |
+
+94 of the 96 sets hit a skeleton and 2 hit an observation prefix.
+
+**End to end.** Run on cpu-q-133 with this job's 38 CPUs: the default
+38 x 1, nlive 150, 15 repeats, 150 dead points, async, seed 4242. Arms ran in
+the order new/base/base/new. Base is `4b951f3` unpacked with `git archive`.
+
+| arm | evals | wall | steady evals/s (30-90s) | simulate mean / median | R2D2 mean | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| new | 3165 | 132s | 30.7 | 79.4 / 52.8ms | 1151ms | 0.01459 +/- 0.00345 |
+| base | 3129 | 158s | 29.2 | 126.8 / 92.1ms | 1149ms | 0.01471 +/- 0.00352 |
+| base | 3214 | 155s | 29.2 | 118.5 / 77.8ms | 1159ms | 0.01443 +/- 0.00361 |
+| new | 3225 | 174s | 30.0 | 82.3 / 52.8ms | 1156ms | 0.01461 +/- 0.00352 |
+
+In the full runs simulate drops by ~40ms (-35%) per evaluation, with no
+overlap between the arms. R2D2 itself does not change. That is ~3% of worker
+time. Steady evals/s is 30.0-30.7 against 29.2, which agrees but is inside
+the ~5% spread of runs this short. Wall time follows the tail (round 20) and
+says nothing here. log(Z) lies in round 20's band (0.01437-0.01475) for every
+run. With the `.mat` byte-identical, a given parameter set scores the same.
+
+What it costs: an R2D2 evaluation has no `sim.ms`, so a failed one keeps its
+`.mat` but no MS. Re-running the recorded simulate command without
+`--mat-only` rebuilds the MS. `NS_KEEP_MEASUREMENT_SETS=1` restores the MS
+for a whole run.
+
+Also tried, not shipped: reusing preallocated buffers for the noise draw
+(`rng.standard_normal(out=)`, then multiply-and-cast into a float32 buffer)
+is bit-identical, but only 20.0 -> 18.2ms solo and 28.5 -> 26.4ms at 36
+copies. That is ~0.7% of a WSClean evaluation. PCG64's ziggurat itself is
+the cost, and any faster generator changes the noise.
+
+Next: WSClean's simulate (~90ms at 36 ranks) still needs the MS. What is
+left there is noise ~20ms, the skeleton copy and fill, and the
+visibility `exp`, and each of those levers changes bits (round 15).

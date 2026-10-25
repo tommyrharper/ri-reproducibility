@@ -68,6 +68,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # The R2D2 PoC's .mat, written from the arrays this run just put in the MS
     # instead of a second worker request reading them back (round 13).
     parser.add_argument("--mat-path", default=None, help="Also write R2D2's .mat (correlation 0) here")
+    # R2D2 reads only the .mat, so building and filling an MS nobody opens was a
+    # third of the stage (docs/csd3-speed.md, round 21). Falls back to the MS
+    # whenever makems has to run, since that build is what fills the caches.
+    parser.add_argument("--mat-only", action="store_true", help="With --mat-path: write no MS when its observation is cached")
     return parser.parse_args(argv)
 
 
@@ -698,13 +702,16 @@ def point_source_visibilities(
 UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
 
 
-def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
+def noise_sigma_of(args: argparse.Namespace) -> float:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
     if args.source_flux_jy <= 0:
         raise SystemExit("FATAL: --source-flux-jy must be positive")
+    return args.source_flux_jy / args.dynamic_range
 
-    noise_sigma_jy = args.source_flux_jy / args.dynamic_range
+
+def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
+    noise_sigma_jy = noise_sigma_of(args)
     l_rad = math.radians(args.source_l_arcsec / 3600.0)
     m_rad = math.radians(args.source_m_arcsec / 3600.0)
 
@@ -769,6 +776,11 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
 
         write_r2d2_mat(Path(args.mat_path), data[:, :, 0], uvw, freqs_hz, np.ones(len(uvw)), noise_sigma_jy)
 
+    return simulation_metadata(args, output_ms, uvw, freqs_hz, noise_sigma_jy)
+
+
+def simulation_metadata(args: argparse.Namespace, output_ms: Path | None, uvw: np.ndarray,
+                        freqs_hz: np.ndarray, noise_sigma_jy: float) -> dict[str, object]:
     # The longest projected baseline in wavelengths, which is what both imagers
     # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
     # image_pixel_size_arcsec() in common.py), and the WSClean runner reads this
@@ -777,7 +789,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     max_proj_baseline_lambda = float(np.max(np.hypot(uvw[:, 0], uvw[:, 1]))) * float(freqs_hz.max()) / SPEED_OF_LIGHT
 
     return {
-        "measurement_set": str(output_ms),
+        "measurement_set": str(output_ms) if output_ms is not None else None,
         "vla_config": args.vla_config,
         "antenna_table_source": str(Cattery_VLA_A),
         "visibility_engine": "analytic point-source RIME (checked against the MeqTrees Meow predict) plus seeded thermal-noise fill",
@@ -805,6 +817,56 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     }
 
 
+_TEMPLATE_LAYOUT: dict[Path, tuple[np.ndarray, np.ndarray, int]] = {}
+
+
+def write_mat_only(args: argparse.Namespace, output_ms: Path) -> dict[str, object] | None:
+    """--mat-only: the .mat fill_point_source_visibilities() writes, array for
+    array, from the cached rows alone - no MS copied, extended or filled. None
+    when the observation is not cached yet: makems has to run, and the MS it
+    builds is what publishes the observation for the next evaluation."""
+    noise_sigma_jy = noise_sigma_of(args)
+    cfg_text = write_makems_config(args, output_ms).read_text()
+    skeleton = cached_skeleton(skeleton_key(cfg_text))
+    if skeleton.exists():
+        # make_ms_skeleton() copies this and changes only the SPECTRAL_WINDOW.
+        with table(str(skeleton), readonly=True, ack=False) as ms:
+            uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
+            n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape[2]
+    else:
+        n_times = n_times_of(args)
+        observation = load_observation(cfg_text, n_times)
+        if observation is None:
+            return None
+        template = one_timestep_template(cfg_text, args, output_ms.parent)
+        if template not in _TEMPLATE_LAYOUT:
+            with table(str(template), readonly=True, ack=False) as ms:
+                _TEMPLATE_LAYOUT[template] = (
+                    ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2"), ms.getcol("DATA", startrow=0, nrow=1).shape[2])
+        a1, a2, n_corr = _TEMPLATE_LAYOUT[template]
+        # extend_template()'s UVW, which round-trips the float64 column unchanged.
+        antenna_uvw = observation["antenna_uvw"][:n_times]
+        uvw = (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3)
+    # patch_spectral_window()'s CHAN_FREQ, again a float64 column read back as is.
+    freqs_hz = args.start_frequency_hz + (np.arange(args.channel_count) + 0.5) * args.channel_width_hz
+
+    vis = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, math.radians(args.source_l_arcsec / 3600.0),
+                                    math.radians(args.source_m_arcsec / 3600.0), 1)[:, :, 0]
+    if noise_sigma_jy:
+        # The whole column's stream is drawn, as the fill does, so correlation 0
+        # gets the same numbers; only its slice is added.
+        per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
+        rng = np.random.default_rng(args.seed)
+        shape = (len(uvw), len(freqs_hz), n_corr)
+        vis.real += rng.normal(0.0, per_component_sigma, shape)[:, :, 0].astype(np.float32)
+        vis.imag += rng.normal(0.0, per_component_sigma, shape)[:, :, 0].astype(np.float32)
+
+    from ms_to_r2d2_mat import write_r2d2_mat
+
+    write_r2d2_mat(Path(args.mat_path), vis, uvw, freqs_hz, np.ones(len(uvw)), noise_sigma_jy)
+    return simulation_metadata(args, None, uvw, freqs_hz, noise_sigma_jy)
+
+
 def simulate(args: argparse.Namespace) -> None:
     final_ms = Path(args.output_ms)
     require_clean_output(final_ms)
@@ -813,16 +875,21 @@ def simulate(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
+        if args.mat_only and not args.mat_path:
+            raise SystemExit("FATAL: --mat-only needs --mat-path")
         try:
-            make_ms(write_makems_config(args, scratch_ms), scratch_ms, args)
-            metadata = fill_point_source_visibilities(args, scratch_ms)
+            metadata = write_mat_only(args, scratch_ms) if args.mat_only else None
+            if metadata is None:
+                make_ms(write_makems_config(args, scratch_ms), scratch_ms, args)
+                metadata = fill_point_source_visibilities(args, scratch_ms)
         except BaseException:
             # The meqserver's error text is only in these, and the temporary
             # directory is about to take them with it.
             for log in Path(scratch).glob("*.log"):
                 shutil.copy2(log, final_ms.parent / log.name)
             raise
-        metadata["measurement_set"] = str(final_ms)
+        if metadata["measurement_set"] is not None:
+            metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
             destination = final_ms.parent / produced.name
             if destination.is_dir():
@@ -1377,6 +1444,43 @@ def self_check_serve_fifo() -> None:
     print("serve fifo self-check passed")
 
 
+def self_check_mat_only() -> None:
+    """--mat-only must write the full path's .mat and metadata on every cache path."""
+    from scipy.io import loadmat
+
+    def run(directory: Path, minutes: str, mat_only: bool) -> tuple[dict, dict]:
+        ms = directory / "sim.ms"
+        with contextlib.redirect_stdout(io.StringIO()):
+            simulate(parse_args([
+                "--output-ms", str(ms), "--observation-minutes", minutes, "--channel-count", "3",
+                "--start-frequency-hz", "1.4e9", "--channel-width-hz", "2.0e6", "--integration-seconds", "30",
+                "--declination-deg=40", "--source-l-arcsec=0.3", "--source-m-arcsec=-0.2",
+                "--dynamic-range", "500", "--seed", "11", "--mat-path", str(directory / "r2d2_data.mat"),
+            ] + (["--mat-only"] if mat_only else [])))
+        assert ms.exists() != mat_only or directory.name == "miss", f"{directory.name}: MS presence is wrong"
+        metadata = json.loads((directory / "simulation.json").read_text())
+        metadata.pop("measurement_set")
+        return loadmat(str(directory / "r2d2_data.mat")), metadata
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        root = Path(scratch)
+        use_skeleton_cache(root / "cache")
+        try:
+            # A miss builds the MS (and so the caches); the shape is then a
+            # skeleton hit, and a shorter one an observation-prefix hit.
+            for name, minutes in (("miss", "6.0"), ("skeleton", "6.0"), ("observation", "3.0")):
+                direct, direct_meta = run(root / name, minutes, True)
+                full, full_meta = run(root / f"{name}-full", minutes, False)
+                for key in ("u", "v", "y", "nW"):
+                    assert direct[key].dtype == full[key].dtype and np.array_equal(
+                        direct[key].view(np.uint8), full[key].view(np.uint8)), f"{name}: --mat-only {key} differs"
+                assert direct_meta == full_meta, f"{name}: --mat-only metadata differs"
+            assert not (root / "observation" / "sim.ms").exists() and (root / "miss" / "sim.ms").exists()
+        finally:
+            use_skeleton_cache(None)
+    print("mat-only self-check passed")
+
+
 if __name__ == "__main__":
     # --serve and --self-check take no other arguments, so they are checked before
     # argparse, which requires the full simulate argument set.
@@ -1402,6 +1506,7 @@ if __name__ == "__main__":
             self_check_forest_reuse()
             self_check_analytic_predict()
             self_check_noise_weighting()
+            self_check_mat_only()
             self_check_dropped_subtables()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()

@@ -2411,6 +2411,10 @@ def simulate_measurement_set(
         # Written by the simulate request itself, beside the MS: a separate
         # convert request re-read the MS for 25ms typical, 170ms heavy (round 13).
         sim_cmd += ["--mat-path", str(work / "r2d2_data.mat")]
+        # R2D2 reads only the .mat, so no MS is built unless one is being kept
+        # (round 21: -25ms of a 75ms stage at 36 ranks, the .mat byte-identical).
+        if os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") == "0":
+            sim_cmd.append("--mat-only")
     returncode = simulate_worker_request(
         meqtrees_image,
         platform,

@@ -589,8 +589,11 @@ Measurement Set (`sim.ms`) that WSClean consumes directly. For the R2D2 run
 the simulate request also writes `r2d2_data.mat` (`--mat-path`) from the arrays
 it just put in the MS, through `write_r2d2_mat()` in
 `scripts/lib/nested_sampling/ms_to_r2d2_mat.py`; that script still converts any
-MS standalone. Either way the file holds the minimal field set R2D2 loads,
-without flag metadata:
+MS standalone. Since nothing in an R2D2 run reads the MS, the request also
+passes `--mat-only` (unless `NS_KEEP_MEASUREMENT_SETS=1`): once the
+observation is cached it writes the same `.mat`, byte for byte, without
+building an MS at all ([csd3-speed.md](csd3-speed.md), round 21). Either way
+the file holds the minimal field set R2D2 loads, without flag metadata:
 
 | Field | Meaning |
 |---|---|
