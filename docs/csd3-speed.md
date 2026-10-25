@@ -2105,3 +2105,67 @@ export, import) gets the same result.
 **Learned.** Rows from runs outside `results/nested-sampling/` are skipped
 by `bench.py` ("not recording ... outside results/nested-sampling"). Move
 the run there and `scripts/bench.py record <dir>` adds the row afterwards.
+
+## Round 42: TIME and TIME_CENTROID out of the IncrementalStMan
+
+**Profile.** At a warm cache with `fastnoise.so` (48 real sets, one pinned
+core), `extend_template` has a median of 17.8ms. Per evaluation, the putcols
+of TIME, TIME_CENTROID and DATA cost about 2ms each. TIME and TIME_CENTROID
+are slow because makems stores them in an IncrementalStMan, and its putcol
+compares each row with the previous one.
+
+**Change.** When `_copy_with_large_ssm_buckets` copies makems' template, it
+now also moves both columns into the template's StandardStMan (the one round
+32 enlarged to 32KB buckets), using the new `_template_dminfo`. The values
+are unchanged. The template is run-local, so there is nothing to invalidate.
+On its own, the extension (copytree, addrows and four putcols at 150
+timesteps x 351 baselines) has a median of 8.5ms, down from 11.5ms. The
+observation-prefix self-check now compares a served MS's layout with a
+makems build passed through `_template_dminfo`, and every value as before.
+
+**In-run.** The two arms raced at once with 18 ranks each (nlive 150, 15
+repeats, 300 dead, seed 4242, async, shipped `wsclean.sif`, host-built
+`fastnoise.so`). Each arm had its own `/dev/shm` observation cache,
+prefilled with the 910 keys of the production cache, which is the warm state
+production runs see (iteration 44). The base arm is HEAD exported into
+`/dev/shm`:
+
+| pair | arm | evals | evals/s | simulate | WSClean binary | worker ms/eval |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| a | base (tmpfs tree) | 8591 | 56.1 | 43.3ms | 220.9ms | 265.4 |
+| a | SSM time (Lustre tree) | 7504 | 44.5 | 38.8ms | 221.5ms | 261.5 |
+| b | base (tmpfs tree) | 7550 | 53.1 | 48.0ms | 238.1ms | 287.4 |
+| b | SSM time (Lustre tree) | 7445 | 44.3 | 41.4ms | 229.7ms | 272.4 |
+| c | base (tmpfs tree) | 7594 | 57.4 | 43.4ms | 220.9ms | 265.4 |
+| c | SSM time (tmpfs tree) | 7376 | 58.4 | 38.4ms | 211.0ms | 250.5 |
+
+Simulate is 4.5-6.6ms shorter in every pair (-10 to -14%), and the WSClean
+binary does not get slower when it reads TIME from the SSM. Worker time per
+evaluation falls by 1.5-5.6%.
+
+In pairs a and b, whole-run evals/s favoured base by about 20%. This was the
+tree's location, not the change. In those pairs, worker-busy time was ~83%
+of wall for the tmpfs tree and ~66% for the Lustre one. Pair c put both
+trees in `/dev/shm`, which brought both to 81-85% and gave the new arm +1.7%.
+
+**Identity.** The synchronous pair (150 dead) gives log(Z) 0.09441 +/-
+0.00264 in both arms, and every chain file is byte-identical
+(`phys_live*.txt` once sorted), including `.resume` and `clusters/`. The
+base arm got there through a `run_with_retries` resume. On both attempts,
+some ranks hit "no wsclean-zygote pool for rank N" (the 300s
+`NS_POOL_CONNECT_SECONDS`) after the prior phase, and the retry started a
+fresh pool. A resumed run is not given a benchmark row.
+
+**Learned.**
+- The working tree's filesystem costs ~20% of whole-run evals/s. With the
+  run directory and tree on Lustre (`/rds`), 18 ranks spend ~17% more of the
+  wall outside worker time than with both in `/dev/shm`, and the
+  per-evaluation stage timings do not show it. Every production run has its
+  tree on `/rds`, which makes this the biggest open lead. The next round
+  should find which per-evaluation file operations on Lustre (evaluation
+  dirs, `metrics.json`, the `run.log` tee, chain writes) the rank waits on.
+- A/B arms must share a filesystem. Export both trees to `/dev/shm`, or
+  neither.
+- Twice, a wsclean-zygote pool failed to connect within 300s when two
+  18-rank arms started together, in the arm that started first. The retry
+  recovered, but the cause is unknown.
