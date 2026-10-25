@@ -68,6 +68,14 @@ deleted and the report falls back to its placeholder. A consequence worth
 knowing: a run holds every image until it finishes, so peak usage during a run
 is unchanged and only the finished run is small.
 
+During a run each rank also strips evaluations as it goes, keeping only its own
+extremes so far. With tmpfs scratch, those extremes wait under
+`$NS_SCRATCH_DIR/.held/` and move to `evaluations/` every
+`NS_RETAIN_FLUSH_SECONDS` (600) and at the end, because publishing each one to
+Lustre only for it to be evicted later was ~15% of a 36-rank WSClean run
+(csd3-speed.md, round 47). A job that dies loses at most one interval of those
+images; their records stay.
+
 Evaluations are identified by directory name, not `eval_id`: PolyChord reuses
 the number across parameter vectors, so one run holds several `eval-0083-*`
 directories and ranking on the number alone would spare or delete whole groups

@@ -1900,7 +1900,11 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
             marker.unlink(missing_ok=True)
     keeping = prune_evaluation_artefacts(eval_dir, record)
     kept = retain_evaluation_detail(eval_dir, record) or keeping
-    publish_evaluation_scratch(eval_dir, record, kept)
+    if kept and not keeping and not _always_retained(eval_dir, record):
+        hold_evaluation_scratch(eval_dir, record)
+    else:
+        publish_evaluation_scratch(eval_dir, record, kept)
+    flush_held_evaluations()
     if _RECORD_WRITER is None:
         _write_record(eval_dir / "metrics.json", _json_text(record))
     else:
@@ -1940,6 +1944,8 @@ def drain_record_writes(timeout: float | None = None) -> None:
     global _RECORD_WRITER
     import concurrent.futures
 
+    if timeout is None:
+        flush_held_evaluations(force=True)
     writer, _RECORD_WRITER = _RECORD_WRITER, None
     if writer is None:
         return
@@ -1983,14 +1989,19 @@ def _strip_to_record(eval_dir: Path) -> None:
             entry.unlink(missing_ok=True)
 
 
+def _always_retained(eval_dir: Path, record: dict[str, Any]) -> bool:
+    return (os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
+            or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+            or "error" in record or record.get("objective") is None
+            or _keeps_detail(eval_dir.name))
+
+
 def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
     """False if this evaluation is stripped to its record."""
     import heapq
+    import shutil
 
-    if (os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
-            or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
-            or "error" in record or record.get("objective") is None
-            or _keeps_detail(eval_dir.name)):
+    if _always_retained(eval_dir, record):
         return True
     key, objective = eval_dir.name, float(record["objective"])
     evicted = set()
@@ -2002,15 +2013,65 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
         evicted.add(heapq.heappop(_HIGHEST)[1])
     evicted -= {k for _, k in _LOWEST} | {k for _, k in _HIGHEST}
     for name in evicted:
+        if name in _HELD:
+            shutil.rmtree(_HELD.pop(name)[0], ignore_errors=True)
         # This evaluation's own dir is empty, or not made yet, while its
         # output is still in scratch: no Lustre walk for it (round 14).
-        if name != key or evaluation_scratch_dir(eval_dir) is None:
+        elif name != key or evaluation_scratch_dir(eval_dir) is None:
             _strip_to_record(eval_dir.parent / name)
     if key in evicted:
         for image_key in RETAINED_IMAGE_KEYS:
             (record.get("paths") or {}).pop(image_key, None)
     return key not in evicted
 
+
+
+# A rank's extremes so far are mostly evicted again: replaying the 71k-evaluation
+# R2D2 run's objectives, 9-13% of all evaluations at 24-36 ranks enter one, and
+# publishing each to Lustre and stripping it later cost ~0.3s of the rank's
+# main thread (docs/csd3-speed.md, round 47). So with scratch they wait in
+# tmpfs under .held/, an eviction there is free, and the survivors go to Lustre
+# every NS_RETAIN_FLUSH_SECONDS and when the rank drains its records. A job
+# that dies loses at most that much of its extremes' images; the records
+# survive and prune_run_artefacts() drops the paths that no longer exist.
+_HELD: dict[str, tuple[Path, Path]] = {}
+_HELD_SINCE: float | None = None
+
+
+def hold_evaluation_scratch(eval_dir: Path, record: dict[str, Any]) -> None:
+    global _HELD_SINCE
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is None or not scratch.is_dir():
+        return
+    held = scratch.parent / ".held" / scratch.name
+    held.parent.mkdir(exist_ok=True)
+    scratch.rename(held)
+    _HELD[eval_dir.name] = (held, eval_dir)
+    if _HELD_SINCE is None:
+        _HELD_SINCE = time.monotonic()
+    paths = record.get("paths") or {}
+    for key, value in paths.items():
+        if isinstance(value, str) and Path(value).is_relative_to(scratch):
+            paths[key] = str(eval_dir / Path(value).relative_to(scratch))
+
+
+def flush_held_evaluations(force: bool = False) -> None:
+    import shutil
+
+    global _HELD_SINCE
+    if not _HELD or not force and (
+            time.monotonic() - (_HELD_SINCE or 0.0)
+            < float(os.environ.get("NS_RETAIN_FLUSH_SECONDS", "600"))):
+        return
+    for held, eval_dir in _HELD.values():
+        if not held.is_dir():
+            continue  # a self-check's scratch, already gone
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        for produced in held.iterdir():
+            shutil.move(str(produced), eval_dir / produced.name, copy_function=shutil.copyfile)
+        held.rmdir()
+    _HELD.clear()
+    _HELD_SINCE = None
 
 
 def self_check_streaming_retention() -> None:
@@ -2024,9 +2085,11 @@ def self_check_streaming_retention() -> None:
         # Same outcome whether an evaluation writes beside its record or in
         # scratch that is published only if it is kept, and whether records
         # are written inline or by the run's background writer.
+        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
         for scratch_root, background in ((None, False), ("scratch", False), ("scratch", True)):
             _LOWEST.clear()
             _HIGHEST.clear()
+            _HELD.clear()
             with tempfile.TemporaryDirectory() as tmp:
                 evaluations = Path(tmp) / "evaluations"
                 if scratch_root:
@@ -2051,11 +2114,20 @@ def self_check_streaming_retention() -> None:
                               "paths": {"image": str(work / "wsclean" / "recon-image.fits")}}
                     write_evaluation_record(eval_dir, record)
                     assert not (Path(tmp) / "scratch" / eval_dir.name).exists(), "scratch outlived scoring"
-                    if not (eval_dir / "wsclean").exists():
+                    if eval_dir.name in _HELD:
+                        # Held in tmpfs: nothing of it on Lustre but its record.
+                        assert not (eval_dir / "wsclean").exists(), "a held evaluation was published"
+                        assert (Path(tmp) / "scratch" / ".held" / eval_dir.name / "wsclean").is_dir()
+                    if not (eval_dir / "wsclean").exists() and eval_dir.name not in _HELD:
                         assert "image" not in record["paths"], "a stripped record still names its image"
                     else:
                         assert record["paths"]["image"] == str(eval_dir / "wsclean" / "recon-image.fits")
+                if scratch_root:
+                    assert _HELD, "no extreme was held in scratch"
+                    assert len(_HELD) <= 6, sorted(_HELD)
                 drain_record_writes()
+                held_root = Path(tmp) / "scratch" / ".held"
+                assert not _HELD and not (held_root.exists() and any(held_root.iterdir()))
                 ordered = sorted(objectives, key=objectives.get)
                 must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
                 for key in objectives:
@@ -2066,6 +2138,15 @@ def self_check_streaming_retention() -> None:
                         assert kept == ["metrics.json"], (key, kept)
                     written = json.loads((evaluations / key / "metrics.json").read_text())
                     assert written["objective"] == objectives[key], (key, written)
+
+                if scratch_root:
+                    # Once NS_RETAIN_FLUSH_SECONDS have passed, the next record publishes.
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                    eval_dir = evaluations / "eval-best"
+                    (evaluation_scratch_dir(eval_dir) / "wsclean").mkdir(parents=True)
+                    write_evaluation_record(eval_dir, {"objective": 1e3, "paths": {}})
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                    assert not _HELD and (eval_dir / "wsclean").is_dir()
 
                 if background:
                     # A write that fails in the background still fails the run.
@@ -2095,6 +2176,8 @@ def self_check_streaming_retention() -> None:
     finally:
         drain_record_writes(timeout=0)
         os.environ.pop("NS_SCRATCH_DIR", None)
+        os.environ.pop("NS_RETAIN_FLUSH_SECONDS", None)
+        _HELD.clear()
         IMAGE_KEEP_ENDS = saved[0]
         if saved[1] is None:
             os.environ.pop("NS_KEEP_DETAIL_EVERY", None)

@@ -1815,7 +1815,8 @@ mkdir and 5.4% newfstatat on Lustre. The Lustre calls are streaming
 retention: each rank publishes every new top/bottom-20 objective to
 `evaluations/` (~0.3s on the main thread) and evicts it later. 1,531 of
 6,661 evaluations were kept at some point; the count grows as ~40 ln(k) a
-rank, so this is a short-benchmark artefact and negligible in production.
+rank, so this is a short-benchmark artefact and negligible in production
+(wrong for WSClean at many ranks: 13% of evaluations at 36 ranks; round 47).
 
 **Change tried.** Queue the publish/evict on the rank's FIFO record-writer
 thread. The mkdir samples went, replaced by 13% futex; simulate was +24ms in
@@ -2169,3 +2170,79 @@ fresh pool. A resumed run is not given a benchmark row.
 - Twice, a wsclean-zygote pool failed to connect within 300s when two
   18-rank arms started together, in the arm that started first. The retry
   recovered, but the cause is unknown.
+
+## Round 47: a rank's extremes wait in tmpfs, not on Lustre
+
+**Profile.** Round 42 found that a tree on Lustre costs ~20% of whole-run
+evals/s. Round 35 had already caught one Lustre cost on the rank's main
+thread: streaming retention publishes each evaluation that enters the rank's
+top or bottom 20 objectives so far from tmpfs scratch to `evaluations/`
+(~0.3s: mkdir and file creates on Lustre), and strips it again once it is
+evicted. Round 35 called this a short-benchmark artefact, but the count is
+~40 ln(k) for a rank with k evaluations, so it grows with the rank count.
+Replaying the 71,393 objectives of the longest R2D2 run
+(`r2d2-vlaa-20260922T174616Z`) through per-rank heaps, with evaluations dealt
+to ranks at random, 9.1% of them enter an extreme at 24 ranks, 13.0% at 36
+and 23.5% at 72. For WSClean, at ~0.25s of worker time per evaluation, that
+is about 15% of the rank's time at 36 ranks. For R2D2, at ~20s, it is
+negligible. A bound pair on HEAD code with both arms in one Lustre tree
+(`NS_IMAGE_KEEP_ENDS=0`, so no extremes are published, against the default
+20) gave 53.8 vs 42.5 and 51.0 vs 40.9 evals/s (+26%, +25%).
+
+**Change.** `write_evaluation_record` now holds an extreme instead of
+publishing it. The scratch directory is renamed to `.held/<eval>` in the
+same tmpfs, and the record names its final Lustre paths as before. An
+eviction of a held evaluation is an `rmtree` in tmpfs. Survivors move to
+Lustre at most every `NS_RETAIN_FLUSH_SECONDS` (600) and when the rank
+drains its records at the end. The 1 in 100 detail evaluations, failures,
+and `NS_KEEP_ALL_IMAGES`/`NS_KEEP_MEASUREMENT_SETS` runs publish at once as
+before. A flush moves at most 2 x `IMAGE_KEEP_ENDS` evaluations per rank. A
+job that dies loses the images of at most one interval's held extremes.
+Their records survive, and `prune_run_artefacts()` drops any path that no
+longer exists. The streaming-retention self-check now covers holding,
+eviction from `.held/`, the timed flush and the final drain.
+
+**In-run.** Base is HEAD exported to `/rds`. New is this tree, also on
+`/rds`. The arms were raced with 18 ranks each (nlive 150, 15 repeats, 300
+dead, seed 4242, async), each with its own `/dev/shm` observation cache
+prefilled from the production one, shipped SIFs and host-built
+`fastnoise.so`. The starting arm alternated between pairs. Pairs c and d
+were run in gnhf 46, which hit a usage limit before it could record them.
+Pairs f and g were rerun here with the same code.
+
+| pair | arm | evals | wall | evals/s | worker ms/eval |
+| --- | --- | ---: | ---: | ---: | ---: |
+| c | base | 7491 | 160.9s | 46.6 | 234.9 |
+| c | held | 7944 | 131.2s | 60.5 | 248.1 |
+| d | held | 8124 | 136.4s | 59.6 | 227.8 |
+| d | base | 7473 | 137.6s | 54.3 | 237.9 |
+| f | held | 7238 | 113.9s | 63.5 | 236.5 |
+| f | base | 7857 | 131.8s | 59.6 | 223.7 |
+| g | base | 7568 | 145.4s | 52.1 | 243.4 |
+| g | held | 8070 | 133.0s | 60.7 | 248.9 |
+
+The held arm was faster in all four pairs: +30%, +10%, +6.5% and +16.5%
+evals/s. Worker time per evaluation did not fall, and was slightly higher
+when the held arm had more evaluations in flight. The gain is all in rank
+main-thread time between evaluations, which is where the Lustre publishes
+were. The bound pair's code with holding (pair e, keep 56.4 vs nokeep 52.2
+evals/s) now matches the no-publish bound. The node's load average reached
+65 during pair g from another job sharing it, which is why only raced pairs
+are compared.
+
+**Identity.** In the synchronous pair (150 dead), log(Z) is 0.09441 +/-
+0.00264 in both arms, and all 13 chain files are byte-identical
+(`phys_live*.txt` once sorted). Neither arm restarted. After the final
+prune, both async pair-c arms keep the same number of FITS images (94).
+
+**Learned.**
+- Round 35's "negligible in production" was wrong for WSClean. A rank's
+  extremes so far grow as ~40 ln(k) per rank, so the fraction of evaluations
+  published grows with the rank count, to 13% at 36 ranks and 23% at 72.
+- A cost on the rank's main thread shows only in whole-run evals/s, not in
+  any stage timing or in worker ms/eval. Keep comparing raced arms on
+  evals/s, with worker ms/eval as a check that the workers did not change.
+- gnhf 46's edits were recovered from its transcript
+  (`.gnhf/runs/*/iteration-46.jsonl`, the `old=`/`new=` python edits) after
+  a usage limit ended it unrecorded. Its result directories and the base
+  tree on `/rds` were still there to re-score with `bench.row_for`.
