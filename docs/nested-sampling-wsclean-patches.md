@@ -361,3 +361,22 @@ data blocks are byte-identical. The measurements are in
 
 Not upstream-shaped as it stands: a long-lived WSClean process with many
 parts would keep every temporary file's pages until it exits.
+
+## 0011: read each meta record at its fixed size
+
+`ReorderedMsReader::CacheMeta()` reads one meta record per row on every
+gridding and degridding pass, through 0008's `ReadMapped()`, which takes the
+length at run time. GCC copied it with a loop of narrow stores into the
+stack record, and the caller then reloaded the record with one 32-byte
+vector load, which cannot be forwarded from those stores, so it stalled on
+every row. In a `perf` profile that load held 37% of `CacheMeta`'s samples,
+and `CacheMeta` was 3.7% of the binary. The patch adds
+`ReadMappedRecord<Record>()`, which copies a whole record at
+`sizeof(Record)` and falls back to `ReadMapped()` for a short record at the
+end of the file, so the bytes read and the return value are unchanged.
+
+Over six real-draw MSs the FITS data blocks are byte-identical (24 of 24),
+and WSClean is 1.0% faster with 37 copies running at once. The measurements
+are in [csd3-speed.md](csd3-speed.md), round 33.
+
+Upstream-shaped: it changes only how bytes are copied.

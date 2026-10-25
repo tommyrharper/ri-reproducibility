@@ -1675,3 +1675,60 @@ This cache started cold, so whichever arm ran first paid the makems misses:
 the synchronous pair's means were 134.5ms (base, first) against 98.2ms. On
 this RDS, `fit32.py` read ~10 metrics.json a second, about 50 minutes for 8
 runs. Fit in the background, or read the files in parallel.
+
+## Round 33: meta records copied at their fixed size (patch 0011)
+
+**Profile.** `perf record` of the 0001-0010 binary, solo and pinned, on the
+largest real-draw MS from round 24 (`-size 32 32`, five runs) put
+`ReorderedMsReader::CacheMeta` at 3.7% of the binary's samples. 37% of those
+were on one instruction: the 32-byte vector load that reads back the meta
+record `ReadMapped()` had just copied in with a run-time length. GCC emits
+that copy as narrow stores, and a wide load over narrow stores cannot be
+store-forwarded, so every row stalled.
+
+**Change.** Patch 0011 adds `ReadMappedRecord<Record>()`, which copies a
+whole record at `sizeof(Record)` (two vector moves) and falls back to
+`ReadMapped()` only for a short record at the end of the file. Solo on that
+MS, inversion plus prediction fell 25ms (-2.5%) in 11 of 11 interleaved
+pairs.
+
+**Driver.** A new zygote driver (`/dev/shm/r35/zy.sh`, `conc.sh`) runs one
+`wsclean-zygote` per CPU on 37 of this job's 38 CPUs, with production's
+malloc tunables. Each sends 21 rounds of six real-draw MSs from round 24
+(0.05-0.40s binary times in their own run, the 10th-90th percentile) and
+averages the reply wall times after the first round. That is 4.7k requests
+per arm, about 25s. Both binaries were built from one sandbox tree, 0001-0010
+and the same plus 0011, and run inside the shipped `wsclean.sif`. Mean
+request wall time, 37 zygotes at once:
+
+| set | order | 0001-0010 | + 0011 |
+| --- | --- | ---: | ---: |
+| 1 | ABBA BAAB ABBA BAAB | 165.6ms | 164.0ms |
+| 2 | BAAB ABBA BAAB ABBA | 165.9ms | 164.2ms |
+
+That is -1.6ms (-1.0%) in both sets, with the new binary ahead in 7 of the 8
+four-arm blocks. The one exception was the first block of each set, where
+both arms were slow. All 24 FITS data blocks over the six MSs are
+byte-identical. (A first pass at 5 rounds per zygote, about 7s an arm,
+drifted by 10ms over its 8 arms and resolved nothing.)
+
+**In-run** (iteration 34, before its job ended: 38 ranks, nlive 150, 300
+dead, async, seed 4242, layered SIFs differing only in the two binaries):
+`wsclean` @1k was 205.0 and 207.5ms (base, the second run cut at 5.8k
+evaluations) against 212.5 and 208.0ms. Per-run fits spread by ~10ms here,
+so a 1.6ms effect is not visible in four runs. In the synchronous pair
+(150 dead) log(Z) is 0.09424 +/- 0.00279 in both arms. Every chain file is
+identical (`phys_live.txt` once sorted) except `.resume`, where rows
+differ in a loglikelihood by ~1e-11. The one such evaluation traced
+(eval 13 base, eval 17 new, same point) built its MS with makems in the
+base run (2.8s simulate, cold observation cache) and from the template in
+the new run, so the difference most likely comes from simulate's two
+paths, not the patch, which gives byte-identical images on a fixed MS.
+
+It takes effect once `wsclean.sif` is rebuilt on a Docker host and
+imported.
+
+**Learned.** The shipped build is reproducible: the sandbox rebuilt here
+on a new node produced a binary with the same md5 as iteration 34's. The
+37-way driver resolves 1% where in-run fits cannot, but needs ~25s an arm.
+Shorter arms drift with load on the other half of the node.
