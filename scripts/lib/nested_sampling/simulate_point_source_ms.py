@@ -72,6 +72,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # third of the stage (docs/csd3-speed.md, round 21). Falls back to the MS
     # whenever makems has to run, since that build is what fills the caches.
     parser.add_argument("--mat-only", action="store_true", help="With --mat-path: write no MS when its observation is cached")
+    # The search's longest observation. An uncached (declination, integration)
+    # is then built once at that length, not once per new longest draw
+    # (docs/csd3-speed.md, round 34).
+    parser.add_argument("--observation-horizon-minutes", type=float, default=0.0)
     return parser.parse_args(argv)
 
 
@@ -436,6 +440,9 @@ def make_ms(cfg: Path, output_ms: Path, args: argparse.Namespace, fill: bool = F
         return None
     n_times = n_times_of(args)
     observation = load_observation(cfg_text, n_times)
+    if observation is None and args.observation_horizon_minutes > args.observation_minutes:
+        cache_observation_to_horizon(args, output_ms.parent)
+        observation = load_observation(cfg_text, n_times)
     if observation is None:
         make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
         save_observation(output_ms, cfg_text)
@@ -444,6 +451,21 @@ def make_ms(cfg: Path, output_ms: Path, args: argparse.Namespace, fill: bool = F
     filled = extend_template(template, observation, output_ms, n_times, args, fill)
     (output_ms.parent / "makems.log").write_text(f"extended a cached observation to {n_times} timesteps\n")
     return filled
+
+
+def cache_observation_to_horizon(args: argparse.Namespace, scratch: Path) -> None:
+    """One makems build at the horizon, for save_observation() alone. Each key
+    (declination x integration, 910 of them in the default space) used to run
+    makems again for every new longest draw, ~1/3 of evaluations in a 7k-eval
+    run and ~85% of simulate's time there. makems costs ~3ms a timestep
+    whatever the channel count, so this builds one channel."""
+    horizon = argparse.Namespace(**vars(args))
+    horizon.observation_minutes, horizon.channel_count = args.observation_horizon_minutes, 1
+    with tempfile.TemporaryDirectory(dir=scratch) as build:
+        ms = Path(build) / Path(args.output_ms).name
+        cfg = write_makems_config(horizon, ms)
+        run_makems(ms)
+        save_observation(ms, cfg.read_text())
 
 
 def make_and_fill_ms(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
@@ -1167,10 +1189,12 @@ def self_check_observation_prefix() -> None:
                     out[column] = None  # optional array column left unset by makems
             return out
 
-    def simulate_with(scratch: Path, name: str, dec: int, step: int, n_times: int, n_chan: int, prefix: bool) -> Path:
+    def simulate_with(scratch: Path, name: str, dec: int, step: int, n_times: int, n_chan: int, prefix: bool,
+                      horizon_times: int = 0) -> Path:
         ms = scratch / name / "sim.ms"
         args = parse_args([
             "--output-ms", str(ms), "--observation-minutes", repr(n_times * step / 60.0 - 0.001),
+            "--observation-horizon-minutes", repr(horizon_times * step / 60.0 if prefix else 0.0),
             "--integration-seconds", str(step), "--channel-count", str(n_chan), f"--declination-deg={dec}",
             "--start-frequency-hz", "1.0374e9", "--channel-width-hz", "1.3331e6", "--dynamic-range", "300",
             f"--source-l-arcsec={0.2 * dec}", "--source-m-arcsec=-0.1",
@@ -1183,19 +1207,22 @@ def self_check_observation_prefix() -> None:
             fill_point_source_visibilities(args, ms)
         return ms
 
-    # (declination, integration, NTimes, channels, served from the cache)
+    # (declination, integration, NTimes, channels, served from the cache[, horizon NTimes])
     steps = [(34, 2, 10, 1, False), (34, 2, 4, 3, True), (34, 2, 20, 8, False), (34, 2, 15, 2, True),
              (34, 2, 20, 4, True), (-15, 7, 3, 3, False), (-15, 7, 1, 3, True), (75, 2, 5, 1, False)]
     # A second run, with a fresh run cache: served from the persistent one.
     steps += [(34, 2, 20, 1, True), (-15, 7, 4, 2, False), (75, 2, 5, 2, True)]
+    # With a horizon, an unseen key is built at it and its first draw is served
+    # by extension, as is the horizon itself afterwards.
+    steps += [(50, 3, 4, 2, True, 25), (50, 3, 25, 3, True, 25), (50, 3, 26, 1, False, 25)]
     saved_env = os.environ.get("NS_OBSERVATION_CACHE_DIR")
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch_dir:
         scratch = Path(scratch_dir)
         os.environ["NS_OBSERVATION_CACHE_DIR"] = str(scratch / "persistent")
         (scratch / "persistent").mkdir()
-        for i, (dec, step, n_times, n_chan, served) in enumerate(steps):
+        for i, (dec, step, n_times, n_chan, served, *horizon) in enumerate(steps):
             use_skeleton_cache(scratch / ("cache" if i < 8 else "cache2"))
-            got = simulate_with(scratch, f"prefix{i}", dec, step, n_times, n_chan, prefix=True)
+            got = simulate_with(scratch, f"prefix{i}", dec, step, n_times, n_chan, prefix=True, horizon_times=sum(horizon))
             log = (got.parent / "makems.log").read_text()
             assert ("extended a cached observation" in log) == served, f"step {i}: cache use was not {served}: {log}"
             expected = simulate_with(scratch, f"makems{i}", dec, step, n_times, n_chan, prefix=False)

@@ -119,6 +119,14 @@ def predict_wait_seconds(n_times: int = 0) -> float:
     return PREDICT_BASE_SECONDS + PREDICT_CONTENTION_MARGIN * PREDICT_SECONDS_PER_TIME_SAMPLE * n_times
 
 
+@cache
+def observation_horizon_minutes() -> float:
+    """The longest observation the search can draw, 0.0 when that is pinned:
+    the length the simulator caches an unseen observation at."""
+    spec = next((spec for spec in load_parameter_space() if spec["name"] == "observation_minutes"), None)
+    return float(spec["max"]) if spec else 0.0
+
+
 def simulate_reply_timeout(n_times: int = 0) -> float:
     """How long the rank waits on the worker: its two predict attempts, and the rest.
 
@@ -2406,6 +2414,8 @@ def simulate_measurement_set(
         # rather than by two constants in two images agreeing.
         "--predict-wait-seconds",
         str(predict_wait_seconds(n_times)),
+        "--observation-horizon-minutes",
+        str(observation_horizon_minutes()),
     ]
     if r2d2_mat:
         # Written by the simulate request itself, beside the MS: a separate
@@ -2420,7 +2430,9 @@ def simulate_measurement_set(
         platform,
         {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)},
         sim_stderr,
-        reply_timeout=simulate_reply_timeout(n_times),
+        # A miss builds the observation at the horizon, so that is the length to wait on.
+        reply_timeout=simulate_reply_timeout(
+            max(n_times, evaluation_time_samples({**params, "observation_minutes": observation_horizon_minutes()}))),
     )
     if returncode != 0:
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)

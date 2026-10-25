@@ -67,6 +67,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Point-source phase ramp in C, numpy's complex `exp` bit for bit | `docker/meqtrees/src/fastnoise.c` | -17% (-10.5ms) on simulate in 38-rank CSD3 searches (8 runs, makems misses trimmed, no overlap); chains identical ([csd3-speed](csd3-speed.md), round 31) |
 | One-timestep template re-laid with 32KB StandardStMan buckets (makems' 256B made ANTENNA1/2 writes walk ~1000 buckets) | `simulate_point_source_ms.py` | -6.1% (-5.7ms) on simulate in 38-rank CSD3 searches (8 runs, makems misses trimmed, no overlap); every column equal, chains identical ([csd3-speed](csd3-speed.md), round 32) |
 | Meta records copied at their fixed size (no store-forwarding stall per row) | `patches/0011` | -1.0% (-1.6ms) on WSClean at 37-way in a controlled driver (two 16-arm interleaved sets, 7 of 8 ABBA blocks); in-run unresolved; byte-identical ([csd3-speed](csd3-speed.md), round 33) |
+| Unseen observations built once at the search's longest observation, not once per new longest draw | `simulate_point_source_ms.py`, `common.py` | +88% evals/s with a warm observation cache (simulate 157 -> 59ms) and +21% cold, 38-rank CSD3 WSClean searches; log(Z) and chains identical in a synchronous pair ([csd3-speed](csd3-speed.md), round 34) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

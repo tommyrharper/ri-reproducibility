@@ -1732,3 +1732,75 @@ imported.
 on a new node produced a binary with the same md5 as iteration 34's. The
 37-way driver resolves 1% where in-run fits cannot, but needs ~25s an arm.
 Shorter arms drift with load on the other half of the node.
+
+## Round 34: unseen observations built once, at the horizon
+
+**Profile.** Rounds 26-33 fitted simulate with makems misses trimmed, so
+the fits never showed how big the misses are. A worker instrumented to log
+every request (removed afterwards; layered `meqtrees.sif` with
+`fastnoise.so`, 38 ranks, nlive 150, 300 dead, async) found the mean
+simulate request is 5-10x the median, and the misses are why:
+
+| run | requests | median | mean | > 100ms | share of simulate time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cold observation cache | 6,687 | 37ms | 333ms | 2,313 | 94% |
+| cache warmed by that run | 6,725 | 31ms | 159ms | 1,045 | 83% |
+
+The observation cache (round 2) is keyed on declination x integration
+time, 91 x 10 = 910 keys in the default space. A miss ran makems for the
+requested length only, so every new longest draw of a key missed again:
+the record maxima of a stream of draws, about ln(k) misses for k draws of
+a key, and still a third of evaluations in a 7k-evaluation run. A warm
+cache did not fix it, because the second run draws longer observations
+the first never did.
+
+**Change.** The rank passes `--observation-horizon-minutes`, the
+parameter space's `observation_minutes` max (`observation_horizon_minutes()`
+in `common.py`, 0 when the dimension is pinned). On a miss below the
+horizon the simulator runs makems once at the horizon with one channel
+(`cache_observation_to_horizon()`; makems costs ~3.2ms a timestep whatever
+the channel count: 0.45s at 10s integration, 3.9s at 1s), saves the
+observation, and serves the evaluation by extension like any hit. Each key
+now misses once per persistent cache, ever. The extended MS is the one
+makems writes (the observation-prefix self-check, which now also covers a
+horizon miss, its horizon-length hit and the fallback past the horizon).
+The rank's reply timeout is sized on the horizon length. Both files are
+bind-mounted, so this needs no rebuild.
+
+**In-run.** Same settings, both arms on `/dev/shm/r36/sifs` (shipped SIFs
+plus `fastnoise.so` layered into `meqtrees.sif`), each arm with its own
+`NS_OBSERVATION_CACHE_DIR`, starting empty. Base is a `git worktree` at
+HEAD. Order base, new, new, base, so each arm's second run had the cache
+its first left:
+
+| arm | cache | evals/s | simulate mean | WSClean binary | idle |
+| --- | --- | ---: | ---: | ---: | ---: |
+| base | cold | 39.9 | 304ms | 209ms | 2.3% |
+| horizon | cold | 48.4 | 219ms | 222ms | 1.4% |
+| horizon | warm (849 keys) | 74.7 | 59ms | 203ms | 1.0% |
+| base | warm (830 keys) | 39.8 | 157ms | 225ms | 11.5% |
+
+Cold: +21% evals/s, simulate -28%. Warm: +88% evals/s, simulate -62%;
+simulate falls from ~40% of worker time to ~22%. The warm base run's 11.5%
+idle is its own tail, not the change: without it, base's warm rate from
+its busy time is 45.0 evals/s against 75.5 for the new arm (+68%). A production
+run reuses one persistent cache across runs, so the warm row is the steady
+state, and a long run on a cold cache converges to it after ~910 misses
+instead of continuing to miss logarithmically.
+
+In a synchronous pair (150 dead, cold caches) log(Z) is 0.09424 +/- 0.00279
+in both arms, and every chain file is identical (`phys_live.txt` and
+`clusters/` once sorted) except `.resume`. There two rows differ in their
+last column by ~1e-11, the same signature round 33 traced to one evaluation
+built by makems in one arm and from the template in the other, which this
+change makes more common.
+
+**Learned.** A mean that trims outliers hides the outliers: the trimmed
+fits of rounds 31-33 were stable to 1.5ms while 83-94% of simulate time
+sat in the trimmed tail. The shipped `meqtrees.sif` still predates
+`fastnoise.so` (rounds 26 and 31): solo with numpy, noise is 23ms of a
+53ms simulate against 7.6ms of 34ms with the library, so rebuilding the
+image is worth ~20ms an evaluation on top of this round. A host-built
+`fastnoise.so` (RHEL gcc 8.5, `-O2 -ffp-contract=off`) passes both
+agreement checks inside the image and layers in with an 8-second
+`apptainer build --fakeroot`.
