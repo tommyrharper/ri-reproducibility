@@ -1804,3 +1804,57 @@ image is worth ~20ms an evaluation on top of this round. A host-built
 `fastnoise.so` (RHEL gcc 8.5, `-O2 -ffp-contract=off`) passes both
 agreement checks inside the image and layers in with an 8-second
 `apptainer build --fakeroot`.
+
+## Round 35 (negative): streaming retention on the record-writer thread
+
+**Profile.** Warm 38-rank WSClean, nlive 150, 300 dead: busy markers show
+only ~25-33 of 37 workers evaluating mid-run. Sampling
+`/proc/<pid>/syscall` on the rank main threads (37 ranks x 100 samples at
+4Hz) gave 65.5% pselect6 (waiting on an evaluation), 16% running, 12.8%
+mkdir and 5.4% newfstatat on Lustre. The Lustre calls are streaming
+retention: each rank publishes every new top/bottom-20 objective to
+`evaluations/` (~0.3s on the main thread) and evicts it later. 1,531 of
+6,661 evaluations were kept at some point; the count grows as ~40 ln(k) a
+rank, so this is a short-benchmark artefact and negligible in production.
+
+**Change tried.** Queue the publish/evict on the rank's FIFO record-writer
+thread. The mkdir samples went, replaced by 13% futex; simulate was +24ms in
+both new-arm runs (112 vs 87.5ms) and throughput did not move (ABBA: new
+60.0/56.4, base 60.2/58.8 evals/s). The writer shares the rank's pinned
+CPU and the Lustre client work is CPU, not just waiting, so it competes with
+the simulate worker and the zygote. Reverted.
+
+**Learnings.** Never strace a live rank: the ptrace attach interrupted an
+`os.listdir` on Lustre with EINTR and the run aborted (`run_with_retries`
+resumed it); sample `/proc/<pid>/syscall` or use perf. PolyChord's root
+rank is 83.5% `mca_btl_vader` in perf - the documented MPI spin, not a
+master bottleneck.
+
+## Round 36: ranks stop claiming failed-artefact slots once they are full
+
+**Profile.** Every failed evaluation calls `claim_failed_artefacts_slot()`
+on the rank's main thread. Once the run's `NS_KEEP_FAILED_ARTEFACTS` (20)
+slots are taken, that is one `mkdir(exist_ok)` plus 20 `mkdir`s that fail
+with `EEXIST`, all ranks contending on one Lustre directory. A failure
+storm (E5/E6 in [csd3-experiments](csd3-experiments.md) had ~6000
+failures) pays it on every failure, and finding failures is this repo's
+purpose. Timed directly on `/rds` with the slots full (cpu-q-166, load
+~19):
+
+| claimers | before: median / mean per call | after: median / mean |
+| --- | ---: | ---: |
+| 1 | 1.0 / 1.0ms | - |
+| 36 at once | 36ms / 36ms (31.9-37.0 across processes) | 0.0 / 0.5-3.5ms |
+
+The "after" mean is one ~30ms discovery per rank, amortised over 10 calls.
+36ms is ~15% of a warm ~250ms WSClean evaluation, on the critical path of
+that rank's next evaluation.
+
+**Change.** Slots are never freed, so a rank that finds them full records
+that (`_FAILED_ARTEFACT_SLOTS_FULL`, per slots directory) and answers
+`False` from then on with no filesystem call. The first 20 failures still
+keep their artefacts, claimed atomically as before; a fresh directory gives
+20 `True` then `False` (checked on tmpfs). Scoring is untouched, so log(Z)
+and the chains cannot change. Not run end to end: there is no failure
+injection hook, and a search that fails often enough to show 15% needs a
+failing region of the parameter space. No image rebuild is needed.

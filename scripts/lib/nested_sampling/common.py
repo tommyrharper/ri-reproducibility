@@ -1386,11 +1386,19 @@ def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
     return Path(root) / eval_dir.name if root else None
 
 
+_FAILED_ARTEFACT_SLOTS_FULL: set[Path] = set()
+
+
 def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
     """One of the run's NS_KEEP_FAILED_ARTEFACTS slots for a failure's MS and
     images. A failure storm otherwise keeps hundreds of files per failure: one
-    in docs/csd3-experiments.md (E5, E6) filled the one-million-file quota."""
+    in docs/csd3-experiments.md (E5, E6) filled the one-million-file quota.
+    Slots are never freed, so once a rank finds them full it stops asking:
+    otherwise every later failure costs ~21 contended Lustre mkdirs on the
+    rank's main thread (~36ms with 36 ranks; docs/csd3-speed.md, round 36)."""
     slots = eval_dir.parent / ".failed-artefacts-kept"
+    if slots in _FAILED_ARTEFACT_SLOTS_FULL:
+        return False
     slots.mkdir(exist_ok=True)
     for index in range(int(os.environ.get("NS_KEEP_FAILED_ARTEFACTS", "20"))):
         try:
@@ -1398,6 +1406,7 @@ def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
             return True
         except FileExistsError:
             continue
+    _FAILED_ARTEFACT_SLOTS_FULL.add(slots)
     return False
 
 
