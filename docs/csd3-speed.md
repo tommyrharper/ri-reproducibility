@@ -2248,3 +2248,48 @@ prune, both async pair-c arms keep the same number of FITS images (94).
   (`.gnhf/runs/*/iteration-46.jsonl`, the `old=`/`new=` python edits) after
   a usage limit ended it unrecorded. Its result directories and the base
   tree on `/rds` were still there to re-score with `bench.row_for`.
+
+## Round 50 (diagnostic): a tree on Lustre no longer costs anything
+
+**Question.** Round 45 found that a tree on `/rds` ran ~20% slower than one
+in `/dev/shm` (44 vs 56 evals/s at 18 ranks). Round 47 moved the biggest
+known Lustre cost, the extremes' publish-then-strip, off the rank's main
+thread. How much of the gap is left?
+
+**Method.** The same code (HEAD `1aabf34`) in two trees: this worktree on
+`/rds`, and `git archive HEAD` unpacked in `/dev/shm`. The arms were raced
+with 18 ranks each (nlive 150, 15 repeats, 300 dead, seed 4242, async).
+Each had its own `/dev/shm` observation cache, prefilled with the
+production cache's 910 keys. The starting arm alternated between the two
+pairs, with a 20s offset. "Middle" is the evaluations that ended between 20s
+after the first start and 25s before the last end, read from each
+evaluation's `timing` (`started_epoch`/`ended_epoch`). "Busy" is the mean
+number of evaluations running then. The 18th rank is PolyChord's root, so
+17 is the ceiling.
+
+| pair | tree | evals | wall | evals/s | worker ms/eval | middle evals/s | busy (of 17) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| a | `/dev/shm` | 8151 | 131.7s | 61.9 | 252.4 | 64.8 | 16.86 |
+| a | `/rds` | 7992 | 129.3s | 61.8 | 249.1 | 65.7 | 16.56 |
+| b | `/rds` | 7604 | 120.9s | 62.9 | 246.7 | 64.8 | 16.64 |
+| b | `/dev/shm` | 7561 | 128.2s | 59.0 | 256.0 | 64.8 | 16.86 |
+
+**Result.** The gap is gone. The `/rds` arm matched or beat the tmpfs arm
+on whole-run evals/s in both pairs (-0.1% and +6.6%), and the middle rates
+are equal to within 1.4%. The `/rds` ranks are idle ~1.5% more of the time
+(16.6 vs 16.86 busy). That is the per-evaluation `metrics.json` write and
+the 1 in 100 detail publishes, which are too small to show end to end. In
+the middle of the run, the workers are now 97-99% busy, against round 39's
+84-87% (13-16% idle) before round 47. What is left of the whole-run
+loss is the start (prior phase and the barrier into slice sampling) and the
+tail (one rank finishing its last chain alone). In a 300-dead benchmark,
+mean busy over the whole span is 15.1-15.6. Both are paid once per run, so
+they shrink to nothing in production. log(Z) agrees within each pair (async
+runs, so the chains differ): 0.09460/0.09466 in pair a, 0.09575/0.09590 in
+pair b.
+
+**Consequence.** A/B arms no longer have to share a filesystem, and the
+cluster's default (a tree on `/rds`) pays no Lustre penalty on the rank's
+main thread. A WSClean evaluation is now ~85% the WSClean binary (208-216ms)
+and ~15% simulate (38-39ms), with the workers saturated, so further gains
+have to come from inside the binary or simulate. No code change.
