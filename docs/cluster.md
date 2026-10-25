@@ -47,6 +47,16 @@ unpacks into `images/.tmp` and caches under `images/.cache`, both beside the
 output, so the login node's `/tmp` and the 50GB home quota are not part of
 the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 
+A SIF carries only the WSClean patches that existed when its Docker image was
+built. To bring `images/wsclean.sif` up to this tree's
+`docker/wsclean/patches/` without a Docker host, run
+`./ri images patch-wsclean` inside a compute-node job (~2 minutes with 30
+cores). It compiles WSClean in an `apptainer --fakeroot` sandbox against the
+SIF's own casacore, layers the result over the SIF, and keeps the old one as
+`wsclean.sif.orig`. The derived SIF keeps the old `ri.build-inputs` label and
+adds `ri.wsclean-patches` (a hash of the patches), so `benchmarks.jsonl`
+gives both the same image id. See [csd3-speed](csd3-speed.md), round 41.
+
 ## Where things live on CSD3
 
 | what | where | why |

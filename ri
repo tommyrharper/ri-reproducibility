@@ -101,7 +101,9 @@ def do_build(args):
 
 
 def do_images(args):
-    return {}, [["scripts/images.sh", args.action, *([args.dir] if args.dir else [])]]
+    script = "scripts/patch-wsclean-sif.sh" if args.action == "patch-wsclean" else "scripts/images.sh"
+    return {}, [[script, *([] if script != "scripts/images.sh" else [args.action]),
+                 *([args.dir] if args.dir else [])]]
 
 
 def do_smoke(args):
@@ -404,9 +406,14 @@ def build_parser():
                  description="export: on a Docker host, `docker save` each built image "
                              "into DIR (default images/archives). import: on the "
                              "cluster, build images/<name>.sif from those archives with "
-                             "Apptainer. rsync DIR between the two. See docs/cluster.md.")
-    images.add_argument("action", choices=("export", "import"))
-    images.add_argument("dir", nargs="?", help="archive directory (default: images/archives)")
+                             "Apptainer. rsync DIR between the two. See docs/cluster.md. "
+                             "patch-wsclean: on a cluster compute node, rebuild WSClean "
+                             "with this tree's patches and layer it over images/wsclean.sif "
+                             "(or into the SIF path given as DIR), keeping the old one "
+                             "as wsclean.sif.orig.")
+    images.add_argument("action", choices=("export", "import", "patch-wsclean"))
+    images.add_argument("dir", nargs="?", help="archive directory (default: images/archives); "
+                                               "for patch-wsclean, the output SIF")
 
     self_check = add("self-check", do_self_check, "run the checks that need the images",
         description="Runs the host-side checks, then each module's own "

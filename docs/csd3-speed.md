@@ -2042,3 +2042,66 @@ an earlier round's gain: rounds 26 and 31 were measured on layered SIFs, and
 production never had them. Small C helpers that the simulator loads by
 path and checks on load can be built on the host and bound in, so they
 need no image rebuild.
+
+## Round 41: the shipped `wsclean.sif` had none of rounds 23-33
+
+**Profile.** The binaries in the shipped `wsclean.sif` (imported 21 Sep) are
+dated 4 Sep, the day patch 0006 landed. So patches 0007-0011 (rounds 23, 24,
+25, 29 and 33) were measured on layered test SIFs and never reached a cluster
+run, just as round 40 found for `fastnoise.so`.
+
+**Change.** `scripts/patch-wsclean-sif.sh` (`./ri images patch-wsclean`)
+turns round 23's manual recipe into one command, run on a compute node:
+
+1. Build a `debian:bookworm-slim` sandbox with `--fakeroot` and apt-install
+   the Dockerfile's build list.
+2. Copy `/opt/casacore` out of the existing SIF, so casacore is not rebuilt.
+3. Clone the Dockerfile's pinned tag, `git apply` every patch, copy in
+   `docker/wsclean/src/*.cpp`, and build with `-DTARGET_CPU` from the
+   Dockerfile.
+4. Write a `Bootstrap: localimage` SIF whose whole `/opt/wsclean` (binaries
+   and `libwsclean.so`) is replaced, keeping the old SIF as `.orig`.
+
+It took 1m54s with 30 jobs. A `--writable` sandbox cannot create a bind's
+mount point, so the patches are copied into the sandbox, not bound.
+
+**In-run.** The two arms raced at once, 18 ranks each (nlive 150, 15
+repeats, 300 dead, seed 4242, async, cpu-q-166 under a load average of
+33-54 from another job). Each arm had its own `/dev/shm` observation cache,
+cold for the first pair. Both used the host-built `fastnoise.so` from round
+40. Base is the shipped `wsclean.sif`, and the new arm is the same SIF after
+`patch-wsclean-sif.sh`:
+
+| pair | arm | evals | evals/s | simulate | WSClean binary | worker ms/eval |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| cold | base | 8179 | 37.3 | 180.1ms | 193.7ms | 374.9 |
+| cold | 0001-0011 | 7460 | 37.8 | 199.2ms | 161.2ms | 361.4 |
+| warm 1 | base | 7664 | 50.5 | 55.5ms | 200.6ms | 257.2 |
+| warm 1 | 0001-0011 | 7419 | 49.8 | 52.3ms | 168.9ms | 222.3 |
+| warm 2 | base | 7476 | 55.1 | 43.2ms | 199.8ms | 244.1 |
+| warm 2 | 0001-0011 | 8325 | 62.5 | 39.8ms | 146.9ms | 187.8 |
+| sync, 150 dead | base | 3094 | 25.8 | 37.2ms | 174.3ms | 212.6 |
+| sync, 150 dead | 0001-0011 | 3094 | 29.0 | 39.9ms | 141.6ms | 182.6 |
+
+In every pair the WSClean binary is 32-53ms shorter (-16 to -27%), more than
+rounds 23-33's in-run estimates added together, because those were measured
+at 37-38-way and here two 18-rank searches share the node. With warm caches,
+worker time per evaluation falls by 14-23%. The synchronous pair, which
+controls for evaluation count, runs 11% faster end to end (120.0 -> 106.8s).
+Whole-run evals/s in the async pairs follows the evaluation count and the
+tail (round 14), so read ms/eval instead.
+
+In the synchronous pair log(Z) is 0.09441 +/- 0.00264 in both arms, and every
+chain file is identical (`phys_live*.txt` once sorted), including `.resume`
+and `clusters/`. That is consistent with rounds 23-33, where each patch was
+shown byte-identical on its own.
+
+**To ship:** run `./ri images patch-wsclean` once in a compute-node job. It
+replaces `images/wsclean.sif` in place, and a run already going keeps the
+inode it opened. The shipped SIF was left as it is, because it is shared
+with any run in flight. Rebuilding on a Docker host (`./ri build wsclean`,
+export, import) gets the same result.
+
+**Learned.** Rows from runs outside `results/nested-sampling/` are skipped
+by `bench.py` ("not recording ... outside results/nested-sampling"). Move
+the run there and `scripts/bench.py record <dir>` adds the row afterwards.
