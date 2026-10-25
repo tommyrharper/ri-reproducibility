@@ -93,13 +93,17 @@ sidecar_launch "${MEQTREES_SIF}" \
 # The WSClean fork server, one per rank over a FIFO pair like the simulate
 # workers: a rank inside polychord.sif cannot start another SIF, so the zygote
 # the Docker branch spawned per rank is a host-started pool here.
+# The malloc tunables keep freed blocks in the heap, so each gridding pass
+# reuses pages the last one faulted in instead of mmapping fresh ones: ~6.5ms
+# less kernel time per evaluation at 38 ranks (docs/csd3-speed.md, round 28).
 # shellcheck disable=SC2016
 sidecar_launch "${WSCLEAN_SIF}" -- sh -c '
   for fifo in "$1"/*.in; do
     [ -e "${fifo}" ] || continue
     base="${fifo%.in}"
     ( while :; do
-        wsclean-zygote <"${fifo}" >"${base}.out" & echo $! >"${base}.pid"; wait $!
+        GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1073741824:glibc.malloc.trim_threshold=4294967295:glibc.malloc.top_pad=67108864 \
+          wsclean-zygote <"${fifo}" >"${base}.out" & echo $! >"${base}.pid"; wait $!
       done ) &
   done
   wait

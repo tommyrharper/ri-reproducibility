@@ -1377,3 +1377,70 @@ that only pays if those shapes repeat. Also the second main-table open, and
 the phase ramp's complex `exp`. For WSClean, the gridding kernels are ~31%,
 and the Wgridder constructor, `CacheMeta`, `CalculateWeightsImplementation`
 and `ApplyWeightsAndCorrections` are ~3-4% each.
+
+## Round 28: a fifth of in-run WSClean time is the kernel (malloc tunables)
+
+**Profile.** The previous rounds' fits only give each evaluation's wall time.
+To split it, `/dev/shm/r28/zy.sh` drives the shipped `wsclean-zygote`
+(0001-0009) the way a rank does. It sends N fork requests for one real-draw
+MS on one pinned CPU, then reads the zygote's `cutime`, `cstime` and
+`cminflt` from `/proc`. On round 24's MS 4 (a typical size), means over 20
+requests after 2 warm-ups:
+
+| | wall | user | sys | minor faults |
+| --- | ---: | ---: | ---: | ---: |
+| 1 zygote | 101.6ms | 86.5ms | 15.0ms | 9.4-10.7k |
+| 37 zygotes at once, one per CPU | 136.4ms | 105.5ms | 29.5ms | 10.2k |
+
+`perf stat` puts most of the user-time growth at 38-way down to the clock
+(2.85 -> 2.43GHz, IPC 2.20 -> 2.02). Kernel time doubles, though, to ~21%
+of the evaluation. Nearly all of it is first-touch page faults, ~40MB of
+fresh pages per evaluation. `perf record -e page-faults` places them in
+`PredictRegularMeasurementSet` and `GridRegularMeasurementSet`, whose
+per-pass `uvw`/visibility buffers are large enough for glibc to `mmap` and
+`munmap` them on every one of the ~7 passes. Further faults come from
+`ReorderedMsProvider::WriteModel`, which writes into a model file
+recreated as a sparse tmpfs file each major cycle, from the degridder's
+output, and from `memcpy` while `metadata_buffer` grows.
+
+**Change.** `run-nested-sampling.sh` starts each zygote with
+`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1073741824:glibc.malloc.trim_threshold=4294967295:glibc.malloc.top_pad=67108864`.
+Large blocks then come from the heap, and the heap is never trimmed, so
+later passes reuse pages an earlier pass faulted in. The setting is per
+process, and each forked child gets the zygote's malloc. No rebuild is
+needed. (In glibc 2.36, `/proc/<pid>/environ` shows only the first tunable
+afterwards, because the string is parsed in place. All three still apply:
+`top_pad` alone moves the fault count.)
+
+**Driver A/B** (MS 4, 37 concurrent zygotes, 20 requests each, ABBA):
+
+| arm | wall | user | sys | minor faults |
+| --- | ---: | ---: | ---: | ---: |
+| base | 136.4ms | 105.5ms | 29.5ms | 10.2k |
+| tunables | 132.9ms | 108.2ms | 23.1ms | 5.9k |
+| tunables | 132.7ms | 108.4ms | 22.9ms | 5.9k |
+| base | 137.2ms | 106.5ms | 29.3ms | 9.9k |
+
+That is -3.9ms (-2.9%) with no overlap. Solo the gain is -3ms. Over the
+six real-draw MSs, all 24 FITS data blocks are byte-identical.
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242, with
+`/dev/shm/r26/sifs-fast` in both arms. The base arm is a `git worktree` at
+HEAD (`.probe/r28ab.sh`), run ABBA and then BAAB:
+
+| arm | `wsclean` @1k, ABBA | `wsclean` @1k, BAAB | synchronous, 150 dead |
+| --- | --- | --- | ---: |
+| base | 227.5, 221.0ms | 215.7, 226.1ms | 221.2ms |
+| tunables | 218.9, 221.4ms | 222.5, 217.7ms | 215.5ms |
+
+The mean is -2.5ms async and -5.7ms in the synchronous pair. The arms
+overlap, because per-run fits here spread by ~10ms, so in-run this is
+consistent with the driver but not resolved by itself. In the synchronous
+pair, log(Z) is 0.09424 +/- 0.00279 in both arms and every chain file is
+identical (`phys_live.txt` once sorted).
+
+**Next.** ~5.9k faults (~23ms of kernel time at 38-way) remain per
+evaluation. A WSClean patch could reuse one `uvw`/visibility buffer across
+passes and `reserve` `metadata_buffer`, and could map the model file with
+`MAP_POPULATE`, or keep it and zero it instead of recreating it each major
+cycle. All of these are bookkeeping changes that cannot alter the output.
