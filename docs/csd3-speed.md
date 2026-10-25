@@ -484,3 +484,71 @@ Worker idle in these short runs is still 30-40%: nlive 25 caps concurrency at
 ~18 of 23 workers mid-run, plus the prior-to-sampling transition and the tail.
 The 71k run was 88.5% busy, so this is a short-run artefact.
 The U-Net is now ~85% of a typical request and the remaining target.
+
+## Round 11: the U-Net on a full CPU node
+
+At `NS_IMAGE_DIM=32` the U-Net (64 channels, 4 pools) runs its deep layers at
+2x2 and 4x4 pixels against 124MB of float32 weights per checkpoint. So a
+forward is mostly a stream of weights through the core, not arithmetic.
+`scripts/probe_unet_forward.py`, one checkpoint, 1 thread, on this half
+icelake node (38 CPUs, 34 of them on one socket), P copies at once:
+
+| P copies | 1 | 12 | 24 | 36 |
+| --- | ---: | ---: | ---: | ---: |
+| U-Net ms/forward | 27.4 | ~30 | 40-41 | 41-54 |
+| cache-resident 64ch conv, ms | 0.76 | | 0.84 | |
+| streaming read, total GB/s | 14.6 | 113 | 185 | 263 |
+
+A compute-bound conv loses only 10% at 24 copies (clock), but the U-Net loses
+48%. The node is not out of bandwidth: 24 U-Nets pull ~74 GB/s where a plain
+streaming read reaches 185. So each core's own weight stream is what slows
+down (per-core memory latency and bandwidth under load). At 24 ranks a typical
+request's ~15 forwards cost ~0.6s, not the 0.41s a lone probe shows.
+
+Tried, all result-preserving or measured to the bit, none a win:
+
+- oneDNN reorders every conv's weights from OIHW to `ABcd16b16a` on each call
+  (`ONEDNN_VERBOSE=1`: ~4ms of a ~30ms forward). Prepacking with
+  `mkldnn_reorder_conv2d_weight` + `torch.mkldnn_convolution` picks
+  `Acdb64a`, which is reordered again on each call: 46-51ms and not
+  bit-identical (4e-6).
+- im2col + MKL `mm` with prepacked `[O, I*9]` weights for convs at <= 4x4
+  pixels: bit-identical (!) but 27.4-27.7ms against 27.4. At <= 8x8: not
+  bit-identical (3.9e-6). Under 24 copies: 40.0-41.1ms against 40.7, noise.
+- `THP_MEM_ALLOC_ENABLE=1`: the node already runs THP `always`; 39.6-40.5ms
+  against 40.2-41.1 under load, 27.2 against 27.4 solo.
+- Batching B images that share a checkpoint reads the weights once: 27.2
+  (B=2), 20.9 (B=4), 17.5 (B=8) ms/image solo, 46.8 (B=2) and 31.3 (B=4)
+  ms/image under 24 copies. Not bit-identical (3-6e-6), and ranks would have
+  to meet at the same R2D2 iteration of different evaluations through a shared
+  server. A ~22% U-Net ceiling at B=4 is not worth that machinery.
+
+On CPU the U-Net is at its memory floor for this layout. Rank x thread layout
+does not change the bytes read per evaluation. What is left is the GPU.
+
+### The GPU, re-measured after rounds 6-10
+
+One `ampere` job (`gpu-q-14`: A100-SXM4-80GB, 32 cores of an AMD EPYC 7763),
+round 9's production shape (async, nlive 25, 15 repeats, 40 dead points,
+seed 4242), `R2D2_DEVICE=cuda` except the CPU arm. 18 ranks is the most the
+card admits (`NS_R2D2_CUDA_MB_PER_RANK` 4096: every worker keeps all 25
+checkpoints on the GPU).
+
+| arm (order run) | evals/s | R2D2 per eval | simulate | log(Z) |
+| --- | ---: | ---: | ---: | ---: |
+| GPU 18 ranks (first in job, cold) | 8.6 | 1.61s | 110ms | -0.00021 |
+| CPU 24 x 1 on the EPYC (first on `r2d2.sif`) | 6.0 | 1.77s | 137ms | -0.00195 |
+| GPU 18 ranks | 12.5 | 0.92s | 97ms | -0.00018 |
+| GPU 12 ranks | 13.2 | 0.54s | 121ms | 0.00221 |
+| *icelake CPU 24 x 1, round 10* | *15.4-16.8* | *0.81-0.93s* | | *-0.00195* |
+
+One A100 with its 32 cores does 12.5-13.2 evals/s: less than 24 icelake
+cores (round 10), and GPU hours cost far more than CPU hours. The CPU arm's
+log(Z) matches round 10's to the digit; the GPU arms differ inside the error
+bar because the GPU's float32 conv moves objectives by ~5e-6 (see
+`docs/cluster.md`), which reorders an async run. Per-eval R2D2 time rises
+from 0.54s at 12 ranks to 0.92s at 18: separate CUDA contexts time-slice the
+card, so ranks queue for it rather than share it. So for production at
+`NS_IMAGE_DIM=32`, stay on icelake CPUs. The GPU would only pay with the
+contexts merged (CUDA MPS, or one GPU server batching forwards for all ranks)
+and the checkpoints held once instead of per worker; neither was tried here.

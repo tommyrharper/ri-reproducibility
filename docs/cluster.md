@@ -307,6 +307,9 @@ Dockerfile builds, whose other packages resolved afresh. Its objective agreed
 with the CPU run to the same 4.9e-6 over 34 shared evaluations. The 1.8 -> 3.1
 gap between the two GPU images is one run each on a shared node and is not
 explained; roughly 2-3x the CPU rate is what these support.
+Those CPU rates predate csd3-speed.md rounds 6-10. Re-measured after them
+(round 11), one A100 does 12.5-13.2 evals/s against 15.4-16.8 for 24 icelake
+cores, so production should stay on CPUs.
 
 Over the 30 evaluations the CPU and GPU runs shared exact parameters for, the
 objective (`total_rms_jy`) agreed to 4.9e-6 relative and every metric to
