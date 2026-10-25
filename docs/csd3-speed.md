@@ -1135,3 +1135,56 @@ The reordered-file row reads ("Loading data in memory" and "Loading
 metadata", ~46ms/eval in-run at 7.4 passes) are three small `istream` reads
 per row. Reading each part into memory once per process is upstream-shaped
 and would keep results byte-identical.
+
+## Round 24: WSClean maps its reordered part files (patch 0008)
+
+**Change.** Round 23's profile left ~46ms per evaluation in "Loading data in
+memory" and "Loading metadata". Both read the reordered part files one row at a time,
+with three small `istream::read` calls per row (metadata record, data,
+weights). `docker/wsclean/patches/0008` maps the three files and copies each
+record out with `memcpy`. The cursors advance exactly as the streams did, so
+the gridder gets the same bytes ([the patches doc](nested-sampling-wsclean-patches.md)).
+It was built and A/B'd on this node with round 23's no-Docker recipe. Both
+arms came from one tree, base = 0001-0007, and differ only in 0008.
+
+**Solo.** Six real-draw Measurement Sets from a short search run with
+`NS_KEEP_MEASUREMENT_SETS=1`, the binary pinned to one CPU, 20 interleaved
+rounds, median of rounds 2-20:
+
+| MS | base | 0008 | change |
+| --- | ---: | ---: | ---: |
+| 1 (smallest) | 46.3ms | 45.8ms | -1.1% |
+| 2 | 116.2ms | 107.8ms | -7.2% |
+| 3 | 130.7ms | 121.9ms | -6.7% |
+| 4 | 140.1ms | 133.5ms | -4.7% |
+| 5 | 173.7ms | 163.5ms | -5.9% |
+| 6 (largest) | 308.3ms | 288.1ms | -6.5% |
+| sum | 915.3ms | 860.6ms | -6.0% |
+
+The restored, model, residual and PSF data blocks are byte-identical for all
+six (24 of 24).
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242, ABBA
+order. Binary time is fitted per run at 1k timestep-channels (`.probe/fit16.py`):
+
+| arm | evals | simulate @1k | `wsclean` @1k | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| base | 6782 | 116.3ms | 253.3ms | 0.09560 +/- 0.00157 |
+| 0008 | 6653 | 112.8ms | 227.6ms | 0.09565 +/- 0.00161 |
+| 0008 | 6844 | 113.2ms | 225.2ms | 0.09556 +/- 0.00152 |
+| base | 6742 | 112.3ms | 251.7ms | 0.09597 +/- 0.00157 |
+| base, synchronous, 150 dead | 3415 | 111.4ms | 248.5ms | 0.09424 +/- 0.00279 |
+| 0008, synchronous, 150 dead | 3415 | 113.7ms | 232.9ms | 0.09424 +/- 0.00279 |
+
+The binary is ~10% faster in the async pairs (226 vs 252ms) and 6% faster in
+the synchronous pair, and the arms do not overlap. Simulate is unchanged.
+Under load the saving is larger than solo, as in round 23, because the
+saved work is memory-bound. At ~300ms of worker time per evaluation it is
+worth ~8% of WSClean throughput, on top of 0007. The synchronous pair matches
+exactly: log(Z) is identical and every chain file is byte-identical except
+`phys_live.txt`, which has the same lines in a different order.
+
+**To ship on CSD3:** as with 0007, rebuild `wsclean.sif` on a Docker host
+and import it. Next for WSClean: `WriteImagingWeights` still seeks, reads
+and writes once per row on the first pass, and "Reordering" (~12-20ms per
+evaluation) writes the part files that this patch maps.

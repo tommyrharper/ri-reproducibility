@@ -1,0 +1,160 @@
+diff --git a/msproviders/msreaders/reorderedmsreader.cpp b/msproviders/msreaders/reorderedmsreader.cpp
+index 5728f5f..7ecefe7 100644
+--- a/msproviders/msreaders/reorderedmsreader.cpp
++++ b/msproviders/msreaders/reorderedmsreader.cpp
+@@ -1,8 +1,24 @@
+ #include "reorderedmsreader.h"
+ #include "../reorderedmsprovider.h"
+ 
++#include <cstring>
++#include <filesystem>
++
+ namespace wsclean {
+ 
++namespace {
++// What istream::read did at the end of a file: copy what is there, stop at
++// the end, and report whether the whole record was read.
++bool ReadMapped(const MappedFile& file, size_t size, size_t& pos, void* dest,
++                size_t n) {
++  const size_t available = pos < size ? size - pos : 0;
++  const size_t count = n < available ? n : available;
++  if (count) std::memcpy(dest, file.Data() + pos, count);
++  pos += count;
++  return count == n;
++}
++}  // namespace
++
+ ReorderedMsReader::ReorderedMsReader(ReorderedMsProvider* reordered_ms)
+     : MSReader(reordered_ms) {
+   const size_t meta_file_index =
+@@ -10,30 +26,35 @@ ReorderedMsReader::ReorderedMsReader(ReorderedMsProvider* reordered_ms)
+   const std::string meta_filename = schaapcommon::reordering::GetMetaFilename(
+       reordered_ms->handle_.data_->ms_path_,
+       reordered_ms->handle_.data_->temporary_directory_, meta_file_index);
+-  meta_file_.open(meta_filename, std::ios::in);
+-  std::vector<char> ms_path(reordered_ms->meta_header_.filename_length + 1,
+-                            char(0));
+-  // meta and data header were read in ReorderedMs constructor
+-  meta_file_.seekg(schaapcommon::reordering::MetaHeader::BINARY_SIZE,
+-                   std::ios::beg);
+-  meta_file_.read(ms_path.data(), reordered_ms->meta_header_.filename_length);
+-  if (!meta_file_.good())
++  std::error_code ec;
++  meta_size_ = std::filesystem::file_size(meta_filename, ec);
++  if (ec || meta_size_ < schaapcommon::reordering::MetaHeader::BINARY_SIZE +
++                             reordered_ms->meta_header_.filename_length)
+     throw std::runtime_error("Error opening temporary metadata file: '" +
+                              meta_filename);
++  meta_file_ = MappedFile(meta_filename, meta_size_);
++  // meta and data header were read in ReorderedMs constructor
++  meta_pos_ = schaapcommon::reordering::MetaHeader::BINARY_SIZE;
++  std::vector<char> ms_path(meta_file_.Data() + meta_pos_,
++                            meta_file_.Data() + meta_pos_ +
++                                reordered_ms->meta_header_.filename_length);
++  ms_path.push_back(char(0));
++  meta_pos_ += reordered_ms->meta_header_.filename_length;
+   const std::string part_prefix = schaapcommon::reordering::GetPartPrefix(
+       ms_path.data(), reordered_ms->part_index_, reordered_ms->polarization_,
+       reordered_ms->handle_.data_->temporary_directory_);
+-  data_file_.open(part_prefix + ".tmp", std::ios::in);
+-  if (!data_file_.good())
++  data_size_ = std::filesystem::file_size(part_prefix + ".tmp", ec);
++  if (ec)
+     throw std::runtime_error("Error opening temporary data file in '" +
+                              part_prefix + ".tmp'");
+-  data_file_.seekg(schaapcommon::reordering::PartHeader::BINARY_SIZE,
+-                   std::ios::beg);
++  data_file_ = MappedFile(part_prefix + ".tmp", data_size_);
++  data_pos_ = schaapcommon::reordering::PartHeader::BINARY_SIZE;
+ 
+-  weight_file_.open(part_prefix + "-w.tmp", std::ios::in);
+-  if (!weight_file_.good())
++  weight_size_ = std::filesystem::file_size(part_prefix + "-w.tmp", ec);
++  if (ec)
+     throw std::runtime_error("Error opening temporary data weight file '" +
+                              part_prefix + "-w.tmp'");
++  weight_file_ = MappedFile(part_prefix + "-w.tmp", weight_size_);
+ 
+   const size_t n_max_visibilities =
+       reordered_ms->NMaxChannels() * reordered_ms->polarization_count_in_file_;
+@@ -75,8 +96,10 @@ void ReorderedMsReader::ReadMeta(MSProvider::MetaData& metadata) {
+ 
+ void ReorderedMsReader::CacheMeta() {
+   if (Provider().IsRegular()) {
+-    schaapcommon::reordering::MetaRecord record;
+-    record.Read(meta_file_);
++    schaapcommon::reordering::details::MetaRecordBuffer record;
++    if (!ReadMapped(meta_file_, meta_size_, meta_pos_, &record,
++                    sizeof(record)))
++      return;
+     metadata_.u_in_m = record.u;
+     metadata_.v_in_m = record.v;
+     metadata_.w_in_m = record.w;
+@@ -86,8 +109,10 @@ void ReorderedMsReader::CacheMeta() {
+     metadata_.antenna1 = record.antenna1;
+     metadata_.antenna2 = record.antenna2;
+   } else {
+-    schaapcommon::reordering::BdaMetaRecord record;
+-    record.Read(meta_file_);
++    schaapcommon::reordering::details::BdaMetaRecordBuffer record;
++    if (!ReadMapped(meta_file_, meta_size_, meta_pos_, &record,
++                    sizeof(record)))
++      return;
+     metadata_.u_in_m = record.u;
+     metadata_.v_in_m = record.v;
+     metadata_.w_in_m = record.w;
+@@ -102,8 +127,8 @@ void ReorderedMsReader::CacheMeta() {
+ void ReorderedMsReader::ReadData(std::complex<float>* buffer) {
+   const int64_t n_visibilities = NVisibilitiesPerRow(metadata_.data_desc_id);
+   if (!has_data_) {
+-    data_file_.read(reinterpret_cast<char*>(data_buffer_.data()),
+-                    n_visibilities * sizeof(std::complex<float>));
++    ReadMapped(data_file_, data_size_, data_pos_, data_buffer_.data(),
++               n_visibilities * sizeof(std::complex<float>));
+     has_data_ = true;
+   }
+   std::copy_n(data_buffer_.data(), n_visibilities, buffer);
+@@ -123,8 +148,8 @@ void ReorderedMsReader::ReadModel(std::complex<float>* buffer) {
+ void ReorderedMsReader::ReadWeights(float* buffer) {
+   const int64_t n_visibilities = NVisibilitiesPerRow(metadata_.data_desc_id);
+   if (!has_weights_) {
+-    weight_file_.read(reinterpret_cast<char*>(weight_buffer_.data()),
+-                      n_visibilities * sizeof(float));
++    ReadMapped(weight_file_, weight_size_, weight_pos_, weight_buffer_.data(),
++               n_visibilities * sizeof(float));
+     has_weights_ = true;
+   }
+   std::copy_n(weight_buffer_.data(), n_visibilities, buffer);
+diff --git a/msproviders/msreaders/reorderedmsreader.h b/msproviders/msreaders/reorderedmsreader.h
+index 5e66fae..57b9d78 100644
+--- a/msproviders/msreaders/reorderedmsreader.h
++++ b/msproviders/msreaders/reorderedmsreader.h
+@@ -2,6 +2,7 @@
+ #define MSPROVIDERS_MSREADERS_REORDEREDMSREADER_H_
+ 
+ #include "msreader.h"
++#include "../../system/mappedfile.h"
+ 
+ #include <aocommon/uvector.h>
+ 
+@@ -49,9 +50,17 @@ class ReorderedMsReader final : public MSReader {
+   bool has_data_ = false;
+   bool has_weights_ = false;
+ 
+-  std::ifstream meta_file_;
+-  std::ifstream weight_file_;
+-  std::ifstream data_file_;
++  // The part files are mapped and read through cursors rather than three
++  // istream reads per row; the cursors advance exactly as the streams did.
++  MappedFile meta_file_;
++  MappedFile weight_file_;
++  MappedFile data_file_;
++  size_t meta_size_ = 0;
++  size_t weight_size_ = 0;
++  size_t data_size_ = 0;
++  size_t meta_pos_ = 0;
++  size_t weight_pos_ = 0;
++  size_t data_pos_ = 0;
+ 
+   aocommon::UVector<float> imaging_weight_buffer_;
+   aocommon::UVector<std::complex<float>> data_buffer_;

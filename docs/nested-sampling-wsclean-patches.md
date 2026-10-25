@@ -297,3 +297,21 @@ log(Z) identical in a synchronous pair. The measurements are in
 Upstream-shaped: it changes nothing ducc0 computes. Upstream ducc0 would
 more likely expose the index as a reusable object than hide a cache in the
 constructor.
+
+## 0008: map the reordered part files
+
+Every gridding and degridding pass reads the reordered part files row by row
+(`msproviders/msreaders/reorderedmsreader.cpp`): one `istream::read` for the
+row's metadata record, one for its data and one for its weights, each a few
+tens of bytes. At CSD3's sizes that is ~120k small reads a pass and ~7
+passes an evaluation. The patch maps the three files with WSClean's own
+`MappedFile` (as the model file already is) and copies each record out of
+the map with `memcpy`. The cursors advance exactly as the streams did,
+including stopping at the end of a file, so the bytes handed to the gridder
+are the same.
+
+It measured -6.0% on the binary solo over six real-draw Measurement Sets,
+with the restored, model, residual and PSF data blocks byte-identical (24 of
+24). The in-run numbers are in [csd3-speed.md](csd3-speed.md), round 24.
+
+Upstream-shaped: it changes how the files are read, not what is read.
