@@ -701,10 +701,21 @@ def point_source_visibilities(
     rounding, at ~1/30 of its cost. self_check_analytic_predict() is the guard."""
     n_minus_1 = math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0
     delay_m = uvw @ np.array([l_rad, m_rad, n_minus_1])
-    vis = source_flux_jy * np.exp((2j * math.pi / SPEED_OF_LIGHT) * np.outer(delay_m, freqs_hz))
-    data = np.zeros((len(uvw), len(freqs_hz), n_corr), dtype=np.complex64)
-    data[:, :, 0] = vis
-    data[:, :, -1] = vis
+    return _phase_ramp(delay_m, freqs_hz, source_flux_jy, n_corr, _fastramp())
+
+
+def _phase_ramp(delay_m: np.ndarray, freqs_hz: np.ndarray, flux: float, n_corr: int, lib) -> np.ndarray:
+    data = np.zeros((len(delay_m), len(freqs_hz), n_corr), dtype=np.complex64)
+    if lib is None:
+        vis = flux * np.exp((2j * math.pi / SPEED_OF_LIGHT) * np.outer(delay_m, freqs_hz))
+        data[:, :, 0] = vis
+        data[:, :, -1] = vis
+        return data
+    delay_m = np.ascontiguousarray(delay_m, dtype=np.float64)
+    freqs_hz = np.ascontiguousarray(freqs_hz, dtype=np.float64)
+    # The imaginary part of numpy's complex constant, so the same double.
+    k = ((2j * math.pi) / SPEED_OF_LIGHT).imag
+    lib(delay_m.ctypes.data, len(delay_m), freqs_hz.ctypes.data, len(freqs_hz), k, flux, data.ctypes.data, n_corr)
     return data
 
 
@@ -729,32 +740,62 @@ UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STA
 # through the bitgen pointer plus two float64 temporaries per half, which was a
 # quarter of simulate in 38-rank CSD3 searches (docs/csd3-speed.md, round 26).
 FASTNOISE_SO = Path("/opt/ri-lib/fastnoise.so")
-_FASTNOISE: list[object] = []
+_FAST: dict[str, object] = {}
 
 
-def _fastnoise():
-    """The C noise filler, or None. Loaded and checked against numpy once per
-    process: a numpy whose stream differs (or no library) means numpy draws."""
-    if not _FASTNOISE:
-        _FASTNOISE.append(None)
+def _fast(name: str, argtypes: list, agrees) -> object | None:
+    """FASTNOISE_SO's `name`, or None. Loaded and checked once per process:
+    `agrees(fn)` false (or no library, or an older one without `name`) means
+    numpy does the work."""
+    if name not in _FAST:
+        _FAST[name] = None
         try:
             import ctypes
 
-            lib = ctypes.CDLL(str(FASTNOISE_SO)).add_normal_f32
-            lib.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 3
-            lib.restype = None
+            fn = getattr(ctypes.CDLL(str(FASTNOISE_SO)), name)
+            fn.argtypes = argtypes
+            fn.restype = None
         except (OSError, AttributeError):
             return None
-        _FASTNOISE[0] = lib
-        for every in (1, 4):
-            # 100k draws, ~1,200 of them through the ziggurat's rejection paths.
-            want = np.zeros((2500, 4, every), np.complex64)[:, :, 0]
-            got = want.copy()
-            _add_complex_noise(np.random.default_rng(12345), want, 0.3, every, None)
-            _add_complex_noise(np.random.default_rng(12345), got, 0.3, every, lib)
-            if want.tobytes() != got.tobytes():
-                _FASTNOISE[0] = None
-    return _FASTNOISE[0]
+        _FAST[name] = fn if agrees(fn) else None
+    return _FAST[name]
+
+
+def _noise_agrees(lib) -> bool:
+    for every in (1, 4):
+        # 100k draws, ~1,200 of them through the ziggurat's rejection paths.
+        want = np.zeros((2500, 4, every), np.complex64)[:, :, 0]
+        got = want.copy()
+        _add_complex_noise(np.random.default_rng(12345), want, 0.3, every, None)
+        _add_complex_noise(np.random.default_rng(12345), got, 0.3, every, lib)
+        if want.tobytes() != got.tobytes():
+            return False
+    return True
+
+
+def _ramp_agrees(lib) -> bool:
+    # VLA-sized delays (metres) over L to X band, 32k phases.
+    rng = np.random.default_rng(12345)
+    delay_m, freqs_hz = rng.normal(0.0, 300.0, 4000), 1e9 + np.arange(4) * 2.7e9
+    return all(_phase_ramp(delay_m, freqs_hz, flux, 2, None).tobytes()
+               == _phase_ramp(delay_m, freqs_hz, flux, 2, lib).tobytes() for flux in (1.0, 0.37))
+
+
+def _fastnoise():
+    """The C noise filler, or None."""
+    import ctypes
+
+    return _fast("add_normal_f32", [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 3,
+                 _noise_agrees)
+
+
+def _fastramp():
+    """phase_ramp_c64(), or None: numpy's predict ~1.8x faster, bit for bit."""
+    import ctypes
+
+    return _fast("phase_ramp_c64", [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_ssize_t,
+                                    ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_ssize_t],
+                 _ramp_agrees)
 
 
 def _add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int, lib) -> None:
@@ -1557,6 +1598,22 @@ def self_check_fast_noise() -> None:
         if rng.random() != reference.random():
             raise SystemExit("FAIL: fast noise left the generator in a different state")
     print("fast noise self-check passed")
+    if not hasattr(__import__("ctypes").CDLL(str(FASTNOISE_SO)), "phase_ramp_c64"):
+        print(f"phase ramp self-check skipped: {FASTNOISE_SO} predates phase_ramp_c64 (rebuild meqtrees)")
+        return
+    lib = _fastramp()
+    if lib is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s phase_ramp_c64 does not reproduce numpy's predict")
+    rng = np.random.default_rng(3)
+    for n_rows, n_chan, n_corr in ((351 * 40, 8, 4), (351, 1, 2), (1000, 3, 1)):
+        uvw = rng.normal(0.0, 3000.0, (n_rows, 3))
+        freqs_hz = rng.uniform(5e7, 1.2e10) + (np.arange(n_chan) + 0.5) * rng.uniform(1e5, 2e6)
+        flux, l_rad, m_rad = float(rng.uniform(0.1, 10.0)), 1.2e-3, -7e-4
+        delay_m = uvw @ np.array([l_rad, m_rad, math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0])
+        want = _phase_ramp(delay_m, freqs_hz, flux, n_corr, None)
+        if want.tobytes() != point_source_visibilities(uvw, freqs_hz, flux, l_rad, m_rad, n_corr).tobytes():
+            raise SystemExit(f"FAIL: phase ramp differs from numpy for {n_rows} rows, {n_chan} channels, {n_corr} corr")
+    print("phase ramp self-check passed")
 
 
 def self_check_mat_only() -> None:

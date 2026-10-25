@@ -1559,3 +1559,59 @@ identical. The module is bind-mounted, so this ships with no rebuild. R2D2's
 **Next.** What is left of simulate solo is mostly casacore: the TIME,
 TIME_CENTROID and ANTENNA1/2 writes (~7ms), the DATA write, and the closes.
 The phase ramp's complex `exp` and noise (with `fastnoise.so`) are ~7ms each.
+
+## Round 31: the phase ramp in C (`phase_ramp_c64`)
+
+**Profile.** With noise in C (round 26), the predict
+`flux * np.exp((2j * pi / c) * np.outer(delay, freqs))` is the largest
+numeric step left in simulate: 9.9ms solo for 21,060 rows x 16 channels.
+numpy builds it through complex128 temporaries, and its complex `exp` is
+7.6ms of that, against 3.7ms each for float64 `cos` and `sin`. Splitting it
+into `np.cos` and `np.sin` is bit-identical but saves only 1.2ms.
+
+**Change.** `phase_ramp_c64()` in `docker/meqtrees/src/fastnoise.c`
+computes `sincos(k * (delay * freq))`, scales by the flux and writes
+correlations 0 and n-1 of the zeroed complex64 array in one pass. numpy's
+complex `exp` is libm's `cexp`, which for a zero real part is `sincos` of
+the imaginary part times `exp(0) = 1`, and `k` is the imaginary part of
+numpy's own constant. The result is the same in float64, not just after
+rounding: 0 of 10.7M complex128 words differ, and 0 of 13.7M complex64
+values over random shapes, fluxes and L to X band frequencies.
+`point_source_visibilities()` keeps the delay `uvw @ (l, m, n-1)` in numpy.
+The library is loaded and checked against numpy once per process, like the
+noise filler (`_fast()`). A library without the symbol, or one that
+disagrees, leaves the work to numpy. `./ri self-check simulate` adds three
+shapes. It is solo 9.9ms -> 5.5ms on the shape above. R2D2's `--mat-only`
+uses the same predict.
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242. Both
+arms ran from this tree. They differed only in the meqtrees SIF:
+`Bootstrap: localimage` over the shipped `meqtrees.sif`, adding
+`/opt/ri-lib/fastnoise.so` built from HEAD's source (base) or this one
+(new), with the 0001-0010 `wsclean.sif`. Both shared one
+`NS_OBSERVATION_CACHE_DIR` in `/dev/shm`.
+
+That cache started empty, and round 30's fit (`.probe/fit16.py`) is
+dominated by makems misses: 279, 166, 129 and 140ms over the first four
+runs as the cache warmed. `.probe/fit32.py` refits simulate after dropping
+evaluations more than 50ms off the line (155-1041 per run, all misses).
+Simulate at 1k timestep-channels, trimmed:
+
+| arm | set 1 (ABBA) | set 2 (BAAB) | synchronous, 150 dead |
+| --- | --- | --- | ---: |
+| base | 63.9, 61.0ms | 61.7, 63.2ms | 61.5ms |
+| ramp in C | 52.6, 51.4ms | 52.2, 51.8ms | 51.2ms |
+
+That is -10.5ms (-17%) on simulate, with no overlap, and about 3.5% of
+WSClean worker time (WSClean @1k: 206-213ms in both arms). It is twice
+the solo saving, as rounds 27 and 30 were. In the synchronous pair, log(Z) is
+0.09424 +/- 0.00279 in both arms. Every chain file is identical except
+`phys_live.txt`, which holds the same 186 rows in a different order. It
+takes effect once `meqtrees.sif` is rebuilt on a Docker host and imported.
+Until then the shipped image has no `fastnoise.so`, so numpy does the
+work.
+
+**Learned.** A cold observation cache costs far more than this change in a
+short run. Between 4% and 15% of evaluations hit makems in the first runs
+on a fresh cache, at hundreds of ms each. Compare arms on a shared,
+pre-warmed cache, and fit with outliers trimmed.

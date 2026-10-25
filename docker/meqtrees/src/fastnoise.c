@@ -14,7 +14,11 @@
  *
  * The Python side checks this against numpy once per process and falls back
  * to numpy if they ever disagree (add_complex_noise() in
- * simulate_point_source_ms.py). */
+ * simulate_point_source_ms.py).
+ *
+ * phase_ramp_c64() is the point-source predict the noise is added to, bit
+ * for bit what point_source_visibilities() computes with numpy. */
+#define _GNU_SOURCE /* sincos */
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -80,4 +84,24 @@ void add_normal_f32(uint64_t state[4], double scale, float *dst, ptrdiff_t n,
   }
   state[0] = (uint64_t)(s >> 64);
   state[1] = (uint64_t)s;
+}
+
+void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
+                    ptrdiff_t n_chan, double k, double flux, float *out,
+                    ptrdiff_t n_corr) {
+  /* flux * np.exp(1j * k * np.outer(delay, freqs)), cast to complex64, into
+   * correlations 0 and n_corr - 1 of a (rows, chans, n_corr) array. numpy's
+   * complex exp is libm's cexp, which for a zero real part is sincos of the
+   * imaginary part times exp(0) = 1; ~1.8x faster than numpy, which goes
+   * through complex128 temporaries (docs/csd3-speed.md, round 31). */
+  ptrdiff_t last = 2 * (n_corr - 1);
+  for (ptrdiff_t r = 0; r < n_rows; r++) {
+    for (ptrdiff_t c = 0; c < n_chan; c++) {
+      double s, co;
+      sincos(k * (delay[r] * freqs[c]), &s, &co);
+      float *v = out + 2 * n_corr * (r * n_chan + c);
+      v[0] = v[last] = (float)(flux * co);
+      v[1] = v[last + 1] = (float)(flux * s);
+    }
+  }
 }
