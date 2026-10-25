@@ -799,3 +799,71 @@ Notes from this round:
   their `benchmarks.jsonl` row is written.
 - This round's 14 rows in `benchmarks.jsonl` have a `note` field naming the
   arm.
+
+## Round 17: R2D2 ranks, memory and threads on a half node (no change)
+
+All on cpu-q-553 (this job's 38 CPUs, 128GB cgroup limit) at `b081568`.
+
+**WSClean at 36 ranks is all gridding and I/O inside WSClean.** `./ri profile
+--phases` on a 150-dead-point run (45 logged evaluations): the `wsclean`
+binary's wall is its logged phases plus ~3ms. Per evaluation: gridding 41ms
+(4.07 passes), loading the reordered data 29ms, reordering 21ms, predicting
+21ms (2.07 passes), loading metadata 9ms. Those are the same phases the
+Hetzner [gridder floor](nested-sampling-gridder-floor.md) prices. No
+CSD3-specific overhead is left outside them.
+
+**A warm R2D2 request, one process, 1 thread** (`probe_r2d2_request.py`, 25
+typical `.mat`s on tmpfs): 517ms. U-Net forwards ~432ms (15.5 per request),
+checkpoint swaps 11ms (0.73ms each, timed without the profiler), Briggs
+imaging weights 13.6ms, FINUFFT ~23ms. The Kaiming init happens once per
+worker, not per request. With the `.mat`s on Lustre, as in earlier probes,
+the same request is 760ms, so probe inputs must sit on tmpfs.
+
+**Rank count.** nlive 150, 15 repeats, 150 dead points, async, seed 4242,
+steady-state retention. `.probe/r17an.py` gives 30s windows:
+
+| layout | steady evals/s (30-150s) | workers busy | R2D2 per eval | whole run | log(Z) |
+| --- | --- | ---: | ---: | --- | --- |
+| 38 x 1 | 31.7, 33.1 (then the tail) | 36.9 of 37 | 1.02-1.05s | 3,260 evals in 183s | 0.0145 +/- 0.0036 |
+| 19 x 2 | 24.6, 25.7, 25.4, 26.0 | 17.9 of 18 | 0.60-0.63s | 3,969 evals in 171s | 0.0148 +/- 0.0030 |
+
+One rank per CPU is ~27% faster mid-run than half the ranks at 2 threads.
+The U-Net is memory-latency bound per core (round 11), so more cores pulling
+weights at once beat more threads per forward. The 38 x 1 run lost its lead
+in the tail (below), so its whole-run figure is lower. One pair only, so
+treat the size as a pointer, not a measurement.
+
+**Memory per rank is ~0.4GB, not 3.5GB.** Sampled every 5s from the job's
+cgroup during the 38-rank runs: peak usage 30.7GB, of which RSS 15.6GB and
+the rest page cache (mostly the 6.2GB of checkpoints). The pool parent loads
+the checkpoints once and the workers share them after the fork, so each rank
+adds ~0.4GB. `NS_R2D2_MB_PER_RANK` (3500) assumes every rank holds its own
+copy. On this node that makes `--mpi-procs 38` print an OOM warning, and a
+default run clamps itself to (128,060 - 4,096) / 3,500 = 35 ranks with
+ceil(38/35) = 2 threads each, 70 threads on 38 CPUs. 35 x 2 was not measured
+here. The 56-rank cap `NS_R2D2_MAX_RANKS` came from a sapphire scaling test
+(E4) that was still rising at 56, and from the file quota. Retention now
+leaves ~2 inodes per evaluation, so the quota no longer sets it.
+
+**Thread count of a lone request** (the tail, where round 9's adaptive
+threads give the last evaluations every CPU). Mean of 3 warm requests, alone
+on this allocation:
+
+| `ncpus` | 1 | 4 | 8 | 16 | 38 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| typical request | 0.59s | 0.29s | 0.23s | 0.22s | 0.34s |
+| heavy request (1s integration, 7 channels) | 1.61s | 0.67s | 0.52s | 0.45s | 0.58s |
+
+38 threads (34 on one socket, 4 on the other) are slower than 16. In the
+38 x 1 run's tail, requests given 38 threads took 3.3-3.9s each, and 60s of
+the 183s had 1-3 workers busy. The 19 x 2 tail capped at ~5 threads was
+short. The lone-request table does not explain all of the 3.3-3.9s (the
+tail's evaluations sit in the heavy corner), so it is not settled yet.
+
+Next, in order:
+
+1. Measure the default (35 x 2) against 38 x 1 here, and correct
+   `NS_R2D2_MB_PER_RANK` to a shared-plus-per-rank model so the default
+   becomes one rank per CPU.
+2. Cap `R2D2_MAX_THREADS` (e.g. 16, or one socket) and A/B the tail.
+3. On a whole node, test ranks above the 56 cap, up to one per CPU.
