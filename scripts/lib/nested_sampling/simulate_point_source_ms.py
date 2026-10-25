@@ -1151,6 +1151,14 @@ def self_check_noise_weighting() -> None:
             expected = np.sqrt(1.0 / (sigma * sigma))
             assert np.allclose(nW, expected, rtol=0.0, atol=0.0), \
                 f"nW is {nW.min()}..{nW.max()}, not the {expected} the WEIGHT column used to carry"
+            # The convert reads one correlation's slice; it must be the column's.
+            with table(str(ms), readonly=True, ack=False) as opened:
+                data = np.asarray(opened.getcol("DATA"), dtype=np.complex128)
+            for corr in (0, data.shape[2] - 1):
+                ms_to_r2d2_mat(ms, mat, corr_index=corr, noise_sigma_jy=sigma)
+                y = loadmat(str(mat))["y"]
+                assert np.array_equal(y.view(np.uint8), data[:, :, corr].reshape(-1, 1).view(np.uint8)), \
+                    f"y differs from DATA[:, :, {corr}]"
     print("noise weighting self-check passed")
 
 

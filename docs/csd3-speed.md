@@ -552,3 +552,66 @@ card, so ranks queue for it rather than share it. So for production at
 `NS_IMAGE_DIM=32`, stay on icelake CPUs. The GPU would only pay with the
 contexts merged (CUDA MPS, or one GPU server batching forwards for all ranks)
 and the checkpoints held once instead of per worker; neither was tried here.
+
+## Round 12: a production-shaped run, and the convert stage
+
+Short benches use nlive 25. Here is round 9's production shape at the real
+nlive: `NS_NLIVE=150 NS_NUM_REPEATS=15`, 24 ranks x 1 thread, async,
+steady-state retention, 250 dead points, seed 4242. It ran on this job's half
+icelake node (38 CPUs) at `d67cbef`. That was 8,512 evaluations in 423s,
+log(Z) 0.0165 +/- 0.0017. Per 30s window (`.probe/timeline12.py`, which
+reads the run's `metrics.json` records):
+
+| window | evals/s | workers busy (of 23) | simulate | convert | R2D2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0-30s | - | 22.4 | 158ms | 78ms | 3.20s (cold) |
+| 30-360s | 21.8-26.1 | 22.9 | 64-97ms | 23-38ms | 0.80-0.88s |
+| 360-390s | 21.8 | 19.1 | 94ms | 38ms | 0.76s |
+| 390-420s (tail) | 9.3 | 5.9 | 107ms | 41ms | 0.51s |
+
+- At nlive 150 the workers are never idle mid-run (22.9 of 23). Round 10's
+  ~18-of-23 cap was a property of nlive 25. Worker time per evaluation
+  (0.95s) explains the whole rate: 23 / 0.95 = 24 evals/s. So nothing is lost
+  between evaluations. The R2D2 request is 87% of it, and round 11 showed
+  that this is the U-Net's memory floor.
+- The tail (the last chains) is ~45s, and the adaptive threads of round 9
+  pick it up (5.9 threads per eval in that window).
+- Every worker's first evaluation took ~40s (0.8s warm). This was the first
+  R2D2 run on this node, so the pool's parent read the 6.2GB of checkpoints
+  cold from Lustre. Run again warm, `warm_imports()` takes 4.5s and a first
+  evaluation 4.4s. So it is once per job on a new node, ~35s, which is 0.2%
+  of a 6h job. Not pursued: `posix_fadvise(DONTNEED)` does not reliably evict
+  Lustre pages (a serial re-read took 19.8s once and 2.5s the next time), so
+  a parallel-prefetch fix could not be measured cold here.
+
+Dead end: the noise draws. They are 20ms of a 73ms typical simulate and
+0.27s of a 0.6s heavy one. They are 11ns a sample (numpy 1.26
+`Generator.normal`; `random_raw` alone is 4ns). `standard_normal(out=)` plus
+an in-place scale is bit-identical but only 6% faster. A vectorised
+reimplementation of numpy's ziggurat from `random_raw` is slower (287ms
+against 121ms for 10.6M samples) because of the temporaries. The seeded
+stream is sequential, so threads cannot split it. Only compiled code would
+help, and that means rebuilding the image.
+
+**Change.** The convert (`ms_to_r2d2_mat.py`) read all four correlations of
+DATA and widened them to complex128 to use one. It now reads that one with
+`getcolslice`. Timed in `meqtrees.sif` on the 48 typical and 6 heavy
+parameter sets, old and new alternating, 2 timed repeats each:
+
+| sets | old convert | new convert | `.mat` arrays |
+| --- | ---: | ---: | --- |
+| 48 typical (mean 53.5k rows) | 27.5ms | 25.1ms | identical, 48/48 |
+| 6 heavy (~377k rows, 7 channels) | 211.6ms | 168.4ms | identical, 6/6 |
+
+The files match byte for byte after savemat's 128-byte header, which holds
+a creation timestamp. That is ~1.3% of a heavy evaluation (the converged
+region of long runs) and 0.3% of a typical one: too small to see end to end,
+so it is timed at the stage. `self_check_noise_weighting` now checks `y`
+against the full DATA column for the first and last correlation.
+
+What is left of the convert is WEIGHT: an IncrementalStMan column whose
+`getcol` costs 15ms typical and 38ms heavy, every value 1.0. The simulator
+never writes it. If simulate wrote the `.mat` itself from the arrays it
+already holds, with the WEIGHT it knows, most of the remaining
+25-170ms/eval would go, along with one worker round trip. That is the next
+small R2D2 target. Its byte-identity check is the same as above.

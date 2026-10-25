@@ -50,18 +50,20 @@ def ms_to_r2d2_mat(
         # reconstruction nothing downstream could tell was wrong.
         raise ValueError(f"noise_sigma_jy must be positive, got {noise_sigma_jy}")
     with table(str(ms_path), readonly=True, ack=False) as ms:
-        data = np.asarray(ms.getcol("DATA"), dtype=np.complex128)
+        n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape[2]
+        if corr_index < 0 or corr_index >= n_corr:
+            raise ValueError(f"corr_index {corr_index} out of range for {n_corr} correlations")
+        # Only the one correlation used: reading all four and widening them to
+        # complex128 was 76ms of a 211ms convert on the heaviest corner
+        # (docs/csd3-speed.md, round 12). Same values, bit for bit.
+        vis = np.asarray(ms.getcolslice("DATA", [-1, corr_index], [-1, corr_index])[:, :, 0], dtype=np.complex128)
         uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
         weight = np.asarray(ms.getcol("WEIGHT"), dtype=np.float64)
 
     with table(str(ms_path / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
         freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
 
-    n_rows, n_chan, n_corr = data.shape
-    if corr_index < 0 or corr_index >= n_corr:
-        raise ValueError(f"corr_index {corr_index} out of range for {n_corr} correlations")
-
-    vis = data[:, :, corr_index]
+    n_rows, n_chan = vis.shape
     row_weight = weight[:, corr_index]
 
     u_lambda = (uvw[:, 0, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
