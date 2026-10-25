@@ -220,7 +220,7 @@ per-rank default. The same count is written into every per-evaluation
 torch - see "R2D2 sizes its own torch thread pool" in
 [nested-sampling-profiling.md](nested-sampling-profiling.md). In async runs
 that count is a floor: each evaluation gets `R2D2_MAX_THREADS` (default: host
-CPUs) over the evaluations in flight, so a run's last chains use the cores
+CPUs, at most 16) over the evaluations in flight, so a run's last chains use the cores
 the finished ranks left idle ([csd3-speed.md](csd3-speed.md), round 9).
 
 ### Environment overrides

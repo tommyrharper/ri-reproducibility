@@ -33,6 +33,13 @@ host
   sidecars  3 running, 0 leaked
 ```
 
+"In flight" on a live run counts the evaluations being imaged right now. A rank
+with scratch builds each one in `/dev/shm` and writes nothing to the run
+directory until it is scored, so the count is the recent imaging seconds per
+elapsed second (Little's law), or the number of directories with no
+`metrics.json` if that is larger. On a dead run it is those leftover
+directories, shown as "abandoned".
+
 `--monitor` redraws every `--interval` seconds (default 5, matching the TUI's
 own timer) instead of printing once, so watching a run does not fill the
 terminal with one scrollback entry per poll. Ctrl-C to stop.

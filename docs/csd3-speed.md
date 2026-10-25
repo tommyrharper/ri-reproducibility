@@ -931,3 +931,54 @@ Next, in order:
    113-119s).
 2. On a whole node, test ranks above the 56 cap, up to one per CPU. Memory
    no longer limits it (76 ranks is ~54GB by the model above).
+
+## Round 20: the tail's thread cap is 16, and health counts in-flight work again
+
+All on cpu-q-133 (this job's 38 CPUs) at `6829906`: the 38 x 1 default, nlive
+150, 15 repeats, 150 dead points, async, seed 4242, with the two arms
+interleaved (`.probe/r19.sh 16 38 ...`, read by `.probe/r20.py`). Round 19's
+attempt died part-way and recorded nothing. "Tail" is the time from 95% of
+the evaluations to the last one. "Slowest late" is the longest R2D2 request
+in that tail.
+
+| `R2D2_MAX_THREADS` | wall | steady evals/s (30-90s) | tail | slowest late | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 16 | 206s | 15.7 | 42s | 4.4s | 0.01443 +/- 0.00351 |
+| 38 | 192s | 28.9 | 54s | 7.2s | 0.01452 +/- 0.00345 |
+| 16 | 147s | 30.7 | 35s | 2.8s | 0.01456 +/- 0.00349 |
+| 38 | 207s | 29.8 | 91s | 9.0s | 0.01472 +/- 0.00329 |
+| 16 | 147s | 28.1 | 30s | 2.6s | 0.01465 +/- 0.00349 |
+| 38 | 184s | 29.2 | 67s | 5.9s | 0.01464 +/- 0.00354 |
+| 16 | 154s | 28.8 | 41s | 3.8s | 0.01437 +/- 0.00347 |
+| 38 | 180s | 29.7 | 68s | 7.7s | 0.01444 +/- 0.00349 |
+| 16 | 164s | 28.3 | 47s | 4.0s | 0.01466 +/- 0.00342 |
+| 38 | 155s | 29.5 | 42s | 6.9s | 0.01475 +/- 0.00333 |
+
+With the cap the tail is 30-47s (median 41s), against 42-91s (median 67s)
+uncapped. Round 18's runs agree: 38 and 45s capped, and 33-119s uncapped.
+With the cap no late request took more than 4.4s, against 5.9-9.0s without
+it. The steady state does not change, since the cap only matters once ranks
+fall idle. (The first run's 15.7 is a slow start: the node's load went from
+6 to 48 during it.) Median wall time for this shape fell from 184s to 154s.
+All ten log(Z) values lie between 0.01437 and 0.01475, against errors of
+~0.0034. This matches round 17's table for a lone request, where 16 threads
+take 0.22/0.45s and 38 take 0.34/0.58s. Above 16, more threads cross the
+socket and the request gets slower.
+
+**The change.** In async runs `R2D2_MAX_THREADS` now defaults to the host's
+CPU count capped at 16 (`run-nested-sampling-r2d2.sh`). It is also written to
+`run.env`, so a resume keeps it and `./ri bench` groups runs by it. Before
+this, two A/B arms of this setting landed in the same bench group.
+A run on the new default recorded `R2D2_MAX_THREADS=16` and ran 160s at a
+steady 29.3 evals/s, with a 43s tail and log(Z) 0.01451 +/- 0.00340.
+
+**Health.** With tmpfs scratch (round 14), an evaluation in flight has no
+directory on Lustre, so `./ri health` read "1 in flight" on a 38-rank run.
+On a live run (local ranks, or a RUNNING Slurm job seen from a login node)
+the count is now the larger of the leftover directories and the recent
+imaging seconds per elapsed second (Little's law). This adds no IO. The same
+live run read "29 in flight" with the new code and "1 in flight" with the
+old. A dead run still counts its leftover directories as "abandoned".
+
+Next: on a whole node, test ranks above the 56 cap, up to one per CPU
+(round 18).

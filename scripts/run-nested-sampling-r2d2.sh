@@ -118,8 +118,10 @@ R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}"
 # Ceiling for r2d2_thread_count() in common.py, which splits it over the
 # evaluations in flight. Async only: any count but 1 moves R2D2's output by
 # ~1e-7, so a synchronous run would stop repeating itself from its seed.
+# At most 16: a lone request is fastest there and slower at 38, and capping
+# the tail at 16 shortened it from 42-91s to 30-47s (csd3-speed.md, round 20).
 if [ "${NS_SYNCHRONOUS}" = 0 ]; then
-  R2D2_MAX_THREADS="${R2D2_MAX_THREADS:-${HOST_CPUS}}"
+  R2D2_MAX_THREADS="${R2D2_MAX_THREADS:-$(( HOST_CPUS < 16 ? HOST_CPUS : 16 ))}"
 else
   R2D2_MAX_THREADS="${R2D2_OMP_THREADS}"
 fi

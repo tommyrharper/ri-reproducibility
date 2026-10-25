@@ -1059,6 +1059,16 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
                            if status in ("healthy", "stalled", "starting", "restarting") else None),
         "warnings": warnings,
         **scan,
+        # A rank with scratch builds its evaluation in /dev/shm and puts
+        # nothing on the run directory until it is scored (docs/csd3-speed.md,
+        # round 14), so a live run has no directories to count. Little's law
+        # does it instead: imaging seconds per elapsed second is the number of
+        # evaluations held at once. Live runs only - a dead run's leftover
+        # directories are the count.
+        "in_flight": (max(int(scan["in_flight"]),
+                          round(float(scan["recent_busy_ranks"] or scan["busy_ranks"] or 0)))
+                      if ranks or job == "RUNNING" else scan["in_flight"]),
+        "flying": bool(ranks) or job == "RUNNING",
     }
 
 
@@ -1240,7 +1250,7 @@ def render(run: dict[str, object]) -> None:
         # "in flight" reads as work still happening on a run that ended hours
         # ago.
         ("progress", f"{run['completed']} evaluations, {run['in_flight']} "
-                     + ("in flight" if run["ranks"] else "abandoned")),
+                     + ("in flight" if run.get("flying", run["ranks"]) else "abandoned")),
         ("activity", "nothing yet" if idle is None else
                      f"last evaluation {format_elapsed(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_elapsed(float(run['span_seconds']))}"
@@ -2692,6 +2702,12 @@ def self_check() -> None:
             # have said 125% and 50% - see _duty.
             assert abs(float(serial["busy_ranks"]) - 3.654) < 0.01, serial
             assert abs(float(serial["recent_busy_ranks"]) - 0.510) < 0.01, serial
+            # With scratch a live run leaves no directory for an evaluation it
+            # is holding, so the count comes from the duty instead; a stopped
+            # run's is still its leftover directories.
+            assert serial["in_flight"] == 0 and "0 abandoned" in io_capture(serial), serial
+            flying = describe(idle, [], 1e9, jobs={idle.resolve().name: "RUNNING"})
+            assert flying["in_flight"] == 1 and "1 in flight" in io_capture(flying), flying
             rendered_idle = io_capture(serial)
             assert "20.0s per evaluation, ranks 46% busy" in rendered_idle, rendered_idle
             assert "(last 50: 5.0s, 6% busy)" in rendered_idle, rendered_idle
