@@ -65,6 +65,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Each reordered file mapped once per evaluation, not once per pass | `patches/0010` | -2.2% (-4.6ms) on WSClean in 38-rank CSD3 searches (8 runs, ABBA+BAAB, no overlap); faults halved solo; byte-identical, chains identical ([csd3-speed](csd3-speed.md), round 29) |
 | Simulate's fill writes in `extend_template()`'s table open (no reopen, no UVW/CHAN_FREQ/FLAG read-back) | `simulate_point_source_ms.py` | -6.3% (-6.4ms) on simulate in 38-rank CSD3 searches (8 runs, no overlap); MSs byte-identical, chains identical ([csd3-speed](csd3-speed.md), round 30) |
 | Point-source phase ramp in C, numpy's complex `exp` bit for bit | `docker/meqtrees/src/fastnoise.c` | -17% (-10.5ms) on simulate in 38-rank CSD3 searches (8 runs, makems misses trimmed, no overlap); chains identical ([csd3-speed](csd3-speed.md), round 31) |
+| One-timestep template re-laid with 32KB StandardStMan buckets (makems' 256B made ANTENNA1/2 writes walk ~1000 buckets) | `simulate_point_source_ms.py` | -6.1% (-5.7ms) on simulate in 38-rank CSD3 searches (8 runs, makems misses trimmed, no overlap); every column equal, chains identical ([csd3-speed](csd3-speed.md), round 32) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

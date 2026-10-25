@@ -1615,3 +1615,63 @@ work.
 short run. Between 4% and 15% of evaluations hit makems in the first runs
 on a fresh cache, at hundreds of ms each. Compare arms on a shared,
 pre-warmed cache, and fit with outliers trimmed.
+
+## Round 32: 32KB StandardStMan buckets in the one-timestep template
+
+**Profile.** Per casacore call on the extend path, solo with `fastnoise.so`
+(`.probe/colprof31.py` over `scripts/probe_simulate_stage.py`, 48 sets,
+median simulate 23ms), the main-table writes were TIME and TIME_CENTROID
+2.1ms each, DATA 1.9ms, ANTENNA1 and ANTENNA2 1.5ms each, `addrows` 0.9ms
+and UVW 0.6ms. The int32 antenna columns were slower than the float64 UVW
+with three times the bytes. makems puts ANTENNA1/2 in a StandardStMan with
+a 256-byte bucket, 32 rows of the pair, behind a 2-bucket cache. Each
+extended evaluation grows that table to tens of thousands of rows, so
+`addrows` and both putcols walk about 1000 buckets.
+
+**Change.** `one_timestep_template()` publishes the template through
+`_copy_with_large_ssm_buckets()`, a deep `table.copy` with the
+StandardStMan's `BUCKETSIZE` set to 32768. The template is built once per
+channel count per run, so the copy costs a few ms once. Every column value
+and keyword stays the same, and only the SSM file's layout changes (the
+makems `vis.*` symlinks are not carried over, and nothing reads them). The
+skeleton and fresh-makems paths are unchanged. Same-shaped extension, solo
+(`/dev/shm/r33/relay.py`, 98 timesteps x 351 baselines):
+
+| template | addrows | ANTENNA1 | ANTENNA2 | sum of writes |
+| --- | ---: | ---: | ---: | ---: |
+| makems (256B) | 0.60ms | 0.99ms | 0.96ms | 7.9ms |
+| 4KB | 0.15ms | 0.14ms | 0.10ms | 5.7ms |
+| 32KB | 0.11ms | 0.11ms | 0.07ms | 5.6ms |
+
+Also tried and dropped: a 1MB ISM bucket made TIME slower (1.3 -> 1.7ms),
+and UVW tiles of 3x1024 instead of 3x128 saved only 0.15ms while changing
+the layout WSClean reads. Over 24 MSs from both trees (12 sets, cached and
+extended), all 1608 columns and every keyword are equal. The observation-prefix
+self-check now allows exactly this difference: the SSM bucket must be 32768
+on an extended MS and the rest of the storage layout must match makems.
+Probe simulate stage, interleaved, median of 48 sets: 23.6, 23.1 and 23.5ms
+before, 20.2, 19.9 and 21.2ms after (-3.4ms, -14%).
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242. Both
+arms used `/dev/shm/r30/sifs-mc` (the shipped `meqtrees.sif`, so numpy noise
+and ramp, plus the 0001-0010 `wsclean.sif`), with one shared
+`NS_OBSERVATION_CACHE_DIR`. The base arm is a `git worktree` at HEAD
+(`.probe/r33ab.sh`). Order was ABBA then BAAB. Simulate at 1k timestep-channels, makems misses
+trimmed (`.probe/fit32.py`):
+
+| arm | set 1 (ABBA) | set 2 (BAAB) | synchronous, 150 dead |
+| --- | --- | --- | ---: |
+| base | 93.3, 94.9ms | 94.2, 94.0ms | log(Z) 0.09424 +/- 0.00279 |
+| 32KB SSM | 89.4, 87.4ms | 88.1, 88.9ms | log(Z) 0.09424 +/- 0.00279 |
+
+That is -5.7ms (-6.1%) on simulate with no overlap. As in rounds 27, 30 and
+31, it is larger than the solo saving. WSClean @1k was 210-212ms (base) and
+204-214ms (new). In the synchronous pair every chain file is identical
+except `phys_live.txt`, which holds the same rows in a different order. The
+module is bind-mounted, so this ships with no rebuild.
+
+**Learned.** The untrimmed means in `benchmarks.jsonl` are useless here.
+This cache started cold, so whichever arm ran first paid the makems misses:
+the synchronous pair's means were 134.5ms (base, first) against 98.2ms. On
+this RDS, `fit32.py` read ~10 metrics.json a second, about 50 minutes for 8
+runs. Fit in the background, or read the files in parallel.

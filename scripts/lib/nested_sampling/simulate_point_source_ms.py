@@ -371,8 +371,21 @@ def one_timestep_template(cfg_text: str, args: argparse.Namespace, scratch: Path
             ms = Path(build) / Path(args.output_ms).name
             write_makems_config(one, ms)
             run_makems(ms)
-            _atomic_publish(lambda path: shutil.copytree(ms, path, symlinks=True), template)
+            _atomic_publish(lambda path: _copy_with_large_ssm_buckets(ms, path), template)
     return template
+
+
+def _copy_with_large_ssm_buckets(ms: Path, destination: Path) -> None:
+    """makems' StandardStMan bucket is 256 bytes, 32 rows of ANTENNA1/2, so
+    every extended evaluation's addrows and two putcols walked ~1000 buckets
+    through a 2-bucket cache. Same values, 32KB buckets: -2.3ms solo
+    (docs/csd3-speed.md, round 32)."""
+    with table(str(ms), ack=False) as t:
+        dminfo = t.getdminfo()
+        for manager in dminfo.values():
+            if manager["TYPE"] == "StandardStMan":
+                manager["SPEC"]["BUCKETSIZE"] = 32768
+        t.copy(str(destination), deep=True, valuecopy=True, dminfo=dminfo).close()
 
 
 def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace,
@@ -1187,7 +1200,13 @@ def self_check_observation_prefix() -> None:
             assert ("extended a cached observation" in log) == served, f"step {i}: cache use was not {served}: {log}"
             expected = simulate_with(scratch, f"makems{i}", dec, step, n_times, n_chan, prefix=False)
             with table(str(got), ack=False) as left, table(str(expected), ack=False) as right:
-                assert repr(left.getdminfo()) == repr(right.getdminfo()), f"step {i}: storage layout differs"
+                layouts = [table_.getdminfo() for table_ in (left, right)]
+            if served:  # the one intended difference: _copy_with_large_ssm_buckets()
+                for manager in layouts[0].values():
+                    if manager["TYPE"] == "StandardStMan":
+                        assert manager["SPEC"]["BUCKETSIZE"] == 32768, f"step {i}: SSM bucket not enlarged"
+                        manager["SPEC"] = next(m["SPEC"] for m in layouts[1].values() if m["NAME"] == manager["NAME"])
+            assert repr(layouts[0]) == repr(layouts[1]), f"step {i}: storage layout differs"
             for sub in ("", "SPECTRAL_WINDOW", "ANTENNA", "FIELD", "DATA_DESCRIPTION", "POLARIZATION", "OBSERVATION"):
                 left, right = values(got, sub), values(expected, sub)
                 assert left.keys() == right.keys(), f"step {i}: {sub or 'MAIN'} columns differ"
