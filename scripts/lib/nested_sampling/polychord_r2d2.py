@@ -25,6 +25,7 @@ from common import (
     cube_like_from_theta,
     cube_to_params,
     drain_record_writes,
+    finished_run_records,
     gathered_window_fit_stats,
     compute_image_metrics,
     image_dim,
@@ -579,13 +580,11 @@ def main() -> None:
     write_records_in_background()
     pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
     total_wall_seconds = time.monotonic() - run_start
-    # Before the collective below, so rank 0 reads every rank's records.
-    drain_record_writes()
-    # Collective, so every rank calls it before rank 0 goes on alone.
+    # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
+    all_evaluations = finished_run_records(evaluations_dir)
     window_fit_stats = gathered_window_fit_stats()
 
-    if mpi_rank() == 0:
-        all_evaluations = load_evaluations_from_dir(evaluations_dir)
+    if all_evaluations is not None:
         best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
         mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
         summary = {

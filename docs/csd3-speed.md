@@ -2293,3 +2293,74 @@ cluster's default (a tree on `/rds`) pays no Lustre penalty on the rank's
 main thread. A WSClean evaluation is now ~85% the WSClean binary (208-216ms)
 and ~15% simulate (38-39ms), with the workers saturated, so further gains
 have to come from inside the binary or simulate. No code change.
+
+## Round 51: a run publishes only the held extremes it keeps
+
+**Question.** Every benchmark so far stopped at 150-300 dead points. What
+does a whole production search (the `production` preset: nlive 150, 15
+repeats, to convergence) spend its wall on, now that the workers are
+saturated mid-run (round 50)?
+
+**Method.** The preset at 36 ranks (seed 1, async, tree on `/rds`, warm
+production observation cache), timed from launcher start to launcher exit.
+Per-evaluation `timing` gives the evaluation span. A second base run
+carried timestamps around each step after `run_polychord` returns.
+
+**Profile.** The search converges at 1427 dead points after ~44k
+evaluations, and the whole run takes 6.5 minutes:
+
+| phase | seconds | share |
+| --- | ---: | ---: |
+| launch to first evaluation | 5.8 | 1.5% |
+| evaluations (132 evals/s, 33 of 35 workers busy) | 331.0 | 85% |
+| of which the tail where one worker finishes the last chain alone | ~20 | ~5% |
+| all ranks drain; each flushes its held extremes to Lustre | 22.7 | 5.8% |
+| rank 0 reads 44k records | 7.2 | 1.8% |
+| rank 0 prunes artefacts | 16.1 | 4.1% |
+| rank 0 writes `summary.json` (176MB) | 3.8 | 1.0% |
+| exit | 2.4 | 0.6% |
+
+The post-run phase, 52.7s, is 13.5% of a production run, and `./ri bench`
+never sees it: a row's `wall_s` is the evaluation span. Its biggest part is
+round 47's held extremes. Each rank ends holding its own lowest and highest
+20 so far, up to 36 x 40 evaluation dirs, and copied all of them to Lustre.
+Only the run's 40 survive, so prune then unlinked the rest again. Prune also
+made 11 Lustre stats per record (an `is_dir` and one `is_file` per log name)
+for dirs that hold only `metrics.json`.
+
+**Change.** `finished_run_records()` (`common.py`) replaces the drain at
+the end of both `polychord_wsclean.py` and `polychord_r2d2.py`. Every rank
+drains its records without flushing what it holds, then waits at a barrier.
+Rank 0 reads the records and computes `evaluations_keeping_images()`, the
+same decision prune makes, and broadcasts the result. Each rank publishes
+only the held evaluations in that set and drops the rest in tmpfs. A second
+barrier then lets rank 0 prune. The kept set is unchanged, because prune
+would have deleted everything else anyway. Prune now lists each eval dir
+once instead of stat-ing each log name. The streaming-retention self-check
+adds another rank's held extreme that the run does not keep, and it fails
+when the keep filter is removed.
+
+**Result.** One run of the new code against the two base runs, same preset:
+
+| run | evaluations | evaluation span | post-run | launch to exit |
+| --- | ---: | ---: | ---: | ---: |
+| base (`r51-prod`) | 44476 | 336.8s | ~51s | ~7.5 min |
+| base, timed (`r51-prod2`) | 44212 | 331.0s | 52.7s | 389.5s |
+| new (`r51-new`) | 44769 | 316.4s | 37.0s | 359.8s |
+
+The post-run phase fell by 15.7s (-30%), or 4% of a production run. All 40
+run extremes kept their images, no path in `summary.json` is missing, and
+the 57-60 images named per run differ only because async runs draw
+different points. log(Z) is 0.0966/0.0953 (base) against 0.0958 (new),
+inside the async spread. This is a direct phase timing of one new run
+against two base runs, not a raced pair. A 15.7s change on a fixed ~52s
+phase is well outside the noise, but the evaluation spans are not
+comparable.
+
+**Left.** ~34s of post-run work, all on rank 0 while 35 ranks wait: the
+record read, the prune's remaining Lustre walk, and a 176MB `summary.json`
+re-read by every reader. These grow with the evaluation count, not the rank
+count, so a multi-hour run pays minutes here. The next step is to time the
+three again with the new code, then cut whichever is largest (for example,
+ranks could hand their records to rank 0 over MPI instead of rank 0
+re-reading them from Lustre).

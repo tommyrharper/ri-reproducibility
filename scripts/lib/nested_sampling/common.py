@@ -1241,6 +1241,37 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
     return [record for _, record in read_evaluation_records(evaluations_dir) if record is not None]
 
 
+def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
+    """Drain every rank's records and settle its held extremes; rank 0 gets
+    every record, the others None. Collective: every rank calls it.
+
+    Each rank holds its own 20 lowest and highest so far, so a run ends with
+    ~40 held per rank of which only the run's 40 survive prune_run_artefacts().
+    Flushing all of them cost ~20s of copies to Lustre and ~10s of unlinks
+    after a 36-rank run (csd3-speed.md, round 51). So rank 0 reads the
+    records first, decides what the run keeps - the same decision prune
+    makes - and the ranks publish only that and drop the rest in tmpfs.
+    """
+    drain_record_writes(flush_held=False)
+    try:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+    except Exception:
+        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    if comm is not None:
+        comm.Barrier()  # every rank's records are on Lustre before rank 0 reads
+    records = load_evaluations_from_dir(evaluations_dir) if mpi_rank() == 0 else None
+    keep = (None if records is None or os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
+            else evaluations_keeping_images(records))
+    if comm is not None:
+        keep = comm.bcast(keep, root=0)
+    flush_held_evaluations(force=True, keep=keep)
+    if comm is not None:
+        comm.Barrier()  # the kept extremes are on Lustre before rank 0 prunes
+    return records
+
+
 def adopt_completed_evaluations(
     evaluations_dir: Path,
     cache: dict[str, float],
@@ -1645,10 +1676,15 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
         if retained or "error" in record:
             return removed
         eval_dir = Path(paths.get("eval_dir") or "")
-        local = evaluations_dir / eval_dir.name if eval_dir.name else None
-        if local is None or not local.is_dir():
+        if not eval_dir.name:
             return removed
-        for name in PRUNED_EVALUATION_LOGS:
+        local = evaluations_dir / eval_dir.name
+        # One readdir, not a stat per log name: most dirs hold only metrics.json.
+        try:
+            present = set(os.listdir(local)) & set(PRUNED_EVALUATION_LOGS)
+        except (FileNotFoundError, NotADirectoryError):
+            return removed
+        for name in present:
             log = local / name
             if log.is_file():
                 log.unlink()
@@ -1938,13 +1974,14 @@ def write_records_in_background() -> None:
         atexit.register(drain_record_writes)
 
 
-def drain_record_writes(timeout: float | None = None) -> None:
+def drain_record_writes(timeout: float | None = None, flush_held: bool = True) -> None:
     """Wait for queued record writes; back to writing inline. Raises the first
-    failed write, unless `timeout` is set (abort paths, which must not hang)."""
+    failed write, unless `timeout` is set (abort paths, which must not hang).
+    `flush_held=False` leaves the held extremes to finished_run_records()."""
     global _RECORD_WRITER
     import concurrent.futures
 
-    if timeout is None:
+    if timeout is None and flush_held:
         flush_held_evaluations(force=True)
     writer, _RECORD_WRITER = _RECORD_WRITER, None
     if writer is None:
@@ -2031,9 +2068,10 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
 # publishing each to Lustre and stripping it later cost ~0.3s of the rank's
 # main thread (docs/csd3-speed.md, round 47). So with scratch they wait in
 # tmpfs under .held/, an eviction there is free, and the survivors go to Lustre
-# every NS_RETAIN_FLUSH_SECONDS and when the rank drains its records. A job
-# that dies loses at most that much of its extremes' images; the records
-# survive and prune_run_artefacts() drops the paths that no longer exist.
+# every NS_RETAIN_FLUSH_SECONDS and, at the end, only those the run keeps
+# (finished_run_records()). A job that dies loses at most that much of its
+# extremes' images; the records survive and prune_run_artefacts() drops the
+# paths that no longer exist.
 _HELD: dict[str, tuple[Path, Path]] = {}
 _HELD_SINCE: float | None = None
 
@@ -2055,7 +2093,8 @@ def hold_evaluation_scratch(eval_dir: Path, record: dict[str, Any]) -> None:
             paths[key] = str(eval_dir / Path(value).relative_to(scratch))
 
 
-def flush_held_evaluations(force: bool = False) -> None:
+def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) -> None:
+    """Move held extremes to Lustre; with `keep`, only those the run keeps."""
     import shutil
 
     global _HELD_SINCE
@@ -2063,9 +2102,12 @@ def flush_held_evaluations(force: bool = False) -> None:
             time.monotonic() - (_HELD_SINCE or 0.0)
             < float(os.environ.get("NS_RETAIN_FLUSH_SECONDS", "600"))):
         return
-    for held, eval_dir in _HELD.values():
+    for name, (held, eval_dir) in _HELD.items():
         if not held.is_dir():
             continue  # a self-check's scratch, already gone
+        if keep is not None and name not in keep:
+            shutil.rmtree(held, ignore_errors=True)
+            continue
         eval_dir.mkdir(parents=True, exist_ok=True)
         for produced in held.iterdir():
             shutil.move(str(produced), eval_dir / produced.name, copy_function=shutil.copyfile)
@@ -2125,8 +2167,26 @@ def self_check_streaming_retention() -> None:
                 if scratch_root:
                     assert _HELD, "no extreme was held in scratch"
                     assert len(_HELD) <= 6, sorted(_HELD)
-                drain_record_writes()
                 held_root = Path(tmp) / "scratch" / ".held"
+                if background:
+                    # Another rank's extreme so far that the run does not keep:
+                    # dropped in tmpfs, never published.
+                    other = evaluations / "eval-other"
+                    (held_root / other.name / "wsclean").mkdir(parents=True)
+                    _HELD[other.name] = (held_root / other.name, other)
+                    _write_record(other / "metrics.json", _json_text(
+                        {"objective": 15.05, "paths": {"eval_dir": str(other)}}))
+                    for key in objectives:
+                        record = json.loads((evaluations / key / "metrics.json").read_text())
+                        record.setdefault("paths", {})["eval_dir"] = str(evaluations / key)
+                        _write_record(evaluations / key / "metrics.json", _json_text(record))
+                    records = finished_run_records(evaluations)
+                    assert records is not None and len(records) == len(objectives) + 1
+                    assert sorted(p.name for p in other.iterdir()) == ["metrics.json"]
+                    (other / "metrics.json").unlink()
+                    other.rmdir()
+                else:
+                    drain_record_writes()
                 assert not _HELD and not (held_root.exists() and any(held_root.iterdir()))
                 ordered = sorted(objectives, key=objectives.get)
                 must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
