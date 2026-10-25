@@ -1858,3 +1858,45 @@ keep their artefacts, claimed atomically as before; a fresh directory gives
 and the chains cannot change. Not run end to end: there is no failure
 injection hook, and a search that fails often enough to show 15% needs a
 failing region of the parameter space. No image rebuild is needed.
+
+## Round 37 (diagnostic): where a short benchmark's idle workers go
+
+**Question.** Round 35's cold run r37p-1 lost 66s of 235s to three gaps
+where no rank was evaluating, and the cause was not found. This round reran
+it to catch one: two cold 38-rank WSClean searches (nlive 150, 15 repeats,
+300 dead, seed 4242, an empty `/dev/shm` observation cache per run, shipped
+SIFs, cpu-q-166 with load ~21). A 2Hz watcher counted the scratch
+`.busy` markers and dumped every rank's state after 2s at zero.
+
+**Result.** Neither run had a gap (54.1 and 45.9 evals/s, rows `r39c-1/2`).
+The watcher fired only after PolyChord had finished. Round 35's gaps are
+still unexplained and did not recur in 2 of 2 runs, so they are rare at
+most. The busy-marker counts (37 workers) show where the idle worker time
+goes in a 146s run:
+
+| phase | mean busy | idle worker-seconds (of ~5400) |
+| --- | ---: | ---: |
+| first 20s (prior phase, then the barrier into slice sampling) | 25.1 / 24.8 | 227 / 232 (4%) |
+| middle | 30.4 / 28.6 | 682 / 861 (13-16%) |
+| last 20s | 6.5 / 3.2 | 534 / 541 (10%) |
+
+- The tail is one worker finishing its last slice-sampling chain alone.
+  The last 8 evaluations of `r39c-1` (ids 270-277) ran back to back on one
+  rank, ~0.9s each, while the other 36 sat idle. The barrier at ~12-15s
+  works the same way: busy drops 37 -> 0 over ~4s before sampling starts.
+  Both are paid once per run (~770 worker-seconds, ~21s of full-width
+  wall), so a 300-dead benchmark understates steady throughput by ~14%. A
+  production run of hours does not. `idle_fraction` in `benchmarks.jsonl`
+  does not show this (0.005 here), because it counts wall time with *any*
+  worker busy.
+- The middle deficit is round 35's streaming-retention Lustre work. It too
+  shrinks as a run grows.
+- Cold-cache misses at 1s integration (1200 timesteps at the 20-minute
+  horizon) cost 5.6-5.8s of simulate under load, against round 34's 3.9s
+  solo. One 6s-integration miss took 10.7s, which is unexplained (200
+  timesteps should be ~0.7s). The misses are spread through the run, not
+  bunched at the end.
+
+**Consequence for measurement.** Compare short benchmarks only with each
+other (same `NS_MAX_NDEAD`). To read steady throughput, take evaluations
+per second over the middle of the run, not `evals_per_s`. No code change.
