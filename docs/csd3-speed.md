@@ -2005,7 +2005,8 @@ needs a Docker host.
 **Change.** `start-sidecars.sh` asks the SIF whether it has the library
 (`apptainer exec ... test -e`, 0.3s). If it does not, and the host has
 `gcc`, it compiles `docker/meqtrees/src/fastnoise.c` with the Dockerfile's
-flags into `~/.cache/ri/fastnoise/<hash of source + gcc --version>/`. It
+flags into `~/.cache/ri/fastnoise/<hash of source + gcc --version>/` (since
+gnhf 48, `$RI_WORK_DIR/.cache/ri/fastnoise/...`, so never `/home`). It
 then binds that directory read-only at `/opt/ri-lib` in the meqtrees pool
 only. The simulator's existing on-load agreement checks against numpy
 (`_noise_agrees`, `_ramp_agrees`) still decide whether it is used, and the

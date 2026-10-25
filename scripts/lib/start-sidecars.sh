@@ -20,12 +20,17 @@ if [ -z "${NS_SCRATCH_DIR:-}" ] && [ -w /dev/shm ]; then
 fi
 export NS_SCRATCH_DIR="${NS_SCRATCH_DIR:-}"
 
+# The caches below live in the work directory job-env.sh puts XDG_CACHE_HOME
+# in (RI_WORK_DIR, else the repo's parent: hpc-work on CSD3), whether or not
+# the run entered the job environment - never /home (docs/cluster.md).
+_ri_cache="${RI_WORK_DIR:-$(dirname "$(cd "${REPO_ROOT}" && pwd -P)")}/.cache/ri"
+
 # makems observations kept across runs (load_observation() in
 # simulate_point_source_ms.py), per meqtrees image. Empty turns it off.
 if [ -z "${NS_OBSERVATION_CACHE_DIR+set}" ] && [ -n "${MEQTREES_SIF:-}" ] && declare -F ns_image_id >/dev/null; then
   _meqtrees_id="$(ns_image_id "${MEQTREES_SIF}")"
   if [ "${_meqtrees_id}" != unknown ]; then
-    NS_OBSERVATION_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ri/ms-observations/${_meqtrees_id}"
+    NS_OBSERVATION_CACHE_DIR="${_ri_cache}/ms-observations/${_meqtrees_id}"
     mkdir -p "${NS_OBSERVATION_CACHE_DIR}" 2>/dev/null || NS_OBSERVATION_CACHE_DIR=""
   fi
 fi
@@ -43,7 +48,7 @@ if [ -z "${NS_FASTNOISE_DIR+set}" ] && [ -f "${MEQTREES_SIF:-}" ] && [ -n "${APP
   _fastnoise_src="${REPO_ROOT}/docker/meqtrees/src"
   _fastnoise_key="$( { cat "${_fastnoise_src}/fastnoise.c" "${_fastnoise_src}/ziggurat_double.h"; gcc --version; } \
     | sha256sum | cut -c1-16)"
-  NS_FASTNOISE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ri/fastnoise/${_fastnoise_key}"
+  NS_FASTNOISE_DIR="${_ri_cache}/fastnoise/${_fastnoise_key}"
   if [ ! -f "${NS_FASTNOISE_DIR}/fastnoise.so" ]; then
     if ! { mkdir -p "${NS_FASTNOISE_DIR}" 2>/dev/null \
       && gcc -O2 -ffp-contract=off -shared -fPIC -o "${NS_FASTNOISE_DIR}/fastnoise.so.$$" \
