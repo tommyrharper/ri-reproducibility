@@ -1942,3 +1942,53 @@ stay at PolyChord's defaults.
 (round 35) plus the evaluation itself. Large runs will scale on the
 evaluation cost. There is no benchmarks.jsonl row, because a toy likelihood
 is not a search.
+
+## Round 39: round 28's malloc threshold was below WSClean's buffers
+
+**Profile.** The 0001-0011 zygote, rebuilt in a fakeroot sandbox, was driven
+solo through six real-draw MSs (3-19MB, kept by a 6-rank search) with
+`perf record -e page-faults -d`. Each child faulted 2.6-5.7k times but on
+only 1.2-2.5k distinct pages, so about half its faults were pages it had
+already touched. The repeats were all in anonymous mappings, not `[heap]`.
+`strace` showed why: `GridRegularMeasurementSet` and
+`PredictRegularMeasurementSet` size their `uvw`/visibility buffers from
+`CalculateMaxRowsInMemory`, i.e. from the machine's RAM, not from the rows
+in the MS. On a 250GB CSD3 node that is 47-110GB of virtual memory per
+buffer. Only the rows used are touched, but such a block is far above round
+28's 1GB `mmap_threshold`, so every pass still `mmap`ed it fresh and
+`munmap`ed it afterwards. Round 28 only fixed the smaller blocks.
+
+**Change.** `mmap_threshold` and `trim_threshold` are now 2^62 in
+`run-nested-sampling.sh` (`top_pad` is unchanged). glibc 2.36 in
+`wsclean.sif` accepts this: a 40GB `malloc` comes from the heap. Each pass
+then reuses the heap pages the last pass touched. Resident memory does not
+change, since only touched pages count. No rebuild is needed.
+
+**Driver** (`/dev/shm/r41/zy.py`: 37 zygotes at once, one per CPU, 21 rounds
+of the six MSs, 4,440 requests per arm, the shipped 0001-0011 binary, two
+interleaved sets):
+
+| set | order | 1GB thresholds | 2^62 | page faults per arm |
+| --- | --- | ---: | ---: | --- |
+| 1 | ABBA BAAB | 130.0-130.7ms | 126.4-127.0ms (one arm 171.5, load spike) | 17.8M -> 7.2M |
+| 2 | BAAB ABBA | 131.2-133.2ms | 126.7-129.1ms | 17.9M -> 7.2M |
+
+That is -3.5 to -4.5ms per request (-3%), with the new setting ahead in all
+8 four-arm blocks. Faults per request fall from ~4.0k to ~1.6k (from 110k
+to 57k for a whole solo run, -3ms). All 24 FITS data blocks are byte-identical.
+Heap reuse hands WSClean's uninitialised `UVector`s old data instead of
+zero pages, and the output does not change.
+
+**In-run.** A synchronous pair (nlive 150, 150 dead, seed 4242, 18 ranks
+per arm, both at once, each with its own cold observation cache, the base
+arm a `git worktree` at HEAD) gives log(Z) 0.0947290581121557 +/-
+0.00262747 in both arms, and every chain file is identical, `.resume`
+included. That pair is not a speed comparison. At 38 ranks a 3% WSClean gain is
+~2% of worker time, below what an in-run fit resolves (round 33).
+
+**Learned.** A glibc tunable can do nothing and say nothing about it, and
+here the reason was the allocation size, not glibc. Check
+`strace -e mmap` for the sizes actually requested before choosing a
+threshold. The remaining ~1.6k faults per request are first touches in a
+fresh fork child, which a fork server cannot avoid: pre-faulting in the
+zygote turns them into copy-on-write faults.

@@ -96,13 +96,16 @@ sidecar_launch "${MEQTREES_SIF}" \
 # The malloc tunables keep freed blocks in the heap, so each gridding pass
 # reuses pages the last one faulted in instead of mmapping fresh ones: ~6.5ms
 # less kernel time per evaluation at 38 ranks (docs/csd3-speed.md, round 28).
+# The thresholds are 2^62, not 1GB: WSClean sizes each pass's buffers from the
+# machine's RAM (47-110GB virtual on a CSD3 node), so at 1GB they were still
+# mmapped per pass and faulted in again (round 39).
 # shellcheck disable=SC2016
 sidecar_launch "${WSCLEAN_SIF}" -- sh -c '
   for fifo in "$1"/*.in; do
     [ -e "${fifo}" ] || continue
     base="${fifo%.in}"
     ( while :; do
-        GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1073741824:glibc.malloc.trim_threshold=4294967295:glibc.malloc.top_pad=67108864 \
+        GLIBC_TUNABLES=glibc.malloc.mmap_threshold=4611686018427387904:glibc.malloc.trim_threshold=4611686018427387904:glibc.malloc.top_pad=67108864 \
           wsclean-zygote <"${fifo}" >"${base}.out" & echo $! >"${base}.pid"; wait $!
       done ) &
   done
