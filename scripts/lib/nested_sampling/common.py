@@ -1429,6 +1429,7 @@ def publish_evaluation_scratch(eval_dir: Path, record: dict[str, Any], kept: boo
     if scratch is None or not scratch.is_dir():
         return
     if kept:
+        eval_dir.mkdir(parents=True, exist_ok=True)
         for produced in scratch.iterdir():
             if files_only and produced.is_dir():
                 continue
@@ -1884,14 +1885,20 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     kept = retain_evaluation_detail(eval_dir, record) or keeping
     publish_evaluation_scratch(eval_dir, record, kept)
     if _RECORD_WRITER is None:
-        write_json_atomic(eval_dir / "metrics.json", record)
+        _write_record(eval_dir / "metrics.json", _json_text(record))
     else:
         for done in [future for future in _RECORD_WRITES if future.done()]:
             _RECORD_WRITES.remove(done)
             done.result()  # a failed write raises here, on the rank's own thread
         _RECORD_WRITES.append(_RECORD_WRITER.submit(
-            _write_text_atomic, eval_dir / "metrics.json", _json_text(record)))
+            _write_record, eval_dir / "metrics.json", _json_text(record)))
     return record
+
+
+def _write_record(path: Path, text: str) -> None:
+    # With tmpfs scratch nothing makes the eval dir before its record does.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_atomic(path, text)
 
 
 # A record write (create, write, rename) costs ~50ms on CSD3's Lustre, a fifth
@@ -1978,7 +1985,10 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
         evicted.add(heapq.heappop(_HIGHEST)[1])
     evicted -= {k for _, k in _LOWEST} | {k for _, k in _HIGHEST}
     for name in evicted:
-        _strip_to_record(eval_dir.parent / name)
+        # This evaluation's own dir is empty, or not made yet, while its
+        # output is still in scratch: no Lustre walk for it (round 14).
+        if name != key or evaluation_scratch_dir(eval_dir) is None:
+            _strip_to_record(eval_dir.parent / name)
     if key in evicted:
         for image_key in RETAINED_IMAGE_KEYS:
             (record.get("paths") or {}).pop(image_key, None)
@@ -2006,10 +2016,14 @@ def self_check_streaming_retention() -> None:
                     os.environ["NS_SCRATCH_DIR"] = str(Path(tmp) / scratch_root)
                 if background:
                     write_records_in_background()
+                evaluations.mkdir()
                 objectives = {}
                 for index in range(300):
                     eval_dir = evaluations / f"eval-{index:04d}"
-                    eval_dir.mkdir(parents=True)
+                    # As simulate_measurement_set(): with scratch, nothing
+                    # makes the eval dir before its record or publish does.
+                    if not scratch_root:
+                        eval_dir.mkdir()
                     work = evaluation_scratch_dir(eval_dir) or eval_dir
                     (work / "wsclean").mkdir(parents=True)
                     (work / "wsclean" / "recon-image.fits").write_text("x")
@@ -2051,7 +2065,8 @@ def self_check_streaming_retention() -> None:
 
                 # A dead worker's logs outlive its scratch; its MS does not.
                 eval_dir = evaluations / "eval-9999-died"
-                eval_dir.mkdir()
+                if not scratch_root:
+                    eval_dir.mkdir()
                 work = evaluation_scratch_dir(eval_dir) or eval_dir
                 (work / "sim.ms").mkdir(parents=True)
                 (work / "simulate.stderr.log").write_text("Traceback")
@@ -2294,9 +2309,13 @@ def simulate_measurement_set(
     platform: str,
     r2d2_mat: bool = False,
 ) -> tuple[Path, list[str], subprocess.CalledProcessError | None]:
-    eval_dir.mkdir(parents=True, exist_ok=False)
     scratch = evaluation_scratch_dir(eval_dir)
-    if scratch is not None:
+    if scratch is None:
+        eval_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        # The eval dir on Lustre is left to whatever first writes into it
+        # (the record writer, or publishing a kept evaluation): one slow
+        # metadata call there used to stall every rank (csd3-speed.md, round 14).
         # A restart that re-runs an evaluation whose scratch survived would hit
         # require_clean_output() in the simulator; the run owns this directory,
         # so clearing it is safe and normally costs an ENOENT.

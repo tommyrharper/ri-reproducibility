@@ -662,3 +662,74 @@ time per evaluation, ~1.5% of a ~1s evaluation. That is too small to show in
 evals/s at the ~5% spread of short runs, so the stage timing
 above is the evidence. log(Z) is the same in all four runs. The R2D2
 request is now ~88% of worker time per evaluation, and simulate is ~10%.
+
+## Round 14: WSClean at 36 ranks, and Lustre on the rank's critical path
+
+**Profile.** A production-shaped WSClean run (36 ranks, async, nlive 150,
+seed 4242) on half an icelake node ran at 88 evals/s with 20% of worker time
+idle. Most of that idle time was not startup or tail. Mid-run, the number of
+busy workers fell from 34 to 1 for up to 45s at a time, while one
+evaluation's `simulate` took 14-45s. PolyChord's async root has no barrier
+(`catch_babies` is an `MPI_RECV` from any source), so the root was not what
+held them.
+
+**Cause.** Sampling `/proc/<pid>/syscall` every 0.5s during a stall showed 34
+ranks in `D` state in `openat` and one in `mkdir`, all on the run's
+`evaluations/` directory on Lustre. strace on a rank showed two synchronous
+Lustre metadata calls per evaluation on its main thread:
+
+- `mkdir(eval_dir)` at the start of `simulate_measurement_set()`, inside the
+  timed simulate. This is where the 14-45s simulates came from.
+- `_strip_to_record(eval_dir)` opening the same, still empty, directory after
+  scoring, to strip an evaluation that is not kept.
+
+Both cost a few ms each, but when Lustre's metadata server is slow, every rank
+blocks on them at once. With tmpfs scratch (round 5), everything an evaluation
+writes goes to scratch anyway, so neither call does any work. Now, when there
+is scratch, `simulate_measurement_set()` does not make the eval dir, the
+retention step skips stripping the evaluation's own dir, and the dir is made
+by whatever first writes into it: the record writer's thread (`_write_record`)
+or publishing a kept evaluation. A 10s strace of a rank's main thread on the
+new code covered 65 evaluations and showed zero syscalls on `/rds`; the old
+code made 31 over 17 evaluations. Without scratch, nothing changes.
+
+A Lustre write the size of a PolyChord update (1.9MB resume plus five 200KB
+files, each written and renamed), done once a second for 10 minutes from this
+node, took 91ms median, 354ms p99 and 0.51s at most. So rank 0's chain writes
+are not where the stalls came from.
+
+**Evidence.** All runs were on cpu-q-553, used 36 ranks with 400 dead points
+unless noted, and had async draws. "Stalled" means 3s windows after startup,
+before the last full window, with fewer than 10 of 35 workers busy. "Steady"
+means evals/s over evaluations that ended 10-70s into the run.
+
+| code | runs | runs with a stall | stalled / steady wall | steady evals/s (unstalled runs) |
+| --- | ---: | ---: | ---: | --- |
+| `ad78f5c` | 13 | 5 | 120s / 1326s (9.0%) | 106.9-126.3 |
+| new | 5 | 0 | 0s / 426s | 105.2-118.4 |
+
+The baseline column includes the diagnostic runs at 36, 38 and 40 ranks and
+600 dead points. The last 4 were an interleaved new/base/base/new A/B against
+`ad78f5c` from `git archive`. No stall hit either arm in that window, so the
+A/B on its own shows only that the steady rate did not change (new 111.4 and
+105.2, base 111.0 and 107.8). log(Z) agrees within its error in every run
+(0.0945-0.0965, +/- 0.0009-0.0016). Async draws differ from run to run, so
+these runs are not identical.
+
+The stalls struck at random. Two runs in a row could be clean, or one run
+could lose 69s of 153s. Their cost grows with the rate of evaluations, which
+is why the R2D2 runs at ~24 evals/s (round 12) never showed one. Measured
+against total worker time, the old code lost ~9% of WSClean throughput.
+
+Notes from this round:
+
+- More ranks than CPUs: 36, 38 and 40 ranks interleaved gave 116.8, 111.7/106.9
+  and 126.3/118.9 steady evals/s. That spread is within draw noise, so no change
+  was made (the default is the job's CPU count).
+- In short runs the tail is set by whichever rank holds the last slice chain,
+  and in these runs it varied from 15s to 60s. That decides `./ri bench`'s
+  whole-run evals/s (72.5-97.5 here) far more than any code change. Use steady
+  evals/s for A/Bs this short.
+- In-flight evaluations on a run with scratch no longer have an eval dir on
+  Lustre, so `./ri health`'s "in flight" count, which counts dirs with no
+  `metrics.json`, now reads close to 0 while the run is live.

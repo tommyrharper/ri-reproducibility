@@ -159,9 +159,10 @@ integration was at least as long (`make_ms()`, [CSD3 speed](csd3-speed.md)).
 
 `timing.simulate_seconds` in `metrics.json` is not this quantity and should not
 be read as one: it is measured around the whole of
-`simulate_measurement_set()`, so it also carries the scratch `rmtree` and the
-evaluation directory's creation, which on a 20-rank run churning `/dev/shm` can
-be tens of seconds on their own. Two verification runs of 2390 and 2089
+`simulate_measurement_set()`, so it also carries the scratch `rmtree` (and,
+without scratch, the evaluation directory's creation on Lustre: that `mkdir`
+was where the tens-of-seconds totals came from, [CSD3 speed](csd3-speed.md)
+round 14). Two verification runs of 2390 and 2089
 evaluations, at up to 1168 time samples, recorded some of those totals well
 above the bound and not one worker death - the request itself was always inside
 it.
