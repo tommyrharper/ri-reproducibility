@@ -315,3 +315,24 @@ with the restored, model, residual and PSF data blocks byte-identical (24 of
 24). The in-run numbers are in [csd3-speed.md](csd3-speed.md), round 24.
 
 Upstream-shaped: it changes how the files are read, not what is read.
+
+## 0009: a fast path in ducc0's `scanData`
+
+Every gridding and degridding pass starts with ducc0's `scanData()`
+(`external/schaapcommon/external/ducc0/wgridder/wgridder.h`), which marks
+each visibility with `norm(vis)*weight*mask != 0` and tracks the w range of
+the marked ones. WSClean always passes weights and a mask that are a uniform
+1 (zero strides), and through the `mav` accessors the compiler reloads every
+array's pointer and strides on each visibility, because the store into the
+local mask may alias them. With one ducc0 thread, uniform weights of 1 and a
+uniform mask of 1, the patch runs the same loop over local pointers. The
+test is the same, since `x*1*1 == x` exactly, and every other case falls
+through to the original loop.
+
+`scanData` was ~7% of the `wsclean` binary's CPU after 0008. The patch
+measured -2.5% on the binary solo and ~-4.5% in 38-rank searches, with the
+restored, model, residual and PSF data blocks byte-identical (24 of 24) and
+every chain file identical in a synchronous pair. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 25.
+
+Upstream-shaped: it changes nothing ducc0 computes.

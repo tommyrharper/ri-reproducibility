@@ -1,0 +1,45 @@
+diff --git a/external/schaapcommon/external/ducc0/wgridder/wgridder.h b/external/schaapcommon/external/ducc0/wgridder/wgridder.h
+--- a/external/schaapcommon/external/ducc0/wgridder/wgridder.h
++++ b/external/schaapcommon/external/ducc0/wgridder/wgridder.h
+@@ -1659,6 +1659,41 @@
+       wmin_d=1e300;
+       wmax_d=-1e300;
+       Mutex mut;
++      // ri: WSClean passes uniform weights and mask of 1 (zero strides), so
++      // the test reduces to norm(vis)!=0 exactly (x*1*1==x). Read through
++      // local pointers: through the mav accessors the compiler reloads every
++      // member on each visibility, because the lmask store may alias them.
++      if constexpr (is_same<Tms_in, cmav<complex<Tms>,2>>::value)
++        if ((nthreads==1) && (nrow*nchan>0)
++          && (wgt.stride(0)==0) && (wgt.stride(1)==0) && (wgt(0,0)==Tms(1))
++          && (mask.stride(0)==0) && (mask.stride(1)==0) && (mask(0,0)==1))
++          {
++          const complex<Tms> *vis = &ms_in(0,0);
++          const ptrdiff_t vs0=ms_in.stride(0), vs1=ms_in.stride(1);
++          uint8_t *lm = &lmask(0,0);
++          const ptrdiff_t ls0=lmask.stride(0), ls1=lmask.stride(1);
++          double lwmin_d=1e300, lwmax_d=-1e300;
++          size_t lnvis=0;
++          for (size_t irow=0; irow<nrow; ++irow)
++            for (size_t ichan=0; ichan<nchan; ++ichan)
++              if (norm(vis[ptrdiff_t(irow)*vs0+ptrdiff_t(ichan)*vs1]) != 0)
++                {
++                lm[ptrdiff_t(irow)*ls0+ptrdiff_t(ichan)*ls1]=1;
++                ++lnvis;
++                double w = bl.absEffectiveW(irow, ichan);
++                lwmin_d = min(lwmin_d, w);
++                lwmax_d = max(lwmax_d, w);
++                }
++              else
++                {
++                if (!gridding) ms_out(irow, ichan)=0;
++                }
++          wmin_d = lwmin_d;
++          wmax_d = lwmax_d;
++          nvis = lnvis;
++          timers.pop();
++          return;
++          }
+       execParallel(nrow, nthreads, [&](size_t lo, size_t hi)
+         {
+         double lwmin_d=1e300, lwmax_d=-1e300;

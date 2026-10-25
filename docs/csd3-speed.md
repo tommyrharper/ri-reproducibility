@@ -1188,3 +1188,56 @@ exactly: log(Z) is identical and every chain file is byte-identical except
 and import it. Next for WSClean: `WriteImagingWeights` still seeks, reads
 and writes once per row on the first pass, and "Reordering" (~12-20ms per
 evaluation) writes the part files that this patch maps.
+
+## Round 25: a fast path in ducc0's `scanData` (patch 0009)
+
+**Profile.** `perf` over five runs of the 0001-0008 binary on the largest
+real-draw MS from round 24 (self time, share of all samples): ducc0's
+gridding kernel 20.7%, degridding kernel 13.0%, `scanData` 7.3%,
+`ReorderedMsReader::CacheMeta` 4.0%, `CalculateWeightsImplementation` 3.2%,
+`ApplyWeightsAndCorrections` 3.1%, `countRanges` 2.7% (the index cache's key
+comparison). The annotated `scanData` loop is scalar and reloads the mav
+pointers and strides on every visibility: the `lmask` store may alias them,
+so the compiler cannot hoist them. WSClean's weights and mask are always a
+uniform 1, so for that case (one thread, as the search runs) patch 0009 runs
+the same test, `norm(vis) != 0`, over local pointers. That is exact, because
+`x*1*1 == x`.
+
+**Solo.** The same six real-draw MSs and protocol as round 24
+(`/dev/shm/r24/solo.sh`, pinned, 20 interleaved rounds, median of rounds
+2-20):
+
+| MS | 0001-0008 | + 0009 | change |
+| --- | ---: | ---: | ---: |
+| 1 (smallest) | 45.3ms | 46.1ms | +1.7% |
+| 2 | 108.5ms | 106.9ms | -1.5% |
+| 3 | 122.7ms | 120.1ms | -2.1% |
+| 4 | 133.8ms | 128.8ms | -3.8% |
+| 5 | 163.1ms | 159.7ms | -2.1% |
+| 6 (largest) | 288.7ms | 279.2ms | -3.3% |
+| sum | 862.0ms | 840.6ms | -2.5% |
+
+The restored, model, residual and PSF data blocks are byte-identical for all
+six (24 of 24).
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242, ABBA
+order (`.probe/r25ab.sh`). Binary time fitted per run at 1k timestep-channels:
+
+| arm | evals | simulate @1k | `wsclean` @1k | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| 0001-0008 | 6683 | 112.3ms | 235.6ms | 0.09566 +/- 0.00157 |
+| + 0009 | 6775 | 110.2ms | 223.3ms | 0.09564 +/- 0.00166 |
+| + 0009 | 6847 | 110.9ms | 225.3ms | 0.09558 +/- 0.00165 |
+| 0001-0008 | 7804 | 113.7ms | 232.4ms | 0.09434 +/- 0.00205 |
+| 0001-0008, synchronous, 150 dead | 3415 | 113.9ms | 232.6ms | 0.09424 +/- 0.00279 |
+| + 0009, synchronous, 150 dead | 3415 | 112.0ms | 222.2ms | 0.09424 +/- 0.00279 |
+
+The binary is ~4.5% faster in the async pairs (224 vs 234ms), and the arms
+do not overlap. The synchronous pair is 4.5% faster too, and its log(Z) and
+every chain file are identical (`phys_live.txt` once sorted). As in rounds
+23 and 24, the in-run saving is larger than the solo one. At ~300ms of
+worker time per evaluation it is worth ~3% of WSClean throughput.
+
+**To ship on CSD3:** rebuild `wsclean.sif` on a Docker host and import it,
+as for 0007 and 0008. The full 0001-0009 series applies cleanly to v3.7.
+Next for WSClean: `CacheMeta` (4%) and the weighting passes (~6% together).
