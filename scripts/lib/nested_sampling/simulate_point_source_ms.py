@@ -702,6 +702,73 @@ def point_source_visibilities(
 UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
 
 
+# docker/meqtrees/src/fastnoise.c, built into the image outside the bind-mounted
+# /opt/ri-nested-sampling. numpy's own normal() is 2.9x slower: ~13ns a draw
+# through the bitgen pointer plus two float64 temporaries per half, which was a
+# quarter of simulate in 38-rank CSD3 searches (docs/csd3-speed.md, round 26).
+FASTNOISE_SO = Path("/opt/ri-lib/fastnoise.so")
+_FASTNOISE: list[object] = []
+
+
+def _fastnoise():
+    """The C noise filler, or None. Loaded and checked against numpy once per
+    process: a numpy whose stream differs (or no library) means numpy draws."""
+    if not _FASTNOISE:
+        _FASTNOISE.append(None)
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL(str(FASTNOISE_SO)).add_normal_f32
+            lib.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 3
+            lib.restype = None
+        except (OSError, AttributeError):
+            return None
+        _FASTNOISE[0] = lib
+        for every in (1, 4):
+            # 100k draws, ~1,200 of them through the ziggurat's rejection paths.
+            want = np.zeros((2500, 4, every), np.complex64)[:, :, 0]
+            got = want.copy()
+            _add_complex_noise(np.random.default_rng(12345), want, 0.3, every, None)
+            _add_complex_noise(np.random.default_rng(12345), got, 0.3, every, lib)
+            if want.tobytes() != got.tobytes():
+                _FASTNOISE[0] = None
+    return _FASTNOISE[0]
+
+
+def _add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int, lib) -> None:
+    shape = (*data.shape, every)
+    if lib is None or not data.flags.c_contiguous or data.dtype != np.complex64:
+        data.real += rng.normal(0.0, sigma, shape)[..., 0].astype(np.float32)
+        data.imag += rng.normal(0.0, sigma, shape)[..., 0].astype(np.float32)
+        return
+    bitgen = rng.bit_generator.state
+    pcg = bitgen["state"]
+    words = np.array([pcg["state"] >> 64, pcg["state"] & (2**64 - 1), pcg["inc"] >> 64, pcg["inc"] & (2**64 - 1)],
+                     dtype=np.uint64)
+    base = data.ctypes.data
+    lib(words.ctypes.data, sigma, base, data.size, 2, every)
+    lib(words.ctypes.data, sigma, base + 4, data.size, 2, every)
+    pcg["state"] = (int(words[0]) << 64) | int(words[1])
+    rng.bit_generator.state = bitgen
+
+
+def add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int = 1) -> None:
+    """In place and bit for bit, what
+
+        data.real += rng.normal(0.0, sigma, (*data.shape, every))[..., 0].astype(np.float32)
+        data.imag += <the same again>
+
+    does, for complex64 data. Rounding each component to float32 before the
+    add is what the old `.astype(np.complex64)` did; the two halves are drawn
+    in this order because that, not the arithmetic, is what fixes the stream.
+    every > 1 draws a whole column's stream and keeps only correlation 0."""
+    lib = _fastnoise()
+    if lib is not None and (rng.bit_generator.state["bit_generator"] != "PCG64"
+                            or rng.bit_generator.state["has_uint32"]):
+        lib = None
+    _add_complex_noise(rng, data, sigma, every, lib)
+
+
 def noise_sigma_of(args: argparse.Namespace) -> float:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
@@ -732,16 +799,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
         data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr)
 
         if noise_sigma_jy:
-            per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
-            # Added in place to the two float32 halves rather than built as a
-            # complex128 array and added out of place. Rounding each component
-            # to float32 before the add is what the old `.astype(np.complex64)`
-            # did, so the column is bit-identical for a given seed - it just
-            # stops allocating three more copies of DATA to get there (0.69ms
-            # an evaluation). The two draws stay separate calls in this order
-            # because that, not the arithmetic, is what fixes the stream.
-            data.real += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
-            data.imag += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
+            add_complex_noise(rng, data, noise_sigma_jy / math.sqrt(2.0))
 
         ms.putcol("DATA", data)
         for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -855,11 +913,7 @@ def write_mat_only(args: argparse.Namespace, output_ms: Path) -> dict[str, objec
     if noise_sigma_jy:
         # The whole column's stream is drawn, as the fill does, so correlation 0
         # gets the same numbers; only its slice is added.
-        per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
-        rng = np.random.default_rng(args.seed)
-        shape = (len(uvw), len(freqs_hz), n_corr)
-        vis.real += rng.normal(0.0, per_component_sigma, shape)[:, :, 0].astype(np.float32)
-        vis.imag += rng.normal(0.0, per_component_sigma, shape)[:, :, 0].astype(np.float32)
+        add_complex_noise(np.random.default_rng(args.seed), vis, noise_sigma_jy / math.sqrt(2.0), n_corr)
 
     from ms_to_r2d2_mat import write_r2d2_mat
 
@@ -1444,6 +1498,29 @@ def self_check_serve_fifo() -> None:
     print("serve fifo self-check passed")
 
 
+def self_check_fast_noise() -> None:
+    if not FASTNOISE_SO.exists():
+        print(f"fast noise self-check skipped: no {FASTNOISE_SO} in this image (rebuild meqtrees)")
+        return
+    lib = _fastnoise()
+    if lib is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO} does not reproduce numpy's normal() stream")
+    for seed, shape, every in ((7, (1000, 5, 4), 1), (2049643611, (3000, 7), 4), (1, (351, 1, 2), 1)):
+        want = np.full(shape, 0.25 - 0.5j, np.complex64)
+        got = want.copy()
+        _add_complex_noise(np.random.default_rng(seed), want, 0.01, every, None)
+        rng = np.random.default_rng(seed)
+        add_complex_noise(rng, got, 0.01, every)
+        if want.tobytes() != got.tobytes():
+            raise SystemExit(f"FAIL: fast noise differs from numpy for seed {seed}, shape {shape}")
+        # The generator is left where numpy's two draws would leave it.
+        reference = np.random.default_rng(seed)
+        reference.normal(size=(2, *shape, every))
+        if rng.random() != reference.random():
+            raise SystemExit("FAIL: fast noise left the generator in a different state")
+    print("fast noise self-check passed")
+
+
 def self_check_mat_only() -> None:
     """--mat-only must write the full path's .mat and metadata on every cache path."""
     from scipy.io import loadmat
@@ -1506,6 +1583,7 @@ if __name__ == "__main__":
             self_check_forest_reuse()
             self_check_analytic_predict()
             self_check_noise_weighting()
+            self_check_fast_noise()
             self_check_mat_only()
             self_check_dropped_subtables()
             self_check_meqserver_restart()

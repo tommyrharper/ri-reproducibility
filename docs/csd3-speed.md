@@ -1241,3 +1241,74 @@ worker time per evaluation it is worth ~3% of WSClean throughput.
 **To ship on CSD3:** rebuild `wsclean.sif` on a Docker host and import it,
 as for 0007 and 0008. The full 0001-0009 series applies cleanly to v3.7.
 Next for WSClean: `CacheMeta` (4%) and the weighting passes (~6% together).
+
+## Round 26: thermal noise drawn in C, bit for bit (`fastnoise.so`)
+
+**Profile.** After rounds 23-25, the `wsclean` binary is ~220ms of a 38-rank
+evaluation at 1k timestep-channels and simulate is ~110ms, so simulate is a
+third of worker time. Round 15 found the noise draw to be its largest part.
+On the largest real-draw MS from round 24 (105,300 rows x 5 channels x 4
+correlations, 4.2M normals), numpy's `rng.normal(...).astype(np.float32)`
+twice takes 55ms. The draw alone costs ~13ns a number: each draw is a call
+through the bitgen function pointer, and each half allocates two float64
+temporaries. Every evaluation has its own seed (`stable_seed()`), so the
+draws cannot be cached.
+
+**Change.** `docker/meqtrees/src/fastnoise.c` holds numpy 1.26's PCG64
+(XSL-RR 128/64) and its 256-layer ziggurat (`random_standard_normal()`,
+with numpy's tables in `ziggurat_double.h`), inlined, and adds
+`(float)(0.0 + scale * z)` to a strided float32 destination in place. The
+only change from numpy's code is the random sign: it is applied by
+XOR-ing the sign bit, which gives the same double without a branch that
+mispredicts half the time. That alone took the C loop from 37ms to 19ms.
+`add_complex_noise()` in `simulate_point_source_ms.py` is the one noise
+path for both the MS fill and R2D2's `--mat-only`. It hands the generator's
+128-bit state to the C code, and writes the advanced state back. The
+library is loaded once per process from `/opt/ri-lib/fastnoise.so`, which
+is outside the bind-mounted `/opt/ri-nested-sampling`, and checked against
+numpy on 100k draws (~1,200 of them through the rejection paths). If it is
+missing or disagrees, numpy draws the noise. A builder stage of the
+meqtrees Dockerfile compiles the library with `-O2 -ffp-contract=off`
+against the runtime's base, so it links the same libm `exp`/`log1p`.
+`./ri self-check simulate` checks three shapes, the every-4th
+(`--mat-only`) stream, and the generator state afterwards. If the image has
+no library, it says so and skips.
+
+**Stage.** In `meqtrees.sif`, on the 4.2M-normal MS, median of 10-12
+repeats: numpy 55.1-62.3ms, C 19.0ms (2.9x). Over 200 seeds and shapes, the
+complex64 output is byte-identical to numpy's. A gcc 8.5 (host) build and a
+gcc 13 (ubuntu:24.04, as the Dockerfile builds it) build time the same.
+
+**In-run.** 38 ranks, nlive 150, 300 dead points, async, seed 4242, ABBA
+order (`.probe/r26ab2.sh`). Both arms use the 0001-0009 `wsclean.sif`. The
+fast arm's `meqtrees.sif` is the shipped one plus the library, built with
+`Bootstrap: localimage`. Stage times are fitted per run at 1k
+timestep-channels (`.probe/fit16.py`):
+
+| arm | evals | simulate @1k | `wsclean` @1k | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| numpy | 6661 | 109.5ms | 221.3ms | 0.09558 +/- 0.00164 |
+| fastnoise | 6874 | 80.2ms | 214.7ms | 0.09566 +/- 0.00158 |
+| fastnoise | 6797 | 82.0ms | 222.2ms | 0.09581 +/- 0.00163 |
+| numpy | 6821 | 109.9ms | 223.6ms | 0.09534 +/- 0.00167 |
+| numpy, synchronous, 150 dead | 3415 | 110.6ms | 221.1ms | 0.09424 +/- 0.00279 |
+| fastnoise, synchronous, 150 dead | 3415 | 82.3ms | 219.7ms | 0.09424 +/- 0.00279 |
+
+Simulate is 28ms (26%) faster, and the arms do not overlap. In the
+synchronous pair, log(Z) and every chain file are identical
+(`phys_live.txt` once sorted). At ~300ms of worker time per evaluation,
+that is ~9% of WSClean throughput. R2D2's `--mat-only` simulate draws the
+same 4-correlation stream, so it saves about the same ~28ms of a ~1s
+evaluation. Steady evals/s spread from 53 to 75 across these runs, because
+the other half of the node was loaded (load average 30-37) and idle
+fractions reached 23% in either arm, so evals/s cannot show this.
+
+**Sharp edge.** `APPTAINER_BIND` cannot layer a file into a run's
+containers. `job-env.sh` re-execs the run under `env -i`, so the variable
+never reaches apptainer. The first four async runs and one synchronous
+pair of this round were meant to A/B that way, and both arms drew with
+numpy (simulate 107.5-111.1ms in all six). They are in `benchmarks.jsonl`
+as controls. Use a derived SIF in a `SIF_DIR` of symlinks instead.
+
+**To ship on CSD3:** rebuild `meqtrees.sif` on a Docker host and import it.
+Until then, runs draw with numpy, and results are the same either way.

@@ -2,6 +2,16 @@
 # MeqTrees/Cattery runtime for VLA Measurement Set simulation. Build with:
 # docker build --platform linux/arm64 -f docker/meqtrees/Dockerfile -t ri-reproducibility/meqtrees:kern-10 .
 
+# The simulator's thermal-noise filler: numpy's PCG64 normal() stream, bit for
+# bit, ~2.9x faster than numpy draws it (docs/csd3-speed.md, round 26). Built
+# against the same base as the runtime so it links the same libm; the
+# simulator checks it against numpy on load and falls back if it disagrees.
+FROM ubuntu:24.04 AS fastnoise
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/meqtrees/src/fastnoise.c docker/meqtrees/src/ziggurat_double.h /src/
+RUN gcc -O2 -ffp-contract=off -shared -fPIC -o /fastnoise.so /src/fastnoise.c -lm
+
 FROM ubuntu:24.04
 
 ARG KERNSUITE_SIGNING_FINGERPRINT=813B0DC8B7D042E7
@@ -47,6 +57,8 @@ for old, new in (("      for i in range(20):", "      for i in range(2000):"),
 path.write_text(source)
 EOF
 
+# Not under /opt/ri-nested-sampling: runs bind the working tree over that.
+COPY --from=fastnoise /fastnoise.so /opt/ri-lib/fastnoise.so
 COPY scripts/lib/nested_sampling/simulate_point_source_ms.py /opt/ri-nested-sampling/simulate_point_source_ms.py
 COPY scripts/lib/nested_sampling/point_source_forest.py /opt/ri-nested-sampling/point_source_forest.py
 COPY scripts/lib/nested_sampling/ms_to_r2d2_mat.py /opt/ri-nested-sampling/ms_to_r2d2_mat.py

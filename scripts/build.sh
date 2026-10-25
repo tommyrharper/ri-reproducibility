@@ -81,6 +81,7 @@ build_r2d2_cuda() {
 build_meqtrees() {
   build_image ri-reproducibility/meqtrees:kern-10 \
     "$(inputs_hash "${PLATFORM}" docker/meqtrees/Dockerfile \
+      docker/meqtrees/src/fastnoise.c docker/meqtrees/src/ziggurat_double.h \
       scripts/lib/nested_sampling/simulate_point_source_ms.py \
       scripts/lib/nested_sampling/point_source_forest.py \
       scripts/lib/nested_sampling/ms_to_r2d2_mat.py \
