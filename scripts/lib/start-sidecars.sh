@@ -31,6 +31,31 @@ if [ -z "${NS_OBSERVATION_CACHE_DIR+set}" ] && [ -n "${MEQTREES_SIF:-}" ] && dec
 fi
 export NS_OBSERVATION_CACHE_DIR="${NS_OBSERVATION_CACHE_DIR:-}"
 
+# A meqtrees.sif built before docker/meqtrees/src/fastnoise.c has no
+# /opt/ri-lib/fastnoise.so, and the simulator then draws noise with numpy:
+# ~20ms more per evaluation (docs/csd3-speed.md, round 40). Such an image is
+# given a host-built copy, cached per source and compiler, so a cluster need
+# not wait for a rebuild. The simulator checks it against numpy on load and
+# falls back if it disagrees. Empty NS_FASTNOISE_DIR turns this off.
+if [ -z "${NS_FASTNOISE_DIR+set}" ] && [ -f "${MEQTREES_SIF:-}" ] && [ -n "${APPTAINER:-}" ] \
+  && command -v gcc >/dev/null 2>&1 \
+  && ! "${APPTAINER}" exec "${MEQTREES_SIF}" test -e /opt/ri-lib/fastnoise.so 2>/dev/null; then
+  _fastnoise_src="${REPO_ROOT}/docker/meqtrees/src"
+  _fastnoise_key="$( { cat "${_fastnoise_src}/fastnoise.c" "${_fastnoise_src}/ziggurat_double.h"; gcc --version; } \
+    | sha256sum | cut -c1-16)"
+  NS_FASTNOISE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ri/fastnoise/${_fastnoise_key}"
+  if [ ! -f "${NS_FASTNOISE_DIR}/fastnoise.so" ]; then
+    if ! { mkdir -p "${NS_FASTNOISE_DIR}" 2>/dev/null \
+      && gcc -O2 -ffp-contract=off -shared -fPIC -o "${NS_FASTNOISE_DIR}/fastnoise.so.$$" \
+        "${_fastnoise_src}/fastnoise.c" -lm 2>/dev/null \
+      && mv -f "${NS_FASTNOISE_DIR}/fastnoise.so.$$" "${NS_FASTNOISE_DIR}/fastnoise.so"; }; then
+      rm -f "${NS_FASTNOISE_DIR}/fastnoise.so.$$"
+      NS_FASTNOISE_DIR=""
+    fi
+  fi
+fi
+export NS_FASTNOISE_DIR="${NS_FASTNOISE_DIR:-}"
+
 _sidecar_remove() {
   local pid
   for pid in ${SIDECAR_PIDS[@]+"${SIDECAR_PIDS[@]}"}; do
@@ -97,6 +122,9 @@ sidecar_launch() {
     echo "$$" >"${OUTPUT_DIR}/.launcher.pid"
   fi
   sidecar_binds
+  if [ "${sif}" = "${MEQTREES_SIF:-}" ] && [ -n "${NS_FASTNOISE_DIR:-}" ]; then
+    args+=(--bind "${NS_FASTNOISE_DIR}:/opt/ri-lib:ro")
+  fi
   local -a run=(
     "${APPTAINER}" exec --pwd "${REPO_ROOT}"
     "${SIDECAR_BINDS[@]}"

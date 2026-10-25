@@ -1992,3 +1992,53 @@ here the reason was the allocation size, not glibc. Check
 threshold. The remaining ~1.6k faults per request are first touches in a
 fresh fork child, which a fork server cannot avoid: pre-faulting in the
 zygote turns them into copy-on-write faults.
+
+## Round 40: a host-built `fastnoise.so` for a `meqtrees.sif` without one
+
+**Profile.** The shipped `meqtrees.sif` (21 Sep) predates rounds 26 and 31,
+so it has no `/opt/ri-lib/fastnoise.so`, and every search on the cluster has
+drawn thermal noise and the phase ramp with numpy. Round 34 measured the
+gap solo (~20ms of simulate) but left the fix to an image rebuild, which
+needs a Docker host.
+
+**Change.** `start-sidecars.sh` asks the SIF whether it has the library
+(`apptainer exec ... test -e`, 0.3s). If it does not, and the host has
+`gcc`, it compiles `docker/meqtrees/src/fastnoise.c` with the Dockerfile's
+flags into `~/.cache/ri/fastnoise/<hash of source + gcc --version>/`. It
+then binds that directory read-only at `/opt/ri-lib` in the meqtrees pool
+only. The simulator's existing on-load agreement checks against numpy
+(`_noise_agrees`, `_ramp_agrees`) still decide whether it is used, and the
+host's RHEL gcc 8.5 build passes both inside the image. If the build fails,
+or `NS_FASTNOISE_DIR` is set empty, the run keeps numpy, as before. A
+rebuilt image has its own copy and skips all of this.
+
+**In-run.** One tree, two arms raced at once, 18 ranks each (nlive 150,
+15 repeats, 300 dead, seed 4242, shipped SIFs, cpu-q-166). Each arm had
+its own `/dev/shm` observation cache, cold for its first run and warm for
+the next two. Base is `NS_FASTNOISE_DIR=` (numpy):
+
+| pair | arm | evals/s | simulate mean | WSClean binary | worker ms/eval |
+| --- | --- | ---: | ---: | ---: | ---: |
+| cold | base | 28.9 | 243.6ms | 206.2ms | 450.9 |
+| cold | fastnoise | 29.8 | 218.4ms | 219.9ms | 439.4 |
+| warm 1 | base | 40.1 | 86.8ms | 214.8ms | 302.7 |
+| warm 1 | fastnoise | 42.5 | 54.9ms | 211.2ms | 267.2 |
+| warm 2 | base | 43.7 | 81.3ms | 221.8ms | 304.3 |
+| warm 2 | fastnoise | 50.7 | 48.3ms | 221.6ms | 271.1 |
+
+Warm: simulate is 32-33ms shorter (-37 to -41%) and each evaluation costs
+11-12% less worker time. evals/s rose 6% and 16%; an async run's evaluation
+count varies, so read ms/eval rather than evals/s here. Cold: -25ms of
+simulate, which makems misses swamp. The saving is larger than round 34's
+solo 20ms because numpy's draws compete for memory bandwidth at 36-way.
+
+In a synchronous pair (150 dead, warm caches) log(Z) is 0.09441 +/-
+0.00264 in both arms, and every chain file is identical (`phys_live.txt`
+once sorted), `.resume` included. That is expected, because the library
+reproduces numpy's stream bit for bit.
+
+**Learned.** Check what a shipped image actually contains before trusting
+an earlier round's gain: rounds 26 and 31 were measured on layered SIFs, and
+production never had them. Small C helpers that the simulator loads by
+path and checks on load can be built on the host and bound in, so they
+need no image rebuild.
