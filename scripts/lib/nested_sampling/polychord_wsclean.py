@@ -40,6 +40,7 @@ from common import (
     mark_evaluation_start,
     mpi_rank,
     params_key,
+    pin_rank_cpu,
     prewarm,
     prune_run_artefacts,
     salvage_evaluation_logs,
@@ -56,6 +57,7 @@ from common import (
     self_check_source_offset,
     self_check_spectral_window,
     self_check_worker_pool_connect,
+    self_check_cpu_pinning,
     self_check_worker_timeout,
     sidecar_command,
     zygote_run,
@@ -379,6 +381,7 @@ def main() -> None:
     # Before `import pypolychord`, so the rank's pool attachments come up
     # while the sampler is still loading. Joined just below, right before the
     # first evaluation can ask for one.
+    pin_rank_cpu()
     warm = prewarm(
         lambda: simulate_worker(args.meqtrees_image, args.platform),
         lambda: zygote_worker(args.wsclean_image),
@@ -535,6 +538,7 @@ if __name__ == "__main__":
         self_check_resume_adoption()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
+        self_check_cpu_pinning()
         print("metric resolution self-check passed")
     else:
         main()

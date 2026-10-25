@@ -733,3 +733,69 @@ Notes from this round:
 - In-flight evaluations on a run with scratch no longer have an eval dir on
   Lustre, so `./ri health`'s "in flight" count, which counts dirs with no
   `metrics.json`, now reads close to 0 while the run is live.
+
+## Round 15: the simulate stage at 36 ranks (no change)
+
+At 36 ranks the in-run simulate is ~86ms. In one process it is ~52ms: make_ms
+19ms, noise 20ms, visibilities 6.4ms, putcol 1.9ms. With 36 probes running at
+once it rises ~35% to ~70ms. A 2-correlation (XX, YY) MS gives byte-identical
+WSClean images (144/144) but makes WSClean only 0.2-1.5% faster, and the noise
+still has to be drawn over 4 correlations to stay bit-identical. So it was
+dropped. Every simulate lever left changes results: drawing noise only for the
+correlations that are used (about -13ms), or a float32 phase ramp.
+
+## Round 16: one CPU per rank
+
+**Profile.** At 36 ranks a WSClean evaluation costs a rank ~300ms of worker
+time: `wsclean` 210ms (70%) and simulate 86ms. Inside the job's 38-CPU
+cpuset, `mpirun` bound each rank to a NUMA node. 32 ranks got the 34 CPUs on
+socket 0 and 4 ranks got the 4 CPUs the job has on socket 1. The rank's
+simulate worker and WSClean zygote, which do the work, were not bound at all
+and moved around all 38 CPUs.
+
+**Change.** A rank waits while its workers run, so all three can share one
+CPU. `pin_rank_cpu()` in `common.py` claims one CPU per rank by holding a
+`flock` on `/dev/shm/ri-cpu-<n>.lock` for the rank's life. Two searches in one
+allocation, such as simultaneous A/B arms, therefore never land on the same
+CPU, and a crashed rank lets go of its CPU. The rank pins itself to that CPU,
+and pins each pooled worker when it connects (`_connect_shell_started_worker`,
+again after every reconnect). WSClean children forked by the zygote inherit
+the pin. `mpirun` now runs with `--bind-to none`, so every rank sees the full
+cpuset. If there are more ranks than CPUs, nothing is pinned.
+`NS_PIN_CPUS=0` turns pinning off. This is WSClean runs only. R2D2 ranks run
+multi-threaded U-Nets and are left alone.
+
+**Evidence.** All runs were on cpu-q-553 with 36 ranks, nlive 150, 400 dead
+points, async and seed 4242, and arms were interleaved. The other half of the
+node was busy (load average ~60), so steady evals/s (evaluations ending 10-70s
+in) is noisy. The stage times are compared with a per-run linear fit,
+`time = a + b x (timesteps x channels)`, read at 1000 timestep-channels
+(`.probe/fit16.py`). That removes the differences between async draws.
+
+| arm | runs | steady evals/s | simulate @1k | `wsclean` @1k |
+| --- | ---: | --- | --- | --- |
+| unpinned | 8 | 99.7-119.0 (mean 111.2) | 115.7-117.9ms | 263.8-284.5ms (mean 278) |
+| pinned (external `sched_setaffinity` probe) | 5 | 110.2-131.8 (mean 118.9) | 111.1-112.7ms | 268.1-280.3ms (mean 275) |
+| pinned (`pin_rank_cpu`) | 1 | 113.3 | 112.7ms | 279.7ms |
+
+The in-code arm also had two unpinned controls in the same run of four
+(104.5, 106.8 evals/s; 116.2 and 117.5ms simulate). Its fourth run died when
+the RDS file quota filled (below), and is not counted.
+
+So simulate is ~4.5ms (4%) faster when pinned, with no overlap between arms in
+14 runs. `wsclean` does not change. That is ~1.5% of worker time. The steady
+evals/s means differ by +6%, but that is within the run-to-run spread, so the
+claim is the 1.5%. log(Z) agrees within its error in every run
+(0.0952-0.0964 +/- 0.0009-0.0014). The objective of a given parameter set does
+not depend on which CPU it ran on.
+
+Notes from this round:
+
+- The run directories filled the RDS inode quota (1,048,576 files on
+  `/rds-d6/user/th773`; check with `quota -s`). Each 36-rank, 400-dead-point
+  WSClean benchmark leaves ~10k evaluation directories (~20k inodes) under
+  `results/`, so ~50 of them fill the quota. Every write then fails with
+  `EDQUOT`, and the search dies with no retry. Delete benchmark runs once
+  their `benchmarks.jsonl` row is written.
+- This round's 14 rows in `benchmarks.jsonl` have a `note` field naming the
+  arm.

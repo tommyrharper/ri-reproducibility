@@ -137,6 +137,9 @@ RUN_COMMAND=(
   "${POLYCHORD_SIF}"
   mpirun
   --use-hwthread-cpus
+  # Each rank pins itself and its two workers to one CPU (pin_rank_cpu() in
+  # common.py); Open MPI's own per-socket binding would hide most CPUs from it.
+  --bind-to none
   ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_wsclean.py

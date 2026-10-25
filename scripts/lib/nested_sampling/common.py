@@ -2193,7 +2193,52 @@ def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
             time.sleep(0.002)
             continue
         os.set_blocking(write_fd, True)
+        if _PINNED_CPU is not None:
+            # The pool loop writes the pid at spawn, before the worker's warm-up
+            # opens the FIFO, so it is this worker's. Forks inherit it.
+            try:
+                os.sched_setaffinity(int(Path(f"{base}.pid").read_text()), {_PINNED_CPU})
+            except (OSError, ValueError):
+                pass
         return FifoWorker(write_fd, Path(f"{base}.out"), base)
+
+
+# A rank and its workers take turns - it waits while they run - so sharing one
+# CPU costs nothing, and keeps the MS the simulator just wrote in that core's
+# cache for WSClean. Left to the scheduler on a 36-rank CSD3 node they wander:
+# steady evals/s 99.7-117.0 unpinned against 121.5-131.8 pinned (round 16 of
+# docs/csd3-speed.md). The CPU is claimed with a lock held for the rank's
+# life, so two searches sharing one allocation never pin onto the same one.
+_PINNED_CPU: int | None = None
+
+
+def pin_rank_cpu() -> int | None:
+    """Claim a CPU for this rank and its workers, or None if there are too few."""
+    global _PINNED_CPU
+    import fcntl
+
+    if not hasattr(os, "sched_setaffinity"):  # macOS
+        return None
+    cpus = sorted(os.sched_getaffinity(0))
+    ranks = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "0"))
+    if os.environ.get("NS_PIN_CPUS", "1") == "0" or not 0 < ranks <= len(cpus):
+        return None
+    start = mpi_rank() % len(cpus)
+    for cpu in cpus[start:] + cpus[:start]:
+        try:
+            fd = os.open(f"/dev/shm/ri-cpu-{cpu}.lock", os.O_RDWR | os.O_CREAT, 0o666)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        # fd stays open: the lock is released when this rank exits.
+        os.sched_setaffinity(0, {cpu})
+        _PINNED_CPU = cpu
+        return cpu
+    return None
 
 
 def simulate_worker(meqtrees_image: str, platform: str) -> FifoWorker:
@@ -2570,6 +2615,59 @@ def self_check_worker_pool_connect() -> None:
                 stand_in.kill()
 
     print("worker pool connect self-check passed")
+
+
+def self_check_cpu_pinning() -> None:
+    global _PINNED_CPU
+    import subprocess
+    import tempfile
+
+    if not hasattr(os, "sched_setaffinity"):
+        print("cpu pinning self-check skipped (no sched_setaffinity)")
+        return
+    allowed = os.sched_getaffinity(0)
+    if len(allowed) < 2:
+        print("cpu pinning self-check skipped (one CPU)")
+        return
+    original = dict(os.environ)
+    stand_in = subprocess.Popen(["sleep", "30"])
+    claims = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "0"
+            os.mkfifo(f"{base}.in")
+            os.mkfifo(f"{base}.out")
+            ends = [os.open(f"{base}.in", os.O_RDWR), os.open(f"{base}.out", os.O_RDWR)]
+            Path(f"{base}.pid").write_text(f"{stand_in.pid}\n")
+            os.environ.update(OMPI_COMM_WORLD_RANK="0", OMPI_COMM_WORLD_SIZE="2", NS_SIMULATE_FIFO_DIR=tmp)
+            # Two claims from one process are two lock holders, as two ranks
+            # are: the second must not take the first one's CPU.
+            for _ in range(2):
+                _PINNED_CPU = None
+                os.sched_setaffinity(0, allowed)
+                claims.append(pin_rank_cpu())
+            assert None not in claims and claims[0] != claims[1], claims
+            assert os.sched_getaffinity(0) == {claims[1]}
+            worker = _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR")
+            assert worker is not None
+            assert os.sched_getaffinity(stand_in.pid) == {claims[1]}, os.sched_getaffinity(stand_in.pid)
+            worker.stdin.close()
+            worker.stdout.close()
+            for fd in ends:
+                os.close(fd)
+            # More ranks than CPUs: no pinning at all, rather than two on one.
+            _PINNED_CPU = None
+            os.sched_setaffinity(0, allowed)
+            os.environ["OMPI_COMM_WORLD_SIZE"] = str(len(allowed) + 1)
+            assert pin_rank_cpu() is None and _PINNED_CPU is None
+    finally:
+        _PINNED_CPU = None
+        os.sched_setaffinity(0, allowed)
+        os.environ.clear()
+        os.environ.update(original)
+        stand_in.kill()
+        stand_in.wait()
+    print("cpu pinning self-check passed")
 
 
 def self_check_parameter_space() -> None:
