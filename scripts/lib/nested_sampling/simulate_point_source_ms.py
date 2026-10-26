@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -47,6 +48,13 @@ def scratch_root_for(destination: Path) -> str | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _parser().parse_args(argv)
+
+
+# Built once per worker: constructing it per request cost 0.41ms of a 7.5ms
+# small simulate, mostly argparse's gettext lookups (docs/csd3-speed.md, round 61).
+@functools.lru_cache(maxsize=None)
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-ms", required=True, help="Measurement Set path to create")
     parser.add_argument("--metadata-json", help="Optional JSON metadata path")
@@ -76,7 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # is then built once at that length, not once per new longest draw
     # (docs/csd3-speed.md, round 36).
     parser.add_argument("--observation-horizon-minutes", type=float, default=0.0)
-    return parser.parse_args(argv)
+    return parser
 
 
 def require_clean_output(output_ms: Path) -> None:

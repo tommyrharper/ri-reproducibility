@@ -2976,3 +2976,69 @@ on a rebuild (`./ri images patch-wsclean`, or a Docker build), with 0007-0014.
   (first "Performed N iterations" segment 2.7 ms an MS, restore 1 ms), so a
   log-time segment that is large only on the first major cycle is a sign of
   per-process setup, worth checking against a warm parent.
+
+## Round 61: where WSClean binary time goes now, and a cached simulator parser
+
+**Question.** Round 60's searches had a mean binary time of ~142 ms against a
+median of ~96 ms. What drives the mean, and what is left of the fixed cost
+per evaluation once every patch is in?
+
+**Cost model.** A 16-rank synchronous search on the shipped SIFs (nlive 150,
+450 dead, seed 4242, 2003 evaluations; still the 0001-0006 `wsclean.sif`)
+fitted by least squares over all evaluations, with `Mvis` = time samples x
+channels x 351 baselines / 1e6 and `major` = `clean_major_iterations`:
+
+| term | coefficient | share of binary time |
+| --- | ---: | ---: |
+| constant | 31.7 ms | 19% |
+| per visibility, once (reorder, PSF, first image) | 0.235 s/Mvis | 36% |
+| per visibility per major cycle (load, grid, predict) | 0.101 s/Mvis | 44% |
+| per minor iteration | 15 us | 1.5% |
+
+R2 is 0.97. Major cycles are 3 or 4 in 75% of evaluations (counts 1: 465,
+2: 43, 3: 754, 4: 737), which is `-mgain 0.8` against the drawn dynamic
+range, so the cycle count is science, not overhead. The top 10% of
+evaluations by binary time take 34% of it. Simulate fits a ~9 ms floor:
+the smallest MSs (under 60 timestep-channels) took 8.3 / 9.2 / 10.5 ms in-run
+(10th / 50th / 90th percentile), against 7.8 ms solo.
+
+**What the fixed cost is made of.** The smallest MS of an
+`NS_KEEP_MEASUREMENT_SETS=1` run (5967 rows, 3 channels, 3 major cycles)
+through `wsclean-zygote`, pinned to one CPU, 20 requests: 26.8 ms median on
+the shipped SIF, **18.3 ms** on a SIF built by `patch-wsclean-sif.sh` with
+0001-0014 and round 60's zygote. On the patched build, the `-log-time`
+segments over 0.25 ms are the MS metadata open between the banner and the
+imaging table (2.3 ms), the reorder (2.2 ms), the PSF beam fit (2.1 ms),
+then 0.4-0.8 ms for each load, grid and predict. A 300-request `perf`
+profile puts the beam fit (GSL `lmsder` over reference BLAS: `dnrm2_`,
+`ddot_`, `gsl_linalg_householder_hm`, `FittingDerivativeCentered`) at
+~8.5% of samples, against 20% for ducc0's gridding kernels. The fit result
+is the restoring beam, so swapping BLAS or the fitter would change image
+bits; it is left alone.
+
+**Change.** `simulate_point_source_ms.parse_args()` built its
+`ArgumentParser` (22 options, each `add_argument` doing gettext lookups) on
+every request. It is now built once per worker (`functools.lru_cache`).
+
+| test | before | after | change |
+| --- | ---: | ---: | ---: |
+| solo simulate, smallest MS, 30 interleaved pairs in one meqtrees.sif process, median | 7.513 ms | 7.105 ms | **-0.41 ms** (30 of 30) |
+
+The two MSs are byte-identical (`diff -r`), and `./ri self-check simulate`
+passes. At ~200 ms of worker time per evaluation this is ~0.2%, far below
+what an end-to-end A/B can see, so this is a direct stage timing only. The
+module is bound over the SIF's copy, so it reaches the next cluster run with
+no rebuild.
+
+**Learned.**
+- `cProfile` put the parser at 1.3 ms a request; timed without the
+  profiler it is 0.41 ms. Size small Python wins with interleaved
+  wall-clock pairs, not with profiler cumulative times.
+- What remains of the per-evaluation floor is spread out (MS open, reorder,
+  beam fit, ~2 ms each). The bulk of binary time scales with visibilities
+  x major cycles, so the gridding and the per-cycle load/predict path are
+  still where big wins would come from.
+- The production `images/wsclean.sif` is still the 21 Sep 0001-0006 build:
+  the smallest evaluation is 46% slower on it than on a 0001-0014 build
+  (26.8 vs 18.3 ms). `./ri images patch-wsclean` is still the largest single
+  speed-up open to a cluster run.
