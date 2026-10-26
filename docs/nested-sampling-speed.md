@@ -108,6 +108,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (diagnostic) WSClean binary profiled over 48 real draws, not the largest MS | - | ducc0 46% of the binary (kernels 40%); nothing else above ~2.3%, so no non-kernel WSClean patch is worth more than ~1% of an evaluation ([csd3-speed](csd3-speed.md), round 83) |
 | (diagnostic) icelake against sapphire, same 48-draw WSClean + simulate workload | - | A sapphire core is 13% faster solo but 6% slower fully loaded; half a sapphire node (54 ranks) does 307 evals/s against half an icelake node's 218 (+41%), ~5% fewer per allocated core ([csd3-speed](csd3-speed.md), round 84) |
 | (diagnostic) Kernel time of a forked WSClean request | - | 8.2ms solo, 13.7ms of a 101.5ms request at 36-way (half a fresh process's); only ~1.4k faults (~3-5ms), a quarter of them re-mapped library text that `fork` does not copy; the rest is syscalls/fork/exit, which strace cannot reach here ([csd3-speed](csd3-speed.md), round 85) |
+| (diagnostic, rejected) The R2D2 U-Net re-profiled on torch 2.13 | - | 45% of a forward is im2col + MKL `sgemm` (every conv at <= 8x8), 30% oneDNN, 10% instance norms; `jit.freeze` no faster, MKL-packed weights and `MKL_ENABLE_INSTRUCTIONS=AVX2` faster only with changed bits (AVX2: -2.3% at 36 copies, 6.8e-6) ([csd3-speed](csd3-speed.md), round 86) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

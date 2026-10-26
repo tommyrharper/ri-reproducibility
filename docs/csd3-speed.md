@@ -4174,3 +4174,47 @@ Faults per request, solo, by where they land (1.6k counted by perf):
 - `taskset -c N` must name a CPU in this job's cpuset
   (`grep Cpus_allowed_list /proc/self/status`); odd CPUs below 22 are not
   in it, and a wrong one makes `wsclean-zygote` exit with no reply.
+
+## Round 86 (diagnostic, rejected): where the R2D2 U-Net's time goes on torch 2.13
+
+**Question.** Round 11 put the U-Net (85% of an R2D2 request at 1 thread)
+at its memory floor and blamed oneDNN's per-call weight reorders. Nothing
+has touched R2D2 since round 21. With `r2d2.sif`'s torch 2.13, is any of
+the forward a lever that keeps the output bit-identical?
+
+**Profile** (`torch.profiler`, one checkpoint, 32x32, 1 thread, 50
+forwards, `.probe/r86/pp.py`). The forward is not mostly oneDNN:
+
+| op | share | calls / forward |
+| --- | ---: | ---: |
+| `_slow_conv2d_forward` (im2col + MKL `sgemm`; every conv at <= 8x8, and the 2-channel input conv) | 45.5% | 12 |
+| `mkldnn_convolution` (the convs at 16x16 and 32x32) | 30.3% | 7 |
+| `slow_conv_transpose2d` | 9.4% | 3 |
+| instance norms (`native_batch_norm`) | ~10% | 22 |
+
+The largest single op is the 1024 -> 1024 3x3 conv at 2x2: 3.5-3.9ms for
+37.7MB of weights, ~10GB/s from one core, a weight stream through `sgemm`
+with N = 4.
+
+**Tried** (all in `.probe/r86/`, `r2d2.sif` unmodified):
+
+| lever | solo | 36 copies | output |
+| --- | ---: | ---: | --- |
+| `torch.jit.trace` / `+ jit.freeze` | 29.0 / 29.0 ms against 28.2 | | identical |
+| `jit.optimize_for_inference` (oneDNN prepack) | 55.0 ms | | 6.3e-6 off |
+| MKL-packed weights (`mkl._mkl_reorder_linear_weight` + `_mkl_linear`) per slow conv | 1024->1024 at 2x2: 2.35 against 3.53ms; 512->1024 at 2x2: 1.18 against 1.76 | | differs where faster; identical only where slower (1024->512 at 4x4: 2.35 against 1.82) |
+| `MKL_ENABLE_INSTRUCTIONS=AVX2` (MKL picks AVX-512 on icelake) | 26.4 against 27.2-29.0 ms (-3 to -9%) | 47.1 against 48.2-48.3 ms (-2.3%, 2 ABAB pairs) | 6.8e-6 of the output peak |
+
+**Learned.**
+- MKL's AVX-512 `sgemm` is ~1.5x slower than its AVX2 path on the deep
+  1024-channel convs (3.50 against 2.35ms at 2x2), but under 36 copies the
+  whole forward gains only 2.3%, since it is then bound on memory (48ms
+  against 27ms solo, round 11's picture). Not worth changing every R2D2
+  objective by ~7e-6.
+- Freezing or tracing does nothing for a CPU forward: torch 2.13's frozen
+  graph still calls the same `aten` convs, and the only prepacking pass
+  (`optimize_for_inference`) is round 11's slower, non-identical oneDNN path.
+- Any lever that is faster here changes the `sgemm` reduction order, so the
+  R2D2 CPU forward is closed to bit-identical changes on this torch build.
+  The open R2D2 avenues stay the ones round 11 named: batching forwards
+  across ranks, or merging GPU contexts.
