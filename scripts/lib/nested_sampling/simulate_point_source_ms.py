@@ -414,12 +414,49 @@ def _copy_with_large_ssm_buckets(ms: Path, destination: Path) -> None:
         t.copy(str(destination), deep=True, valuecopy=True, dminfo=_template_dminfo(t.getdminfo())).close()
 
 
+_TEMPLATE_BYTES: dict[str, tuple[tuple[int, int], list[tuple[str, int, bytes | None]]]] = {}
+
+
+def _copy_template(template: Path, output_ms: Path) -> None:
+    """shutil.copytree() minus UNUSED_SUBTABLES, from bytes this worker read
+    once: ~39 files a copy, each an open, sendfile and copystat, were ~2.5ms
+    of a ~18ms solo simulate (docs/csd3-speed.md, round 62). A published
+    template is never written again, and a new one is a new directory, so
+    its inode and mtime are the whole key."""
+    st = os.stat(template)
+    key = (st.st_ino, st.st_mtime_ns)
+    cached = _TEMPLATE_BYTES.get(str(template))
+    if cached is None or cached[0] != key:
+        entries = []
+        for root, dirs, files in os.walk(template):
+            if root == str(template):
+                dirs[:] = [d for d in dirs if d not in UNUSED_SUBTABLES]
+            rel = os.path.relpath(root, template)
+            entries.append((rel, 0, None))
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as f:
+                    entries.append((os.path.join(rel, name), os.stat(path).st_mode & 0o7777, f.read()))
+        cached = _TEMPLATE_BYTES[str(template)] = (key, entries)
+    for rel, mode, data in cached[1]:
+        path = os.path.normpath(os.path.join(output_ms, rel))
+        if data is None:
+            os.mkdir(path)
+            continue
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError(f"short write to {path}")
+        finally:
+            os.close(fd)
+
+
 def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace,
                     fill: bool = False) -> tuple | None:
     """With `fill`, also writes the visibilities while the table is open and
     returns fill_point_source_visibilities()'s (data, uvw, freqs_hz)."""
     filled = None
-    shutil.copytree(template, output_ms, symlinks=True, ignore=shutil.ignore_patterns(*UNUSED_SUBTABLES))
+    _copy_template(template, output_ms)
     with table(str(output_ms), readonly=False, ack=False) as ms:
         a1, a2 = ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2")
         n_base = len(a1)

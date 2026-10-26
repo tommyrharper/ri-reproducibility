@@ -3042,3 +3042,47 @@ no rebuild.
   the smallest evaluation is 46% slower on it than on a 0001-0014 build
   (26.8 vs 18.3 ms). `./ri images patch-wsclean` is still the largest single
   speed-up open to a cluster run.
+
+## Round 62: the one-timestep template copied from memory
+
+**Profile.** `PROFILE=1 scripts/probe_simulate_stage.py .probe/params15.jsonl warm`
+in `meqtrees.sif` (fastnoise.so bound, one pinned CPU, 48 real draws) puts a
+warm extended simulate at 17.8 ms median. Of the parts left after rounds
+26-61, `_add_complex_noise` is ~5.6 ms an evaluation, the 20 `putcol`s
+~3.5 ms, `extend_template`'s `shutil.copytree` of the one-timestep template
+~2.5 ms and the phase ramp ~1.7 ms. The copy is 39 files an evaluation, and
+each is a source open, a `sendfile`, a `copystat` (`utime` + `chmod`) and
+several `stat`s, all for ~400 KB.
+
+**Change.** `_copy_template()` reads a template's files once per worker and
+writes later copies from those bytes (`mkdir`, then `open(O_EXCL)` + one
+`write` per file, with the source's mode bits). A published template is never
+written again, and a republished one is a new directory, so the cache is keyed
+by the template directory's inode and mtime. Each template is ~0.5 MB, and
+there is one per channel count.
+
+**Result.** `.probe/ab62.py` (its last argument is the directory holding `probe_simulate_stage.py`'s `argv()`, copied out): one process warms every
+observation and template, checks both arms' MS for every draw, then times
+the 48 draws per arm with the order alternating each round.
+
+| test | `copytree` | from memory | change |
+| --- | ---: | ---: | ---: |
+| 1 process, pinned, 30 rounds, median of per-round means | 17.690 ms | 16.457 ms | **-1.25 ms (-7.0%)**, 30 of 30 |
+| 16 processes at once on 16 pinned CPUs, 10 rounds each | 22.43-22.69 ms | 21.09-21.41 ms | **-1.26 to -1.35 ms (-5.7%)**, 160 of 160 |
+
+All 48 draws give byte-identical MSs in every copy (768 of 768, `filecmp`
+over every file), and the file modes match. `./ri self-check simulate`
+passes; its observation-prefix check compares extended MSs with fresh makems
+builds column by column. At ~200 ms of worker time per WSClean evaluation
+this is ~0.6%, too small for an end-to-end A/B to see (round 61), so it is a
+stage timing only and no search was run for the ledger. The module is bound
+over the SIF's copy, so the next cluster run gets it without a rebuild.
+
+**Learned.**
+- On tmpfs, `shutil.copytree` of a small casacore table costs ~65 us a file,
+  most of it metadata syscalls. For a source that never changes, keep the
+  bytes in the process.
+- Simulate in a 16-way load is ~27% slower than solo (22.5 against 17.7 ms)
+  even though no imager is running. A 16-rank search's in-run simulate
+  (~35 ms, round 61) is slower again, by about as much as the gap from solo
+  to 16 copies.
