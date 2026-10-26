@@ -4335,3 +4335,54 @@ either.
   avenues are closed: page-mapping settings (THP off, populate, trim,
   alignment) do not help, and a request's ~9.5ms of faults at 36-way can
   only come down by WSClean touching less memory.
+
+## Round 89 (diagnostic): rounds 72-88 together in a production-shaped search
+
+**Question.** Round 72 measured a production-shaped search on a 0001-0016
+SIF: 174 evals/s whole run, 233 steady, and a ~30 s single-rank tail.
+Since then patch 0017 (round 74), five simulate rounds (78-82) and the
+tail cut (round 81) have each been measured alone. What do they give
+together, and how much of it does a cluster run on the shipped SIF see?
+
+**Run.** Round 72's shape: 36 ranks, async, nlive 150, 15 repeats, 900
+dead, seed 4242, commit b63c209, cpu-q-576 (the other half of the node
+busy, load ~45 at the end). Two searches run back to back, not raced: first
+the shipped `wsclean.sif` (0001-0006), then a fresh 0001-0017 build
+(`scripts/patch-wsclean-sif.sh /dev/shm/r89/wsclean.sif`, 2 minutes with
+36 jobs). Both use the tree's simulate. Rows `r89-stock` and `r89-prof`.
+
+| run | WSClean SIF | evals | wall | evals/s whole run | steady (10 s to end-10 s) | simulate | `wsclean` binary | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| r72-prof (round 72) | 0001-0016 | 26,899 | 154 s | 174.3 | 233 | 28.2 ms | 122.5 ms | |
+| r89-stock | shipped 0001-0006 | 28,514 | 158 s | 180.0 | 184 | 23.9 ms | 162.0 ms | 0.09620 ± 0.00098 |
+| r89-prof | 0001-0017 | 28,599 | 114 s | **250.5** | **258** | 23.4 ms | 108.6 ms | 0.09642 ± 0.00102 |
+
+Workers are 97-98.5% busy in every 5.7 s window from 6 s to 108 s. The
+last 5% of evaluations end within 6.5 s, against round 72's ~28 s on one
+rank. Both log(Z)s agree within their error bars. The async runs evaluate
+different points, so they are not identical.
+
+**Learned.**
+- Rounds 72-88 together take a production-shaped search from 174 to 250
+  evals/s whole run (+44%) and from 233 to 258 steady (+11%). Most of the
+  whole-run gain is round 81's tail cut, so a short benchmark's whole-run
+  rate is now close to its steady rate (250 against 258, where round 72
+  had 174 against 233).
+- MeqTrees (simulate) is 17.5% of evaluation time (23.4 of 133 ms), about
+  the same share as round 72's 18%. Simulate got 17% cheaper, but the
+  binary got cheaper too. The binary is 82%, and ducc0's kernels are most
+  of that (round 83).
+- A cluster search on the shipped `images/wsclean.sif` runs at 184 evals/s
+  steady against 258 on a patched build: 29% fewer evaluations an hour.
+  This is still the largest single lever open to production.
+  `./ri images patch-wsclean` in a compute-node job (2 minutes) closes it,
+  and the run's stale-SIF warning flags it. The shipped SIF was left as it
+  is here, because other worktrees use it.
+- `WSCLEAN_SIF=...` in the environment is ignored: `defaults.sh` sets it
+  from `SIF_DIR` unconditionally. To run a search on a different build
+  without replacing the shared one, point `SIF_DIR` at a directory of
+  symlinks with the new `wsclean.sif` in it. The row's
+  `NS_IMAGER_IMAGE_ID` then gains a `+p<patch hash>` suffix, and its
+  absence is how to spot a run that silently used the stock SIF.
+- Each 36-rank, 900-dead run leaves ~58k files (106 MB `summary.json`), so
+  delete it once its row is in `benchmarks.jsonl`.
