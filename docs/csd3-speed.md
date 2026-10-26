@@ -4281,3 +4281,57 @@ what runs.
   and its forks. Wrap `_exit` to dump a forked child's counters, since
   `_exit` skips destructors, and don't wrap `clock_gettime` or `getenv`,
   which the wrapper itself calls.
+
+## Round 88 (diagnostic, two rejections): the zygote parent's heap reshaped before `fork`
+
+**Question.** Round 87 put ~700 of a request's ~1.4k faults in the parent's
+`[heap]` range. Are those copy-on-write faults on heap the parent has
+touched, and can reshaping that heap before `fork` turn them into fewer,
+cheaper faults?
+
+**What the heap looks like.** After three requests, the parent
+`wsclean-zygote` under the production malloc tunables (`.probe/r88/peek.py`)
+has a 65.5MB `[heap]` VMA (`top_pad` is 64MB), of which 3.8MB is resident:
+one 2MB huge page and ~1.8MB of 4kB pages. The small pages sit in the head
+below the heap's first 2MB boundary, because the program break starts
+unaligned. CSD3's THP is `always` with `defrag=madvise`, and
+`thp_fault_fallback` is ~2% of `thp_fault_alloc`, so the untouched 60MB
+already gets huge pages on first touch.
+
+**Rejected: `malloc_trim(0)` before each `fork`** (`.probe/r88/trim.c`, an
+`LD_PRELOAD` wrapper of `fork` that trims once or on every call). The idea
+was to give free heap pages back so the child zero-fills them instead of
+copying them. Round 83's `D.sif` (0001-0017) was used with its 48 real
+draws, pinned solo on CPU 24, 2 timed passes per run, interleaved:
+
+| arm | run 1 | run 2 |
+| --- | ---: | ---: |
+| baseline | 77.24 ms | 76.78 ms |
+| trim once | 77.08 | 76.69 |
+| trim every `fork` | 77.02 | 77.23 |
+
+**Rejected: a 2MB-aligned heap start** (`.probe/r88/align.c`, a
+constructor that moves the break to the next 2MB boundary before glibc's
+arena takes it). The resident small pages fell from ~1.8MB to ~1.2MB, but
+requests did not get faster:
+
+| arm | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| baseline | 77.48 ms | 77.15 | 77.27 |
+| aligned heap | 77.31 | 77.01 | 77.40 |
+
+Both levers are inside the ~0.5ms run-to-run spread. The zygote's
+`cminflt`, i.e. the faults of all its children, varied by ±10% between
+baseline runs alone, so it cannot resolve a fault-count change this small
+either.
+
+**Learned.**
+- The parent's heap is small: ~3.5MB resident. Even if every 4kB page in
+  it were copied once per request (~450-900 faults), the reshaping levers
+  can only move the part THP could cover, and that did not show up in
+  request time.
+- The heap faults round 87 counted are first touches the child needs
+  anyway. With rounds 85, 87 and 88 together, the per-request kernel-time
+  avenues are closed: page-mapping settings (THP off, populate, trim,
+  alignment) do not help, and a request's ~9.5ms of faults at 36-way can
+  only come down by WSClean touching less memory.
