@@ -2423,3 +2423,74 @@ record-writer thread gets the GIL only while an evaluation blocks in
 `zygote_run()`. This has not been tested yet. The next step is to write
 records from a GIL-free helper (a child process fed over a pipe), or
 otherwise inline, and then check the lag and the drain.
+
+## Round 53 (rejected): a helper process for the record writes
+
+**Question.** Round 52 found the record-writer thread running minutes behind
+scoring and blamed the GIL. Does writing records from a GIL-free helper
+process fix the lag without costing throughput?
+
+**Method.** First a probe run: the production preset (36 ranks, nlive 150,
+15 repeats, to convergence, seed 1, async), with every background write
+timed in wall and thread-CPU time. A control process did the same mkdir,
+write and rename every 0.25s in a sibling directory. Then the change, as one
+36-rank production run and as raced 18-rank pairs (800 dead points,
+seed 4242, ABBA) against a copy of 63e2074. Driver scripts:
+`.probe/r53prod.sh`, `.probe/r53ab.sh`. Analysis: `.probe/r53an.py`,
+`r53lag.py`, `r53busy.py`.
+
+**The GIL part is confirmed.** `_pypolychord.cpp` calls back into Python
+with `PyObject_CallFunctionObjArgs` and never releases the GIL around the
+Fortran.
+
+**But the slow step is Lustre.** In the probe, each background write spent
+~600ms in `mkdir` of its eval dir and ~100ms writing and renaming, at 1ms of
+CPU. That gave the writer ~1.4 records/s per rank against ~3.7/s scored, and
+the queue grew to 174s by 200-300s into the run. The control in a sibling
+directory took 0ms for mkdir and 11ms for the write. Measured from an
+outside process during a raced pair, `mkdir` *inside* the live
+`evaluations/` took 134ms (new arm) and 242ms (base arm), median, against
+0ms in a sibling directory. Idle, 16 processes creating records in one
+shared directory reach ~1000 records/s, the same as in 16 separate ones, so
+the cost appears only while a search runs. Once the run stops scoring, the
+same writers drain at ~1000 records/s with 0ms mkdirs. Node-wide on the
+run's MDT (`rds-d6-MDT0001`, from `/proc/fs/lustre/mdc/*/md_stats`), two
+raced arms made 640 intent_lock, 218 create, 134 revalidate_lock and 104
+rename per second. What makes the live directory slow is not yet known. An
+strace of a rank showed no Lustre path at all (everything is in tmpfs); its
+workers were not traced.
+
+**Change tried.** `write_records_in_background()` started a
+`python -I -c` helper per rank that reads length-prefixed (path, text)
+pairs from a pipe, writes each one atomically and reports failures as
+errno lines. Failed writes still raised on the rank; the self-check and a
+mutation test passed.
+
+**Result: rejected.**
+
+| run | evals | eval span (s) | evals/s | ms/eval | drain (s) | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| base a (18 ranks) | 24210 | 354.1 | 68.38 | 224.8 | 18.4 | 0.09701 |
+| new a | 24337 | 415.7 | 58.54 | 237.0 | 0.0 | 0.09710 |
+| new b | 25110 | 403.1 | 62.29 | 223.8 | 0.0 | 0.09631 |
+| base b | 24052 | 354.1 | 67.93 | 222.5 | 13.0 | 0.09716 |
+| probe, thread (36) | 42889 | 300.1 | 142.90 | 213.8 | 17.7 | 0.09604 |
+| new (36) | 45200 | 424.6 | 106.46 | 184.1 | 0.1 | 0.09556 |
+
+The drain is gone, and the record lag stays flat at 3-5s for the whole run
+instead of growing. That lag is about one full 64KB pipe (16 records of
+~4KB) at ~270ms each. So the helper can't keep up either, and the bounded
+pipe makes each rank wait on Lustre. At 36 ranks only ~20 of 35 workers were
+busy. The thread's unbounded queue is what keeps the ranks scoring, so the
+helper costs 11% of evaluations/s raced, and more at 36 ranks. log(Z) is
+within the async spread. Reverted.
+
+**What it means.** The lag can't be fixed by moving the writes to another
+thread or process. One record per evaluation in a live `evaluations/` costs
+~130-600ms of Lustre wait, and the evaluations come faster than that.
+Candidates for a later round: find what slows the live directory (trace the
+WSClean and MeqTrees workers, or `md_stats` per phase); fewer metadata
+operations per record (no per-record eval dir for the 80% that hold only
+`metrics.json`, or appending records in batches to a per-rank file); or
+sharding `evaluations/`. All but the first change a layout that resume,
+health and profile read.
