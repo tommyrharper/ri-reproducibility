@@ -3086,3 +3086,49 @@ over the SIF's copy, so the next cluster run gets it without a rebuild.
   even though no imager is running. A 16-rank search's in-run simulate
   (~35 ms, round 61) is slower again, by about as much as the gap from solo
   to 16 copies.
+
+## Round 63 (rejected): the noise generator split into lanes or vectors
+
+**Profile.** A 16-rank synchronous search on a SIF built by
+`patch-wsclean-sif.sh` with 0001-0014 and round 60's zygote (nlive 150, 450
+dead, seed 4242, so the same 2003 evaluations as round 61's cost-model run;
+`r63-prof` in `benchmarks.jsonl`) ran at 31.9 evals/s, against 25.3 for round
+61's run on the shipped SIF. That is not an A/B: the runs were an hour apart
+and the host load differed. Its worker time was 165.6 ms an evaluation:
+binary 119.5 ms, simulate 44.9 ms. `./ri profile --phases` over the logs
+prune kept puts gridding at 30% of logged binary work, loading and
+predicting at 17% each, and the reorder at 17%. Simulate is now 27% of
+worker time. In-run it fits 26 ms + 74 ms/Mvis, but makems misses for new
+observations early in the run inflate that constant (the slowest 50
+evaluations hold 20% of simulate time, at 0.4-0.8 s each). Solo on 51 of the
+run's draws spread across sizes (one pinned CPU, warm cache, `PROFILE=1`),
+`_add_complex_noise` took 8.2 ms of an evaluation, the `putcol`s 4.5 ms and
+the phase ramp 2.3 ms.
+
+**What was tried.** `add_normal_f32` draws ~4.0 ns a normal, one PCG64 step
+after another. Two rewrites, both bit-identical to it on the outputs and the
+final state, were tested in a C harness (gcc 8.5 `-O2 -ffp-contract=off`,
+pinned, best of 30):
+
+| variant | 1k draws | 100k | 1.1M |
+| --- | ---: | ---: | ---: |
+| current: a serial step and the ziggurat in one loop | 3.94 ns | 4.03 ns | 4.05 ns |
+| raw outputs from 4 jump-ahead lanes into a 512-word buffer, then the ziggurat over the buffer | 4.69 ns | 3.95 ns | 3.98 ns |
+| the same, with an AVX-512 ziggurat fast path (8 gathered `ki`/`wi`, scalar if any of the 8 is rejected) | 6.70 ns | 6.06 ns | 6.13 ns |
+
+Timed apart, the lane fill is 1.28 ns a raw output and the scalar ziggurat
+1.70 ns. So the serial step is not latency-bound: three 64-bit multiplies
+for each 128-bit step already take the multiplier's throughput, and removing
+the dependency chain frees nothing. The AVX-512 path loses on its two
+gathers, on the 9% of 8-blocks that hold a rejection and fall back to
+scalar, and on writing strided floats one at a time. Neither variant was
+shipped.
+
+**Learned.**
+- Noise is at ~4 ns a normal against a ~3 ns floor (raw output plus
+  ziggurat). Making it much faster would need fewer multiplies per step,
+  which means a different generator and a different noise stream, so it is
+  not byte-safe.
+- On a 0001-0014 build, the remaining per-evaluation binary work is mostly
+  gridding, load and predict, which scale with visibilities times major
+  cycles (round 61). The reorder is the largest once-per-evaluation phase.
