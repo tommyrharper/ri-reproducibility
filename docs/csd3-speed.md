@@ -4076,3 +4076,45 @@ process start. Addresses mapped with `nm -C` (`.probe/r83/map.py`).
   twice, gives makems' 4-correlation MSs with TIME in the ISM, which make
   casacore look 2x more expensive in the binary (`ISMBucket::getInterval`
   1.7%).
+
+## Round 84 (diagnostic): icelake against sapphire for a WSClean evaluation
+
+**Question.** Production searches default to `icelake` (`slurm.sh`), and
+every round so far was measured there. CSD3 also has `sapphire` (Xeon
+Platinum 8480+, 112 cores, 4580MiB each). For this workload, is a sapphire
+core faster than an icelake one, and is a half node of each worth more?
+
+**Run.** `.probe/r84/bench.sh`, one script on both partitions: N pinned
+copies at once, each imaging round 83's 48 real-draw template MSs three
+times with the 0001-0017 build (one `wsclean` process per image, so
+process start is included in both arms), then N pinned copies of round 82's
+simulate harness (`meqtrees.sif` with this tree's `fastnoise.so`, 10 passes
+of the 48 draws). Icelake ran in this job (cpu-q-576, 38 of its 76 CPUs,
+other half someone else's). Sapphire ran as one 56-CPU job
+(`.probe/r84/job.sh`, cpu-r-86), also half a node.
+
+| arm | `wsclean` wall / user / sys ms | simulate wall ms | evaluation ms | evals/s for the allocation |
+| --- | ---: | ---: | ---: | ---: |
+| icelake, 1 copy | 113.2 / 89.5 / 16.7 | 15.3 | 128.5 | |
+| sapphire, 1 copy | 98.2 / 73.6 / 18.9 | 12.9 | 111.1 | |
+| icelake, 36 of 38 | 144.3 / 109.6 / 27.7 | 20.7 | 165.0 | 218 |
+| sapphire, 36 of 56 | 128.0 / 92.8 / 28.2 | 18.1 | 146.1 | 246 |
+| sapphire, 54 of 56 | 154.2 / 107.0 / 39.2 | 22.0 | 176.1 | **307** |
+
+**Learned.**
+- A sapphire core is 13-14% faster solo (user time -18% for `wsclean`), but
+  at the same ~95% occupancy it slows more under load (+59% against +28%;
+  kernel time doubles), so a fully loaded sapphire core does 5.7 evals/s
+  against icelake's 6.1 (-6%).
+- What a search buys is its allocation. Half a sapphire node runs 54 ranks
+  at 307 evals/s against half an icelake node's 36 at 218 (+41%), and a
+  whole node 112 against 76 cores. Per allocated core (56 vs 38) it is
+  5.5 against 5.7 evals/s, so per core-hour icelake stays ~5% ahead; the
+  public policy page gives no per-partition rate (`csd3.cam.ac.uk/charges`
+  needs a Raven login), so whether sapphire is cheaper per evaluation
+  depends on the project's charge. For a fixed wall-clock deadline,
+  `SBATCH_PARTITION=sapphire` with ~54 ranks per half node is the faster
+  run.
+- The default stays `icelake`. Every per-evaluation round was measured
+  there, and nothing in the code depends on the partition: WSClean's
+  `target_clones` and `fastnoise.so` already pick their AVX2 paths on both.

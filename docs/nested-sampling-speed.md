@@ -106,6 +106,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Chains still in flight end once PolyChord has finished: its root has written every output before it waits for them, and keeps only their `nlike` (`PolyChordFinish`) | `common.py`, both drivers | async PolyChord wall -13.8% / -8.9% in raced 17-rank 600-dead pairs, both launch orders (a fixed ~20-40 s tail per run); sync pair byte-identical ([csd3-speed](csd3-speed.md), round 81) |
 | Phase ramp written with its XX/YY real noise in one pass (`phase_ramp_c64_xxyy2`) | `fastnoise.c`, `simulate_point_source_ms.py` | simulate -1.5% in-run (23.10 to 22.76 ms, 34 pinned copies, 4/4 ABBA pairs); all 48 MSs column-identical ([csd3-speed](csd3-speed.md), round 82) |
 | (diagnostic) WSClean binary profiled over 48 real draws, not the largest MS | - | ducc0 46% of the binary (kernels 40%); nothing else above ~2.3%, so no non-kernel WSClean patch is worth more than ~1% of an evaluation ([csd3-speed](csd3-speed.md), round 83) |
+| (diagnostic) icelake against sapphire, same 48-draw WSClean + simulate workload | - | A sapphire core is 13% faster solo but 6% slower fully loaded; half a sapphire node (54 ranks) does 307 evals/s against half an icelake node's 218 (+41%), ~5% fewer per allocated core ([csd3-speed](csd3-speed.md), round 84) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
