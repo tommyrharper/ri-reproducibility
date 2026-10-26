@@ -56,8 +56,12 @@ SIF's own casacore, layers the result over the SIF, and keeps the old one as
 `wsclean.sif.orig`. The derived SIF keeps the old `ri.build-inputs` label and
 adds `ri.wsclean-patches` (a hash of the patches), and its image id in
 `run.env` and `benchmarks.jsonl` is the old one plus `+p` and the first 12
-characters of that hash, so bench never pools the two. A WSClean search warns
-when `wsclean.sif` matches neither label to this tree. On today's code the
+characters of that hash, so bench never pools the two. When `wsclean.sif` matches neither label to this tree, a WSClean search warns on
+the login node, and its job builds the same layer once into
+`$RI_WORK_DIR/.cache/ri/wsclean-<base id>-p<patches hash>.sif` (~2 minutes
+with the job's CPUs), uses it, and every later run reuses it; the shared SIF
+is not touched, a failed build falls back to it, and `NS_PATCH_WSCLEAN=0`
+skips the step (round 94: +50% evals/s, chains byte-identical). On today's code the
 upgrade from the shipped 0001-0006 SIF to 0001-0016 is worth +42% evals/s in a
 17-rank search (binary 193 -> 126 ms, chains byte-identical). See
 [csd3-speed](csd3-speed.md), rounds 43, 70 and 71.

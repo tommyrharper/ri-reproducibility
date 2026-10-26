@@ -4642,3 +4642,58 @@ segment's records as files, and a finished run gives them all back.
 - `./ri self-check self-heal`'s mid-run kill can be reproduced cheaply by
   `kill -9` of one `polychord_wsclean.py` rank from a short 8-rank search
   (`--retries 2`): `run_with_retries` resumes it within seconds.
+
+## Round 94: a search's job patches a stale `wsclean.sif` itself
+
+**Question.** Round 89 found the largest lever left open to production
+outside the code: the shared `images/wsclean.sif` stops at patch 0006, and a
+cluster search on it runs 29% fewer evaluations an hour than on a
+0001-0017 build. Runs only warned (round 70), and the SIF was left alone
+because other worktrees share it. Can every search get the patches without
+anyone replacing that file?
+
+**Change.** `ns_use_patched_wsclean_sif` (`defaults.sh`), called by
+`run-nested-sampling.sh` once it is inside its Slurm job (so also by `./ri
+resume` and `./ri bench run`). When `WSCLEAN_SIF` lags the tree's patches
+(`ns_wsclean_sif_current`, the old warning's test), it builds
+`$RI_WORK_DIR/.cache/ri/wsclean-<base id>-p<patches hash>.sif` with
+`patch-wsclean-sif.sh` and the job's CPUs, renames it into place, and points
+the run at it. Later runs, on any node, find it and pay nothing. A failed
+build warns and keeps the stock SIF; `NS_PATCH_WSCLEAN=0` skips it (for an
+A/B that means to run a stale SIF). The shared SIF is never written. The
+login node only warns, and says the job will patch. There is no lock: two
+jobs racing build the same bytes and the rename is atomic.
+
+`patch-wsclean-sif.sh` failed inside a job at first: `job-env.sh` puts the
+container home (and the cwd) under `/rds`, and neither a `--writable`
+sandbox nor the layer's `%post` can create `/rds` to mount it on
+("destination /rds doesn't exist in container"). It now runs from its
+`/tmp` work dir with `HOME` there and `APPTAINER_HOME` unset, and resolves
+its paths first.
+
+**Measured.** 16 ranks, nlive 50, 5 repeats, 150 dead, seed 4242,
+synchronous, cpu-q-576 (this job's 38 CPUs), shipped SIFs; runs in this
+order:
+
+| run | WSClean SIF | wall | evals/s | `wsclean` binary | simulate | chains |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| r94-stock-1 | shipped (0001-0006) | 79.9 s | 20.14 | 179.2 ms | 27.3 ms | `ccfd575b` |
+| r94-stock-buildfail | shipped (the first, failed build) | 79.1 s | 20.35 | 179.0 ms | 25.4 ms | `ccfd575b` |
+| r94-auto-build | built this run, 0001-0017 | 52.5 s (+1m54 build) | 30.63 | 111.8 ms | 25.1 ms | `ccfd575b` |
+| r94-auto-cached | cached | 52.6 s | 30.56 | 112.3 ms | 25.1 ms | `ccfd575b` |
+| r94-stock-2 | shipped, `NS_PATCH_WSCLEAN=0` | 78.5 s | 20.49 | 177.6 ms | 25.0 ms | `ccfd575b` |
+
+All five chains files (and `_dead-birth.txt`) are byte-identical, and log(Z)
+is 0.09600 ± 0.00170 in each. The patched runs are +50% evals/s; the
+benchmark rows carry `+p800c8ece3777` on the imager id, so bench keeps them
+apart. A 12-hour job pays the ~2 minute build once at most (0.3%), and only
+the first job after a patch change.
+
+**Learned.**
+- Anything that runs `apptainer --fakeroot --writable` or a `%post` from
+  inside a run's job must keep both its cwd and `HOME`/`APPTAINER_HOME` off
+  `/rds`; `job-env.sh` sets the home to `$RI_WORK_DIR/.ri-job/home`.
+- At 16 ranks the shipped SIF costs a third of a search's throughput
+  (20.3 against 30.6 evals/s), more than round 89's 29% at 36 ranks, since
+  the binary is a larger share of a less loaded evaluation.
+

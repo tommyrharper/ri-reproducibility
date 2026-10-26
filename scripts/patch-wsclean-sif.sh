@@ -19,8 +19,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/defaults.sh
 source "${REPO_ROOT}/scripts/lib/defaults.sh"
-BASE="${WSCLEAN_BASE_SIF:-${SIF_DIR}/wsclean.sif}"
-OUT="${1:-${SIF_DIR}/wsclean.sif}"
+BASE="$(realpath -m "${WSCLEAN_BASE_SIF:-${SIF_DIR}/wsclean.sif}")"
+OUT="$(realpath -m "${1:-${SIF_DIR}/wsclean.sif}")"
 JOBS="${BUILD_JOBS:-$(env -u OMP_NUM_THREADS nproc)}"
 dockerfile="${REPO_ROOT}/docker/wsclean/Dockerfile"
 arg_of() { sed -n "s/^ARG $1=//p" "${dockerfile}" | head -n1; }
@@ -37,6 +37,12 @@ trap 'chmod -R u+w "${work}" 2>/dev/null; rm -rf "${work}"' EXIT
 export APPTAINER_CACHEDIR="${work}/cache" APPTAINER_TMPDIR="${work}/tmp"
 mkdir -p "${APPTAINER_CACHEDIR}" "${APPTAINER_TMPDIR}"
 box="${work}/box"
+# A --writable sandbox, and the layer's %post, cannot create mount points, and
+# inside a run's job both the cwd and the container home are under /rds
+# (job-env.sh), which the box has no directory for. Keep both in ${work}.
+cd "${work}"
+unset APPTAINER_HOME SINGULARITY_HOME
+export HOME="${work}"
 
 echo "==> sandbox"
 apptainer build --fakeroot --sandbox "${box}" docker://debian:bookworm-slim >/dev/null
