@@ -2558,3 +2558,79 @@ goes from 7-9s to 0s. evals/s is unchanged within this host's ~5% spread
 within the async spread. The gain is in what a run leaves behind, not in
 its rate: a job killed mid-run now loses seconds of records, not minutes,
 and the drain no longer grows with run length.
+
+## Round 55: meta fields read straight from the mapping (patch 0012)
+
+**Profile.** One 36-rank search (nlive 150, 15 repeats, 1500 dead, seed
+4242, async) on a `wsclean.sif` rebuilt with patches 0001-0011 by
+`./ri images patch-wsclean`, with the host-built `fastnoise.so`. `perf
+record` was attached for 30s to five `wsclean-zygote`s and five simulate
+servers. perf 4.18 here rejects a `-p` list longer than a few PIDs with a
+bare usage message, so attach to a handful, not all. Symbols come from
+`--symfs` over a tree untarred from the SIF. Zygote samples by function:
+
+| function | share |
+| --- | ---: |
+| ducc0 `Wgridder` (all kernels) | ~38% |
+| `ReorderedMsReader::CacheMeta` | 5.7% |
+| `MsGridderData::CalculateWeightsImplementation` | 3.5% |
+| `MsGridderData::ApplyWeightsAndCorrections` | 2.8% |
+| `WGriddingMSGridder::GridRegularMeasurementSet` | 2.3% |
+| `ImageWeights::Grid` | 2.0% |
+| libc (memcpy/memset, malloc) | ~10% |
+
+The simulate servers spend 38% in `fastnoise.so` and 14% in libm
+(`sincos` for the phase ramp), 17% in the interpreter and 7% in numpy.
+
+Two thirds of `CacheMeta`'s samples sit on one instruction, a 32-byte
+`vmovapd` from the stack. Round 35's patch 0011 copies the 38-byte packed
+`MetaRecordBuffer` at its fixed size, but GCC emits that as two 16-byte
+stores plus an overlapping 8-byte store. `u`..`time` are then reloaded as
+one 32-byte word, which spans two stores and cannot be forwarded, so every
+row still stalls. The stall is worse under load: 2.9% of the binary solo,
+5.7% at 36-way.
+
+**Change.** Patch 0012 drops the stack record on the regular path and
+`memcpy`s each field from the mapped meta file into `metadata_`
+(`docs/nested-sampling-wsclean-patches.md`). The short-record fallback and
+the BDA path are unchanged.
+
+**Result.** Driver: six real-draw MSs from an `NS_KEEP_MEASUREMENT_SETS=1`
+run (binary times at the 10th-90th percentile, 30-210ms in-run), each run
+with the search's `wsclean` arguments and production's malloc tunables. A
+sample is the summed wall time of one pass over the six MSs, after one warm
+pass.
+
+| driver | order | 0001-0011 | 0001-0012 | change |
+| --- | --- | ---: | ---: | ---: |
+| solo, pinned, 3 reps per MS | 6 ABBA/BAAB blocks | 719.3ms | 709.9ms | -1.3% (-1.0 to -1.8%, 6 of 6 blocks) |
+| 37 copies at once, one per CPU, 4 reps | 4 ABBA/BAAB blocks | 986.2/983.8/989.5/985.5ms | 978.3/977.3/983.0/977.2ms | -0.75% (-0.67 to -0.85%, 4 of 4 blocks) |
+
+Every one of the 16 concurrent arms beat the base arm next to it. Solo
+`perf` puts `CacheMeta` at 0.9% of the binary's samples, down from 2.9%.
+All 24 FITS data blocks over the six MSs are byte-identical, so the chains
+cannot change. Each driver time includes process start and the reorder,
+which the patch doesn't touch.
+
+In a raced 18-rank ABBA pair (600 dead), whole-run evals/s was 78.8 -> 82.3
+and 85.5 -> 79.5, and median binary time 116.1 -> 109.9ms and
+102.8 -> 105.3ms. Both follow the draws, not the binary. A <1% effect can't
+be seen end to end here (AGENTS.md: ~5% spread). log(Z) was
+0.09676/0.09672 (base) and 0.09613/0.09643 (new), within the async spread.
+
+It takes effect when `wsclean.sif` is rebuilt (`./ri images patch-wsclean`,
+or a Docker build). No change for a run on the shipped SIF.
+
+**Learned.**
+- `images/wsclean.sif` is still the 21 Sep build with patches 0001-0006
+  (round 43). This round's 36-rank profile search on a 0001-0011 SIF ran at
+  204.6 evals/s (154ms worker time per evaluation, 122.7ms binary). Round
+  53's 36-rank probe on the shipped SIF ran at 142.9 (213.8ms). Seeds and
+  run lengths differ, so this is not an A/B, but it agrees with round 43's
+  -16 to -27% binary time. Running `./ri images patch-wsclean` once is
+  still the biggest unclaimed speedup for production.
+- A fixed-size `memcpy` into a packed struct does not guarantee
+  forwardable stores. Check the generated code (`perf annotate`) rather
+  than trusting the source, and read fields from the mapping directly.
+- In-run, a WSClean evaluation is now ~80% binary and ~20% simulate
+  (30ms), with simulate dominated by `fastnoise.so` and `sincos`.

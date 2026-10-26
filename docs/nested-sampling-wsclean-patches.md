@@ -380,3 +380,22 @@ and WSClean is 1.0% faster with 37 copies running at once. The measurements
 are in [csd3-speed.md](csd3-speed.md), round 35.
 
 Upstream-shaped: it changes only how bytes are copied.
+
+## 0012: read each meta field straight from the mapping
+
+0011 did not remove the stall. The 38-byte packed `MetaRecordBuffer` is
+copied to the stack as two 16-byte stores and one overlapping 8-byte store,
+and `CacheMeta()` then reloads `u`..`time` as one 32-byte word. A load that
+spans two stores cannot be forwarded either, so every row still waited. In a
+36-rank search `CacheMeta` held 5.7% of the zygote's samples, two thirds of
+them on that one load. The patch drops the stack record on the regular path
+and `memcpy`s each field from the mapped meta file into `metadata_`, keeping
+`ReadMapped()` for a short record at the end of the file, so the bytes read
+and the position are unchanged. BDA files keep 0011's path.
+
+Solo over six real-draw MSs, `CacheMeta` falls from 2.9% to 0.9% of the
+binary's samples, and WSClean is 1.3% faster (1.0-1.8% in 6 of 6
+interleaved ABBA blocks). All 24 FITS data blocks are byte-identical. The
+measurements are in [csd3-speed.md](csd3-speed.md), round 55.
+
+Upstream-shaped: it changes only how bytes are copied.
