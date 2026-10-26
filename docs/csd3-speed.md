@@ -4152,7 +4152,8 @@ Faults per request, solo, by where they land (1.6k counted by perf):
   (8.2 against 16.7ms solo, 13.7 against 27.7ms at 36-way), as expected.
   Kernel time is still ~13% of a loaded request, but page faults are only
   a part of it: ~1.4k faults at a few microseconds each is ~3-5ms, so the
-  other ~9ms is syscalls, fork and exit.
+  other ~9ms is syscalls, fork and exit. (Wrong, as round 87 found:
+  at 36-way a fault costs ~6.6us, so faults are ~9.5ms of it.)
 - ~400 faults per request (a quarter) re-map library text and rodata the
   parent already has mapped. Linux's `fork` does not copy page-table
   entries of file-backed mappings that have no anonymous pages, so every
@@ -4218,3 +4219,65 @@ with N = 4.
   R2D2 CPU forward is closed to bit-identical changes on this torch build.
   The open R2D2 avenues stay the ones round 11 named: batching forwards
   across ranks, or merging GPU contexts.
+
+## Round 87 (diagnostic, two rejections): a zygote request's kernel time is page faults
+
+**Question.** Round 85 left ~9ms of a loaded request's ~14ms kernel time
+unexplained and guessed syscalls, fork and exit. `strace` cannot see
+WSClean here, so what is it, and can any of it be cut?
+
+**Method.** `.probe/r87/sc.c` is an `LD_PRELOAD` library passed to
+`wsclean-zygote` through round 85's `zy.py` (`PRE=`). It times every
+interposable file and memory call (open/read/lseek/stat/fopen/mmap/... ,
+wall clock) and `fork` in the parent. At `_exit` it writes each child's
+counts with its own `getrusage`, and the zygote's `wait4` writes the reaped
+rusage, so exit teardown is the reaped `stime` minus the child's own.
+Round 83's 0001-0017 `D.sif`, its 48 real-draw MSs, production malloc
+tunables, 2 timed passes (96 requests per driver), `.probe/r87/agg.py`
+sums them up.
+
+| per request | 1 copy | 36 copies, one per CPU |
+| --- | ---: | ---: |
+| request | 76.7-77.8 ms | 101.9 ms |
+| user | 68.8 ms | 88.5 ms |
+| sys, up to `_exit` | 5.9-6.7 ms | 11.6 ms |
+| sys, exit teardown (reaped - own) | 1.2 ms | 2.2 ms |
+| minor faults | 1.26-1.61k | 1.43k |
+| wrapped calls, wall | 1.65 ms | 2.09 ms |
+| of which `read` (548 calls) | 1.02 ms | 1.25 ms |
+| `lstat64` (210), `open64` (102), `fopen64` (44), `lseek64` (613) | 0.45 ms | 0.58 ms |
+| `fork` in the parent | 0.23 ms | - |
+
+So at 36-way ~9.5ms of the 13.8ms is page faults: ~1.4k faults at
+~6.6us each, not round 85's few us. The syscalls a request makes cost ~2ms
+(mostly `read`'s copy out of tmpfs), teardown ~2ms and `fork` ~0.2ms.
+
+**Rejected: THP off** (`prctl(PR_SET_THP_DISABLE)` in the zygote, inherited
+by every child). Faults go from ~1.3k to 5.28k a request, sys from 6.1 to
+7.7-9.2ms, teardown from 1.2 to 1.7ms, and the request from 76.7-77.8 to
+79.1-81.1ms solo (3 ABAB runs, +3%). CSD3's `always` THP is already saving
+the heap ~4k small faults.
+
+**Rejected: populate library text in the child.** Round 85 counted ~400
+faults per request that re-map library text the parent already has.
+`mlock` (populate) of each file-backed `r-xp` mapping right after `fork`,
+with or without `munlock`, takes a request to 85.1-85.5ms (+11%), and all
+`r-xp`/`r--p` mappings to 90.2-90.8ms (+17%), 2 runs each, interleaved.
+Populating maps every text page; fault-around (16 pages a fault) maps only
+what runs.
+
+**Learned.**
+- A loaded zygote request's kernel time is ~70% page faults (~9.5 of
+  13.8ms), ~15% syscalls and ~15% exit. `fork` itself is 0.23ms. Round 85's
+  "syscalls, fork and exit" guess was wrong.
+- The faults left are first touches of per-request memory, the heap
+  (~700) and the child's new mappings (~450). Fewer faults means touching
+  less memory per request, not a kernel or THP setting: both levers that
+  change how pages are mapped made it slower.
+- At 36-way a fault costs ~6.6us against ~3.5us solo, so the fault cost,
+  like simulate's (round 76), grows with the node's load.
+- An `LD_PRELOAD` library is a working substitute for `strace` here:
+  `apptainer exec ... env LD_PRELOAD=/dev/shm/...so` reaches the zygote
+  and its forks. Wrap `_exit` to dump a forked child's counters, since
+  `_exit` skips destructors, and don't wrap `clock_gettime` or `getenv`,
+  which the wrapper itself calls.
