@@ -3254,3 +3254,66 @@ worker time.
   per channel count.
 - casacore lists a re-added column's data manager last in `getdminfo()`, so
   a layout comparison has to sort by manager name.
+
+## Round 67 (rejected): blocked u/v divisions for the imaging weights
+
+**Profile.** This round profiled a SIF built by `patch-wsclean-sif.sh` with
+0001-0014. `perf record` ran 3 passes over the three largest real-draw MSs
+from round 24's `results/r24ms`, pinned to one CPU, with the search's
+`wsclean` arguments (`-size 32 32`, natural weighting, `-pol I`, `-j 1`).
+The self time splits like this:
+
+| function | share |
+| --- | ---: |
+| ducc0 `x2grid_c_helper<6>` (gridding) | 26.8% |
+| ducc0 `grid2x_c_helper<6>` (degridding) | 17.2% |
+| ducc0 `Wgridder` constructor (scan, baselines) | 4.2% |
+| `MsGridderData::CalculateWeightsImplementation<1>` | 4.1% |
+| `ApplyWeightsAndCorrections<4>` | 2.6% |
+| `WGriddingMSGridder::GridRegularMeasurementSet` | 2.3% |
+| `ImageWeights::Grid` | 2.0% |
+| `ReorderedMsReader` `CacheMeta` + `ReadMeta` + `ReadWeights` + `NextInputRow` | 5.8% |
+| `countRanges` (three symbols) | 3.0% |
+
+On the largest MS (388k rows, 6 channels, 4 major cycles, 1.1 s), the
+`-log-time` timeline shows the reorder at 137 ms. The natural-weights pass
+takes 29 ms and the w-limits pass 13 ms. Each major cycle spends 31-35 ms
+"loading data in memory" before 57-89 ms of gridding, and each predict
+spends 13 ms loading metadata, 58 ms predicting and 7-12 ms writing. The
+per-cycle load, at ~15% of the binary, is the largest cost outside ducc0.
+
+**What was tried.** `CalculateWeightsImplementation` and
+`ImageWeights::Grid` compute `u / (c / f[ch])` and `v / (c / f[ch])` per
+channel, row by row, on every pass. A candidate patch 0015 computed these
+quotients first, into 16-channel stack blocks the compiler can vectorise,
+then did the grid lookups. IEEE division gives the same quotient either
+way. Solo ABBA (6 blocks x 3 reps x 5 MSs, pinned, median of reps 2-3 per
+block):
+
+| MS | 0001-0014 | + 0015 | change | 0015 faster |
+| --- | ---: | ---: | ---: | ---: |
+| largest | 1109.2 ms | 1127.8 ms | +1.7% | 0/6 |
+| 2nd largest | 557.8 ms | 565.2 ms | +1.3% | 0/6 |
+| 3rd largest | 404.2 ms | 410.5 ms | +1.6% | 0/6 |
+| median-size | 125.7 ms | 127.6 ms | +1.5% | 2/6 |
+| smallest | 54.5 ms | 54.8 ms | +0.5% | 2/6 |
+
+All 20 FITS data blocks were byte-identical, but the patch is slower. Under
+perf, `CalculateWeightsImplementation` rose from 4.1% to 5.5%, while
+`ImageWeights::Grid` fell only from 2.0% to 1.7%. It was not shipped.
+
+**Learned.**
+- `perf annotate` on the shipped code shows the divisions were never the
+  cost. With 1-8 channels per row, the function is per-row overhead: the
+  `is_selected` zeroing loop takes ~15% of its samples, and the double to
+  int conversions and the `_grid` load take most of the rest. Blocking adds
+  stack traffic and vector prologues for a loop that runs at most 8 times.
+- Per-channel restructuring doesn't pay at 1-8 channels per row. Any win
+  in the weights path has to remove per-row work. One option is to
+  compute image weights once per evaluation rather than on every major
+  cycle, since they are identical on every pass.
+- `perf` can resolve symbols for a SIF's binaries through `--symfs` over a
+  directory holding copies taken with `apptainer exec <sif> cat <path>`.
+  Under a per-run `apptainer exec`, ~6% of samples are the host's libz,
+  which is squashfs decompression at container start. A zygote-run search
+  doesn't pay this.
