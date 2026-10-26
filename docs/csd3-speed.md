@@ -4033,3 +4033,46 @@ changes, and `meqtrees.sif` gets it at its next rebuild.
   costs ~0.3-0.4 ms in-run. The imaginary noise pass and `putcol`'s copy
   into casacore's tiles are the two left; the first is fixed by the stream
   order, the second by casacore.
+
+## Round 83 (diagnostic): the binary's profile over a search's mix of evaluations
+
+**Question.** Rounds 69 and 74 profiled the *largest* real-draw MS, where
+ducc0's kernels are 54% of the binary. Most evaluations are median-sized or
+smaller (round 74's in-run gain was half its solo one). Over a search's own
+mix of evaluations, is anything outside ducc0 big enough to patch?
+
+**Run.** Round 63's 48 real draws (`.probe/params15.jsonl`), built through
+the warm observation cache (`.probe/r83/gen.py`; XX/YY template MSs, TIME
+in the SSM, as a run sees them), imaged once each by a fresh 0001-0017
+build (`scripts/patch-wsclean-sif.sh`; its `make install` binary keeps its
+symbols) with a search's flags, one pinned CPU, 3 passes under `perf record
+-F 2000` (`.probe/r83/all.sh`). 48 images take 6.3 s, ~131 ms each with
+process start. Addresses mapped with `nm -C` (`.probe/r83/map.py`).
+
+| where | share of samples | share without process start |
+| --- | ---: | ---: |
+| `ld.so` (process start; the zygote forks past it in a run) | 14.3% | - |
+| ducc0 `x2grid_c_helper<6>` (gridding) | 21.4% | 25% |
+| ducc0 `grid2x_c_helper<6>` (degridding) | 13.2% | 15% |
+| ducc0 scan, `countRanges`, `Baselines` | 5.0% | 6% |
+| WSClean's own code, ~25 functions | 20.6% | 24% (largest: `GridRegularMeasurementSet` 2.0, `ImageWeights::Grid` 1.9, `CacheMeta` 1.8, `NextInputRow` 1.4) |
+| libc (memcpy/malloc family) | 7.3% | 8.5% |
+| casacore (tables + casa) | 6.1% | 7% (largest: `IPosition` 1.8) |
+| FFTW | 4.1% | 4.8% |
+| libz (squashfuse paging the SIF) | 2.6% | 3% |
+
+**Learned.**
+- Over a search's mix, ducc0 is ~46% of the binary and its two kernels
+  40%. Outside them nothing is above ~2.3% of the binary: every remaining
+  WSClean target is worth under ~1% of an evaluation, the size of rounds
+  59 and 74. The next large WSClean win has to come from the kernels.
+- The x2grid inner loop (cmav instantiation, `supp` 6, AVX2) is already
+  tight: per visibility, two 8-wide Horner chains for the kernel
+  (`eval2`) and 12 FMAs into the local buffer. A cheaper kernel would change
+  image bits, and round 27 found AVX-512 changes them too.
+- A simulate harness only gets template MSs if each draw's observation is
+  first built at the 20-minute horizon (`make_ms` with `observation_minutes
+  20`, as `.probe/r82/p.py` does). Calling `simulate()` on a cold cache, even
+  twice, gives makems' 4-correlation MSs with TIME in the ISM, which make
+  casacore look 2x more expensive in the binary (`ISMBucket::getInterval`
+  1.7%).
