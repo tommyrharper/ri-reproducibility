@@ -3886,3 +3886,39 @@ anyone will see end to end. No search ran, so there is no
 - A simulate harness must name its MS `sim.ms` in every call: makems'
   `MSName=` is part of the observation-cache key, so a different name
   misses the cache and silently times makems and the 4-correlation MS.
+
+## Round 80: the phase ramp's output left unzeroed
+
+**Change.** `_phase_ramp()` allocated its `(rows, chans, n_corr)` complex64
+output with `np.zeros` and then had `fastnoise.c`'s `phase_ramp_c64()`
+write correlations 0 and `n_corr - 1` of it. For the 2-correlation XX/YY
+template (round 66) and `--mat-only`'s 1-correlation call, those are every
+element, so the zeroing was a full extra write pass over the largest array
+in simulate. It now uses `np.empty` when the C ramp runs and `n_corr <= 2`.
+4-correlation data (makems' own MS, the first evaluation of a new
+observation) and numpy's fallback keep `np.zeros`, since they leave XY and
+YX to the zeros.
+
+**Results.** Unchanged. `.probe/r80/ident.py` simulates round 63's 48 real
+draws in each arm and hashes every main-table column: all 48 hashes match,
+including the 4-correlation makems MSs. `./ri self-check simulate` passes.
+
+**In-run** (`.probe/r80/run.sh`, round 79's harness on the same CPU set:
+34 pinned `meqtrees.sif` copies, 4 passes of the 48 draws each, ABBA):
+
+| pair | A (zeros) wall / user ms | B (empty) wall / user ms |
+|---|---|---|
+| 1 (AB) | 23.65 / 15.13 | 23.24 / 14.75 |
+| 2 (BA) | 23.68 / 15.20 | 23.08 / 14.67 |
+| 3 (AB) | 23.49 / 15.04 | 23.14 / 14.70 |
+| 4 (BA) | 23.51 / 15.07 | 23.09 / 14.70 |
+| mean | 23.58 / 15.11 | 23.14 / 14.71 |
+
+Simulate is 0.44 ms (-1.9%) faster in-run, in 4 of 4 pairs, nearly all of
+it user time. That is ~0.3% of a ~150 ms WSClean evaluation, too small to
+see end to end, so no search ran and there is no `benchmarks.jsonl` row.
+
+**Learned.**
+- An `np.zeros` buffer that a C kernel then overwrites whole is a wasted
+  pass that matters under L3 pressure (round 76): it costs 0.4 ms in-run
+  here. Check what the kernel writes before zeroing.

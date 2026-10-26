@@ -834,7 +834,11 @@ def point_source_visibilities(
 
 
 def _phase_ramp(delay_m: np.ndarray, freqs_hz: np.ndarray, flux: float, n_corr: int, lib) -> np.ndarray:
-    data = np.zeros((len(delay_m), len(freqs_hz), n_corr), dtype=np.complex64)
+    # The C ramp writes correlations 0 and n_corr - 1, i.e. every element of
+    # 1- and 2-correlation data, so only 4-correlation data needs the zeros:
+    # a full extra write pass otherwise (docs/csd3-speed.md, round 80).
+    shape = (len(delay_m), len(freqs_hz), n_corr)
+    data = np.empty(shape, np.complex64) if lib is not None and n_corr <= 2 else np.zeros(shape, np.complex64)
     if lib is None:
         vis = flux * np.exp((2j * math.pi / SPEED_OF_LIGHT) * np.outer(delay_m, freqs_hz))
         data[:, :, 0] = vis
