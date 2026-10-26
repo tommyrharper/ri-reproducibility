@@ -270,6 +270,11 @@ rank then died on `mkdir`. Four bounds keep a long run inside it, all in
 - `NS_MEQSERVER_RECYCLE` (20): predicts before a simulate worker replaces its
   meqserver, which holds every MS it has written open and so pins it in tmpfs.
 
+Those bounds still leave ~2 files per evaluation, ~970 per unit of nlive for a
+converged 15-repeat run, so an nlive of ~1000 cannot finish even in an empty
+quota. A search warns at the start when its estimate passes what its project
+has left (`ns_warn_file_quota`, `docs/csd3-speed.md` round 91).
+
 A failure storm is worse here than slow: `FAILURE_OBJECTIVE` is the likelihood
 PolyChord maximises, so thousands of infrastructure failures took over the live
 points and the run "converged" on them.

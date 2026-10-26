@@ -166,6 +166,31 @@ ns_refuse_unmounted_run() {
   exit 1
 }
 
+# Even stripped as it goes, an evaluation leaves ~2 files (its dir and
+# metrics.json), and a converged run makes ~9 x nlive dead points at ~3.4 x
+# num_repeats evaluations each: 150k files for the 71k evaluations of a
+# 24-rank nlive 150 R2D2 run (docs/csd3-speed.md, round 91). So ~7 files per
+# repeat per dead point; a run sized past the free file quota dies on EDQUOT
+# part way through. Warns, never refuses: the estimate is rough, and only
+# Lustre's project quota (CSD3's hpc-work) is read.
+#   ns_warn_file_quota <run dir> <nlive> <num repeats> <max ndead>
+ns_warn_file_quota() {
+  local project ndead need free
+  command -v "${LFS:-lfs}" >/dev/null 2>&1 || return 0
+  project="$("${LFS:-lfs}" project -d "$1" 2>/dev/null | awk '{ print $1 }')"
+  [ "${project:-0}" -gt 0 ] 2>/dev/null || return 0
+  ndead="$4"
+  [ "${ndead}" -gt 0 ] 2>/dev/null || ndead=$((9 * $2))
+  need=$((7 * $3 * ndead))
+  # Header, then: filesystem kbytes quota limit grace files quota limit grace.
+  free="$("${LFS:-lfs}" quota -p "${project}" "$1" 2>/dev/null \
+    | awk 'NR > 2 && $8 + 0 > 0 { print $8 - $6; exit }')"
+  [ -n "${free}" ] && [ "${need}" -gt "${free}" ] || return 0
+  echo "WARNING: this run may make ~${need} files (nlive $2, num_repeats $3), and" \
+    "its project quota has ${free} left: a full quota kills it with EDQUOT. Delete" \
+    "finished runs' evaluations/ or lower --nlive (docs/cluster.md)." >&2
+}
+
 # `bash scripts/lib/run-config.sh --self-check` - that what is written can be
 # sourced back to the same values, including a metric that needs quoting.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
@@ -322,6 +347,24 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   touch "${_dir}/elsewhere/R2D2_A1/R2D2_UNet_N1.ckpt"
   ( ns_refuse_missing_checkpoints "${_dir}/elsewhere" R2D2_A1 ) ||
     { echo "FAIL: CHECKPOINTS_DIR must be what decides where to look"; exit 1; }
+
+  # The file-quota warning, against a stand-in lfs with FREE files left on
+  # project 110845 (FREE empty: no project, as off Lustre).
+  # shellcheck disable=SC2016  # expanded by the stand-in, not here
+  printf '%s\n' '#!/bin/sh' \
+    'case "$1" in project) [ -n "${FREE}" ] && echo "110845 P $3" || echo "0 - $3" ;;' \
+    'quota) echo "Disk quotas for prj 110845 (pid 110845):"' \
+    '  echo "Filesystem kbytes quota limit grace files quota limit grace"' \
+    '  echo ". 1 2 3 - $((1048576 - FREE)) 1048576 1048576 -" ;; esac' >"${_dir}/lfs"
+  chmod +x "${_dir}/lfs"
+  quota_warns() { LFS="${_dir}/lfs" FREE="$1" ns_warn_file_quota "${_dir}" "$2" 15 "$3" 2>&1 | grep -c EDQUOT; }
+  # nlive 150 converged: 7 x 15 x 1350 = 141,750 files.
+  [ "$(quota_warns 650000 150 -1)" = 0 ] || { echo "FAIL: 650k free must fit nlive 150"; exit 1; }
+  [ "$(quota_warns 100000 150 -1)" = 1 ] || { echo "FAIL: 100k free must warn for nlive 150"; exit 1; }
+  [ "$(quota_warns 100000 150 900)" = 0 ] || { echo "FAIL: max-ndead must bound the estimate"; exit 1; }
+  [ "$(quota_warns '' 5000 -1)" = 0 ] || { echo "FAIL: no project quota must stay quiet"; exit 1; }
+  [ "$(LFS="${_dir}/missing" ns_warn_file_quota "${_dir}" 5000 15 -1 2>&1 | grep -c EDQUOT)" = 0 ] \
+    || { echo "FAIL: no lfs must stay quiet"; exit 1; }
 
   rm -rf "${_dir}"
   echo "run-config self-check passed"

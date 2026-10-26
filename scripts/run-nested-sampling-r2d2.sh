@@ -44,6 +44,7 @@ if [ -n "${OUTPUT_DIR:-}" ]; then
 else
   OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" r2d2-vlaa-)"
 fi
+ns_warn_file_quota "${OUTPUT_DIR}" "${NS_NLIVE}" "${NS_NUM_REPEATS}" "${NS_MAX_NDEAD}"
 # On a cluster login node the search leaves here: the claimed directory and the
 # whole environment go to a Slurm job that runs this script again inside the
 # allocation, where the cores and memory below are the job's (docs/cluster.md).

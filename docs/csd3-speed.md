@@ -4467,3 +4467,60 @@ cluster run gets it without a rebuild.
 - What is left of simulate solo: the C ramp and noise ~6 ms, the main
   table's 19 putcols ~2.5 ms, its one open/close ~0.5 ms, and
   `extend_template()`'s own numpy (uvw, tiles) ~0.7 ms.
+
+## Round 91 (diagnostic): the file quota caps a run's size; simulate's table writes re-timed
+
+**Question.** With rounds 72-90 a production-shaped WSClean search runs at
+~250 evals/s. Round 89 noted each 900-dead run leaves ~58k files. What does
+that make the largest run the 1M-file `hpc-work` quota can finish, and is
+anything left in simulate's casacore writes after round 90?
+
+**Files.** Counted with `lfs find` (57 s, no Slurm) in the last converged
+production run, `r2d2-vlaa-20260922T174616Z` (24 ranks, nlive 150, 15
+repeats, run to convergence): 149,976 files for 71,395 evaluations, 2.10 an
+evaluation (74,713 directories). Its `.stats`: 1,373 dead points (9.2 x
+nlive) and 69,225 likelihood calls (3.4 x num_repeats per dead point).
+Round 89's 36-rank WSClean runs give the same ~2 files an evaluation. The
+project quota (`lfs quota -p 110845`) had 398,660 of 1,048,576 used.
+
+| run | evaluations | files | of an empty quota | of today's ~650k free |
+| --- | ---: | ---: | ---: | ---: |
+| nlive 150, converged | ~71k | ~150k | 14% | 23% |
+| nlive 500 (`docs/cluster.md`'s example) | ~240k | ~490k | 47% | 75% |
+| nlive 1000 | ~470k | ~970k | 93% | does not fit |
+
+At 250 evals/s, 650k files is ~22 minutes of WSClean evaluations. A run
+that hits the quota dies on `EDQUOT` with every rank failing `mkdir`
+(round 16), and that is lost work no speed-up recovers.
+
+**Change.** `ns_warn_file_quota()` (`scripts/lib/run-config.sh`): when a
+search starts, both run scripts estimate its files as 7 x num_repeats x
+dead points (`--max-ndead`, or 9 x nlive when it is -1) and warn if that is
+more than the run directory's Lustre project has left (`lfs project -d`,
+`lfs quota -p`: ~12 ms, no Slurm call). Off Lustre, or with no project
+quota, it is silent. It warns and never refuses, because the estimate is
+rough. The run-config self-check covers fit, overflow, a `--max-ndead`
+bound, no project and no `lfs`.
+
+**Simulate's main-table writes.** Round 90 left ~2.5 ms of putcols. Timed
+per column (`.probe/r91/cols.py`, 48 real draws x 3, one pinned CPU, 12.9
+ms a call): DATA 0.76, UVW 0.51, ANTENNA1 0.28, ANTENNA2 0.23, TIME 0.22,
+TIME_CENTROID 0.22, close 0.32, addrows 0.29, INTERVAL 0.07 ms. Setting
+`setmaxcachesize` on the StandardStMan to 64MB before the writes changed
+nothing (12.93/12.92 against 12.99/12.98 ms, per-column times equal to 0.01
+ms), so the 32KB buckets of round 33 are not cache-bound. The four scalar
+columns are ~11 ns a row, about casacore's per-row put cost.
+
+**Learned.**
+- At ~2 files an evaluation the quota, not CPU time, bounds a run's size:
+  about 970 files per unit of nlive for a converged 15-repeat run. Getting
+  past it needs fewer inodes per evaluation (round 53's idea: no eval
+  directory for the ~80% of records that hold only `metrics.json`, or
+  per-rank record files), which every record reader would have to follow.
+- `lfs project -d <dir>` and `lfs quota -p <id> <dir>` read the quota of
+  the project that holds a directory in ~12 ms. `quota -w` lists it under
+  `/rds-d6/user/<user>`, which does not prefix-match the `/rds/user/...`
+  paths runs use.
+- Simulate's casacore side is now near its floor: what is left is the C
+  ramp and noise (~6 ms solo) and ~3.5 ms of table opens, puts and closes
+  that no bucket setting moves.
