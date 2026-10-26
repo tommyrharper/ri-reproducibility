@@ -2034,12 +2034,23 @@ _RECORD_WRITES: list[Any] = []
 _WRITTEN_RECORDS: dict[str, str] = {}
 
 
+# The writer must not share the rank's pinned CPU. Every mkdir in evaluations/
+# holds the directory's lock across its Lustre round trip, so a writer that then
+# waits behind its rank's busy worker for the core stalls all 36 ranks' writers:
+# ~570ms a mkdir there while scoring, against 0.13ms in a subdirectory
+# (docs/csd3-speed.md, round 54).
+def _unpin_thread() -> None:
+    if _UNPINNED_CPUS:
+        os.sched_setaffinity(0, _UNPINNED_CPUS)  # this thread only, on Linux
+
+
 def write_records_in_background() -> None:
     global _RECORD_WRITER
     from concurrent.futures import ThreadPoolExecutor
 
     if _RECORD_WRITER is None:
-        _RECORD_WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="record-writer")
+        _RECORD_WRITER = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="record-writer", initializer=_unpin_thread)
         atexit.register(drain_record_writes)
 
 
@@ -2437,11 +2448,12 @@ def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
 # docs/csd3-speed.md). The CPU is claimed with a lock held for the rank's
 # life, so two searches sharing one allocation never pin onto the same one.
 _PINNED_CPU: int | None = None
+_UNPINNED_CPUS: list[int] = []
 
 
 def pin_rank_cpu() -> int | None:
     """Claim a CPU for this rank and its workers, or None if there are too few."""
-    global _PINNED_CPU
+    global _PINNED_CPU, _UNPINNED_CPUS
     import fcntl
 
     if not hasattr(os, "sched_setaffinity"):  # macOS
@@ -2463,7 +2475,7 @@ def pin_rank_cpu() -> int | None:
             continue
         # fd stays open: the lock is released when this rank exits.
         os.sched_setaffinity(0, {cpu})
-        _PINNED_CPU = cpu
+        _PINNED_CPU, _UNPINNED_CPUS = cpu, cpus
         return cpu
     return None
 
@@ -2883,6 +2895,9 @@ def self_check_cpu_pinning() -> None:
                 claims.append(pin_rank_cpu())
             assert None not in claims and claims[0] != claims[1], claims
             assert os.sched_getaffinity(0) == {claims[1]}
+            write_records_in_background()
+            assert _RECORD_WRITER.submit(os.sched_getaffinity, 0).result() == allowed
+            drain_record_writes(flush_held=False)
             worker = _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR")
             assert worker is not None
             assert os.sched_getaffinity(stand_in.pid) == {claims[1]}, os.sched_getaffinity(stand_in.pid)

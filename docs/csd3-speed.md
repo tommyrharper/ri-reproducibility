@@ -2494,3 +2494,67 @@ operations per record (no per-record eval dir for the 80% that hold only
 `metrics.json`, or appending records in batches to a per-rank file); or
 sharding `evaluations/`. All but the first change a layout that resume,
 health and profile read.
+
+## Round 54: the record writer no longer shares its rank's pinned CPU
+
+**Question.** Round 53 found that `mkdir` inside a live `evaluations/` takes
+130-600ms while a run scores, against ~0ms in a sibling directory, and left
+the cause open. What makes the live directory slow?
+
+**Method.** Three probe runs (HEAD a417def, 36 ranks, nlive 150, 15
+repeats, 800 dead, seed 1, async). While each one scored, an outside process
+timed mkdir, write and rename in the live `evaluations/` and in a series of
+control directories. strace (`--seccomp-bpf`, every process I own) showed
+what touches the directory. Then a raced 18-rank ABBA pair (600 dead,
+seed 4242) against a tree copy of a417def. Scripts: `.probe/r54run.sh`,
+`.probe/r54ab.sh`.
+
+**What it is not.** It is not another reader. No process has a cwd or fd in
+`evaluations/`, and strace shows only the record writers using it. The
+stall watchdog's `find -maxdepth 2` doesn't slow concurrent creates either:
+a 24k-entry synthetic dir kept 0.12ms mkdirs with `find` looping over it.
+Load and concurrency alone don't explain it. Under the same live load, 36
+writer processes in a fake run's `evaluations/` kept 0.12ms mkdirs (sibling
+of the run, 1175 records/s from 36 threads in one directory). The decisive
+control was a fresh subdirectory *inside* the live `evaluations/`, which
+took 0.13ms while `evaluations/` itself took 560ms. Throughout, at most 0-4
+modify RPCs were in flight from the node (`mdc.*.rpc_stats`). So the
+creates were queueing in the client, not at the MDS.
+
+**Cause.** The VFS takes the parent directory's lock for every `mkdir`, so
+all 36 ranks' writers serialise on `evaluations/`, and each one holds that
+lock across its Lustre round trip. `pin_rank_cpu()` (round 16) pins each
+rank to one CPU, and the writer thread inherits the pin. So the CPU the
+writer must wake on is the one where its rank's WSClean or MeqTrees worker
+is running flat out. Each lock holder waits for that core while 35 others
+wait for it, and an otherwise ~0.1ms create costs a scheduler wait times
+the queue. When scoring stops (the end-of-run drain, or strace freezing the
+workers) the same writers do ~1000 records/s, which is round 53's
+observation.
+
+**Change.** `write_records_in_background()` starts the writer with an
+initializer that resets that thread's affinity to the CPUs the rank had
+before it was pinned (`_unpin_thread`, `_UNPINNED_CPUS`). The rank and its
+workers stay pinned. The CPU-pinning self-check now asserts that the writer
+thread runs on the full set, and fails with the initializer removed.
+
+**Result.** Raced 18-rank pairs, ABBA (base a, new a 20s later; then the
+reverse):
+
+| arm | evals | eval span (s) | evals/s | ms/eval | drain (s) | record lag median / p90 (s) | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| base a | 17349 | 246.9 | 70.27 | 230.4 | 7.4 | 38.2 / 79.0 | 0.09656 |
+| new a | 17672 | 261.6 | 67.54 | 234.3 | 0.0 | -0.5 / -0.1 | 0.09674 |
+| new b | 17500 | 269.4 | 64.96 | 235.2 | 0.0 | -0.5 / -0.1 | 0.09705 |
+| base b | 18280 | 284.0 | 64.37 | 240.7 | 8.9 | 42.6 / 87.6 | 0.09590 |
+
+Measured from outside during pass a, mkdir in the live `evaluations/` took
+180-240ms in the base arm and 0.14-9ms in the new one. The record lag
+(metrics.json mtime minus `ended_epoch`) falls from a median of ~40s to
+the clock-skew floor. The ~200s maximum in both arms is the held extremes,
+which are flushed after scoring by design (round 51). The end-of-run drain
+goes from 7-9s to 0s. evals/s is unchanged within this host's ~5% spread
+(means 66.3 new, 67.3 base; ms/eval 234-235 against 230-241). log(Z) is
+within the async spread. The gain is in what a run leaves behind, not in
+its rate: a job killed mid-run now loses seconds of records, not minutes,
+and the drain no longer grows with run length.

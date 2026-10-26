@@ -79,6 +79,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | A run publishes only the held extremes it keeps; prune lists each eval dir once | `common.py` `finished_run_records()` | A production search (36 ranks, to convergence) spent 52.7s of 389.5s after its last evaluation; now 37.0s (-30%), same kept images ([csd3-speed](csd3-speed.md), round 51) |
 | Rank 0 gets the records over MPI; prune skips dirs that hold only a record | `common.py` `finished_run_records()`, `prune_run_artefacts()` | Post-run record read 7.5s to 1.0s and prune 9.5s to 5.3s in a production search (36 ranks); found the record writer lagging up to ~3 min behind scoring ([csd3-speed](csd3-speed.md), round 52) |
 | (rejected) Records written by a helper process over a pipe instead of a thread | - | Drain 13-18s to 0s and lag no longer grows, but -11% evals/s raced at 18 ranks (58.5/62.3 vs 68.4/67.9): the bounded pipe makes ranks wait on Lustre. The writer is slow because `mkdir` in a live `evaluations/` takes 130-600ms, not mainly the GIL ([csd3-speed](csd3-speed.md), round 53) |
+| Record-writer thread unpinned from its rank's CPU | 0 evals/s (in noise) | `mkdir` in a live `evaluations/` 180-240ms to 0.14-9ms; record lag median ~40s to ~0s; end-of-run drain 7-9s to 0s. The writer held the directory's lock while waiting for a core its rank's worker was saturating ([csd3-speed](csd3-speed.md), round 54) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
