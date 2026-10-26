@@ -3983,3 +3983,53 @@ calls each.
 - pypolychord's `dumper` runs on the root at every `update_files` and once
   at the very end, with an empty `live` array only on that last call. It is
   the one Python hook between the final write and the cleanup wait.
+
+## Round 82: the phase ramp written with its noise
+
+**Change.** Simulate built DATA in three passes over the array: the C phase
+ramp wrote it, then `add_normal_f32_xxyy2()` read and rewrote every real
+half, then again every imaginary half (the imaginary draws are the second
+half of numpy's stream, so they cannot come first). New
+`phase_ramp_c64_xxyy2()` in `fastnoise.c` shares `phase_ramp_c64()`'s body
+and adds each element's XX and YY real noise while it is still in L1, so
+the predict is written once with its noise. The imaginary pass is
+unchanged. `point_source_visibilities()` takes the generator and sigma and
+uses the fused kernel for 2-correlation data with a plain PCG64 stream;
+anything else (4-correlation makems MSs, numpy fallback, an older
+`fastnoise.so`) takes the old ramp-then-noise path. The kernel is checked
+against numpy's ramp and numpy's 4-correlation fill once per process
+(`_ramp_xxyy2_agrees()`, ~770 rejection-path draws a half) and in
+`self_check_fast_noise()`.
+
+**Results.** Unchanged. `.probe/r82/ident.py` (round 80's) hashes every
+main-table column of round 63's 48 real draws per arm: all 48 match.
+`self_check_fast_noise()` passes against the new library, and a 351k-row
+fill is byte-identical to the separate passes for two seeds.
+
+**Solo**, 351k rows x 1 channel, median of 30: 11.76 to 11.50 ms (-2%).
+
+**In-run** (`.probe/r82/run.sh`, round 79's harness: 34 pinned
+`meqtrees.sif` copies, 4 passes of the 48 draws each, ABBA; the arms differ
+only in their bound `nested_sampling` tree and `fastnoise.so`):
+
+| pair | A (separate) wall / user ms | B (fused) wall / user ms |
+|---|---|---|
+| 1 (AB) | 23.09 / 14.72 | 22.77 / 14.38 |
+| 2 (BA) | 23.12 / 14.71 | 22.71 / 14.31 |
+| 3 (AB) | 23.11 / 14.73 | 22.80 / 14.40 |
+| 4 (BA) | 23.06 / 14.69 | 22.74 / 14.43 |
+| mean | 23.10 / 14.71 | 22.76 / 14.38 |
+
+Simulate is 0.34 ms (-1.5%) faster in-run, in 4 of 4 pairs, all of it user
+time, against 0.26 ms solo: the saved pass is worth more under L3 pressure,
+as round 76 predicted. That is ~0.2% of a ~150 ms WSClean evaluation, too
+small to see end to end, so no search ran and there is no
+`benchmarks.jsonl` row. A run needs a `fastnoise.so` built from this
+source: `start-sidecars.sh` rebuilds its host copy when `fastnoise.c`
+changes, and `meqtrees.sif` gets it at its next rebuild.
+
+**Learned.**
+- With round 80's zeroing gone, each remaining DATA-sized pass in simulate
+  costs ~0.3-0.4 ms in-run. The imaginary noise pass and `putcol`'s copy
+  into casacore's tiles are the two left; the first is fixed by the stream
+  order, the second by casacore.

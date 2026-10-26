@@ -220,10 +220,10 @@ static inline int rounds_alike(double v, double err) {
   return (float)(v - err) == (float)(v + err);
 }
 
-__attribute__((target_clones("avx2", "default")))
-void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
-                    ptrdiff_t n_chan, double k, double flux, float *out,
-                    ptrdiff_t n_corr) {
+static inline __attribute__((always_inline))
+void ramp_body(const double *delay, ptrdiff_t n_rows, const double *freqs,
+               ptrdiff_t n_chan, double k, double flux, float *out,
+               ptrdiff_t n_corr, uint64_t *state, double scale) {
   /* flux * np.exp(1j * k * np.outer(delay, freqs)), cast to complex64, into
    * correlations 0 and n_corr - 1 of a (rows, chans, n_corr) array. numpy's
    * complex exp is libm's cexp, which for a zero real part is sincos of the
@@ -239,6 +239,9 @@ void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
    * the scalar phase stores and vector loads apart, which would otherwise
    * stall on store forwarding. */
   double err = 1e-14 * fabs(flux);
+  uint64_t hi = state ? state[0] : 0, lo = state ? state[1] : 0;
+  uint64_t inc_hi = state ? state[2] : 0, inc_lo = state ? state[3] : 0;
+  u128 inc = ((u128)inc_hi << 64) | inc_lo;
   v4d x[BLOCK / 4], re[BLOCK / 4], im[BLOCK / 4];
   for (ptrdiff_t i0 = 0; i0 < total; i0 += BLOCK) {
     ptrdiff_t m = total - i0 < BLOCK ? total - i0 : BLOCK;
@@ -271,6 +274,37 @@ void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
       }
       v[0] = v[last] = (float)a;
       v[1] = v[last + 1] = (float)b;
+      if (state) {
+        /* xxyy_body()'s real half for this element, while v is in L1. */
+        v[0] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
+        skip_normal(&hi, &lo, inc_hi, inc_lo, inc);
+        skip_normal(&hi, &lo, inc_hi, inc_lo, inc);
+        v[2] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
+      }
     }
   }
+  if (state) {
+    state[0] = hi;
+    state[1] = lo;
+  }
+}
+
+__attribute__((target_clones("avx2", "default")))
+void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
+                    ptrdiff_t n_chan, double k, double flux, float *out,
+                    ptrdiff_t n_corr) {
+  ramp_body(delay, n_rows, freqs, n_chan, k, flux, out, n_corr, NULL, 0.0);
+}
+
+/* phase_ramp_c64() into 2-correlation data, then add_normal_f32_xxyy2()'s
+ * real halves, in one pass: the predict is written with its noise rather
+ * than written and then read back and written again, which under a full
+ * node's L3 pressure is a DATA-sized trip to memory (docs/csd3-speed.md,
+ * round 82). The imaginary halves still come from add_normal_f32_xxyy2(),
+ * because they are the second half of the stream. */
+__attribute__((target_clones("avx2", "default")))
+void phase_ramp_c64_xxyy2(const double *delay, ptrdiff_t n_rows, const double *freqs,
+                          ptrdiff_t n_chan, double k, double flux, float *out,
+                          uint64_t state[4], double scale) {
+  ramp_body(delay, n_rows, freqs, n_chan, k, flux, out, 2, state, scale);
 }

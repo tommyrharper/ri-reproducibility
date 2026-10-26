@@ -824,13 +824,44 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
 
 
 def point_source_visibilities(
-    uvw: np.ndarray, freqs_hz: np.ndarray, source_flux_jy: float, l_rad: float, m_rad: float, n_corr: int
+    uvw: np.ndarray, freqs_hz: np.ndarray, source_flux_jy: float, l_rad: float, m_rad: float, n_corr: int,
+    rng: np.random.Generator | None = None, sigma: float = 0.0
 ) -> np.ndarray:
     """Stokes-I point source at (l, m): what the Meow forest predicts, to float32
-    rounding, at ~1/30 of its cost. self_check_analytic_predict() is the guard."""
+    rounding, at ~1/30 of its cost. self_check_analytic_predict() is the guard.
+    sigma > 0 adds add_complex_noise(rng, ..., sigma, xxyy=True)'s noise."""
     n_minus_1 = math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0
     delay_m = uvw @ np.array([l_rad, m_rad, n_minus_1])
-    return _phase_ramp(delay_m, freqs_hz, source_flux_jy, n_corr, _fastramp())
+    if sigma and n_corr == len(XXYY) and _plain_pcg(rng):
+        fused = _fastramp_xxyy2()
+        if fused is not None:
+            return _ramp_xxyy2(delay_m, freqs_hz, source_flux_jy, rng, sigma, fused)
+    data = _phase_ramp(delay_m, freqs_hz, source_flux_jy, n_corr, _fastramp())
+    if sigma:
+        add_complex_noise(rng, data, sigma, xxyy=True)
+    return data
+
+
+def _plain_pcg(rng: np.random.Generator) -> bool:
+    state = rng.bit_generator.state
+    return state["bit_generator"] == "PCG64" and not state["has_uint32"]
+
+
+def _ramp_xxyy2(delay_m: np.ndarray, freqs_hz: np.ndarray, flux: float, rng: np.random.Generator,
+                sigma: float, fused) -> np.ndarray:
+    # The ramp and the real halves of the noise in one pass, then the
+    # imaginary halves: one DATA-sized pass fewer (docs/csd3-speed.md, round 82).
+    data = np.empty((len(delay_m), len(freqs_hz), len(XXYY)), np.complex64)
+    delay_m = np.ascontiguousarray(delay_m, dtype=np.float64)
+    freqs_hz = np.ascontiguousarray(freqs_hz, dtype=np.float64)
+    k = ((2j * math.pi) / SPEED_OF_LIGHT).imag
+    bitgen, words = _pcg_words(rng)
+    fused(delay_m.ctypes.data, len(delay_m), freqs_hz.ctypes.data, len(freqs_hz), k, flux, data.ctypes.data,
+          words.ctypes.data, sigma)
+    _fastnoise_xxyy2()(words.ctypes.data, sigma, data.ctypes.data + 4, 2 * data.size, 2)
+    bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
+    rng.bit_generator.state = bitgen
+    return data
 
 
 def _phase_ramp(delay_m: np.ndarray, freqs_hz: np.ndarray, flux: float, n_corr: int, lib) -> np.ndarray:
@@ -964,6 +995,34 @@ def _fastnoise_xxyy2():
                  _xxyy2_agrees)
 
 
+def _ramp_xxyy2_agrees(fused) -> bool:
+    # _ramp_agrees()'s phases, ~770 draws a half through the ziggurat's
+    # rejection paths, against numpy's ramp and numpy's 4-correlation fill.
+    if _fastnoise_xxyy2() is None:
+        return False
+    rng = np.random.default_rng(12345)
+    delay_m, freqs_hz = np.append(rng.normal(0.0, 300.0, 3999), 4e4), 1e9 + np.arange(4) * 2.7e9
+    for flux in (1.0, 0.37):
+        full = np.zeros((len(delay_m), len(freqs_hz), STREAM_CORRELATIONS), np.complex64)
+        full[..., XXYY] = _phase_ramp(delay_m, freqs_hz, flux, 2, None)
+        reference = np.random.default_rng(54321)
+        _add_complex_noise(reference, full, 0.3, 1, None)
+        rng = np.random.default_rng(54321)
+        got = _ramp_xxyy2(delay_m, freqs_hz, flux, rng, 0.3, fused)
+        if full[..., XXYY].tobytes() != got.tobytes() or rng.random() != reference.random():
+            return False
+    return True
+
+
+def _fastramp_xxyy2():
+    """phase_ramp_c64_xxyy2(), or None."""
+    import ctypes
+
+    return _fast("phase_ramp_c64_xxyy2", [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_ssize_t,
+                                          ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_double], _ramp_xxyy2_agrees)
+
+
 def _fastramp():
     """phase_ramp_c64(), or None: numpy's predict ~4.5x faster, bit for bit."""
     import ctypes
@@ -1070,10 +1129,8 @@ def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse
     _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
     if n_chan != len(freqs_hz):
         raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
-    data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr)
-
-    if noise_sigma_jy:
-        add_complex_noise(rng, data, noise_sigma_jy / math.sqrt(2.0), xxyy=True)
+    data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr,
+                                     rng, noise_sigma_jy / math.sqrt(2.0))
 
     ms.putcol("DATA", data)
     for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -1838,6 +1895,10 @@ def self_check_fast_noise() -> None:
         print(f"fast noise self-check: {FASTNOISE_SO} predates 2-correlation noise (rebuild meqtrees)")
     elif _fastnoise_xxyy2() is None:
         raise SystemExit(f"FAIL: {FASTNOISE_SO}'s 2-correlation noise does not match numpy's XX and YY")
+    if not hasattr(ctypes.CDLL(str(FASTNOISE_SO)), "phase_ramp_c64_xxyy2"):
+        print(f"fast noise self-check: {FASTNOISE_SO} predates the fused ramp and noise (rebuild meqtrees)")
+    elif _fastramp_xxyy2() is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s fused ramp and noise does not match numpy's")
     print("fast noise self-check passed")
     if not hasattr(__import__("ctypes").CDLL(str(FASTNOISE_SO)), "phase_ramp_c64"):
         print(f"phase ramp self-check skipped: {FASTNOISE_SO} predates phase_ramp_c64 (rebuild meqtrees)")
