@@ -4784,3 +4784,45 @@ evaluations): the old view had 47 logs to read; the new one times 1,807
 records (the rest carry no epochs), every record has the count, and the
 table shows the expected warm-up (97 evals/s in the first bucket, ~200
 after). No sampled value changes, so there is no A/B.
+
+## Round 97 (diagnostic, one rejection): an R2D2 evaluation on the current tree
+
+**Where an R2D2 search's time goes now.** The user's 30-50% MeqTrees
+figure is the 22 Sep production R2D2 run (job 36031480, before every gnhf
+round): `./ri profile` gives simulate 34.7% (1.94 s an evaluation), the
+R2D2 request 51.4% (2.87 s) and idle 11.5%. A 17-rank search on this tree
+(nlive 50, 150 dead, seed 4242, 1,085 evaluations, 1m16s) gives simulate
+**4.2%** (47 ms), the R2D2 request 94.0% (1.06 s), idle 1.6%.
+
+**Inside a request.** `scripts/probe_r2d2_request.py` over 12 `.mat`
+files re-simulated from that run's records (`--mat-only`, fastnoise
+bound), 3 threads as the run's ranks had, solo: 0.33-0.36 s warm. Under
+cProfile the U-Net is 65% (`conv2d` 43%, `conv_transpose2d` 9%, instance
+norm 5%), `load_state_dict` 8%, the normal-operator kernel and PSF 4%,
+`gen_imaging_weights` 4%.
+
+**Rejected: one net per checkpoint.** `load_net` re-assigns each
+iteration's checkpoint over the worker's one U-Net (~16 a request), 31 ms
+of a request under cProfile. A per-worker cache of one deep-copied net per
+checkpoint (same tensors, so the same arithmetic) turns that into a
+lookup. Four interleaved ABAB probe pairs, warm mean: HEAD 0.331, 0.332,
+0.330, 0.330 s; cache 0.336, 0.334, 0.335, 0.401 s, and the first request
+paid +0.4 s for the copies. cProfile's per-call cost had inflated the
+22,852 tiny `Module.load` calls; the real swap cost is the ~0.4 ms an
+evaluation already priced in docs/nested-sampling-speed.md. Not kept.
+
+**Tooling fix.** The probe wrote its own hand-copied config, which lacked
+`target_dynamic_range: 0.0` (round 4). Without it every request computes
+the operator norm by power iteration: 83% of a 2.0 s request, a cost runs
+never pay. The probe now writes its config with the run's own
+`write_r2d2_config` (`image_dim()` overridden by `DIM`, since r2d2.sif's
+Python 3.10 has no `tomllib`), and `EXTRA` still appends to it.
+
+**Learned.**
+- MeqTrees is no longer a lever for R2D2 searches (4%). The request is
+  the evaluation, and two thirds of it is the U-Net's convolutions, which
+  round 86 closed for bit-identical changes.
+- An R2D2 request at 3 threads is not bit-reproducible run to run: two
+  runs of the same code differ in 10-15 of 48 output FITS by 1e-17 to
+  8e-16. At 1 thread two runs are byte-identical (48 of 48). Identity
+  checks of R2D2 changes must run at 1 thread, or compare to tolerance.

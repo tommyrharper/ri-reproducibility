@@ -241,7 +241,9 @@ removed. Removing legacy weight-norm reparameterisation: 114.96 against
 **R2D2 swap machinery is finished.** All 25 checkpoint swaps now take 11.0 ms,
 about 0.44 ms/evaluation, under 0.2% of the model-update phase. The 512x512
 `_model_prev` clone it might have replaced costs 0.221 ms. Model inference is
-the only R2D2 target left.
+the only R2D2 target left. On CSD3, caching one net per checkpoint so the swap
+becomes a lookup was measured and gained nothing (0.331 against 0.336 s a
+request; [csd3-speed](csd3-speed.md), round 97).
 
 **WSClean `-march=native`** measured 111.6 against 114.8 evaluations/second for
 matched `x86-64-v3`, with one 36.9 eval/s outlier in the native arm. Not
