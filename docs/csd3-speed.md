@@ -4118,3 +4118,59 @@ other half someone else's). Sapphire ran as one 56-CPU job
 - The default stays `icelake`. Every per-evaluation round was measured
   there, and nothing in the code depends on the partition: WSClean's
   `target_clones` and `fastnoise.so` already pick their AVX2 paths on both.
+
+## Round 85 (diagnostic): where a zygote request's kernel time goes
+
+**Question.** Round 84 left ~17ms (solo) to ~28ms (36-way) of kernel time
+per `wsclean` process. A run does not start a process per evaluation, it
+forks one from `wsclean-zygote`, so how much kernel time and how many page
+faults does a *zygote* request still pay, and what are they?
+
+**Method.** `.probe/r85/zy.py` drives one pinned `wsclean-zygote` (round
+83's 0001-0017 `D.sif`, production malloc tunables) through round 83's 48
+real-draw template MSs, one warm-up pass plus N timed passes, and reads the
+zygote's `cutime`/`cstime`/`cminflt` (its reaped children). `perf record -e
+page-faults -c 1 -d` over a solo run, with each fault address classified
+against the zygote parent's `/proc/PID/maps` (`cls.py`), splits the faults.
+
+| arm | request ms | user ms | sys ms | minor faults |
+| --- | ---: | ---: | ---: | ---: |
+| 1 copy | 77.8 | 69 | 8.2 (11%) | 1.26k |
+| 36 copies, one per CPU | 101.5 | 86.9 | 13.7 (13.5%) | 1.40k |
+
+Faults per request, solo, by where they land (1.6k counted by perf):
+
+| mapping | faults |
+| --- | ---: |
+| parent's `[heap]` (copy-on-write or untouched parent pages) | 683 |
+| mappings the child creates (heap growth past the parent's top, reordered-file and model mmaps) | 449 |
+| file-backed text and rodata (`r-xp` 247, `r--p` 150) | 397 |
+| file-backed `rw-p` (GOT/data) and stack | 60 |
+
+**Learned.**
+- A forked request pays about half the kernel time of a fresh process
+  (8.2 against 16.7ms solo, 13.7 against 27.7ms at 36-way), as expected.
+  Kernel time is still ~13% of a loaded request, but page faults are only
+  a part of it: ~1.4k faults at a few microseconds each is ~3-5ms, so the
+  other ~9ms is syscalls, fork and exit.
+- ~400 faults per request (a quarter) re-map library text and rodata the
+  parent already has mapped. Linux's `fork` does not copy page-table
+  entries of file-backed mappings that have no anonymous pages, so every
+  child faults them in again (16 pages per fault with fault-around). A
+  workaround (giving each text mapping an anon page so `fork` copies its
+  entries, plus pre-touching the code the parent never runs) could save at
+  most ~400 faults, ~1ms of a 100ms request at 36-way, and adds per-fork
+  page-table copying and refcount traffic on shared pages. Not attempted.
+- The heap and new-mapping faults (~1.1k, ~4.5MB) are first touches of
+  per-evaluation buffers, which round 41 already found a fork server
+  cannot avoid.
+- The syscall side cannot be counted on this host: `strace -f` (with or
+  without `--seccomp-bpf`) hangs inside apptainer's starter before
+  `wsclean` runs, and attaching `strace -f -p` to a running zygote
+  traced only ~300 calls in 15s while requests ran normally (it reported
+  the process switching between x32 and 64-bit mode). `perf_event_paranoid`
+  is 2, so kernel profiling is out too. Splitting the remaining ~9ms needs
+  an `LD_PRELOAD` syscall counter or a counter built into the zygote.
+- `taskset -c N` must name a CPU in this job's cpuset
+  (`grep Cpus_allowed_list /proc/self/status`); odd CPUs below 22 are not
+  in it, and a wrong one makes `wsclean-zygote` exit with no reply.

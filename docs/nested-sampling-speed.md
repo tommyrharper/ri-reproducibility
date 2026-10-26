@@ -107,6 +107,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Phase ramp written with its XX/YY real noise in one pass (`phase_ramp_c64_xxyy2`) | `fastnoise.c`, `simulate_point_source_ms.py` | simulate -1.5% in-run (23.10 to 22.76 ms, 34 pinned copies, 4/4 ABBA pairs); all 48 MSs column-identical ([csd3-speed](csd3-speed.md), round 82) |
 | (diagnostic) WSClean binary profiled over 48 real draws, not the largest MS | - | ducc0 46% of the binary (kernels 40%); nothing else above ~2.3%, so no non-kernel WSClean patch is worth more than ~1% of an evaluation ([csd3-speed](csd3-speed.md), round 83) |
 | (diagnostic) icelake against sapphire, same 48-draw WSClean + simulate workload | - | A sapphire core is 13% faster solo but 6% slower fully loaded; half a sapphire node (54 ranks) does 307 evals/s against half an icelake node's 218 (+41%), ~5% fewer per allocated core ([csd3-speed](csd3-speed.md), round 84) |
+| (diagnostic) Kernel time of a forked WSClean request | - | 8.2ms solo, 13.7ms of a 101.5ms request at 36-way (half a fresh process's); only ~1.4k faults (~3-5ms), a quarter of them re-mapped library text that `fork` does not copy; the rest is syscalls/fork/exit, which strace cannot reach here ([csd3-speed](csd3-speed.md), round 85) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
