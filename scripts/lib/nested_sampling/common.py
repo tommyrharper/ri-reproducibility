@@ -1804,13 +1804,14 @@ def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> bool:
 
 
 def publish_evaluation_scratch(eval_dir: Path, record: dict[str, Any], kept: bool,
-                               files_only: bool = False) -> None:
+                               files_only: bool = False, defer: Any = None) -> None:
     """Move what an evaluation wrote to scratch beside its record, if it is kept.
 
     Everything an evaluation writes goes to tmpfs scratch because on CSD3's
     Lustre each file created costs 25-40ms and each unlink ~10ms, and most
     evaluations are stripped to metrics.json straight after scoring
     (docs/csd3-speed.md, round 5). Records name the final paths either way.
+    `defer`, if given, runs the move to Lustre instead (the record writer).
     """
     import shutil
 
@@ -1818,19 +1819,28 @@ def publish_evaluation_scratch(eval_dir: Path, record: dict[str, Any], kept: boo
     if scratch is None or not scratch.is_dir():
         return
     if kept:
-        eval_dir.mkdir(parents=True, exist_ok=True)
-        for produced in scratch.iterdir():
-            if files_only and produced.is_dir():
-                continue
-            destination = eval_dir / produced.name
-            if destination.is_dir():
-                shutil.rmtree(destination)
-            shutil.move(str(produced), destination, copy_function=shutil.copyfile)
-    shutil.rmtree(scratch, ignore_errors=True)
+        (defer or (lambda job: job()))(
+            lambda: _move_scratch(scratch, eval_dir, files_only))
+    else:
+        shutil.rmtree(scratch, ignore_errors=True)
     paths = record.get("paths") or {}
     for key, value in paths.items():
         if isinstance(value, str) and Path(value).is_relative_to(scratch):
             paths[key] = str(eval_dir / Path(value).relative_to(scratch))
+
+
+def _move_scratch(scratch: Path, eval_dir: Path, files_only: bool) -> None:
+    import shutil
+
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    for produced in scratch.iterdir():
+        if files_only and produced.is_dir():
+            continue
+        destination = eval_dir / produced.name
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        shutil.move(str(produced), destination, copy_function=shutil.copyfile)
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def salvage_evaluation_logs(eval_dir: Path) -> None:
@@ -2285,19 +2295,26 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     if kept and not keeping and not _always_retained(eval_dir, record):
         hold_evaluation_scratch(eval_dir, record)
     else:
-        publish_evaluation_scratch(eval_dir, record, kept)
+        # The 1 in NS_KEEP_DETAIL_EVERY kept whole is ~7 files to Lustre,
+        # ~0.2s, and the rank sat idle through it: ~2% of a 36-rank search
+        # (docs/csd3-speed.md, round 95).
+        publish_evaluation_scratch(eval_dir, record, kept, defer=(
+            _submit_record_job if _RECORD_WRITER is not None else None))
     flush_held_evaluations()
     text = _json_text(record)
     _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
     if _RECORD_WRITER is None:
         _write_record(flat_record_path(eval_dir), text)
     else:
-        for done in [future for future in _RECORD_WRITES if future.done()]:
-            _RECORD_WRITES.remove(done)
-            done.result()  # a failed write raises here, on the rank's own thread
-        _RECORD_WRITES.append(_RECORD_WRITER.submit(
-            _write_record, flat_record_path(eval_dir), text))
+        _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
     return record
+
+
+def _submit_record_job(job: Any) -> None:
+    for done in [future for future in _RECORD_WRITES if future.done()]:
+        _RECORD_WRITES.remove(done)
+        done.result()  # a failed write raises here, on the rank's own thread
+    _RECORD_WRITES.append(_RECORD_WRITER.submit(job))
 
 
 def _write_record(path: Path, text: str) -> None:
@@ -2523,6 +2540,9 @@ def self_check_streaming_retention() -> None:
                               "paths": {"eval_dir": str(eval_dir),
                                         "image": str(work / "wsclean" / "recon-image.fits")}}
                     write_evaluation_record(eval_dir, record)
+                    # A kept evaluation's move to Lustre is the writer's job.
+                    for future in list(_RECORD_WRITES):
+                        future.result()
                     assert not (Path(tmp) / "scratch" / eval_dir.name).exists(), "scratch outlived scoring"
                     if eval_dir.name in _HELD:
                         # Held in tmpfs: nothing of it on Lustre but its record.

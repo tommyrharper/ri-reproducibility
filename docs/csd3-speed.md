@@ -4697,3 +4697,69 @@ the first job after a patch change.
   (20.3 against 30.6 evals/s), more than round 89's 29% at 36 ranks, since
   the binary is a larger share of a less loaded evaluation.
 
+
+## Round 95: kept evaluations published by the record writer
+
+**Question.** With round 94's patched SIF, a production-shaped search
+(36 ranks, async, nlive 150, 15 repeats, 900 dead, seed 4242) runs at
+~270 evals/s and `./ri profile` puts 5.2% of worker time in "idle". Some
+of that is start-up and the tail. What is the rest?
+
+**Method.** Each record carries `timing.started_epoch` and `ended_epoch`,
+and `eval_id` counts up per rank. Matching each rank's evaluation k to
+the nearest unclaimed k+1 start after its end gives the gap between one
+evaluation and the next on a worker (`.probe/r95/gaps2.py`). The sum of
+the gaps does not depend on the matching, only their distribution does.
+
+**Found.** The median gap is 1.6 ms (PolyChord, the prior and the
+harness), but ~280 gaps per run are 100-500 ms and are spread evenly over
+the run, ~3 a second. The run kept 305 evaluation dirs. `ended_epoch` is
+stamped before `publish_evaluation_scratch()`, and for the 1 in
+`NS_KEEP_DETAIL_EVERY` (100) evaluations kept whole (for `./ri profile`)
+that function moved ~7 files from tmpfs to Lustre on the rank's main
+thread, ~0.2 s at 25-40 ms a file created. Round 47 had moved the
+extremes off the main thread (`.held/`), but not these.
+
+**Change.** `publish_evaluation_scratch(defer=...)`: the record path
+rewrite stays on the rank's thread, and the move itself
+(`_move_scratch()`) is queued on the rank's record writer, the unpinned
+thread round 54 set up for record writes, ahead of the record's own
+write. Drains, failures raised on the next record, and abort paths are
+the record writer's. Without a writer (self-checks, `NS_SCRATCH_DIR`
+unset) the move is inline as before. The streaming-retention self-check
+waits on the writer before checking that scratch is gone; `./ri
+self-check wsclean` passes.
+
+**Measured.** ABAB, run one after another (cpu-q-576, this job's 38
+CPUs; the node's other half was busy, load 51-53 from the second run on):
+
+| run | code | evals/s | gaps, worker-s | gaps > 100 ms | log(Z) |
+| --- | --- | ---: | ---: | ---: | --- |
+| r95-a | HEAD | 273.0 | 117.5 | 281 | 0.09704 ± 0.00051 |
+| r95-b | deferred | 266.2 | 70.2 | 69 | 0.09719 ± 0.00052 |
+| r95-a2 | HEAD | 255.3 | 109.6 | 242 | 0.09681 ± 0.00050 |
+| r95-b2 | deferred | 269.3 | 73.0 | 76 | 0.09687 ± 0.00051 |
+
+Gap time falls by ~42 worker-s out of ~3,400 (35 workers x ~97 s), i.e.
+~1.2% of a search's worker time. That is below what end-to-end evals/s
+can resolve on a shared node (the rows above span 7%), so the gap sum is
+the measurement. Almost all the gaps over 100 ms left in B (65 of 69 in
+r95-b) are in the first 2 s, ranks waiting at the end of the prior
+phase. Both arms keep the same layout (309/302 dirs, 57/56 with logs), and
+log(Z) agrees within its error in all four. The change only moves files
+after an evaluation is scored, so it cannot change what is sampled. It
+is in the bound `nested_sampling` tree, so it needs no rebuild.
+
+**Learned.**
+- `ended_epoch` is stamped before the record's publish and retention
+  work, so anything slow there is idle time in the profile, not
+  evaluation time. Per-rank gaps from the records are the direct way to
+  see it.
+- `./ri profile --over-time` reads `wsclean.stdout.log` from kept
+  evaluation dirs, and since rounds 92-93 only ~1 in 100 evaluations has
+  one (55 of 26k here). The records' `timing` epochs would give it every
+  evaluation.
+- Startup accounts for ~22 worker-s per run (ranks waiting for the
+  slowest prior evaluation) and the tail ~70. Together they are most of
+  the idle that is left at 900 dead, and both get smaller as a run gets
+  longer.
