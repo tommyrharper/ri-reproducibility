@@ -1241,6 +1241,23 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
     return [record for _, record in read_evaluation_records(evaluations_dir) if record is not None]
 
 
+def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The run's records in name order, as load_evaluations_from_dir() gives
+    them, reading from disk only those not already in `written`."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        names = {name for name in os.listdir(evaluations_dir) if name.startswith("eval-")}
+    except FileNotFoundError:
+        names = set()
+    earlier = sorted(names - written.keys())
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        read = dict(zip(earlier, pool.map(
+            lambda name: read_evaluation_record(evaluations_dir / name / "metrics.json"), earlier)))
+    records = (written.get(name) or read.get(name) for name in sorted(names | written.keys()))
+    return [record for record in records if record is not None]
+
+
 def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     """Drain every rank's records and settle its held extremes; rank 0 gets
     every record, the others None. Collective: every rank calls it.
@@ -1252,6 +1269,8 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     records first, decides what the run keeps - the same decision prune
     makes - and the ranks publish only that and drop the rest in tmpfs.
     """
+    POST_RUN_SECONDS.clear()
+    started = time.monotonic()
     drain_record_writes(flush_held=False)
     try:
         from mpi4py import MPI
@@ -1260,8 +1279,21 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     except Exception:
         comm = None  # no MPI (a host run, or the self-checks): this process is the run
     if comm is not None:
-        comm.Barrier()  # every rank's records are on Lustre before rank 0 reads
-    records = load_evaluations_from_dir(evaluations_dir) if mpi_rank() == 0 else None
+        comm.Barrier()  # apart from the gather, so post_run_line() tells the two apart
+    started = post_run_phase("drain", started)
+    # Each rank parses its own records, in parallel, and hands them to rank 0,
+    # which reads from Lustre only what an earlier segment of a resumed run
+    # wrote: re-reading 43k metrics.json files took it 7.5s (round 52). The
+    # texts held for this cost ~4KB a record, ~5MB a rank in that run.
+    here = os.path.abspath(evaluations_dir)
+    mine = [(os.path.basename(path), json.loads(text)) for path, text in _WRITTEN_RECORDS.items()
+            if os.path.dirname(path) == here]
+    gathered = comm.gather(mine, root=0) if comm is not None else [mine]
+    records = None
+    if mpi_rank() == 0:
+        written = {name: record for rank_records in gathered for name, record in rank_records}
+        records = gathered_and_earlier_records(evaluations_dir, written)
+    started = post_run_phase("records", started)
     keep = (None if records is None or os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
             else evaluations_keeping_images(records))
     if comm is not None:
@@ -1269,7 +1301,24 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     flush_held_evaluations(force=True, keep=keep)
     if comm is not None:
         comm.Barrier()  # the kept extremes are on Lustre before rank 0 prunes
+    post_run_phase("flush", started)
     return records
+
+
+# Seconds per step between run_polychord() returning and the summary landing,
+# which `./ri bench` never sees (its wall is the evaluation span) and which
+# grows with the evaluation count: 13.5% of a production run in round 51.
+POST_RUN_SECONDS: dict[str, float] = {}
+
+
+def post_run_phase(name: str, started: float) -> float:
+    now = time.monotonic()
+    POST_RUN_SECONDS[name] = now - started
+    return now
+
+
+def post_run_line() -> str:
+    return "post-run seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in POST_RUN_SECONDS.items())
 
 
 def adopt_completed_evaluations(
@@ -1314,6 +1363,17 @@ def self_check_resume_adoption() -> None:
         assert cache[params_key(params)] == 0.5
         # The next eval id continues rather than restarting at 1.
         assert adopted + 1 == 2
+
+        # A resumed run's records: rank 0 is handed this segment's and reads
+        # only the earlier segment's back, and the result is what reading
+        # them all from disk gives, in the same order.
+        later = evaluations_dir / "eval-0002-def"
+        later.mkdir()
+        write_evaluation_record(later, {"eval_id": 2, "params": {"a": 2}, "objective": 0.25})
+        (evaluations_dir / "eval-0003-ghi").mkdir()  # in flight: no record
+        written = {"eval-0002-def": json.loads((later / "metrics.json").read_text())}
+        assert gathered_and_earlier_records(evaluations_dir, written) == load_evaluations_from_dir(evaluations_dir)
+        assert [r["eval_id"] for r in finished_run_records(evaluations_dir)] == [1, 2]
 
     with tempfile.TemporaryDirectory() as tmp:
         # An evaluation that was in flight when the run stopped has a
@@ -1659,6 +1719,11 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
         removed = 0
         paths = record.get("paths") or {}
         retained = evaluation_key(record) in keep
+        # A scored record that names no image was stripped to its record as
+        # it was scored (retain_evaluation_detail() drops the paths), so its
+        # dir holds nothing but metrics.json: no Lustre listing for it. That
+        # was 80% of a production run's records (round 52).
+        named = any(paths.get(key) for key in RETAINED_IMAGE_KEYS)
         for key in RETAINED_IMAGE_KEYS:
             recorded = paths.get(key)
             if not recorded:
@@ -1673,7 +1738,7 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
             target.unlink(missing_ok=True)
             paths.pop(key, None)
             removed += 1
-        if retained or "error" in record:
+        if retained or "error" in record or not named:
             return removed
         eval_dir = Path(paths.get("eval_dir") or "")
         if not eval_dir.name:
@@ -1941,14 +2006,16 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     else:
         publish_evaluation_scratch(eval_dir, record, kept)
     flush_held_evaluations()
+    text = _json_text(record)
+    _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
     if _RECORD_WRITER is None:
-        _write_record(eval_dir / "metrics.json", _json_text(record))
+        _write_record(eval_dir / "metrics.json", text)
     else:
         for done in [future for future in _RECORD_WRITES if future.done()]:
             _RECORD_WRITES.remove(done)
             done.result()  # a failed write raises here, on the rank's own thread
         _RECORD_WRITES.append(_RECORD_WRITER.submit(
-            _write_record, eval_dir / "metrics.json", _json_text(record)))
+            _write_record, eval_dir / "metrics.json", text))
     return record
 
 
@@ -1963,6 +2030,8 @@ def _write_record(path: Path, text: str) -> None:
 # one thread per rank instead; whatever reads the records back drains it first.
 _RECORD_WRITER: Any = None
 _RECORD_WRITES: list[Any] = []
+# Every record this process wrote, by eval dir, for finished_run_records().
+_WRITTEN_RECORDS: dict[str, str] = {}
 
 
 def write_records_in_background() -> None:
@@ -2153,7 +2222,8 @@ def self_check_streaming_retention() -> None:
                     objective = ((index * 7919) % 300) / 10
                     objectives[eval_dir.name] = objective
                     record = {"objective": objective,
-                              "paths": {"image": str(work / "wsclean" / "recon-image.fits")}}
+                              "paths": {"eval_dir": str(eval_dir),
+                                        "image": str(work / "wsclean" / "recon-image.fits")}}
                     write_evaluation_record(eval_dir, record)
                     assert not (Path(tmp) / "scratch" / eval_dir.name).exists(), "scratch outlived scoring"
                     if eval_dir.name in _HELD:
@@ -2170,16 +2240,13 @@ def self_check_streaming_retention() -> None:
                 held_root = Path(tmp) / "scratch" / ".held"
                 if background:
                     # Another rank's extreme so far that the run does not keep:
-                    # dropped in tmpfs, never published.
+                    # dropped in tmpfs, never published. Its record is read
+                    # from disk, as an earlier segment's would be.
                     other = evaluations / "eval-other"
                     (held_root / other.name / "wsclean").mkdir(parents=True)
                     _HELD[other.name] = (held_root / other.name, other)
                     _write_record(other / "metrics.json", _json_text(
                         {"objective": 15.05, "paths": {"eval_dir": str(other)}}))
-                    for key in objectives:
-                        record = json.loads((evaluations / key / "metrics.json").read_text())
-                        record.setdefault("paths", {})["eval_dir"] = str(evaluations / key)
-                        _write_record(evaluations / key / "metrics.json", _json_text(record))
                     records = finished_run_records(evaluations)
                     assert records is not None and len(records) == len(objectives) + 1
                     assert sorted(p.name for p in other.iterdir()) == ["metrics.json"]

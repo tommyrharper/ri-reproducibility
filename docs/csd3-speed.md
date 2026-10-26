@@ -2364,3 +2364,62 @@ count, so a multi-hour run pays minutes here. The next step is to time the
 three again with the new code, then cut whichever is largest (for example,
 ranks could hand their records to rank 0 over MPI instead of rank 0
 re-reading them from Lustre).
+
+## Round 52: rank 0 gets the records over MPI; prune skips record-only dirs
+
+**Question.** Of round 51's ~34s left after the last evaluation, which step
+is largest, and can it go?
+
+**Method.** Both entrypoints now print `post-run seconds: drain, records,
+flush, prune, summary` after the summary lands (`post_run_line()` in
+`common.py`), so `run.log` shows the phase that `./ri bench` misses. Same
+preset as round 51 (36 ranks, nlive 150, 15 repeats, to convergence, seed 1,
+async, tree on `/rds`). One base run from a copy of a2b9b03 plus the timing,
+then the new code three times. The runs were sequential, because two 36-rank
+arms don't fit on 38 CPUs, but each phase is timed directly.
+
+**Change.** Each rank keeps the text of every record it writes. At the end it
+parses its own records, all ranks in parallel, and `comm.gather`s them to
+rank 0. Rank 0 reads from Lustre only the eval dirs it wasn't handed, which
+are the records of an earlier segment of a resumed run
+(`gathered_and_earlier_records()`), and the result has the same order as
+`load_evaluations_from_dir()`. Prune now skips listing the dir of a scored
+record that names no image. `retain_evaluation_detail()` drops those paths
+when it strips an evaluation as it is scored, so such a dir holds only
+`metrics.json`. In the base run that was 34.5k of 43.2k records, and none of
+them held anything else. A barrier before the gather keeps the drain wait out
+of the `records` figure.
+
+**Result.**
+
+| run | drain | records | flush | prune | summary | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| base (`r52-base`) | 8.3 | 7.5 | 0.7 | 9.5 | 3.7 | 0.09647 |
+| gather only, no barrier (`r52-new`) | 0.0 | 21.2* | 0.9 | 9.7 | 11.1** | 0.09640 |
+| new (`r52-new2`) | 46.1 | 1.0 | 1.3 | 5.2 | 3.7 | 0.09634 |
+| new (`r52-new3`) | 13.3 | 1.0 | 1.0 | 5.4 | 3.7 | 0.09624 |
+
+\* includes the drain wait. \** a 176MB write to Lustre, which took 3.7s in
+the other three runs. Dumping unpickled and JSON-parsed records to
+`/dev/shm` took the same 3.2s, so this was noise.
+
+Reading records fell from 7.5s to 1.0s and prune from 9.5s to 5.3s: 10.7s
+off every production run, more on longer ones. Both new runs kept images
+for all 40 run extremes, and no path in `summary.json` is missing. log(Z)
+stayed within the async spread (rounds 47 and 51 saw 0.0953-0.0966). A
+mutation that drops the earlier-segment read fails the resume self-check.
+
+**Finding: the record writer runs minutes behind.** The drain step swung
+from 8.3s to 46.1s with no change to its code. Per-rank timestamps in
+`r52-new3` showed every rank leaving `run_polychord` at the same instant
+with 415-1222 record writes still queued, out of ~1240 per rank. When
+`metrics.json` mtimes are compared with each record's `ended_epoch`, the lag
+grows to a median of ~190s by 90s into the run and then shrinks to ~40s by
+the end. So for most of a run, a killed job loses minutes of records, which a
+resume has to evaluate again. The likely cause is that
+`_pypolychord.so` imports no `PyEval_SaveThread`/`PyGILState` symbols. The
+sampler holds the GIL in Fortran and MPI between callbacks, so the
+record-writer thread gets the GIL only while an evaluation blocks in
+`zygote_run()`. This has not been tested yet. The next step is to write
+records from a GIL-free helper (a child process fed over a pipe), or
+otherwise inline, and then check the lag and the drain.

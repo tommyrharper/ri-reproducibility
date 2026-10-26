@@ -26,6 +26,8 @@ from common import (
     cube_to_params,
     drain_record_writes,
     finished_run_records,
+    post_run_line,
+    post_run_phase,
     gathered_window_fit_stats,
     compute_image_metrics,
     image_dim,
@@ -627,12 +629,16 @@ def main() -> None:
         # Rank-based, so it can only run now that every evaluation is scored.
         # Mutates the records the summary embeds, so summary.json never names
         # an image this just deleted.
+        started = time.monotonic()
         prune_run_artefacts(evaluations_dir, all_evaluations)
+        started = post_run_phase("prune", started)
         summary_path = output_dir / "summary.json"
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
         write_json_atomic(summary_path, summary)
+        post_run_phase("summary", started)
+        print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")
 
