@@ -55,7 +55,9 @@ cores). It compiles WSClean in an `apptainer --fakeroot` sandbox against the
 SIF's own casacore, layers the result over the SIF, and keeps the old one as
 `wsclean.sif.orig`. The derived SIF keeps the old `ri.build-inputs` label and
 adds `ri.wsclean-patches` (a hash of the patches), so `benchmarks.jsonl`
-gives both the same image id. See [csd3-speed](csd3-speed.md), round 43.
+gives both the same image id. A WSClean search warns when `wsclean.sif`
+matches neither label to this tree. See [csd3-speed](csd3-speed.md), rounds 43
+and 70.
 
 ## Where things live on CSD3
 

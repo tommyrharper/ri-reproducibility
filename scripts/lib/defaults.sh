@@ -89,6 +89,53 @@ ns_require_sifs() {
   done
 }
 
+# Hash Dockerfiles and copied or bind-mounted files. Include names so renames
+# invalidate builds; exclude __pycache__ to match .dockerignore. Paths are
+# relative to REPO_ROOT, which is part of what is hashed.
+# Usage: inputs_hash <flavour> <path...>
+inputs_hash() {
+  local flavour="$1"
+  shift
+  (
+    cd "${REPO_ROOT}" || exit
+    printf '%s\n' "${flavour}"
+    find "$@" -name '__pycache__' -prune -o -type f -print | LC_ALL=C sort
+    find "$@" -name '__pycache__' -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 cat
+  ) | sha256sum | cut -d' ' -f1
+}
+
+# The ri.build-inputs scripts/build.sh gives a WSClean image built from this tree.
+ns_wsclean_build_inputs() {
+  inputs_hash "${PLATFORM} TARGET_CPU=${WSCLEAN_TARGET_CPU-x86-64-v3}" \
+    docker/wsclean/Dockerfile docker/wsclean/patches docker/wsclean/src
+}
+
+# The ri.wsclean-patches scripts/patch-wsclean-sif.sh gives a SIF it layers.
+ns_wsclean_patches_hash() {
+  cat "${REPO_ROOT}"/docker/wsclean/patches/*.patch "${REPO_ROOT}"/docker/wsclean/src/*.cpp \
+    | sha256sum | cut -c1-16
+}
+
+# A SIF carries only the WSClean patches of the tree it was built from, and
+# each later patch is a speed-up a run silently goes without: the 21 Sep
+# wsclean.sif stops at 0006 (docs/csd3-speed.md, rounds 43 and 70). Warns,
+# never refuses, since the images are still correct.
+#   ns_warn_stale_wsclean_sif <sif>
+ns_warn_stale_wsclean_sif() {
+  local labels patches
+  labels="$("${APPTAINER}" inspect --labels "$1" 2>/dev/null)" || return 0
+  patches="$(awk -F': ' '$1 == "ri.wsclean-patches" { print $2 }' <<<"${labels}")"
+  if [ -n "${patches}" ]; then
+    [ "${patches}" = "$(ns_wsclean_patches_hash)" ] && return 0
+  else
+    [ "$(awk -F': ' '$1 == "ri.build-inputs" { print $2 }' <<<"${labels}")" = "$(ns_wsclean_build_inputs)" ] \
+      && return 0
+  fi
+  echo "WARNING: $1 was not built from this tree's docker/wsclean, so this run may lack" \
+    "some WSClean speed-up patches. On a compute node: ./ri images patch-wsclean" \
+    "(docs/cluster.md)" >&2
+}
+
 # The build-input hash scripts/build.sh labelled the image with, which the SIF
 # keeps; what run.env and the manifests record as the image id.
 #   ns_image_id <sif>

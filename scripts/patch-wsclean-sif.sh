@@ -17,7 +17,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SIF_DIR="${SIF_DIR:-${REPO_ROOT}/images}"
+# shellcheck source=scripts/lib/defaults.sh
+source "${REPO_ROOT}/scripts/lib/defaults.sh"
 BASE="${WSCLEAN_BASE_SIF:-${SIF_DIR}/wsclean.sif}"
 OUT="${1:-${SIF_DIR}/wsclean.sif}"
 JOBS="${BUILD_JOBS:-$(env -u OMP_NUM_THREADS nproc)}"
@@ -78,7 +79,7 @@ From: ${BASE}
     rm -rf /opt/wsclean && mv /opt/wsclean.new /opt/wsclean
 
 %labels
-    ri.wsclean-patches $(cat "${REPO_ROOT}"/docker/wsclean/patches/*.patch "${REPO_ROOT}"/docker/wsclean/src/*.cpp | sha256sum | cut -c1-16)
+    ri.wsclean-patches $(ns_wsclean_patches_hash)
 EOF
 apptainer build --fakeroot "${work}/new.sif" "${work}/layer.def" >/dev/null
 apptainer exec "${work}/new.sif" wsclean --version | head -n3

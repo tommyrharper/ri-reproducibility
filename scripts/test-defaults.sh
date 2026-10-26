@@ -72,6 +72,44 @@ check "the generated seed is exported, so the run scripts see it" \
 check "{REPO_ROOT} is expanded" \
   "${REPO_ROOT}/results" "$(load RESULTS_DIR)"
 
+# A stand-in apptainer whose `inspect --labels` prints LABELS.
+fake_bin="$(mktemp -d)"
+trap 'rm -rf "${fake_bin}"' EXIT
+# shellcheck disable=SC2016  # expanded by the stand-in, not here
+printf '#!/bin/sh\nprintf "%%b" "${LABELS}"\n' >"${fake_bin}/apptainer"
+chmod +x "${fake_bin}/apptainer"
+# Prints "warned" or "quiet" for a SIF labelled with LABELS.
+stale() {
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM LABELS="$1" APPTAINER="${fake_bin}/apptainer" bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "${REPO_ROOT}/scripts/lib/defaults.sh"
+    ns_warn_stale_wsclean_sif some.sif 2>&1 | grep -q WARNING && echo warned || echo quiet
+  ' _ "${REPO_ROOT}"
+}
+# Runs one defaults.sh function in a clean child shell.
+call() {
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "${REPO_ROOT}/scripts/lib/defaults.sh"
+    "$2"
+  ' _ "${REPO_ROOT}" "$1"
+}
+patches="$(call ns_wsclean_patches_hash)"
+inputs="$(call ns_wsclean_build_inputs)"
+
+check "a SIF built from this tree's docker/wsclean is not stale" \
+  "quiet" "$(stale "ri.build-inputs: ${inputs}\n")"
+check "a SIF built from another tree's docker/wsclean is stale" \
+  "warned" "$(stale "ri.build-inputs: 0123\n")"
+check "a SIF layered with this tree's patches is not stale" \
+  "quiet" "$(stale "ri.build-inputs: 0123\nri.wsclean-patches: ${patches}\n")"
+check "a SIF layered with other patches is stale" \
+  "warned" "$(stale "ri.build-inputs: ${inputs}\nri.wsclean-patches: 0123\n")"
+
 if [[ "${failures}" -gt 0 ]]; then
   echo "${failures} check(s) failed" >&2
   exit 1

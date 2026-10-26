@@ -17,19 +17,6 @@ WSCLEAN_TARGET_CPU="${WSCLEAN_TARGET_CPU-x86-64-v3}"
 # Cache build inputs in an image label; FORCE_BUILD=1 bypasses the check.
 BUILD_INPUTS_LABEL="ri.build-inputs"
 
-# Hash Dockerfiles and copied or bind-mounted files. Include names so renames
-# invalidate builds; exclude __pycache__ to match .dockerignore.
-# Usage: inputs_hash <flavour> <path...>
-inputs_hash() {
-  local flavour="$1"
-  shift
-  {
-    printf '%s\n' "${flavour}"
-    find "$@" -name '__pycache__' -prune -o -type f -print | LC_ALL=C sort
-    find "$@" -name '__pycache__' -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 cat
-  } | sha256sum | cut -d' ' -f1
-}
-
 # Build unless the tag already names an image carrying this input hash.
 # Usage: build_image <tag> <hash> <docker build args...>
 build_image() {
@@ -52,8 +39,7 @@ build_image() {
 # it from inputs_hash because it changes build time, not output.
 build_wsclean() {
   build_image ri-reproducibility/wsclean:v3.7 \
-    "$(inputs_hash "${PLATFORM} TARGET_CPU=${WSCLEAN_TARGET_CPU}" \
-      docker/wsclean/Dockerfile docker/wsclean/patches docker/wsclean/src)" \
+    "$(ns_wsclean_build_inputs)" \
     -f docker/wsclean/Dockerfile \
     --build-arg BUILD_JOBS="${BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}" \
     --build-arg WSCLEAN_TARGET_CPU="${WSCLEAN_TARGET_CPU}"

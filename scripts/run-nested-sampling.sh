@@ -11,6 +11,7 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
 ns_require_sifs "${MEQTREES_SIF}" "${WSCLEAN_SIF}" "${POLYCHORD_SIF}"
+ns_warn_stale_wsclean_sif "${WSCLEAN_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
 # OMP_THREAD_LIMIT are dropped because GNU nproc honours them, and CSD3's login

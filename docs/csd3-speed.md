@@ -3452,3 +3452,57 @@ binary, at -3.5 to -3.8 ms per evaluation, is the measure that does not.
 - Harness: `.probe/r69inner.sh`, `r69abba.sh`, `r69ab.sh` and
   `r69fitscmp.py` (git-ignored). FITS identity is checked as the data block
   after the END card, plus every header card except DATE and HISTORY.
+
+## Round 70: a run warns when `wsclean.sif` lags the tree's patches
+
+**Why.** Rounds 43 and 61 found that the production `images/wsclean.sif` is
+still the 21 Sep build, which has patches 0001-0006 and nothing after. Every
+WSClean round from 23 to 69 (0007-0016) therefore reaches a real run only
+after someone runs `./ri images patch-wsclean`, and a run gave no sign that
+it was missing them. Round 43 measured 0007-0011 alone at -16 to -27% of
+binary time. Round 61 found the smallest evaluation 46% slower on the
+shipped SIF than on a 0001-0014 build.
+
+**Change.** `ns_warn_stale_wsclean_sif` (`scripts/lib/defaults.sh`), called
+by `run-nested-sampling.sh` (and so by `./ri search wsclean` and `./ri
+resume`), reads the SIF's labels once (~0.1 s). It warns on stderr, without
+refusing, unless one of these holds:
+
+- `ri.wsclean-patches` (written by `patch-wsclean-sif.sh`) equals the hash
+  of this tree's `docker/wsclean/patches/*.patch` and `src/*.cpp`;
+- or, with no such label, `ri.build-inputs` equals what `scripts/build.sh`
+  would label a WSClean image built from this tree.
+
+Both hashes now live in `defaults.sh` (`ns_wsclean_patches_hash`,
+`ns_wsclean_build_inputs`, and `inputs_hash`, moved from `build.sh`), so the
+builders and the check cannot drift apart. The moved `inputs_hash` gives
+the same WSClean and R2D2 hashes as before. Against real SIFs, the shipped
+`wsclean.sif` and round 69's 0001-0015 build both warn, and the 0001-0016
+build stays quiet. `patch-wsclean-sif.sh` rebuilt into `/dev/shm` with the
+shared hash and its output stays quiet. `scripts/test-defaults.sh`, which
+CI runs, covers all four label cases with a stand-in `apptainer`. No search
+timing changes, so this round has no A/B.
+
+**Simulate today (diagnostic).** `probe_simulate_stage.py warm` with
+`PROFILE=1` covered round 63's 48 real draws (`params15`), pinned to one
+CPU on the current tree. On the 41 draws whose one-timestep template was
+already cached, simulate took **17.8 ms** (mean; median 14.1 ms; mean
+49.7k rows). Seven draws built a new template at ~134 ms each, a cost a long
+run pays once per channel count and observation. cProfile's per-evaluation
+split: XX/YY noise 5.0 ms, which round 63 showed is near its floor; `putcol`
+2.9 ms; table opens and closes (~4.6 an evaluation) ~2 ms; the phase ramp
+1.4 ms; the observation `.npz` load ~1 ms (1.9 under cProfile).
+
+**Learned.**
+- After rounds 56-66, simulate is ~18 ms solo, about 10% of a ~178 ms worker
+  evaluation, and in-run simulate is 26-30 ms. MeqTrees itself is not called
+  for WSClean (round 1's analytic predict), so the "MeqTrees ~30-50% of
+  runtime" stage of the early runs is now this.
+- Memoising the observation `.npz` per worker was considered and dropped.
+  It would save at most ~1 ms (~0.5% of worker time). Entries are 160-270 KB
+  and there are up to 910 keys, so it could hold ~200 MB per rank, and a
+  small LRU's hit rate across 910 keys is unknown.
+- Round 69's three biggest remaining shares are all inside WSClean: ducc0
+  x2grid (30%), grid2x (21%) and the Wgridder constructor (5%). On the
+  cluster, the largest single speed-up is still bringing
+  `images/wsclean.sif` up to 0016, which this round only makes visible.
