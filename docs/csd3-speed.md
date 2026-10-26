@@ -2862,3 +2862,57 @@ still the 0001-0006 build. A run on the shipped SIF does not change.
 - What is left in the reorder is casacore reading the MS (~8ms on a 46k-row
   MS), and after it "loading data in memory" (14ms/eval over 4.35 passes),
   which copies the reordered files into the gridder's buffers on every pass.
+
+## Round 59: no time-offset map lookups outside facets (patch 0014)
+
+**Question.** After 0013, "loading data in memory" is the third-largest
+WSClean phase (14.4ms/eval in round 58's table, ~4ms a pass on a 51k-row MS
+against ~12ms of gridding). Where does it go?
+
+**Profile.** A 0001-0013 SIF built into `/dev/shm` with
+`scripts/patch-wsclean-sif.sh OUT`, and `perf record -F 20000` over ten
+pinned runs of one kept 51k-row MS. Symbols came from a copy of the binary
+pulled out of the SIF, matched to perf's file offsets with `nm -n`. The load
+path was ~11% of the binary's samples, spread over a dozen functions:
+`CalculateWeightsImplementation<1>` 2.8%, `ApplyWeightsAndCorrections<4>`
+2.2%, `GridRegularMeasurementSet` 1.8%, `CacheMeta` 1.3%, `ReadMeta` 1.0%,
+`NextInputRow` 0.9%, `ReadWeights` 0.7%, `std::map<unsigned long, unsigned
+long>` 0.55%, `ReadData` 0.5%. The map is `VisibilityModifier::time_offsets_`,
+read and written back for every row by `LoadAndApplyCorrections()`, though
+only facets ever change it.
+
+**Change.** Patch 0014 returns from `LoadAndApplyCorrections()` before the
+lookups unless the gridder is a facet with a non-`kSingle` PSF mode
+([the patches doc](nested-sampling-wsclean-patches.md)).
+
+**Result.** Driver: five real-draw MSs from an `NS_KEEP_MEASUREMENT_SETS=1`
+run (binary 57-388ms in-run, 10th-90th percentile), each run with the
+search's `wsclean` arguments and production's malloc tunables, pinned to one
+CPU, 3 reps per MS. A sample is one 15-run pass; phases are summed from
+`-log-time` lines.
+
+| test | 0001-0013 | 0001-0014 | change |
+| --- | ---: | ---: | ---: |
+| solo, 6 ABBA/BAAB blocks: "loading data in memory" | 697.6ms | 660.7ms | -5.3% (6 of 6) |
+| same: whole pass | 4111.8ms | 4097.2ms | -0.35% (-0.13 to -0.54%, 6 of 6) |
+| rejected variant (also caching per-channel wavelengths in `thread_local` vectors): load | 697.2ms | 766.6ms | +9.9% (6 of 6) |
+
+All 20 FITS data blocks over the five MSs are byte-identical. No raced
+search was run: 0.35% is far below an in-run A/B's ~5% resolution.
+
+**Shipping.** Takes effect when `wsclean.sif` is rebuilt (`./ri images
+patch-wsclean`, or a Docker build), together with 0007-0013.
+
+**Learned.**
+- The rejected variant saved one division per channel per row
+  (`ChannelWavelength()` is `c / freq`), but the `thread_local std::vector`
+  wrapper calls and the `std::equal` key check per row cost more than the
+  division. The remaining `u / wavelength` divisions (two per visibility)
+  are most of `CalculateWeightsImplementation`, and replacing them with a
+  multiply would change rounding at the uv-limit boundary.
+- The load path has no single hot spot left after 0008-0014. Each of its
+  ~10 pieces is 0.5-3% of the binary, so further gains there mean
+  restructuring the per-row reader-to-gridder pipeline, not another
+  one-line skip.
+- Pin CPUs from this job's mask (`taskset -cp $$`: even CPUs only here). A
+  `taskset -c` outside it fails at once, and the driver's log is then empty.

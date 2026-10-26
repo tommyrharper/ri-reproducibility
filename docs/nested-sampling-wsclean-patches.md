@@ -423,3 +423,21 @@ measurements are in [csd3-speed.md](csd3-speed.md), round 58.
 Upstream-shaped: it changes how the files are written, not what is written.
 A write error now surfaces at the next flush rather than on the row that
 caused it.
+
+## 0014: skip the time-offset lookups outside facets
+
+Every gridded row goes through `LoadAndApplyCorrections()`
+(`gridding/msgridderdata.h`), which read and then wrote back the visibility
+modifier's `std::map` of time offsets, though only a facet's corrections
+move the offset. The search never images facets, so both lookups were
+pure overhead on every row of every pass. The patch returns before them
+unless the gridder is a facet whose PSF mode is not `kSingle`, the only
+case that ever changed the offset. The map's entry was only ever read
+back through the same `operator[]`, so skipping the insert changes nothing.
+
+Solo over five real-draw MSs, "loading data in memory" is 5.3% faster
+and WSClean 0.35% faster (6 of 6 interleaved ABBA blocks). All 20 FITS data
+blocks are byte-identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 59.
+
+Upstream-shaped: it changes nothing computed.

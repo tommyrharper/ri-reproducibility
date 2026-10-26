@@ -1,0 +1,17 @@
+diff --git a/gridding/msgridderdata.h b/gridding/msgridderdata.h
+index 0ca92dc..bcb5539 100644
+--- a/gridding/msgridderdata.h
++++ b/gridding/msgridderdata.h
+@@ -149,8 +149,11 @@ class MsGridderData {
+                                const aocommon::MultiBandData& bands,
+                                const float* weight_buffer,
+                                const MSProvider::MetaData& metadata) {
++    // Only a facet's corrections move the time offset, so skip the two map
++    // lookups per row otherwise.
++    if (!IsFacet() || GetPsfMode() == PsfMode::kSingle) return;
+     size_t time_offset = visibility_modifier_.GetTimeOffset(original_ms_index_);
+-    if (IsFacet() && GetPsfMode() != PsfMode::kSingle) {
++    {
+       const bool apply_beam =
+           settings_.applyFacetBeam || settings_.gridWithBeam;
+       if (apply_beam) {
