@@ -159,19 +159,32 @@ void add_normal_f32(uint64_t state[4], double scale, float *dst, ptrdiff_t n,
 /* add_normal_f32(..., every=1) over n draws, n a multiple of 4, keeping only
  * the first and last of each 4: XX and YY of a 4-correlation DATA column,
  * the only two `-pol I` imaging reads. XY and YX keep their stream position
- * and get no noise, which is -15% on the noise (docs/csd3-speed.md, round 65). */
-void add_normal_f32_xxyy(uint64_t state[4], double scale, float *dst,
-                         ptrdiff_t n, ptrdiff_t stride) {
+ * and get no noise, which is -15% on the noise (docs/csd3-speed.md, round 65).
+ * yy is YY's offset in dst: 3 for a 4-correlation column, 1 for one that
+ * holds XX and YY alone (round 66). */
+static inline void xxyy_body(uint64_t state[4], double scale, float *dst,
+                             ptrdiff_t n, ptrdiff_t stride, ptrdiff_t yy) {
   uint64_t hi = state[0], lo = state[1], inc_hi = state[2], inc_lo = state[3];
   u128 inc = ((u128)inc_hi << 64) | inc_lo;
-  for (float *end = dst + (n > 0 ? n / 4 : 0) * 4 * stride; dst != end; dst += 4 * stride) {
+  for (float *end = dst + (n > 0 ? n / 4 : 0) * (yy + 1) * stride; dst != end; dst += (yy + 1) * stride) {
     dst[0] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
     skip_normal(&hi, &lo, inc_hi, inc_lo, inc);
     skip_normal(&hi, &lo, inc_hi, inc_lo, inc);
-    dst[3 * stride] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
+    dst[yy * stride] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
   }
   state[0] = hi;
   state[1] = lo;
+}
+
+void add_normal_f32_xxyy(uint64_t state[4], double scale, float *dst,
+                         ptrdiff_t n, ptrdiff_t stride) {
+  xxyy_body(state, scale, dst, n, stride, 3);
+}
+
+/* The same n draws into a 2-correlation (XX, YY) column: n / 2 values. */
+void add_normal_f32_xxyy2(uint64_t state[4], double scale, float *dst,
+                          ptrdiff_t n, ptrdiff_t stride) {
+  xxyy_body(state, scale, dst, n, stride, 1);
 }
 
 typedef double v4d __attribute__((vector_size(32)));

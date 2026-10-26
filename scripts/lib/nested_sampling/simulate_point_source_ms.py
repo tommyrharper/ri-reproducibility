@@ -281,7 +281,9 @@ def _observation_path(cfg_text: str) -> Path:
 
 
 def _template_path(cfg_text: str) -> Path:
-    directory = skeleton_dir() / "templates"
+    # "templates" held round 33-65's 4-correlation layout; a run of older
+    # code on this node may still read it.
+    directory = skeleton_dir() / "templates-xxyy"
     directory.mkdir(exist_ok=True)
     return directory / _config_key(cfg_text, ("StartFreq=", "StepFreq=", "NTimes=", "Declination=", "StepTime="))
 
@@ -383,11 +385,15 @@ def one_timestep_template(cfg_text: str, args: argparse.Namespace, scratch: Path
             ms = Path(build) / Path(args.output_ms).name
             write_makems_config(one, ms)
             run_makems(ms)
-            _atomic_publish(lambda path: _copy_with_large_ssm_buckets(ms, path), template)
+            _atomic_publish(lambda path: _write_template(ms, path), template)
     return template
 
 
 SSM_TIME_COLUMNS = ("TIME", "TIME_CENTROID")
+# XX and YY's places in makems' 4 correlations, whose noise stream every
+# simulated MS still draws whole.
+XXYY = [0, 3]
+STREAM_CORRELATIONS = 4
 
 
 def _template_dminfo(dminfo: dict) -> dict:
@@ -409,9 +415,28 @@ def _template_dminfo(dminfo: dict) -> dict:
     return dminfo
 
 
-def _copy_with_large_ssm_buckets(ms: Path, destination: Path) -> None:
+def _write_template(ms: Path, destination: Path) -> None:
+    """makems' MS with _template_dminfo()'s layout, and with DATA, FLAG,
+    WEIGHT and SIGMA cut to XX and YY: `-pol I` reads nothing else, and a
+    2-correlation MS images byte for byte the same with half the DATA to
+    write and reorder (docs/csd3-speed.md, round 66)."""
     with table(str(ms), ack=False) as t:
         t.copy(str(destination), deep=True, valuecopy=True, dminfo=_template_dminfo(t.getdminfo())).close()
+    with table(str(destination), readonly=False, ack=False) as t:
+        for column in ("DATA", "FLAG"):
+            desc, dminfo = t.getcoldesc(column), t.getdminfo(column)
+            n_chan, n_corr = desc["shape"]
+            tile = dminfo["SPEC"]["DEFAULTTILESHAPE"]
+            t.removecols(column)
+            desc["shape"] = np.array([n_chan, len(XXYY)])
+            spec = {"DEFAULTTILESHAPE": np.array([len(XXYY), tile[1], tile[2] * n_corr // len(XXYY)], dtype=np.int32)}
+            t.addcols({column: desc}, {"TYPE": dminfo["TYPE"], "NAME": dminfo["NAME"], "SPEC": spec})
+        for column in ("WEIGHT", "SIGMA"):
+            t.putcol(column, t.getcol(column)[:, XXYY])
+    with table(str(destination / "POLARIZATION"), readonly=False, ack=False) as pol:
+        pol.putcell("NUM_CORR", 0, len(XXYY))
+        pol.putcell("CORR_TYPE", 0, pol.getcell("CORR_TYPE", 0)[XXYY])
+        pol.putcell("CORR_PRODUCT", 0, np.ascontiguousarray(pol.getcell("CORR_PRODUCT", 0)[XXYY]))
 
 
 _TEMPLATE_BYTES: dict[str, tuple[tuple[int, int], list[tuple[str, int, bytes | None]]]] = {}
@@ -906,6 +931,25 @@ def _fastnoise_xxyy():
                  _xxyy_agrees)
 
 
+def _xxyy2_agrees(fn) -> bool:
+    # XX and YY of the 4-correlation fill, packed side by side.
+    want = np.full((2500, 2, 4), 0.25 - 0.5j, np.complex64)
+    got = np.ascontiguousarray(want[..., XXYY])
+    reference = np.random.default_rng(12345)
+    _add_complex_noise(reference, want, 0.3, 1, None)
+    rng = np.random.default_rng(12345)
+    _add_xxyy_noise(rng, got, 0.3, fn, 2 * got.size)
+    return want[..., XXYY].tobytes() == got.tobytes() and rng.random() == reference.random()
+
+
+def _fastnoise_xxyy2():
+    """add_normal_f32_xxyy2(), or None."""
+    import ctypes
+
+    return _fast("add_normal_f32_xxyy2", [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 2,
+                 _xxyy2_agrees)
+
+
 def _fastramp():
     """phase_ramp_c64(), or None: numpy's predict ~4.5x faster, bit for bit."""
     import ctypes
@@ -936,10 +980,11 @@ def _pcg_words(rng: np.random.Generator) -> tuple[dict, np.ndarray]:
                              pcg["inc"] & (2**64 - 1)], dtype=np.uint64)
 
 
-def _add_xxyy_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, fn) -> None:
+def _add_xxyy_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, fn, draws: int | None = None) -> None:
+    draws = data.size if draws is None else draws
     bitgen, words = _pcg_words(rng)
-    fn(words.ctypes.data, sigma, data.ctypes.data, data.size, 2)
-    fn(words.ctypes.data, sigma, data.ctypes.data + 4, data.size, 2)
+    fn(words.ctypes.data, sigma, data.ctypes.data, draws, 2)
+    fn(words.ctypes.data, sigma, data.ctypes.data + 4, draws, 2)
     bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
     rng.bit_generator.state = bitgen
 
@@ -957,11 +1002,23 @@ def add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, 
     every > 1 draws a whole column's stream and keeps only correlation 0.
     xxyy=True, for 4-correlation data, may leave XY and YX without their noise
     (the C path does; numpy's fallback adds it): `-pol I` reads XX and YY only,
-    and the draws are skipped ~15% faster than made (docs/csd3-speed.md, round 65)."""
+    and the draws are skipped ~15% faster than made (docs/csd3-speed.md, round 65).
+    For 2-correlation data, xxyy=True means XX and YY of that 4-correlation
+    stream (round 66)."""
     lib = _fastnoise()
     if lib is not None and (rng.bit_generator.state["bit_generator"] != "PCG64"
                             or rng.bit_generator.state["has_uint32"]):
         lib = None
+    if xxyy and every == 1 and data.ndim and data.shape[-1] == len(XXYY):
+        fn = _fastnoise_xxyy2() if lib is not None and data.flags.c_contiguous and data.dtype == np.complex64 else None
+        if fn is not None:
+            _add_xxyy_noise(rng, data, sigma, fn, 2 * data.size)
+            return
+        full = np.zeros((*data.shape[:-1], STREAM_CORRELATIONS), data.dtype)
+        full[..., XXYY] = data
+        _add_complex_noise(rng, full, sigma, 1, lib)
+        data[...] = full[..., XXYY]
+        return
     if (lib is not None and xxyy and every == 1 and data.ndim and data.shape[-1] == 4
             and data.flags.c_contiguous and data.dtype == np.complex64):
         fn = _fastnoise_xxyy()
@@ -1118,8 +1175,7 @@ def write_mat_only(args: argparse.Namespace, output_ms: Path) -> dict[str, objec
         template = one_timestep_template(cfg_text, args, output_ms.parent)
         if template not in _TEMPLATE_LAYOUT:
             with table(str(template), readonly=True, ack=False) as ms:
-                _TEMPLATE_LAYOUT[template] = (
-                    ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2"), ms.getcol("DATA", startrow=0, nrow=1).shape[2])
+                _TEMPLATE_LAYOUT[template] = (ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2"), STREAM_CORRELATIONS)
         a1, a2, n_corr = _TEMPLATE_LAYOUT[template]
         # extend_template()'s UVW, which round-trips the float64 column unchanged.
         antenna_uvw = observation["antenna_uvw"][:n_times]
@@ -1332,12 +1388,22 @@ def self_check_observation_prefix() -> None:
             expected = simulate_with(scratch, f"makems{i}", dec, step, n_times, n_chan, prefix=False)
             with table(str(got), ack=False) as left, table(str(expected), ack=False) as right:
                 layouts = [table_.getdminfo() for table_ in (left, right)]
-            if served:  # the one intended difference: _template_dminfo()
-                layouts = [{m["NAME"]: (m["TYPE"], sorted(m["COLUMNS"]), m["SPEC"].get("BUCKETSIZE")) for m in layout.values()}
+            if served:  # the intended differences: _template_dminfo(), and _write_template()'s XX and YY
+                layouts = [sorted((m["NAME"], m["TYPE"], sorted(m["COLUMNS"]), m["SPEC"].get("BUCKETSIZE"))
+                                  for m in layout.values())
                            for layout in (layouts[0], _template_dminfo(layouts[1]))]
             assert repr(layouts[0]) == repr(layouts[1]), f"step {i}: storage layout differs: {layouts}"
             for sub in ("", "SPECTRAL_WINDOW", "ANTENNA", "FIELD", "DATA_DESCRIPTION", "POLARIZATION", "OBSERVATION"):
                 left, right = values(got, sub), values(expected, sub)
+                if served and sub == "":
+                    for column in ("DATA", "FLAG"):
+                        right[column] = right[column][..., XXYY]
+                    for column in ("WEIGHT", "SIGMA"):
+                        right[column] = right[column][:, XXYY]
+                if served and sub == "POLARIZATION":
+                    right["NUM_CORR"] = np.full_like(right["NUM_CORR"], len(XXYY))
+                    for column in ("CORR_TYPE", "CORR_PRODUCT"):
+                        right[column] = right[column][:, XXYY]
                 assert left.keys() == right.keys(), f"step {i}: {sub or 'MAIN'} columns differ"
                 for column in left:
                     same = (left[column] is None and right[column] is None) if left[column] is None or right[column] is None \
@@ -1751,6 +1817,10 @@ def self_check_fast_noise() -> None:
         print(f"fast noise self-check: {FASTNOISE_SO} predates XX/YY-only noise (rebuild meqtrees)")
     elif _fastnoise_xxyy() is None:
         raise SystemExit(f"FAIL: {FASTNOISE_SO}'s XX/YY-only noise does not match numpy's XX and YY")
+    if not hasattr(ctypes.CDLL(str(FASTNOISE_SO)), "add_normal_f32_xxyy2"):
+        print(f"fast noise self-check: {FASTNOISE_SO} predates 2-correlation noise (rebuild meqtrees)")
+    elif _fastnoise_xxyy2() is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s 2-correlation noise does not match numpy's XX and YY")
     print("fast noise self-check passed")
     if not hasattr(__import__("ctypes").CDLL(str(FASTNOISE_SO)), "phase_ramp_c64"):
         print(f"phase ramp self-check skipped: {FASTNOISE_SO} predates phase_ramp_c64 (rebuild meqtrees)")

@@ -3184,3 +3184,73 @@ files byte-identical between the arms, so WSClean does not read XY or YX.
 - When raced arms start 10 s apart, launch order alone is worth ~1.5 ms of
   in-run simulate here. A single pair cannot resolve an effect of that size,
   so run both orders.
+
+## Round 66: the MS holds XX and YY only
+
+**Why.** Round 65 showed that `-pol I` never reads XY and YX: with their
+noise gone, every chain file was still identical. They were still carried
+through the pipeline, though. Simulate wrote them, and WSClean's reorder
+read them: half of `DATA` and `FLAG`.
+
+**Gate.** Six real draws (`params15`) were each simulated, and a copy was
+cut to 2 correlations (`DATA` and `FLAG` re-added at `[nchan, 2]`,
+`POLARIZATION` set to `[XX, YY]`). Both were imaged with the search's
+`wsclean` arguments, using the shipped `wsclean.sif` with production malloc
+tunables, one process per run, pinned to one CPU. All 24 FITS files
+(image, model, residual and psf for each MS) were byte-identical. The time
+per pass over the six MSs was 601.9 ms with 4 correlations and 587.5 ms
+with 2 (**-2.4%**, median of 7 warm alternating passes, 6 of 7 lower).
+
+**Change.** `_write_template()`, formerly `_copy_with_large_ssm_buckets()`,
+now also cuts the one-timestep template to XX and YY. `DATA` and `FLAG` are
+re-added at `[nchan, 2]`, keeping their tile size in bytes. `WEIGHT` and
+`SIGMA` become `[2]`, and `POLARIZATION` becomes `NUM_CORR` 2 with
+`CORR_TYPE` `[9, 12]`. Every extended evaluation, which in a long run is
+nearly all of them, inherits this layout. Templates now sit in
+`templates-xxyy/`, so a run of older code on the same node never reads one.
+A new `add_normal_f32_xxyy2()` in `fastnoise.c`, sharing round 65's
+unrolled body with YY at offset 1 instead of 3, draws the 4-correlation
+stream and stores only XX and YY. The numpy fallback draws into a
+4-correlation scratch array. Both are bit for bit what XX and YY were
+before, as `_xxyy2_agrees()` at load time and the fast-noise self-check
+confirm. The `.mat` path still draws its stream 4 wide (`STREAM_CORRELATIONS`).
+A cached makems skeleton or a fresh makems build stays at 4 correlations,
+and those MSs image the same. Cluster runs pick this up without a rebuild,
+because the module is bound over the SIF's copy and `start-sidecars.sh`
+compiles the new `fastnoise.c`.
+
+**Identity.** The new simulator's `DATA` and `FLAG` match the gate's
+converted MSs byte for byte, on both the template-miss and the template-hit
+paths, and imaging them gives the same 24 FITS files. `./ri self-check
+simulate` passes. The observation-prefix check now projects the makems
+build onto XX and YY before it compares. In the raced sync pass, all chain
+files were byte-identical between the arms, with log(Z) 0.09607 +/- 0.00114
+in both.
+
+**In run.** These were raced 17-rank pairs (`.probe/r66ab.sh`,
+`NS_SEED=4242`, nlive 150). The base arm was a `git archive HEAD` copy:
+
+| pass | first launched | base simulate ms | new simulate ms | base binary ms | new binary ms | base evals/s | new evals/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| sync, ndead 300 | base | 29.23 | 26.12 | 198.63 | 196.38 | 25.21 | 26.02 |
+| async a, ndead 600 | base | 27.96 | 25.41 | 179.08 | 185.22 | 73.19 | 71.64 |
+| async b, ndead 600 | new | 28.45 | 25.07 | 191.72 | 170.76 | 68.19 | 76.40 |
+
+Simulate was lower by 3.1, 2.6 and 3.4 ms (**-10%**), in both launch
+orders, so this is not round 65's ~1.5 ms launch-order effect. The binary
+can only be compared in the sync pass, where both arms image the same
+draws: there it was -1.1% (-2.25 ms) and evals/s +3.2%. The async arms draw
+different points, so their binary and evals/s gaps (+3.4% and -11%) are
+sampling, not code. Together, worker time per evaluation falls by about
+3 ms of simulate plus ~1-2.5% of the binary, which is roughly 2.5% of
+worker time.
+
+**Learned.**
+- An MS needs only the correlations the imager reads. WSClean `-pol I` on
+  an `[XX, YY]` MS is byte-identical to one on `[XX, XY, YX, YY]`, including
+  when `WEIGHT` keeps 4 entries.
+- makems has no option for fewer correlations (`NPolarizations=2` is
+  ignored). Re-adding the columns on the cached template is a one-off cost
+  per channel count.
+- casacore lists a re-added column's data manager last in `getdminfo()`, so
+  a layout comparison has to sort by manager name.
