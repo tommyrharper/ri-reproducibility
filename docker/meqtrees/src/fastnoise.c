@@ -133,22 +133,90 @@ void add_normal_f32(uint64_t state[4], double scale, float *dst, ptrdiff_t n,
   state[1] = lo;
 }
 
+typedef double v4d __attribute__((vector_size(32)));
+typedef int64_t v4i __attribute__((vector_size(32)));
+
+/* sin and cos of four |x| < 2^19 by Cody-Waite reduction to [-pi/4, pi/4]
+ * and fdlibm's kernel polynomials: within 2.3e-16 of glibc 2.28's and 2.39's
+ * sincos over 2e8 draws (docs/csd3-speed.md, round 57). */
+static inline void poly_sincos4(const v4d *xp, v4d *s, v4d *c) {
+  v4d x = *xp;
+  const v4d shift = {0x1.8p52, 0x1.8p52, 0x1.8p52, 0x1.8p52};
+  v4d t = x * 6.36619772367581382433e-01 + shift; /* 2/pi */
+  v4d n = t - shift;
+  v4i q = (v4i)t;
+  v4d r = x - n * 1.57079632673412561417e+00;
+  r = r - n * 6.07710050630396597660e-11;
+  r = r - n * 2.02226624871116645580e-21;
+  v4d z = r * r;
+  v4d sp = r + r * z * (-1.66666666666666324348e-01 + z * (8.33333333332248946124e-03
+      + z * (-1.98412698298579493134e-04 + z * (2.75573137070700676789e-06
+      + z * (-2.50507602534068634195e-08 + z * 1.58969099521155010221e-10)))));
+  v4d cp = 1.0 - 0.5 * z + z * z * (4.16666666666666019037e-02 + z * (-1.38888888888741095749e-03
+      + z * (2.48015872894767294178e-05 + z * (-2.75573143513906633035e-07
+      + z * (2.08757232129817482790e-09 + z * -1.13596475577881948265e-11)))));
+  v4i swap = -(q & 1);
+  v4i si = ((v4i)cp & swap) | ((v4i)sp & ~swap), ci = ((v4i)sp & swap) | ((v4i)cp & ~swap);
+  *s = (v4d)(si ^ ((q & 2) << 62));
+  *c = (v4d)(ci ^ (((q + 1) & 2) << 62));
+}
+
+/* Whether every double within err of v rounds to the same float. */
+static inline int rounds_alike(double v, double err) {
+  return (float)(v - err) == (float)(v + err);
+}
+
+__attribute__((target_clones("avx2", "default")))
 void phase_ramp_c64(const double *delay, ptrdiff_t n_rows, const double *freqs,
                     ptrdiff_t n_chan, double k, double flux, float *out,
                     ptrdiff_t n_corr) {
   /* flux * np.exp(1j * k * np.outer(delay, freqs)), cast to complex64, into
    * correlations 0 and n_corr - 1 of a (rows, chans, n_corr) array. numpy's
    * complex exp is libm's cexp, which for a zero real part is sincos of the
-   * imaginary part times exp(0) = 1; ~1.8x faster than numpy, which goes
-   * through complex128 temporaries (docs/csd3-speed.md, round 32). */
-  ptrdiff_t last = 2 * (n_corr - 1);
-  for (ptrdiff_t r = 0; r < n_rows; r++) {
-    for (ptrdiff_t c = 0; c < n_chan; c++) {
-      double s, co;
-      sincos(k * (delay[r] * freqs[c]), &s, &co);
-      float *v = out + 2 * n_corr * (r * n_chan + c);
-      v[0] = v[last] = (float)(flux * co);
-      v[1] = v[last + 1] = (float)(flux * s);
+   * imaginary part times exp(0) = 1, so libm's sincos is the reference.
+   * poly_sincos4() does four phases at a time; where a product lies close
+   * enough to a float32 rounding boundary that its error could matter, or a
+   * phase is out of its range, that phase is redone with libm, so the output
+   * is libm's bit for bit (docs/csd3-speed.md, rounds 32 and 57). */
+  enum { BLOCK = 256 };
+  ptrdiff_t last = 2 * (n_corr - 1), total = n_rows * n_chan, r = 0, c = 0;
+  /* poly_sincos4()'s distance from libm with ~40x to spare, scaled by
+   * flux; the products' own rounding is the relative term. The blocks keep
+   * the scalar phase stores and vector loads apart, which would otherwise
+   * stall on store forwarding. */
+  double err = 1e-14 * fabs(flux);
+  v4d x[BLOCK / 4], re[BLOCK / 4], im[BLOCK / 4];
+  for (ptrdiff_t i0 = 0; i0 < total; i0 += BLOCK) {
+    ptrdiff_t m = total - i0 < BLOCK ? total - i0 : BLOCK;
+    double *xs = (double *)x;
+    for (ptrdiff_t j = 0; j < m; j++) {
+      xs[j] = k * (delay[r] * freqs[c]);
+      if (++c == n_chan) {
+        c = 0;
+        r++;
+      }
+    }
+    for (ptrdiff_t j = m; j % 4; j++)
+      xs[j] = 0.0;
+    for (ptrdiff_t j = 0; j < (m + 3) / 4; j++) {
+      v4d s, co;
+      poly_sincos4(&x[j], &s, &co);
+      re[j] = flux * co;
+      im[j] = flux * s;
+    }
+    const double *res = (const double *)re, *ims = (const double *)im;
+    for (ptrdiff_t j = 0; j < m; j++) {
+      float *v = out + 2 * n_corr * (i0 + j);
+      double a = res[j], b = ims[j];
+      if (!(fabs(xs[j]) < 0x1p19 && rounds_alike(a, err + fabs(a) * 0x1p-50)
+            && rounds_alike(b, err + fabs(b) * 0x1p-50))) {
+        double ss, cc;
+        sincos(xs[j], &ss, &cc);
+        a = flux * cc;
+        b = flux * ss;
+      }
+      v[0] = v[last] = (float)a;
+      v[1] = v[last + 1] = (float)b;
     }
   }
 }

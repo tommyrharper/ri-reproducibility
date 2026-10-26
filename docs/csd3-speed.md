@@ -2708,3 +2708,72 @@ if that build ever disagrees.
   groups by, so a library A/B (`NS_FASTNOISE_DIR`) is two raced
   `./ri search` runs. Their output directories must sit under
   `results/nested-sampling/` for `./ri bench record` to take them.
+
+## Round 57: a vectorised sincos for the phase ramp (`fastnoise.c`)
+
+**Question.** After round 56, libm's `sincos` in `phase_ramp_c64()` (round
+32) was the largest piece of simulate that was not noise. Can it be faster
+and still give libm's float32s bit for bit?
+
+**Diagnosis.** A pinned C driver over (351000 rows, 4 channels) took
+~34ms a call: ~21ns a `sincos` under `meqtrees.sif`'s glibc 2.39 (25-27ns
+under the host's 2.28), at any phase size from ~10 to ~10^4 rad.
+
+**Change.** In `docker/meqtrees/src/fastnoise.c`, `phase_ramp_c64()` now
+works in blocks of 256 phases:
+
+1. A scalar loop writes the phases, with the same `k * (delay * freq)`
+   expression as before.
+2. `poly_sincos4()` takes four at a time with GCC vector extensions:
+   Cody-Waite reduction by pi/2 in three parts, then fdlibm's sin and cos
+   kernel polynomials. It is cloned for AVX2 and for baseline SSE2
+   (`target_clones`).
+3. A scalar loop writes the float32s. It keeps a product only if every
+   double within `1e-14 * |flux|` (plus 2^-50 relative, for the product's
+   own rounding) rounds to the same float. Otherwise, or for |phase| >=
+   2^19, that phase is redone with libm's `sincos`.
+
+Over 2e8 draws (uniform in log magnitude up to 2^19, plus points next to
+multiples of pi/2), the polynomial is within 2.2e-16 of `sincos` under
+both glibc 2.28 and glibc 2.39. That leaves the 1e-14 margin ~40x headroom,
+so the output is libm's whatever the polynomial's last bit. In practice
+the fallback runs about 3 times in 1.4M phases. The blocks matter too:
+packing four scalar phases straight into a vector stalled on store
+forwarding and gave only 18.7ms, against 10.3ms with blocks.
+
+**Result.**
+
+| test | base | new | change |
+| --- | ---: | ---: | ---: |
+| C driver, pinned, (351000,4), AVX2 clone | 33.9ms | 10.3ms | -70% |
+| same, SSE2 clone | 39.4ms | 13.6ms | -65% |
+| same, all phases >= 2^19 (all fall back) | 39.2ms | 40.8ms | +4% (not reached in searches) |
+| `_phase_ramp()` in `meqtrees.sif`, (351000,4), 30 interleaved triples (numpy 72.9ms) | 43.2ms | 15.9ms | -63% (30/30) |
+| raced 16-rank synchronous search, warm pair 1: simulate | 44.6ms | 42.4ms | -4.9% |
+| warm pair 2: simulate | 45.2ms | 43.2ms | -4.3% |
+| warm pairs: evals/s | 22.30 / 23.95 | 22.74 / 24.10 | +1.9% / +0.6% (below resolution) |
+
+The searches used nlive 150, 2 repeats, 150 dead and seed 4242. Every
+arm's output is byte-identical to base in every C and Python test, at
+delay spreads of 2, 200, 2000 and 20000m. The dead-point chains are
+byte-identical across all six raced arms (log(Z) 0.09426 +/- 0.00255);
+`phys_live.txt` matches up to row order. The first raced pair was cold
+(simulate 108ms on makems misses in the new arm), so it is not a speed
+comparison. `simulate_point_source_ms.py --self-check` passes with the
+new library at `/opt/ri-lib`. The load-time check (`_ramp_agrees()`) now
+also covers a partial block and a phase on libm's path.
+
+**Shipping.** As in round 56, the change reaches cluster runs through the
+host-built copy that `start-sidecars.sh` caches by source hash, so no
+rebuild is needed.
+
+**Learned.**
+- gcc 8.5 has no `__builtin_convertvector`, and passing a 32-byte vector
+  by value draws a `-Wpsabi` note. Pass vectors by pointer and do the
+  float conversions per lane.
+- Building a vector from four scalar stores and loading it straight back
+  costs a store-forwarding stall on every vector, which ate half the
+  gain. Stage the inputs in a block buffer first.
+- "Bit-identical to libm" does not require a correctly rounded libm
+  clone. The output is float32, so an error bound and a check for
+  rounding ambiguity, with a fallback, are enough.

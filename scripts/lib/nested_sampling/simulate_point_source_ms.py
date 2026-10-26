@@ -823,9 +823,11 @@ def _noise_agrees(lib) -> bool:
 
 
 def _ramp_agrees(lib) -> bool:
-    # VLA-sized delays (metres) over L to X band, 32k phases.
+    # VLA-sized delays (metres) over L to X band, 16k phases: a part block
+    # at the end, and one delay far enough out that its phases take libm's
+    # path rather than fastnoise.c's polynomial.
     rng = np.random.default_rng(12345)
-    delay_m, freqs_hz = rng.normal(0.0, 300.0, 4000), 1e9 + np.arange(4) * 2.7e9
+    delay_m, freqs_hz = np.append(rng.normal(0.0, 300.0, 3999), 4e4), 1e9 + np.arange(4) * 2.7e9
     return all(_phase_ramp(delay_m, freqs_hz, flux, 2, None).tobytes()
                == _phase_ramp(delay_m, freqs_hz, flux, 2, lib).tobytes() for flux in (1.0, 0.37))
 
@@ -839,7 +841,7 @@ def _fastnoise():
 
 
 def _fastramp():
-    """phase_ramp_c64(), or None: numpy's predict ~1.8x faster, bit for bit."""
+    """phase_ramp_c64(), or None: numpy's predict ~4.5x faster, bit for bit."""
     import ctypes
 
     return _fast("phase_ramp_c64", [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_ssize_t,
