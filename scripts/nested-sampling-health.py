@@ -351,6 +351,26 @@ class Evaluation(NamedTuple):
     peak_memory_bytes: float | None
 
 
+ENDED_EPOCH_PATTERN = re.compile(r'"ended_epoch":\s*([0-9.eE+-]+)')
+
+
+def packed_records(evaluations: Path) -> dict[str, tuple[float, str]]:
+    """{name: (when it ended, record text)} from evaluations/records.jsonl,
+    without its torn last line if a killed packer left one."""
+    try:
+        data = (evaluations / "records.jsonl").read_bytes()
+        fallback = (evaluations / "records.jsonl").stat().st_mtime
+    except OSError:
+        return {}
+    packed = {}
+    for line in data[:data.rfind(b"\n") + 1].decode(errors="replace").splitlines():
+        name, tab, text = line.partition("\t")
+        if tab:
+            ended = ENDED_EPOCH_PATTERN.search(text)
+            packed[name] = (float(ended.group(1)) if ended else fallback, text)
+    return packed
+
+
 def evaluation_scan(run_dir: Path, procs: int = 0,
                     checkpoint: float | None = None) -> dict[str, object]:
     evaluations = run_dir / "evaluations"
@@ -367,12 +387,18 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     flat = {e.name.removesuffix(".json") for e in listed
             if e.name.startswith("eval-") and e.name.endswith(".json")}
     dirs = {e.name for e in listed if e.name.startswith("eval-") and e.is_dir()}
-    for name in flat | dirs:
+    # Records packed into records.jsonl (round 93) by a finish or a resume:
+    # a `name<TAB>record` line each, timed by the record's own end.
+    packed = packed_records(evaluations)
+    for name in flat | dirs | packed.keys():
         entry = evaluations / name
         metrics = evaluations / f"{name}.json" if name in flat else entry / "metrics.json"
         directories += 1
         try:
-            when, text = metrics.stat().st_mtime, metrics.read_text()
+            if name in packed and name not in flat:
+                when, text = packed[name]
+            else:
+                when, text = metrics.stat().st_mtime, metrics.read_text()
         except OSError:
             pass  # in flight, or a leftover the next run will sweep
         else:
@@ -1860,6 +1886,20 @@ def self_check() -> None:
             assert "next past ~7" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
+
+            # Packed records (round 93) are completed, not in flight, even
+            # with a kept dir beside one; timed by ended_epoch; torn tail ignored.
+            with tempfile.TemporaryDirectory() as packed_tmp:
+                packed = Path(packed_tmp)
+                (packed / "evaluations" / "eval-0002-b").mkdir(parents=True)
+                (packed / "evaluations" / "records.jsonl").write_text(
+                    'eval-0001-a\t{"objective": 0.5, "timing": {"ended_epoch": 1000.0}}\n'
+                    'eval-0002-b\t{"objective": 100.0, "timing": {"ended_epoch": 1010.0}}\n'
+                    'eval-0003-c\t{"objec')
+                write_eval(packed, 4, now)
+                scanned = evaluation_scan(packed)
+                assert scanned["completed"] == 3 and scanned["in_flight"] == 0, scanned
+                assert scanned["failed"] == 1 and scanned["span_seconds"] == now - 1000.0, scanned
             assert report["ranks"] == 4 and report["failed"] == 0, report
             assert report["warnings"] == [], report
             # The headline is the exit status in words. Clean run: HEALTHY and

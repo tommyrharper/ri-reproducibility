@@ -31,6 +31,7 @@ from common import (
     cube_to_params,
     PolyChordFinish,
     finished_run_records,
+    pack_finished_run,
     post_run_line,
     post_run_phase,
     gathered_window_fit_stats,
@@ -527,7 +528,9 @@ def main() -> None:
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
         write_json_atomic(summary_path, summary)
-        post_run_phase("summary", started)
+        started = post_run_phase("summary", started)
+        pack_finished_run(evaluations_dir)
+        post_run_phase("pack", started)
         print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")

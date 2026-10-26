@@ -274,7 +274,11 @@ Those bounds still leave ~1.1 files per evaluation (its `eval-*.json` record;
 a dir only for what it keeps), ~510 per unit of nlive for a converged
 15-repeat run, so an nlive of ~2000 cannot finish even in an empty quota. A
 search warns at the start when its estimate passes what its project has left
-(`ns_warn_file_quota`, `docs/csd3-speed.md` rounds 91-92).
+(`ns_warn_file_quota`, `docs/csd3-speed.md` rounds 91-92). That is the live
+segment only: a resume packs the records before it into
+`evaluations/records.jsonl` and a finished run packs them all, and
+`scripts/prune-run-artefacts.py results/nested-sampling/*/` packs runs that
+finished before round 93.
 
 A failure storm is worse here than slow: `FAILURE_OBJECTIVE` is the likelihood
 PolyChord maximises, so thousands of infrastructure failures took over the live

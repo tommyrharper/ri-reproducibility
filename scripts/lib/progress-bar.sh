@@ -200,9 +200,19 @@ _ns_retry_say() {
 # flight when the run died and the next attempt deletes those before it starts
 # - so this counts work that survived, and cannot be inflated by the handful
 # of directories a crash leaves half-written.
+# Records packed into evaluations/records.jsonl (round 93) count too, by name,
+# since a packed record may also still be a file, or be packed twice.
 _ns_completed_evals() {
-  find "$1/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
-    wc -l | tr -d ' '
+  { find "$1/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
+      sed 's#/metrics\.json$##; s#\.json$##; s#.*/##'
+    _ns_packed_names "$1/evaluations"
+  } | sort -u | wc -l | tr -d ' '
+}
+
+# The names in a run's record pack, one a line: `name<TAB>record` lines.
+_ns_packed_names() {
+  [ -f "$1/records.jsonl" ] || return 0
+  cut -f1 "$1/records.jsonl"
 }
 
 # Return run.log size so retry output can be isolated from earlier attempts.
@@ -404,20 +414,21 @@ _ns_count_evals() {
       read -r total since < <(
         find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' \
           \( -newer "${reference}" -printf 's %f\n' -o -printf 't %f\n' \) 2>/dev/null |
+          { cat; _ns_packed_names "${dir}" | sed 's/^/t /'; } |
           awk '{ n = $2; sub(/\.json$/, "", n)
                  if (!(n in seen)) { seen[n]; total++ }
                  if ($1 == "s" && !(n in new)) { new[n]; since++ } }
                END { print total + 0, since + 0 }'
       )
     else
-      total="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -printf '%f\n' \
-        2>/dev/null | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
+      total="$({ find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -printf '%f\n' \
+        2>/dev/null; _ns_packed_names "${dir}"; } | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
     fi
     echo "${total:-0} ${since:-0}"
     return
   fi
-  total="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' 2>/dev/null |
-    sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
+  total="$({ find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' 2>/dev/null |
+    sed 's#.*/##'; _ns_packed_names "${dir}"; } | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
   if [ -n "${reference}" ] && [ -e "${reference}" ]; then
     since="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -newer "${reference}" \
       2>/dev/null | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
@@ -722,6 +733,19 @@ self_check() {
   [ "$(_ns_count_evals "${tmp}/evaluations" "${tmp}/chains/absent")" = "4 0" ] || {
     echo "FAIL: missing reference must not split"; exit 1
   }
+  # Packed records (round 93) count once by name, before the checkpoint: one
+  # still a file too (eval-0004-d), one packed only (eval-0006-f).
+  printf 'eval-0004-d\t{}\neval-0006-f\t{}\n' >"${tmp}/evaluations/records.jsonl"
+  [ "$(_ns_count_evals "${tmp}/evaluations" "${dead_file}")" = "5 2" ] || {
+    echo "FAIL: packed records: $(_ns_count_evals "${tmp}/evaluations" "${dead_file}")"; exit 1
+  }
+  [ "$(_ns_count_evals "${tmp}/evaluations")" = "5 0" ] || {
+    echo "FAIL: packed records, no reference: $(_ns_count_evals "${tmp}/evaluations")"; exit 1
+  }
+  [ "$(_ns_completed_evals "${tmp}")" = "3" ] || {
+    echo "FAIL: completed with packed records: $(_ns_completed_evals "${tmp}")"; exit 1
+  }
+  rm "${tmp}/evaluations/records.jsonl"
 
   # The redraw backs off with the cost of the draw, so the bar cannot grow
   # into a share of the machine on a long run. A shell that cannot time itself

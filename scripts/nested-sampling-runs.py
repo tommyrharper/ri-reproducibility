@@ -171,11 +171,19 @@ def count_evaluations(run_dir: Path) -> int:
         # Records are eval-*.json (round 92) or, before, eval-*/metrics.json;
         # a kept evaluation's dir sits beside its record, so count names.
         with os.scandir(run_dir / "evaluations") as entries:
-            return len({e.name.removesuffix(".json") for e in entries if e.name.startswith("eval-")
-                        and (e.name.endswith(".json")
-                             or os.path.exists(os.path.join(e.path, "metrics.json")))})
+            names = {e.name.removesuffix(".json") for e in entries if e.name.startswith("eval-")
+                     and (e.name.endswith(".json")
+                          or os.path.exists(os.path.join(e.path, "metrics.json")))}
     except OSError:  # no evaluations directory yet
         return 0
+    # And those a resume packed into records.jsonl (round 93), a name a line.
+    try:
+        with open(run_dir / "evaluations" / "records.jsonl", "rb") as pack:
+            names.update(line.partition(b"\t")[0].decode(errors="replace")
+                         for line in pack if line.endswith(b"\n"))
+    except OSError:
+        pass
+    return len(names)
 
 
 RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
@@ -371,6 +379,9 @@ def self_check() -> None:
             # A round-92 record, with the dir of what it keeps beside it: one.
             (stopped / "evaluations" / "eval-0004-e.json").write_text("{}")
             (stopped / "evaluations" / "eval-0004-e").mkdir()
+            # Packed (round 93): one also a file, one only packed, one torn.
+            (stopped / "evaluations" / "records.jsonl").write_text(
+                'eval-0004-e\t{}\neval-0005-f\t{}\neval-0006-g\t{"ev')
             (stopped / "chains").mkdir()
             (stopped / "chains" / "wsclean_vlaa.resume").write_text("")
             (stopped / "run.env").write_text(
@@ -383,7 +394,7 @@ def self_check() -> None:
             runs = {r["name"]: r for r in find_runs(running=set())}
             assert runs[done.name]["status"] == "complete", runs[done.name]
             assert runs[stopped.name]["status"] == "resumable", runs[stopped.name]
-            assert runs[stopped.name]["evaluations"] == 3, runs[stopped.name]
+            assert runs[stopped.name]["evaluations"] == 4, runs[stopped.name]
             assert runs[stopped.name]["algorithm"] == "wsclean"
             assert runs[stopped.name]["settings"]["NS_METRIC"] == "total_rms_jy - snr"
             assert runs[stopped.name]["settings"]["NS_MPI_PROCS"] == "7"

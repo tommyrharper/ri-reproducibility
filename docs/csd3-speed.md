@@ -4582,3 +4582,63 @@ filling them instead of ~22.
 - Async arms that differ only in record layout still differ by up to 11% in
   evals/s, driven by the evaluation mix: compare their `image_binary` ms
   before reading a throughput gap as a code effect.
+
+## Round 93: records packed into one file when a run finishes or resumes
+
+**Question.** Round 92 left ~1.07 files an evaluation, nearly all its
+`eval-*.json` record. They pile up across runs (the finished production
+R2D2 run alone holds ~148k files) and across the segments of a resumed run.
+Can records stop costing an inode each once nobody writes them?
+
+**Change.** `pack_evaluation_records()` appends records to
+`evaluations/records.jsonl`, one `name<TAB>record json` line each, fsyncs,
+then unlinks their files (a flat record, or a pre-round-92 `metrics.json`
+and then its dir if that held nothing else). It runs at the two moments no
+rank writes records:
+- at resume, inside `adopt_completed_evaluations()`, on rank 0 after a
+  barrier, from the records every rank just read (no rank may still be
+  reading a flat record: a missing one reads as torn, and its dir is
+  swept);
+- at finish, on rank 0 after `summary.json` is written, from the records
+  `finished_run_records()` gathered and `prune_run_artefacts()` edited
+  (`pack_finished_run()`, post-run phase `pack`).
+
+`scripts/prune-run-artefacts.py` does the same for runs that finished
+before this, from their `summary.json`. Readers: `common.py`'s record readers
+(a flat record beats a packed one; the last line for a name wins; a line
+without its newline is a torn append and is ignored), `./ri runs`, `./ri
+health` (a packed record is timed by its `timing.ended_epoch`, and the dir
+of a packed evaluation is not counted in flight), the progress bar's counts,
+`./ri resume`'s count and `test_self_heal.sh`. Records keep the default
+`json.dumps` separators so health's `"objective": 100.0` marker still
+matches.
+
+**Measured.**
+
+| case | before | after |
+| --- | ---: | ---: |
+| 8-rank WSClean search, nlive 25, a rank `kill -9`ed at 900 evals, finished at 1,337: files under `evaluations/` | ~1,430 (1.07/eval) | 117 (22 kept dirs, their files, the pack) |
+| 20k synthetic 4.2KB records on Lustre, read back (warm) | 2.2 s flat | 0.94 s packed |
+| pack 20k records (unpinned) | - | 3.8 s |
+| pack 5k records from a process pinned to one CPU | - | 31.3 s, then 0.89 s with the unlink threads unpinned |
+| in-run resume pack, 8 ranks | 900 records in 5.6 s (pinned) | 1,023 in 0.3 s (unpinned) |
+| `_ns_count_evals` / `_ns_completed_evals`, 20k records | 0.07 / 0.06 s | 0.18 / 0.18 s (80MB pack) |
+
+Every eval_id, params and objective read back from the packed run equals
+`summary.json`'s (1,337 of 1,337), and `./ri health` and `./ri runs` read it
+as before (0 in flight, 1,337 evaluations). Records from an earlier segment
+keep the `paths` they were written with, as their files did: `summary.json`
+remains the authority for what a finished run kept. Evaluation throughput
+is untouched: no record write changed. A run's own live segment still costs
+~1.07 files an evaluation, so `ns_warn_file_quota` keeps that estimate, but
+a run that resumes every job (CSD3's 12 h cap) now holds only its current
+segment's records as files, and a finished run gives them all back.
+
+**Learned.**
+- Unlinks from threads of a process pinned to one CPU cost ~6 ms each on
+  Lustre against ~0.2 ms unpinned: the same directory-lock stall round 54
+  found for `mkdir`. Every thread pool rank 0 runs over `evaluations/` must
+  run off the pinned CPU (`initializer=_unpin_thread`).
+- `./ri self-check self-heal`'s mid-run kill can be reproduced cheaply by
+  `kill -9` of one `polychord_wsclean.py` rank from a short 8-rank search
+  (`--retries 2`): `run_with_retries` resumes it within seconds.

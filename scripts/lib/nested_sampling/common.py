@@ -1232,6 +1232,93 @@ def evaluation_record_paths(evaluations_dir: Path) -> dict[str, Path]:
     return paths
 
 
+# Records packed into one file, a `name<TAB>record json` line each, so that a
+# finished run is one inode of records rather than one an evaluation, and a
+# resumed run carries only its last segment's as files (round 93). Packed when
+# a run finishes and when it resumes, the two moments no rank writes records;
+# a flat record beside a packed one wins. A line without its newline is a torn
+# append, and is ignored.
+RECORD_PACK = "records.jsonl"
+
+
+def _read_record_pack(evaluations_dir: Path) -> tuple[dict[str, str], int]:
+    """({name: record json} from the pack, the length of its whole lines)."""
+    try:
+        data = (evaluations_dir / RECORD_PACK).read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return {}, 0
+    whole = data.rfind(b"\n") + 1
+    texts: dict[str, str] = {}
+    for line in data[:whole].decode(errors="replace").splitlines():
+        name, tab, text = line.partition("\t")
+        if tab:
+            texts[name] = text
+    return texts, whole
+
+
+def packed_record_texts(evaluations_dir: Path) -> dict[str, str]:
+    return _read_record_pack(evaluations_dir)[0]
+
+
+def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
+    """(every evaluation name, a function reading one's record or None)."""
+    paths = evaluation_record_paths(evaluations_dir)
+    packed = packed_record_texts(evaluations_dir)
+
+    def read(name: str) -> dict[str, Any] | None:
+        path = paths.get(name)
+        if name in packed and (path is None or path.parent != evaluations_dir):
+            try:
+                record = json.loads(packed[name])
+            except ValueError:
+                record = None
+            if isinstance(record, dict):
+                return record
+            print(f"WARNING: ignoring unreadable {name} in {evaluations_dir / RECORD_PACK}",
+                  file=sys.stderr, flush=True)
+            return None
+        return read_evaluation_record(path)
+
+    return sorted(paths.keys() | packed.keys()), read
+
+
+def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]]) -> int:
+    """Move the records named in `known` ({name: record}) into the pack and
+    unlink their files - a flat record, or a pre-round-92 metrics.json and
+    then its dir if that held nothing else; how many moved. No process may be
+    writing records."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
+    texts, whole = _read_record_pack(evaluations_dir)
+    # A packed name's dir has no record file: only a flat one is newer.
+    moving = [name for name in sorted(known) if name in paths
+              and (paths[name].parent == evaluations_dir or name not in texts)]
+    if not moving:
+        return 0
+    text = "".join(f"{name}\t{json.dumps(known[name])}\n" for name in moving)
+    with open(evaluations_dir / RECORD_PACK, "ab") as pack:
+        pack.truncate(whole)  # a torn last line from a killed packer
+        pack.write(text.encode())
+        pack.flush()
+        os.fsync(pack.fileno())
+
+    def unlink(name: str) -> None:
+        paths[name].unlink(missing_ok=True)
+        if paths[name].parent != evaluations_dir:
+            try:
+                paths[name].parent.rmdir()
+            except OSError:
+                pass  # it keeps something
+
+    # Off rank 0's pinned CPU, as the record writer is (round 54): pinned, a
+    # thread holding the directory's lock waits for the core, and an unlink
+    # cost ~6ms rather than ~0.2ms (round 93).
+    with ThreadPoolExecutor(RECORD_READ_THREADS, initializer=_unpin_thread) as pool:
+        list(pool.map(unlink, moving))
+    return len(moving)
+
+
 def evaluation_record_file(eval_dir: Path) -> Path:
     """The record of one evaluation, in either layout (two stats at most)."""
     flat = flat_record_path(eval_dir)
@@ -1263,10 +1350,9 @@ def read_evaluation_records(evaluations_dir: Path) -> list[tuple[Path, dict[str,
     """(eval dir, record or None) for every eval-* entry, in name order."""
     from concurrent.futures import ThreadPoolExecutor
 
-    paths = evaluation_record_paths(evaluations_dir)
-    names = sorted(paths)
+    names, read = _record_reader(evaluations_dir)
     with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        records = pool.map(lambda name: read_evaluation_record(paths[name]), names)
+        records = pool.map(read, names)
         return [(evaluations_dir / name, record) for name, record in zip(names, records)]
 
 
@@ -1279,13 +1365,27 @@ def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[
     them, reading from disk only those not already in `written`."""
     from concurrent.futures import ThreadPoolExecutor
 
-    paths = evaluation_record_paths(evaluations_dir)
-    names = set(paths)
+    listed, read_one = _record_reader(evaluations_dir)
+    names = set(listed)
     earlier = sorted(names - written.keys())
     with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        read = dict(zip(earlier, pool.map(lambda name: read_evaluation_record(paths[name]), earlier)))
-    records = (written.get(name) or read.get(name) for name in sorted(names | written.keys()))
-    return [record for record in records if record is not None]
+        read = dict(zip(earlier, pool.map(read_one, earlier)))
+    _FINISHED_RECORDS.clear()
+    for name in sorted(names | written.keys()):
+        record = written.get(name) or read.get(name)
+        if record is not None:
+            _FINISHED_RECORDS[name] = record
+    return list(_FINISHED_RECORDS.values())
+
+
+# The records finished_run_records() gave rank 0, by name, which
+# pack_finished_run() packs once prune_run_artefacts() has edited them.
+_FINISHED_RECORDS: dict[str, dict[str, Any]] = {}
+
+
+def pack_finished_run(evaluations_dir: Path) -> int:
+    """Rank 0, once the summary is written: no rank writes records now."""
+    return pack_evaluation_records(evaluations_dir, _FINISHED_RECORDS)
 
 
 class PolyChordFinish:
@@ -1423,11 +1523,14 @@ def adopt_completed_evaluations(
     import shutil
 
     adopted = 0
+    good: dict[str, dict[str, Any]] = {}
     # A record a killed writer left half-written: the record it was replacing,
     # if any, is still there beside it.
     for partial in evaluations_dir.glob("eval-*" + RECORD_SUFFIX + ".partial"):
         partial.unlink(missing_ok=True)
     for eval_dir, record in read_evaluation_records(evaluations_dir):
+        if record is not None:
+            good[eval_dir.name] = record
         if record is None:
             # A half-written record goes too, or every resume warns about it.
             flat_record_path(eval_dir).unlink(missing_ok=True)
@@ -1439,6 +1542,23 @@ def adopt_completed_evaluations(
             continue
         cache[params_key(record["params"])] = float(record["objective"])
         adopted += 1
+    # Collective: every rank adopts, and none may still be reading a flat
+    # record when rank 0 unlinks it - a missing record reads as a torn one,
+    # whose dir the loop above removes.
+    try:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+    except Exception:
+        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    if comm is not None:
+        comm.Barrier()
+    if mpi_rank() == 0 and good:
+        started = time.monotonic()
+        packed = pack_evaluation_records(evaluations_dir, good)
+        if packed:
+            print(f"packed {packed} earlier records into {RECORD_PACK} in "
+                  f"{time.monotonic() - started:.1f}s", flush=True)
     return adopted
 
 
@@ -1537,7 +1657,8 @@ def self_check_resume_adoption() -> None:
         # the record it was replacing still counts.
         flat_record_path(eval_dir).with_name("eval-0001-abc.json.partial").write_text('{"ev')
         assert adopt_completed_evaluations(Path(tmp), {}) == 1
-        assert list(Path(tmp).iterdir()) == [flat_record_path(eval_dir)]
+        # ...and the record, adopted, is packed (round 93).
+        assert list(Path(tmp).iterdir()) == [Path(tmp) / RECORD_PACK]
         # ...and one that was renamed into place half-written (a full disk).
         torn = Path(tmp) / "eval-0009-zzz.json"
         torn.write_text('{"ev')
@@ -1551,6 +1672,48 @@ def self_check_resume_adoption() -> None:
         kept.mkdir(parents=True)  # a kept evaluation's artefacts, beside its record
         assert [r["eval_id"] for _, r in read_evaluation_records(Path(tmp))] == [1, 2]
         assert evaluation_record_file(legacy) == legacy / "metrics.json"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The pack (round 93): a resume packs every earlier flat record, keeps
+        # a packed evaluation's dir, reads a flat record over a packed one and
+        # drops a torn last line; a finished run packs what prune left.
+        evaluations_dir = Path(tmp)
+        kept = evaluations_dir / "eval-0001-abc"
+        (kept / "wsclean").mkdir(parents=True)
+        write_evaluation_record(kept, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        write_evaluation_record(evaluations_dir / "eval-0002-def",
+                                {"eval_id": 2, "params": {"a": 2}, "objective": 0.25})
+        cache = {}
+        assert adopt_completed_evaluations(evaluations_dir, cache) == 2 and len(cache) == 2
+        assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 2  # nothing left to pack
+        assert (kept / "wsclean").is_dir(), "a packed evaluation's kept dir was swept"
+        with open(evaluations_dir / RECORD_PACK, "a") as pack:
+            pack.write('eval-0003-ghi\t{"eval_id": 3, "par')  # a packer killed mid-line
+        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2]
+        write_evaluation_record(evaluations_dir / "eval-0002-def",
+                                {"eval_id": 2, "params": {"a": 2}, "objective": 0.75})
+        assert [r["objective"] for r in load_evaluations_from_dir(evaluations_dir)] == [0.5, 0.75]
+        write_evaluation_record(evaluations_dir / "eval-0004-jkl",
+                                {"eval_id": 4, "params": {"a": 4}, "objective": 0.1})
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4]
+        records[2]["paths"] = {}  # as prune_run_artefacts() edits a record
+        assert pack_finished_run(evaluations_dir) == 2
+        assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
+        assert (evaluations_dir / RECORD_PACK).read_text().count("\n") == 4  # 1, 2, 2 again, 4
+        assert load_evaluations_from_dir(evaluations_dir) == records
+        # A pre-round-92 run: metrics.json goes, and its dir unless it keeps something.
+        for name, keeps in (("eval-0005-mno", False), ("eval-0006-pqr", True)):
+            (evaluations_dir / name).mkdir()
+            (evaluations_dir / name / "metrics.json").write_text(json.dumps(
+                {"eval_id": 5 + keeps, "params": {"a": 5 + keeps}, "objective": 0.2}))
+            if keeps:
+                (evaluations_dir / name / "wsclean").mkdir()
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 5
+        assert sorted(p.name for p in evaluations_dir.iterdir()) == [
+            "eval-0001-abc", "eval-0006-pqr", RECORD_PACK]
+        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6]
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.

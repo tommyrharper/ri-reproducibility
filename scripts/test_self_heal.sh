@@ -52,10 +52,13 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# Records: eval-*.json, or eval-*/metrics.json from before round 92.
+# Records: eval-*.json, eval-*/metrics.json from before round 92, and the
+# names packed into evaluations/records.jsonl (round 93), counted once each.
 completed_evals() {
-  find "${1}/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
-    wc -l | tr -d ' '
+  { find "${1}/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
+      sed 's#/metrics\.json$##; s#\.json$##; s#.*/##'
+    [ ! -f "${1}/evaluations/records.jsonl" ] || cut -f1 "${1}/evaluations/records.jsonl"
+  } | sort -u | wc -l | tr -d ' '
 }
 
 # Bounded rather than a bare `wait`, because the failure this whole script is
