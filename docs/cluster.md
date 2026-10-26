@@ -259,7 +259,7 @@ rank then died on `mkdir`. Four bounds keep a long run inside it, all in
 `defaults.toml` (`docs/csd3-experiments.md` has the measurements):
 
 - `NS_KEEP_DETAIL_EVERY` (100): a successful evaluation is stripped to its
-  `metrics.json` as the run goes, unless it is among its rank's 20 lowest or
+  record as the run goes, unless it is among its rank's 20 lowest or
   highest objectives - which is what the end-of-run image policy needs - or one
   of the 1 in 100 kept whole, which `./ri profile` reads.
 - `NS_KEEP_FAILED_ARTEFACTS` (20): failures per run that keep their Measurement
@@ -270,10 +270,11 @@ rank then died on `mkdir`. Four bounds keep a long run inside it, all in
 - `NS_MEQSERVER_RECYCLE` (20): predicts before a simulate worker replaces its
   meqserver, which holds every MS it has written open and so pins it in tmpfs.
 
-Those bounds still leave ~2 files per evaluation, ~970 per unit of nlive for a
-converged 15-repeat run, so an nlive of ~1000 cannot finish even in an empty
-quota. A search warns at the start when its estimate passes what its project
-has left (`ns_warn_file_quota`, `docs/csd3-speed.md` round 91).
+Those bounds still leave ~1.1 files per evaluation (its `eval-*.json` record;
+a dir only for what it keeps), ~510 per unit of nlive for a converged
+15-repeat run, so an nlive of ~2000 cannot finish even in an empty quota. A
+search warns at the start when its estimate passes what its project has left
+(`ns_warn_file_quota`, `docs/csd3-speed.md` rounds 91-92).
 
 A failure storm is worse here than slow: `FAILURE_OBJECTIVE` is the likelihood
 PolyChord maximises, so thousands of infrastructure failures took over the live

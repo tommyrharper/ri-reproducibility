@@ -4524,3 +4524,61 @@ columns are ~11 ns a row, about casacore's per-row put cost.
 - Simulate's casacore side is now near its floor: what is left is the C
   ramp and noise (~6 ms solo) and ~3.5 ms of table opens, puts and closes
   that no bucket setting moves.
+
+## Round 92: one record file per evaluation, not a dir plus `metrics.json`
+
+**Question.** Round 91 found the 1M-file quota, not CPU time, caps a run:
+~2.1 files an evaluation, nearly all an `eval-*` directory holding nothing
+but its `metrics.json`. Can a record be one inode?
+
+**Change.** `write_evaluation_record()` writes `evaluations/eval-NNNN-key.json`
+(atomic, through `.json.partial` and a rename). The `eval-NNNN-key/` dir now
+exists only for an evaluation that keeps something (extremes, the 1 in 100
+kept whole, failures), and `_strip_to_record()` removes it rather than
+leaving it empty. Record writes no longer `mkdir` in `evaluations/` (round
+54's shared directory lock). Every reader takes both layouts, so runs from
+before resume and report as they did: `evaluation_record_paths()` (one
+listing) for `common.py`'s record readers, plus `./ri runs`, `./ri health`
+(in flight, disk per evaluation, wedge logs), the progress bar, `./ri
+resume`'s count and `test_self_heal.sh`. Resume adoption sweeps a torn
+`.json.partial` and an unreadable flat record, as it removed a torn record's
+dir before. `ns_warn_file_quota` now estimates 4 files per repeat per dead
+point, not 7.
+
+**Measured.** Raced 17-rank WSClean arms, nlive 150, shipped SIFs, A = HEAD
+(`dc27cd5`) from a `git archive` tree on Lustre, B = this tree
+(`.probe/r92/ab.sh`):
+
+| pass | arm | evals | files under `evaluations/` | files/eval | evals/s | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| sync, 300 dead | A | 7,821 | 16,225 | 2.07 | 27.15 | 0.09607 +/- 0.00114 |
+| sync, 300 dead | B | 7,821 | 8,562 | 1.09 | 27.20 | 0.09607 +/- 0.00114 |
+| async, 600 dead, A first | A | 17,641 | 36,099 | 2.05 | 76.47 | 0.09602 +/- 0.00111 |
+| async, 600 dead, A first | B | 17,446 | 18,432 | 1.06 | 79.54 | 0.09682 +/- 0.00055 |
+| async, 600 dead, B first | A | 16,727 | 34,256 | 2.05 | 89.39 | 0.09661 +/- 0.00055 |
+| async, 600 dead, B first | B | 17,722 | 18,726 | 1.06 | 79.15 | 0.09578 +/- 0.00123 |
+
+The synchronous seeded pass is identical: same evaluations, same log(Z).
+Files per evaluation fall from ~2.06 to ~1.07 in every pass. Throughput does
+not move visibly: the async pairs split +4% and -11%, the later-started arm
+was faster both times, and A-b's mean binary time (153 ms against 173-181)
+shows its evaluation mix was cheaper, not its records. The `harness` stage
+is 0.26-0.30 ms in B against 0.29-0.32 ms in A. Post-run phases are equal.
+
+**What it buys.** At round 91's 3.4 x num_repeats evaluations per dead point
+and ~9 x nlive dead points, a converged 15-repeat run now needs ~510 files
+per unit of nlive instead of ~970. The ~650k files free on the project fit
+nlive ~1,250 instead of ~650, and 250 evals/s runs ~40 minutes before
+filling them instead of ~22.
+
+**Learned.**
+- Raced searches from a compute node each call `squeue` once per named
+  `--output-dir` (`ns_refuse_live_run` -> `_ns_slurm_job_live`), plus
+  `rank-budget.sh`'s liveness check of other runs. It took ~1-3 minutes
+  here and delayed arm B's start, so start-time offsets in raced A/Bs can be
+  minutes, not the scripted 10 s. `resume-nested-sampling-run.sh
+  --self-check` also calls the real `squeue` and blocks on it, so it is not
+  safe to run inside the agent's job.
+- Async arms that differ only in record layout still differ by up to 11% in
+  evals/s, driven by the evaluation mix: compare their `image_binary` ms
+  before reading a throughput gap as a code effect.

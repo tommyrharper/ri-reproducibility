@@ -84,10 +84,11 @@ if [ "${1:-}" = "--self-check" ]; then
   printf 'NS_ALGORITHM=wsclean\nNS_MPI_PROCS=1\n' >"${COUNT_RUN}/run.env"
   echo '{}' >"${COUNT_RUN}/evaluations/eval-0001-a/metrics.json"
   echo '{}' >"${COUNT_RUN}/evaluations/eval-0002-b/metrics.json"
+  echo '{}' >"${COUNT_RUN}/evaluations/eval-0004-d.json"
 
   OUT="$(NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
   case "${OUT}" in
-    *"(wsclean, 2 evaluations already done, 1 rank)"*) ;;
+    *"(wsclean, 3 evaluations already done, 1 rank)"*) ;;
     *) echo "FAIL: resume must count scored evaluations, got: ${OUT}"; exit 1 ;;
   esac
   case "${OUT}" in
@@ -193,8 +194,7 @@ fi
 # Count scored evaluations; guard missing evaluations/ under `pipefail`.
 DONE=0
 if [ -d "${RUN_DIR}/evaluations" ]; then
-  DONE="$(find "${RUN_DIR}/evaluations" -mindepth 2 -maxdepth 2 -name 'metrics.json' \
-    | wc -l | tr -d ' ')"
+  DONE="$(_ns_completed_evals "${RUN_DIR}")"
 fi
 if [ "${NS_MPI_PROCS:-}" = 1 ]; then RANKS="1 rank"; else RANKS="${NS_MPI_PROCS:-?} ranks"; fi
 # Record downtime beside automatic retries; health excludes it.

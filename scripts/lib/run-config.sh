@@ -166,11 +166,11 @@ ns_refuse_unmounted_run() {
   exit 1
 }
 
-# Even stripped as it goes, an evaluation leaves ~2 files (its dir and
-# metrics.json), and a converged run makes ~9 x nlive dead points at ~3.4 x
-# num_repeats evaluations each: 150k files for the 71k evaluations of a
-# 24-rank nlive 150 R2D2 run (docs/csd3-speed.md, round 91). So ~7 files per
-# repeat per dead point; a run sized past the free file quota dies on EDQUOT
+# Stripped as it goes, an evaluation leaves ~1.1 files (its eval-*.json
+# record, and a dir for the few it keeps: 8,562 files for 7,821 evaluations,
+# docs/csd3-speed.md round 92; ~2.1 before), and a converged run makes ~9 x
+# nlive dead points at ~3.4 x num_repeats evaluations each (round 91). So ~4
+# files per repeat per dead point; a run sized past the free file quota dies on EDQUOT
 # part way through. Warns, never refuses: the estimate is rough, and only
 # Lustre's project quota (CSD3's hpc-work) is read.
 #   ns_warn_file_quota <run dir> <nlive> <num repeats> <max ndead>
@@ -181,7 +181,7 @@ ns_warn_file_quota() {
   [ "${project:-0}" -gt 0 ] 2>/dev/null || return 0
   ndead="$4"
   [ "${ndead}" -gt 0 ] 2>/dev/null || ndead=$((9 * $2))
-  need=$((7 * $3 * ndead))
+  need=$((4 * $3 * ndead))
   # Header, then: filesystem kbytes quota limit grace files quota limit grace.
   free="$("${LFS:-lfs}" quota -p "${project}" "$1" 2>/dev/null \
     | awk 'NR > 2 && $8 + 0 > 0 { print $8 - $6; exit }')"
@@ -358,10 +358,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     '  echo ". 1 2 3 - $((1048576 - FREE)) 1048576 1048576 -" ;; esac' >"${_dir}/lfs"
   chmod +x "${_dir}/lfs"
   quota_warns() { LFS="${_dir}/lfs" FREE="$1" ns_warn_file_quota "${_dir}" "$2" 15 "$3" 2>&1 | grep -c EDQUOT; }
-  # nlive 150 converged: 7 x 15 x 1350 = 141,750 files.
+  # nlive 150 converged: 4 x 15 x 1350 = 81,000 files.
   [ "$(quota_warns 650000 150 -1)" = 0 ] || { echo "FAIL: 650k free must fit nlive 150"; exit 1; }
-  [ "$(quota_warns 100000 150 -1)" = 1 ] || { echo "FAIL: 100k free must warn for nlive 150"; exit 1; }
-  [ "$(quota_warns 100000 150 900)" = 0 ] || { echo "FAIL: max-ndead must bound the estimate"; exit 1; }
+  [ "$(quota_warns 60000 150 -1)" = 1 ] || { echo "FAIL: 60k free must warn for nlive 150"; exit 1; }
+  [ "$(quota_warns 60000 150 900)" = 0 ] || { echo "FAIL: max-ndead must bound the estimate"; exit 1; }
   [ "$(quota_warns '' 5000 -1)" = 0 ] || { echo "FAIL: no project quota must stay quiet"; exit 1; }
   [ "$(LFS="${_dir}/missing" ns_warn_file_quota "${_dir}" 5000 15 -1 2>&1 | grep -c EDQUOT)" = 0 ] \
     || { echo "FAIL: no lfs must stay quiet"; exit 1; }

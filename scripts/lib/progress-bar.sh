@@ -194,13 +194,15 @@ _ns_retry_say() {
   echo "run_with_retries: $*" | tee -a "${output_dir}/run.log" >&2
 }
 
-# Evaluations this run has finished, across every attempt. metrics.json
-# rather than the directory holding it, because a directory without one is an
-# evaluation that was in flight when the run died and the next attempt deletes
-# those before it starts - so this counts work that survived, and cannot be
-# inflated by the handful of directories a crash leaves half-written.
+# Evaluations this run has finished, across every attempt. Records
+# (eval-*.json, or eval-*/metrics.json from before round 92) rather than
+# directories, because a directory without one is an evaluation that was in
+# flight when the run died and the next attempt deletes those before it starts
+# - so this counts work that survived, and cannot be inflated by the handful
+# of directories a crash leaves half-written.
 _ns_completed_evals() {
-  find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
+  find "$1/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
+    wc -l | tr -d ' '
 }
 
 # Return run.log size so retry output can be isolated from earlier attempts.
@@ -396,23 +398,29 @@ _ns_count_evals() {
   # GNU find can classify both counts during one directory walk. Keep the
   # portable two-pass fallback for macOS and other BSD find implementations.
   if find "${dir}" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    # One evaluation can be two entries: its record, eval-*.json, and the
+    # dir beside it holding what it keeps (round 92). Counted once, by name.
     if [ -n "${reference}" ] && [ -e "${reference}" ]; then
       read -r total since < <(
-        find "${dir}" -maxdepth 1 -name 'eval-*' \
-          \( -newer "${reference}" -printf 's\n' -o -printf 't\n' \) 2>/dev/null |
-          awk '{ total++; since += ($1 == "s") } END { print total + 0, since + 0 }'
+        find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' \
+          \( -newer "${reference}" -printf 's %f\n' -o -printf 't %f\n' \) 2>/dev/null |
+          awk '{ n = $2; sub(/\.json$/, "", n)
+                 if (!(n in seen)) { seen[n]; total++ }
+                 if ($1 == "s" && !(n in new)) { new[n]; since++ } }
+               END { print total + 0, since + 0 }'
       )
     else
-      total="$(find "${dir}" -maxdepth 1 -name 'eval-*' -printf 'x\n' 2>/dev/null |
-        wc -l | tr -d ' ')"
+      total="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -printf '%f\n' \
+        2>/dev/null | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
     fi
     echo "${total:-0} ${since:-0}"
     return
   fi
-  total="$(find "${dir}" -maxdepth 1 -name 'eval-*' 2>/dev/null | wc -l | tr -d ' ')"
+  total="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' 2>/dev/null |
+    sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
   if [ -n "${reference}" ] && [ -e "${reference}" ]; then
-    since="$(find "${dir}" -maxdepth 1 -name 'eval-*' -newer "${reference}" 2>/dev/null |
-      wc -l | tr -d ' ')"
+    since="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -newer "${reference}" \
+      2>/dev/null | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
   fi
   echo "${total} ${since}"
 }
@@ -691,8 +699,13 @@ self_check() {
   }
   [ "$(_ns_count_lines "${tmp}/chains/wsclean_vlaa_dead-birth.txt")" = "3" ] || { echo "FAIL: dead-birth line count"; exit 1; }
 
+  # Both layouts (round 92): eval-0003-c is a record with the dir it keeps
+  # beside it, eval-0004-d a record alone, and a .partial is not a record.
   mkdir "${tmp}/evaluations/eval-0001-a" "${tmp}/evaluations/eval-0002-b" \
-    "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+    "${tmp}/evaluations/eval-0003-c"
+  echo '{}' >"${tmp}/evaluations/eval-0003-c.json"
+  echo '{}' >"${tmp}/evaluations/eval-0004-d.json"
+  echo '{' >"${tmp}/evaluations/eval-0005-e.json.partial"
   local dead_file="${tmp}/chains/wsclean_vlaa_dead-birth.txt"
   [ "$(_ns_count_evals "${tmp}/evaluations")" = "4 0" ] || {
     echo "FAIL: evaluations count: $(_ns_count_evals "${tmp}/evaluations")"; exit 1
@@ -700,7 +713,8 @@ self_check() {
   # -t rather than -d: the timestamp form is POSIX and BSD touch has no -d.
   touch -t 202601010000 "${tmp}/evaluations"/eval-*
   touch -t 202601010100 "${dead_file}"
-  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0003-c.json" \
+    "${tmp}/evaluations/eval-0004-d.json"
   [ "$(_ns_count_evals "${tmp}/evaluations" "${dead_file}")" = "4 2" ] || {
     echo "FAIL: split either side of the checkpoint: $(_ns_count_evals "${tmp}/evaluations" "${dead_file}")"
     exit 1
@@ -849,7 +863,8 @@ self_check() {
   # from the checkpoint and is as stale as it is, so overtaking it means the
   # estimate is out of date rather than that the run has finished.
   touch -t 202601010100 "${dead_file}"
-  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0003-c.json" \
+    "${tmp}/evaluations/eval-0004-d.json"
   line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
   case "${line}" in
     *"~100%"*"~20/~18 dead points"*"eta ~?"*"past the ~18 estimate; the next checkpoint revises it"*) ;;

@@ -863,7 +863,7 @@ def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
             continue
         eval_dir = (record.get("paths") or {}).get("eval_dir")
         try:
-            ended = (Path(eval_dir) / "metrics.json").stat().st_mtime
+            ended = evaluation_record_file(Path(eval_dir)).stat().st_mtime
         except (OSError, TypeError):
             return profiling
         spans.append({"timing": {"started_epoch": ended - length, "ended_epoch": ended}})
@@ -1202,6 +1202,42 @@ def worker_procs(mpi_procs: int) -> int:
     return mpi_procs - 1 if mpi_procs > 1 else 1
 
 
+# An evaluation's record is one file, eval-NNNN-xxx.json, beside the eval dir
+# that holds only what it keeps: a dir plus its metrics.json was two inodes an
+# evaluation, and the file quota, not CPU time, capped a run (round 91). Runs
+# from before round 92 have eval-NNNN-xxx/metrics.json, which is still read.
+RECORD_SUFFIX = ".json"
+
+
+def flat_record_path(eval_dir: Path) -> Path:
+    return eval_dir.with_name(eval_dir.name + RECORD_SUFFIX)
+
+
+def evaluation_record_paths(evaluations_dir: Path) -> dict[str, Path]:
+    """{eval dir name: its record path} for every evaluation an entry names,
+    from one listing: a flat record if there is one, else the dir's metrics.json
+    (which may not exist: an evaluation in flight, or one a killed rank left)."""
+    try:
+        names = os.listdir(evaluations_dir)
+    except FileNotFoundError:
+        return {}
+    paths: dict[str, Path] = {}
+    for name in names:
+        if not name.startswith("eval-") or name.endswith(".partial"):
+            continue
+        if name.endswith(RECORD_SUFFIX):
+            paths[name[:-len(RECORD_SUFFIX)]] = evaluations_dir / name
+        else:
+            paths.setdefault(name, evaluations_dir / name / "metrics.json")
+    return paths
+
+
+def evaluation_record_file(eval_dir: Path) -> Path:
+    """The record of one evaluation, in either layout (two stats at most)."""
+    flat = flat_record_path(eval_dir)
+    return flat if flat.exists() else eval_dir / "metrics.json"
+
+
 def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
     try:
         record = json.loads(metrics_path.read_text())
@@ -1227,14 +1263,11 @@ def read_evaluation_records(evaluations_dir: Path) -> list[tuple[Path, dict[str,
     """(eval dir, record or None) for every eval-* entry, in name order."""
     from concurrent.futures import ThreadPoolExecutor
 
-    try:
-        names = sorted(name for name in os.listdir(evaluations_dir) if name.startswith("eval-"))
-    except FileNotFoundError:
-        return []
-    eval_dirs = [evaluations_dir / name for name in names]
+    paths = evaluation_record_paths(evaluations_dir)
+    names = sorted(paths)
     with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        records = pool.map(lambda eval_dir: read_evaluation_record(eval_dir / "metrics.json"), eval_dirs)
-        return list(zip(eval_dirs, records))
+        records = pool.map(lambda name: read_evaluation_record(paths[name]), names)
+        return [(evaluations_dir / name, record) for name, record in zip(names, records)]
 
 
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
@@ -1246,14 +1279,11 @@ def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[
     them, reading from disk only those not already in `written`."""
     from concurrent.futures import ThreadPoolExecutor
 
-    try:
-        names = {name for name in os.listdir(evaluations_dir) if name.startswith("eval-")}
-    except FileNotFoundError:
-        names = set()
+    paths = evaluation_record_paths(evaluations_dir)
+    names = set(paths)
     earlier = sorted(names - written.keys())
     with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        read = dict(zip(earlier, pool.map(
-            lambda name: read_evaluation_record(evaluations_dir / name / "metrics.json"), earlier)))
+        read = dict(zip(earlier, pool.map(lambda name: read_evaluation_record(paths[name]), earlier)))
     records = (written.get(name) or read.get(name) for name in sorted(names | written.keys()))
     return [record for record in records if record is not None]
 
@@ -1393,8 +1423,14 @@ def adopt_completed_evaluations(
     import shutil
 
     adopted = 0
+    # A record a killed writer left half-written: the record it was replacing,
+    # if any, is still there beside it.
+    for partial in evaluations_dir.glob("eval-*" + RECORD_SUFFIX + ".partial"):
+        partial.unlink(missing_ok=True)
     for eval_dir, record in read_evaluation_records(evaluations_dir):
         if record is None:
+            # A half-written record goes too, or every resume warns about it.
+            flat_record_path(eval_dir).unlink(missing_ok=True)
             if not eval_dir.is_dir():
                 continue
             # ignore_errors because every rank runs this, and they are all
@@ -1435,7 +1471,7 @@ def self_check_resume_adoption() -> None:
         later.mkdir()
         write_evaluation_record(later, {"eval_id": 2, "params": {"a": 2}, "objective": 0.25})
         (evaluations_dir / "eval-0003-ghi").mkdir()  # in flight: no record
-        written = {"eval-0002-def": json.loads((later / "metrics.json").read_text())}
+        written = {"eval-0002-def": json.loads(flat_record_path(later).read_text())}
         assert gathered_and_earlier_records(evaluations_dir, written) == load_evaluations_from_dir(evaluations_dir)
         assert [r["eval_id"] for r in finished_run_records(evaluations_dir)] == [1, 2]
 
@@ -1488,15 +1524,33 @@ def self_check_resume_adoption() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         # The record is renamed into place rather than truncated and rewritten,
-        # so a rank killed mid-write leaves no metrics.json at all instead of
-        # half of one. A rename gives a new inode; an in-place write does not.
+        # so a rank killed mid-write leaves no record at all instead of half
+        # of one. A rename gives a new inode; an in-place write does not.
         eval_dir = Path(tmp) / "eval-0001-abc"
-        eval_dir.mkdir()
         write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
-        first_inode = (eval_dir / "metrics.json").stat().st_ino
+        first_inode = flat_record_path(eval_dir).stat().st_ino
         write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.7})
-        assert (eval_dir / "metrics.json").stat().st_ino != first_inode
-        assert list(eval_dir.iterdir()) == [eval_dir / "metrics.json"]
+        assert flat_record_path(eval_dir).stat().st_ino != first_inode
+        # One inode an evaluation that keeps nothing: no dir beside it.
+        assert list(Path(tmp).iterdir()) == [flat_record_path(eval_dir)]
+        # A half-written record a killed writer left is swept on resume, and
+        # the record it was replacing still counts.
+        flat_record_path(eval_dir).with_name("eval-0001-abc.json.partial").write_text('{"ev')
+        assert adopt_completed_evaluations(Path(tmp), {}) == 1
+        assert list(Path(tmp).iterdir()) == [flat_record_path(eval_dir)]
+        # ...and one that was renamed into place half-written (a full disk).
+        torn = Path(tmp) / "eval-0009-zzz.json"
+        torn.write_text('{"ev')
+        assert adopt_completed_evaluations(Path(tmp), {}) == 1
+        assert not torn.exists()
+        # Both layouts in one run (a run resumed across round 92) read as one.
+        legacy = Path(tmp) / "eval-0002-def"
+        legacy.mkdir()
+        (legacy / "metrics.json").write_text(json.dumps({"eval_id": 2, "params": {"a": 2}, "objective": 0.1}))
+        kept = Path(tmp) / "eval-0001-abc" / "wsclean"
+        kept.mkdir(parents=True)  # a kept evaluation's artefacts, beside its record
+        assert [r["eval_id"] for _, r in read_evaluation_records(Path(tmp))] == [1, 2]
+        assert evaluation_record_file(legacy) == legacy / "metrics.json"
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -1864,7 +1918,7 @@ def self_check_evaluation_pruning() -> None:
         assert "measurement_set" not in written["paths"] and "mat" not in written["paths"]
         assert written["paths"]["image"].endswith("recon-image.fits")
         assert written["paths"]["dirty"].endswith("recon-dirty.fits")
-        assert json.loads((scored / "metrics.json").read_text())["paths"] == written["paths"]
+        assert json.loads(flat_record_path(scored).read_text())["paths"] == written["paths"]
 
         # A failed evaluation keeps its inputs: that is the case worth looking at.
         failed = evaluation(root, "eval-0002-failed")
@@ -2073,19 +2127,17 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     text = _json_text(record)
     _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
     if _RECORD_WRITER is None:
-        _write_record(eval_dir / "metrics.json", text)
+        _write_record(flat_record_path(eval_dir), text)
     else:
         for done in [future for future in _RECORD_WRITES if future.done()]:
             _RECORD_WRITES.remove(done)
             done.result()  # a failed write raises here, on the rank's own thread
         _RECORD_WRITES.append(_RECORD_WRITER.submit(
-            _write_record, eval_dir / "metrics.json", text))
+            _write_record, flat_record_path(eval_dir), text))
     return record
 
 
 def _write_record(path: Path, text: str) -> None:
-    # With tmpfs scratch nothing makes the eval dir before its record does.
-    path.parent.mkdir(parents=True, exist_ok=True)
     _write_text_atomic(path, text)
 
 
@@ -2160,14 +2212,22 @@ def _keeps_detail(key: str) -> bool:
 def _strip_to_record(eval_dir: Path) -> None:
     import shutil
 
-    for entry in eval_dir.iterdir():
-        # The record, or its .partial while the record writer is on it.
+    try:
+        entries = list(eval_dir.iterdir())
+    except FileNotFoundError:
+        return  # stripped already, or never published
+    for entry in entries:
+        # A pre-round-92 record, or its .partial while a writer is on it.
         if entry.name.startswith("metrics.json"):
             continue
         if entry.is_dir():
             shutil.rmtree(entry, ignore_errors=True)
         else:
             entry.unlink(missing_ok=True)
+    try:
+        eval_dir.rmdir()  # its record is beside it, not in it
+    except OSError:
+        pass
 
 
 def _always_retained(eval_dir: Path, record: dict[str, Any]) -> bool:
@@ -2320,25 +2380,25 @@ def self_check_streaming_retention() -> None:
                     other = evaluations / "eval-other"
                     (held_root / other.name / "wsclean").mkdir(parents=True)
                     _HELD[other.name] = (held_root / other.name, other)
-                    _write_record(other / "metrics.json", _json_text(
+                    _write_record(flat_record_path(other), _json_text(
                         {"objective": 15.05, "paths": {"eval_dir": str(other)}}))
                     records = finished_run_records(evaluations)
                     assert records is not None and len(records) == len(objectives) + 1
-                    assert sorted(p.name for p in other.iterdir()) == ["metrics.json"]
-                    (other / "metrics.json").unlink()
-                    other.rmdir()
+                    assert not other.exists()
+                    flat_record_path(other).unlink()
                 else:
                     drain_record_writes()
                 assert not _HELD and not (held_root.exists() and any(held_root.iterdir()))
                 ordered = sorted(objectives, key=objectives.get)
                 must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
                 for key in objectives:
-                    kept = sorted(p.name for p in (evaluations / key).iterdir())
                     if key in must:
-                        assert kept == ["metrics.json", "wsclean", "wsclean.stdout.log"], (key, kept)
+                        kept = sorted(p.name for p in (evaluations / key).iterdir())
+                        assert kept == ["wsclean", "wsclean.stdout.log"], (key, kept)
                     else:
-                        assert kept == ["metrics.json"], (key, kept)
-                    written = json.loads((evaluations / key / "metrics.json").read_text())
+                        # Stripped to its record, which is beside the dir: no dir.
+                        assert not (evaluations / key).exists(), key
+                    written = json.loads(flat_record_path(evaluations / key).read_text())
                     assert written["objective"] == objectives[key], (key, written)
 
                 if scratch_root:
@@ -2354,7 +2414,7 @@ def self_check_streaming_retention() -> None:
                     # A write that fails in the background still fails the run.
                     write_records_in_background()
                     blocked = evaluations / "eval-blocked"
-                    (blocked / "metrics.json.partial").mkdir(parents=True)
+                    flat_record_path(blocked).with_name(blocked.name + ".json.partial").mkdir(parents=True)
                     write_evaluation_record(blocked, {"objective": 1.0})
                     try:
                         drain_record_writes()

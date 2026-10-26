@@ -52,8 +52,10 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Records: eval-*.json, or eval-*/metrics.json from before round 92.
 completed_evals() {
-  find "${1}/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
+  find "${1}/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
+    wc -l | tr -d ' '
 }
 
 # Bounded rather than a bare `wait`, because the failure this whole script is
@@ -227,11 +229,11 @@ SEARCH_PID=""
   && fail "the killed search wrote a summary.json, so there would be nothing to resume"
 
 # One of its records is zeroed out first, which is what a rank killed in the
-# middle of writing a metrics.json leaves behind (and what a full disk leaves).
+# middle of writing a record leaves behind (and what a full disk leaves).
 # That one file used to end a search for good: json.loads raised at startup in
 # the resume and in every restart, all before scoring anything, so nothing
 # retried. The resume below has to skip it and finish anyway.
-corrupt_record="$(find "${RESUME_OUT}/evaluations" -maxdepth 2 -name metrics.json | sort | head -1)"
+corrupt_record="$(find "${RESUME_OUT}/evaluations" -maxdepth 1 -name 'eval-*.json' | sort | head -1)"
 [ -n "${corrupt_record}" ] || fail "the killed run scored nothing to corrupt"
 : >"${corrupt_record}"
 
@@ -271,11 +273,13 @@ SEARCH_PID=""
 [ -f "${RESUME_OUT}/summary.json" ] || fail "the resumed run finished with no summary.json"
 grep -qF "WARNING: ignoring unreadable ${corrupt_record}" "${RESUME_OUT}.log" \
   || fail "the resume did not say it had skipped the half-written ${corrupt_record}; see ${RESUME_OUT}.log"
-[ -e "${corrupt_record%/metrics.json}" ] \
+[ -e "${corrupt_record%.json}" ] \
   && fail "the half-written record's directory survived the resume, so the sampler collides with it when it proposes that point again"
+[ -e "${corrupt_record}" ] \
+  && fail "the half-written record survived the resume, so every later resume warns about it"
 
 # Continued, not restarted. The count the resume script prints is the scored
-# evaluations - the same `eval-*/metrics.json` rule `completed_evals` uses -
+# evaluations - the same records `completed_evals` counts -
 # read after the kill, so it can only be >= what was counted before it. A
 # resume that ignored the previous attempt would print 0 and re-image
 # everything.

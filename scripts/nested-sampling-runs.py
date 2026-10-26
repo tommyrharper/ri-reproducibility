@@ -168,9 +168,12 @@ def count_evaluations(run_dir: Path) -> int:
     if counted is not None:
         return counted
     try:
+        # Records are eval-*.json (round 92) or, before, eval-*/metrics.json;
+        # a kept evaluation's dir sits beside its record, so count names.
         with os.scandir(run_dir / "evaluations") as entries:
-            return sum(1 for e in entries if e.name.startswith("eval-")
-                       and os.path.exists(os.path.join(e.path, "metrics.json")))
+            return len({e.name.removesuffix(".json") for e in entries if e.name.startswith("eval-")
+                        and (e.name.endswith(".json")
+                             or os.path.exists(os.path.join(e.path, "metrics.json")))})
     except OSError:  # no evaluations directory yet
         return 0
 
@@ -365,6 +368,9 @@ def self_check() -> None:
             score(stopped / "evaluations" / "eval-0001-b")
             score(stopped / "evaluations" / "eval-0002-c")
             (stopped / "evaluations" / "eval-0003-d").mkdir()
+            # A round-92 record, with the dir of what it keeps beside it: one.
+            (stopped / "evaluations" / "eval-0004-e.json").write_text("{}")
+            (stopped / "evaluations" / "eval-0004-e").mkdir()
             (stopped / "chains").mkdir()
             (stopped / "chains" / "wsclean_vlaa.resume").write_text("")
             (stopped / "run.env").write_text(
@@ -377,7 +383,7 @@ def self_check() -> None:
             runs = {r["name"]: r for r in find_runs(running=set())}
             assert runs[done.name]["status"] == "complete", runs[done.name]
             assert runs[stopped.name]["status"] == "resumable", runs[stopped.name]
-            assert runs[stopped.name]["evaluations"] == 2, runs[stopped.name]
+            assert runs[stopped.name]["evaluations"] == 3, runs[stopped.name]
             assert runs[stopped.name]["algorithm"] == "wsclean"
             assert runs[stopped.name]["settings"]["NS_METRIC"] == "total_rms_jy - snr"
             assert runs[stopped.name]["settings"]["NS_MPI_PROCS"] == "7"

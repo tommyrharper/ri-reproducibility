@@ -308,6 +308,15 @@ def occupancy(times: list[float], costs: list[float | None],
     }
 
 
+def _evaluation_bytes(eval_dir: Path) -> int:
+    """An evaluation's dir and, from round 92, the record file beside it."""
+    try:
+        record = os.stat(f"{eval_dir}.json").st_blocks * 512
+    except OSError:
+        record = 0
+    return _dir_bytes(eval_dir) + record
+
+
 def _dir_bytes(path: Path) -> int:
     total = 0
     stack = [path]
@@ -348,11 +357,20 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     directories = 0
     records: list[Evaluation] = []
     wedged_lines = 0
-    for entry in evaluations.glob("eval-*"):
-        if not entry.is_dir():
-            continue
+    # A record is eval-*.json beside the dir of what the evaluation keeps
+    # (round 92), or eval-*/metrics.json in runs from before; a dir with
+    # neither is in flight, or a leftover the next run will sweep.
+    try:
+        listed = list(os.scandir(evaluations))
+    except OSError:
+        listed = []
+    flat = {e.name.removesuffix(".json") for e in listed
+            if e.name.startswith("eval-") and e.name.endswith(".json")}
+    dirs = {e.name for e in listed if e.name.startswith("eval-") and e.is_dir()}
+    for name in flat | dirs:
+        entry = evaluations / name
+        metrics = evaluations / f"{name}.json" if name in flat else entry / "metrics.json"
         directories += 1
-        metrics = entry / "metrics.json"
         try:
             when, text = metrics.stat().st_mtime, metrics.read_text()
         except OSError:
@@ -364,6 +382,8 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
                 when, FAILURE_OBJECTIVE_MARKER in text, entry,
                 float(cost.group(1)) if cost else None,
                 float(peak.group(1)) if peak else None))
+        if name not in dirs:
+            continue
         try:
             wedged_lines += len((entry / "meqserver-wedged.log").read_text().splitlines())
         except OSError:
@@ -450,7 +470,7 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # deterministic strides keep unchanged readings stable.
     stride = max(1, len(records) // DISK_SAMPLE)
     sample = [r.path for r in records[::stride]]
-    per_evaluation = (statistics.mean(_dir_bytes(where) for where in sample)
+    per_evaluation = (statistics.mean(_evaluation_bytes(where) for where in sample)
                       if sample else None)
     rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
 
@@ -1661,9 +1681,10 @@ def self_check() -> None:
     def write_eval(run: Path, index: int, mtime: float, objective: float = 0.008,
                    wedges: int = 0, wall_seconds: float | None = None,
                    peak_memory_bytes: float | None = None) -> None:
+        # The round-92 layout: a record file, and a dir only for what is kept.
         eval_dir = run / "evaluations" / f"eval-{index:04d}-abc"
-        eval_dir.mkdir(parents=True)
-        metrics = eval_dir / "metrics.json"
+        eval_dir.parent.mkdir(parents=True, exist_ok=True)
+        metrics = eval_dir.with_name(eval_dir.name + ".json")
         body: dict[str, object] = {"eval_id": index, "objective": objective}
         if wall_seconds is not None or peak_memory_bytes is not None:
             metric_values: dict[str, float] = {}
@@ -1675,6 +1696,7 @@ def self_check() -> None:
         metrics.write_text(json.dumps(body, indent=2))
         os.utime(metrics, (mtime, mtime))
         if wedges:
+            eval_dir.mkdir()
             (eval_dir / "meqserver-wedged.log").write_text(
                 "".join(f"attempt {i + 1}: no reply to the predict in 3.0s\n"
                         for i in range(wedges)))
