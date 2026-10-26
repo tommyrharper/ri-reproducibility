@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+import pickle
 import shutil
 import signal
 import subprocess
@@ -277,7 +278,9 @@ def _config_key(cfg_text: str, dropped: tuple[str, ...]) -> str:
 def _observation_path(cfg_text: str) -> Path:
     directory = skeleton_dir() / "observations"
     directory.mkdir(exist_ok=True)
-    return directory / (_config_key(cfg_text, ("StartFreq=", "StepFreq=", "NFrequencies=", "NTimes=")) + ".npz")
+    # A pickle, not an .npz: np.load's zip parse of the ten arrays was ~0.8ms of
+    # every extended evaluation, 4% of simulate in-run (docs/csd3-speed.md, round 78).
+    return directory / (_config_key(cfg_text, ("StartFreq=", "StepFreq=", "NFrequencies=", "NTimes=")) + ".pkl")
 
 
 def _template_path(cfg_text: str) -> Path:
@@ -328,10 +331,11 @@ def save_observation(ms_path: Path, cfg_text: str) -> None:
         return
 
     def write(path: Path) -> None:
+        observation = dict(time=per_time["TIME"], time_centroid=per_time["TIME_CENTROID"], antenna_uvw=antenna_uvw,
+                           interval=interval, exposure=exposure, time_range_start=time_range[0, 0],
+                           **{f"FIELD_{c}": v for c, v in dirs.items()})
         with path.open("wb") as out:
-            np.savez(out, time=per_time["TIME"], time_centroid=per_time["TIME_CENTROID"], antenna_uvw=antenna_uvw,
-                     interval=interval, exposure=exposure, time_range_start=time_range[0, 0],
-                     **{f"FIELD_{c}": v for c, v in dirs.items()})
+            pickle.dump({k: np.asarray(v) for k, v in observation.items()}, out, protocol=5)
 
     for destination in (_observation_path(cfg_text), _persistent_observation_path(cfg_text)):
         if destination is not None and _observation_times(destination) < n_times:
@@ -350,11 +354,18 @@ def _persistent_observation_path(cfg_text: str) -> Path | None:
     return Path(root) / _observation_path(cfg_text).name if root else None
 
 
+_UNREADABLE = (OSError, EOFError, pickle.UnpicklingError, ValueError, KeyError, TypeError)
+
+
+def _read_observation(path: Path) -> dict:
+    with path.open("rb") as cached:
+        return pickle.load(cached)
+
+
 def _observation_times(path: Path) -> int:
     try:
-        with np.load(path) as cached:
-            return len(cached["time"])
-    except (OSError, ValueError, KeyError):
+        return len(_read_observation(path)["time"])
+    except _UNREADABLE:
         return 0
 
 
@@ -364,11 +375,10 @@ def load_observation(cfg_text: str, n_times: int) -> dict | None:
         if source is None:
             continue
         try:
-            with np.load(source) as cached:
-                if len(cached["time"]) < n_times:
-                    continue
-                observation = {k: cached[k] for k in cached.files}
-        except (OSError, ValueError, KeyError):
+            observation = _read_observation(source)
+            if len(observation["time"]) < n_times:
+                continue
+        except _UNREADABLE:
             continue
         if source != local and _observation_times(local) < n_times:
             _atomic_publish(lambda path: shutil.copyfile(source, path), local)

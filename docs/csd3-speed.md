@@ -3786,3 +3786,54 @@ over 3 s of the timed loop.)
   in-run than solo, and a solo-only timing would miss that.
 - `Cpus_allowed_list` on this allocation is the even CPUs 0-74, i.e. all of
   NUMA node 0. `taskset -c i` on an odd CPU fails, so pin with `2*i`.
+
+## Round 78: the observation cache read with pickle, not `np.load`
+
+**Change.** `simulate_point_source_ms.py` stored each cached makems
+observation (round 36: times, per-antenna UVW, interval, exposure, field
+directions) as an `.npz`, and every extended evaluation read one back with
+`np.load`. The zip parse costs more than the ~100-270 kB of arrays it reads.
+The cache is now a protocol-5 pickle of the same arrays (`.pkl`). This round
+finishes gnhf 77's change, which was cut off before it was measured.
+
+**Read alone** (`meqtrees.sif`, three real observations of 100-266 kB, 300
+loads each, twice): `np.load` 0.76-0.95 ms, `pickle.load` 0.03-0.08 ms. Every
+array came back equal, with the same dtype and shape.
+
+**In-run** (`.probe/r78/run.sh`, round 76's harness: pinned
+`meqtrees.sif` copies each warm round 63's 48 draws, then time `simulate()`
+from a shared start file; ABBA, 2 passes of 48 draws a copy). This job's
+CPU set had 29 usable even CPUs, so 29 copies:
+
+| pair | A (`.npz`) wall / user ms | B (pickle) wall / user ms |
+|---|---|---|
+| 1 (AB) | 30.36 / 17.27 | 29.08 / 16.07 |
+| 2 (BA) | 30.61 / 17.52 | 29.26 / 16.22 |
+| 3 (AB) | 30.71 / 17.50 | 29.35 / 16.16 |
+| 4 (BA) | 30.29 / 17.31 | 29.42 / 16.31 |
+| mean | 30.49 / 17.40 | 29.28 / 16.19 |
+
+Simulate is 1.21 ms (-4.0%) faster in-run, 4/4 pairs, all of it user time
+(system time 4.7 ms in both). That is about 0.8% of a 154 ms WSClean
+evaluation (round 74's 17-rank search), and is too small to see end to end
+(AGENTS.md: a three-repeat control spans ~5%), so it was timed at the stage.
+
+**Results.** Unchanged: the cached arrays load bit-identical, and
+`./ri self-check simulate` passes (observation prefix, mat-only and
+analytic predict included). No search ran, so there is no
+`benchmarks.jsonl` row.
+
+**Learned.**
+- `np.load` of a small `.npz` is ~0.8 ms of fixed cost (zip directory,
+  one header parse a member). For a hot cache of small arrays, pickle is
+  ~15x cheaper and loads the same bytes.
+- The new file name means the persistent cache
+  (`NS_OBSERVATION_CACHE_DIR`, ~200 MB per meqtrees image id) starts cold
+  once and is rebuilt as `.pkl`. The old `.npz` files are no longer read
+  and can be deleted.
+- A harness that leaves each copy's scratch in `/dev/shm` fills the 126 GB
+  tmpfs after three 34-copy arms (1.4 GB a copy), and the failures look like
+  makems errors. Delete each arm's scratch when it ends.
+- CPU sets differ between jobs: this one was
+  `0,2,...,20,22-34,36,...,52,64,...,72`, not round 76's even 0-74. Read
+  `Cpus_allowed_list` before pinning.
