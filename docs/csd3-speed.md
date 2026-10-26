@@ -3623,3 +3623,69 @@ Not taken.
   simulate's 28 ms, is still what scales.
 - WSClean's `-j` is not a thread knob that leaves the output alone. Even
   the PSF changes, so `-j 1` has to stay fixed for every evaluation.
+
+## Round 74: the w-range scan skipped when w-gridding is off (patch 0017)
+
+**Profile.** `perf record` on five runs of the largest real-draw MS (round
+69's m1) through a 0001-0016 build, with symbols taken from round 69's
+unstripped binary bound over the SIF's (the SIF's own is stripped, so
+`perf report` prints bare addresses; map them with `nm -C` against the
+unstripped copy):
+
+| symbol | share of samples |
+| --- | ---: |
+| ducc0 `x2grid_c_helper<6>` (gridding) | 32.3% |
+| ducc0 `grid2x_c_helper<6>` (degridding) | 21.7% |
+| ducc0 `Wgridder` constructor (inlined `scanData`) | 5.3% |
+| `GridRegularMeasurementSet` | 2.9% |
+| `ImageWeights::Grid` | 2.2% |
+| ducc0 `countRanges` | 3.0% |
+| everything else | under 1.4% each |
+
+The constructor's hot loop is `scanData()`'s 0009 fast path: per visibility,
+`norm(vis) != 0`, then `|w * f/c|` folded into a min and max. Those two values
+are read only under `do_wgridding` (w-plane count, `wmin`, kernel cost
+model), and 0006 turns w-gridding off.
+
+**Change.** Patch 0017 skips the w arithmetic and the min/max in that fast
+path when `do_wgridding` is false. The mask, the visibility count and the
+zeroed degrid outputs are built exactly as before.
+
+**Solo.** `.probe/r74/` harness (round 69's: five MSs, 3 reps a block, 6 ABBA
+blocks on each of 4 pinned CPUs, `-niter 1000`), median per block:
+
+| MS | 0001-0016 | 0001-0017 | change | 0017 faster |
+| --- | ---: | ---: | ---: | ---: |
+| largest | 1047.8 ms | 1027.7 ms | -1.9% | 21/24 |
+| 2nd largest | 1011.2 ms | 988.7 ms | -2.2% | 24/24 |
+| 3rd largest | 963.9 ms | 942.2 ms | -2.3% | 24/24 |
+| median-size | 127.5 ms | 126.6 ms | -0.7% | 17/24 |
+| smallest | 40.9 ms | 41.2 ms | +0.9% | 8/24 |
+
+All 1440 FITS data blocks (image, model, psf, residual) are byte-identical.
+
+**In run.** Raced synchronous 17-rank pairs (`.probe/r74ab.sh`: seed 4242,
+nlive 150, 300 dead, same draws), arms differing only in `wsclean.sif`:
+
+| pass | first launched | A binary ms | 0017 binary ms | A evals/s | 0017 evals/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| sync | A | 126.62 | 125.62 (-0.8%) | 37.34 | 37.91 (+1.5%) |
+| sync | 0017 | 128.38 | 125.85 (-2.0%) | 37.15 | 37.73 (+1.6%) |
+
+In both passes every chain file and log(Z) (0.09607 +/- 0.00114) are
+byte-identical between the arms, and peak memory is unchanged (277-279 MB).
+The in-run gain is smaller than the solo one on large MSs because most
+evaluations are median-sized or smaller, where the scan is a smaller share.
+Like 0007-0016, it reaches a cluster run only through `./ri images
+patch-wsclean`.
+
+**Learned.**
+- With 0001-0016 in, the two ducc0 kernels are 54% of a large evaluation's
+  binary samples; everything outside them is spread across items of 3% or
+  less. 0017 was the largest of those that is provably dead work.
+- `perf` cannot resolve symbols in a SIF's stripped `wsclean`. Bind an
+  unstripped build over `/opt/wsclean/bin/wsclean` (it must be executable)
+  and map addresses with `nm -C` yourself: `perf report` still printed
+  bare addresses with the bound binary.
+- When waiting on a background job by process name, `pgrep -f` matches the
+  waiting shell's own command line. Wait on recorded PIDs or an output file.

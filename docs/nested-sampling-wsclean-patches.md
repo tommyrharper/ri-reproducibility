@@ -496,3 +496,18 @@ five MSs, WSClean is 2.9-4.6% faster on the three largest (24 of 24 ABBA
 blocks each), 2.8% faster on the median one and unchanged on the smallest.
 All 1440 FITS data blocks and headers are identical. The measurements are in
 [csd3-speed.md](csd3-speed.md), round 69.
+
+## 0017: skip the unused w-range scan
+
+Every gridding and degridding pass starts with ducc0's `scanData()`, which
+marks the non-zero visibilities and, for each one, folds `|w * f/c|` into a
+running min and max. Those two numbers are read only when w-gridding is on:
+they size the w planes and feed the kernel cost model. 0006 turns w-gridding
+off, so on 0009's fast path (one thread, uniform weights and mask) the patch
+skips the w arithmetic and the min/max when `do_wgridding` is false. The
+mask and visibility count are built exactly as before, so the output is
+byte-identical. A `perf` profile of the largest MS put the scan at ~5% of the
+binary's samples, behind the two gridding kernels (54%). Solo, WSClean is
+1.9-2.3% faster on the three largest MSs (21-24 of 24 ABBA blocks) and
+unchanged on the two smallest, with all 1440 FITS data blocks identical
+([csd3-speed.md](csd3-speed.md), round 74).
