@@ -3736,3 +3736,53 @@ and it changes every output. No in-run A/B was run.
 - In a WSClean FITS file from a 32x32 search, the data block is bytes
   5760-9856 (two 2880-byte header blocks, then 4096 bytes of float32).
   Compare `tail -c +5761`, not the whole file: the header carries the date.
+
+## Round 76 (diagnostic): why simulate is ~1.5x slower inside a run
+
+**Question.** Round 72 measured simulate at 28 ms an evaluation in a
+36-rank search, against ~18 ms solo (round 70). Is that gap a kernel or
+tmpfs lock that fewer syscalls could fix, a drop in clock speed, or memory?
+
+**Harness.** `.probe/r76/run.sh N REPS`: N `meqtrees.sif` processes, one
+per pinned CPU of this job (the even CPUs, all of socket 0, no SMT). Each
+warms round 63's 48 real draws (`params15`) and then times `simulate()` on
+all of them together, from a shared start file. `getrusage` gives user and
+system time per call. No imager runs, so the only load is simulate itself.
+
+| copies | wall | user | system | IPC (user) | LLC demand loads per call | LLC miss rate |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 18.4-20.7 ms | 12.4-13.0 | 2.5-3.0 | 2.99 | ~7k | 24% |
+| 17 | 24.4 ms | 15.4 | 4.0 | | | |
+| 34 | 29.3-32.1 ms | 18.5-19.7 | 5.0-5.4 | 1.85 | ~100k | 72% |
+
+(IPC and LLC counts are `perf stat -e cycles,instructions,LLC-loads,LLC-load-misses`
+over 3 s of the timed loop.)
+
+- **Not a lock.** User time grows as much as system time (+51% against
+  +78%), voluntary context switches stay at ~3 a call, and an strace of the
+  timed loop shows no slow syscalls. A call makes ~1,100 `lseek`, ~650
+  `write`, ~390 `newfstatat` (casacore re-stats `table.dat` ~26 times a
+  call), ~170 `fcntl` (table locks) and ~63 `unlinkat`. Even removing all
+  of the ~3 ms of solo system time would save ~1.5% of an evaluation.
+- **Not the clock.** A pure-Python integer loop takes 244 ms solo and 241
+  ms across 34 copies.
+- **Memory.** Demand L2 misses per call rise ~14x and three quarters of
+  them miss the shared 58 MB L3 as well. The jump is superlinear in copies
+  (+18% at 17, +55% at 34). That is what a hot set of a few MB a copy does
+  once 34 copies no longer fit in L3 together (58/17 = 3.4 MB a copy fits,
+  58/34 = 1.7 MB does not). Solo, the prefetchers hide almost all of it.
+- The ~4.5 ms solo gap between wall time and user+system time is makems.
+  The first pass over the draws builds 7 one-timestep templates in a child
+  process, which `RUSAGE_SELF` does not count. It is not waiting.
+
+**Learned.**
+- At one rank per CPU, simulate's in-run cost is ~10 ms of L3 misses on top
+  of its ~18 ms of work. Neither fewer syscalls nor locking changes reach
+  it. The lever is a smaller working set per call: fewer full-size
+  complex64 temporaries between the noise, the phase ramp and `putcol`.
+  At ~14% of worker time that is worth at most ~5%.
+- Benchmark simulate changes under a 34-copy load as well as solo. A
+  change that shrinks the working set can be worth up to ~1.5x more
+  in-run than solo, and a solo-only timing would miss that.
+- `Cpus_allowed_list` on this allocation is the even CPUs 0-74, i.e. all of
+  NUMA node 0. `taskset -c i` on an odd CPU fails, so pin with `2*i`.
