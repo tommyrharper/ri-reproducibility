@@ -2634,3 +2634,77 @@ or a Docker build). No change for a run on the shipped SIF.
   than trusting the source, and read fields from the mapping directly.
 - In-run, a WSClean evaluation is now ~80% binary and ~20% simulate
   (30ms), with simulate dominated by `fastnoise.so` and `sincos`.
+
+## Round 56: the noise generator's state stays in registers (`fastnoise.c`)
+
+**Question.** Round 55's simulate-server profile puts `fastnoise.so` at 38%
+of simulate, which is ~20% of a WSClean evaluation. Is the C loop as fast
+as it can be?
+
+**Diagnosis.** `perf stat` on a pinned driver (400k complex visibilities,
+50 reps) gave 4.57ns a draw at 3.56 instructions per cycle. The
+disassembly showed why it was slow. With the ziggurat's rejection paths
+inlined, gcc 8.5 (the host compiler that builds the `fastnoise.so` runs
+use, round 42) ran out of registers and kept the 128-bit PCG state on the
+stack. So every draw's multiply chain went through a store and a reload.
+
+Things that did not help:
+
+- Four interleaved PCG lanes filling a 256-state buffer (jump-ahead by
+  M^4) to break the multiply's latency chain: +7% at every=1, and +32% when
+  the buffer was `__thread`. The loop is limited by instruction count, not
+  multiply latency.
+- Moving the rejection paths out of line on their own: -4%. The state
+  was still spilled.
+
+**Change.** In `docker/meqtrees/src/fastnoise.c`:
+
+- The rare rejection paths (~1.2% of draws, idx 0 tail and wedge) moved
+  to a `noinline slow_normal()` that takes and returns the state by value.
+- The hot path steps the state as two `uint64_t` words (one 64x64->128
+  `mul` plus two `imul`s).
+- `add_normal_f32()` is one flat loop over all `n * every` draws, so only
+  one copy of the draw is inlined. A pointer-based loop beats an
+  index-based one (3.76 vs 4.08ns).
+
+Every draw consumes the same stream words in the same order, so the
+output is unchanged bit for bit.
+
+**Result.**
+
+| test | base | new | change |
+| --- | ---: | ---: | ---: |
+| C driver, pinned, every=1 (MS fill) | 4.56ns/draw | 3.76ns/draw | -17.6% |
+| C driver, pinned, every=4 (R2D2 `--mat-only`) | 4.70ns/draw | 3.37ns/draw | -28.4% |
+| C driver, 36 copies at once, every=1 | 5.68ns/draw | 4.71ns/draw | -17.1% (36/36 faster) |
+| `add_complex_noise()` in `meqtrees.sif`, (351000,4,4), every=1, 30 interleaved pairs | 50.1ms | 41.5ms | -17.2% (30/30) |
+| `add_complex_noise()`, (87750,4), every=4, 30 interleaved pairs | 13.0ms | 9.1ms | -29.6% (30/30) |
+| raced 16-rank synchronous search, warm pair: simulate stage | 30.5ms | 29.0ms | -4.9% |
+| same pair: evals/s | 31.47 | 31.70 | +0.7% (below resolution) |
+
+The driver compares outputs and the final generator state over five
+chained calls of odd lengths. The Python pairs compare the data bytes and
+the next `rng.random()`. `simulate_point_source_ms.py --self-check` passes
+inside `meqtrees.sif` with the new library bound at `/opt/ri-lib`. All
+seven chain files are byte-identical across the four raced arms
+(log(Z) 0.09667). The first raced pair was cold in both arms (226ms
+container overhead per evaluation), so only the second is a speed
+comparison.
+
+**Shipping.** The shipped `meqtrees.sif` has no `/opt/ri-lib`, so every
+cluster run uses the host-built copy that `start-sidecars.sh` caches by
+source hash (round 42). The new source therefore reaches the next search
+with no rebuild. A Docker build compiles it with Ubuntu 24.04's gcc, which
+was not tried here. The load-time check against numpy falls back to numpy
+if that build ever disagrees.
+
+**Learned.**
+- Check what gcc 8 does with an `unsigned __int128` loop-carried value:
+  under register pressure it lives on the stack. Splitting the value into
+  two 64-bit words and keeping only one inlined copy of the hot path fixed
+  it. An instructions-per-cycle reading near 3.5 points to instruction
+  count, not latency, so lanes don't help.
+- `./ri bench run --interleave` takes only the settings the ledger
+  groups by, so a library A/B (`NS_FASTNOISE_DIR`) is two raced
+  `./ri search` runs. Their output directories must sit under
+  `results/nested-sampling/` for `./ri bench record` to take them.
