@@ -1,0 +1,234 @@
+diff --git a/external/schaapcommon/include/schaapcommon/reordering/filewriter.h b/external/schaapcommon/include/schaapcommon/reordering/filewriter.h
+--- a/external/schaapcommon/include/schaapcommon/reordering/filewriter.h
++++ b/external/schaapcommon/include/schaapcommon/reordering/filewriter.h
+@@ -8,6 +8,7 @@
+ #include "reordering.h"
+ 
+ #include <fstream>
++#include <complex>
+ #include <cstddef>
+ #include <vector>
+ #include <set>
+@@ -66,6 +67,11 @@
+     std::unique_ptr<std::ofstream> data;
+     std::unique_ptr<std::ofstream> weight;
+     std::unique_ptr<std::ofstream> model;
++    // ri: rows not yet written to the files above. One stream write per row
++    // cost more than extracting the row (see FlushPending()).
++    std::vector<std::complex<float>> pending_data;
++    std::vector<float> pending_weight;
++    std::vector<std::complex<float>> pending_model;
+   };
+ 
+  public:
+@@ -113,8 +119,12 @@
+     aocommon::OptionalNumber<size_t> data_desc_id;
+     size_t selected_row_count = 0;
+     std::fstream file;
++    std::vector<char> pending;
+   };
+ 
++  /// Writes every row buffered so far; must precede any seek on the files.
++  void FlushPending();
++
+   aocommon::VectorMap<std::vector<MetaFileData*>> MakeDataDescIdToMetaFileMap(
+       const std::map<size_t, size_t>& meta_file_indices);
+ 
+diff --git a/external/schaapcommon/src/reordering/filewriter.cc b/external/schaapcommon/src/reordering/filewriter.cc
+--- a/external/schaapcommon/src/reordering/filewriter.cc
++++ b/external/schaapcommon/src/reordering/filewriter.cc
+@@ -4,6 +4,8 @@
+ #include "filewriter.h"
+ 
+ #include <fcntl.h>
++
++#include <cstring>
+ #include <functional>
+ #include <stdexcept>
+ 
+@@ -144,40 +146,64 @@
+   return result;
+ }
+ 
++namespace {
++// A file's buffered rows are written once they reach this size.
++constexpr size_t kFlushBytes = 1 << 20;
++
++template <typename T>
++T* Grow(std::vector<T>& buffer, size_t n) {
++  if (buffer.capacity() == 0) buffer.reserve(kFlushBytes / sizeof(T) + n);
++  const size_t old_size = buffer.size();
++  buffer.resize(old_size + n);
++  return buffer.data() + old_size;
++}
++
++template <typename T>
++void Write(std::vector<T>& buffer, std::ostream& stream, const char* error) {
++  if (buffer.empty()) return;
++  stream.write(reinterpret_cast<const char*>(buffer.data()),
++               buffer.size() * sizeof(T));
++  if (!stream.good()) throw std::runtime_error(error);
++  buffer.clear();
++}
++
++template <typename T>
++void WriteIfFull(std::vector<T>& buffer, std::ostream& stream,
++                 const char* error) {
++  if (buffer.size() * sizeof(T) >= kFlushBytes) Write(buffer, stream, error);
++}
++
++template <typename Buffer>
++void Append(std::vector<char>& pending, const Buffer& record) {
++  std::memcpy(Grow(pending, sizeof(Buffer)), &record, sizeof(Buffer));
++}
++}  // namespace
++
+ void FileWriter::WriteMetaRow(double u, double v, double w, double time,
+                               uint32_t data_desc_id, uint32_t antenna1,
+                               uint32_t antenna2, uint32_t field_id) {
+   const std::vector<MetaFileData*>& meta_file_list =
+       data_desc_id_to_meta_file_indices_[data_desc_id];
+   for (MetaFileData* file_data : meta_file_list) {
++    // The same narrowing to uint16_t as MetaRecord and BdaMetaRecord.
+     if (file_data->data_desc_id.HasValue()) {
+-      reordering::MetaRecord meta;
+-      meta.u = u;
+-      meta.v = v;
+-      meta.w = w;
+-      meta.time = time;
+-      meta.antenna1 = antenna1;
+-      meta.antenna2 = antenna2;
+-      meta.field_id = field_id;
+-      ++selected_rows_total_;
+-      meta.Write(file_data->file);
++      Append(file_data->pending,
++             details::MetaRecordBuffer{
++                 u, v, w, time, static_cast<uint16_t>(antenna1),
++                 static_cast<uint16_t>(antenna2),
++                 static_cast<uint16_t>(field_id)});
+     } else {
+-      reordering::BdaMetaRecord meta;
+-      meta.u = u;
+-      meta.v = v;
+-      meta.w = w;
+-      meta.time = time;
+-      meta.antenna1 = antenna1;
+-      meta.antenna2 = antenna2;
+-      meta.field_id = field_id;
+-      meta.data_desc_id = data_desc_id;
+-      ++selected_rows_total_;
+-      meta.Write(file_data->file);
++      Append(file_data->pending,
++             details::BdaMetaRecordBuffer{
++                 u, v, w, time, static_cast<uint16_t>(antenna1),
++                 static_cast<uint16_t>(antenna2),
++                 static_cast<uint16_t>(field_id),
++                 static_cast<uint16_t>(data_desc_id)});
+     }
++    ++selected_rows_total_;
+     ++file_data->selected_row_count;
+-    if (!file_data->file.good()) {
+-      throw std::runtime_error("Error writing to temporary file");
+-    }
++    WriteIfFull(file_data->pending, file_data->file,
++                "Error writing to temporary file");
+   }
+ }
+ 
+@@ -187,52 +213,37 @@
+                               const bool* flag_array, size_t data_desc_id) {
+   const size_t polarizations_per_file =
+       aocommon::Polarization::GetVisibilityCount(*data_.polarizations_.begin());
+-  std::vector<std::complex<float>> data_buffer(polarizations_per_file *
+-                                               max_channels_);
+-  std::vector<float> weight_buffer(polarizations_per_file * max_channels_);
+ 
+   size_t file_index = 0;
+   for (const aocommon::VectorMap<ChannelRange>& ranges : data_.channels_) {
+     if (ContainsDataDescId(ranges, data_desc_id)) {
+       const size_t part_start_ch = ranges[data_desc_id].start;
+       const size_t part_end_ch = ranges[data_desc_id].end;
++      const size_t n =
++          (part_end_ch - part_start_ch) * polarizations_per_file;
+       const std::set<aocommon::PolarizationEnum>& ms_polarizations =
+           ms_polarizations_per_data_desc_id_.find(data_desc_id)->second;
+ 
+       for (aocommon::PolarizationEnum p : data_.polarizations_) {
+         ReorderedDataFiles& f = files_[file_index];
+-        reordering::ExtractData(data_buffer.data(), part_start_ch, part_end_ch,
+-                                ms_polarizations, data_array, p);
+-        f.data->write(reinterpret_cast<char*>(data_buffer.data()),
+-                      (part_end_ch - part_start_ch) *
+-                          sizeof(std::complex<float>) * polarizations_per_file);
+-        if (!f.data->good()) {
+-          throw std::runtime_error("Error writing to temporary data file");
+-        }
++        reordering::ExtractData(Grow(f.pending_data, n), part_start_ch,
++                                part_end_ch, ms_polarizations, data_array, p);
++        WriteIfFull(f.pending_data, *f.data,
++                    "Error writing to temporary data file");
+ 
+         if (data_.initial_model_required_) {
+-          reordering::ExtractData(data_buffer.data(), part_start_ch,
++          reordering::ExtractData(Grow(f.pending_model, n), part_start_ch,
+                                   part_end_ch, ms_polarizations, model_array,
+                                   p);
+-          f.model->write(reinterpret_cast<char*>(data_buffer.data()),
+-                         (part_end_ch - part_start_ch) *
+-                             sizeof(std::complex<float>) *
+-                             polarizations_per_file);
+-          if (!f.model->good()) {
+-            throw std::runtime_error(
+-                "Error writing to temporary model data file");
+-          }
++          WriteIfFull(f.pending_model, *f.model,
++                      "Error writing to temporary model data file");
+         }
+ 
+-        reordering::ExtractWeights(weight_buffer.data(), part_start_ch,
++        reordering::ExtractWeights(Grow(f.pending_weight, n), part_start_ch,
+                                    part_end_ch, ms_polarizations, data_array,
+                                    weight_spectrum_array, flag_array, p);
+-        f.weight->write(reinterpret_cast<char*>(weight_buffer.data()),
+-                        (part_end_ch - part_start_ch) * sizeof(float) *
+-                            polarizations_per_file);
+-        if (!f.weight->good()) {
+-          throw std::runtime_error("Error writing to temporary weights file");
+-        }
++        WriteIfFull(f.pending_weight, *f.weight,
++                    "Error writing to temporary weights file");
+         ++file_index;
+       }
+     } else {
+@@ -241,7 +252,23 @@
+   }
+ }
+ 
++void FileWriter::FlushPending() {
++  for (ReorderedDataFiles& f : files_) {
++    Write(f.pending_data, *f.data, "Error writing to temporary data file");
++    if (f.model) {
++      Write(f.pending_model, *f.model,
++            "Error writing to temporary model data file");
++    }
++    Write(f.pending_weight, *f.weight,
++          "Error writing to temporary weights file");
++  }
++  for (MetaFileData& file_data : meta_files_) {
++    Write(file_data.pending, file_data.file, "Error writing to temporary file");
++  }
++}
++
+ void FileWriter::UpdateMetaHeaders() {
++  FlushPending();
+   // Rewrite meta header to include selected row count
+   for (MetaFileData& file_data : meta_files_) {
+     // Data narrowed for reordered file
+@@ -265,6 +292,7 @@
+ }
+ 
+ void FileWriter::UpdatePartHeaders(bool include_model) {
++  FlushPending();
+   size_t file_index = 0;
+   for (const aocommon::VectorMap<ChannelRange>& ranges : data_.channels_) {
+     reordering::PartHeader header;

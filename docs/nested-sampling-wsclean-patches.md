@@ -399,3 +399,27 @@ interleaved ABBA blocks). All 24 FITS data blocks are byte-identical. The
 measurements are in [csd3-speed.md](csd3-speed.md), round 55.
 
 Upstream-shaped: it changes only how bytes are copied.
+
+## 0013: buffer the reordered rows in memory
+
+The reorder (`ReorderMS()` in `msproviders/reorderedmsprovider.cpp`) writes
+each row through schaapcommon's `FileWriter`
+(`external/schaapcommon/src/reordering/filewriter.cc`): one `ostream::write`
+for the meta record, one for the data and one for the weights, each a few
+tens of bytes, plus two `std::vector`s allocated and freed per row. On the
+search's MSs that per-row overhead was about half of the reorder, which is
+the second-largest phase of an evaluation after 0001-0012 (~17ms of ~140ms).
+The patch appends every row to an in-memory buffer per file, extracting the
+data and weights straight into it, and writes a buffer once it reaches 1MB.
+`UpdateMetaHeaders()` and `UpdatePartHeaders()` write whatever is left before
+they seek, so each file gets the same bytes in the same order. The meta
+fields are narrowed to `uint16_t` exactly as `MetaRecord` did.
+
+Solo over five real-draw MSs, the reorder is 19.5% faster and WSClean 3.3%
+faster (6 of 6 interleaved ABBA blocks). The four reordered files
+(`-save-reordered`) and all 20 FITS data blocks are byte-identical. The
+measurements are in [csd3-speed.md](csd3-speed.md), round 58.
+
+Upstream-shaped: it changes how the files are written, not what is written.
+A write error now surfaces at the next flush rather than on the row that
+caused it.

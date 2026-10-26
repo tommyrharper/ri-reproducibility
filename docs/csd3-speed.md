@@ -2777,3 +2777,88 @@ rebuild is needed.
 - "Bit-identical to libm" does not require a correctly rounded libm
   clone. The output is float32, so an error bound and a check for
   rounding ambiguity, with a fallback, are enough.
+
+## Round 58: reordered rows buffered in memory (patch 0013)
+
+**Question.** After rounds 56-57, simulate is ~18% of a 16-rank WSClean
+evaluation and the `wsclean` binary ~80%. Where does a 0001-0012 binary
+spend its time, and what can go next?
+
+**Profile.** A 0001-0012 `wsclean.sif` built into `/dev/shm` by
+`scripts/patch-wsclean-sif.sh OUT` (the shipped SIF was left alone), then a
+16-rank synchronous search (nlive 150, 2 repeats, 150 dead, seed 4242) read
+with `./ri profile --phases`:
+
+| phase | ms/eval | share | per eval |
+| --- | ---: | ---: | ---: |
+| gridding | 24.9 | 27.6% | 4.35 passes |
+| reordering | 16.6 | 18.4% | once |
+| loading data in memory | 14.4 | 16.0% | 4.35 |
+| predicting | 13.2 | 14.6% | 2.35 |
+| process start to imaging table | 3.0 | 3.4% | once |
+| loading metadata | 2.9 | 3.2% | 2.35 |
+| fitting beam | 2.3 | 2.5% | once |
+
+The reorder runs once per evaluation but costs as much as three gridding
+passes. On a kept 46k-row MS it took 17.6ms solo, with only 0.01s of sys
+time in the whole 0.15s run, so it is user CPU. Frame-pointer and DWARF call
+graphs both lose their callers inside casacore, so perf attributes almost
+nothing to `ReorderMS`. To get a profile of the phase itself, `perf record
+-k monotonic` was run over ten runs and only the samples that fell between
+each run's logged `Reordering:` and `Initializing model` lines were kept
+(the realtime-monotonic offset was read just before and after the
+recording). That gave 3584 samples, 17.9ms a run. About half were the
+writer: `ostream::write`, its sentry and `filebuf::xsputn` (~14%), libc
+copies and malloc/free (~16%), `ExtractWeights`/`ExtractData` (~12%), and
+`FileWriter::WriteDataRow`/`WriteMetaRow` (~8%). The other half was
+casacore and `MSRowProvider` reading the MS. Per row, `FileWriter` makes
+three `ostream::write` calls of a few tens of bytes and allocates two
+`std::vector`s.
+
+**Change.** Patch 0013 has `FileWriter` append every row to an in-memory
+buffer per file, extract the data and weights straight into it, and write a
+buffer once it reaches 1MB. The header updates write what is left before
+they seek, so each file gets the same bytes in the same order
+(`docs/nested-sampling-wsclean-patches.md`).
+
+**Result.** Driver: five kept real-draw MSs (binary 45-310ms in-run), each
+run with the search's `wsclean` arguments and production's malloc
+tunables, pinned. A sample is one pass over the five MSs.
+
+| test | 0001-0012 | 0001-0013 | change |
+| --- | ---: | ---: | ---: |
+| solo, CPU 10, 3 reps per MS, 6 ABBA/BAAB blocks: reorder | 262ms | 211ms | -19.5% (6 of 6) |
+| same: whole pass | 2364ms | 2287ms | -3.3% (6 of 6) |
+| 36 copies at once, arms alternating across CPUs, 2 reps, block 1: pass | 2593ms | 2540ms | -2.0% |
+| block 2 (CPUs swapped): pass | 2498ms | 2422ms | -3.0% |
+| both blocks: reorder | 215ms | 177ms | -18%; new faster in 30 of 36 adjacent pairs |
+| raced 16-rank synchronous search, pair 1 (cold): binary mean / median | 150.7 / 102.8ms | 146.5 / 100.4ms | -2.8% / -2.3% |
+| pair 2 (warm): binary mean / median | 151.0 / 104.0ms | 147.1 / 99.7ms | -2.6% / -4.1% |
+| pair 2: evals/s | 29.67 | 30.58 | +3.1% (below resolution) |
+
+The whole-pass saving (~5ms a run solo) is larger than the reorder's alone
+(3.4ms), probably the tail of the per-row allocations freed earlier. With
+`-save-reordered`, the four reordered files of two MSs are byte-identical
+(8 of 8), and so are all 20 FITS data blocks over the five MSs. In both
+raced pairs every chain file is byte-identical, `phys_live.txt` matches up
+to row order, and log(Z) is 0.09426 +/- 0.00255, the same as round 57.
+
+**Shipping.** Takes effect when `wsclean.sif` is rebuilt (`./ri images
+patch-wsclean` on a compute node, or a Docker build). The production SIF is
+still the 0001-0006 build. A run on the shipped SIF does not change.
+
+**Learned.**
+- `scripts/patch-wsclean-sif.sh OUT` builds a test SIF anywhere in ~2
+  minutes without touching `images/`. A `SIF_DIR` of symlinks (the other
+  SIFs plus the test `wsclean.sif`) then lets two `./ri search` runs race
+  two builds.
+- perf on CSD3 can't unwind through casacore, so `--children` is useless
+  for a phase that lives there. Windowing samples by the binary's own
+  `-log-time` lines (`perf record -k monotonic`, plus the realtime offset)
+  gives a per-phase profile instead.
+- strace -f over `apptainer exec` hangs on this host (it stopped inside
+  apptainer's startup). For syscall questions, compare `/usr/bin/time`'s
+  user and sys times instead.
+- What is left in the reorder is casacore reading the MS (~8ms on a 46k-row
+  MS), and after it "loading data in memory" (14ms/eval over 4.35 passes),
+  which copies the reordered files into the gridder's buffers on every pass.
