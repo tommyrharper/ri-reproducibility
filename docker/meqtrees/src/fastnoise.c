@@ -108,6 +108,29 @@ static inline double fast_normal(uint64_t *hi, uint64_t *lo, uint64_t inc_hi,
   return d.x;
 }
 
+/* fast_normal() for a draw nobody keeps: the same steps of the stream, but
+ * the double is built only on the rejection path that needs it. */
+static inline void skip_normal(uint64_t *hi, uint64_t *lo, uint64_t inc_hi,
+                               uint64_t inc_lo, u128 inc) {
+  u128 p = (u128)*lo * PCG_MULT_LO + inc_lo;
+  uint64_t h = (uint64_t)(p >> 64) + *hi * PCG_MULT_LO + *lo * PCG_MULT_HI + inc_hi;
+  uint64_t l = (uint64_t)p;
+  *hi = h;
+  *lo = l;
+  unsigned rot = (unsigned)(h >> 58u);
+  uint64_t r = ((h ^ l) >> rot) | ((h ^ l) << ((-rot) & 63u));
+  int idx = r & 0xff;
+  r >>= 8;
+  uint64_t rabs = (r >> 1) & 0x000fffffffffffff;
+  if (__builtin_expect(rabs < ki_double[idx], 1))
+    return;
+  union { double d; uint64_t u; } bits = {rabs * wi_double[idx]};
+  bits.u ^= (uint64_t)(r & 0x1) << 63;
+  draw d = slow_normal(((u128)h << 64) | l, inc, idx, rabs, bits.d);
+  *hi = (uint64_t)(d.s >> 64);
+  *lo = (uint64_t)d.s;
+}
+
 void add_normal_f32(uint64_t state[4], double scale, float *dst, ptrdiff_t n,
                     ptrdiff_t stride, ptrdiff_t every) {
   /* n * every draws; the first of each `every` is added, the rest are drawn
@@ -128,6 +151,24 @@ void add_normal_f32(uint64_t state[4], double scale, float *dst, ptrdiff_t n,
       k = 0;
       out += stride;
     }
+  }
+  state[0] = hi;
+  state[1] = lo;
+}
+
+/* add_normal_f32(..., every=1) over n draws, n a multiple of 4, keeping only
+ * the first and last of each 4: XX and YY of a 4-correlation DATA column,
+ * the only two `-pol I` imaging reads. XY and YX keep their stream position
+ * and get no noise, which is -15% on the noise (docs/csd3-speed.md, round 65). */
+void add_normal_f32_xxyy(uint64_t state[4], double scale, float *dst,
+                         ptrdiff_t n, ptrdiff_t stride) {
+  uint64_t hi = state[0], lo = state[1], inc_hi = state[2], inc_lo = state[3];
+  u128 inc = ((u128)inc_hi << 64) | inc_lo;
+  for (float *end = dst + (n > 0 ? n / 4 : 0) * 4 * stride; dst != end; dst += 4 * stride) {
+    dst[0] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
+    skip_normal(&hi, &lo, inc_hi, inc_lo, inc);
+    skip_normal(&hi, &lo, inc_hi, inc_lo, inc);
+    dst[3 * stride] += (float)(0.0 + scale * fast_normal(&hi, &lo, inc_hi, inc_lo, inc));
   }
   state[0] = hi;
   state[1] = lo;

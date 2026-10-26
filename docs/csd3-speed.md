@@ -3132,3 +3132,55 @@ shipped.
 - On a 0001-0014 build, the remaining per-evaluation binary work is mostly
   gridding, load and predict, which scale with visibilities times major
   cycles (round 61). The reorder is the largest once-per-evaluation phase.
+
+## Round 65: XY and YX drawn but not computed
+
+**Why.** `-pol I` imaging reads XX and YY only, so half of the thermal noise
+`write_visibilities()` adds to a 4-correlation `DATA` column is never read.
+Noise was the largest part of simulate (8.2 ms of an evaluation solo, round
+63). The draws are still needed: the stream is interleaved per value (all
+reals, then all imaginaries), so skipping a draw would move every later one.
+
+**Change.** `add_normal_f32_xxyy()` in `fastnoise.c` walks each 4-value group
+as fast, skip, skip, fast. `skip_normal()` steps the PCG64 state and runs the
+ziggurat's accept test, but builds the double only when the draw is rejected
+and `slow_normal()` needs it. There is no float conversion, multiply or store
+for XY and YX. `add_complex_noise(..., xxyy=True)` takes this path when the
+library has the symbol and passes a check on load: XX and YY must match
+numpy, XY and YX must be untouched, and the generator must end in the same
+state. Otherwise it falls back to the full fill. So a kept MS's XY and YX
+columns now hold only the predict (zero for this unpolarised source), not
+noise. The `.mat` R2D2 reads is correlation 0 and is unchanged. In a C
+harness, a generic per-draw `if (keep & bit)` loop was 35-38% slower than the
+original, and putting `skip_normal` into the existing `every` loop was 14-16%
+slower (register pressure, as in round 56). Only the fixed, unrolled body
+wins. Cluster runs get the change with no rebuild, through the host-built
+copy in `start-sidecars.sh`.
+
+**Solo.** 168,480 complex values (351 x 120 rows, 4 channels, 4
+correlations), in the image, mean of 20 seeds, two alternations: 5.10/5.00 ms
+before, 4.27/4.27 ms after (-15%). The C harness gave 8.25 -> 7.05 ms at 1.1M
+values.
+
+**In run.** Raced 17-rank pairs, `NS_SEED=4242`, nlive 150. Base is a `git
+archive HEAD` copy and new is this tree. The arms launched 10 s apart, and
+each order was run twice:
+
+| pass | first launched | base simulate ms | new simulate ms | base evals/s | new evals/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| sync, ndead 300 | base | 32.62 | 28.92 | 24.75 | 25.09 |
+| async a, ndead 600 | base | 30.34 | 27.35 | 68.61 | 71.42 |
+| async b, ndead 600 | new | 30.43 | 30.30 | 66.46 | 65.93 |
+| sync2, ndead 300 | new | 29.68 | 28.94 | 8.41 | 8.52 |
+
+Simulate was lower in the new arm in all four pairs. The arm launched second
+gains ~1.5 ms, and averaging over both orders gives -1.9 ms (-6% of in-run
+simulate, ~0.8% of worker time). That is too small to show in evals/s (sync2
+ran with load ~59 on the node from outside this job, hence its 65% idle).
+Both sync passes gave the same log(Z) (0.09607 +/- 0.00114) and all 8 chain
+files byte-identical between the arms, so WSClean does not read XY or YX.
+
+**Learned.**
+- When raced arms start 10 s apart, launch order alone is worth ~1.5 ms of
+  in-run simulate here. A single pair cannot resolve an effect of that size,
+  so run both orders.

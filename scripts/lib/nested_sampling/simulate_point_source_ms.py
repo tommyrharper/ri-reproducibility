@@ -885,6 +885,27 @@ def _fastnoise():
                  _noise_agrees)
 
 
+def _xxyy_agrees(fn) -> bool:
+    # What add_complex_noise(..., xxyy=True) promises: XX and YY as numpy
+    # draws them, XY and YX untouched, the stream left where numpy leaves it.
+    want = np.full((2500, 2, 4), 0.25 - 0.5j, np.complex64)
+    got = want.copy()
+    reference = np.random.default_rng(12345)
+    _add_complex_noise(reference, want, 0.3, 1, None)
+    want[..., 1:3] = got[..., 1:3]
+    rng = np.random.default_rng(12345)
+    _add_xxyy_noise(rng, got, 0.3, fn)
+    return want.tobytes() == got.tobytes() and rng.random() == reference.random()
+
+
+def _fastnoise_xxyy():
+    """add_normal_f32_xxyy(), or None."""
+    import ctypes
+
+    return _fast("add_normal_f32_xxyy", [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 2,
+                 _xxyy_agrees)
+
+
 def _fastramp():
     """phase_ramp_c64(), or None: numpy's predict ~4.5x faster, bit for bit."""
     import ctypes
@@ -900,18 +921,31 @@ def _add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float,
         data.real += rng.normal(0.0, sigma, shape)[..., 0].astype(np.float32)
         data.imag += rng.normal(0.0, sigma, shape)[..., 0].astype(np.float32)
         return
-    bitgen = rng.bit_generator.state
-    pcg = bitgen["state"]
-    words = np.array([pcg["state"] >> 64, pcg["state"] & (2**64 - 1), pcg["inc"] >> 64, pcg["inc"] & (2**64 - 1)],
-                     dtype=np.uint64)
+    bitgen, words = _pcg_words(rng)
     base = data.ctypes.data
     lib(words.ctypes.data, sigma, base, data.size, 2, every)
     lib(words.ctypes.data, sigma, base + 4, data.size, 2, every)
-    pcg["state"] = (int(words[0]) << 64) | int(words[1])
+    bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
     rng.bit_generator.state = bitgen
 
 
-def add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int = 1) -> None:
+def _pcg_words(rng: np.random.Generator) -> tuple[dict, np.ndarray]:
+    bitgen = rng.bit_generator.state
+    pcg = bitgen["state"]
+    return bitgen, np.array([pcg["state"] >> 64, pcg["state"] & (2**64 - 1), pcg["inc"] >> 64,
+                             pcg["inc"] & (2**64 - 1)], dtype=np.uint64)
+
+
+def _add_xxyy_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, fn) -> None:
+    bitgen, words = _pcg_words(rng)
+    fn(words.ctypes.data, sigma, data.ctypes.data, data.size, 2)
+    fn(words.ctypes.data, sigma, data.ctypes.data + 4, data.size, 2)
+    bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
+    rng.bit_generator.state = bitgen
+
+
+def add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int = 1,
+                      xxyy: bool = False) -> None:
     """In place and bit for bit, what
 
         data.real += rng.normal(0.0, sigma, (*data.shape, every))[..., 0].astype(np.float32)
@@ -920,11 +954,20 @@ def add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, 
     does, for complex64 data. Rounding each component to float32 before the
     add is what the old `.astype(np.complex64)` did; the two halves are drawn
     in this order because that, not the arithmetic, is what fixes the stream.
-    every > 1 draws a whole column's stream and keeps only correlation 0."""
+    every > 1 draws a whole column's stream and keeps only correlation 0.
+    xxyy=True, for 4-correlation data, may leave XY and YX without their noise
+    (the C path does; numpy's fallback adds it): `-pol I` reads XX and YY only,
+    and the draws are skipped ~15% faster than made (docs/csd3-speed.md, round 65)."""
     lib = _fastnoise()
     if lib is not None and (rng.bit_generator.state["bit_generator"] != "PCG64"
                             or rng.bit_generator.state["has_uint32"]):
         lib = None
+    if (lib is not None and xxyy and every == 1 and data.ndim and data.shape[-1] == 4
+            and data.flags.c_contiguous and data.dtype == np.complex64):
+        fn = _fastnoise_xxyy()
+        if fn is not None:
+            _add_xxyy_noise(rng, data, sigma, fn)
+            return
     _add_complex_noise(rng, data, sigma, every, lib)
 
 
@@ -959,7 +1002,7 @@ def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse
     data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr)
 
     if noise_sigma_jy:
-        add_complex_noise(rng, data, noise_sigma_jy / math.sqrt(2.0))
+        add_complex_noise(rng, data, noise_sigma_jy / math.sqrt(2.0), xxyy=True)
 
     ms.putcol("DATA", data)
     for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -1702,6 +1745,12 @@ def self_check_fast_noise() -> None:
         reference.normal(size=(2, *shape, every))
         if rng.random() != reference.random():
             raise SystemExit("FAIL: fast noise left the generator in a different state")
+    import ctypes
+
+    if not hasattr(ctypes.CDLL(str(FASTNOISE_SO)), "add_normal_f32_xxyy"):
+        print(f"fast noise self-check: {FASTNOISE_SO} predates XX/YY-only noise (rebuild meqtrees)")
+    elif _fastnoise_xxyy() is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s XX/YY-only noise does not match numpy's XX and YY")
     print("fast noise self-check passed")
     if not hasattr(__import__("ctypes").CDLL(str(FASTNOISE_SO)), "phase_ramp_c64"):
         print(f"phase ramp self-check skipped: {FASTNOISE_SO} predates phase_ramp_c64 (rebuild meqtrees)")
