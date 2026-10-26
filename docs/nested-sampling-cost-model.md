@@ -12,8 +12,8 @@ Rig: 20-thread i5-13500, 65 W package limit; [details](nested-sampling-power-lim
 
 One search, `--mpi-procs 20 --nlive 200 --num-repeats 10 --max-ndead 2000`:
 34368 evaluations in 5m 59s, 95.7 evaluations/second, and `./ri profile` accounts
-for 98.4% of the worker-time budget. `./ri profile <run> --over-time` reads each
-evaluation's own `-log-time` timeline and buckets it by wall clock:
+for 98.4% of the worker-time budget. `./ri profile <run> --over-time` read each
+evaluation's own `-log-time` timeline and bucketed it by wall clock:
 
 | t (s) | evals/s | ms/eval | vis/eval |
 | ---: | ---: | ---: | ---: |
@@ -186,10 +186,13 @@ were known. The avenue is closed at the flag level; it is only movable upstream.
 ./ri profile <run> --phases         # inside the binary
 ```
 
-`--over-time` needs a run made since `-log-time` became a default; on an older
-run it says so rather than printing an empty table. `--buckets N` changes the
-resolution. The visibility count it prints is WSClean's own
-`Gridded visibility count` line, so it is what the gridder actually saw.
+`--over-time` buckets every evaluation's record by its `timing` epochs, so
+its `ms/eval` is the whole evaluation; the table above predates that and
+timed the WSClean `-log-time` span alone, which a run older than records
+carrying the visibility count still gets if it kept every log (csd3-speed.md,
+round 96). `--buckets N` changes the resolution. The visibility count it
+prints is WSClean's own `Gridded visibility count` line
+(`metrics.gridded_visibilities`), so it is what the gridder actually saw.
 
 The cost-model fit is a least squares of each log's (first stamp, last stamp)
 span against that count, over `evaluation_timeline()` in

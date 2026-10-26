@@ -4763,3 +4763,24 @@ is in the bound `nested_sampling` tree, so it needs no rebuild.
   slowest prior evaluation) and the tail ~70. Together they are most of
   the idle that is left at 900 dead, and both get smaller as a run gets
   longer.
+
+## Round 96 (tooling): `./ri profile --over-time` reads every evaluation
+
+Round 95 found `--over-time` blind on current runs: it bucketed the
+`-log-time` span of each kept `wsclean.stdout.log`, and since rounds
+92-93 retention keeps a log for ~1 in 100 evaluations. It now reads the
+run's records (packed or flat, through `load_evaluations_from_dir`) and
+buckets every evaluation by its `timing.started_epoch`; `ms/eval` is the
+whole evaluation (simulate + WSClean + metrics), `ended - started`. The
+`vis/eval` column needs the visibility count, which only the logs had, so
+each WSClean record now carries `metrics.gridded_visibilities`, parsed by
+`clean_convergence()` from the log the evaluation already reads for its
+CLEAN fields (one regex search; no new IO). A run from before this whose
+logs cover at least as many evaluations as its records still gets the
+old log view.
+
+Checked on a 16-rank WSClean search (nlive 50, 300 dead, 1,816
+evaluations): the old view had 47 logs to read; the new one times 1,807
+records (the rest carry no epochs), every record has the count, and the
+table shows the expected warm-up (97 evals/s in the first bucket, ~200
+after). No sampled value changes, so there is no A/B.

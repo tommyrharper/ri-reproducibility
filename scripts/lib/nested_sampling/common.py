@@ -1875,6 +1875,7 @@ RETAINED_IMAGE_KEYS = ("image", "dirty", "residual")
 _CLEAN_STOPPED = re.compile(r"Stopped on peak [^,]+, because ([^\n]+)")
 _CLEAN_ITERATIONS = re.compile(r"Performed (\d+) iterations in total")
 _CLEAN_MAJOR = re.compile(r"(\d+) major iterations were performed")
+_GRIDDED = re.compile(r"Gridded visibility count: (\d+)")
 
 
 def clean_convergence(log_text: str) -> dict[str, Any]:
@@ -1902,6 +1903,12 @@ def clean_convergence(log_text: str) -> dict[str, Any]:
     major = _CLEAN_MAJOR.search(log_text)
     if major:
         out["clean_major_iterations"] = int(major.group(1))
+    # What drives an evaluation's cost (docs/nested-sampling-cost-model.md),
+    # kept in the record so `./ri profile --over-time` need not read logs the
+    # retention policy deletes from all but ~1 in 100 evaluations.
+    gridded = _GRIDDED.search(log_text)
+    if gridded:
+        out["gridded_visibilities"] = int(gridded.group(1))
     return out
 
 
@@ -2255,6 +2262,8 @@ def self_check_clean_convergence() -> None:
 
     # A log that never got as far as cleaning yields nothing, not a crash.
     assert clean_convergence("WSClean version 3.7\n") == {}
+    assert clean_convergence("2026-Aug-29 10:19:02.105500 Gridded visibility count: 4140\n"
+                             "Gridded visibility count: 4140\n") == {"gridded_visibilities": 4140}
     assert clean_convergence("") == {}
     assert clean_convergence_from(Path("/nonexistent/wsclean.stdout.log")) == {}
 

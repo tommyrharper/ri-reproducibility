@@ -19,6 +19,7 @@ from common import (  # noqa: E402
     backfill_busy_seconds,
     format_duration,
     format_share,
+    load_evaluations_from_dir,
     profiling_breakdown,
 )
 
@@ -262,20 +263,38 @@ def evaluation_timeline(log_paths: Any) -> list[tuple[float, float, int]]:
     return rows
 
 
+def record_timeline(records: Any) -> list[tuple[float, float, int | None]]:
+    """(start epoch, ms of the evaluation, gridded visibilities or None) for
+    every record that has its timing epochs - all of a run, where the logs
+    are kept for only ~1 in 100 evaluations (round 96)."""
+    rows = []
+    for record in records:
+        timing = record.get("timing") or {}
+        began, ended = timing.get("started_epoch"), timing.get("ended_epoch")
+        if began is None or ended is None:
+            continue
+        rows.append((float(began), (float(ended) - float(began)) * 1000.0,
+                     (record.get("metrics") or {}).get("gridded_visibilities")))
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
 def print_over_time(run_dir: Path, buckets: int) -> None:
-    logs = sorted(run_dir.glob("evaluations/*/wsclean.stdout.log"))
-    if not logs:
-        raise SystemExit(f"no evaluations/*/wsclean.stdout.log under {run_dir}")
-    rows = evaluation_timeline(logs)
+    rows: list[tuple[float, float, int | None]] = record_timeline(
+        load_evaluations_from_dir(run_dir / "evaluations"))
+    source = "records"
+    if not any(row[2] is not None for row in rows):
+        # A run from before records carried the visibility count: its logs,
+        # if every evaluation kept one, are the better view.
+        logs = sorted(run_dir.glob("evaluations/*/wsclean.stdout.log"))
+        timeline = evaluation_timeline(logs)
+        if len(timeline) >= len(rows):
+            rows, source = timeline, "wsclean -log-time spans"
     if not rows:
-        raise SystemExit(
-            f"{len(logs)} wsclean logs under {run_dir} carry no timestamps - the "
-            "run predates `-log-time` being passed by default, so there is no "
-            "timeline in them to read."
-        )
+        raise SystemExit(f"no evaluation under {run_dir} records its timing")
     start = rows[0][0]
     span = rows[-1][0] - start
-    print(f"{len(rows)} evaluations over {span:.0f}s of wall clock, "
+    print(f"{len(rows)} evaluations ({source}) over {span:.0f}s of wall clock, "
           f"in {buckets} equal-count buckets")
     print()
     print(f"{'t (s)':>7} {'evals/s':>9} {'ms/eval':>9} {'vis/eval':>9}")
@@ -289,9 +308,10 @@ def print_over_time(run_dir: Path, buckets: int) -> None:
             continue
         elapsed = chunk[-1][0] - chunk[0][0]
         rate = len(chunk) / elapsed if elapsed else float("nan")
+        counts = [r[2] for r in chunk if r[2] is not None]
+        vis = f"{statistics.median(counts):9.0f}" if counts else f"{'-':>9}"
         print(f"{chunk[0][0] - start:7.0f} {rate:9.1f} "
-              f"{statistics.median(r[1] for r in chunk):9.1f} "
-              f"{statistics.median(r[2] for r in chunk):9.0f}")
+              f"{statistics.median(r[1] for r in chunk):9.1f} {vis}")
 
 
 def self_check() -> None:
@@ -362,6 +382,15 @@ def self_check() -> None:
     assert len(timeline) == 1, timeline
     assert abs(timeline[0][1] - 7.5) < 1e-3, timeline
     assert timeline[0][2] == 4140, timeline
+
+    records = [
+        {"timing": {"started_epoch": 1002.0, "ended_epoch": 1002.5}},
+        {"timing": {"started_epoch": 1000.0, "ended_epoch": 1000.25},
+         "metrics": {"gridded_visibilities": 4140}},
+        {"timing": {"simulate_seconds": 0.1}},  # no epochs: not timed
+    ]
+    assert record_timeline(records) == [(1000.0, 250.0, 4140), (1002.0, 500.0, None)], (
+        record_timeline(records))
 
     with tempfile.TemporaryDirectory() as raw:
         live = Path(raw) / "wsclean-vlaa-20260101T000000Z"
