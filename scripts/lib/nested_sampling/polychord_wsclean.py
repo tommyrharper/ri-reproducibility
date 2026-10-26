@@ -29,6 +29,7 @@ from common import (
     clean_convergence_from,
     cube_like_from_theta,
     cube_to_params,
+    PolyChordFinish,
     finished_run_records,
     post_run_line,
     post_run_phase,
@@ -52,6 +53,7 @@ from common import (
     self_check_image_pixel_size,
     self_check_lazy_numpy,
     self_check_metric_resolution,
+    self_check_polychord_finish,
     self_check_parameter_space,
     self_check_parameter_toggle,
     self_check_profiling,
@@ -407,6 +409,8 @@ def main() -> None:
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
         nonlocal scored
+        if finish.finished():
+            return finish.discarded(), []
         # ponytail: theta values are rounded back to the documented parameter
         # space here; a later science run should keep integer/discrete handling
         # in one sampler-aware transform instead of this bridge.
@@ -465,8 +469,10 @@ def main() -> None:
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
-    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
+    finish = PolyChordFinish()
+    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
+    finish.close()
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)
     window_fit_stats = gathered_window_fit_stats()
@@ -538,6 +544,7 @@ if __name__ == "__main__":
         self_check_image_pixel_size()
         self_check_source_offset()
         self_check_profiling()
+        self_check_polychord_finish()
         self_check_failure_record_persistence()
         self_check_resume_adoption()
         self_check_worker_timeout()

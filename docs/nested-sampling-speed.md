@@ -103,6 +103,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | The makems observation cache stored as a pickle, not an `.npz` | `simulate_point_source_ms.py` | simulate -4.0% in-run (30.49 to 29.28 ms, 29 pinned copies, 4/4 ABBA pairs); `np.load` 0.8 ms against `pickle.load` 0.05 ms; arrays bit-identical ([csd3-speed](csd3-speed.md), round 78) |
 | FLAG no longer written: casacore's zero-filled tiles already read False | `simulate_point_source_ms.py` | simulate -0.7% in-run (23.79 to 23.62 ms, 34 pinned copies, 4/4 ABBA pairs); every column identical ([csd3-speed](csd3-speed.md), round 79) |
 | Phase ramp output allocated with `np.empty`: the C ramp writes every element of 1- and 2-correlation data | `simulate_point_source_ms.py` | simulate -1.9% in-run (23.58 to 23.14 ms, 34 pinned copies, 4/4 ABBA pairs); all 48 MSs column-identical ([csd3-speed](csd3-speed.md), round 80) |
+| Chains still in flight end once PolyChord has finished: its root has written every output before it waits for them, and keeps only their `nlike` (`PolyChordFinish`) | `common.py`, both drivers | async PolyChord wall -13.8% / -8.9% in raced 17-rank 600-dead pairs, both launch orders (a fixed ~20-40 s tail per run); sync pair byte-identical ([csd3-speed](csd3-speed.md), round 81) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

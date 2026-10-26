@@ -25,6 +25,7 @@ from common import (
     cube_like_from_theta,
     cube_to_params,
     drain_record_writes,
+    PolyChordFinish,
     finished_run_records,
     post_run_line,
     post_run_phase,
@@ -526,6 +527,8 @@ def main() -> None:
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
         nonlocal scored
+        if finish.finished():
+            return finish.discarded(), []
         params = cube_to_params(cube_like_from_theta(theta))
         key = params_key(params)
         params["noise_seed"] = stable_seed(args.seed, key)
@@ -580,8 +583,10 @@ def main() -> None:
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
-    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
+    finish = PolyChordFinish()
+    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
+    finish.close()
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)
     window_fit_stats = gathered_window_fit_stats()

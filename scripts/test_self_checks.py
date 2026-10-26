@@ -21,6 +21,7 @@ HOST_RUNNABLE = {
         "self_check_image_retention",
         "self_check_parameter_space",
         "self_check_parameter_toggle",
+        "self_check_polychord_finish",
         "self_check_profiling",
         "self_check_resume_adoption",
         "self_check_streaming_retention",

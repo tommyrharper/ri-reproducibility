@@ -1258,6 +1258,70 @@ def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[
     return [record for record in records if record is not None]
 
 
+class PolyChordFinish:
+    """Ends the chains still in flight once PolyChord has finished (round 81).
+
+    An async run's root writes every output (chains, .resume, stats) and
+    makes its final dump() call, then waits for each worker's chain only to
+    throw its points away (NestedSampling's cleanup keeps just nlike). That
+    wait was the last ~30s of a run, one rank slicing alone. On the final
+    dump - the only one with no live points - the root tells every worker,
+    which then answers PolyChord without evaluating: low, low, high, so a
+    step-out ends on a low and the shrink on a high within three calls.
+    Build it on every rank before run_polychord (Dup() is collective) and
+    call close() on every rank after it.
+    """
+
+    TAG = 81
+
+    def __init__(self) -> None:
+        try:
+            from mpi4py import MPI
+
+            self.comm = MPI.COMM_WORLD.Dup()
+        except Exception:
+            self.comm = None  # no MPI: one process, nothing in flight to end
+        self.rank = self.comm.Get_rank() if self.comm is not None else 0
+        self.done = False
+        self.skipped = 0
+        self._sent: list | None = None
+
+    def dumper(self, live, dead, logweights, logZ, logZerr) -> None:
+        if self.rank == 0 and len(live) == 0:
+            self._send()
+
+    def _send(self) -> None:
+        if self._sent is None and self.comm is not None:
+            self._sent = [self.comm.isend(None, dest=rank, tag=self.TAG) for rank in range(1, self.comm.Get_size())]
+
+    def finished(self) -> bool:
+        """On a worker, True once the root's final dump has happened. One
+        Iprobe a call, which costs microseconds."""
+        if not self.done and self.rank and self.comm.iprobe(source=0, tag=self.TAG):
+            self.comm.recv(source=0, tag=self.TAG)
+            self.done = True
+        return self.done
+
+    def discarded(self) -> float:
+        self.skipped += 1
+        return 1e300 if self.skipped % 3 == 0 else -1e300
+
+    def close(self) -> None:
+        if self.comm is None:
+            return
+        if self.rank == 0:
+            self._send()  # a run whose final dump was missed must not hang its workers below
+            from mpi4py import MPI
+
+            MPI.Request.Waitall(self._sent)
+        elif not self.done:
+            self.comm.recv(source=0, tag=self.TAG)  # synchronous runs end with no chain in flight
+            self.done = True
+        if self.skipped:
+            print(f"rank {self.rank}: {self.skipped} likelihood calls answered without evaluating "
+                  "after PolyChord finished", flush=True)
+
+
 def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     """Drain every rank's records and settle its held extremes; rank 0 gets
     every record, the others None. Collective: every rank calls it.
@@ -3299,6 +3363,42 @@ def self_check_fits_reader() -> None:
     assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
     assert header["SIMPLE"] is True
     assert int(header["NAXIS"]) == int(expected_header["NAXIS"])
+
+
+def self_check_polychord_finish() -> None:
+    """PolyChordFinish's answers end a slice_sample (chordal_sampling.f90,
+    PolyChordLite 370f6af) within three calls, wherever in it they start and
+    however many of its points fall outside the cube, so a worker never
+    reaches the 101-step shrink limit and its 'Non deterministic' warning."""
+    import random
+
+    logzero, contour = -1e30, -1.0
+    rng = random.Random(81)
+    for stop_at in range(1, 40):
+        for outside in (0.0, 0.3, 0.7):
+            finish, calls = PolyChordFinish.__new__(PolyChordFinish), [0]
+            finish.skipped = 0
+
+            def point() -> float:
+                if rng.random() < outside:
+                    return logzero  # calculate_point: outside the cube, no likelihood call
+                calls[0] += 1
+                return finish.discarded() if calls[0] >= stop_at else 0.0  # a real point inside the contour
+
+            for _ in range(15):
+                right, left = point(), point()
+                while right >= contour and right > logzero:
+                    right = point()
+                while left >= contour and left > logzero:
+                    left = point()
+                for _ in range(101):
+                    baby = point()
+                    if baby >= contour and baby > logzero:
+                        break
+                else:
+                    raise AssertionError(f"shrink hit its limit (stop at call {stop_at}, outside {outside})")
+            assert finish.skipped <= 3 * 15, finish.skipped
+    print("polychord finish answers end each slice_sample within three calls")
 
 
 def self_check_lazy_numpy() -> None:

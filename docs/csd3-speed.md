@@ -3618,8 +3618,8 @@ Not taken.
   steady throughput by ~25% at 900 dead (174 against 233). Compare steady
   windows, or same-`NS_MAX_NDEAD` rows only.
 - The remaining large-run cost outside the worker evaluation is the last
-  chain's ~30 s, and it cannot be cut without changing which points
-  PolyChord sees. Per-evaluation work, i.e. ducc0 gridding (round 69) and
+  chain's ~30 s. (Wrong, as round 81 found: PolyChord throws those
+  chains away, so they now end as soon as it has finished.) Per-evaluation work, i.e. ducc0 gridding (round 69) and
   simulate's 28 ms, is still what scales.
 - WSClean's `-j` is not a thread knob that leaves the output alone. Even
   the PSF changes, so `-j 1` has to stay fixed for every evaluation.
@@ -3922,3 +3922,64 @@ see end to end, so no search ran and there is no `benchmarks.jsonl` row.
 - An `np.zeros` buffer that a C kernel then overwrites whole is a wasted
   pass that matters under L3 pressure (round 76): it costs 0.4 ms in-run
   here. Check what the kernel writes before zeroing.
+
+## Round 81: in-flight chains end once PolyChord has finished
+
+**Finding.** Rounds 39 and 72 put the last ~30 s of an async search, one
+rank finishing its chain alone, down to the sampler and left it. PolyChord's
+own source says otherwise (`nested_sampling.F90` at the pinned 370f6af).
+The root writes every output (chains, `.resume`, stats, posteriors) and
+makes its final `dump()` call. Only then does its cleanup loop
+`catch_babies()` each worker's chain, and that loop keeps nothing but
+`nlike`. Every point slice-sampled after the final write is thrown away, so
+the tail was spent computing evaluations that change no output.
+
+**Change.** `PolyChordFinish` (`common.py`), used by both drivers. Before
+`run_polychord` every rank `Dup()`s `COMM_WORLD`. The root's dumper sees
+the final dump, the only one with no live points, and `isend`s each worker
+a message. A worker's likelihood `iprobe`s once a call (microseconds). Once
+the message is there it answers without evaluating: low, low, high. A
+step-out loop ends on a low, the shrink ends on a high, and every
+slice_sample then ends within three calls (`self_check_polychord_finish`
+is a port of `chordal_sampling.f90`'s loops). After `run_polychord`,
+`close()` waits for the sends, and a worker that never probed (a
+synchronous run has no chain in flight) receives its message there.
+
+**In run.** `.probe/r81/ab.sh`: raced 17-rank pairs, shipped SIFs, seed
+4242, nlive 150, 15 repeats. A is `a92b658` from a `git archive` tree, B
+is this tree:
+
+| pass | first launched | A PolyChord wall | B PolyChord wall | A evals | B evals | A log(Z) | B log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| async, 600 dead | A | 275.5 s | 237.4 s (**-13.8%**) | 17,050 | 17,196 | 0.09626 +/- 0.00054 | 0.09688 +/- 0.00056 |
+| async, 600 dead | B | 242.6 s | 221.0 s (**-8.9%**) | 18,027 | 17,926 | 0.09561 +/- 0.00132 | 0.09649 +/- 0.00088 |
+| sync, 300 dead | A | 287.1 s | 286.2 s | 7,821 | 7,821 | 0.09607 +/- 0.00114 | 0.09607 +/- 0.00114 |
+
+The whole command took 361/251 s (A) against 256/231 s (B). A's first run
+also spent ~85 s outside PolyChord starting up in its fresh tree, so
+compare the PolyChord column. Async log(Z) differs run to run whatever the
+code (the arms' log(Z)s overlap within their error bars). By construction
+the change cannot alter an async run's outputs, because they are all
+written before the dumper fires. In the synchronous pair, where both arms
+see the same points, every chain file is byte-identical (`phys_live.txt`
+once sorted), with the same evaluations and the same wall time. Workers
+answered 3-42 calls each without evaluating, and none printed PolyChord's
+"Non deterministic loglikelihood" warning. Mean binary time falls too
+(179 to 158 ms in the first pair), because the dropped tail evaluations
+were the run's heaviest (round 72: 318 ms). A 12-rank async R2D2 smoke
+run (nlive 24, 24 dead) also ended cleanly, with 7 workers answering 3-9
+calls each.
+
+**Learned.**
+- The tail was not the sampler's. PolyChord discards every chain that
+  finishes after its final write, so a whole chain's worth of evaluations
+  per in-flight rank (up to 470 in round 72's run) was waste. The saving is
+  a fixed ~20-40 s per run segment. That is ~13% of a ~4 minute production
+  WSClean search (round 72), and more for R2D2, whose evaluations are ~1 s.
+  A resumed run saves it again on every segment.
+- `evals_per_s` across the round-81 line is not comparable with earlier
+  rows: B runs fewer of the heaviest evaluations, so its ms/eval and its
+  rate both move. Compare PolyChord wall at a fixed `NS_MAX_NDEAD`.
+- pypolychord's `dumper` runs on the root at every `update_files` and once
+  at the very end, with an empty `live` array only on that last call. It is
+  the one Python hook between the final write and the cleanup wait.
