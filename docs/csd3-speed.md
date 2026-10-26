@@ -3381,3 +3381,74 @@ and 31.8/30.8 ms, launch order and load), so the whole gain is the binary:
   (the first took seconds), with the node's load average at 55-60 from
   other jobs. `benchmarks.jsonl`'s `wall_s` (245-260 s) does not include
   it, so give a raced pair's `timeout` room for that startup.
+
+## Round 69: residual rows read in blocks from the mappings (patch 0016)
+
+**Why.** After round 68, each residual inversion of the largest MS still
+spent ~14 ms "loading data in memory" (341k rows x 8 channels here). That is
+~6% of the binary over five such passes.
+
+**First attempt (no gain).** A reader call that copied a whole chunk's data
+and model at once, followed by one subtract-and-weight loop, left the load at
+14-16 ms. So the time is not per-row call overhead. A `perf` profile of the
+0015 build shows the pass is memory-bound: data and model are each copied
+twice, the uvws once, and the freshly allocated chunk buffer (22 MB here)
+page-faults on first touch every pass. The extra model buffer only added
+more of the same.
+
+**Change.** Patch 0016 (`docker/wsclean/patches/`, described in
+[nested-sampling-wsclean-patches.md](nested-sampling-wsclean-patches.md))
+adds `MSReader::MapDataAndModelRows()`. For a regular reordered set it
+returns pointers into the data and model mappings for a whole chunk and
+moves the cursors as the row reads would. `(data - model) * weight` is then
+formed in one loop into a buffer kept in 0015's cache, so its pages stay
+mapped, and the cached uvws go to the gridder directly. The operations are
+the same, in the same order, so the result is the same.
+
+**Phase timing.** On the largest MS with `-log-time`, the residual passes'
+load falls from 13.8-14.2 ms to 5.6-6.0 ms. The PSF and dirty passes are
+unchanged, at 36 and 14 ms. WSClean drops from 1091 to 1041 ms (two runs
+per arm).
+
+**Solo.** Fresh real-draw MSs, which are XX/YY since round 66, came from an
+`NS_KEEP_MEASUREMENT_SETS=1` search. Four chains, each pinned to one CPU,
+ran ABBA blocks at the same time (6 blocks per chain, 3 reps per MS, mean of
+reps 2-3). A = 0001-0015 (round 68's B2), B = 0001-0016, both built by
+`patch-wsclean-sif.sh`. The node's load average from other jobs was 31-35:
+
+| MS | 0001-0015 | + 0016 | change | 0016 faster |
+| --- | ---: | ---: | ---: | ---: |
+| largest | 1065.1 ms | 1034.0 ms | -2.9% | 24/24 |
+| 2nd largest | 1057.6 ms | 1008.6 ms | -4.6% | 24/24 |
+| 3rd largest | 1012.1 ms | 967.3 ms | -4.4% | 24/24 |
+| median-size | 132.9 ms | 129.3 ms | -2.8% | 20/24 |
+| smallest | 41.6 ms | 41.5 ms | -0.3% | 11/24 |
+
+All 1440 FITS data blocks are byte-identical. So are all 1440 headers, apart
+from DATE and HISTORY.
+
+**In run.** Synchronous raced 17-rank pairs (`NS_SEED=4242`, nlive 150,
+ndead 300) image the same draws. The arms differ only in `SIF_DIR`'s
+`wsclean.sif`:
+
+| pass | first launched | A binary ms | 0016 binary ms | A evals/s | 0016 evals/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| sync | A | 148.06 | 144.61 (-2.3%) | 31.63 | 32.94 (+4.2%) |
+| sync | 0016 | 147.39 | 143.60 (-2.6%) | 32.38 | 32.91 (+1.6%) |
+
+In each pass, every chain file and log(Z) (0.09607 +/- 0.00114) were
+byte-identical between the arms. The two evals/s gains differ because in-run
+simulate depends on launch order (37.96/30.20 ms, then 29.79/30.66 ms). The
+binary, at -3.5 to -3.8 ms per evaluation, is the measure that does not.
+
+**Learned.**
+- After 0015, a residual pass's load is memory bandwidth plus page faults,
+  not row-loop overhead. Block copies through the reader save nothing.
+  Avoiding the copies and reusing a warm buffer does.
+- A regular reordered set's data and model files are flat arrays from the
+  first row: data from `PartHeader::BINARY_SIZE`, model at
+  `current_value_position_`. Callers can therefore read them in place, with
+  no row API at all.
+- Harness: `.probe/r69inner.sh`, `r69abba.sh`, `r69ab.sh` and
+  `r69fitscmp.py` (git-ignored). FITS identity is checked as the data block
+  after the END card, plus every header card except DATE and HISTORY.

@@ -470,3 +470,29 @@ and headers are byte-identical. The measurements are in
 
 Not upstream-shaped as is: a cleaner version would hold the weights in the
 gridder across inversions instead of in a thread-local.
+
+## 0016: read residual rows in blocks
+
+With 0015 in, a residual inversion (one per major cycle after the first)
+still spent ~14 ms on the largest MS "loading data in memory". The time is not
+per-row call overhead: reading the rows in blocks through a copying API
+changed nothing. It is memory traffic. Each pass copies the data and the
+model into row buffers and then into the chunk buffer, copies the cached
+uvws, and touches a freshly allocated chunk buffer, which costs page faults.
+For residual inversions (no PSF, model subtracted, one visibility
+polarization), the patch adds `MSReader::MapDataAndModelRows()`. In the
+reordered reader (`msproviders/msreaders/reorderedmsreader.cpp`), a regular
+set's rows are consecutive in both the data file and the model file, so the
+call returns pointers into the two mappings for a whole chunk and advances
+the cursors exactly as the row-by-row reads would. `GridRegularMeasurementSet()`
+then forms `(data - model) * weight` in one loop into a buffer kept in the
+0015 cache, and passes the cached uvws to the gridder directly. The
+arithmetic is the same operations in the same order, so the result is
+byte-identical. Readers without the method, and every other kind of pass,
+take the 0015 path.
+
+The per-pass load on the largest MS drops from ~14 ms to ~5.7 ms. Solo over
+five MSs, WSClean is 2.9-4.6% faster on the three largest (24 of 24 ABBA
+blocks each), 2.8% faster on the median one and unchanged on the smallest.
+All 1440 FITS data blocks and headers are identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 69.
