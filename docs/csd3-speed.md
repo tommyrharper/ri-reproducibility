@@ -3557,3 +3557,69 @@ say.
   same settings and same draws. Here the same patches took 126 ms with the
   node's load average at ~11. Other jobs' load moves absolute times by
   ~12%, so only raced arms compare.
+
+## Round 72 (diagnostic, one rejection): a production-shaped search on 0001-0016, and `-j N` for the lone last chain
+
+**Question.** With every WSClean patch in (round 71's 0001-0016 SIF), what
+does a production-shaped search spend its worker time on, and is any of the
+idle worker time something a large run would also pay?
+
+**Run.** 36 ranks, async, nlive 150, 15 repeats, 900 dead, seed 4242,
+r71's patched `wsclean.sif`, cpu-q-278 at load ~25 (row `r72-prof`):
+26,899 evaluations in 154 s, **174 evals/s** whole run.
+
+| stage (`./ri profile`) | per eval | share of worker time |
+| --- | ---: | ---: |
+| simulate (MeqTrees) | 28 ms | 14.0% |
+| `wsclean` binary | 123 ms | 61.0% |
+| zygote, metrics, harness | 1.2 ms | 0.6% |
+| PolyChord (no evaluation in flight) | | 0.4% |
+| idle | | **23.9%** |
+
+MeqTrees is 18% of evaluation time, down from the 30-50% that motivated
+this work. Busy workers per 7.7 s window, from each evaluation's
+`started_epoch`/`ended_epoch` (`.probe/r72busy.py`):
+
+| window | busy | evals/s |
+| --- | ---: | ---: |
+| 0-8 s | 91% | 183 |
+| 8-115 s | 97-98.5% | 188-266 (**233** mean over 10-110 s) |
+| 115-123 s | 38% | 55 |
+| 123-154 s | 3-9% | 3-9 |
+
+So mid-run idle is ~2%. The 24% is one worker finishing the last
+slice-sampling chain alone (round 39): 470 evaluations end after 116 s, the
+last ~28 s on a single rank, back to back. The tail's evaluations sit in
+the converged region and are heavy: 318 ms of binary time against 123 ms
+for the run as a whole. A converged production search is ~1,400 dead points
+(round 51), so ~4 minutes of steady state now carries a ~35 s tail, ~13%.
+
+**Rejected: `-j N` for the evaluations a busy count says are alone.** Round
+9 gives a lone R2D2 request the idle cores. The WSClean equivalent is `-j N`.
+On four real-draw MSs from round 69 (`.probe/r72j.sh`, inside the 0001-0016
+SIF, 3 reps each, `-niter 100000` as in a search):
+
+| MS | `-j 1` | `-j 2` | `-j 4` | `-j 8` |
+| --- | ---: | ---: | ---: | ---: |
+| m1 (largest) | 1.157 s | 0.942 | 0.757 | 0.671 (-42%) |
+| m2 | 1.013 s | 0.949 | 0.802 | 0.718 (-29%) |
+| m4 (tail-sized) | 0.140 s | 0.136 | 0.124 | 0.112 (-20%) |
+
+Every `-j N > 1` output differs from `-j 1`, the PSF included: up to
+1.3e-4 of the PSF peak and 8e-5 of the image peak on m1. `-j 2` and `-j 8`
+are not even reproducible run to run (2e-7 to 1.4e-6). An objective that
+depends on how many other ranks were busy breaks same-seed reproducibility,
+and at tail-sized evaluations the gain is ~20%, i.e. ~6 s off a ~30 s tail.
+Not taken.
+
+**Learned.**
+- On a fully patched SIF, a WSClean search is saturated mid-run (97-98.5%
+  of 35 workers busy). Short benchmarks' whole-run evals/s understates
+  steady throughput by ~25% at 900 dead (174 against 233). Compare steady
+  windows, or same-`NS_MAX_NDEAD` rows only.
+- The remaining large-run cost outside the worker evaluation is the last
+  chain's ~30 s, and it cannot be cut without changing which points
+  PolyChord sees. Per-evaluation work, i.e. ducc0 gridding (round 69) and
+  simulate's 28 ms, is still what scales.
+- WSClean's `-j` is not a thread knob that leaves the output alone. Even
+  the PSF changes, so `-j 1` has to stay fixed for every evaluation.
