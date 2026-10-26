@@ -1075,9 +1075,10 @@ def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse
     for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
         if optional_col in ms.colnames():
             ms.putcol(optional_col, data)
-    if "FLAG" in ms.colnames():
-        # FLAG is DATA's shape in an MS.
-        ms.putcol("FLAG", np.zeros(data.shape, dtype=bool))
+    # FLAG is not written: it is a TiledColumnStMan column in every MS this
+    # gets (makems' and the template's), and casacore zero-fills new tiles,
+    # so every row already reads False. The all-False putcol was a DATA-sized
+    # bool array packed to bits (docs/csd3-speed.md, round 79).
     # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
     # noise is one sigma for every row and channel, so the pair carried a
     # single number written to every row - and they are variable-shaped
@@ -1414,6 +1415,8 @@ def self_check_observation_prefix() -> None:
                     right["NUM_CORR"] = np.full_like(right["NUM_CORR"], len(XXYY))
                     for column in ("CORR_TYPE", "CORR_PRODUCT"):
                         right[column] = right[column][:, XXYY]
+                if sub == "":  # write_visibilities() leaves FLAG to casacore's zero-filled tiles
+                    assert not left["FLAG"].any() and not right["FLAG"].any(), f"step {i}: FLAG is not all False"
                 assert left.keys() == right.keys(), f"step {i}: {sub or 'MAIN'} columns differ"
                 for column in left:
                     same = (left[column] is None and right[column] is None) if left[column] is None or right[column] is None \

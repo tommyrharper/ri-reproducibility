@@ -3837,3 +3837,52 @@ analytic predict included). No search ran, so there is no
 - CPU sets differ between jobs: this one was
   `0,2,...,20,22-34,36,...,52,64,...,72`, not round 76's even 0-74. Read
   `Cpus_allowed_list` before pinning.
+
+## Round 79: FLAG left to casacore's zero-filled tiles
+
+**Change.** `write_visibilities()` wrote FLAG with
+`putcol("FLAG", np.zeros(data.shape, bool))` on every evaluation: a bool
+array the size of DATA, which casacore then packs to bits. FLAG is a
+`TiledColumnStMan` column in every MS simulate fills (the XX/YY template
+and makems' own), and casacore zero-fills new tiles, so every row already
+reads False. The putcol is gone. `self_check_observation_prefix()` now
+asserts FLAG is all False in both the extended and the makems-built MS.
+
+**Results.** Unchanged. On round 63's 48 real draws, every column of the
+main table reads back identical with and without the putcol, and FLAG has
+no True value anywhere. Every file of each MS is byte-identical except the
+`IncrementalStMan` index `table.f0i`, which also differs between two runs
+of the unchanged code (43 of 48 MSs), so it carries uninitialised bytes,
+not values. `./ri self-check simulate` passes.
+
+**In-run** (`.probe/r79/run.sh`, round 78's harness with pinning read from
+`Cpus_allowed_list`: 34 pinned `meqtrees.sif` copies, each timing 4 passes
+of the 48 draws from a shared start file; ABBA):
+
+| pair | A (putcol) wall / user ms | B (no putcol) wall / user ms |
+|---|---|---|
+| 1 (AB) | 23.90 / 15.38 | 23.65 / 15.22 |
+| 2 (BA) | 23.74 / 15.29 | 23.60 / 15.12 |
+| 3 (AB) | 23.81 / 15.29 | 23.62 / 15.16 |
+| 4 (BA) | 23.72 / 15.21 | 23.60 / 15.16 |
+| mean | 23.79 / 15.29 | 23.62 / 15.17 |
+
+Simulate is 0.17 ms (-0.7%) faster in-run, in 4 of 4 pairs. That is about
+0.1% of an evaluation, so this is dead work removed rather than a speed-up
+anyone will see end to end. No search ran, so there is no
+`benchmarks.jsonl` row.
+
+**Learned.**
+- An MS column that is about to be all-default does not need a putcol
+  when its storage manager zero-fills (tiled managers do). Check the
+  values come back the same, not the files: casacore's ISM index file
+  differs between identical runs.
+- This job's CPU set, `0,2,...,20,22-34,36,...,52,64,...,72` (38 CPUs),
+  gave 34-copy in-run simulate at 23.8 ms, against round 78's 30.5 ms
+  across 29 copies on even CPUs only. The odd CPUs 23-33 are on socket 1
+  (`topology/physical_package_id`), with its own L3, so six copies left
+  socket 0's L3. In-run simulate timings are only comparable within one
+  job's CPU set.
+- A simulate harness must name its MS `sim.ms` in every call: makems'
+  `MSName=` is part of the observation-cache key, so a different name
+  misses the cache and silently times makems and the 4-correlation MS.

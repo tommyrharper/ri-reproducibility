@@ -101,6 +101,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | WSClean 0001-0017 built with GCC profile-guided optimisation, trained on five real-draw MSs: rejected | none | +0.9 to +1.9% slower solo on the four larger MSs (2-5/24 ABBA blocks faster), and no FITS data block byte-identical (1.8e-7 of the image peak, most likely because FMA contraction follows inlining) ([csd3-speed](csd3-speed.md), round 75) |
 | Why simulate is ~1.5x slower in-run than solo (28 against 18 ms) | none | diagnostic: L3 capacity, not locks, syscalls or clock. 34 simulate-only copies: +55% wall, user +51%, IPC 2.99 to 1.85, LLC miss rate 24% to 72%; a pure-compute loop does not slow down. The lever left is a smaller per-call working set ([csd3-speed](csd3-speed.md), round 76) |
 | The makems observation cache stored as a pickle, not an `.npz` | `simulate_point_source_ms.py` | simulate -4.0% in-run (30.49 to 29.28 ms, 29 pinned copies, 4/4 ABBA pairs); `np.load` 0.8 ms against `pickle.load` 0.05 ms; arrays bit-identical ([csd3-speed](csd3-speed.md), round 78) |
+| FLAG no longer written: casacore's zero-filled tiles already read False | `simulate_point_source_ms.py` | simulate -0.7% in-run (23.79 to 23.62 ms, 34 pinned copies, 4/4 ABBA pairs); every column identical ([csd3-speed](csd3-speed.md), round 79) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
