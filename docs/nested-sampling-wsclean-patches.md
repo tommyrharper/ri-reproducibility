@@ -441,3 +441,32 @@ blocks are byte-identical. The measurements are in
 [csd3-speed.md](csd3-speed.md), round 59.
 
 Upstream-shaped: it changes nothing computed.
+
+## 0015: reuse each row's weights across major cycles
+
+Every inversion - the PSF, then one per major cycle - loads every row
+through `GetCollapsedVisibilities()` (`gridding/msgridderdata.h`): read the
+meta record and the weights, compute the imaging weight from u/v, multiply,
+and add to the weight counters. Only the residual data changes between
+cycles; uvw, visibility weights and imaging weights do not. The patch keeps
+each row's uvw and final weight from the first inversion of a measurement
+set (`InversionWeightCache`, filled in `GridRegularMeasurementSet()` in
+`wgridder/wgriddingmsgridder.cpp`), and later inversions read only data and
+model, subtract, and multiply by the cached weight. The counters the full
+pass ends with are restored as they were, so `WSCNVIS`, `WSCENVIS`,
+`WSCVWSUM` and the normalisation match. It applies only where the full path
+reduces to exactly that: one visibility polarization, no facets, beams,
+solutions or stored imaging weights, counters at zero on entry. The cache is
+thread-local and keyed on the process id, MS index, row and channel counts,
+first frequency, the `ImageWeights` object, weighting and gain mode, so a
+forked zygote child never inherits one.
+
+On the largest real-draw MS, "loading data in memory" drops from ~33 ms to
+~15 ms on every pass after the first. Solo over five MSs, WSClean is 6.2-7.3%
+faster on the three largest (24 of 24 interleaved ABBA blocks each), 3.9%
+on the median one and unchanged on the smallest; all 1440 FITS data blocks
+and headers are byte-identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 68.
+
+Not upstream-shaped as is: a cleaner version would hold the weights in the
+gridder across inversions instead of in a thread-local.

@@ -3317,3 +3317,67 @@ perf, `CalculateWeightsImplementation` rose from 4.1% to 5.5%, while
   Under a per-run `apptainer exec`, ~6% of samples are the host's libz,
   which is squashfs decompression at container start. A zygote-run search
   doesn't pay this.
+
+## Round 68: row weights reused across major cycles (patch 0015)
+
+**Why.** Round 67's timeline showed every inversion of the largest
+real-draw MS spending 31-35 ms "loading data in memory" before gridding,
+~15% of the binary, and the weights part of that is recomputed identically
+on every pass. Only the residual (data minus model) changes between cycles.
+
+**Change.** Patch 0015 (`docker/wsclean/patches/`, described in
+[nested-sampling-wsclean-patches.md](nested-sampling-wsclean-patches.md))
+keeps each row's uvw and final weight from the first inversion of an MS,
+plus the weight counters that pass ends with. Later inversions read only
+data and model, subtract, multiply by the cached weight, and restore the
+counters. It applies only where the full path reduces to exactly that
+(one visibility polarization, no facets, beams, solutions or stored imaging
+weights), and the cache is keyed on the process id, so a forked zygote child
+starts empty. Built with `patch-wsclean-sif.sh` over 0001-0014 into a
+scratch SIF; the A arm was the same script without 0015.
+
+**Phase timing.** With `-log-time` on the largest MS (388k rows, 6
+inversions), "loading data in memory" stays ~33 ms on the first inversion
+and falls to 14-16 ms on the five that follow.
+
+**Solo.** Four chains pinned to one CPU each ran ABBA blocks at the same
+time (6 blocks per chain, 3 reps per MS, mean of reps 2-3, the search's
+`wsclean` arguments). The node's load average from other jobs was 35-41:
+
+| MS | 0001-0014 | + 0015 | change | 0015 faster |
+| --- | ---: | ---: | ---: | ---: |
+| largest | 1128.6 ms | 1045.8 ms | -7.3% | 24/24 |
+| 2nd largest | 565.5 ms | 527.3 ms | -6.8% | 24/24 |
+| 3rd largest | 413.9 ms | 388.2 ms | -6.2% | 24/24 |
+| median-size | 128.4 ms | 123.4 ms | -3.9% | 22/24 |
+| smallest | 42.3 ms | 42.5 ms | +0.3% | 11/24 |
+
+All 1440 FITS files had byte-identical data blocks, and identical headers
+apart from DATE and HISTORY (so `WSCNVIS`, `WSCENVIS`, `WSCVWSUM`,
+`WSCNORMF` and the major-cycle counts match).
+
+**In run.** Synchronous raced 17-rank pairs (`NS_SEED=4242`, nlive 150,
+ndead 300), so both arms image the same draws; the arms differ only in
+`SIF_DIR`'s `wsclean.sif`:
+
+| pass | first launched | A binary ms | 0015 binary ms | A evals/s | 0015 evals/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| sync | A | 162.18 | 150.25 (-7.4%) | 29.84 | 31.38 (+5.2%) |
+| sync | 0015 | 161.48 | 150.65 (-6.7%) | 30.09 | 31.95 (+6.2%) |
+
+Every chain file and log(Z) (0.09607 +/- 0.00114) were byte-identical
+between the arms in each pass. Simulate is unchanged by the patch (33.9/38.5
+and 31.8/30.8 ms, launch order and load), so the whole gain is the binary:
+-11 to -12 ms per evaluation, ~6% of worker time at these settings.
+
+**Learned.**
+- The per-cycle load was about half weights work: removing the meta read,
+  weight read, imaging-weight lookup and counter updates halves it, and
+  the rest is data and model reads plus the subtract.
+- The gain grows with major cycles times rows, which is the 44% of binary
+  time round 61's cost model put on visibilities x cycles; on the
+  smallest MS (one or two cycles) it is nil.
+- The second pass spent ~9.5 minutes in `uv run` before Python started
+  (the first took seconds), with the node's load average at 55-60 from
+  other jobs. `benchmarks.jsonl`'s `wall_s` (245-260 s) does not include
+  it, so give a raced pair's `timeout` room for that startup.
