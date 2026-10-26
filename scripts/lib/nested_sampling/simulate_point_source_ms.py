@@ -233,15 +233,19 @@ def publish_skeleton(built_ms: Path, cached: Path) -> None:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def spectral_window_values(n_chan: int, start_frequency_hz: float, channel_width_hz: float) -> dict[str, np.ndarray]:
+    widths = np.full((1, n_chan), channel_width_hz)
+    return {"CHAN_FREQ": (start_frequency_hz + (np.arange(n_chan) + 0.5) * channel_width_hz)[None, :],
+            "CHAN_WIDTH": widths, "EFFECTIVE_BW": widths, "RESOLUTION": widths,
+            "REF_FREQUENCY": np.array([start_frequency_hz + n_chan * channel_width_hz / 2.0]),
+            "TOTAL_BANDWIDTH": np.array([n_chan * channel_width_hz])}
+
+
 def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_width_hz: float) -> None:
     with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=False, ack=False) as spw:
         n_chan = int(spw.getcol("NUM_CHAN")[0])
-        spw.putcol("CHAN_FREQ", (start_frequency_hz + (np.arange(n_chan) + 0.5) * channel_width_hz)[None, :])
-        widths = np.full((1, n_chan), channel_width_hz)
-        for column in ("CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION"):
-            spw.putcol(column, widths)
-        spw.putcol("REF_FREQUENCY", np.array([start_frequency_hz + n_chan * channel_width_hz / 2.0]))
-        spw.putcol("TOTAL_BANDWIDTH", np.array([n_chan * channel_width_hz]))
+        for column, value in spectral_window_values(n_chan, start_frequency_hz, channel_width_hz).items():
+            spw.putcol(column, value)
 
 
 def skeleton_key(cfg_text: str) -> str:
@@ -449,15 +453,82 @@ def _write_template(ms: Path, destination: Path) -> None:
         pol.putcell("CORR_PRODUCT", 0, np.ascontiguousarray(pol.getcell("CORR_PRODUCT", 0)[XXYY]))
 
 
-_TEMPLATE_BYTES: dict[str, tuple[tuple[int, int], list[tuple[str, int, bytes | None]]]] = {}
+_TEMPLATE_BYTES: dict[str, tuple[tuple[int, int], list[tuple[str, int, bytes | None]], tuple[dict, dict] | None]] = {}
+# The subtable values extend_template() writes: ~10 float64s in three
+# one-row tables, each a casacore open, putcol and close of ~0.3ms.
+SPLICED_COLUMNS = {
+    "FIELD": ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME"),
+    "OBSERVATION": ("TIME_RANGE",),
+    "SPECTRAL_WINDOW": ("CHAN_FREQ", "CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION", "REF_FREQUENCY", "TOTAL_BANDWIDTH"),
+}
 
 
-def _copy_template(template: Path, output_ms: Path) -> None:
+def _subtable_files(root: Path) -> dict[str, bytes]:
+    return {f"{sub}/{f.name}": f.read_bytes() for sub in SPLICED_COLUMNS for f in sorted((root / sub).iterdir())
+            if f.name != "table.lock"}
+
+
+def _put_subtables(root: Path, values: dict) -> None:
+    for sub, columns in SPLICED_COLUMNS.items():
+        with table(str(root / sub), readonly=False, ack=False) as t:
+            for column in columns:
+                t.putcol(column, values[sub, column])
+
+
+def _splice_plan(template: Path, scratch: Path) -> tuple[dict, dict] | None:
+    """(base, plan): `base` is the SPLICED_COLUMNS subtables' files as
+    casacore leaves them after one write session on the template (it also
+    rewrites a few header bytes), and `plan` says where in them each value
+    sits, found by writing unique values. None unless splicing a second set
+    of values into `base` reproduces casacore's own write of that set byte
+    for byte (all but table.lock, whose counters every writable open bumps)."""
+    rng = np.random.default_rng(90)
+    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
+        probe, check = Path(tmp) / "probe", Path(tmp) / "check"
+        for sub in SPLICED_COLUMNS:
+            shutil.copytree(template / sub, probe / sub)
+            shutil.copytree(template / sub, check / sub)
+        shapes = {}
+        for sub, columns in SPLICED_COLUMNS.items():
+            with table(str(probe / sub), ack=False) as t:
+                shapes.update({(sub, c): t.getcol(c).shape for c in columns})
+        probe_values = {k: 1.0 + rng.random(shape) for k, shape in shapes.items()}
+        check_values = {k: 1.0 + rng.random(shape) for k, shape in shapes.items()}
+        _put_subtables(probe, probe_values)
+        _put_subtables(check, check_values)
+        base, expected = _subtable_files(probe), _subtable_files(check)
+    plan = {}
+    for (sub, column), value in probe_values.items():
+        hits = [(name, data.find(value.astype(dtype).tobytes()), dtype)
+                for name, data in base.items() if name.startswith(sub + "/") for dtype in ("<f8", ">f8")
+                if data.count(value.astype(dtype).tobytes()) == 1]
+        if len(hits) != 1:
+            return None
+        plan[sub, column] = hits[0] + (value.shape,)
+    if _splice(base, plan, check_values) != expected:
+        return None
+    return base, plan
+
+
+def _splice(files: dict[str, bytes], plan: dict, values: dict) -> dict[str, bytes] | None:
+    out = {name: bytearray(data) for name, data in files.items()}
+    for key, (name, offset, dtype, shape) in plan.items():
+        value = np.asarray(values[key], dtype=np.float64)
+        if value.shape != shape:
+            return None
+        raw = value.astype(dtype).tobytes()
+        out[name][offset:offset + len(raw)] = raw
+    return {name: bytes(data) for name, data in out.items()}
+
+
+def _copy_template(template: Path, output_ms: Path, subtable_values: dict | None = None) -> bool:
     """shutil.copytree() minus UNUSED_SUBTABLES, from bytes this worker read
     once: ~39 files a copy, each an open, sendfile and copystat, were ~2.5ms
     of a ~18ms solo simulate (docs/csd3-speed.md, round 62). A published
     template is never written again, and a new one is a new directory, so
-    its inode and mtime are the whole key."""
+    its inode and mtime are the whole key. With `subtable_values`, those are
+    spliced into the copied bytes where _splice_plan() found casacore keeps
+    them (round 90); False means the caller still has to write them."""
     st = os.stat(template)
     key = (st.st_ino, st.st_mtime_ns)
     cached = _TEMPLATE_BYTES.get(str(template))
@@ -472,18 +543,28 @@ def _copy_template(template: Path, output_ms: Path) -> None:
                 path = os.path.join(root, name)
                 with open(path, "rb") as f:
                     entries.append((os.path.join(rel, name), os.stat(path).st_mode & 0o7777, f.read()))
-        cached = _TEMPLATE_BYTES[str(template)] = (key, entries)
+        try:
+            plan = _splice_plan(template, output_ms.parent)
+        except (OSError, RuntimeError):
+            plan = None
+        cached = _TEMPLATE_BYTES[str(template)] = (key, entries, plan)
+    spliced = None
+    if subtable_values is not None and cached[2] is not None:
+        spliced = _splice(*cached[2], subtable_values)
     for rel, mode, data in cached[1]:
         path = os.path.normpath(os.path.join(output_ms, rel))
         if data is None:
             os.mkdir(path)
             continue
+        if spliced is not None:
+            data = spliced.get(os.path.normpath(rel), data)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         try:
             if os.write(fd, data) != len(data):
                 raise OSError(f"short write to {path}")
         finally:
             os.close(fd)
+    return spliced is not None
 
 
 def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace,
@@ -491,7 +572,12 @@ def extend_template(template: Path, observation: dict, output_ms: Path, n_times:
     """With `fill`, also writes the visibilities while the table is open and
     returns fill_point_source_visibilities()'s (data, uvw, freqs_hz)."""
     filled = None
-    _copy_template(template, output_ms)
+    start = observation["time_range_start"]
+    values = {("FIELD", c): observation[f"FIELD_{c}"] for c in SPLICED_COLUMNS["FIELD"]}
+    values["OBSERVATION", "TIME_RANGE"] = np.array([[start, start + n_times * observation["interval"]]])
+    values.update({("SPECTRAL_WINDOW", c): v for c, v in spectral_window_values(
+        args.channel_count, args.start_frequency_hz, args.channel_width_hz).items()})
+    spliced = _copy_template(template, output_ms, values)
     with table(str(output_ms), readonly=False, ack=False) as ms:
         a1, a2 = ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2")
         n_base = len(a1)
@@ -513,13 +599,8 @@ def extend_template(template: Path, observation: dict, output_ms: Path, n_times:
             # float64 columns that read back unchanged: no reopen, no getcol.
             freqs_hz = channel_frequencies(args)
             filled = (write_visibilities(ms, uvw, freqs_hz, args), uvw, freqs_hz)
-    with table(str(output_ms / "FIELD"), readonly=False, ack=False) as field:
-        for column in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME"):
-            field.putcol(column, observation[f"FIELD_{column}"])
-    start = observation["time_range_start"]
-    with table(str(output_ms / "OBSERVATION"), readonly=False, ack=False) as obs:
-        obs.putcol("TIME_RANGE", np.array([[start, start + n_times * observation["interval"]]]))
-    patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
+    if not spliced:
+        _put_subtables(output_ms, values)
     return filled
 
 
@@ -1483,6 +1564,9 @@ def self_check_observation_prefix() -> None:
                     same = (left[column] is None and right[column] is None) if left[column] is None or right[column] is None \
                         else np.array_equal(left[column], right[column])
                     assert same, f"step {i}: {sub or 'MAIN'}.{column} differs from a makems build"
+    # Served steps must have had their subtables spliced, not casacore-written.
+    assert _TEMPLATE_BYTES and all(entry[2] is not None for entry in _TEMPLATE_BYTES.values()), \
+        "a template has no subtable splice plan"
     if saved_env is None:
         os.environ.pop("NS_OBSERVATION_CACHE_DIR")
     else:

@@ -4386,3 +4386,84 @@ different points, so they are not identical.
   absence is how to spot a run that silently used the stock SIF.
 - Each 36-rank, 900-dead run leaves ~58k files (106 MB `summary.json`), so
   delete it once its row is in `benchmarks.jsonl`.
+
+## Round 90: the FIELD, OBSERVATION and SPECTRAL_WINDOW values spliced into the copy
+
+**Why.** A cProfile of simulate on the current tree (round 63's 48 real
+draws, one pinned CPU, 14.0 ms a call) put ~2 ms in casacore table
+opens and closes, four a call. Three of them were `extend_template()`'s
+one-row subtables: FIELD (four direction/time columns), OBSERVATION
+(`TIME_RANGE`) and SPECTRAL_WINDOW (`patch_spectral_window()`), opened
+writable to store ~10 float64 values. Alone, those three blocks timed
+at 0.97 ms a call.
+
+**Change.** `_splice_plan()` runs once per template per worker (~10 ms):
+it copies the three subtables twice into scratch, writes a set of
+unique random values into one copy and a second set into the other with
+casacore, finds each value's bytes in the first copy's files (exactly
+one hit, either byte order), and keeps the plan only if splicing the
+second set into the first copy's bytes gives the second copy's files
+byte for byte (all but `table.lock`). The first copy's bytes become the
+base: casacore also rewrites a few header bytes in `table.f0` and
+`table.f0i` on any write, so the template's own bytes are not the
+right base. `_copy_template()` then writes those subtables from the
+base with the evaluation's values spliced in. A template whose plan
+fails, or a value whose shape is not the plan's, takes the old casacore
+writes (`_put_subtables()`). `patch_spectral_window()`'s values moved to
+`spectral_window_values()`, which both paths use.
+
+**Results.** Unchanged. `.probe/r90/vals.py` hashes the row count,
+keywords and every column of the main table and every subtable for each
+of the 48 draws: all 48 match HEAD. Byte for byte, the three spliced
+subtables match HEAD's in all 48. The files that differ (main `table.f0i`,
+`POLARIZATION/table.f0i`, `simulation.json`) differ just as much
+between two HEAD runs. `./ri self-check simulate` passes; its
+observation-prefix check compares every subtable column with a makems
+build, and now also asserts that every template it served got a splice
+plan, so a silent fallback fails it. With the plan forced to None, the
+fallback path's 48 MSs are column-identical to HEAD as well.
+
+**Solo**, one pinned CPU, 48 draws x 5 reps, ABBAAB:
+
+| arm | ms a call |
+|---|---|
+| A (casacore writes) | 14.04, 14.02, 13.99 |
+| B (spliced) | 13.16, 13.12, 13.08 |
+
+-0.89 ms (-6.4%).
+
+**In-run** (`.probe/r90/run.sh`, round 82's harness: 34 pinned
+`meqtrees.sif` copies, 4 passes of the 48 draws, ABBA, same
+`fastnoise.so` for both arms):
+
+| pair | A wall / user / sys ms | B wall / user / sys ms |
+|---|---|---|
+| 1 (AB) | 23.26 / 14.66 / 4.41 | 22.30 / 13.84 / 4.26 |
+| 2 (BA) | 23.14 / 14.57 / 4.39 | 22.13 / 13.77 / 4.19 |
+| 3 (AB) | 23.09 / 14.58 / 4.32 | 22.21 / 13.87 / 4.16 |
+| 4 (BA) | 23.33 / 14.72 / 4.37 | 22.26 / 13.88 / 4.21 |
+| mean | 23.21 / 14.63 / 4.37 | 22.23 / 13.84 / 4.21 |
+
+Simulate is 0.98 ms (-4.2%) faster in-run, in 4 of 4 pairs: ~0.7% of a
+~133 ms production evaluation (round 89), below what a search can
+resolve end to end, so no search ran and there is no `benchmarks.jsonl`
+row. The change is in the bound `nested_sampling` tree, so the next
+cluster run gets it without a rebuild.
+
+**Learned.**
+- A casacore writable open-putcol-close of a one-row subtable costs
+  ~0.3 ms, nearly all of it fixed cost, and that is the same order as one
+  full DATA-sized pass in-run (round 82). Small table writes are worth
+  as much as array passes.
+- casacore rewrites a few header bytes of `table.f0`/`table.f0i` the
+  first time a copy is written, and the value bytes alone after that.
+  So a byte-level shortcut must start from a casacore-written copy, not
+  from the template.
+- A profile without the `fastnoise.so` bind falls back to numpy noise
+  (36.6 ms a call, `Generator.normal` 18 ms). `meqtrees.sif` has no
+  `/opt/ri-lib/fastnoise.so`, and only `start-sidecars.sh` supplies one,
+  so a probe has to bind a host build (`gcc -O2 -ffp-contract=off
+  -shared -fPIC docker/meqtrees/src/fastnoise.c -lm`).
+- What is left of simulate solo: the C ramp and noise ~6 ms, the main
+  table's 19 putcols ~2.5 ms, its one open/close ~0.5 ms, and
+  `extend_template()`'s own numpy (uvw, tiles) ~0.7 ms.
