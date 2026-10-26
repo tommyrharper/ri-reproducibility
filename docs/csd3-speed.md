@@ -2916,3 +2916,63 @@ patch-wsclean`, or a Docker build), together with 0007-0013.
   one-line skip.
 - Pin CPUs from this job's mask (`taskset -cp $$`: even CPUs only here). A
   `taskset -c` outside it fails at once, and the driver's log is then empty.
+
+## Round 60: the zygote warms FFTW for the image size actually used
+
+**Question.** A whole-binary `perf` profile of a 0001-0014 WSClean (driven
+through `wsclean-zygote`, symbols via `perf report --symfs` over a copy of the
+SIF's `/opt` and `/usr/lib`) still had FFTW at 4.4% of samples, and most of it
+was the planner: `fftwf_md5putc`, `fftwf_ct_applicable`, `fftwf_choose_radix`.
+A forked child should find every plan's per-size tables already built by the
+parent. Why was it planning?
+
+**Diagnosis.** An `LD_PRELOAD` shim that times every `fftwf_plan_dft_*` call,
+keyed by pid, over five real-draw MSs in one zygote: the parent warmed 108,
+128, 142 and 156 - the sizes for `-size 128`, hard-coded in
+`WarmFftwPlanner()` - but `NS_IMAGE_DIM` has since gone to 32, and every child
+planned 32 (image and inversion), 36 (radler's `even(ceil(1.1 x 32))`
+convolution) and 40 (the padded image) from cold: 12 plans, **~5.0 ms an
+evaluation** of planning, against an ~87 ms mean binary on these MSs.
+
+**Change.** `zygote.cpp` now warms at the first request, beside the casacore
+warm-up, for every even size from 0.8x to 1.25x the request's `-size` plus 8
+(24-48 at 32; 102-168 at 128, which still covers the old list). Planning in a
+child fell to 0.28 ms; the parent pays ~36 ms once per rank.
+
+**Result.** Solo driver as round 59 (five MSs from an
+`NS_KEEP_MEASUREMENT_SETS=1` run, binary 10th-90th percentile, production
+malloc tunables, pinned to CPU 10), but through `wsclean-zygote` rather than
+one process per run, because the fork server is what holds the warm state.
+A sample is one pass over the five MSs, mean of three warm passes.
+
+| test | old zygote | new zygote | change |
+| --- | ---: | ---: | ---: |
+| solo, 6 ABBA/BAAB blocks: binary per pass | 425.8 ms | 400.5 ms | **-5.9%** (6 of 6) |
+| same: first deconvolution ("Performed N iterations") | 13.69 ms | 0.99 ms | -92.8% |
+| same: rendering the restored image | 5.23 ms | 0.66 ms | -87.3% |
+| raced 16-rank sync search, pair 1 (cold): binary mean / median | 147.1 / 101.4 ms | 141.7 / 96.7 ms | -3.7% / -4.6% |
+| pair 2 (warm): binary mean / median | 147.0 / 101.2 ms | 141.7 / 95.9 ms | -3.6% / -5.2% |
+| pair 2: evals/s | 31.40 | 31.69 | +0.9% (below resolution) |
+
+Searches: `--mpi-procs 16 --nlive 150 --num-repeats 2 --max-ndead 150 --seed
+4242 --synchronous`, both arms at once from `SIF_DIR`s of symlinks. All 20
+FITS data blocks of the solo driver are byte-identical, and all four searches'
+chain files are byte-identical (`phys_live.txt` up to row order), log(Z)
+0.09426 +/- 0.00255 as in rounds 57-58. The new arm's
+`image_container_overhead` is ~1 ms higher: the 36 ms warm-up, 16 ranks over
+613 evaluations, which a production-length run amortises away.
+
+**Shipping.** The zygote is compiled into `wsclean.sif`, so this takes effect
+on a rebuild (`./ri images patch-wsclean`, or a Docker build), with 0007-0014.
+
+**Learned.**
+- `perf report --symfs DIR` resolves symbols of a SIF binary once `DIR` holds
+  copies of its `/opt` and `/usr/lib` (`apptainer exec SIF cp -a ...`), which is
+  quicker than round 59's `nm` bisection. `squashfuse_ll`'s zlib shows up as
+  ~10% of a short profile: SIF decompression at zygote start, not per eval.
+- Anything a fork server warms by a hard-coded size goes stale silently when a
+  default moves; derive it from the first request instead.
+- The deconvolution's and restore's FFT plans were most of the planning cost
+  (first "Performed N iterations" segment 2.7 ms an MS, restore 1 ms), so a
+  log-time segment that is large only on the first major cycle is a sign of
+  per-process setup, worth checking against a warm parent.

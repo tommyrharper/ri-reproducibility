@@ -93,10 +93,13 @@ void Redirect(const std::string& path, int fd, int flags) {
   _exit(status);
 }
 
-// Warm process-global FFTW plans inherited by forked evaluations. Sizes match
-// this search's fixed image and scale; see docs/nested-sampling-fftw-planner.md.
-void WarmFftwPlanner() {
-  for (const int n : {108, 128, 142, 156}) {
+// Warm process-global FFTW plans inherited by forked evaluations, for every
+// even size from 0.8x to 1.25x the image plus 8: that covers the inversion
+// size, the image, radler's 1.1x convolution and the padded image (108, 128,
+// 142, 156 at 128; 32, 36, 40 at 32). See docs/nested-sampling-fftw-planner.md.
+void WarmFftwPlanner(int width) {
+  if (width < 2 || width > 4096) return;
+  for (int n = (width * 4 / 5) & ~1; n <= width * 5 / 4 + 8; n += 2) {
     fftwf_destroy_plan(fftwf_plan_dft_r2c_1d(n, nullptr, nullptr, FFTW_ESTIMATE));
     fftwf_destroy_plan(
         fftwf_plan_dft_1d(n, nullptr, nullptr, FFTW_FORWARD, FFTW_ESTIMATE));
@@ -115,6 +118,13 @@ void WarmFftwPlanner() {
     fftwf_free(spectrum);
     fftwf_free(image);
   }
+}
+
+// The request's -size width, or 0.
+int ImageWidth(const std::vector<std::string>& fields) {
+  for (size_t i = 3; i + 1 < fields.size(); ++i)
+    if (fields[i] == "-size") return std::atoi(fields[i + 1].c_str());
+  return 0;
 }
 
 // Warm casacore once against the first request's Measurement Set.
@@ -136,7 +146,6 @@ double MonotonicSeconds() {
 int main() {
   check_openblas_multithreading();
   RefuseIfThreaded();
-  WarmFftwPlanner();
   fits_init_cfitsio();
 
   bool casacore_warmed = false;
@@ -147,6 +156,7 @@ int main() {
       continue;
     }
     if (!casacore_warmed) {
+      WarmFftwPlanner(ImageWidth(fields));
       WarmCasacore(fields.back());
       // Casacore warm-up may create threads between the initial check and fork.
       RefuseIfThreaded();

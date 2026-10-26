@@ -71,8 +71,8 @@ The sizes are fixed for this search:
 FFTW's per-size state lives in the process, and
 [the fork server](nested-sampling-wsclean-zygote.md) already exists to pay
 process-global costs once per rank. `WarmFftwPlanner()` in
-`docker/wsclean/src/zygote.cpp` builds and immediately destroys the twelve plans
-before the parent accepts its first request; destroying a plan does not discard
+`docker/wsclean/src/zygote.cpp` builds and immediately destroys the plans
+when the parent reads its first request (see below for the sizes); destroying a plan does not discard
 what FFTW learned making it, so every forked child starts warm. It costs the
 rank **9.6 ms, once**, against the minutes-to-hours a rank lives.
 
@@ -91,9 +91,14 @@ Nothing about this can change a result: FFTW plans with `FFTW_ESTIMATE` are
 chosen by a fixed heuristic rather than by measurement, so a warm planner hands
 back the same plan a cold one would have. A size that stops being used costs
 this warm-up and nothing else; a size that starts being used is simply not
-warmed. That is why the list is hard-coded with a pointer beside
-`DEFAULT_IMAGE_DIM` rather than derived - getting it wrong loses the speedup and
-cannot lose an image.
+warmed, so getting the list wrong loses the speedup and cannot lose an image.
+
+That is exactly what happened when `NS_IMAGE_DIM` went from 128 to 32: the
+list was hard-coded to 108/128/142/156, so every evaluation re-planned 32, 36
+and 40 (~5 ms of an ~87 ms binary on CSD3). Since round 60 of
+[csd3-speed](csd3-speed.md) the parent warms at its first request instead, for
+every even size from 0.8x to 1.25x the request's `-size` plus 8 (24-48 at 32,
+102-168 at 128): ~36 ms once per rank.
 
 ## Measured: the binary
 
