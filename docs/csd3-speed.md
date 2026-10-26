@@ -3689,3 +3689,50 @@ patch-wsclean`.
   bare addresses with the bound binary.
 - When waiting on a background job by process name, `pgrep -f` matches the
   waiting shell's own command line. Wait on recorded PIDs or an output file.
+
+## Round 75 (rejected): WSClean built with profile-guided optimisation
+
+**Question.** Nothing in this log has tried the compiler itself. With the
+ducc0 kernels at 54% of the binary (round 74), does GCC profile-guided
+optimisation (PGO) of the 0001-0017 build buy anything?
+
+**Build.** `.probe/r75/build.sh` and `use.sh`: the same bookworm sandbox
+and flags as `patch-wsclean-sif.sh` (`-O3 -march=x86-64-v3`, GCC 12), with
+`-fprofile-generate -fprofile-update=single` added. It was trained on
+round 69's five real-draw MSs, twice each at a search's `-niter 100000`
+(90 `.gcda` files), then rebuilt with `-fprofile-use -fprofile-correction`
+and layered over round 74's 0001-0017 SIF. Radler is an ExternalProject
+with its own `CMAKE_CXX_FLAGS`, so its deconvolution stayed unprofiled.
+ducc0 and the rest of WSClean were profiled.
+
+**Solo.** Round 74's harness: five MSs, 3 reps a block, 6 ABBA blocks on
+each of 4 pinned CPUs, `-niter 1000`. A is the plain 0001-0017 build, B is
+the PGO build. Median per block:
+
+| MS | plain | PGO | change | PGO faster |
+| --- | ---: | ---: | ---: | ---: |
+| largest | 1014.8 ms | 1034.1 ms | +1.9% | 3/24 |
+| 2nd largest | 988.6 ms | 997.0 ms | +0.9% | 5/24 |
+| 3rd largest | 941.4 ms | 954.8 ms | +1.4% | 2/24 |
+| median-size | 126.7 ms | 128.4 ms | +1.3% | 4/24 |
+| smallest | 41.2 ms | 40.9 ms | -0.6% | 15/24 |
+
+None of the 1440 FITS data blocks is byte-identical between the arms, PSF
+included. The largest difference is 1.8e-7 of the image peak. Within one
+arm, repeat runs differ only in the header's date bytes.
+
+**Rejected** on both counts: PGO is ~1-2% slower where the time is spent,
+and it changes every output. No in-run A/B was run.
+
+**Learned.**
+- PGO moves WSClean's floating-point results, most likely through FMA. GCC contracts `a*b+c` into
+  FMA by default (`-ffp-contract=fast`, and FMA is in `x86-64-v3`), so a
+  change in inlining changes which operations are fused. Any build-flag
+  experiment on WSClean (PGO, LTO, another compiler) must check FITS bytes
+  first; a speed gain alone is not enough.
+- The ducc0 kernels are hand-vectorised, branch-light template code, so a
+  profile gives GCC little to act on. The hot path is already what `-O3`
+  emits.
+- In a WSClean FITS file from a 32x32 search, the data block is bytes
+  5760-9856 (two 2880-byte header blocks, then 4096 bytes of float32).
+  Compare `tail -c +5761`, not the whole file: the header carries the date.
