@@ -137,11 +137,17 @@ ns_warn_stale_wsclean_sif() {
 }
 
 # The build-input hash scripts/build.sh labelled the image with, which the SIF
-# keeps; what run.env and the manifests record as the image id.
+# keeps; what run.env and the manifests record as the image id. A SIF from
+# patch-wsclean-sif.sh inherits its base's build-input label, so its patches
+# hash is appended: otherwise ./ri bench groups a patched and an unpatched
+# wsclean.sif as one image (docs/csd3-speed.md, round 71).
 #   ns_image_id <sif>
 ns_image_id() {
   local id=""
   [ -f "${1:-}" ] && [ -n "${APPTAINER}" ] \
-    && id="$("${APPTAINER}" inspect --labels "$1" 2>/dev/null | awk -F': ' '$1 == "ri.build-inputs" { print $2 }')"
+    && id="$("${APPTAINER}" inspect --labels "$1" 2>/dev/null | awk -F': ' '
+      $1 == "ri.build-inputs" { id = $2 }
+      $1 == "ri.wsclean-patches" { patches = $2 }
+      END { if (id != "" && patches != "") id = id "+p" substr(patches, 1, 12); print id }')"
   printf '%s\n' "${id:-unknown}"
 }

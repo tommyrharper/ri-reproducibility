@@ -110,6 +110,24 @@ check "a SIF layered with this tree's patches is not stale" \
 check "a SIF layered with other patches is stale" \
   "warned" "$(stale "ri.build-inputs: ${inputs}\nri.wsclean-patches: 0123\n")"
 
+# Prints ns_image_id for a SIF labelled with LABELS.
+image_id() {
+  touch "${fake_bin}/some.sif"
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM LABELS="$1" APPTAINER="${fake_bin}/apptainer" bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "${REPO_ROOT}/scripts/lib/defaults.sh"
+    ns_image_id "$2"
+  ' _ "${REPO_ROOT}" "${fake_bin}/some.sif"
+}
+check "an image id is its build-input label" \
+  "abcd" "$(image_id "ri.build-inputs: abcd\n")"
+check "a patched wsclean.sif's id carries its patches" \
+  "abcd+p0123456789ab" "$(image_id "ri.build-inputs: abcd\nri.wsclean-patches: 0123456789abcdef\n")"
+check "an unlabelled SIF's id is unknown" \
+  "unknown" "$(image_id "")"
+
 if [[ "${failures}" -gt 0 ]]; then
   echo "${failures} check(s) failed" >&2
   exit 1

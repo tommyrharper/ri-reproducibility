@@ -54,10 +54,13 @@ built. To bring `images/wsclean.sif` up to this tree's
 cores). It compiles WSClean in an `apptainer --fakeroot` sandbox against the
 SIF's own casacore, layers the result over the SIF, and keeps the old one as
 `wsclean.sif.orig`. The derived SIF keeps the old `ri.build-inputs` label and
-adds `ri.wsclean-patches` (a hash of the patches), so `benchmarks.jsonl`
-gives both the same image id. A WSClean search warns when `wsclean.sif`
-matches neither label to this tree. See [csd3-speed](csd3-speed.md), rounds 43
-and 70.
+adds `ri.wsclean-patches` (a hash of the patches), and its image id in
+`run.env` and `benchmarks.jsonl` is the old one plus `+p` and the first 12
+characters of that hash, so bench never pools the two. A WSClean search warns
+when `wsclean.sif` matches neither label to this tree. On today's code the
+upgrade from the shipped 0001-0006 SIF to 0001-0016 is worth +42% evals/s in a
+17-rank search (binary 193 -> 126 ms, chains byte-identical). See
+[csd3-speed](csd3-speed.md), rounds 43, 70 and 71.
 
 ## Where things live on CSD3
 
@@ -221,7 +224,7 @@ the containers replaced by processes:
   test.
 - `run.env` and the manifests record each image as the `ri.build-inputs`
   label the Docker build stamped it with (`ns_image_id`), which the SIF
-  keeps.
+  keeps, plus a `+p<patches hash>` suffix on a `patch-wsclean-sif.sh` build.
 
 ### Being a good citizen on CSD3
 

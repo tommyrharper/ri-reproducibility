@@ -3506,3 +3506,54 @@ split: XX/YY noise 5.0 ms, which round 63 showed is near its floor; `putcol`
   x2grid (30%), grid2x (21%) and the Wgridder constructor (5%). On the
   cluster, the largest single speed-up is still bringing
   `images/wsclean.sif` up to 0016, which this round only makes visible.
+
+## Round 71: what the shipped `wsclean.sif` costs a cluster run today
+
+**Why.** Round 70 made a run warn when `images/wsclean.sif` lags the tree,
+but each patch since round 23 was measured against the build before it. No
+round had measured the whole gap that `./ri images patch-wsclean` closes on
+today's code.
+
+**Measure.** `patch-wsclean-sif.sh` built 0001-0016 over the shipped SIF
+into `/dev/shm` (1m58s, 36 jobs). Two `SIF_DIR`s of symlinks that differ
+only in `wsclean.sif` raced two 17-rank searches on this half node
+(cpu-q-278, load ~11 from other jobs): nlive 150, 15 repeats, 300 dead
+points, synchronous, seed 4242. The two passes launched opposite arms first
+(`.probe/r71ab.sh`).
+
+| pass | arm | evals | evals/s | ms/eval | simulate | binary | peak MB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A first | shipped (0001-0006) | 7821 | 26.35 | 223.1 | 29.4 | 192.6 | 182 |
+| A first | tree (0001-0016) | 7821 | 37.24 | 156.4 | 28.9 | 126.3 | 278 |
+| B first | shipped (0001-0006) | 7821 | 26.45 | 220.1 | 25.8 | 193.3 | 182 |
+| B first | tree (0001-0016) | 7821 | 37.59 | 154.9 | 27.6 | 126.2 | 278 |
+
+Binary time falls **34.6%** (193 -> 126 ms) and evals/s rises **41-42%**
+in both orders. log(Z) is 0.09607 +/- 0.00114 in all four runs, and every
+`chains/` file, `clusters/` included, is byte-identical between arms and
+across passes. That checks 0007-0016 together, not one at a time. The
+patched arm finished ~85 s early, so the shipped arm ran its tail alone, and
+the gap is if anything understated. Peak memory per rank rises 96 MB, from
+0015's per-MS weight cache and 0016's residual buffer. At ~0.28 GB per rank
+that is still far inside a node.
+
+**Fix: bench could not tell the two apart.** A `Bootstrap: localimage` SIF
+inherits its base's labels, so `ns_image_id` gave both arms the same
+`NS_IMAGER_IMAGE_ID`. `./ri bench` groups rows by image id, so it would have
+pooled a 42% difference into one group. `ns_image_id`
+(`scripts/lib/defaults.sh`) now appends `+p` plus the first 12 characters of
+`ri.wsclean-patches` when that label is present. Unpatched images keep
+their ids unchanged. `scripts/test-defaults.sh` gains three cases (plain,
+patched, unlabelled). The two r71 tree-arm rows in `benchmarks.jsonl` were
+recorded before the fix and had the suffix added by hand, as their notes
+say.
+
+**Learned.**
+- On the cluster as shipped, WSClean runs at ~70% of the speed this tree
+  can reach. That is the largest single speed-up available, and it costs
+  one 2-minute compute-node job. It is still left for the user to run,
+  because `images/` is shared with their checkout.
+- Round 69's 0001-0016 arm took 144 ms of binary time on the same node,
+  same settings and same draws. Here the same patches took 126 ms with the
+  node's load average at ~11. Other jobs' load moves absolute times by
+  ~12%, so only raced arms compare.
