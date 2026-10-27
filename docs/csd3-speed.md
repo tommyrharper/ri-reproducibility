@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 162; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 163; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -7575,3 +7575,37 @@ the forward makes no denormals worth flushing. Nothing ships, and the R2D2
 CPU forward stays where round 160 left it. Round 161's 2-GPU job
 (39368806) was still queued when this round ended, with no output file.
 No search was run, so there is no `benchmarks.jsonl` row.
+
+## Round 163 (pending): the GPU search on today's tree, and why 2-GPU jobs never run
+
+**Why 2-GPU jobs never report.** Every 1-GPU ampere job this loop sent
+(rounds 119-130, `--gres=gpu:1 --cpus-per-task=32`, most with
+`--qos=intr`) started within 9-17 minutes of submission. Every 2-GPU job
+(rounds 128 and 129, round 130's 39303263, round 161's 39368806, all
+`--gres=gpu:2 --cpus-per-task=64` without `--qos=intr`) has left no
+output file at all, after hours in the queue. On `WBARKER-SL3-GPU` a
+2-GPU request is not a practical way to measure, or to run, a search.
+Treat more cards as more independent 1-GPU searches whose runs are
+merged, not as one search over two cards, unless a 2-GPU job is ever
+seen to start.
+
+**Question.** Rounds 148, 151 and 153 cut ~28 ms of CPU work per request
+(Briggs weights, FITS writes, FINUFFT bin sort). The GPU path runs all of
+that on the CPU too (`patch_cuda_network` moves only the U-Net). Round 127
+says a 1-GPU search is bound by its 32 cores, and round 130 says it is
+bound by the card under MPS. If 127 is right, these rounds should lift
+the GPU rate. No GPU search has run on the tree since round 146, so this
+is also the regression check for the GPU path.
+
+**Run.** Job 39371931 (ampere, 1 x A100, 32 CPUs, `--qos=intr`,
+`agent-node/r163/job.sh`) runs the round-146 tree (`git archive 5872bb4`,
+in `agent-node/r163/base`) against HEAD (`agent-node/r163/new`). The arms
+are warmN B1 N1 B2 N2 B3 N3, each `./ri search r2d2 --device cuda --nlive 48
+--num-repeats 5 --max-ndead 150 --seed 4242`, with the default 19 ranks, MPS
+and blocking sync. It was still queued when this round ended.
+
+**To finish.** Read `agent-node/r163/job-39371931.out` and the `row-*.json`
+and `smi-*.log` files beside it. Compare evals/s and the R2D2 request in
+ms for B against N, check that log(Z) agrees within 1 sigma, and copy the
+rows into `benchmarks.jsonl` with `run` set to `r163-<arm>`. Then delete
+`agent-node/r163`, whose `results/` count against the file quota.
