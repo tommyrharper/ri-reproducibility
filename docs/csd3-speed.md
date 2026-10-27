@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 171; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 172; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -60,6 +60,9 @@ the Hetzner host.
   With 25 engines a worker holds 5.1 GB, so an A100 fits 12 TensorRT workers,
   and those 12 still give +84% forwards over eager's best 16, so a GPU search
   should gain ~20% ([round 170](#round-170-positive-probe-25-tensorrt-engines-per-worker-fit-12-copies-on-an-a100-84-forwards)).
+  Wired in as opt-in `R2D2_RUNTIME=trt` it gave +4% (round 171), inside
+  the +/-10% run noise; 13-14 ranks or 1-2 threads a rank add nothing,
+  since 12 TensorRT workers already saturate the card ([round 172](#round-172-negative-more-tensorrt-ranks-per-a100-or-fewer-cpu-threads-each-gain-nothing)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -8044,3 +8047,51 @@ Rows: `r171-E1`..`r171-T3`, `r171-cpu-*` in `benchmarks.jsonl`. Run
 directories deleted. Plans are cached in
 `$RI_WORK_DIR/.cache/ri/r2d2-trt/plans` (5.3 GB).
 
+
+## Round 172 (negative): more TensorRT ranks per A100, or fewer CPU threads each, gain nothing
+
+**Question.** Round 171 left the TensorRT GPU search at 12 ranks, with the
+card at ~58% utilisation and 15 GB unused. Do 13 or 14 ranks
+(`NS_R2D2_CUDA_TRT_MB_PER_RANK=5900` or `5500`), or 1-2 CPU threads a rank
+instead of the default 3, run faster?
+
+**Run.** Two ampere jobs, 1 x A100-SXM4-80GB, 32 CPUs, MPS.
+`R2D2_RUNTIME=trt ./ri search r2d2 --device cuda --nlive 48 --num-repeats 5
+--max-ndead 150 --seed 4242`, arms rotated, 3 passes after a warm-up arm.
+14 workers peaked at 75.8 GB (13 at 71.6, 12 at 64.7) and no evaluation
+failed.
+
+| node | arm (ranks x threads) | evals/s (3 passes) | mean | request, ms | simulate, ms |
+| --- | --- | --- | ---: | ---: | ---: |
+| gpu-q-4 | 12 x 3 (default) | 51.3, 55.3, 45.3 | 50.6 | 161-192 | 27-35 |
+| gpu-q-4 | 13 x 3 | 45.0, 46.5, 42.0 | 44.5 | 201-219 | 40-44 |
+| gpu-q-4 | 14 x 3 | 42.9, 46.7, 47.5 | 45.7 | 221-239 | 36-43 |
+| gpu-q-17 | 12 x 3 (default) | 40.8, 39.5, 39.8 | 40.0 | 214-219 | 38-44 |
+| gpu-q-17 | 12 x 2 | 42.0, 43.3, 44.1 | 43.1 | 198-208 | 34-37 |
+| gpu-q-17 | 14 x 2 | 43.4, 43.6, 48.9 | 45.3 | 212-240 | 38-41 |
+| gpu-q-17 | 14 x 1 | 44.0, 42.7, 42.0 | 42.9 | 241-248 | 36-44 |
+
+Every log(Z) is 0.013-0.018 (+/- 0.002-0.004), in agreement.
+
+**Learned.**
+- No lever. Pooled over both nodes, the default 12 x 3 averages 45.3
+  evals/s and every 13- or 14-rank arm 43-46. The ranking flips between
+  nodes: 12 x 3 was best on gpu-q-4 by 10% and worst on gpu-q-17 by 7-12%.
+  Defaults are unchanged.
+- The request time grows with the rank count about as fast as the ranks
+  do (12 -> 14 ranks: request +17-35%), so the card or the MPS server is
+  already the bound at 12 TensorRT workers. nvidia-smi's sampled ~55-60%
+  "utilisation" does not show it, so it is not a sign of headroom. Spare
+  card memory buys nothing until a single forward gets cheaper.
+- Fewer CPU threads a rank does not hurt (12 x 2 >= 12 x 3 on gpu-q-17),
+  so the GPU request is not CPU-bound at 32 cores either.
+- A 150-dead-point GPU search (~60 s) varies by +/-10% between repeats of
+  one arm on one node (45.3-55.3), and its evaluation count by 25%
+  (2,311-2,910 at the same seed, since asynchronous ranks change the
+  stream). Only differences above ~15% show at this length, and between
+  nodes only interleaved arms are comparable. Round 171's +4% was inside
+  this noise.
+- The first arm of a job on a fresh node runs at 18-26 evals/s (cold plan
+  and SIF reads), so a warm-up arm is required.
+
+Rows: `r172-*` in `benchmarks.jsonl`. Run directories deleted.
