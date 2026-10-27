@@ -5919,3 +5919,63 @@ then each arm alternating with 2 threads three times.
   resolved with three pairs on the GPU.
 - The 14 rows are in `benchmarks.jsonl` (`r126-*`). Their run directories
   (~10k files) were deleted.
+
+## Round 127 (diagnostic, one rejection): batching U-Net forwards across requests on the GPU
+
+**Question.** Rounds 117, 122, 125 and 126 left one lever for a 1-GPU
+R2D2 search: gather forwards from several requests into one batch.
+Round 117's figure for that was 4,762 forwards/s at batch 18, but it was
+measured with TF32 on, which production turns off. Two things decide
+whether a gathering server is worth building. First, is a batched GPU
+forward bit-identical to batch 1? On the CPU it never is (rounds 11 and
+109, ~1e-6). Second, what is the float32 ceiling?
+
+**Probe.** `scripts/probe_unet_forward.py` gained `DET=1`
+(cudnn.deterministic). One ampere job (`.probe/r127/job.sh`, job
+39300680, `gpu-q-22`, A100-SXM4-80GB, MPS on, TF32 off as in
+`r2d2_serve.py`) ran a solo sweep over B, then P copies x B images per
+forward at a fixed 19 images in flight, in ABBA order over two passes.
+`maxrel` is the largest difference of a batched row from the same image
+forwarded alone, relative to the output's largest value.
+
+| B (one process) | forwards/s, DET=0 | DET=1 | ms a batch | maxrel |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 352 | 351 | 2.84 | 0 |
+| 2 | 730 | 699 | 2.74 | 0 |
+| 4 | 1,220 | 1,190 | 3.28 | 0 |
+| 8 | 1,695 | 1,667 | 4.72 | 0 |
+| 12 | 2,174 | 2,128 | 5.52 | 0 |
+| 16 | 2,128 | 2,083 | 7.52 | 0 |
+| 19 | 2,326 | 2,273 | 8.17 | 0 |
+| 24 | 2,381 | 2,326 | 10.08 | 0 |
+| 32 | 2,500 | 2,439 | 12.80 | 0 |
+
+| 19 in flight as | forwards/s, four runs | ms a forward call |
+| --- | --- | ---: |
+| 19 MPS copies x B=1 (production) | 1,746 / 1,739 / 1,734 / 1,738 | 11.05 |
+| 4 copies x B=5 | 2,270 / 2,244 / 2,279 / 2,273 | 8.85 |
+| 2 copies x B=10 | 2,299 (all four) | 8.70 |
+| 1 process x B=19 | 2,326 (all four) | 8.17 |
+
+**Learned.**
+- On the A100, a batched float32 forward is **bit-identical** to batch 1
+  at every B up to 32, with or without `cudnn.deterministic`. Unlike the
+  CPU, a gathering server on the GPU would preserve results exactly.
+- The float32 ceiling is low, though. Batching all 19 requests' forwards
+  gives 2,326 forwards/s, only **1.33x** the MPS plateau of ~1,740.
+  Round 117's 4,762 was a TF32 number. `cudnn.deterministic` costs ~2%
+  and is not needed, since outputs are already identical.
+- A search does not reach even the plateau. At 19 ranks and ~44 evals/s
+  (round 124), about 18 forwards per evaluation is ~790 forwards/s, ~45%
+  of 1,740. Round 120 showed what binds instead: going from 16 to 32
+  ranks doubled both the request time and the CPU-only simulate. The
+  32 cores CSD3 gives each A100 are the limit, not the card. Batching
+  would cut the forwards' share of a request (at most ~18 x (11.05 - 8.17)
+  ≈ 50 ms out of ~350 ms, and less at the real ~45% load). It adds a
+  gathering wait and a cross-process copy, and does nothing for the CPU.
+- **Rejected:** no gathering server. Under the current CPU limit, the
+  most it could give is a small fraction of a request, which three
+  GPU pairs (round 126's ~5% resolution) could not even confirm. The
+  remaining GPU levers are CPU-side: less R2D2 CPU work around the U-Net
+  (NUFFTs, weights, data load) and simulate, or more cores per card (a
+  4-GPU node as four MPS pools, round 120).

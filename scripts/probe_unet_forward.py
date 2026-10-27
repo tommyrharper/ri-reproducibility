@@ -7,7 +7,8 @@ T (torch threads) and DEV (cpu or cuda; csd3-speed.md, round 117) as named;
 START (epoch seconds) holds the timed loop until then, so P copies overlap.
 GRAPH=1 (cuda only) replays the forward from a captured CUDA graph (round 122).
 TF32 (default 1, torch's own) 0 computes float32 convolutions as r2d2_serve does;
-BENCH=1 sets cudnn.benchmark; CL=1 runs channels_last (round 125). Run P copies at once to see what a full node does:
+BENCH=1 sets cudnn.benchmark; CL=1 runs channels_last (round 125);
+DET=1 sets cudnn.deterministic (round 127). Run P copies at once to see what a full node does:
     for i in $(seq 24); do apptainer exec ... python3 probe_unet_forward.py & done; wait
 """
 import os, sys, time
@@ -19,6 +20,7 @@ torch.backends.mkldnn.deterministic = True  # as r2d2_serve.warm_imports
 torch.set_num_threads(int(os.environ.get("T", "1")))
 torch.backends.cudnn.allow_tf32 = os.environ.get("TF32", "1") == "1"
 torch.backends.cudnn.benchmark = os.environ.get("BENCH", "0") == "1"
+torch.backends.cudnn.deterministic = os.environ.get("DET", "0") == "1"
 fmt = torch.channels_last if os.environ.get("CL", "0") == "1" else torch.contiguous_format
 net = create_net_imaging()
 ck = torch.load("/checkpoints/R2D2_A1/R2D2_UNet_N1.ckpt", map_location="cpu", weights_only=False)
