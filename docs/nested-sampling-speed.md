@@ -154,6 +154,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Diagnostic: one 36-rank WSClean search against two 18-rank searches raced on the same CPUs | - | single 253 evals/s, +11% over the pair; nothing per search limits WSClean at 36 ranks. A whole sapphire node runs 737-749 evals/s at 112 ranks; there the raced pairs lost their first search to the other's startup reaper ([round 152](csd3-speed.md), fixed in round 154) |
 | A request's two FINUFFT type-1 NUFFTs without the bin sort (`R2D2_NUFFT_SORT`, 0 by default) | `r2d2_serve.py` `nufft_sort()` | -16 to -21% a call solo and under 36-copy load (kernel 17.7 -> 14.6 ms, adjoint 13.1 -> 10.4 ms loaded), ~6 ms a request; images within 1.2e-7 of the peak; ABAB inside noise, log(Z)s agree ([round 153](csd3-speed.md)) |
 | Startup reaper skips a pool worker that has exec'd instead of reading it as a pool with no run (a raced search killed the other's live pool) | `rank-budget.sh` `_ns_pool_row()` | correctness, not speed: a fake starting pool was falsely reaped on 4/300 passes before, 0/300 after; raced A/B arms in a batch job no longer lose one ([round 154](csd3-speed.md)) |
+| (rejected) OpenVINO 2026.4 instead of ONNX Runtime for the CPU U-Net | - | one 32x32 forward, f32: solo 15.5 ms against ORT's 17.0, but 28.3 against 24.4 (+16%) with 36 forked children, the pool's shape ([round 155](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

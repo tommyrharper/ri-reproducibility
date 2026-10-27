@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 154).**
+**Where it stands (round 155).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -7304,3 +7304,36 @@ search start. A re-run of round 152's whole-sapphire pairs would confirm
 it end to end, and would also give the 2 x 56 pair rate that round lost.
 No benchmark rows.
 
+
+## Round 155 (negative): OpenVINO for the CPU U-Net
+
+**Question.** ONNX Runtime's MLAS kernels beat torch on the U-Net by 34%
+(round 140). Intel's OpenVINO is the other CPU runtime that reads the same
+`.onnx`, and its oneDNN-based plugin is tuned for Xeons. Is it faster again?
+
+**Method.** `openvino` 2026.4.1 pip-installed with `--target` into
+`/dev/shm` and put on `PYTHONPATH` inside `r2d2.sif` (image unchanged). The
+cached production `N1.onnx` (`.cache/ri/r2d2-onnx/models/<key>/`), reshaped
+to 1x2x32x32, compiled with `INFERENCE_NUM_THREADS=1`, `NUM_STREAMS=1`,
+`PERFORMANCE_HINT=LATENCY`, `INFERENCE_PRECISION_HINT=f32` and pinning off.
+ORT ran as production does (1 thread, no spinning, no arena). Both models
+are built in a parent and used by forked children pinned one per CPU, the
+pool's shape (`.probe/r155/ov.py`). This loop's icelake half-node, load
+~0.3 at the start, arms in ABBA order, 100-150 forwards per child.
+
+| shape | ORT, ms a forward | OpenVINO, ms a forward | OV / ORT |
+| --- | ---: | ---: | ---: |
+| solo, pinned | 16.95, 17.05 | 15.45, 15.49 | 0.91 |
+| 36 forked children sharing the parent's model | 24.37, 24.51 | 28.22, 28.31 | 1.16 |
+| 36 children, each compiling its own model | - | 30.40 | 1.24 |
+
+OpenVINO's output differs from ORT's by 1.2e-5 of the peak on one
+forward, about the whole 25-checkpoint chain's ORT-vs-torch drift
+(1.5e-5, round 140).
+
+**Learned.** OpenVINO wins solo (-9%) and loses under the production load
+(+16%), the same way AMX did (round 134): at 36 copies the 32x32 forward is
+bound by memory traffic, and OpenVINO's faster kernels move more of it.
+Solo timings mislead for this network; only the loaded shape counts. ORT
+stays the CPU runtime. Not a search, so there are no `benchmarks.jsonl`
+rows; the `/dev/shm` packages were deleted.
