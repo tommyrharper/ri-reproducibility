@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 141).**
+**Where it stands (round 143).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -24,7 +24,8 @@ the Hetzner host.
   -52% or worse, because the server cannot keep up). Shipped opt-in:
   `R2D2_RUNTIME=onnx` runs the U-Net through ONNX Runtime, **+33% evals/s**
   end to end on a half icelake node (round 141; 1.5e-5 of the peak at
-  worst, round 140). Open: whether to make it the default.
+  worst, round 140). It runs without ORT's memory arena and is budgeted
+  at 1 GB a rank (round 143). Open: whether to make it the default.
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6611,7 +6612,9 @@ chains (round 102), and every log(Z) agrees within its error. Rows are in
   sessions (~0.17 GB each) count in every worker's RSS. They are one copy,
   but `NS_R2D2_SHARED_MB` (4.2 GB) does not include them. That does not
   matter on a half node (38 x 0.4 + 8.5 GB is well within memory), but the
-  budget should add ~4.3 GB before it becomes the default.
+  budget should add ~4.3 GB before it becomes the default. (Corrected in
+  round 143: the parent fits the 8000 MB SHARED default; it was the
+  per-rank part that was short.)
 - The sessions are one copy on the parent's socket, so per-socket copies
   (round 106) do not apply to them. Whole-node A/B still to do.
 - The cache is 3.1 GB and ~6.7k files (onnx, onnxruntime, sympy and
@@ -6619,3 +6622,60 @@ chains (round 102), and every log(Z) agrees within its error. Rows are in
 
 Probe: `.probe/r141/ab.sh`. Run directories deleted.
 
+
+## Round 143: `R2D2_RUNTIME=onnx` without ORT's CPU arena, and an onnx-aware rank budget
+
+**Question.** What does `R2D2_RUNTIME=onnx` cost in memory, and does the
+rank budget cover it? (Round 142's probe of this was cut off by the job
+limit before it committed.) The run's processes were sampled for summed PSS
+every 10 s, and steady-state workers were split by VMA.
+
+**Where the memory goes.** These are short searches (`--max-ndead 250`, 38 ranks x 1, half icelake node):
+
+| arm | parent RSS | worker PSS | worker private heap | run peak PSS |
+| --- | ---: | ---: | ---: | ---: |
+| torch | 3.4 GB | 0.34-0.38 GB | 0.11-0.23 GB | 16.4 GB |
+| onnx | 7.5 GB | 0.57-0.74 GB | 0.43-0.51 GB | 38.9 GB |
+| onnx, arena off | 6.9 GB | 0.74-0.87 GB* | 0.35-0.51 GB | 29.9 GB |
+
+\* Sampled while the arena-off run's workers were still warming. The ABAB
+below measures it properly.
+
+The parent's 25 sessions fit inside `NS_R2D2_SHARED_MB` (8000), so round
+141's note that SHARED needed another ~4.3 GB was wrong. The overrun is
+per rank: ~0.83 GB per rank for onnx against 0.34 GB for torch, against a
+budget of 600 MB per rank. A one-child probe (`.probe/r142/arena.py`)
+shows that an ORT arena is the parent's to lose (4.4 against 3.5 GB) and
+costs nothing in speed (18.1 against 17.7 ms a forward).
+
+**A/B: `enable_cpu_mem_arena = False`.** ABAB async searches, onnx, 38 x
+1, `--nlive 100 --num-repeats 5 --max-ndead 400 --seed 4242`:
+
+| arm | arena | evals | wall | evals/s | request ms | run peak PSS | log(Z) x1e3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | on | 6915 | 171.1 s | 40.4 | 777 | 42.2 GB | 16.49 +/- 1.01 |
+| B1 | off | 6472 | 145.0 s | 44.6 | 774 | 31.3 GB | 16.81 +/- 1.06 |
+| A2 | on | 6963 | 147.4 s | 47.2 | 732 | 38.9 GB | 17.06 +/- 0.86 |
+| B2 | off | 5796 | 128.8 s | 45.0 | 764 | 32.0 GB | 17.44 +/- 0.73 |
+
+Speed does not change: 44.8 against 43.8 evals/s, inside the arm-to-arm
+spread, and the request time is the same. Peak PSS falls by **~9 GB
+(-22%)** and per-worker peak RSS goes from 8.3 to 7.3 GB. With all 25
+checkpoints run three times on the same input, the outputs are
+bit-identical with the arena on and off (75/75, `.probe/r143/ident.py`).
+log(Z) agrees.
+
+**Shipped.**
+- `patch_onnx_network` turns off ORT's CPU memory arena.
+- `rank-budget.sh` has `ns_r2d2_mb`, which gives `SHARED+PER` for the
+  `R2D2_RUNTIME` in force. onnx budgets `NS_R2D2_ONNX_MB_PER_RANK`
+  (default 1000; measured ~0.65 GB per rank without the arena, rounded up
+  as torch's 0.34 was to 600). `resume` calls it after loading `run.env`,
+  since it sources `rank-budget.sh` first. This changes nothing on a half
+  icelake node (38 x 1.0 + 8 GB fits easily). It matters for a job with
+  less memory per CPU.
+
+Rows: `r143-onnx`, `r143-torch` and `r143-noarena` are the 250-dead
+memory probes, run sequentially and dominated by warm-up, so do not read
+speed from them. `r143-A1..B2` are the ABAB. Probes are in `.probe/r143/`.
+Run directories were deleted.

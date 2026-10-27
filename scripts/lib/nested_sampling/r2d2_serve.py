@@ -253,6 +253,8 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     options.intra_op_num_threads = 1
     options.inter_op_num_threads = 1
     options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    # No CPU arena: bit-identical, same speed, ~8GB less PSS at 38 ranks (round 143).
+    options.enable_cpu_mem_arena = False
     net = None
     for cur_iter in range(1, num_iter + 1):
         path = models / f"N{cur_iter}.onnx"

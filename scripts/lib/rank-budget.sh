@@ -14,8 +14,18 @@
 # SHARED (round 106).
 NS_R2D2_SHARED_MB="${NS_R2D2_SHARED_MB:-8000}"
 NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-600}"
+# R2D2_RUNTIME=onnx: each worker's ONNX Runtime buffers add ~0.4GB of heap,
+# 0.83GB a rank against torch's 0.34 at 38 ranks (round 143).
+NS_R2D2_ONNX_MB_PER_RANK="${NS_R2D2_ONNX_MB_PER_RANK:-1000}"
+# `SHARED+PER` for R2D2 under the R2D2_RUNTIME in force when it is called.
+ns_r2d2_mb() {
+  case "${R2D2_RUNTIME:-torch}" in
+    onnx) printf '%s\n' "${NS_R2D2_SHARED_MB}+${NS_R2D2_ONNX_MB_PER_RANK}" ;;
+    *) printf '%s\n' "${NS_R2D2_SHARED_MB}+${NS_R2D2_MB_PER_RANK}" ;;
+  esac
+}
 # shellcheck disable=SC2034  # read by the scripts that source this
-NS_R2D2_MB="${NS_R2D2_SHARED_MB}+${NS_R2D2_MB_PER_RANK}"
+NS_R2D2_MB="$(ns_r2d2_mb)"
 NS_WSCLEAN_MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK:-200}"
 
 # Left free for the OS, the page cache and the non-worker parts of a run.
@@ -298,6 +308,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   clear_reservations() { rm -f "${NS_RANK_BUDGET_DIR}"/[0-9]*; }
 
   ns_reap_leaked_sidecars() { :; }
+
+  [ "$(R2D2_RUNTIME=onnx ns_r2d2_mb)" = "${NS_R2D2_SHARED_MB}+${NS_R2D2_ONNX_MB_PER_RANK}" ]
+  [ "$(R2D2_RUNTIME=torch ns_r2d2_mb)" = "${NS_R2D2_SHARED_MB}+${NS_R2D2_MB_PER_RANK}" ]
 
   [ "$(ns_budget_ranks 8 3400 r2d2)" = 8 ]
   [ "$(awk '{print $2}' "${NS_RANK_BUDGET_DIR}/$$")" = 27200 ]
