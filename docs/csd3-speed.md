@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 164; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 165; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -48,8 +48,10 @@ the Hetzner host.
   whole sapphire node. Rejected: a
   shared weight copy (120), CUDA graphs (122, 130), TF32, `cudnn.benchmark`
   and channels_last (125), more CPU threads per rank (126) and batching
-  across requests (127). A 2-GPU A/B (round 130's job 39303263) had not
-  run when this was written.
+  across requests (127). Rounds 148-153's CPU cuts change nothing on the
+  card: today's tree runs 43.1 evals/s against round 146's 43.4, so a
+  1-GPU search is bound by the card, not its 32 cores ([round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146)).
+  2-GPU jobs never start on SL3 (round 163): scale out with 1-GPU searches.
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -7576,7 +7578,9 @@ CPU forward stays where round 160 left it. Round 161's 2-GPU job
 (39368806) was still queued when this round ended, with no output file.
 No search was run, so there is no `benchmarks.jsonl` row.
 
-## Round 163 (pending): the GPU search on today's tree, and why 2-GPU jobs never run
+## Round 163: the GPU search on today's tree, and why 2-GPU jobs never run
+
+The job ran in iteration 165; its result is [round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146).
 
 **Why 2-GPU jobs never report.** Every 1-GPU ampere job this loop sent
 (rounds 119-130, `--gres=gpu:1 --cpus-per-task=32`, most with
@@ -7641,3 +7645,48 @@ no faster. The `mallopt` arm is 0.7% faster on average, inside the spread
 of three passes and far below the ~5% an end-to-end A/B can see, so it is
 not shipped. Allocation is closed as an R2D2 CPU lever. Not a search, so
 no `benchmarks.jsonl` rows.
+
+## Round 165 (null): the GPU search on today's tree against round 146
+
+**Question.** Round 163's job 39371931: does a 1-GPU search speed up with
+rounds 148-153's CPU cuts (~28 ms a request), as it would if round 127 is
+right that it is bound by its 32 cores? And has the GPU path regressed
+since round 146, the last time it ran?
+
+**Run.** As round 163 set it up: gpu-q-23, 1 x A100-SXM4-80GB, 32 CPUs.
+`./ri search r2d2 --device cuda --nlive 48 --num-repeats 5 --max-ndead 150
+--seed 4242`, 19 ranks, MPS, `R2D2_RUNTIME=torch` (the GPU default), the
+round-146 tree (`5872bb4`, B) against `d5f3326` (N, the tree as of round
+162; 163-164 changed no code), alternating.
+
+| arm | evals/s | R2D2 request, ms | simulate, ms | wall, s | CPU (user), s | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| warmN (first on the node) | 23.7 | 666 | 71 | 141.7 | 139 | 0.01655 +/- 0.00244 |
+| B1 | 44.7 | 341 | 43 | 66.6 | 107 | 0.01639 +/- 0.00259 |
+| N1 | 45.3 | 339 | 40 | 62.5 | 110 | 0.01488 +/- 0.00315 |
+| B2 | 43.3 | 351 | 43 | 63.6 | 107 | 0.01674 +/- 0.00235 |
+| N2 | 41.7 | 362 | 49 | 62.1 | 101 | 0.01681 +/- 0.00222 |
+| B3 | 42.2 | 360 | 43 | 61.7 | 112 | 0.01658 +/- 0.00240 |
+| N3 | 42.3 | 360 | 45 | 63.0 | 135 | 0.01682 +/- 0.00226 |
+
+Means: B 43.4, N 43.1 evals/s (-0.7%, inside the 42.2-45.3 spread of
+either arm). The card peaks at 99-100% utilisation in every arm (1 s
+samples every 10 s; 67.9 GB used), while the 32 CPUs do 101-135 CPU-s of
+user time in ~63 s of wall, about 2 of 32 cores. Every log(Z) agrees
+within 0.6 sigma. GPU searches are not bit-reproducible run to run on
+one tree either (B1-B3 differ), as for every GPU arm since round 119.
+
+**Learned.**
+- No regression on the GPU path since round 146, and no gain: a 1-GPU
+  search is bound by the card. Round 130 was right and round 127 wrong.
+  CPU-side request work is not a GPU lever; the U-Net on the card is.
+- The first search on a fresh GPU node runs at half rate (23.7 evals/s,
+  666 ms a request): cold caches (SIF, checkpoints, CUDA/cuDNN set-up)
+  across its whole 80 s. A short GPU benchmark needs a warm-up arm, and a
+  production GPU run pays this once.
+- 1 x A100 at ~43 evals/s is ~37% of a whole sapphire node on CPU (117,
+  round 150).
+
+Rows: `r163-warmN`, `r163-B1`..`r163-N3` in `benchmarks.jsonl` (commit set
+to the archived tree's). `agent-node/r163` and the never-run round-161
+2-GPU tree deleted.
