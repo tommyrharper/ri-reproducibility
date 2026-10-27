@@ -6285,3 +6285,68 @@ that finished. The runs are async, so they are not identical.
   no temp file is left behind.
 - Rows: `r135-new-A..D` and `r135-old-A, B, D` in `benchmarks.jsonl`. All
   run directories were deleted (~1.4k files each).
+
+## Round 136 (diagnostic): batched CPU U-Net forwards at a fixed CPU count
+
+**Question.** Round 109 found batch 8 cuts a loaded CPU U-Net forward by
+35%, but at one thread per worker, so it needs 8 requests in flight per
+CPU (8x the ranks). A search has one rank per CPU. If a worker gets T CPUs
+and batches the T requests of its T ranks, is it still faster?
+
+**Run.** `.probe/r136/tb.py` (round 109's `batchunet.py` plus `T`, with each
+forked worker pinned to its own T CPUs) inside `r2d2.sif`. The parent
+first-touches all 25 checkpoints and forks P workers. Each worker runs 40
+batch-B forwards, cycling the checkpoints. Every arm uses the same 36
+socket-0 CPUs of this loop's half icelake node (cpu-q-141, other half
+busy), P x T = 36. Order mirrored (ABC...CBA). The figure is images/s for
+the node.
+
+| P workers x T threads, batch B | pass 1 | pass 2 | vs 36 x 1, B 1 |
+| --- | ---: | ---: | ---: |
+| 36 x 1, B 1 (production) | 649 | 706 | - |
+| 18 x 2, B 2 | 525 | 539 | -21% |
+| 12 x 3, B 3 | 646 | 638 | -5% |
+| 9 x 4, B 4 | 802 | 745 | +14% |
+| 6 x 6, B 6 | 886 | 876 | +30% |
+| 4 x 9, B 9 | 992 | 998 | **+47%** |
+| 2 x 18, B 18 | 1,105 | 1,117 | **+64%** |
+| 1 x 36, B 36 | 1,087 | 1,042 | +57% |
+| 4 x 9, B 1 (threads, no batch) | 324 | 328 | -52% |
+
+One thread per worker, 36 workers, B swept (B requests in flight per CPU):
+
+| B | 1 | 2 | 4 | 6 | 9 | 18 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| images/s, two passes | 693, 646 | 508, 561 | 882, 878 | 1,081, 1,082 | 1,265, 1,266 | 1,526, 1,512 |
+
+Accuracy (`CHECK=1`, one checkpoint, random input): no batched row is
+bit-identical to its batch-1 forward. The largest difference is 2.1e-5 to
+3.2e-5 on outputs peaking at 18-42, ~1e-6 of the peak. That is 20x below
+patch 0006's accepted 2.3e-5.
+
+**Learned.**
+- Batching is the CPU U-Net's one big lever left, and it survives the
+  fixed-CPU constraint. 2 workers of 18 threads, each forwarding its 18
+  ranks' images as one batch, do **+64%** images/s over production's one
+  image per CPU. 4 x 9 does +47%. The weights are read once per batch
+  instead of once per image, and under full load reading them is the cost
+  (round 134).
+- Threads alone lose: 4 x 9 at B 1 is half production's rate. The gain is
+  all batching.
+- **B = 2 is slower than B = 1** (-20% at one thread, -21% at 2 threads).
+  oneDNN must take a worse path for batch 2. Round 109's flat B 4 at 38
+  copies was a smaller form of the same thing. So batching only helps from
+  B ~4 up, and a gatherer must not pair requests off.
+- What it would take: R2D2 iteration k uses checkpoint k, so only
+  requests at the same iteration can share a forward. `prune: True` stops
+  each request after its own number of iterations (~16 of 25), so a batch
+  thins as it goes. A worker would run B requests in lockstep, start them
+  together, and batch each iteration's forward over those still running.
+  The NUFFTs, PSF and imaging weights (~35% of a request solo, round 97)
+  stay per request. A U-Net-only gain of 47-64% is therefore ~30-40% on a
+  request, before the cost of ranks waiting for a batch to fill.
+- Results would shift by ~1e-6 of the peak per forward. That is float32
+  rounding, so the change would need the same accuracy sign-off as
+  patch 0006, plus a check that 16 chained iterations do not grow it.
+- No search was run, so there is no `benchmarks.jsonl` row and nothing to
+  delete. Scripts: `.probe/r136/tb.py`, `run.sh`.
