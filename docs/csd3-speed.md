@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 169; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 170; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -57,6 +57,9 @@ the Hetzner host.
   ~30%; it is not wired into the pool yet ([round 168](#round-168-positive-probe-tensorrt-for-the-gpu-u-net-62-forwards-on-one-a100-under-mps)).
   The route is clear: TensorRT 11.4's own CUDA 13 wheels run in the same
   process as the image's torch, on torch's buffers, at +64% ([round 169](#round-169-positive-probe-tensorrt-cu13-beside-torch-in-one-process-64)).
+  With 25 engines a worker holds 5.1 GB, so an A100 fits 12 TensorRT workers,
+  and those 12 still give +84% forwards over eager's best 16, so a GPU search
+  should gain ~20% ([round 170](#round-170-positive-probe-25-tensorrt-engines-per-worker-fit-12-copies-on-an-a100-84-forwards)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -7904,3 +7907,65 @@ solo and then 19 copies in E T T E order, twice:
   `STRIP_PLAN`) with each iteration's weights swapped in.
 - No search ran, so there are no `benchmarks.jsonl` rows. The job output is
   `.probe/r169/job-39382083.out`.
+
+## Round 170 (positive probe): 25 TensorRT engines per worker fit 12 copies on an A100, +84% forwards
+
+**Question.** Round 169 left device memory open. A GPU worker holds all 25
+iterations' nets, and a TensorRT plan is 213 MB against 124 MB of fp32
+weights. How much does a worker with 25 engines actually hold, how many
+workers fit on an 80 GB A100, and does TensorRT still win at that count
+when each forward steps through N1..N25 the way a request does?
+
+**Probe.** `scripts/probe_trt_memory.py` (tensorrt-cu13 11.4 inside
+`r2d2-cuda.sif` as in round 169, no rebuild). It builds N1..N25.onnx into
+fp32 plans (TF32 off, 1x2x32x32, 258 s for all 25, 5.3 GB, cached in
+`$RI_WORK_DIR/.cache/ri/trt-probe/a100-fp32`), then loads one worker's
+worth and reads `cudaMemGetInfo` after each step. The engine arm (T) holds
+25 engines; with `SHARED=1` all 25 contexts share one user-managed
+activation buffer. The eager arm (E) holds 25 checkpoints' weights on the
+card, as `_CUDA_WEIGHTS` does, and calls `load_state_dict(assign=True)` before
+each forward. Both arms time forwards cycling N1..N25, and each forward
+waits on a blocking event, as `patch_cuda_network` does. Jobs
+`.probe/r170/job.sh` (39383558, gpu-q-22) and `job2.sh` (39387935,
+gpu-q-44), A100-SXM4-80GB, MPS restarted for each arm in job 2.
+
+| arm | copies | forwards/s (2 runs) | vs best eager | ms a forward | peak GPU memory |
+| --- | ---: | --- | ---: | ---: | ---: |
+| E eager, solo | 1 | 240 | | 4.16 | 3.9 GB (3,142 MB of weights, 126 MB a net) |
+| T TensorRT, solo | 1 | 629 | | 1.59 | 5.6 GB (5,140 MB of engines, 206 MB a net) |
+| T, shared activations, solo | 1 | 629 | | 1.59 | 5.6 GB (5,112 MB) |
+| E | 12 | 1,335 / 1,344 | -9% | 8.9-9.0 | 46.2 GB |
+| E | 16 | 1,481 / 1,466 | - | 10.8-10.9 | 61.5 GB |
+| E | 19 | crashed (`unspecified launch failure`) | | | 73.1 GB |
+| **T, shared activations** | **12** | **2,688 / 2,728** | **+84%** | 4.4-4.5 | 66.4 GB |
+
+**Learned.**
+- A deserialised engine holds about 206 MB of device memory, close to its
+  213 MB plan, so 25 of them take 5.1 GB a worker against eager's 3.1 GB.
+  Activations are only 1.5 MB an engine at 32x32, so a shared
+  user-managed buffer saves just 28 MB. Each process's CUDA context adds
+  about 0.45 GB. So an 80 GB A100 holds 12 TensorRT workers (66 GB), not
+  the 19 eager ones that production runs (67.9 GB, round 124).
+- TensorRT still wins at that count. 12 TensorRT copies push 2,688-2,728
+  forwards/s, against eager's best of 1,466-1,481 at 16 copies (+84%) and
+  1,335-1,344 at 12 copies (+102%). Cycling through 25 nets costs eager more
+  than one net does: 4.16 ms solo against round 169's 3.12 ms, because
+  `load_state_dict` runs before every forward. TensorRT's 25 contexts cost
+  nothing over its one (1.59 ms either way).
+- The end-to-end gain is smaller than the forward gain, because a GPU
+  search's ranks are its workers. Round 124's 19-rank request was ~350 ms,
+  of which ~25 x 11 ms was forwards. At 12 ranks with 25 x 4.4 ms of
+  forwards, a request would be ~190 ms, about 12/0.23 s ~ 52 evals/s with
+  simulate added, against 43.4: roughly +20%, to be measured. Integration
+  must therefore size GPU ranks from a TensorRT per-worker memory figure
+  (~5.6 GB) rather than eager's ~3.6 GB.
+- An eager arm at 19 copies here reached 73 GB (the probe's process also
+  carries tensorrt and a spare net) and died with `cudaErrorLaunchFailure`.
+  That took down the MPS server, every later arm in the job, and the next
+  job on the same node (gpu-q-22: error 805, `nvidia-cuda-mps-control quit`
+  hung until scancel). The fix is to exclude a node after an MPS fault,
+  and to start and quit MPS for each arm.
+- The `intr` QOS allows one job per user at a time, including one still
+  completing, so a replacement job cannot be submitted until the old one
+  is cancelled.
+- No search ran, so there are no `benchmarks.jsonl` rows.
