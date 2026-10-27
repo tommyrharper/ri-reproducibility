@@ -132,6 +132,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | `./ri health` reads a run's records on 32 threads instead of one at a time (`evaluation_scan`) | `nested-sampling-health.py` | not a search speed-up: a cold scan of a 10-11k-record run fell from 382 s to 8.9 s (34 -> 0.9 ms a record), so health answers on large live runs again; output unchanged ([round 116](csd3-speed.md)) |
 | (diagnostic) CUDA MPS on one A100, P copies of the 32x32 U-Net forward | - | the card saturates at ~600 forwards/s without MPS (contexts time-slice) and ~1,680 with it (2.8x, two ABAB passes), i.e. U-Net capacity for ~93 R2D2 evals/s, about a whole sapphire node; end to end in round 119 ([round 117](csd3-speed.md)) |
 | GPU searches start a CUDA MPS daemon so the R2D2 workers share the card (`NS_CUDA_MPS`, default on) | `start-sidecars.sh` `sidecar_cuda_mps_flags` | 16 ranks on one A100: 15.8 -> 41.8 evals/s (2.65x, three ABAB pairs plus a warm-up), R2D2 request ~900 -> ~300 ms, log(Z)s agree; beats 24 sapphire CPUs (26.6) ([round 119](csd3-speed.md)) |
+| (rejected) One GPU copy of R2D2's weights shared with the workers over CUDA IPC | - | GPU memory at 16 ranks 58.5 -> 14.7 GB, but 16 ranks no faster (40.6 -> 41.7 evals/s, noise) and 32 ranks slower (38.8): the 32 cores per A100 are the cap, not GPU memory ([round 120](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

@@ -5629,6 +5629,61 @@ are no-MPS controls, and are labelled that way in `benchmarks.jsonl`.
   2.65x the work at that utilisation, so that figure is not a headroom
   measure. Round 117's batch-18 probe says the card has ~3x more. The next
   levers are more ranks per card, which needs the workers to share one copy
-  of the checkpoints on the GPU, and batching forwards across requests.
+  of the checkpoints on the GPU, and batching forwards across requests. Round 120 tried
+  the shared copy: it fits more ranks, but they run no faster on 32 cores.
 - Do not edit a script that a running job is executing. bash reads scripts
   lazily, so round 118's M2 arm died at its end with `unexpected EOF`.
+
+## Round 120 (negative): one shared GPU copy of R2D2's weights
+
+**Change tried.** A holder process loaded R2D2's 25 checkpoints onto the
+GPU once and passed them to the forked workers over CUDA IPC (torch's
+`ForkingPickler`), so each worker stopped keeping its own copy. The aim
+was to fit more ranks per card, the lever round 119 named. It was reverted:
+fitting more ranks did not make the search faster.
+
+**A/B.** One ampere job (`.probe/r120/job.sh`, job 39297083, `gpu-q-16`,
+A100-SXM4-80GB, 32 cores), CUDA MPS on in every arm: `./ri search r2d2
+--device cuda --nlive 48 --num-repeats 5 --max-ndead 150 --seed 4242`, with
+a warm-up arm and then own weights (O16) / shared at 16 ranks (S16) /
+shared at 32 ranks (S32) taking turns:
+
+| arm | weights | ranks | evals/s | wall, s | peak GPU memory | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| warm | shared | 16 | 27.3 | 111.6 | 14.7 GB | 0.01710 +/- 0.00242 |
+| O16a | own | 16 | 39.9 | 70.5 | 58.5 GB | 0.01711 +/- 0.00228 |
+| S16a | shared | 16 | 40.1 | 65.2 | 14.7 GB | 0.01704 +/- 0.00228 |
+| S32a | shared | 32 | 37.5 | 64.9 | 25.9 GB | 0.01503 +/- 0.00397 |
+| O16b | own | 16 | 41.0 | 69.1 | 58.5 GB | 0.01700 +/- 0.00237 |
+| S16b | shared | 16 | 43.2 | 63.6 | 14.7 GB | 0.01704 +/- 0.00223 |
+| S32b | shared | 32 | 40.5 | 59.5 | 25.9 GB | 0.01516 +/- 0.00381 |
+| O16c | own | 16 | 40.9 | 69.0 | 58.5 GB | 0.01705 +/- 0.00237 |
+| S32c | shared | 32 | 38.4 | 65.8 | 25.9 GB | 0.01537 +/- 0.00389 |
+
+The S32 log(Z)s are lower than the 16-rank ones because 32 ranks take a
+different, still unconverged, path through the same `--max-ndead 150`.
+They are within 1 sigma, and the S16 and O16 arms agree closely. The
+`benchmarks.jsonl` rows were lost when the change was reverted (the
+iteration restored the file with `git checkout`). These numbers come from
+the job's output, which is still in `.probe/r120/job-39297083.out`.
+
+**Learned.**
+- A GPU worker's 3.6 GB is ~3.1 GB of weights: 25 iterations x 124 MB of
+  float32 `state_dict`. The 248 MB `.ckpt` files are about half optimizer
+  state. With one shared copy, 16 ranks need 14.7 GB instead of 58.5 GB,
+  and 32 ranks need 25.9 GB, so an 80 GB card could hold ~100 ranks.
+  CUDA IPC works under MPS inside `apptainer --nv` from forked workers.
+- At 16 ranks, sharing makes no difference: a mean of 41.7 against 40.6
+  evals/s (+2.6%, inside the arm spread). At 32 ranks it is slower, 38.8
+  evals/s. The R2D2 request rose from ~300 to ~616 ms and the CPU-only
+  simulate from ~36 to ~71 ms. Both double, which is what happens when 32
+  ranks share 32 cores. The cap is the 32 cores CSD3 gives each A100, not
+  GPU memory.
+- So a 1-GPU search tops out at ~16 ranks (~41 evals/s). Round 117's ~93
+  evals/s U-Net ceiling is out of reach on 32 cores. Further GPU speed
+  has to come from less CPU work per request (~100 ms of R2D2 code around
+  the U-Net, plus simulate) or from batching forwards across requests. A
+  whole 4-GPU node (128 cores) should give ~4 x 41 evals/s as four
+  independent MPS pools.
+- The first arm in a fresh ampere job runs cold (27.3 against ~41 evals/s,
+  R2D2 request 475 ms). Always throw away a warm-up arm in GPU jobs.
