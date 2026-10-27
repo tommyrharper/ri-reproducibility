@@ -110,7 +110,7 @@ if [ "${1:-}" = "--self-check" ]; then
       echo "FAIL: a torn summary must not count as finished, got: ${OUT}"; exit 1 ;;
   esac
   case "${OUT}" in
-    *"half-written summary.json"*"2 evaluations already done"*) ;;
+    *"half-written summary.json"*"3 evaluations already done"*) ;;
     *) echo "FAIL: the resume must say it is rewriting the summary, got: ${OUT}"; exit 1 ;;
   esac
   rm -f "${COUNT_RUN}/summary.json"
