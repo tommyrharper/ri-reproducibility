@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 166; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 167; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -47,7 +47,7 @@ the Hetzner host.
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
   shared weight copy (120), CUDA graphs (122, 130), TF32, `cudnn.benchmark`
-  and channels_last (125), `torch.compile` (166, -40%), more CPU threads per rank (126) and batching
+  and channels_last (125), `torch.compile` (166, -40%), ONNX Runtime's CUDA EP (167, -2%), more CPU threads per rank (126) and batching
   across requests (127). Rounds 148-153's CPU cuts change nothing on the
   card: today's tree runs 43.1 evals/s against round 146's 43.4, so a
   1-GPU search is bound by the card, not its 32 cores ([round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146)).
@@ -7738,3 +7738,52 @@ Inductor and Triton caches shared and warmed by the solo arms:
 - A zig `CC` makes Triton (and so `torch.compile`) usable in any SIF with
   no rebuild. No search ran, so there are no `benchmarks.jsonl` rows; the
   job output is `.probe/r166/job-39373826.out`.
+
+## Round 167 (negative): ONNX Runtime's CUDA EP for the GPU U-Net, -2% under MPS
+
+**Question.** Round 166 left a different engine as the last single-forward
+GPU lever. ORT is already the CPU default (round 145) and has its own CUDA EP
+with cuDNN algorithm search and CUDA graphs. Does it put more forwards
+through one A100 under MPS than torch's eager forward?
+
+**Probe.** `r2d2-cuda.sif` has CUDA 13 torch, while `onnxruntime-gpu` 1.23.2
+is a CUDA 12 build. `uv pip install --target` with the CUDA 12 runtime,
+cuBLAS, cuDNN 9, cuFFT, cuRAND and NVRTC wheels gives a 3.1 GB, 602-file
+directory. `ort.preload_dlls()` loads it in the SIF on the 595 driver with
+no rebuild. It is carried as one tar (`agent-node/ortgpu-py.tar`).
+`scripts/probe_ort_cuda.py` runs the exported net (`N1.onnx`, the same file
+the CPU sessions use) through the CUDA EP with I/O bound on the card. It
+does not import torch, because both stacks ship a `libcudnn.so.9`. It
+compares the output against the CPU session's output for the same seeded
+input (`DEV=cpu` writes that reference). One ampere job (`.probe/r167/job.sh`,
+job 39376600, gpu-q-27, A100-SXM4-80GB, MPS on, TF32 off in both engines,
+batch 1, 32x32) ran each arm solo, then 19 copies in E O G H H G O E order
+twice:
+
+| arm | solo ms a forward | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs CPU ORT |
+| --- | ---: | --- | ---: | ---: |
+| E torch eager (production) | 2.82 | 1,777 / 1,769 / 1,775 / 1,774 | - | (torch) |
+| O ORT CUDA EP, `EXHAUSTIVE` conv search | 2.41 | 1,745 / 1,740 / 1,740 / 1,739 | -2.0% | 7.2e-6 |
+| G as O, plus `enable_cuda_graph` | - | - / - / 1,724 / 1,722 | -2.9% | 7.2e-6 |
+| H ORT CUDA EP, `HEURISTIC` conv search | 2.50 | 1,715 / 1,718 / 1,724 / 1,721 | -3.1% | 6.8e-6 |
+
+(G's first pass crashed in the probe's post-loop check, which ran the graph
+session unbound. That was fixed between passes, so G has no solo time.)
+
+**Learned.**
+- Rejected. ORT's CUDA EP is 15% faster solo, because it has less per-forward
+  host work: 2.41 ms of wall and CPU against torch's 2.82. Under 19 MPS
+  copies, where the card is the bound (round 165), it is 2-3% slower in all
+  eight runs. The convolutions are cuDNN in both engines, so the card does
+  the same work, and ORT's choices (exhaustive search, its graph) do not
+  beat ATen's. Like `torch.compile`, it moves the output (~7e-6 from the CPU
+  path), so it would not be bit-identical either.
+- A shorter host path is not worth anything on a saturated card. That is
+  the same conclusion as rounds 122/130 (graphs) and 166 (Inductor's
+  shorter launch path). A GPU lever has to cut the card's kernel time, and
+  single-forward engines all end up on the same cuDNN kernels.
+- That leaves TensorRT (its own fp32 tactics, but a further ~3 GB of
+  libraries and results that move) and cross-request batching (round 127,
+  1.33x ceiling) as the only GPU options.
+- No search ran, so there are no `benchmarks.jsonl` rows. The job output is
+  `.probe/r167/job-39376600.out`.
