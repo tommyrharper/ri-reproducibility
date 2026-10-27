@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 149).**
+**Where it stands (round 150).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -36,7 +36,9 @@ the Hetzner host.
   On balanced multi-socket jobs the ORT sessions are built once per
   socket like the torch copies: a whole icelake node went from 59.2 to
   **80.5 evals/s (+36%)** ([round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36));
-  before it, onnx ran a whole node at torch's rate.
+  before it, onnx ran a whole node at torch's rate. A whole sapphire node
+  now runs **117 evals/s**, +40% over the pre-149 onnx default and +22%
+  over torch ([round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40)).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6981,3 +6983,49 @@ with an `lfs` that fails, run outside `||` so `set -e` applies (it exits
 Rows: `r149-old-a`, `r149-new-a`, `r149-new-b`, `r149-old-b` in
 `benchmarks.jsonl`. Run directories were in the job node's `/dev/shm` and
 are gone.
+
+## Round 150 (validation): round 149 on a whole sapphire node, +40%
+
+**Question.** Round 149 was measured on a whole icelake node. Production
+R2D2 runs whole sapphire nodes (112 ranks, round 106), where the shipped
+onnx default had never been compared against its own per-node sessions
+or against torch.
+
+**Measured.** One exclusive sapphire node (cpu-r-100, job 39343297; 2
+sockets, 2 NUMA nodes, 8480+), 112 x 1 async with the defaults, nlive 200,
+5 repeats, 1000 dead, seed 4242. Both trees are `git archive 66bdccd` in
+`/dev/shm`. The old arms have `r2d2_serve.py` from `01d0bd5` (pre-149), and
+the torch arm is the new tree with `R2D2_RUNTIME=torch`. Order old, new,
+new, old, torch:
+
+| arm | ORT sessions | evals | evals/s | ms per eval | peak MB | parent pages N0 / N1 | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| old-a | one set, first touch | 14,161 | 73.0 | 1493 | 10,163 | 1686k / 792k | 0.01778 ± 0.00038 |
+| new-a | per node | 14,779 | 117.2 | 918 | 13,422 | 1657k / 1665k | 0.01780 ± 0.00037 |
+| new-b | per node | 14,821 | 116.7 | 921 | 13,629 | 1644k / 1686k | 0.01785 ± 0.00037 |
+| old-b | one set, first touch | 18,165 | 93.3 | 1166 | 10,349 | 822k / 1658k | 0.01743 ± 0.00046 |
+| torch | (per-node torch copies) | 16,030 | 95.7 | 1130 | 6,718 | 842k / 765k | 0.01705 ± 0.00048 |
+
+**+40% evals/s** against the pre-149 onnx default (116.9 against 83.2),
+and **+22% against torch** (95.7 here, 103.5 in round 106 on another
+node). The log(Z)s agree within their errors (async). Peak memory is
++3.3 GB in the pool parent, as on icelake. With per-node sessions a whole
+sapphire node now runs **117 evals/s**, up from round 115's 103.5, the
+previous production best.
+
+**Learned.**
+- The old arms differ by 28% (73.0 against 93.3), and their page counts
+  show why: the single ORT set lands on whichever socket the pool parent
+  first touched (node 0 in old-a, node 1 in old-b), and what that socket
+  shares with the busier half of the job varies run to run. Per-node
+  sessions removed that spread as well (117.2 against 116.7).
+- Before round 149, the onnx default on a whole sapphire node was *slower*
+  than torch (83 against 96-104 evals/s). Rounds 141-145's half-node gain
+  had never reached production shape until round 149.
+- Simulate is 72-74 ms of a ~920 ms evaluation (8%) in the new arms. The
+  request is still the evaluation.
+
+Rows: `r150-old-a`, `r150-new-a`, `r150-new-b`, `r150-old-b`, `r150-torch`
+in `benchmarks.jsonl`. Their `commit` is 66bdccd, with `dirty` marking the
+old arms' swapped-in `r2d2_serve.py`. The run directories were in the job
+node's `/dev/shm` and are gone.
