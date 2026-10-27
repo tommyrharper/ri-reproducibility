@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 168; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 169; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -55,6 +55,8 @@ the Hetzner host.
   Open: TensorRT's fp32 engine puts **+62% forwards/s** through the card
   at 19 MPS copies, 1e-5 off the CPU path, so a 1-GPU search should gain
   ~30%; it is not wired into the pool yet ([round 168](#round-168-positive-probe-tensorrt-for-the-gpu-u-net-62-forwards-on-one-a100-under-mps)).
+  The route is clear: TensorRT 11.4's own CUDA 13 wheels run in the same
+  process as the image's torch, on torch's buffers, at +64% ([round 169](#round-169-positive-probe-tensorrt-cu13-beside-torch-in-one-process-64)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -7850,3 +7852,55 @@ in E T3 T5 T3G T3G T5 T3 E order, twice:
   it.
 - No search ran, so there are no `benchmarks.jsonl` rows. The job output is
   `.probe/r168/job-39379761.out`.
+
+## Round 169 (positive probe): tensorrt-cu13 beside torch in one process, +64%
+
+**Question.** Round 168 measured TensorRT through `onnxruntime-gpu`, a CUDA
+12 stack that cannot share the pool process with the image's CUDA 13 torch
+(both load a `libcudnn.so.9`). Does TensorRT's own Python API, from CUDA 13
+wheels, run in a torch process on torch's device buffers with the same
+gain? That is the shape the pool needs.
+
+**Probe.** `tensorrt-cu13` 11.4.0.106 (`uv pip install --python-version
+3.10 --target`, no deps; 4.4 GB as shipped, 1.2 GB after dropping the
+Windows and non-sm80 builder resources, carried as one file,
+`agent-node/trt13-py.tar`) on `PYTHONPATH` inside `r2d2-cuda.sif`, no
+rebuild. `scripts/probe_trt.py` imports torch first, builds an engine from
+round 168's `N1.onnx` with TensorRT's ONNX parser (TF32 flag cleared,
+one 1x2x32x32 profile), binds torch tensors' `data_ptr()` as input and
+output, and runs `execute_async_v3` on torch's stream. Every timed forward
+then waits on a blocking CUDA event, as `patch_cuda_network` does.
+`EAGER=1` times torch eager in the same process instead, so both arms carry
+the TensorRT engine and compare outputs. One ampere job (`.probe/r169/job.sh`,
+job 39382083, gpu-q-77, A100-SXM4-80GB, driver 595.112, MPS on) ran each arm
+solo and then 19 copies in E T T E order, twice:
+
+| arm | solo ms a forward | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs CPU ORT |
+| --- | ---: | --- | ---: | ---: |
+| E torch eager (production) | 3.12 | 1,748 / 1,743 / 1,750 / 1,673 | - | (torch; TensorRT vs eager 1.2e-5) |
+| T tensorrt-cu13 11.4, fp32, in the torch process | 1.57 | 2,872 / 2,859 / 2,859 / 2,858 | **+64%** | 8.9e-6 |
+
+**Learned.**
+- The integration route works. TensorRT's CUDA 13 wheels load beside torch
+  2.13+cu130 with no library clash, build the engine in 11 s (213 MB) and
+  run it on torch's buffers. The gain matches round 168's ORT-hosted
+  engine (+61-62%), so the EP added nothing and costs nothing.
+- Host time a forward falls from 2.85-3.07 to 0.38 CPU-ms solo, which
+  leaves CPU for data prep, though round 165 says the card, not the CPU,
+  is the bound.
+- Accuracy: TensorRT is 8.9e-6 from the CPU ORT path and 1.2e-5 from
+  torch eager on the card, the same order as round 140's ORT-vs-torch gap.
+- TensorRT warns "Using default stream in enqueueV3()" and adds a
+  `cudaStreamSynchronize` when given torch's default stream. It cost
+  nothing measurable here, but the pool should run the engine on its own
+  `torch.cuda.Stream`.
+- Memory is the open question before wiring it in. Each worker
+  deserialises its own engines, and a plan is 213 MB against the 124 MB of
+  fp32 weights it carries, so 25 checkpoints in 19 workers would be ~100 GB
+  if the plan size is what stays resident. Eager's per-worker weight cache
+  is already 25 x 124 MB, ~59 GB across 19 workers, so this needs a
+  measured device footprint. If it does not fit, the options are engines
+  built lazily per iteration, or one refittable engine (`REFIT`,
+  `STRIP_PLAN`) with each iteration's weights swapped in.
+- No search ran, so there are no `benchmarks.jsonl` rows. The job output is
+  `.probe/r169/job-39382083.out`.
