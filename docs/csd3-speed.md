@@ -4837,7 +4837,8 @@ syscall 238), and each worker was pinned to its node's CPUs.
 allocation's 32/6 split): weights node-local 51.4 ms per forward, interleaved
 59.4 ms, weights on node 0 57.5 ms, on node 1 102 ms (1.9x worst case).
 
-**Search** (synchronous 38 x 1, same draws, ABBA): per request 1116/1117 ms
+**Search** (38 x 1, seed 4242, ABBA; async, not synchronous as first
+logged - the commands had no `--synchronous`, round 102): per request 1116/1117 ms
 first touch against 1170/1188 ms per-node copies, **5-6% slower**. Rejected;
 pinning takes away the scheduler's choice of idle CPU, which is worth more
 than locality here.
@@ -4847,9 +4848,9 @@ than locality here.
   ~3.1 GB of weights on the node it ran on, and nothing moves them.
 - Upstream `set_common_args` caps torch threads at the affinity mask, so
   pinning a worker silently caps its request threads too.
-- Synchronous 38 x 1 R2D2 searches with seed 4242 gave four different chain
-  md5s, even within one arm, though a 1-thread request is byte-identical.
-  Chain identity is not an R2D2 A/B gate until that is explained.
+- 38 x 1 R2D2 searches with seed 4242 gave four different chain md5s, even
+  within one arm. Explained in round 102: they ran async (the default), so
+  differing chains are expected; synchronous R2D2 runs reproduce.
 
 ## Round 99: R2D2 checkpoint pages interleaved across the job's sockets
 
@@ -4974,3 +4975,34 @@ No throughput change: evaluations never see this path, so there is no
   from this round's runs alone. Harmless inside a Slurm job; worth knowing
   when counting processes.
 
+## Round 102 (diagnostic): synchronous R2D2 searches are bit-reproducible
+
+**Question.** Round 98 logged that synchronous, seeded 38 x 1 R2D2 searches
+gave different chains, which would rule out chain identity as an R2D2 A/B
+gate. Is that so on the current tree?
+
+**Runs** (commit 2c92357, this allocation, seed 4242, `--synchronous`,
+nlive 20-50, 2 repeats; rows `r102-A`..`r102-F`):
+
+| runs | shape | dead | evals | chains |
+| --- | --- | ---: | ---: | --- |
+| A, B (raced) | 8 x 1 | 30 | 170 | all 7 md5s identical |
+| C, D (back to back) | 38 x 1 | 300 | 2,303 | all 7 md5s identical |
+| E, F (back to back) | 8 x 4 threads | 60 | 394 | identical |
+
+**Cause.** Round 98's commands had no `--synchronous`, and `defaults.toml`
+sets `NS_SYNCHRONOUS = 0`, so those runs were async, which does not
+reproduce by design. Round 98's section is corrected.
+
+**Learned.**
+- A synchronous, seeded R2D2 search reproduces byte for byte across runs,
+  at 1 or 4 threads per request, raced or back to back. Chain md5 is a valid
+  R2D2 A/B gate for anything meant to keep the arithmetic unchanged.
+- The thread count changes the arithmetic. The same 170 draws scored at
+  8 x 1 and at 8 x 4 differ in every objective, by a median relative 4.9e-8
+  and at most 1.8e-5. A thread-count A/B therefore cannot be gated on
+  chains, and an automatic `R2D2_OMP_THREADS` that differs between arms (it
+  follows the memory-clamped rank count) splits chains too. Each record's
+  `r2d2_threads` says which one it got.
+- A synchronous R2D2 A/B has to pass `--synchronous`: the bare
+  `./ri search r2d2` is async.
