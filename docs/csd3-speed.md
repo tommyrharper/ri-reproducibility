@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 150).**
+**Where it stands (round 151).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -32,7 +32,8 @@ the Hetzner host.
   In a search, ORT is 68% of worker CPU and the visibility-sized data
   prep (torch element-wise ops, FINUFFT) ~25% ([round 146](#round-146-diagnostic-where-an-onnx-default-r2d2-workers-cpu-goes)).
   Briggs weights by `np.bincount` (round 148) cut 26 to 10 ms of that,
-  byte-identical, ~1.5% end to end.
+  byte-identical, ~1.5% end to end. A request's four FITS writes and its
+  config parse skip astropy and PyYAML (round 151, byte-identical, ~6 ms).
   On balanced multi-socket jobs the ORT sessions are built once per
   socket like the torch copies: a whole icelake node went from 59.2 to
   **80.5 evals/s (+36%)** ([round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36));
@@ -7029,3 +7030,69 @@ Rows: `r150-old-a`, `r150-new-a`, `r150-new-b`, `r150-old-b`, `r150-torch`
 in `benchmarks.jsonl`. Their `commit` is 66bdccd, with `dirty` marking the
 old arms' swapped-in `r2d2_serve.py`. The run directories were in the job
 node's `/dev/shm` and are gone.
+
+## Round 151: a request's FITS writes and config parse without astropy and PyYAML
+
+**Change.** `patch_request_io()` in `r2d2_serve.py`. Each request writes
+four 32x32 FITS images (`dirty_normalised`, `PSF`, the model and the
+residual) through astropy's `fits.writeto`, and parses its YAML config
+with PyYAML's pure-Python `safe_load`. For a fixed shape and dtype the
+FITS header never changes, so astropy now writes it once per shape into
+a buffer. Every later image is that header, then the big-endian data,
+then zero padding. Anything other than a plain native float32 or float64
+array written to a path with `overwrite=True` goes to upstream. The
+config goes through libyaml's `CSafeLoader`, which r2d2.sif ships.
+`R2D2_FAST_IO=0` turns both off.
+
+**Byte-identical.** The new self-check `self_check_request_io` compares
+the bytes against upstream's `writeto` for float32 and float64, zeros,
+NaN/inf/-0, odd shapes, a transposed array, and str and Path targets
+over a stale longer file. It also checks that upstream still refuses an
+existing file without overwrite, and that the config parses to the same
+dict. It passes inside `r2d2.sif`. The run's own config, from
+`write_r2d2_config`, parses equal with the same value types (23 keys).
+
+**Stage.** In-process, pinned to one CPU, 250 requests' worth, 3 passes:
+
+| stage | upstream | patched |
+| --- | ---: | ---: |
+| four FITS writes (2 x float32, 2 x float64, 32x32) | 4.90 ms | 0.053 ms |
+| config parse | 1.32 ms | 0.145 ms |
+
+That is ~6 ms off a ~430 ms solo request (~1.4%).
+
+**End to end.** Interleaved A/B/A/B/A/B, 38 x 1, nlive 100, 5 repeats,
+400 dead, seed 4242, onnx default, half icelake node (cpu-q-228). Rows
+`r151-A1`..`r151-B3`. Both arms ran the same dirty tree, and only
+`R2D2_FAST_IO` (not recorded in `settings`) separates them:
+
+| arm | request IO | evals/s | request ms | simulate ms | log(Z) x1e-3 |
+| --- | --- | ---: | ---: | ---: | --- |
+| A1 | upstream | 35.45 | 981.8 | 46.8 | 17.6 +/- 0.8 |
+| B1 | patched | 44.73 | 761.3 | 45.9 | 17.6 +/- 0.8 |
+| A2 | upstream | 46.53 | 734.2 | 44.5 | 17.7 +/- 0.7 |
+| B2 | patched | 47.05 | 726.2 | 44.9 | 17.5 +/- 0.8 |
+| A3 | upstream | 46.67 | 731.9 | 43.0 | 17.6 +/- 0.8 |
+| B3 | patched | 47.71 | 720.3 | 42.2 | 16.7 +/- 1.0 |
+
+A1 was the first search on a node that had been idle. It ran 28% slower
+than every other arm, and slower than round 148's upstream arms on the
+same host (~45 evals/s), which no 6 ms change can explain. Without it,
+the two clean pairs give +1.1% and +2.2% evals/s and a request 733.0 to
+723.3 ms (-1.3%), the size the stage timing predicts. That is inside the
+~5% noise, so as in round 148 the end-to-end run shows no regression,
+and the stage timing plus byte identity is the evidence. log(Z) agrees
+in all six arms.
+
+**Learned.**
+- The first search after an idle spell can run ~25% slow, which is a
+  warm-up, not an effect of the change. Put a throwaway arm first, or
+  drop the first arm when it is an outlier against the arm after it of
+  the same kind.
+- The PSF image is written on every request and then pruned (`PRUNED_ARTEFACTS`).
+  Writing it now costs ~13 us, so dropping it is not worth changing
+  what a failed evaluation keeps.
+- After rounds 146-151, a solo request has nothing left outside ORT and
+  FINUFFT above ~1%.
+
+Run directories deleted.
