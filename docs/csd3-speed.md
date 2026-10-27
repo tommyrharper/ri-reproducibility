@@ -6130,3 +6130,53 @@ probe files were deleted in 17 s with 32 unlink threads.
   writer's comment gives for a write during a 36-rank search. What costs
   time in-run is contention (round 54's directory lock), not the
   directory's size.
+
+## Round 133 (diagnostic): the flat `evaluations/` directory's metadata ceiling
+
+**Question.** Round 115's production rerun spent 18.4 s of its 34.5 s
+post-run phase packing records, and most of a pack is unlinking one file
+per evaluation (`pack_evaluation_records()`, 32 threads). Would more
+threads make that faster? And because round 132 found only contention
+matters, where is the ceiling of the one flat directory every rank's
+record writer creates into?
+
+**Method.** Two probes, not committed (`.probe/r133/un.py`, `sh.py`), on
+this job's icelake CPUs under `hpc-work`. Each arm made fresh 4.2 KB
+files (round 132's record size) with the record writer's calls (a
+`.partial` file, write, `os.replace`) and then unlinked them all. Arms
+alternated in mirrored order. S is the number of subdirectories the
+files were dealt over (S=1 is today's layout) and T the thread count.
+
+| S | T | files | create+rename/s | unlink/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 / 32 / 64 / 128 (unlink only) | 20,000 | | 6,742-7,661, no trend |
+| 1 | 4 / 16 / 64 | 12,000 | 732-2,243 / 1,899-2,027 / 1,866-1,958 | 4,042-4,800 |
+| 1 | 32 | 20,000 | 2,433-2,445 | 5,020-5,171 |
+| 4 | 32 | 20,000 | 8,330-8,428 | 16,663-18,167 |
+| 16 | 4 | 12,000 | 609-1,145 | 32,148-34,644 |
+| 16 | 32 | 20,000 | 13,541-14,219 | 41,522-44,796 |
+| 16 | 64 | 12,000 | 9,973-10,289 | 35,999-36,454 |
+
+**Learned.**
+- In one directory, the thread count does nothing above 4: creates top
+  out at ~2k/s and unlinks at ~4-7k/s, from 4 threads to 128. The client
+  serialises every name operation on the parent's lock (round 54), so the
+  ceiling is one Lustre round trip at a time. Changing the pack's 32
+  unlink threads would not shorten it.
+- Dealing the files over subdirectories lifts both ceilings almost
+  linearly: 4 give ~3.5x creates and unlinks, 16 give ~5-7x creates and
+  ~8x unlinks. Here the parallelism is real, because each subdirectory
+  has its own lock.
+- Production is under the flat ceiling. A whole sapphire node of WSClean
+  ranks scores ~1k evaluations/s (round 114: 56 ranks ran 400-560), about
+  half of the ~2k/s ceiling, and the record writers run off the ranks'
+  pinned CPUs (round 54). So sharding would buy nothing in-run on one
+  node today. At the end of a run it would cut the unlink from ~10-13 s
+  to ~1-2 s for 65k records, ~0.4% of round 115's 41 minutes. That is
+  not worth a layout change that every record reader (`./ri health`,
+  `./ri runs`, live summaries, the progress bar, resume) would have to
+  follow.
+- When to revisit: if a run ever needs more than ~2k records/s from one
+  node (more ranks, faster evaluations, or the WSClean binary halving),
+  the record writers will lag and the end-of-run drain will grow. Deal
+  records over ~16 subdirectories by a hash of the name then.
