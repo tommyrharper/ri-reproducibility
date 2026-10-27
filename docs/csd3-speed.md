@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 153).**
+**Where it stands (round 154).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -7150,9 +7150,9 @@ each), after a throwaway warm-up. Order single, pair, single, pair. Script:
   again, with `.launcher.pid` now renamed into place. Both of the reaper's
   liveness tests must have failed: `pgrep` of the first run's rank
   pattern, and `kill -0` of its launcher. The 36-rank pairs on this loop's
-  node did not hit it. The cause was not traced here. Until it is, a raced
-  A/B in a batch job can lose an arm, so check every arm's log for that
-  NOTE.
+  node did not hit it. The cause was traced and fixed in
+  [round 154](#round-154-the-startup-reaper-no-longer-kills-a-raced-searchs-pool):
+  the reaper read a worker that had just exec'd as a pool.
 
 Rows: `r152-lsingle-a/b`, `r152-lhalf-a1/a2/b1/b2`, and from the sapphire job
 `r152-single-a/b` and `r152-half-a2/b2`, in `benchmarks.jsonl`
@@ -7252,3 +7252,55 @@ to Lustre, and a Lustre stall there is the likeliest cause.
 
 Rows: `r153-W`, `r153-A1`..`r153-B3` in `benchmarks.jsonl`. Run
 directories deleted.
+
+## Round 154: the startup reaper no longer kills a raced search's pool
+
+**Question.** In round 152's whole-sapphire job, the second of two raced
+searches killed the first's live wsclean pool in both pairs, so a raced
+A/B there loses an arm. Both of the reaper's liveness tests (ranks of the
+run, `kill -0` of `.launcher.pid`) had to fail for a run whose ranks and
+launcher were both alive. Why?
+
+**Cause.** `_ns_pool_table` lists pool shells with `pgrep -f
+'/\.[a-z0-9]*-workers$'`, then reads each one's pgid and command line with
+two separate `ps` calls and takes the command line's last word for the
+FIFO directory. A pool shell starts one subshell per worker, and each
+subshell carries the shell's command line until it execs
+`wsclean-zygote` or `python3 ... --fifo <dir>/.simulate-workers/N`. If
+`pgrep` catches the subshell before the exec and `ps` reads it after,
+the "run directory" is `wsclean-zygote` (or a FIFO path). That directory
+has no ranks and no `.launcher.pid`, and an empty launcher counts as
+dead, so the row's pgid is printed, and the pgid is the live pool's.
+The window is a worker's fork-to-exec time, which is long while 56
+workers per pool start from a squashfs on a loaded 112-CPU node, which
+is when the second search's reaper ran. With 16-18 workers on this node
+the window is small, which is why round 152's local pairs never hit it.
+
+**Reproduction.** A fake pool (`setsid sh -c 'while :; do (sleep 0.03;
+exec sleep 0.3); done' sh <dir>/run/.fake-workers`, launcher a live
+`sleep`, no ranks) stands in for a starting pool: its subshell shows the
+pool's command line for 30 ms, then becomes `sleep 0.3`.
+
+| reaper | passes that would kill the live pool | bogus rows seen |
+|---|---|---|
+| HEAD (`d72086a`) | 3/200, then 4/300 | `<pgid>\t\t0.3` 3 times in 100 table reads |
+| fixed | 0/300 | none |
+
+With the launcher `sleep` killed, the fixed reaper still killed the fake
+pool ("NOTE: killing worker pool(s) left behind ..."), so a real leak is
+still reaped.
+
+**Fix.** `_ns_pool_table` reads pgid and command line in one `ps -o
+pgid=,args=`, and the new `_ns_pool_row` emits a row only if the
+command line still ends in `/.<name>-workers`, so a worker that has
+exec'd is skipped rather than read as a pool. The rank-budget self-check
+gets three cases: a pool shell gives its run directory, and a bare
+`wsclean-zygote` and a simulate worker's `--fifo` path give no row.
+`bash scripts/lib/rank-budget.sh --self-check`, shellcheck 0.11 on
+`rank-budget.sh`, and `scripts/test_cli.py` pass.
+
+**Not measured.** No speed change is expected: the reaper runs once per
+search start. A re-run of round 152's whole-sapphire pairs would confirm
+it end to end, and would also give the 2 x 56 pair rate that round lost.
+No benchmark rows.
+
