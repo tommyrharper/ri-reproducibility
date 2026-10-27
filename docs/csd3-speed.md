@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 151).**
+**Where it stands (round 152).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -56,6 +56,8 @@ the Hetzner host.
   nothing else in it is above ~2% (round 83). The biggest lever left for
   production is not code: a run on the stale shipped SIF (0001-0006) is
   29% slower, and a search's job now patches it itself (round 94).
+  One 36-rank search runs 253 evals/s, +11% over two 18-rank searches
+  raced on the same CPUs (round 152).
 - **Hardware.** Half a sapphire node runs +41% more WSClean evaluations
   than half an icelake node (round 84), and about the same per core.
 
@@ -7096,3 +7098,43 @@ in all six arms.
   FINUFFT above ~1%.
 
 Run directories deleted.
+
+## Round 152 (diagnostic): one WSClean search against two raced on the same CPUs
+
+**Question.** No WSClean search has been measured above 38 ranks, and A/Bs
+here race two searches on one allocation (round 135). Does one search
+scale over its allocation as well as two smaller ones sharing it, or does
+something per search (PolyChord's root, its pools, its records) stop it?
+
+**Run.** This loop's half icelake node (cpu-q-228, 38 CPUs), `git archive
+2736358` in `/dev/shm`, the patched 0001-0017 SIF from the job cache, 15
+repeats, seed 4242. Arms are one 36-rank search (nlive 200, 1200 dead)
+against two 18-rank searches launched 2 s apart (nlive 100, 600 dead
+each), after a throwaway warm-up. Order single, pair, single, pair. Script:
+`.probe/r152/local.sh`.
+
+| arm | evals/s | ms per eval | simulate | `wsclean` binary | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| single-a | **253.7** | 134.3 | 21.9 ms | 111.3 ms | 0.09700 ± 0.00044 |
+| pair-a (112.6 + 120.9) | 233.5 | 147.4 / 137.4 | 24.2 / 22.2 ms | 122.0 / 114.0 ms | 0.09666 / 0.09643 ± 0.0007 |
+| single-b | **252.7** | 134.7 | 22.0 ms | 111.6 ms | 0.09616 ± 0.00067 |
+| pair-b (110.7 + 109.6) | 220.3 | 150.0 / 151.0 | 24.9 / 24.3 ms | 123.9 / 125.5 ms | 0.09704 / 0.09669 ± 0.0007 |
+
+**Learned.**
+- One 36-rank search does **+11%** more evaluations than two 18-rank
+  searches on the same CPUs (253.2 against 226.9 evals/s, both singles
+  above both pairs). Every stage is slower in the pairs, the binary by
+  3-13%. Idle is 0.03% in all arms, so this is the evaluation, not
+  PolyChord. Nothing per search limits WSClean at 36 ranks.
+- 253 evals/s is the best 36-rank WSClean figure so far (round 89: ~250).
+- A raced pair understates what each tree gets alone, by ~10% here. That
+  is fine for a relative A/B, but absolute rates from raced arms are low.
+- log(Z) agrees across all six arms.
+- Still open: a whole sapphire node (112 ranks against 2 x 56 raced),
+  submitted as job 39351719 (`.probe/r152/job.sh`). It was still pending
+  after 35 minutes, so it was not waited for. It writes its rows and logs
+  to `.probe/r152/`.
+
+Rows: `r152-lsingle-a/b`, `r152-lhalf-a1/a2/b1/b2` in `benchmarks.jsonl`
+(commit set by hand, since an archived tree has no `.git`). Run
+directories deleted.

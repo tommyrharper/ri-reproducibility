@@ -151,6 +151,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | ONNX Runtime sessions built once per NUMA node, beside round 106's per-node checkpoints (`enter_node()` swaps a worker's node's set in) | `r2d2_serve.py` `patch_onnx_network()` | whole icelake node, 76 x 1 onnx: 59.2 -> 80.5 evals/s (+36%), request 1197 -> 857 ms, ABBA, log(Z)s agree; the shipped single set sat on one socket and ran a whole node at torch's rate ([round 149](csd3-speed.md)) |
 | Round 149 validated on a whole sapphire node (production shape) | - | 112 x 1 onnx: 83.2 -> 116.9 evals/s (+40%), +22% over torch (95.7); the pre-149 single ORT set made onnx slower than torch there ([round 150](csd3-speed.md)) |
 | A request's four FITS images written from a cached header and its config parsed by libyaml (`R2D2_FAST_IO`) | `r2d2_serve.py` `patch_request_io()` | byte-identical; 6.2 -> 0.2 ms a request solo (~1.4%); ABAB -1.3% a request, inside noise, log(Z)s agree ([round 151](csd3-speed.md)) |
+| Diagnostic: one 36-rank WSClean search against two 18-rank searches raced on the same CPUs | - | single 253 evals/s, +11% over the pair; nothing per search limits WSClean at 36 ranks ([round 152](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
