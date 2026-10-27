@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 155).**
+**Where it stands (round 156).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -7337,3 +7337,37 @@ bound by memory traffic, and OpenVINO's faster kernels move more of it.
 Solo timings mislead for this network; only the loaded shape counts. ORT
 stays the CPU runtime. Not a search, so there are no `benchmarks.jsonl`
 rows; the `/dev/shm` packages were deleted.
+
+## Round 156 (negative): huge pages for ONNX Runtime's U-Net weights
+
+**Question.** Under load the CPU forward is bound by streaming weights
+(round 146). Round 100 found THP backing 78% of the torch checkpoints'
+memory, but ORT (round 141 on) allocates its own copies of the weights. Are
+they on 4 kB pages, and would forcing huge pages help?
+
+**Pages.** All 25 production sessions built as `patch_onnx_network` builds
+them (1 thread, no arena), one forward each, then `/proc/self/smaps` read
+(`.probe/r156/thp.py`, inside `r2d2.sif`): `[heap]` 2,693 MB resident, 2,340
+MB of it `AnonHugePages`; anonymous mmaps 802 MB, 748 MB huge. So **88%**
+of the weights are already on 2 MB pages under CSD3's THP `always`.
+
+**Rejected: `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`** (glibc 2.36 in
+`r2d2.sif`: malloc madvises THP on every arena it grows). Round 146's
+`fork.py` (`.probe/r156/fork.py`): one N1 session in a parent, 36 forked
+children pinned one per CPU, 150 forwards each, two passes a run, runs
+alternated ABABAB on this loop's half icelake node (load ~3):
+
+| arm | run 1 | run 2 | run 3 | mean |
+| --- | ---: | ---: | ---: | ---: |
+| default | 24.48, 24.47 | 24.76, 24.72 | 24.75, 24.78 | 24.66 ms |
+| `hugetlb=1` | 24.63, 24.60 | 24.57, 24.57 | 24.48, 24.54 | 24.57 ms |
+
+-0.4%, inside the run-to-run spread (24.47-24.78 for the default alone),
+and outputs bit-identical. The parent's THP share did not change either
+(132-162 MB of 225-264 MB resident in both arms), so the tunable has little
+left to convert.
+
+**Learned.** The page-mapping levers are now closed for both runtimes:
+THP already covers the R2D2 weights whether torch (round 100) or ORT holds
+them, as it does the WSClean zygote's heap (rounds 87-88). Not a search,
+so no `benchmarks.jsonl` rows.
