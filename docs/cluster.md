@@ -366,7 +366,10 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   `--mem` above the cores' share is granted by allocating (and charging)
   more cores. For WSClean, half a sapphire node does ~41% more evals/s
   than half an icelake node but ~5% fewer per core (`docs/csd3-speed.md`,
-  round 84), so pick by deadline or by charge. R2D2 needs ~4.2GB once plus
+  round 84), so pick by deadline or by charge. For R2D2, sapphire wins on
+  both: half a node does ~1.8x the evals/s of half an icelake node and ~20%
+  more per core (round 103), so `--partition sapphire` is the better R2D2 run
+  unless sapphire is charged >20% more per core. R2D2 needs ~4.2GB once plus
   ~0.4GB per rank (the workers share the checkpoints after the fork;
   `docs/csd3-speed.md`, round 18), so on CPU nodes the cores set the rank count.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the

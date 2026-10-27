@@ -5006,3 +5006,66 @@ reproduce by design. Round 98's section is corrected.
   `r2d2_threads` says which one it got.
 - A synchronous R2D2 A/B has to pass `--synchronous`: the bare
   `./ri search r2d2` is async.
+
+## Round 103 (diagnostic): R2D2 on `sapphire` against `icelake`
+
+**Question.** Round 84 found that a loaded sapphire core is ~6% *slower*
+than an icelake core for WSClean, so the default partition stayed
+`icelake`. The R2D2 U-Net, though, is bound by each core's weight stream
+(round 11), and sapphire has DDR5. Is R2D2 the other way round?
+
+**Probe.** `.probe/r103/run.sh`: N pinned copies of the real 32x32 U-Net
+(checkpoint N1, 124 MB of weights each, 1 thread), 4 x 30 forwards timed
+from a shared start. Icelake ran on this job (38 CPUs, all NUMA node 0,
+with the other half of the node busy). Sapphire ran as one 56-CPU job
+(`job.sh`, cpu-r-101).
+
+| copies | icelake ms/forward | sapphire ms/forward |
+| ---: | ---: | ---: |
+| 1 | 28.4 | 19.0 |
+| 19 / 28 | 41.3 (19) | 28.6 (28) |
+| 38 | 61.3 | 33.7 |
+| 56 | - | 43.9 |
+
+Per loaded core that is 16.3 forwards/s (icelake, 38) against 22.8
+(sapphire, 56), +40%, and per half node it is 2.1x.
+
+**Searches.** Async R2D2, nlive 150, 5 repeats, seed 4242, one rank per
+CPU, commit bce22a8. Rows `r103-*`.
+
+| run | partition, ranks | job CPUs per NUMA node | dead | evals/s | per core | request ms | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| icelake38 | icelake, 38 | 38/0 | 600 | 30.1 | 0.79 | 1161 | 0.01789 ± 0.00050 |
+| sapphire56 | sapphire, 56 | 54/2 | 600 | 45.3 | 0.81 | 1132 | 0.01780 ± 0.00054 |
+| ice-1, ice-2 | icelake, 38 | 38/0 | 400 | 29.3, 30.8 | 0.77, 0.81 | 1200, 1148 | 0.01725, 0.01590 |
+| sap-on1, on2 | sapphire, 56 | 20/36 | 400 | 54.2, 53.6 | 0.96 | 916, 921 | 0.01702, 0.01714 |
+| sap-off1, off2 (`R2D2_INTERLEAVE_WEIGHTS=0`) | sapphire, 56 | 20/36 | 400 | 47.7 (cold), 53.6 | 0.96 | 1026, 930 | 0.01698, 0.01704 |
+
+All log(Z)s agree within their errors. The runs are async, so their
+chains differ.
+
+**Learned.**
+- For R2D2 the partitions trade places. Half a sapphire node does 1.8x
+  the evaluations of half an icelake node (54 against 30 evals/s), and
+  about +20% per allocated core. For WSClean (round 84) it is +41% and
+  -5%. The request at one rank per CPU is ~0.92 s on sapphire against
+  ~1.16 s on icelake. `SBATCH_PARTITION=sapphire` (`--partition
+  sapphire`) is the faster R2D2 run whatever the deadline. Whether it is
+  also the cheaper one depends on the project's per-partition charge,
+  which round 84 could not read. The default stays `icelake` until that
+  charge is known.
+- The searches recover only half of the probe's per-core gap (+20%, where
+  the probe gave +40%). In the probe every copy owns its weights, first
+  touched locally. In a run, every rank streams the pool parent's one
+  shared copy, and that is the realistic case.
+- Round 99's interleave on a lopsided allocation: on 20/36 it is neutral
+  (53.6-54.2 against 53.6 warm). The 54/2 job (`sapphire56`) came in at
+  0.81 per core with a 1132 ms request, against 0.96 and ~920 ms on 20/36.
+  That fits half the weights being placed on a node that holds 2 of the
+  job's 56 CPUs, but that run also differs in dead count and node, so it
+  is not shown. An interleave restricted to nodes holding a fair share of
+  the job's CPUs is the follow-up, and it needs a 54/2-shaped allocation
+  to test. Slurm decides the shape, so record it with every result.
+- Every sapphire allocation in this round and round 84 shared its node
+  with other jobs (load 47-139 on 112 cores), so the gains above are what
+  a shared node gives.
