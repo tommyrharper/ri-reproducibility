@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 144).**
+**Where it stands (round 145).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -21,13 +21,14 @@ the Hetzner host.
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
-  -52% or worse, because the server cannot keep up). Shipped opt-in:
-  `R2D2_RUNTIME=onnx` runs the U-Net through ONNX Runtime, **+33% evals/s**
+  -52% or worse, because the server cannot keep up). The CPU default
+  since round 145: `R2D2_RUNTIME=onnx` runs the U-Net through ONNX Runtime, **+33% evals/s**
   end to end on a half icelake node (round 141; 1.5e-5 of the peak at
   worst, round 140). It runs without ORT's memory arena and is budgeted
   at 1 GB a rank (round 143). Run to convergence on two seeds (round 144)
   it matches torch's log(Z) within 0.25 sigma and its posterior, at +44%
-  evals/s. Open: making it the default (GPU, old `run.env`, first-run cost).
+  evals/s. `R2D2_RUNTIME=torch` brings torch back; GPU runs and runs
+  started before round 141 keep it ([round 145](#round-145-r2d2_runtimeonnx-is-the-cpu-default)).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6727,3 +6728,50 @@ checkpoints (~50 s, 3.1 GB).
 
 Rows: `r144-{torch,onnx}-{4242,4343}` in `benchmarks.jsonl` (clean tree at
 6b02d68). Probe: `.probe/r144/race.sh <seed>`. Run directories deleted.
+
+## Round 145: `R2D2_RUNTIME=onnx` is the CPU default
+
+Rounds 140-144 measured and validated ONNX Runtime for the CPU U-Net. This
+round makes it the default and settles the four open points from round 144.
+
+- **Default.** `run-nested-sampling-r2d2.sh` sets `R2D2_RUNTIME` to `onnx`
+  when `R2D2_DEVICE=cpu` and to `torch` when it is `cuda`, before
+  `rank-budget.sh` is sourced, so the 1 GB-a-rank onnx budget applies.
+  An explicit `R2D2_RUNTIME=torch` still wins.
+- **Old runs.** `./ri resume` on a `run.env` with no `R2D2_RUNTIME` line
+  (written before round 141, so torch) exports `R2D2_RUNTIME=torch` unless
+  the caller set one. Checked by sourcing a fake old and new `run.env`
+  through the same lines: old -> torch, new -> onnx.
+- **No PyPI.** If the one-off pip install of onnxruntime fails, the run warns
+  and runs its pool on torch instead of ending the search.
+- **Reproducibility.** onnx is not bit-identical to torch, so a synchronous
+  seeded search no longer reproduces an archived torch one. Set
+  `R2D2_RUNTIME=torch` to do that.
+
+ABAB on the half icelake node, 38 ranks x 1, nlive 100, num-repeats 5,
+400 dead, seed 4242. The A arms set `R2D2_RUNTIME=torch` and the B arms set
+nothing:
+
+| arm | runtime (from `run.env`) | evals | wall | evals/s | request | peak MB | log(Z) x1e-3 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 | torch | 6545 | 229 s | 28.6 | 1215 ms | 3977 | 16.97 +/- 0.88 |
+| B1 | onnx (default) | 5390 | 128 s | 42.0 | 800 ms | 7655 | 17.73 +/- 0.79 |
+| A2 | torch | 5929 | 194 s | 30.6 | 1149 ms | 3739 | 17.54 +/- 0.79 |
+| B2 | onnx (default) | 6921 | 154 s | 45.0 | 762 ms | 7401 | 16.31 +/- 1.27 |
+
+The default is **+47%** (43.5 against 29.6 evals/s mean), and both default
+arms beat both torch arms. This is in line with round 141 (+33%) and
+round 144 (+44%). log(Z) agrees within its errors. The per-worker peak is
+the 25 shared sessions counted in every worker's RSS (round 143), which shows
+that the default arms really did run onnx.
+
+B2's search finished, but its wrapper died at the end with `unexpected EOF`
+because the script was edited while bash was still reading it (the pip
+fallback went in during B2). Its row was written with `./ri bench record`.
+A later 150-dead search on the final script ran onnx by default (rc 0).
+The pip-failure fallback has not been exercised, because the cache is
+already installed here.
+
+Rows: `r145-{A1,B1,A2,B2}`, plus two warm-up-dominated 150-dead smoke rows
+`r145-default` and `r145-final`, in `benchmarks.jsonl`. Run directories
+deleted.

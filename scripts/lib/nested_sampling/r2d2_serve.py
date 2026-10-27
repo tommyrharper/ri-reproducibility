@@ -200,7 +200,7 @@ def patch_cuda_network() -> None:
 
 
 def r2d2_runtime() -> str:
-    """What runs a CPU U-Net forward: `torch` (the default) or `onnx` (R2D2_RUNTIME)."""
+    """What runs a CPU U-Net forward: `torch` or `onnx` (R2D2_RUNTIME; the run script defaults CPU to onnx)."""
     return os.environ.get("R2D2_RUNTIME", "torch").strip().lower() or "torch"
 
 
@@ -228,8 +228,9 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     MLAS does this float32 network in 26ms against torch's 39.6ms with 36
     forked workers sharing one copy (docs/csd3-speed.md, round 140); outputs
     differ by up to 1.5e-5 of the peak over 25 chained checkpoints, so it is
-    not bit-identical to torch and stays opt-in. Each checkpoint is exported
-    once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
+    not bit-identical to torch, but converged log(Z) agrees (round 144) and it
+    is the CPU default; R2D2_RUNTIME=torch keeps torch. Each checkpoint is
+    exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
     and its session built here, before the fork: one intra-op thread starts no
     pool threads, so it survives the fork and every worker shares its pages.
     A request running more than one torch thread (the tail of an async run)

@@ -19,6 +19,12 @@ case "${R2D2_DEVICE:=cpu}" in
   *) echo "FATAL: R2D2_DEVICE must be cpu or cuda, got '${R2D2_DEVICE}'" >&2; exit 1 ;;
 esac
 export R2D2_DEVICE
+# A CPU forward runs through ONNX Runtime unless R2D2_RUNTIME=torch: 33-44%
+# more evals/s, log(Z) within 0.25 sigma of torch's at convergence
+# (docs/csd3-speed.md, rounds 140-145). GPU runs keep torch. Set before
+# rank-budget.sh, which budgets onnx ranks larger.
+: "${R2D2_RUNTIME:=$([ "${R2D2_DEVICE}" = cpu ] && echo onnx || echo torch)}"
+export R2D2_RUNTIME
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
@@ -196,23 +202,31 @@ if [ "${R2D2_DEVICE}" = cuda ]; then
 fi
 # R2D2_RUNTIME=onnx runs the CPU U-Net through ONNX Runtime, ~34% faster a
 # forward but not bit-identical (patch_onnx_network in r2d2_serve.py,
-# docs/csd3-speed.md rounds 140-141). r2d2.sif has no onnxruntime, so it is
+# docs/csd3-speed.md rounds 140-141); the CPU default since round 145. r2d2.sif has no onnxruntime, so it is
 # pip-installed once into the work-dir cache - compute nodes reach PyPI - and
 # its exported checkpoints are cached beside it. numpy is dropped from the
-# install so the image's own is the one imported.
-case "${R2D2_RUNTIME:=torch}" in
+# install so the image's own is the one imported. A failed install (no PyPI)
+# runs the pool on torch rather than ending the search.
+case "${R2D2_RUNTIME}" in
   torch) ;;
   onnx)
     R2D2_ONNX_DIR="${_ri_cache}/r2d2-onnx"
     if [ ! -d "${R2D2_ONNX_DIR}/py/onnxruntime" ]; then
       mkdir -p "${R2D2_ONNX_DIR}"
       rm -rf "${R2D2_ONNX_DIR}/py.$$"
-      "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
-        --target "${R2D2_ONNX_DIR}/py.$$" onnxruntime==1.23.2 onnx==1.23.2
-      rm -rf "${R2D2_ONNX_DIR}/py.$$"/numpy "${R2D2_ONNX_DIR}/py.$$"/numpy-* "${R2D2_ONNX_DIR}/py.$$"/numpy.libs
-      mv -T "${R2D2_ONNX_DIR}/py.$$" "${R2D2_ONNX_DIR}/py" 2>/dev/null || rm -rf "${R2D2_ONNX_DIR}/py.$$"
+      if "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
+        --target "${R2D2_ONNX_DIR}/py.$$" onnxruntime==1.23.2 onnx==1.23.2; then
+        rm -rf "${R2D2_ONNX_DIR}/py.$$"/numpy "${R2D2_ONNX_DIR}/py.$$"/numpy-* "${R2D2_ONNX_DIR}/py.$$"/numpy.libs
+        mv -T "${R2D2_ONNX_DIR}/py.$$" "${R2D2_ONNX_DIR}/py" 2>/dev/null || rm -rf "${R2D2_ONNX_DIR}/py.$$"
+      else
+        rm -rf "${R2D2_ONNX_DIR}/py.$$"
+        echo "WARNING: could not pip-install onnxruntime; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
+        R2D2_RUNTIME=torch
+      fi
     fi
-    R2D2_POOL_FLAGS+=(--bind "${R2D2_ONNX_DIR}:/opt/r2d2-onnx")
+    if [ "${R2D2_RUNTIME}" = onnx ]; then
+      R2D2_POOL_FLAGS+=(--bind "${R2D2_ONNX_DIR}:/opt/r2d2-onnx")
+    fi
     ;;
   *) echo "FATAL: R2D2_RUNTIME must be torch or onnx, got '${R2D2_RUNTIME}'" >&2; exit 1 ;;
 esac

@@ -172,6 +172,11 @@ set -a
 . "${RUN_DIR}/run.env"
 set +a
 export OUTPUT_DIR="${RUN_DIR}"
+# A run.env from before round 141 has no R2D2_RUNTIME and was torch; without
+# this it would resume under the newer onnx default.
+if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_RUNTIME=' "${RUN_DIR}/run.env"; then
+  export R2D2_RUNTIME="${R2D2_RUNTIME:-torch}"
+fi
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"
