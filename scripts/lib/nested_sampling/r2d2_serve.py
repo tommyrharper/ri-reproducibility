@@ -206,8 +206,10 @@ def r2d2_runtime() -> str:
 
 # Where the run script binds onnxruntime and the exported checkpoints.
 ONNX_DIR = Path(os.environ.get("R2D2_ONNX_DIR", "/opt/r2d2-onnx"))
-# One session per R2D2 iteration, built in the pool parent and shared by fork.
+# One session per R2D2 iteration, built in the pool parent and shared by fork;
+# with per-node checkpoints, one such set per NUMA node.
 _ORT_SESSIONS: dict[int, object] = {}
+_NODE_ORT_SESSIONS: dict[int, dict[int, object]] = {}
 
 
 class OrtNet:
@@ -269,7 +271,28 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
                                   input_names=["x"], output_names=["y"],
                                   dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
             partial.replace(path)
-        _ORT_SESSIONS[cur_iter] = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
+
+    def build() -> dict[int, object]:
+        return {cur_iter: ort.InferenceSession(str(models / f"N{cur_iter}.onnx"), options,
+                                               providers=["CPUExecutionProvider"])
+                for cur_iter in range(1, num_iter + 1)}
+
+    # Where the torch checkpoints went, the sessions' weights go too: a set
+    # per NUMA node when load_checkpoints made one (enter_node swaps it in),
+    # else one set interleaved across the job's nodes (round 149).
+    if _NODE_CHECKPOINTS:
+        for node in _NODE_CHECKPOINTS:
+            bound = set_mempolicy(2, [node])  # MPOL_BIND
+            try:
+                _NODE_ORT_SESSIONS[node] = build()
+            finally:
+                if bound:
+                    set_mempolicy(0, [])
+        # Like _CHECKPOINT_CACHE, the parent keeps the last node's set.
+        _ORT_SESSIONS.update(_NODE_ORT_SESSIONS[node])
+    else:
+        with interleaved_pages():
+            _ORT_SESSIONS.update(build())
 
     optimiser = sys.modules["optimiser.R2D2"]
     upstream_load_net = optimiser.load_net
@@ -397,6 +420,9 @@ def enter_node(node: int, nodes: dict[int, list[int]]) -> None:
     os.sched_setaffinity(0, nodes[node])
     _CHECKPOINT_CACHE.clear()
     _CHECKPOINT_CACHE.update(_NODE_CHECKPOINTS[node])
+    if node in _NODE_ORT_SESSIONS:
+        _ORT_SESSIONS.clear()
+        _ORT_SESSIONS.update(_NODE_ORT_SESSIONS[node])
 
 
 def warm_imports() -> None:

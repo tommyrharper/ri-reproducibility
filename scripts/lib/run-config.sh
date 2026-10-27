@@ -187,14 +187,16 @@ ns_refuse_unmounted_run() {
 ns_warn_file_quota() {
   local project ndead need free
   command -v "${LFS:-lfs}" >/dev/null 2>&1 || return 0
-  project="$("${LFS:-lfs}" project -d "$1" 2>/dev/null | awk '{ print $1 }')"
+  # `|| true`: off Lustre (a /dev/shm tree) lfs fails, and under the run
+  # scripts' `set -e -o pipefail` that failure ended the search (round 149).
+  project="$("${LFS:-lfs}" project -d "$1" 2>/dev/null | awk '{ print $1 }' || true)"
   [ "${project:-0}" -gt 0 ] 2>/dev/null || return 0
   ndead="$4"
   [ "${ndead}" -gt 0 ] 2>/dev/null || ndead=$((9 * $2))
   need=$((4 * $3 * ndead))
   # Header, then: filesystem kbytes quota limit grace files quota limit grace.
   free="$("${LFS:-lfs}" quota -p "${project}" "$1" 2>/dev/null \
-    | awk 'NR > 2 && $8 + 0 > 0 { print $8 - $6; exit }')"
+    | awk 'NR > 2 && $8 + 0 > 0 { print $8 - $6; exit }' || true)"
   [ -n "${free}" ] && [ "${need}" -gt "${free}" ] || return 0
   echo "WARNING: this run may make ~${need} files (nlive $2, num_repeats $3), and" \
     "its project quota has ${free} left: a full quota kills it with EDQUOT. Delete" \
@@ -375,6 +377,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "$(quota_warns '' 5000 -1)" = 0 ] || { echo "FAIL: no project quota must stay quiet"; exit 1; }
   [ "$(LFS="${_dir}/missing" ns_warn_file_quota "${_dir}" 5000 15 -1 2>&1 | grep -c EDQUOT)" = 0 ] \
     || { echo "FAIL: no lfs must stay quiet"; exit 1; }
+  # Not inside `||` or `[ ]`, which would suspend `set -e`: lfs failing (off
+  # Lustre) must not end the caller.
+  printf '#!/bin/sh\nexit 25\n' >"${_dir}/lfs-fails"
+  chmod +x "${_dir}/lfs-fails"
+  _reached="$(set -e -o pipefail; LFS="${_dir}/lfs-fails" ns_warn_file_quota "${_dir}" 150 15 -1; echo reached)"
+  [ "${_reached}" = reached ] || { echo "FAIL: lfs failing off Lustre must not end the run"; exit 1; }
 
   rm -rf "${_dir}"
   echo "run-config self-check passed"

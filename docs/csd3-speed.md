@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 148).**
+**Where it stands (round 149).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -33,6 +33,10 @@ the Hetzner host.
   prep (torch element-wise ops, FINUFFT) ~25% ([round 146](#round-146-diagnostic-where-an-onnx-default-r2d2-workers-cpu-goes)).
   Briggs weights by `np.bincount` (round 148) cut 26 to 10 ms of that,
   byte-identical, ~1.5% end to end.
+  On balanced multi-socket jobs the ORT sessions are built once per
+  socket like the torch copies: a whole icelake node went from 59.2 to
+  **80.5 evals/s (+36%)** ([round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36));
+  before it, onnx ran a whole node at torch's rate.
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6897,3 +6901,83 @@ it is byte-identical and costs nothing.
   25 s).
 
 Run directories deleted.
+
+## Round 149: ONNX Runtime sessions per NUMA node on whole nodes, +36%
+
+**Question.** Round 106 gives a balanced multi-socket job one torch
+checkpoint copy per socket and pins each worker to its socket. Since round
+145 the CPU forward runs through ONNX Runtime, whose sessions hold their
+own weights, and `patch_onnx_network()` built one set with no memory
+policy: first touch put all of it on the pool parent's socket. Round 146
+found the ORT forward weight-bandwidth bound, so on a whole node half the
+workers stream every weight across the interconnect.
+
+**Probe** (`.probe/r149/forkort.py`, round 106's pool shape for ORT: the
+parent builds the 25 sessions, forks one 1-thread worker per CPU, each
+runs 200 forwards cycling them). On this loop's half node (38 CPUs, all
+on node 0), sessions bound to the *other* node made a forward 46-57 ms
+against 27-29 ms local. On an exclusive whole icelake node (cpu-q-100,
+job 39336852), 76 workers, two passes each:
+
+| sessions | ms per forward | parent pages N0 / N1 |
+| --- | ---: | --- |
+| one set, first touch (shipped) | 32.99 / 33.05 | all on one node |
+| one set, interleaved | 32.78 / 33.09 | half / half |
+| one set per node, workers pinned to theirs | **28.35 / 28.20** (-14%) | 903k / 867k |
+
+Interleaving alone gains nothing; locality does. All 456 workers'
+outputs were identical to the parent's.
+
+**Change.** `patch_onnx_network()` builds the sessions where
+`load_checkpoints()` put the torch copies: one set per node under
+`MPOL_BIND` when it made per-node copies (`R2D2_WEIGHTS_PER_NODE`), else
+one set inside `interleaved_pages()`. `enter_node()`, which already pins a
+forked worker and swaps its node's checkpoints in, now swaps its node's
+sessions in too. Same models, same options, so the same forwards; a half
+node on one socket (this loop's allocation) takes the old path unchanged.
+
+**Measured.** One exclusive whole icelake node (cpu-q-103, job 39339396),
+76 x 1 async with the onnx default, nlive 200, 5 repeats, 1000 dead, seed
+4242. Both arms are `git archive 01d0bd5` in `/dev/shm`; the new arm has
+this round's `r2d2_serve.py`. Order old, new, new, old:
+
+| arm | sessions | evals | evals/s | request ms | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| old-a | one set, first touch | 16,796 | 55.4 | 1278 | 10,288 | 0.01792 ± 0.00036 |
+| new-a | per node | 15,097 | 80.4 | 864 | 13,538 | 0.01803 ± 0.00034 |
+| new-b | per node | 15,820 | 80.6 | 851 | 13,678 | 0.01801 ± 0.00035 |
+| old-b | one set, first touch | 14,673 | 63.0 | 1115 | 10,155 | 0.01802 ± 0.00035 |
+
+**+36% evals/s** (80.5 against 59.2), request -28% (857 against 1197 ms),
+log(Z)s agree within their errors (async, so not identical). The shipped
+onnx default had been running a whole icelake node at about torch's rate
+(56.7 evals/s, round 107): its +33-47% half-node gain (rounds 141-145) was
+lost to remote weight reads, and this round gets it back. Cost: the
+second session set, ~3.4 GB more peak in the pool parent (it is
+`NS_R2D2_SHARED_MB`'s job, and whole-node memory never clamps the ranks;
+comment in `rank-budget.sh`).
+
+**Fixed on the way: a search whose output dir is not on Lustre died at
+start-up.** `ns_warn_file_quota` assigned `$(lfs project -d ... | awk)`
+under the run scripts' `set -e -o pipefail`; off Lustre (a `/dev/shm`
+tree, as both arms here) `lfs` fails with ENOTTY and the search exited 25
+with an empty log. That killed job 39336852's four search arms. Both `lfs`
+calls now end in `|| true`, and `run-config.sh --self-check` has a case
+with an `lfs` that fails, run outside `||` so `set -e` applies (it exits
+25 on the old code).
+
+**Learned.**
+- Under onnx the per-node torch copies of round 106 no longer did their
+  job: workers read ORT's weights, not torch's. Any new runtime that holds
+  its own weights must be placed like the torch copies.
+- The other socket's weights cost an ORT forward 60-95% when 36 workers
+  read them; on a whole node, where half the workers do, the request was
+  ~40% longer. The pool probe understates the search effect (-14% against
+  -28% a request), since a search also has the visibility work and
+  MeqTrees contending for the same memory.
+- Not run: a whole sapphire node (112 ranks, round 106's +19% shape) and
+  `NS_SLURM_SOCKETS=2` half nodes, which take the same path.
+
+Rows: `r149-old-a`, `r149-new-a`, `r149-new-b`, `r149-old-b` in
+`benchmarks.jsonl`. Run directories were in the job node's `/dev/shm` and
+are gone.

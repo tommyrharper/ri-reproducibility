@@ -387,7 +387,8 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   whole icelake and sapphire nodes (`docs/csd3-speed.md`, round 105).
   On such a node the R2D2 pool loads one checkpoint copy per socket and
   pins each worker to its socket (+19% on a whole sapphire node, round 106; +21% on a whole icelake
-  node, round 107);
+  node, round 107), and builds the ONNX Runtime sessions once per socket the
+  same way (+36% on a whole icelake node, round 149);
   `R2D2_WEIGHTS_PER_NODE=0` keeps one shared copy. A sized (`--mpi-procs`)
   R2D2 job can land on one socket, which turns this off; on one sapphire
   node, 56 CPUs split 28/28 ran 75 evals/s against 54 on one socket (+37%,

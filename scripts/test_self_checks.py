@@ -39,6 +39,7 @@ HOST_RUNNABLE = {
         "self_check_serve_fifo",
         "self_check_serve_pool",
         "self_check_serve_reply_stream",
+        "self_check_worker_nodes",
     ),
 }
 
@@ -74,6 +75,7 @@ IMAGE_ONLY = {
         "self_check_worker_death_is_not_scored",
     ),
     "polychord_wsclean": ("self_check_failure_record_persistence",),
+    "r2d2_serve": ("self_check_imaging_weights",),
 }
 
 MODULES = sorted(set(HOST_RUNNABLE) | set(IMAGE_ONLY))

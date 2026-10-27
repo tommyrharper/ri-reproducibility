@@ -11,7 +11,10 @@
 # the run pays them once (SHARED) and each rank only its own working set
 # (docs/csd3-speed.md, round 18). On a balanced multi-socket job it loads one
 # copy per NUMA node (R2D2_WEIGHTS_PER_NODE): 6.8GB peak on two, still inside
-# SHARED (round 106).
+# SHARED (round 106). Under onnx each node also gets its own ~3.5GB of session
+# weights (round 149), ~14GB on two: past SHARED, but that only happens on
+# balanced multi-socket jobs, whose memory (e.g. 256GB for 76 ranks) never
+# clamps the rank count.
 NS_R2D2_SHARED_MB="${NS_R2D2_SHARED_MB:-8000}"
 NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-600}"
 # R2D2_RUNTIME=onnx: each worker's ONNX Runtime buffers add ~0.4GB of heap,
