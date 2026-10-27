@@ -446,6 +446,7 @@ def warm_imports() -> None:
             patch_nufft_plans()
             patch_normal_operator()
             patch_imaging_weights()
+            patch_request_io()
             patch_checkpoint_loading()
             patch_net_reuse()
             if r2d2_device() == "cuda":
@@ -508,6 +509,53 @@ def patch_imaging_weights() -> None:
     module.gen_imaging_weights = gen_imaging_weights
 
 
+_FITS_HEADERS: dict[tuple, bytes] = {}
+
+
+def patch_request_io() -> None:
+    """Write a request's four FITS images and parse its config without astropy's
+    and PyYAML's pure-Python paths (~1.3ms an image, ~1.2ms a config, solo).
+
+    The FITS header depends only on shape and dtype, so astropy writes it once
+    per shape and every later image is that header, the big-endian data and
+    the zero padding: byte-identical to `fits.writeto`. Anything but a plain
+    float array to a fresh path with overwrite=True goes to upstream. The
+    config goes through libyaml's CSafeLoader, which reads the run's config
+    to the same dict. R2D2_FAST_IO=0 keeps upstream.
+    """
+    if os.environ.get("R2D2_FAST_IO", "1") == "0":
+        return
+    import io
+
+    import numpy as np
+    import yaml
+    from astropy.io import fits
+
+    upstream_writeto = fits.writeto
+
+    def writeto(filename, data, header=None, output_verify="exception", overwrite=False, checksum=False):
+        if (header is not None or checksum or not overwrite or output_verify != "exception"
+                or not isinstance(filename, (str, os.PathLike)) or not isinstance(data, np.ndarray)
+                or data.dtype not in (np.float32, np.float64) or not 1 <= data.ndim <= 3):
+            return upstream_writeto(filename, data, header, output_verify, overwrite, checksum)
+        key = (data.shape, data.dtype.str)
+        padding = -data.nbytes % 2880
+        head = _FITS_HEADERS.get(key)
+        if head is None:
+            buffer = io.BytesIO()
+            upstream_writeto(buffer, np.zeros(data.shape, data.dtype))
+            head = _FITS_HEADERS[key] = buffer.getvalue()[: -(data.nbytes + padding)]
+        with open(filename, "wb") as handle:
+            handle.write(head)
+            handle.write(data.astype(data.dtype.newbyteorder(">"), copy=False).tobytes())
+            handle.write(bytes(padding))
+
+    writeto.upstream = upstream_writeto
+    fits.writeto = writeto
+    if getattr(yaml, "__with_libyaml__", False):
+        yaml.safe_load = lambda stream: yaml.load(stream, Loader=yaml.CSafeLoader)
+
+
 def patch_nufft_plans() -> None:
     """Cache CPU FINUFFT plans; unsupported devices and batches use upstream."""
     import finufft
@@ -549,6 +597,7 @@ def patch_nufft_plans() -> None:
                     upsampfac=2.0,
                     modeord=0,
                     nthreads=nthreads,
+                    spread_sort=nufft_sort(),
                 )
                 _NUFFT_PLAN_CACHE[cache_key] = made
             # Workers process one request at a time, so one shared plan can be
@@ -585,6 +634,14 @@ def patch_nufft_plans() -> None:
 NORMAL_KERNEL_EPS = 1e-9
 
 
+def nufft_sort() -> int:
+    """FINUFFT's spread_sort for a request's two type-1 NUFFTs. 0 skips the bin sort,
+    which on R2D2's tiny grids costs more than it saves: -18% a call under load, and
+    images within one float32 ulp of the peak (docs/csd3-speed.md, round 153).
+    R2D2_NUFFT_SORT=2 is upstream's."""
+    return int(os.environ.get("R2D2_NUFFT_SORT", "0"))
+
+
 class _Deferred:
     def __init__(self, image):
         self.image = image
@@ -617,7 +674,7 @@ def normal_operator(op):
     # modeord 0 puts mode m at index m + N, so ifftshift puts d at index d mod 2N.
     kernel = finufft.nufft2d1(points[0], points[1], strengths, (2 * rows, 2 * cols),
                               eps=NORMAL_KERNEL_EPS, isign=-1, modeord=0,
-                              nthreads=torch.get_num_threads())
+                              nthreads=torch.get_num_threads(), spread_sort=nufft_sort())
     spectrum = np.fft.rfft2(np.fft.ifftshift(kernel.real))
     dtype = op._dtype
 
@@ -1068,6 +1125,50 @@ def self_check_imaging_weights() -> None:
     print("r2d2 imaging weights self-check passed")
 
 
+def self_check_request_io() -> None:
+    import tempfile
+
+    try:
+        import numpy as np
+        import yaml
+        from astropy.io import fits
+    except ImportError:
+        print("r2d2 request io self-check skipped: no astropy")
+        return
+
+    upstream_writeto, upstream_safe_load = fits.writeto, yaml.safe_load
+    patch_request_io()
+    assert getattr(fits.writeto, "upstream", None) is upstream_writeto, "R2D2_FAST_IO must patch by default"
+    rng = np.random.default_rng(0)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            arrays = [rng.standard_normal((32, 32)), rng.standard_normal((32, 32)).astype(np.float32),
+                      np.zeros((32, 32)), rng.standard_normal((7, 5)), rng.standard_normal(3).astype(np.float32),
+                      rng.standard_normal((32, 32)).T, np.array([[np.nan, np.inf], [-np.inf, -0.0]]),
+                      rng.standard_normal((32, 32)).astype(">f8")]
+            for index, array in enumerate(arrays * 2):
+                fast, slow = Path(tmp) / f"fast{index}.fits", Path(tmp) / f"slow{index}.fits"
+                slow.write_bytes(b"stale" * 9000)
+                fast.write_bytes(b"stale" * 9000)
+                upstream_writeto(slow, array, overwrite=True)
+                fits.writeto(str(fast) if index % 2 else fast, array, overwrite=True)
+                assert fast.read_bytes() == slow.read_bytes(), f"FITS image {index} must be byte-identical"
+            # Upstream's own refusals stay upstream's.
+            try:
+                fits.writeto(fast, arrays[0])
+            except OSError:
+                pass
+            else:
+                raise AssertionError("an existing file without overwrite must still be refused")
+        config = "\n".join(["data_file: /tmp/a.mat", "im_dim_x: 32", "data_weighting: True",
+                             "weight_robustness: -0.5", "target_dynamic_range: 1e+4", "series: R2D2",
+                             "imweight_name: nWimag", "num_iter: 15", "ncpus: 1", "gdth_file: null"])
+        assert yaml.safe_load(config) == upstream_safe_load(config), "the config must parse to the same dict"
+    finally:
+        fits.writeto, yaml.safe_load = upstream_writeto, upstream_safe_load
+    print("r2d2 request io self-check passed")
+
+
 def self_check_lazy_utils() -> None:
     import tempfile
 
@@ -1202,6 +1303,7 @@ if __name__ == "__main__":
         self_check_nufft_plan_reuse()
         self_check_normal_operator()
         self_check_imaging_weights()
+        self_check_request_io()
         self_check_lazy_utils()
         self_check_checkpoint_cache()
         self_check_serve_reply_stream()

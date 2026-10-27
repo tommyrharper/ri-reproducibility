@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 149).**
+**Where it stands (round 160; R2D2 speed work stopped, see [the final status](#round-160-final-status-stop-condition-met)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -29,14 +29,20 @@ the Hetzner host.
   it matches torch's log(Z) within 0.25 sigma and its posterior, at +44%
   evals/s. `R2D2_RUNTIME=torch` brings torch back; GPU runs and runs
   started before round 141 keep it ([round 145](#round-145-r2d2_runtimeonnx-is-the-cpu-default)).
-  In a search, ORT is 68% of worker CPU and the visibility-sized data
+  In a search, ORT was 68% of worker CPU and the visibility-sized data
   prep (torch element-wise ops, FINUFFT) ~25% ([round 146](#round-146-diagnostic-where-an-onnx-default-r2d2-workers-cpu-goes)).
   Briggs weights by `np.bincount` (round 148) cut 26 to 10 ms of that,
-  byte-identical, ~1.5% end to end.
+  byte-identical, ~1.5% end to end. A request's four FITS writes and its
+  config parse skip astropy and PyYAML (round 151, byte-identical, ~6 ms).
+  Both NUFFTs skip FINUFFT's bin sort (round 153, ~6 ms a request under load).
+  After those, ORT is 78% of worker CPU and nothing outside it is above 4%
+  (FINUFFT 8% in all), so that side is closed ([round 158](#round-158-diagnostic-an-r2d2-workers-cpu-after-rounds-148-153)).
   On balanced multi-socket jobs the ORT sessions are built once per
   socket like the torch copies: a whole icelake node went from 59.2 to
   **80.5 evals/s (+36%)** ([round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36));
-  before it, onnx ran a whole node at torch's rate.
+  before it, onnx ran a whole node at torch's rate. A whole sapphire node
+  now runs **117 evals/s**, +40% over the pre-149 onnx default and +22%
+  over torch ([round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40)).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -53,6 +59,9 @@ the Hetzner host.
   nothing else in it is above ~2% (round 83). The biggest lever left for
   production is not code: a run on the stale shipped SIF (0001-0006) is
   29% slower, and a search's job now patches it itself (round 94).
+  One 36-rank search runs 253 evals/s, +11% over two 18-rank searches
+  raced on the same CPUs, and a whole sapphire node (112 ranks) runs
+  ~743 evals/s (round 152).
 - **Hardware.** Half a sapphire node runs +41% more WSClean evaluations
   than half an icelake node (round 84), and about the same per core.
 
@@ -6981,3 +6990,525 @@ with an `lfs` that fails, run outside `||` so `set -e` applies (it exits
 Rows: `r149-old-a`, `r149-new-a`, `r149-new-b`, `r149-old-b` in
 `benchmarks.jsonl`. Run directories were in the job node's `/dev/shm` and
 are gone.
+
+## Round 150 (validation): round 149 on a whole sapphire node, +40%
+
+**Question.** Round 149 was measured on a whole icelake node. Production
+R2D2 runs whole sapphire nodes (112 ranks, round 106), where the shipped
+onnx default had never been compared against its own per-node sessions
+or against torch.
+
+**Measured.** One exclusive sapphire node (cpu-r-100, job 39343297; 2
+sockets, 2 NUMA nodes, 8480+), 112 x 1 async with the defaults, nlive 200,
+5 repeats, 1000 dead, seed 4242. Both trees are `git archive 66bdccd` in
+`/dev/shm`. The old arms have `r2d2_serve.py` from `01d0bd5` (pre-149), and
+the torch arm is the new tree with `R2D2_RUNTIME=torch`. Order old, new,
+new, old, torch:
+
+| arm | ORT sessions | evals | evals/s | ms per eval | peak MB | parent pages N0 / N1 | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| old-a | one set, first touch | 14,161 | 73.0 | 1493 | 10,163 | 1686k / 792k | 0.01778 ± 0.00038 |
+| new-a | per node | 14,779 | 117.2 | 918 | 13,422 | 1657k / 1665k | 0.01780 ± 0.00037 |
+| new-b | per node | 14,821 | 116.7 | 921 | 13,629 | 1644k / 1686k | 0.01785 ± 0.00037 |
+| old-b | one set, first touch | 18,165 | 93.3 | 1166 | 10,349 | 822k / 1658k | 0.01743 ± 0.00046 |
+| torch | (per-node torch copies) | 16,030 | 95.7 | 1130 | 6,718 | 842k / 765k | 0.01705 ± 0.00048 |
+
+**+40% evals/s** against the pre-149 onnx default (116.9 against 83.2),
+and **+22% against torch** (95.7 here, 103.5 in round 106 on another
+node). The log(Z)s agree within their errors (async). Peak memory is
++3.3 GB in the pool parent, as on icelake. With per-node sessions a whole
+sapphire node now runs **117 evals/s**, up from round 115's 103.5, the
+previous production best.
+
+**Learned.**
+- The old arms differ by 28% (73.0 against 93.3), and their page counts
+  show why: the single ORT set lands on whichever socket the pool parent
+  first touched (node 0 in old-a, node 1 in old-b), and what that socket
+  shares with the busier half of the job varies run to run. Per-node
+  sessions removed that spread as well (117.2 against 116.7).
+- Before round 149, the onnx default on a whole sapphire node was *slower*
+  than torch (83 against 96-104 evals/s). Rounds 141-145's half-node gain
+  had never reached production shape until round 149.
+- Simulate is 72-74 ms of a ~920 ms evaluation (8%) in the new arms. The
+  request is still the evaluation.
+
+Rows: `r150-old-a`, `r150-new-a`, `r150-new-b`, `r150-old-b`, `r150-torch`
+in `benchmarks.jsonl`. Their `commit` is 66bdccd, with `dirty` marking the
+old arms' swapped-in `r2d2_serve.py`. The run directories were in the job
+node's `/dev/shm` and are gone.
+
+## Round 151: a request's FITS writes and config parse without astropy and PyYAML
+
+**Change.** `patch_request_io()` in `r2d2_serve.py`. Each request writes
+four 32x32 FITS images (`dirty_normalised`, `PSF`, the model and the
+residual) through astropy's `fits.writeto`, and parses its YAML config
+with PyYAML's pure-Python `safe_load`. For a fixed shape and dtype the
+FITS header never changes, so astropy now writes it once per shape into
+a buffer. Every later image is that header, then the big-endian data,
+then zero padding. Anything other than a plain native float32 or float64
+array written to a path with `overwrite=True` goes to upstream. The
+config goes through libyaml's `CSafeLoader`, which r2d2.sif ships.
+`R2D2_FAST_IO=0` turns both off.
+
+**Byte-identical.** The new self-check `self_check_request_io` compares
+the bytes against upstream's `writeto` for float32 and float64, zeros,
+NaN/inf/-0, odd shapes, a transposed array, and str and Path targets
+over a stale longer file. It also checks that upstream still refuses an
+existing file without overwrite, and that the config parses to the same
+dict. It passes inside `r2d2.sif`. The run's own config, from
+`write_r2d2_config`, parses equal with the same value types (23 keys).
+
+**Stage.** In-process, pinned to one CPU, 250 requests' worth, 3 passes:
+
+| stage | upstream | patched |
+| --- | ---: | ---: |
+| four FITS writes (2 x float32, 2 x float64, 32x32) | 4.90 ms | 0.053 ms |
+| config parse | 1.32 ms | 0.145 ms |
+
+That is ~6 ms off a ~430 ms solo request (~1.4%).
+
+**End to end.** Interleaved A/B/A/B/A/B, 38 x 1, nlive 100, 5 repeats,
+400 dead, seed 4242, onnx default, half icelake node (cpu-q-228). Rows
+`r151-A1`..`r151-B3`. Both arms ran the same dirty tree, and only
+`R2D2_FAST_IO` (not recorded in `settings`) separates them:
+
+| arm | request IO | evals/s | request ms | simulate ms | log(Z) x1e-3 |
+| --- | --- | ---: | ---: | ---: | --- |
+| A1 | upstream | 35.45 | 981.8 | 46.8 | 17.6 +/- 0.8 |
+| B1 | patched | 44.73 | 761.3 | 45.9 | 17.6 +/- 0.8 |
+| A2 | upstream | 46.53 | 734.2 | 44.5 | 17.7 +/- 0.7 |
+| B2 | patched | 47.05 | 726.2 | 44.9 | 17.5 +/- 0.8 |
+| A3 | upstream | 46.67 | 731.9 | 43.0 | 17.6 +/- 0.8 |
+| B3 | patched | 47.71 | 720.3 | 42.2 | 16.7 +/- 1.0 |
+
+A1 was the first search on a node that had been idle. It ran 28% slower
+than every other arm, and slower than round 148's upstream arms on the
+same host (~45 evals/s), which no 6 ms change can explain. Without it,
+the two clean pairs give +1.1% and +2.2% evals/s and a request 733.0 to
+723.3 ms (-1.3%), the size the stage timing predicts. That is inside the
+~5% noise, so as in round 148 the end-to-end run shows no regression,
+and the stage timing plus byte identity is the evidence. log(Z) agrees
+in all six arms.
+
+**Learned.**
+- The first search after an idle spell can run ~25% slow, which is a
+  warm-up, not an effect of the change. Put a throwaway arm first, or
+  drop the first arm when it is an outlier against the arm after it of
+  the same kind.
+- The PSF image is written on every request and then pruned (`PRUNED_ARTEFACTS`).
+  Writing it now costs ~13 us, so dropping it is not worth changing
+  what a failed evaluation keeps.
+- After rounds 146-151, a solo request has nothing left outside ORT and
+  FINUFFT above ~1%.
+
+Run directories deleted.
+
+## Round 152 (diagnostic): one WSClean search against two raced on the same CPUs
+
+**Question.** No WSClean search has been measured above 38 ranks, and A/Bs
+here race two searches on one allocation (round 135). Does one search
+scale over its allocation as well as two smaller ones sharing it, or does
+something per search (PolyChord's root, its pools, its records) stop it?
+
+**Run.** This loop's half icelake node (cpu-q-228, 38 CPUs), `git archive
+2736358` in `/dev/shm`, the patched 0001-0017 SIF from the job cache, 15
+repeats, seed 4242. Arms are one 36-rank search (nlive 200, 1200 dead)
+against two 18-rank searches launched 2 s apart (nlive 100, 600 dead
+each), after a throwaway warm-up. Order single, pair, single, pair. Script:
+`.probe/r152/local.sh`.
+
+| arm | evals/s | ms per eval | simulate | `wsclean` binary | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| single-a | **253.7** | 134.3 | 21.9 ms | 111.3 ms | 0.09700 ± 0.00044 |
+| pair-a (112.6 + 120.9) | 233.5 | 147.4 / 137.4 | 24.2 / 22.2 ms | 122.0 / 114.0 ms | 0.09666 / 0.09643 ± 0.0007 |
+| single-b | **252.7** | 134.7 | 22.0 ms | 111.6 ms | 0.09616 ± 0.00067 |
+| pair-b (110.7 + 109.6) | 220.3 | 150.0 / 151.0 | 24.9 / 24.3 ms | 123.9 / 125.5 ms | 0.09704 / 0.09669 ± 0.0007 |
+
+**Learned.**
+- One 36-rank search does **+11%** more evaluations than two 18-rank
+  searches on the same CPUs (253.2 against 226.9 evals/s, both singles
+  above both pairs). Every stage is slower in the pairs, the binary by
+  3-13%. Idle is 0.03% in all arms, so this is the evaluation, not
+  PolyChord. Nothing per search limits WSClean at 36 ranks.
+- 253 evals/s is the best 36-rank WSClean figure so far (round 89: ~250).
+- A raced pair understates what each tree gets alone, by ~10% here. That
+  is fine for a relative A/B, but absolute rates from raced arms are low.
+- log(Z) agrees across all six arms.
+- Whole sapphire node, read in iteration 153: job 39351719 (`.probe/r152/job.sh`,
+  cpu-r-14, exclusive, 2 x 56 Xeon 8480+) ran a 112-rank single search
+  (nlive 600, 3600 dead) twice: **736.9 and 749.1 evals/s**, 145.9 and
+  143.2 ms an evaluation, simulate 30.4/30.1 ms, binary 114.2/111.8 ms,
+  idle 0.06%, log(Z) 0.09713 and 0.09659 (+/- 0.0003). That is ~2.9x
+  the 36-rank half icelake figure, and the best WSClean figure for one
+  node. The pair arms (2 x 56, nlive 300, 1800 dead) are **not usable**.
+  In both pairs, the second search's startup reaper (`ns_reap_leaked_sidecars`)
+  logged "killing worker pool(s) left behind by a run that is gone" and
+  killed the first search's wsclean pool 16 s after its manifest, while its
+  ranks were running. The first search's ranks died ("no wsclean-zygote
+  pool"), and `run_with_retries` resumed them after ~4.5k evaluations, so
+  they recorded no row. The second searches alone ran 415.0 and 413.1
+  evals/s (log(Z) 0.09683, 0.09700), but on CPUs the first search was
+  partly idle on, so they are not a pair rate. This is round 135's symptom
+  again, with `.launcher.pid` now renamed into place. Both of the reaper's
+  liveness tests must have failed: `pgrep` of the first run's rank
+  pattern, and `kill -0` of its launcher. The 36-rank pairs on this loop's
+  node did not hit it. The cause was traced and fixed in
+  [round 154](#round-154-the-startup-reaper-no-longer-kills-a-raced-searchs-pool):
+  the reaper read a worker that had just exec'd as a pool.
+
+Rows: `r152-lsingle-a/b`, `r152-lhalf-a1/a2/b1/b2`, and from the sapphire job
+`r152-single-a/b` and `r152-half-a2/b2`, in `benchmarks.jsonl`
+(commit set by hand, since an archived tree has no `.git`). Run
+directories deleted.
+
+## Round 153: FINUFFT's bin sort skipped for a request's two NUFFTs
+
+**Question.** Round 146 put FINUFFT at 12% of an onnx R2D2 worker's CPU
+in a search, sorting included (`indexSort` 1.4%, `spreadSorted` 3.5%). A
+request runs two type-1 NUFFTs over the same ~60k-330k points: the normal
+kernel (2N = 64 modes, eps 1e-9, width 10) and the adjoint dirty image
+(N = 32, eps 1e-6). Both fine grids are tiny (128x128 and 64x64,
+256 KB and 64 KB as complex128) and fit in L2, so the bin sort that
+FINUFFT does to keep spreading cache-local buys nothing. Does it cost
+something?
+
+**Stage.** `.probe/r153/fin.py`: `finufft.nufft2d1` (2.5.1, inside
+`r2d2.sif`) on the uv points of 24 real request `.mat` files (mean 141k
+points), 1 thread, interleaved, 4 passes:
+
+| call | `spread_sort` 2 (default) | 0 (no sort) | 1 (always) | relative difference at 0 |
+| --- | ---: | ---: | ---: | --- |
+| kernel, 64 modes, eps 1e-9, solo | 13.31 ms | **11.22 ms** | 13.32 ms | 4.3e-15 |
+| adjoint, 32 modes, eps 1e-6, solo | 9.39 ms | **7.59 ms** | 9.40 ms | 2.5e-12 |
+| kernel, 36 pinned copies at once | 17.72 ms | **14.55 ms** | 17.72 ms | |
+| adjoint, 36 pinned copies at once | 13.09 ms | **10.37 ms** | 13.12 ms | |
+
+So FINUFFT already sorts these, and not sorting is 16-21% faster per call
+solo and under a full allocation's load. `spread_kerevalmeth=0` gives the
+same bits and times as the default (2.5.1 ignores it).
+
+**Change.** `r2d2_serve.py` passes `spread_sort=nufft_sort()` to both:
+the cached adjoint `Plan` (`patch_nufft_plans`) and the normal kernel
+(`normal_operator`). `R2D2_NUFFT_SORT` defaults to 0, and
+`R2D2_NUFFT_SORT=2` restores upstream. `run-nested-sampling-r2d2.sh`
+passes the variable into the pool. Like the rest of `r2d2_serve.py` it
+lives in the bound tree, so no rebuild is needed.
+
+**Real requests.** `scripts/probe_r2d2_request.py` on 48 real `.mat`
+files, onnx, 1 thread, the two arms in parallel on CPUs 20 and 22, each
+with its own input copy (the probe writes `cfg.yaml` beside the `.mat`,
+so two arms sharing one input directory cross their outputs;
+`.probe/r153/solo.sh`). FINUFFT goes from 33.0 to 28.6 ms a request.
+`setpts`, where the adjoint plan sorts, goes from 2.3 to 0.4 ms, and the
+kernel from 20.0 to 17.7 ms. The request wall goes from 379.3 to 376.8
+ms (-0.6%). Of 192 output images, 102 are bit-identical: the PSF and
+the dirty image all are, the model differs by at most 1.2e-7 of its
+peak (about one float32 ulp), and the residual by 1.5e-6 of its own,
+much smaller, peak. ORT was accepted at 1.5e-5 (round 140).
+`./ri self-check r2d2-serve` passes in `r2d2.sif`, including the
+normal-operator check against upstream's NUFFTs (1e-5) and the
+nufft-plan check.
+
+**End to end.** A throwaway warm-up arm W, then interleaved A/B/A/B/A/B,
+38 x 1, nlive 100, 5 repeats, 400 dead, seed 4242, onnx default, this
+loop's half icelake node (cpu-q-228). Only `R2D2_NUFFT_SORT` (not in
+`settings`) separates the arms. Script: `.probe/r153/abab.sh`.
+
+| arm | sort | evals/s | request ms | simulate ms | idle | log(Z) x1e-3 |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| W | 2 | 44.41 | 741.2 | 43.5 | 0.15% | 17.7 +/- 0.8 |
+| A1 | 2 | 43.83 | 723.9 | 40.5 | 0.16% | 17.5 +/- 0.8 |
+| B1 | 0 | (9.02) | 697.7 | 55.3 | 77% | 17.6 +/- 0.8 |
+| A2 | 2 | 43.94 | 775.0 | 50.0 | 0.09% | 17.1 +/- 0.8 |
+| B2 | 0 | 44.34 | 696.0 | 37.8 | 0.09% | 17.6 +/- 0.8 |
+| A3 | 2 | 47.64 | 719.6 | 42.7 | 0.09% | 16.9 +/- 0.9 |
+| B3 | 0 | 47.36 | 724.0 | 44.2 | 0.08% | 16.9 +/- 1.0 |
+
+B1's rate does not measure this change. Its PolyChord root stalled for
+~505 s between 300 and 500 dead: every one of the 37 workers logged
+"Inefficient MPI parallelisation", with 482-514 s waiting against
+135-166 s slicing. Its evaluations ran at the normal rate (698 ms a
+request), and it finished with an agreeing log(Z). Nothing in this change
+runs on the root. Run directories are deleted at the end of each arm, so
+the cause was not traced. The root writes its resume and posterior files
+to Lustre, and a Lustre stall there is the likeliest cause.
+
+**Learned.**
+- The two clean pairs give +0.9% and -0.6% evals/s, and all three pairs
+  give a request of 739.5 against 705.9 ms (-4.5%, mostly from A2). Both
+  are inside this host's ~5% noise. So the end to end run shows no
+  regression rather than a gain, and the gain is the stage timing:
+  ~6 ms of FINUFFT a request under load, ~0.8% of a ~720 ms request.
+  log(Z) agrees in all seven arms.
+- FINUFFT's default `spread_sort=2` does sort at these sizes, and on
+  R2D2's 32x32 grids it costs more than it saves. Any other tiny-grid
+  NUFFT here (WSClean uses ducc0, not FINUFFT) should be checked the
+  same way.
+- A whole-arm stall in PolyChord's root shows up as every worker's
+  "Inefficient MPI parallelisation" line and an idle fraction far above
+  the ~0.1% of a normal R2D2 arm. Check `idle_fraction` before reading
+  an arm's evals/s.
+- After this round, solo, FINUFFT is ~29 ms of a ~377 ms request, ORT
+  ~315 ms. The visibility-sized work outside ORT has no single piece
+  left above ~1% of a request.
+
+Rows: `r153-W`, `r153-A1`..`r153-B3` in `benchmarks.jsonl`. Run
+directories deleted.
+
+## Round 154: the startup reaper no longer kills a raced search's pool
+
+**Question.** In round 152's whole-sapphire job, the second of two raced
+searches killed the first's live wsclean pool in both pairs, so a raced
+A/B there loses an arm. Both of the reaper's liveness tests (ranks of the
+run, `kill -0` of `.launcher.pid`) had to fail for a run whose ranks and
+launcher were both alive. Why?
+
+**Cause.** `_ns_pool_table` lists pool shells with `pgrep -f
+'/\.[a-z0-9]*-workers$'`, then reads each one's pgid and command line with
+two separate `ps` calls and takes the command line's last word for the
+FIFO directory. A pool shell starts one subshell per worker, and each
+subshell carries the shell's command line until it execs
+`wsclean-zygote` or `python3 ... --fifo <dir>/.simulate-workers/N`. If
+`pgrep` catches the subshell before the exec and `ps` reads it after,
+the "run directory" is `wsclean-zygote` (or a FIFO path). That directory
+has no ranks and no `.launcher.pid`, and an empty launcher counts as
+dead, so the row's pgid is printed, and the pgid is the live pool's.
+The window is a worker's fork-to-exec time, which is long while 56
+workers per pool start from a squashfs on a loaded 112-CPU node, which
+is when the second search's reaper ran. With 16-18 workers on this node
+the window is small, which is why round 152's local pairs never hit it.
+
+**Reproduction.** A fake pool (`setsid sh -c 'while :; do (sleep 0.03;
+exec sleep 0.3); done' sh <dir>/run/.fake-workers`, launcher a live
+`sleep`, no ranks) stands in for a starting pool: its subshell shows the
+pool's command line for 30 ms, then becomes `sleep 0.3`.
+
+| reaper | passes that would kill the live pool | bogus rows seen |
+|---|---|---|
+| HEAD (`d72086a`) | 3/200, then 4/300 | `<pgid>\t\t0.3` 3 times in 100 table reads |
+| fixed | 0/300 | none |
+
+With the launcher `sleep` killed, the fixed reaper still killed the fake
+pool ("NOTE: killing worker pool(s) left behind ..."), so a real leak is
+still reaped.
+
+**Fix.** `_ns_pool_table` reads pgid and command line in one `ps -o
+pgid=,args=`, and the new `_ns_pool_row` emits a row only if the
+command line still ends in `/.<name>-workers`, so a worker that has
+exec'd is skipped rather than read as a pool. The rank-budget self-check
+gets three cases: a pool shell gives its run directory, and a bare
+`wsclean-zygote` and a simulate worker's `--fifo` path give no row.
+`bash scripts/lib/rank-budget.sh --self-check`, shellcheck 0.11 on
+`rank-budget.sh`, and `scripts/test_cli.py` pass.
+
+**Not measured.** No speed change is expected: the reaper runs once per
+search start. A re-run of round 152's whole-sapphire pairs would confirm
+it end to end, and would also give the 2 x 56 pair rate that round lost.
+No benchmark rows.
+
+
+## Round 155 (negative): OpenVINO for the CPU U-Net
+
+**Question.** ONNX Runtime's MLAS kernels beat torch on the U-Net by 34%
+(round 140). Intel's OpenVINO is the other CPU runtime that reads the same
+`.onnx`, and its oneDNN-based plugin is tuned for Xeons. Is it faster again?
+
+**Method.** `openvino` 2026.4.1 pip-installed with `--target` into
+`/dev/shm` and put on `PYTHONPATH` inside `r2d2.sif` (image unchanged). The
+cached production `N1.onnx` (`.cache/ri/r2d2-onnx/models/<key>/`), reshaped
+to 1x2x32x32, compiled with `INFERENCE_NUM_THREADS=1`, `NUM_STREAMS=1`,
+`PERFORMANCE_HINT=LATENCY`, `INFERENCE_PRECISION_HINT=f32` and pinning off.
+ORT ran as production does (1 thread, no spinning, no arena). Both models
+are built in a parent and used by forked children pinned one per CPU, the
+pool's shape (`.probe/r155/ov.py`). This loop's icelake half-node, load
+~0.3 at the start, arms in ABBA order, 100-150 forwards per child.
+
+| shape | ORT, ms a forward | OpenVINO, ms a forward | OV / ORT |
+| --- | ---: | ---: | ---: |
+| solo, pinned | 16.95, 17.05 | 15.45, 15.49 | 0.91 |
+| 36 forked children sharing the parent's model | 24.37, 24.51 | 28.22, 28.31 | 1.16 |
+| 36 children, each compiling its own model | - | 30.40 | 1.24 |
+
+OpenVINO's output differs from ORT's by 1.2e-5 of the peak on one
+forward, about the whole 25-checkpoint chain's ORT-vs-torch drift
+(1.5e-5, round 140).
+
+**Learned.** OpenVINO wins solo (-9%) and loses under the production load
+(+16%), the same way AMX did (round 134): at 36 copies the 32x32 forward is
+bound by memory traffic, and OpenVINO's faster kernels move more of it.
+Solo timings mislead for this network; only the loaded shape counts. ORT
+stays the CPU runtime. Not a search, so there are no `benchmarks.jsonl`
+rows; the `/dev/shm` packages were deleted.
+
+## Round 156 (negative): huge pages for ONNX Runtime's U-Net weights
+
+**Question.** Under load the CPU forward is bound by streaming weights
+(round 146). Round 100 found THP backing 78% of the torch checkpoints'
+memory, but ORT (round 141 on) allocates its own copies of the weights. Are
+they on 4 kB pages, and would forcing huge pages help?
+
+**Pages.** All 25 production sessions built as `patch_onnx_network` builds
+them (1 thread, no arena), one forward each, then `/proc/self/smaps` read
+(`.probe/r156/thp.py`, inside `r2d2.sif`): `[heap]` 2,693 MB resident, 2,340
+MB of it `AnonHugePages`; anonymous mmaps 802 MB, 748 MB huge. So **88%**
+of the weights are already on 2 MB pages under CSD3's THP `always`.
+
+**Rejected: `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`** (glibc 2.36 in
+`r2d2.sif`: malloc madvises THP on every arena it grows). Round 146's
+`fork.py` (`.probe/r156/fork.py`): one N1 session in a parent, 36 forked
+children pinned one per CPU, 150 forwards each, two passes a run, runs
+alternated ABABAB on this loop's half icelake node (load ~3):
+
+| arm | run 1 | run 2 | run 3 | mean |
+| --- | ---: | ---: | ---: | ---: |
+| default | 24.48, 24.47 | 24.76, 24.72 | 24.75, 24.78 | 24.66 ms |
+| `hugetlb=1` | 24.63, 24.60 | 24.57, 24.57 | 24.48, 24.54 | 24.57 ms |
+
+-0.4%, inside the run-to-run spread (24.47-24.78 for the default alone),
+and outputs bit-identical. The parent's THP share did not change either
+(132-162 MB of 225-264 MB resident in both arms), so the tunable has little
+left to convert.
+
+**Learned.** The page-mapping levers are now closed for both runtimes:
+THP already covers the R2D2 weights whether torch (round 100) or ORT holds
+them, as it does the WSClean zygote's heap (rounds 87-88). Not a search,
+so no `benchmarks.jsonl` rows.
+
+## Round 157 (negative): more ORT threads per R2D2 worker, and shared L3
+
+**Question.** Under load the forward is memory-bound (round 146). Would
+fewer workers with more ONNX Runtime intra-op threads each do more
+forwards per node? Round 18 settled this for torch, not for ORT.
+
+**Threads.** `.probe/r157/threads.py`, inside `r2d2.sif`: N1 on 36 CPUs of
+this loop's half icelake node, each worker pinned to its own CPUs and
+building its own session (an ORT thread pool does not survive a fork),
+two passes per arm:
+
+| arm | workers | ms a forward | node forwards/s |
+| --- | ---: | ---: | ---: |
+| 1 thread | 36 | 32.95, 33.40 | 1093, 1078 |
+| 2 threads | 18 | 17.13, 16.96 | 1051, 1062 |
+| 2 threads, spinning | 18 | 16.85, 16.86 | 1069, 1068 |
+| 3 threads | 12 | 13.04, 12.78 | 921, 939 |
+
+2 threads are -2% at best, 3 threads -14%. All outputs are bit-identical to
+a 1-thread session. And these numbers flatter the threaded arms: the
+production pool shares one parent's sessions across forks (24.7 ms below),
+which a threaded session cannot do.
+
+**Shared L3.** That fork sharing is worth more than it looks.
+`.probe/r157/mix.py`: 25 sessions in the parent, 36 forked children, three
+passes:
+
+| what the children run | ms a forward |
+| --- | ---: |
+| all on N1 | 24.73, 24.71, 24.66 |
+| each on its own checkpoint (`k mod 25`) | 27.54, 27.59, 27.77 |
+| each walking N1..N25, staggered | 26.06, 25.99, 26.05 |
+
+Children that read the same weights at the same time hit each other's L3
+lines, so the all-N1 probe (rounds 146, 155, 156) reads ~6% fast against a
+real pool, whose workers are staggered across checkpoints. Forcing
+alignment is what round 137's lockstep did (-24 to -45%). The ~5% left
+between staggered and aligned is smaller than any wait that alignment
+would add.
+
+**Learned.** Threads per rank stay at one for ORT, as they do for torch.
+36 workers that each build their own session run 33 ms a forward, against
+24.7 ms when they share the parent's. Keep the build-in-parent design, and
+probe the forward with staggered checkpoints, not all on N1. Not a search,
+so no `benchmarks.jsonl` rows.
+
+## Round 158 (diagnostic): an R2D2 worker's CPU after rounds 148-153
+
+**Question.** Round 146 put ~25% of worker CPU outside ONNX Runtime and
+named it the next R2D2 lever. Rounds 148, 151 and 153 then cut the
+imaging weights, the FITS/config I/O and FINUFFT's bin sort. How much is
+left outside ORT, and is any single piece worth a round?
+
+**Method.** Round 146's perf probe, unchanged apart from sampling 8 random
+pool workers (`.probe/r158/perf.sh`): one default search (38 x 1, onnx,
+nlive 100, 5 repeats, 400 dead, seed 4242, half icelake node), then
+`perf record -F 499 -g` for 20 s mid-run. The libraries were copied out of
+`r2d2.sif` for `--symfs`. Row `r158-perf`: **46.4 evals/s**, against
+44.8 for round 146's identical probe (`r146-perf`), +3.5%, about what
+rounds 148-153 claimed together.
+
+| library | round 146 | round 158 |
+| --- | ---: | ---: |
+| ONNX Runtime (the U-Net) | 67.8% | **78.4%** |
+| libfinufft | 12.2% | 8.2% |
+| libtorch_cpu | 12.5% | 4.8% |
+| numpy | | 3.5% |
+| libc, libpython | 6.7% (with numpy) | 4.5% |
+
+Nothing outside ORT is above 4% of worker CPU now. The largest items:
+
+| symbol | share |
+| --- | ---: |
+| FINUFFT width-10 spread (the eps 1e-9 normal kernel) | 3.9% |
+| FINUFFT width-7 spread (the eps 1e-6 dirty adjoint) | 2.5% |
+| FINUFFT `spreadSorted` (adding subproblems into the grid) | 1.5% |
+| torch complex128 `mul` | 1.5% |
+| every other torch or numpy kernel | 0.4% or less each |
+
+Solo, under `scripts/probe_r2d2_request.py` (48 warm requests, 1 thread,
+`.probe/r158/solo.sh`), a request is 375 ms, 320 ms of it ORT. What is
+left is FINUFFT execute at 29 ms, data load at 8 ms, weights at 5.6 ms,
+the normal kernel's plan creation at 1.6 ms (`nufft2d1` plans each call;
+caching it saves at most ~0.4%), and a few ms of config and operator
+setup.
+
+**Learned.** The ~25% outside ORT that round 146 named is now ~22% of
+worker CPU, spread over a dozen kernels. Removing *all* of FINUFFT would
+be worth 8%. Narrowing the normal kernel's width from 10 to 8 (eps 1e-7)
+would save about 1.4%, well under what an end-to-end A/B can see, and it
+gives up round 10's headroom. Merging the two type-1 NUFFTs into one
+`ntransf=2` plan on the 2N grid would change the dirty image (eps 1e-9 instead of
+1e-6), and FINUFFT spreads each transform separately anyway. So the
+per-request Python and visibility-side work on R2D2's CPU path is closed.
+R2D2's CPU speed is now the U-Net's forward under load (78%), and rounds
+86-157 have already closed every runtime, kernel, threading, page and
+batching option for that.
+Run directory deleted. Probe scripts in `.probe/r158/`.
+
+## Round 160: final status (stop condition met)
+
+The loop's stop rule (scope note of 2026-10-27): stop after three rounds in
+a row that each give under 2% end-to-end R2D2 throughput, with diagnostics
+and negatives counted as 0%. Rounds 155 (OpenVINO, negative), 156 (huge
+pages, negative), 157 (ORT threads per worker, negative) and 158
+(diagnostic) are four such rounds, so R2D2 speed work stops here.
+
+Where R2D2 ends up on CSD3:
+
+| shape | evals/s | against | source |
+| --- | ---: | --- | --- |
+| 22 Sep production search, 24 sapphire CPUs | 26.6 (torch, round 115) | 4.12 before (7.0x) | [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree) |
+| half icelake node, default onnx, 38 x 1 | 46.4 | 44.8 in round 146 | [round 158](#round-158-diagnostic-an-r2d2-workers-cpu-after-rounds-148-153) |
+| whole icelake node, onnx, sessions per NUMA node | 80.5 | 59.2 before round 149 | [round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36) |
+| whole sapphire node, onnx, sessions per NUMA node | 117 | 83.2 pre-149 onnx, 96-104 torch | [round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40) |
+| one A100, MPS, 19 ranks (torch) | 43.9 | MPS is 2.65x the same card without it | rounds [119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100), 124 |
+
+Why it stops: on CPU a worker is 78% U-Net forward (ONNX Runtime), and
+that forward is memory-bandwidth bound under a full node. Runtime
+(torch, ORT, OpenVINO), kernel packing, bfloat16/AMX, threads per rank,
+huge pages, per-NUMA copies, and batching inside a worker, across a pool
+or through a forward server have each been measured and closed. Nothing
+outside the forward is above 4% of worker CPU. The levers left would
+change the results or are outside this scope:
+
+- **A different network.** Quantisation or distillation of the U-Net
+  changes the reconstructions, so it is a science decision, not a speed
+  patch.
+- **GPUs for production.** One A100 does ~40% of a whole sapphire node.
+  Round 130's 2-GPU A/B (job 39303263) never reported back; re-run it
+  before sizing a GPU production run.
+- **Job shape.** Whole nodes with sessions per NUMA node (rounds 149-150)
+  give the best per-core rate. Prefer them to half nodes for long
+  searches.
+
+WSClean speed work closed earlier (rounds 83, 135, and the 2026-10-27
+scope decision). The one non-code lever left for it is still shipping a
+SIF with all of `docker/wsclean/patches/` (round 94).

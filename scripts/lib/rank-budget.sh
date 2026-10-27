@@ -161,18 +161,28 @@ _ns_dead_pools() {
   done
 }
 
+# One row from a pool process's pgid and command line, or none if the command
+# line is no longer a pool shell's. pgrep matches a worker's subshell before it
+# execs `wsclean-zygote` or `python3 ...`; read after the exec, the last word
+# was taken for the run directory - one with no ranks and no `.launcher.pid` -
+# and the live pool was killed (round 154: a raced search lost its pool while
+# the other's 56 workers were starting).
+_ns_pool_row() {
+  local pgid="$1" args="$2" fifo_dir launcher
+  fifo_dir="${args##* }"
+  [[ "${fifo_dir}" =~ /\.[a-z0-9]*-workers$ ]] || return 0
+  launcher="$(cat "${fifo_dir%/*}/.launcher.pid" 2>/dev/null || true)"
+  printf '%s\t%s\t%s\n' "${pgid}" "${launcher}" "${fifo_dir%/*}"
+}
+
 # Every pool on the host: the pool's shell names its FIFO directory, which is
 # `<run dir>/.<worker>-workers`, as its last argument, and start-sidecars.sh
 # leaves the launcher's pid in `<run dir>/.launcher.pid`.
 _ns_pool_table() {
-  local pid pgid args fifo_dir launcher
+  local pid pgid args
   for pid in $(pgrep -f -- '/\.[a-z0-9]*-workers$' 2>/dev/null); do
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-    args="$(ps -ww -o args= -p "${pid}" 2>/dev/null)"
-    { [ -n "${pgid}" ] && [ -n "${args}" ]; } || continue
-    fifo_dir="${args##* }"
-    launcher="$(cat "${fifo_dir%/*}/.launcher.pid" 2>/dev/null || true)"
-    printf '%s\t%s\t%s\n' "${pgid}" "${launcher}" "${fifo_dir%/*}"
+    read -r pgid args < <(ps -ww -o pgid=,args= -p "${pid}" 2>/dev/null) || continue
+    _ns_pool_row "${pgid}" "${args}"
   done | sort -u
 }
 
@@ -346,6 +356,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "$(printf '4242\t\t\n' | _ns_dead_pools)" = 4242 ]
   [ -z "$(printf 'notapgid\t999999\t\nsomething-else\n' | _ns_dead_pools)" ]
   [ -z "$(printf '' | _ns_dead_pools)" ]
+  [ "$(_ns_pool_row 4242 'sh -c loop sh /r/run-1/.wsclean-workers')" = "$(printf '4242\t\t/r/run-1')" ]
+  [ -z "$(_ns_pool_row 4242 'wsclean-zygote')" ] \
+    || { echo "FAIL: a worker that has just exec'd was read as a pool"; exit 1; }
+  [ -z "$(_ns_pool_row 4242 'python3 /opt/s.py --serve --fifo /r/run-1/.simulate-workers/3')" ] \
+    || { echo "FAIL: a worker's FIFO path was read as a pool"; exit 1; }
 
   # The orphaned run: launcher pid gone, run directory that still has ranks.
   # Reaping these is what would kill the search - so a live run wins over the
