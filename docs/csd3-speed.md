@@ -10,6 +10,8 @@ rerun on the same 24 sapphire CPUs with the same images and seed, now
 converges in **41 minutes instead of 6h20m (7.0x)**, at 26.6 evals/s
 instead of 4.12, with log(Z) in agreement. Simulate (MeqTrees) went from
 39% of worker time to 3.8%. See [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree).
+On a GPU, CUDA MPS makes one A100 (16 ranks) run 41.8 evals/s, 2.65x its
+rate without MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100)).
 
 ## Where the time went
 
@@ -5572,11 +5574,61 @@ One process at batch 18 ran 4,762 forwards/s, so the card itself has
   below even that, because each rank also does ~100 ms of CPU work a
   request plus simulate.
 - MPS should not change any output: each process still runs its own
-  kernels, and MPS only shares the card. The end-to-end search (start the
-  daemon in the job when `R2D2_DEVICE=cuda`, and check log(Z) against
-  round 10's GPU arms) is the next step. Its rank count is bounded by
+  kernels, and MPS only shares the card. Round 119 runs the end-to-end search. Its rank count is bounded by
   `NS_R2D2_CUDA_MB_PER_RANK` (4 GB: every worker holds all 25
   checkpoints), i.e. ~19 ranks on an 80 GB card, and P = 16 already
   reaches the MPS plateau.
 - Whether it pays depends on what CSD3 charges for a GPU hour against
   ~112 CPU hours, which this round did not settle.
+
+## Round 119: CUDA MPS in GPU searches, 2.65x on one A100
+
+**Change.** A search with `R2D2_DEVICE=cuda` now starts a CUDA MPS daemon
+on the host before the R2D2 pool (`sidecar_cuda_mps_flags` in
+`start-sidecars.sh`). It needs no root. Its pipe and log directories go in
+the run's scratch, and the pool gets them through `--bind` and
+`CUDA_MPS_PIPE_DIRECTORY`. Teardown (`_sidecar_remove`) tells it to quit. A
+host without `nvidia-cuda-mps-control`, or a daemon that will not start,
+leaves the pool as before with a warning. `NS_CUDA_MPS` (default 1, in
+`defaults.toml`) set to 0 turns it off for A/Bs. The start-sidecars
+self-check covers the flags, the start and the stop with a stand-in
+control binary.
+
+**A/B.** One ampere job (`.probe/r119/job.sh`, job 39296539, `gpu-q-9`,
+A100-SXM4-80GB, 32 cores): `./ri search r2d2 --device cuda --mpi-procs 16
+--nlive 48 --num-repeats 5 --max-ndead 150 --seed 4242`, with a warm-up
+arm and then N/M alternating three times:
+
+| arm | MPS | evals/s | ms an evaluation | R2D2 request, ms | simulate, ms | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| warm | on | 41.4 | 345 | 303 | 41 | 0.01543 +/- 0.00275 |
+| N1 | off | 15.7 | 942 | 906 | 35 | 0.01544 +/- 0.00294 |
+| M1 | on | 41.7 | 344 | 304 | 39 | 0.01554 +/- 0.00269 |
+| N2 | off | 16.1 | 922 | 885 | 36 | 0.01684 +/- 0.00261 |
+| M2 | on | 40.5 | 351 | 309 | 42 | 0.01685 +/- 0.00237 |
+| N3 | off | 15.5 | 954 | 918 | 35 | 0.01731 +/- 0.00224 |
+| M3 | on | 43.1 | 332 | 295 | 36 | 0.01702 +/- 0.00228 |
+
+Iteration 118 ran the same job (39296057) and was cut off. Its change was
+reverted while the job was running, so only its warm-up arm had MPS (34.2
+evals/s). Its other arms (15.4-16.9 evals/s, including the two labelled M)
+are no-MPS controls, and are labelled that way in `benchmarks.jsonl`.
+
+**Learned.**
+- With MPS the GPU search runs **2.65x faster**: a mean of 41.8 against 15.8
+  evals/s, with no overlap between arms. The R2D2 request falls from ~900 to
+  ~300 ms. This is round 117's forward-level 2.8x, carried end to end. The
+  log(Z)s agree within their errors. These are async runs, so the chains
+  differ run to run in both arms alike.
+- 16 MPS ranks on one A100 and its 32 cores (41.8 evals/s) beat 24
+  sapphire CPUs (26.6, round 115), and get to ~40% of a whole sapphire node
+  (103.5, round 106). Without MPS, the GPU lost to 24 CPUs.
+- GPU memory is the same with and without MPS (~58.5 GB at 16 ranks,
+  ~3.6 GB a worker), so `NS_R2D2_CUDA_MB_PER_RANK` still caps an 80 GB card
+  at ~19 ranks. The card ran at 95-100% in both arms. With MPS it is doing
+  2.65x the work at that utilisation, so that figure is not a headroom
+  measure. Round 117's batch-18 probe says the card has ~3x more. The next
+  levers are more ranks per card, which needs the workers to share one copy
+  of the checkpoints on the GPU, and batching forwards across requests.
+- Do not edit a script that a running job is executing. bash reads scripts
+  lazily, so round 118's M2 arm died at its end with `unexpected EOF`.

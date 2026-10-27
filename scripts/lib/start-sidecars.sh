@@ -66,10 +66,35 @@ _sidecar_remove() {
   for pid in ${SIDECAR_PIDS[@]+"${SIDECAR_PIDS[@]}"}; do
     kill -KILL -- "-${pid}" 2>/dev/null || true
   done
+  if [ -n "${NS_CUDA_MPS_DIR:-}" ]; then
+    echo quit | CUDA_MPS_PIPE_DIRECTORY="${NS_CUDA_MPS_DIR}/pipe" nvidia-cuda-mps-control >/dev/null 2>&1 || true
+  fi
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
     # Best-effort cleanup must not replace a successful search's exit status.
     rm -rf "${NS_SCRATCH_DIR}" 2>/dev/null || true
   fi
+}
+
+# CUDA MPS for a GPU pool: one daemon merges the workers' CUDA contexts, so
+# they share the card instead of time-slicing it - 2.8x the U-Net forwards a
+# second on an A100 at 16 workers (csd3-speed.md, round 117). It runs on the
+# host (no root needed), in this run's scratch, and _sidecar_remove stops it.
+# Fills CUDA_MPS_FLAGS with the apptainer flags that point a pool at it, in
+# place like SIDECAR_BINDS; leaves it empty (and the pool runs without MPS)
+# where there is no control binary or the daemon will not start.
+sidecar_cuda_mps_flags() {
+  CUDA_MPS_FLAGS=()
+  command -v nvidia-cuda-mps-control >/dev/null 2>&1 || return 0
+  NS_CUDA_MPS_DIR="${NS_SCRATCH_DIR:-${TMPDIR:-/tmp}}/cuda-mps-$$"
+  mkdir -p "${NS_CUDA_MPS_DIR}/pipe" "${NS_CUDA_MPS_DIR}/log"
+  if ! CUDA_MPS_PIPE_DIRECTORY="${NS_CUDA_MPS_DIR}/pipe" CUDA_MPS_LOG_DIRECTORY="${NS_CUDA_MPS_DIR}/log" \
+      nvidia-cuda-mps-control -d >&2; then
+    echo "WARNING: CUDA MPS did not start; the GPU workers will time-slice the card" >&2
+    NS_CUDA_MPS_DIR=""
+    return 0
+  fi
+  # shellcheck disable=SC2034  # read by the caller
+  CUDA_MPS_FLAGS=(--bind "${NS_CUDA_MPS_DIR}" --env "CUDA_MPS_PIPE_DIRECTORY=${NS_CUDA_MPS_DIR}/pipe")
 }
 
 # The bind mounts every pool and every rank gets: the repo at its own path
@@ -263,8 +288,25 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   done
   [ -z "$(sidecar_reset_workers 2>&1)" ] || { echo "FAIL: a second reset found something to kill"; exit 1; }
 
+  # CUDA MPS: no control binary leaves the pool flags empty; a daemon that
+  # starts gives the bind and pipe env, and teardown tells it to quit.
+  PATH="${_tmp}/nobin" APPTAINER=x sidecar_cuda_mps_flags
+  [ "${#CUDA_MPS_FLAGS[@]}" = 0 ] || { echo "FAIL: MPS flags without nvidia-cuda-mps-control"; exit 1; }
+  mkdir -p "${_tmp}/bin"
+  # shellcheck disable=SC2016  # expanded by the stand-in, not here
+  printf '#!/bin/sh\necho "$CUDA_MPS_PIPE_DIRECTORY $* $(cat)" >>"%s/mps"\n' "${_tmp}" >"${_tmp}/bin/nvidia-cuda-mps-control"
+  chmod +x "${_tmp}/bin/nvidia-cuda-mps-control"
+  _path="${PATH}"
+  PATH="${_tmp}/bin:${PATH}"
+  sidecar_cuda_mps_flags </dev/null
+  [ "${CUDA_MPS_FLAGS[*]}" = "--bind ${NS_CUDA_MPS_DIR} --env CUDA_MPS_PIPE_DIRECTORY=${NS_CUDA_MPS_DIR}/pipe" ] \
+    || { echo "FAIL: MPS flags: ${CUDA_MPS_FLAGS[*]}"; exit 1; }
+  grep -q -- "^${NS_CUDA_MPS_DIR}/pipe -d" "${_tmp}/mps" || { echo "FAIL: MPS daemon not started"; exit 1; }
+
   # Teardown kills whole groups, children included.
   _sidecar_remove
+  grep -q -- "^${NS_CUDA_MPS_DIR}/pipe  quit" "${_tmp}/mps" || { echo "FAIL: teardown did not stop MPS"; exit 1; }
+  PATH="${_path}"
   sleep 0.2
   for _pid in "${SIDECAR_PIDS[@]}"; do
     kill -0 "${_pid}" 2>/dev/null && { echo "FAIL: pool ${_pid} survived _sidecar_remove"; exit 1; }

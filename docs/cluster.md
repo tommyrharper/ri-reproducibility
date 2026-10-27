@@ -319,7 +319,12 @@ three image tensors on the GPU and hands the result back as the CPU tensor the
 rest of upstream expects. TF32 is off, so the GPU does the CPU's float32
 arithmetic. The pool still forks its workers from one warm parent: the parent
 never touches CUDA, and each worker makes its own context on its first request
-(a context made before a fork is unusable in the child).
+(a context made before a fork is unusable in the child). The run starts a
+CUDA MPS daemon on the host first (`sidecar_cuda_mps_flags` in
+`start-sidecars.sh`; no root needed, pipe directory in the run's scratch) so
+those contexts share the card instead of time-slicing it: 16 ranks on an A100
+went from ~16 to ~41 evals/s. `NS_CUDA_MPS=0` turns it off
+(`docs/csd3-speed.md`, rounds 117 and 119).
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:

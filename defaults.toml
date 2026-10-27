@@ -55,6 +55,10 @@ NS_R2D2_CUDA_MAX_RANKS = 16
 # 95% of the card holds - 19 on an 80GB A100 - and refuses an explicit
 # --mpi-procs above it: past it workers die of CUDA OOM.
 NS_R2D2_CUDA_MB_PER_RANK = 4096
+# R2D2_DEVICE=cuda starts a CUDA MPS daemon for the run, so the workers share
+# the card rather than time-slice it (csd3-speed.md, rounds 117-118). 0 turns
+# it off, for an A/B.
+NS_CUDA_MPS = 1
 
 # Pixels on a side of the image both imagers make, and with it the field of
 # view: source_offset_to_lm() in common.py scales the sampled

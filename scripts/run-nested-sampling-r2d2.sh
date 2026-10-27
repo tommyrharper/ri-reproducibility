@@ -188,6 +188,11 @@ sidecar_launch "${MEQTREES_SIF}" \
 R2D2_POOL_FLAGS=()
 if [ "${R2D2_DEVICE}" = cuda ]; then
   R2D2_POOL_FLAGS=(--nv)
+  # NS_CUDA_MPS=0 leaves the workers time-slicing the card, for an A/B.
+  if [ "${NS_CUDA_MPS}" != 0 ]; then
+    sidecar_cuda_mps_flags
+    R2D2_POOL_FLAGS+=(${CUDA_MPS_FLAGS[@]+"${CUDA_MPS_FLAGS[@]}"})
+  fi
 fi
 sidecar_launch "${R2D2_SIF}" \
   ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
