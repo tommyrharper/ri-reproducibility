@@ -419,6 +419,7 @@ def warm_imports() -> None:
                 torch.set_num_interop_threads(max(1, interop_threads))
             patch_nufft_plans()
             patch_normal_operator()
+            patch_imaging_weights()
             patch_checkpoint_loading()
             patch_net_reuse()
             if r2d2_device() == "cuda":
@@ -436,6 +437,49 @@ def warm_imports() -> None:
             )
         except Exception:
             traceback.print_exc()
+
+
+def patch_imaging_weights() -> None:
+    """Grid Briggs weights with `np.bincount` and apply the tail per grid cell.
+
+    Byte-identical to upstream (same summation order at one thread, and torch's
+    complex tail gives each value the same bits per cell as per visibility),
+    without its masked-index copies and its per-visibility complex sqrt.
+    R2D2_NUMPY_WEIGHTS=0 keeps upstream.
+    """
+    if os.environ.get("R2D2_NUMPY_WEIGHTS", "1") == "0":
+        return
+    import importlib
+
+    import numpy as np
+    import torch
+
+    # The package re-exports the function under the module's own name, so
+    # the module is only reachable through sys.modules.
+    importlib.import_module("ri_measurement_operator.pysrc.utils.gen_imaging_weights")
+    module = sys.modules["ri_measurement_operator.pysrc.utils.gen_imaging_weights"]
+    upstream = module.gen_imaging_weights
+
+    def gen_imaging_weights(u, v, nW, im_size, weight_type="briggs", weight_gridsize=2.0, weight_robustness=0.0):
+        if (weight_type != "briggs" or u.device.type != "cpu" or u.dtype != torch.float64
+                or torch.get_num_threads() != 1):
+            return upstream(u, v, nW, im_size, weight_type, weight_gridsize, weight_robustness)
+        rows, cols = (int(np.floor(i * weight_gridsize)) for i in im_size)
+        nW2 = nW.view(-1) ** 2
+        if nW2.size(-1) == 1:
+            nW2 = nW2 * torch.ones(u.numel())
+        u, v = u.reshape(-1).numpy(), v.reshape(-1).numpy()
+        flip = v < 0
+        u, v = np.where(flip, -u, u), np.where(flip, -v, v)
+        p = np.floor((v + np.pi) * rows / 2 / np.pi).astype(np.int64) - 1
+        q = np.floor((u + np.pi) * cols / 2 / np.pi).astype(np.int64) - 1
+        index = p * cols + q
+        grid = torch.from_numpy(np.bincount(index, weights=nW2.to(torch.float64).numpy(), minlength=rows * cols))
+        robust_scale = (torch.sum(nW2) / torch.sum(grid**2)) * (5 * 10 ** (-weight_robustness)) ** 2
+        return (1 / torch.sqrt(1 + robust_scale * grid))[torch.from_numpy(index)].view(1, 1, -1)
+
+    gen_imaging_weights.upstream = upstream
+    module.gen_imaging_weights = gen_imaging_weights
 
 
 def patch_nufft_plans() -> None:
@@ -964,6 +1008,40 @@ def self_check_normal_operator() -> None:
     print("r2d2 normal operator self-check passed")
 
 
+def self_check_imaging_weights() -> None:
+    sys.path.insert(0, str(IMAGER.parent))
+    try:
+        import torch
+        from ri_measurement_operator.pysrc.utils import gen_imaging_weights  # noqa: F401
+    except ImportError:
+        print("r2d2 imaging weights self-check skipped: no R2D2 measurement operator")
+        return
+
+    patch_imaging_weights()
+    module = sys.modules["ri_measurement_operator.pysrc.utils.gen_imaging_weights"]
+    patched = module.gen_imaging_weights
+    upstream = getattr(patched, "upstream", None)
+    assert upstream is not None, "R2D2_NUMPY_WEIGHTS must patch by default"
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(0)
+        count = 30011
+        for robustness in (0.0, -1.0, 1.5):
+            u = (torch.rand(1, 1, count, dtype=torch.float64) - 0.5) * 6.0
+            v = (torch.rand(1, 1, count, dtype=torch.float64) - 0.5) * 6.0
+            for nW in (torch.full((1, 1), 3.7 + 0j, dtype=torch.complex128),
+                       (torch.rand(1, 1, count, dtype=torch.float64) + 0.5).to(torch.complex128)):
+                expected = upstream(u.clone(), v.clone(), nW, (32, 32), "briggs", 2.0, robustness)
+                got = patched(u.clone(), v.clone(), nW, (32, 32), "briggs", 2.0, robustness)
+                assert got.dtype == expected.dtype and got.shape == expected.shape, (got.dtype, expected.dtype)
+                assert torch.equal(got, expected), "imaging weights must be byte-identical"
+    finally:
+        torch.set_num_threads(threads)
+        module.gen_imaging_weights = upstream
+    print("r2d2 imaging weights self-check passed")
+
+
 def self_check_lazy_utils() -> None:
     import tempfile
 
@@ -1097,6 +1175,7 @@ if __name__ == "__main__":
         self_check_net_reuse()
         self_check_nufft_plan_reuse()
         self_check_normal_operator()
+        self_check_imaging_weights()
         self_check_lazy_utils()
         self_check_checkpoint_cache()
         self_check_serve_reply_stream()

@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 146).**
+**Where it stands (round 148).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -31,6 +31,8 @@ the Hetzner host.
   started before round 141 keep it ([round 145](#round-145-r2d2_runtimeonnx-is-the-cpu-default)).
   In a search, ORT is 68% of worker CPU and the visibility-sized data
   prep (torch element-wise ops, FINUFFT) ~25% ([round 146](#round-146-diagnostic-where-an-onnx-default-r2d2-workers-cpu-goes)).
+  Briggs weights by `np.bincount` (round 148) cut 26 to 10 ms of that,
+  byte-identical, ~1.5% end to end.
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6846,3 +6848,52 @@ would be under the ~5% an end-to-end A/B can see, and it gives up the
 
 Rows: `r146-base`, `r146-perf` in `benchmarks.jsonl` (both the shipped
 default, no change). Run directories deleted.
+
+## Round 148: Briggs imaging weights by `np.bincount`
+
+**Change.** `patch_imaging_weights()` in `r2d2_serve.py` replaces
+upstream's `gen_imaging_weights` for the CPU, float64, one-thread Briggs
+case: it grids with `np.bincount` instead of masked-index copies and
+`scatter_add_`, and applies the complex `1/sqrt(1 + s*g)` tail once per
+grid cell (64x64) before gathering, instead of once per visibility.
+Anything else falls through to upstream; `R2D2_NUMPY_WEIGHTS=0` turns it
+off. The tail stays complex128 on purpose: torch's vectorised complex
+sqrt differs from the real one in the last bit, but per value it gives
+the same bits whether applied per cell or per visibility.
+
+**Byte-identical.** `torch.equal` against upstream on 48 real request
+`.mat` files (58k-334k visibilities) and in the new self-check
+(`./ri self-check`, three robustness values, scalar and per-visibility
+`nW`).
+
+**Stage.** Solo under cProfile (48 warm requests, onnx, 1 thread):
+26.3 -> 9.6 ms a call, ~4% of a ~400 ms request.
+
+**End to end.** Interleaved A/B/A/B/A/B, 38 x 1 ranks, nlive 100,
+5 repeats, 400 dead, seed 4242, onnx default (rows `r147-A1`..`r147-B3`;
+the ABAB was started by iteration 147 and finished in this one):
+
+| arm | weights | evals/s | request ms | log(Z) x1e-3 |
+| --- | --- | ---: | ---: | --- |
+| A1 | upstream | 44.97 | 763.1 | 17.6 +/- 0.8 |
+| B1 | bincount | 45.84 | 750.4 | 17.0 +/- 1.0 |
+| A2 | upstream | 44.77 | 765.0 | 16.0 +/- 1.3 |
+| B2 | bincount | 44.19 | 759.2 | 16.5 +/- 1.1 |
+| A3 | upstream | 45.08 | 759.0 | 16.9 +/- 0.9 |
+| B3 | bincount | 46.79 | 733.4 | 16.6 +/- 0.9 |
+
+Means: 44.94 against 45.61 evals/s (+1.5%), request 762.4 against
+747.7 ms (-1.9%). That is inside the ~5% an end-to-end A/B can resolve,
+so the end-to-end run shows no regression rather than a measured gain;
+the gain is the stage timing. log(Z) agrees within errors. Kept because
+it is byte-identical and costs nothing.
+
+**Learned.**
+- `ri_measurement_operator.pysrc.utils` re-exports `gen_imaging_weights`
+  under the module's own name, so patch the module through `sys.modules`;
+  `imager.py` re-runs its from-import every request and picks it up.
+- Fresh request `.mat` files for `scripts/probe_r2d2_request.py`: a short
+  search with `NS_KEEP_MEASUREMENT_SETS=1` (8 ranks, 20 dead gave 104 in
+  25 s).
+
+Run directories deleted.
