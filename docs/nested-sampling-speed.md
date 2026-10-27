@@ -158,6 +158,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (rejected) `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` for the ORT U-Net's weights | - | THP `always` already backs 88% of the 25 sessions' 3.5 GB; 24.57 against 24.66 ms a forward with 36 forked children (ABABAB, noise) ([round 156](csd3-speed.md)) |
 | (rejected) 2-3 ORT intra-op threads per R2D2 worker (18 x 2, 12 x 3) | - | -2% and -14% forwards per node against 36 x 1, outputs bit-identical. Fork-shared sessions also give 11% from shared L3 when workers align on a checkpoint, of which ~5% remains over a staggered pool ([round 157](csd3-speed.md)) |
 | (diagnostic) R2D2 worker CPU under load after rounds 148-153 | - | ORT 78.4% (was 67.8%), FINUFFT 8.2%, torch 4.8%, numpy 3.5%; no single item outside ORT above 4%, so per-request work outside the U-Net is closed; 46.4 evals/s against 44.8 for the same probe in round 146 ([round 158](csd3-speed.md)) |
+| (final status) stop condition met: rounds 155-158 each under 2% end to end | - | R2D2 CPU is 78% U-Net forward, memory-bound, every runtime/kernel/threading/batching option closed; levers left are a different network, GPUs, whole-node job shapes ([round 160](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

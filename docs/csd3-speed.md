@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 158).**
+**Where it stands (round 160; R2D2 speed work stopped, see [the final status](#round-160-final-status-stop-condition-met)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -7472,3 +7472,43 @@ R2D2's CPU speed is now the U-Net's forward under load (78%), and rounds
 86-157 have already closed every runtime, kernel, threading, page and
 batching option for that.
 Run directory deleted. Probe scripts in `.probe/r158/`.
+
+## Round 160: final status (stop condition met)
+
+The loop's stop rule (scope note of 2026-10-27): stop after three rounds in
+a row that each give under 2% end-to-end R2D2 throughput, with diagnostics
+and negatives counted as 0%. Rounds 155 (OpenVINO, negative), 156 (huge
+pages, negative), 157 (ORT threads per worker, negative) and 158
+(diagnostic) are four such rounds, so R2D2 speed work stops here.
+
+Where R2D2 ends up on CSD3:
+
+| shape | evals/s | against | source |
+| --- | ---: | --- | --- |
+| 22 Sep production search, 24 sapphire CPUs | 26.6 (torch, round 115) | 4.12 before (7.0x) | [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree) |
+| half icelake node, default onnx, 38 x 1 | 46.4 | 44.8 in round 146 | [round 158](#round-158-diagnostic-an-r2d2-workers-cpu-after-rounds-148-153) |
+| whole icelake node, onnx, sessions per NUMA node | 80.5 | 59.2 before round 149 | [round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36) |
+| whole sapphire node, onnx, sessions per NUMA node | 117 | 83.2 pre-149 onnx, 96-104 torch | [round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40) |
+| one A100, MPS, 19 ranks (torch) | 43.9 | MPS is 2.65x the same card without it | rounds [119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100), 124 |
+
+Why it stops: on CPU a worker is 78% U-Net forward (ONNX Runtime), and
+that forward is memory-bandwidth bound under a full node. Runtime
+(torch, ORT, OpenVINO), kernel packing, bfloat16/AMX, threads per rank,
+huge pages, per-NUMA copies, and batching inside a worker, across a pool
+or through a forward server have each been measured and closed. Nothing
+outside the forward is above 4% of worker CPU. The levers left would
+change the results or are outside this scope:
+
+- **A different network.** Quantisation or distillation of the U-Net
+  changes the reconstructions, so it is a science decision, not a speed
+  patch.
+- **GPUs for production.** One A100 does ~40% of a whole sapphire node.
+  Round 130's 2-GPU A/B (job 39303263) never reported back; re-run it
+  before sizing a GPU production run.
+- **Job shape.** Whole nodes with sessions per NUMA node (rounds 149-150)
+  give the best per-core rate. Prefer them to half nodes for long
+  searches.
+
+WSClean speed work closed earlier (rounds 83, 135, and the 2026-10-27
+scope decision). The one non-code lever left for it is still shipping a
+SIF with all of `docker/wsclean/patches/` (round 94).
