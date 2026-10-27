@@ -59,6 +59,9 @@ write_run_config() {
     if [ -n "${R2D2_MAX_THREADS:-}" ]; then
       printf 'R2D2_MAX_THREADS=%q\n' "${R2D2_MAX_THREADS}"
     fi
+    if [ -n "${R2D2_INTERLEAVE_WEIGHTS:-}" ]; then
+      printf 'R2D2_INTERLEAVE_WEIGHTS=%q\n' "${R2D2_INTERLEAVE_WEIGHTS}"
+    fi
   } >"${output_dir}/run.env"
 }
 

@@ -4826,3 +4826,51 @@ Python 3.10 has no `tomllib`), and `EXTRA` still appends to it.
   runs of the same code differ in 10-15 of 48 output FITS by 1e-17 to
   8e-16. At 1 thread two runs are byte-identical (48 of 48). Identity
   checks of R2D2 changes must run at 1 thread, or compare to tolerance.
+
+## Round 99: R2D2 checkpoint pages interleaved across the job's sockets
+
+**Why.** The R2D2 pool parent loads every checkpoint (~3.4 GB) once and
+forks the workers, which all stream those pages. First touch puts them on
+whichever NUMA node the parent ran on. A default `./ri search r2d2` job
+takes a whole icelake node (`--exclusive`, 2 sockets x 38 cores), so half
+the workers read every weight across the socket interconnect, and round 98's
+pinned probe put a remote U-Net forward at ~1.9x a local one under load.
+
+**Change.** `r2d2_serve.interleaved_pages()` wraps the parent's checkpoint
+preload in `set_mempolicy(MPOL_INTERLEAVE)` over the NUMA nodes holding the
+job's allowed CPUs, then restores `MPOL_DEFAULT`, so workers' own
+allocations stay first-touch. One node, or `R2D2_INTERLEAVE_WEIGHTS=0`,
+leaves it off. `/proc/self/numa_maps` after warm-up on this half node:
+3.38 GB on node 0 before, 1.77 / 1.61 GB after. No worker is pinned
+(round 98 showed pinning costs more than locality gains). The arithmetic is
+unchanged; only where pages live moves.
+
+**Whole node** (one `--exclusive --qos intr` icelake job, cpu-q-200;
+76 x 1 async, nlive 200, 5 repeats, 1200 dead, seed 4242; warm = evaluations
+starting 10 s after the first):
+
+| run (order) | pages | evals | evals/s | warm R2D2 request | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| r99-long-1 (first in job) | interleaved | 19,570 | 46.6 | 1474 ms | 0.01795 ± 0.00034 |
+| r99-long-2 | first touch | 19,234 | 41.8 | 1705 ms | 0.01805 ± 0.00032 |
+| r99-long-3 | interleaved | 19,331 | 46.5 | 1533 ms | 0.01801 ± 0.00034 |
+
+**+11% evals/s, -10 to -14% per request**, well past the ~4% that
+sequential arms can fake; the interleaved arm also took the job's cold
+first slot. The job was cut after three runs for time, so there is one
+first-touch run; log(Z) agrees within its error (async 76-rank runs are not
+bit-reproducible, round 97).
+
+**Half node** (this 38-CPU allocation, 32 CPUs on node 0 and 6 on node 1;
+38 x 1, nlive 50, 2 repeats, 300 dead): first touch 1306 ms (first run),
+1093 ms; interleaved 1081, 1082 ms. Neutral on a lopsided split, where
+most pages already sat on the majority node, though the 1306 ms first run
+fits a parent that landed on the minority node.
+
+**Learned.**
+- On a whole icelake node first-touch weights cost R2D2 ~11% of its
+  throughput. Interleaving is free on a half node and needs no rebuild:
+  `r2d2_serve.py` is bound from the working tree.
+- Short 76-rank runs (300 dead, ~300 evaluations, ~4 per rank) measure
+  only the cold first request (1.7-1.8 s); a whole-node R2D2 A/B needs
+  ~20k evaluations (~7.5 minutes a run), so an `intr` hour fits ~6 runs.

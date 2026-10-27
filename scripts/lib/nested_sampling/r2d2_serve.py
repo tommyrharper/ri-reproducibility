@@ -192,6 +192,47 @@ def patch_cuda_network() -> None:
     optimiser.forward = forward
 
 
+def job_numa_nodes() -> list[int]:
+    """NUMA nodes holding at least one CPU this process may run on."""
+    allowed = os.sched_getaffinity(0)
+    nodes = []
+    for path in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+        cpus = set()
+        for part in (path / "cpulist").read_text().strip().split(","):
+            if part:
+                low, _, high = part.partition("-")
+                cpus.update(range(int(low), int(high or low) + 1))
+        if cpus & allowed:
+            nodes.append(int(path.name[4:]))
+    return nodes
+
+
+@contextmanager
+def interleaved_pages():
+    """Spread pages allocated inside across the job's NUMA nodes.
+
+    The pool parent loads every checkpoint once and its forked workers all
+    read those pages. Left to first touch, they sit on whichever socket the
+    parent ran on, and on a whole two-socket node half the workers stream
+    weights across the interconnect. R2D2_INTERLEAVE_WEIGHTS=0 turns it off.
+    """
+    nodes = job_numa_nodes() if os.environ.get("R2D2_INTERLEAVE_WEIGHTS", "1") != "0" else []
+    if len(nodes) < 2 or sys.platform != "linux" or os.uname().machine != "x86_64":
+        yield
+        return
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    set_mempolicy = 238  # x86_64 syscall number
+    mask = ctypes.c_ulong(sum(1 << node for node in nodes))
+    interleaving = libc.syscall(set_mempolicy, 3, ctypes.byref(mask), 64) == 0  # MPOL_INTERLEAVE
+    try:
+        yield
+    finally:
+        if interleaving:
+            libc.syscall(set_mempolicy, 0, None, 0)  # MPOL_DEFAULT
+
+
 def warm_imports() -> None:
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
@@ -220,9 +261,10 @@ def warm_imports() -> None:
             if checkpoint_path.is_dir():
                 # Load before fork: tensor pages stay shared until a child
                 # writes them, instead of paying torch.load once per rank.
-                sys.modules["utils"].get_DNNs(
-                    int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path)
-                )
+                with interleaved_pages():
+                    sys.modules["utils"].get_DNNs(
+                        int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path)
+                    )
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
@@ -852,6 +894,16 @@ def self_check_net_reuse() -> None:
     print("r2d2 net reuse self-check passed")
 
 
+def self_check_interleaved_pages() -> None:
+    nodes = job_numa_nodes()
+    if Path("/sys/devices/system/node/node0").is_dir():
+        assert nodes, "no NUMA node holds an allowed CPU"
+    with interleaved_pages():
+        block = bytearray(1 << 20)
+    assert len(block) == 1 << 20
+    print(f"r2d2 interleaved pages self-check passed ({len(nodes)} node(s))")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_net_reuse()
@@ -862,6 +914,7 @@ if __name__ == "__main__":
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
+        self_check_interleaved_pages()
     elif sys.argv[1:2] == ["--fifo-dir"]:
         serve_pool(sys.argv[2])
     else:
