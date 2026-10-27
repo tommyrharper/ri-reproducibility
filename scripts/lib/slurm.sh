@@ -26,6 +26,10 @@ ns_should_submit() {
 # One node, one task (mpirun forks the ranks), named after the run so squeue
 # and ns_run_is_live can find it, stdout beside the run's own logs. With an
 # explicit NS_MPI_PROCS the job is sized to it; otherwise it takes the node.
+# A sized job may land on one socket; NS_SLURM_SOCKETS=2 spreads its cores
+# over two (one task per socket, mpirun ignores the tasks) and counts the
+# shared memory once per socket, for the R2D2 pool's per-socket checkpoint
+# copies: 56 R2D2 CPUs split 28/28 ran +37% over one socket (round 111).
 # NS_SLURM_GPUS=N (R2D2_DEVICE=cuda sets 1) asks for N GPUs on the ampere
 # partition instead, with the 32 cores per GPU CSD3 allows there: a GPU job is
 # charged in GPU hours, so the cores and their 8000MB each cost nothing extra.
@@ -36,7 +40,7 @@ ns_should_submit() {
 # a directory of its own. sbatch still reads SBATCH_* from this shell. Paths
 # are physical: the job's REPO_ROOT is, and the settings' directories are.
 ns_submit_run() {
-  local run_dir="$1" memory="$2" shared=0 cmd size repo="${REPO_ROOT}" settings phys
+  local run_dir="$1" memory="$2" shared=0 sockets="${NS_SLURM_SOCKETS:-1}" cmd size repo="${REPO_ROOT}" settings phys
   shift 2
   # A -CPU project has no GPU hours, and sbatch's own refusal does not say so.
   if [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
@@ -54,16 +58,21 @@ ns_submit_run() {
   ns_write_job_settings "${settings}" || return
   printf -v cmd '%q ' /bin/bash "${repo}/scripts/lib/job-env.sh" "${settings}" "$@"
   if [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
-    size=(--gres "gpu:${NS_SLURM_GPUS}" --cpus-per-task "$((32 * NS_SLURM_GPUS))")
+    size=(--ntasks 1 --gres "gpu:${NS_SLURM_GPUS}" --cpus-per-task "$((32 * NS_SLURM_GPUS))")
     export SBATCH_PARTITION="${SBATCH_PARTITION:-ampere}"
   elif [ -n "${NS_MPI_PROCS:-}" ]; then
     case "${memory}" in *+*) shared="${memory%%+*}" memory="${memory#*+}" ;; esac
-    size=(--cpus-per-task "${NS_MPI_PROCS}"
-          --mem "$((shared + NS_MPI_PROCS * memory + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
+    if [ "${sockets}" -gt 1 ]; then
+      size=(--ntasks "${sockets}" --ntasks-per-socket 1
+            --cpus-per-task "$(((NS_MPI_PROCS + sockets - 1) / sockets))")
+    else
+      size=(--ntasks 1 --cpus-per-task "${NS_MPI_PROCS}")
+    fi
+    size+=(--mem "$((sockets * shared + NS_MPI_PROCS * memory + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
   else
     # Not --mem 0: CSD3's sbatch refuses it. --exclusive already brings every
     # core's default memory, i.e. the node.
-    size=(--exclusive)
+    size=(--ntasks 1 --exclusive)
   fi
   export SBATCH_PARTITION="${SBATCH_PARTITION:-icelake}"
   # CSD3's `intr` QoS starts at once but caps a job at one hour, and sbatch
@@ -80,7 +89,7 @@ ns_submit_run() {
     --job-name "${run_dir##*/}" \
     --chdir "${repo}" \
     --output "${run_dir}/slurm-%j.out" \
-    --nodes 1 --ntasks 1 "${size[@]}" \
+    --nodes 1 "${size[@]}" \
     --wrap "exec ${cmd}" || return
   # The readers' shared squeue cache (scripts/slurm_queue.py) predates this job;
   # dropped so `./ri runs` lists it as queued straight away.
@@ -125,7 +134,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   chmod +x "${_dir}/bin/sbatch"
   REPO_ROOT="${_dir}/repo"
   mkdir -p "${REPO_ROOT}"
-  unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS SBATCH_PARTITION SBATCH_TIMELIMIT SBATCH_QOS
+  unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS NS_SLURM_SOCKETS SBATCH_PARTITION SBATCH_TIMELIMIT SBATCH_QOS
 
   # A PATH of only the fake: the real cluster has sbatch on its own PATH.
   PATH="${_dir}/none" ns_should_submit && { echo "FAIL: no sbatch on PATH, so the run must stay in place"; exit 1; }
@@ -176,6 +185,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   esac
   [ "$(cat "${_dir}/env")" = "${_run} sapphire 01:00:00" ] \
     || { echo "FAIL: the caller's partition and time must win, got: $(cat "${_dir}/env")"; exit 1; }
+  # Two sockets: one task on each, the cores split between them (rounded
+  # up) and the shared memory counted per socket.
+  NS_SLURM_SOCKETS=2 NS_MPI_PROCS=5 ns_submit_run "${_run}" 8000+600 x >/dev/null
+  _args="$(tr '\n' ' ' <"${_dir}/args")"
+  case "${_args}" in
+    *"--nodes 1 --ntasks 2 --ntasks-per-socket 1 --cpus-per-task 3 --mem 23096 --wrap"*) ;;
+    *) echo "FAIL: NS_SLURM_SOCKETS=2 must split the job over two sockets, got: ${_args}"; exit 1 ;;
+  esac
 
   # The intr QoS caps a job at an hour, so without a time that is the default;
   # a submission also drops the squeue cache so the job is seen at once.

@@ -382,8 +382,9 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   `R2D2_WEIGHTS_PER_NODE=0` keeps one shared copy. A sized (`--mpi-procs`)
   R2D2 job can land on one socket, which turns this off; on one sapphire
   node, 56 CPUs split 28/28 ran 75 evals/s against 54 on one socket (+37%,
-  round 111), so for half a node submit by hand with `--ntasks=2
-  --ntasks-per-socket=1 --cpus-per-task=28` (it may queue longer).
+  round 111), so for half a node set `NS_SLURM_SOCKETS=2`: the job asks
+  for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice the
+  shared memory (it may queue longer, ~30 minutes against ~3 in round 110).
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
   whole toolchain, and a job purges the rest (above). `uv` is still needed for
   the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,

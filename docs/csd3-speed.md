@@ -5316,3 +5316,23 @@ All log(Z)s agree within their errors.
   queued ~30 minutes against ~3 in round 110, so it is documented in
   `docs/cluster.md` as the by-hand half-node shape rather than made the
   default.
+
+## Round 112: `NS_SLURM_SOCKETS=2` for sized jobs
+
+Round 111's placement, as a knob instead of a by-hand `sbatch`.
+`scripts/lib/slurm.sh` now reads `NS_SLURM_SOCKETS` (default 1, unchanged):
+with 2 and an explicit `NS_MPI_PROCS=N`, a submitted run asks for
+`--ntasks 2 --ntasks-per-socket 1 --cpus-per-task ceil(N/2)` and counts the
+R2D2 pool's shared memory twice in `--mem`, since `auto` then loads one
+checkpoint copy per socket (peak ~6.9 GB against ~3.9 GB in rounds 110-111).
+Whole-node (`--exclusive`) and GPU jobs are unchanged; mpirun ignores the
+two tasks (`OMPI_MCA_ras/plm=^slurm`, round 110), and the batch step sees
+all the job's cores, which is how round 110's 28/28 job ran.
+
+**Verified.** `bash scripts/lib/slurm.sh --self-check` has a case for the
+split (`--ntasks 2 --ntasks-per-socket 1 --cpus-per-task 3 --mem 23096` for
+5 ranks at 8000+600 MB); shellcheck 0.11 (`uvx --from shellcheck-py`) is
+clean; `sbatch --test-only` on sapphire accepts the 2 x 28 shape. No search
+was rerun: the throughput is round 111's (74.9 against 54.5 evals/s on one
+socket), and the cost is round 110's longer queue (~30 against ~3 minutes),
+which is why it stays opt-in.
