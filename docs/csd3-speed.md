@@ -5870,3 +5870,52 @@ then F B C T T C B F twice, so every arm ran 4 times at 19 copies:
   (round 117's batch-18 ran ~4,760 forwards/s).
 - No search ran, so there are no `benchmarks.jsonl` rows; the job output
   is `.probe/r125/job-39299282.out`.
+
+## Round 126 (diagnostic, two rejections): CPU threads per GPU R2D2 rank
+
+**Question.** A GPU search's rank derives `R2D2_OMP_THREADS` as the
+rounded-up CPU share, ceil(32 / 19) = 2, so 19 ranks run 38 threads on
+the 32 cores CSD3 gives an A100. Round 123's blocking sync means a rank
+waiting on the card no longer burns a core. Would 1 thread (no
+oversubscription) or 3 (more for the CPU phases) be faster?
+
+**A/B.** Two ampere jobs on `gpu-q-22` (A100-SXM4-80GB, 32 cores, MPS and
+blocking sync on), `.probe/r126/job.sh` (39300003) and `job3.sh`
+(39300346): `./ri search r2d2 --device cuda --mpi-procs 19 --nlive 48
+--num-repeats 5 --max-ndead 150 --seed 4242`, a discarded 2-thread warm-up,
+then each arm alternating with 2 threads three times.
+
+| job | arm | threads | evals/s | ms an evaluation | R2D2 request, ms | simulate, ms | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 39300003 | warm | 2 | 27.3 | 639 | 583 | 55 | 0.01688 +/- 0.00240 |
+| | T1a | 1 | 41.4 | 412 | 371 | 40 | 0.01659 +/- 0.00259 |
+| | T2a | 2 | 42.3 | 406 | 357 | 48 | 0.01451 +/- 0.00326 |
+| | T1b | 1 | 43.3 | 395 | 357 | 37 | 0.01659 +/- 0.00259 |
+| | T2b | 2 | 47.1 | 364 | 327 | 37 | 0.01287 +/- 0.00363 |
+| | T1c | 1 | 39.9 | 431 | 385 | 45 | 0.01655 +/- 0.00254 |
+| | T2c | 2 | 41.6 | 414 | 364 | 49 | 0.01472 +/- 0.00309 |
+| 39300346 | warm | 2 | 39.9 | 431 | 380 | 50 | 0.01652 +/- 0.00244 |
+| | T3a | 3 | 41.4 | 417 | 374 | 41 | 0.01663 +/- 0.00254 |
+| | T2d | 2 | 44.5 | 389 | 344 | 44 | 0.01459 +/- 0.00322 |
+| | T3b | 3 | 40.5 | 424 | 375 | 49 | 0.01676 +/- 0.00222 |
+| | T2e | 2 | 40.0 | 431 | 378 | 51 | 0.01468 +/- 0.00310 |
+| | T3c | 3 | 40.0 | 428 | 379 | 49 | 0.01642 +/- 0.00264 |
+| | T2f | 2 | 41.6 | 412 | 366 | 45 | 0.01678 +/- 0.00240 |
+
+**Learned.**
+- The derived 2 threads stay. Against 1 thread, 2 win every pair (+2.2%,
+  +8.8%, +4.3%; 43.7 against 41.5 evals/s). Against 3 they win two of three
+  (-7.0%, +1.3%, -3.8% for 3; 42.0 against 40.6). Both alternatives are
+  rejected. With blocking sync and `OMP_WAIT_POLICY=PASSIVE`, a 38-thread
+  oversubscription of 32 cores costs nothing measurable. The second thread
+  shortens the R2D2 request's CPU phases (~360 against ~371 ms).
+- 1-thread arms give near-identical log(Z)s run to run (0.01659, 0.01659,
+  0.01655) and so do the 3-thread arms, while the 2-thread arms spread
+  (0.0129-0.0168). All agree within 1 sigma. These are async runs that stop at 150
+  dead points, so their chains are not expected to match.
+- The first job's warm-up was cold (27.3 evals/s) and the second's was not
+  (39.9), as in rounds 120-124. The 2-thread arms spread 40.0-47.1 across
+  two jobs on one node, so a CPU-thread change worth under ~5% cannot be
+  resolved with three pairs on the GPU.
+- The 14 rows are in `benchmarks.jsonl` (`r126-*`). Their run directories
+  (~10k files) were deleted.

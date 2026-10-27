@@ -137,6 +137,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | GPU R2D2 workers wait for the U-Net on a blocking CUDA event instead of spin-waiting in the copy back (`R2D2_CUDA_BLOCKING_SYNC`, default on) | `r2d2_serve.py` `patch_cuda_network()` | 16 ranks on one A100 with MPS: 37.5 -> 39.8 evals/s (+6%, three ABAB pairs, no overlap), CPU-only simulate ~48 -> ~43 ms, log(Z)s agree ([round 123](csd3-speed.md)) |
 | A GPU search runs 19 R2D2 ranks per A100 by default, not 16 (`NS_R2D2_CUDA_MAX_RANKS`, the most the card's memory holds) | `defaults.toml` | one A100 with MPS and blocking sync: 41.1 -> 43.9 evals/s (+7%, three pairs, every 19-rank arm above every 16-rank one), log(Z)s agree ([round 124](csd3-speed.md)) |
 | (rejected) TF32, `cudnn.benchmark` or channels_last for the GPU U-Net | - | On one A100 under MPS at 19 copies, production's float32 forward is fastest (~1,716 forwards/s); TF32 -3% and 1.7e-3 off, `cudnn.benchmark` -23% and non-deterministic across workers, channels_last -39% ([round 125](csd3-speed.md)) |
+| (rejected) 1 or 3 CPU threads per GPU R2D2 rank instead of the derived 2 (`R2D2_OMP_THREADS`) | - | one A100, 19 ranks, MPS and blocking sync: 2 threads beat 1 in all three pairs (43.7 vs 41.5 evals/s) and 3 in two of three (42.0 vs 40.6) ([round 126](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
