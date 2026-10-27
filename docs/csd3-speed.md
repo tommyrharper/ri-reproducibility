@@ -5,13 +5,41 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 115).** The 22 Sep production R2D2 search below,
-rerun on the same 24 sapphire CPUs with the same images and seed, now
-converges in **41 minutes instead of 6h20m (7.0x)**, at 26.6 evals/s
-instead of 4.12, with log(Z) in agreement. Simulate (MeqTrees) went from
-39% of worker time to 3.8%. See [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree).
-On a GPU, CUDA MPS makes one A100 (16 ranks) run 41.8 evals/s, 2.65x its
-rate without MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100)).
+**Where it stands (round 137).**
+
+- **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
+  sapphire CPUs with the same images and seed, converges in **41 minutes
+  instead of 6h20m (7.0x)**: 26.6 evals/s against 4.12, log(Z) in
+  agreement ([round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree)).
+  Simulate (MeqTrees) went from 39% of worker time to 3.8%, idle from
+  11.5% to 0.05%. A whole sapphire node (112 ranks x 1, one checkpoint
+  copy per socket, rounds 105-106) runs 103.5 evals/s. The request is now
+  the evaluation (96%), and two thirds of it is the U-Net's convolutions,
+  which are memory-bound under load (one request costs 55% more CPU with
+  36 neighbours than solo). Closed with numbers: bit-identical forward
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), per-NUMA
+  copies with pinning (98), one net per checkpoint (97), and batching
+  forwards inside a worker, in a pool (109, 136) or with real requests in
+  lockstep (137, -24 to -45%). The one CPU lever left is a cross-rank
+  forward server, with a ceiling of about +30%.
+- **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
+  and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
+  whole sapphire node. Rejected: a
+  shared weight copy (120), CUDA graphs (122, 130), TF32, `cudnn.benchmark`
+  and channels_last (125), more CPU threads per rank (126) and batching
+  across requests (127). A 2-GPU A/B (round 130's job 39303263) had not
+  run when this was written.
+- **WSClean.** A production-shaped 36-rank search on a patched
+  (0001-0017) SIF runs ~250 evals/s on half an icelake node
+  ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
+  and rounds 90-134 add another ~4.5%, mostly from a 13% cheaper simulate
+  (round 135). Simulate is ~15-17% of an evaluation and the `wsclean`
+  binary the rest. ducc0's gridding kernels are ~40% of the binary, and
+  nothing else in it is above ~2% (round 83). The biggest lever left for
+  production is not code: a run on the stale shipped SIF (0001-0006) is
+  29% slower, and a search's job now patches it itself (round 94).
+- **Hardware.** Half a sapphire node runs +41% more WSClean evaluations
+  than half an icelake node (round 84), and about the same per core.
 
 ## Where the time went
 
