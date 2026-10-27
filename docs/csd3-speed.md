@@ -5336,3 +5336,53 @@ clean; `sbatch --test-only` on sapphire accepts the 2 x 28 shape. No search
 was rerun: the throughput is round 111's (74.9 against 54.5 evals/s on one
 socket), and the cost is round 110's longer queue (~30 against ~3 minutes),
 which is why it stays opt-in.
+
+## Round 113 (diagnostic): `NS_SLURM_SOCKETS=2` end to end, and simulate re-profiled
+
+**Socket knob, end to end.** Round 112 checked the request shape alone.
+This round submitted a real search from a compute node with
+`SBATCH_PARTITION=sapphire NS_SLURM_SOCKETS=2 ./ri search r2d2
+--mpi-procs 56 --nlive 200 --num-repeats 5 --max-ndead 600 --seed 4242`
+(job 39292394). The job started within seconds, not round 110's ~30
+minutes, on cpu-r-6 (a shared node this time), and finished with no
+memory trouble:
+
+| run | evals | evals/s | ms per eval | peak memory | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| r113-sock | 8,444 | 59.4 | 908 | 6,855 MB | 0.01784 ± 0.00063 |
+| r111-pin-P2 (exclusive node, warm) | 8,468 | 75.3 | 716 | 6,777 MB | 0.01756 ± 0.00064 |
+| r111-pin-S2 (one socket) | 8,434 | 53.3 | 1,013 | 3,925 MB | 0.01767 ± 0.00059 |
+
+The peak memory shows two checkpoint copies, so `auto` saw a balanced
+split and took per-socket copies, as intended; log(Z) agrees. The rate
+is a single, uncontrolled arm: it was the job's first (cold) arm, which
+round 110 found ~20% slow (75 x 0.8 = 60), on a node shared with other
+jobs. Read it as "the knob works", not as a new throughput figure.
+
+**Simulate, solo.** A cProfile of the current tree (round 90's harness,
+48 real draws x 3, one pinned CPU, host-built `fastnoise.so` bound in)
+gives 13.0 ms a call, against round 90's 13.1:
+
+| part | ms a call |
+| --- | ---: |
+| C phase ramp + XX/YY noise (`_ramp_xxyy2`) | 6.0 |
+| DATA putcol | 0.76 |
+| main-table open + close | 0.87 |
+| UVW, ANTENNA1/2, TIME, TIME_CENTROID putcols | 1.50 |
+| addrows | 0.29 |
+| rest (template copy, argparse, json, pathlib) | ~3.5 |
+
+The ramp+noise pass is at round 70's floor. The four small integer/time
+putcols are ~1.5 ms, about 1% of a ~133 ms production WSClean evaluation
+(round 89) even before in-run inflation, so this round did not try
+splicing them as round 90 did with the subtables. Without the
+`fastnoise.so` bind, the probe drops to numpy's normal draws and reads
+35.9 ms a call. Any simulate probe that skips the bind measures the
+fallback, not production.
+
+**Learned.**
+- `NS_SLURM_SOCKETS=2` works end to end through `./ri search`: the
+  2 x 28 sapphire shape was accepted and placed immediately, the
+  `--mem` request covered both checkpoint copies, and auto engaged.
+- MeqTrees simulate has no lever left above ~1% of a WSClean evaluation.
+  The remaining WSClean time is the binary (ducc0, rounds 83-88).
