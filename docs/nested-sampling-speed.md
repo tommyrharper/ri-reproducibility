@@ -156,6 +156,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | Startup reaper skips a pool worker that has exec'd instead of reading it as a pool with no run (a raced search killed the other's live pool) | `rank-budget.sh` `_ns_pool_row()` | correctness, not speed: a fake starting pool was falsely reaped on 4/300 passes before, 0/300 after; raced A/B arms in a batch job no longer lose one ([round 154](csd3-speed.md)) |
 | (rejected) OpenVINO 2026.4 instead of ONNX Runtime for the CPU U-Net | - | one 32x32 forward, f32: solo 15.5 ms against ORT's 17.0, but 28.3 against 24.4 (+16%) with 36 forked children, the pool's shape ([round 155](csd3-speed.md)) |
 | (rejected) `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` for the ORT U-Net's weights | - | THP `always` already backs 88% of the 25 sessions' 3.5 GB; 24.57 against 24.66 ms a forward with 36 forked children (ABABAB, noise) ([round 156](csd3-speed.md)) |
+| (rejected) 2-3 ORT intra-op threads per R2D2 worker (18 x 2, 12 x 3) | - | -2% and -14% forwards per node against 36 x 1, outputs bit-identical. Fork-shared sessions also give 11% from shared L3 when workers align on a checkpoint, of which ~5% remains over a staggered pool ([round 157](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

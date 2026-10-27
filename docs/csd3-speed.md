@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 156).**
+**Where it stands (round 157).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -7370,4 +7370,50 @@ left to convert.
 **Learned.** The page-mapping levers are now closed for both runtimes:
 THP already covers the R2D2 weights whether torch (round 100) or ORT holds
 them, as it does the WSClean zygote's heap (rounds 87-88). Not a search,
+so no `benchmarks.jsonl` rows.
+
+## Round 157 (negative): more ORT threads per R2D2 worker, and shared L3
+
+**Question.** Under load the forward is memory-bound (round 146). Would
+fewer workers with more ONNX Runtime intra-op threads each do more
+forwards per node? Round 18 settled this for torch, not for ORT.
+
+**Threads.** `.probe/r157/threads.py`, inside `r2d2.sif`: N1 on 36 CPUs of
+this loop's half icelake node, each worker pinned to its own CPUs and
+building its own session (an ORT thread pool does not survive a fork),
+two passes per arm:
+
+| arm | workers | ms a forward | node forwards/s |
+| --- | ---: | ---: | ---: |
+| 1 thread | 36 | 32.95, 33.40 | 1093, 1078 |
+| 2 threads | 18 | 17.13, 16.96 | 1051, 1062 |
+| 2 threads, spinning | 18 | 16.85, 16.86 | 1069, 1068 |
+| 3 threads | 12 | 13.04, 12.78 | 921, 939 |
+
+2 threads are -2% at best, 3 threads -14%. All outputs are bit-identical to
+a 1-thread session. And these numbers flatter the threaded arms: the
+production pool shares one parent's sessions across forks (24.7 ms below),
+which a threaded session cannot do.
+
+**Shared L3.** That fork sharing is worth more than it looks.
+`.probe/r157/mix.py`: 25 sessions in the parent, 36 forked children, three
+passes:
+
+| what the children run | ms a forward |
+| --- | ---: |
+| all on N1 | 24.73, 24.71, 24.66 |
+| each on its own checkpoint (`k mod 25`) | 27.54, 27.59, 27.77 |
+| each walking N1..N25, staggered | 26.06, 25.99, 26.05 |
+
+Children that read the same weights at the same time hit each other's L3
+lines, so the all-N1 probe (rounds 146, 155, 156) reads ~6% fast against a
+real pool, whose workers are staggered across checkpoints. Forcing
+alignment is what round 137's lockstep did (-24 to -45%). The ~5% left
+between staggered and aligned is smaller than any wait that alignment
+would add.
+
+**Learned.** Threads per rank stay at one for ORT, as they do for torch.
+36 workers that each build their own session run 33 ms a forward, against
+24.7 ms when they share the parent's. Keep the build-in-parent design, and
+probe the forward with staggered checkpoints, not all on N1. Not a search,
 so no `benchmarks.jsonl` rows.
