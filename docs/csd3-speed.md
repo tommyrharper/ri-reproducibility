@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 139).**
+**Where it stands (round 140).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -21,8 +21,10 @@ the Hetzner host.
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
-  -52% or worse, because the server cannot keep up). No CPU lever is left
-  for the U-Net.
+  -52% or worse, because the server cannot keep up). Open: ONNX Runtime
+  runs the same float32 forward 34% faster in the pool's shape and stays
+  within 1.5e-5 of the peak across all 25 checkpoints (round 140), so
+  ~+30% is projected once `r2d2.sif` ships it.
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6491,3 +6493,69 @@ through every positional argument.
 - No search was run, so there is no `benchmarks.jsonl` row. The `/dev/shm`
   outputs were deleted. Scripts: `.probe/r139/fserver.py`, `run.sh`, and the
   results in `pass1.txt`.
+
+## Round 140 (diagnostic): ONNX Runtime runs the CPU U-Net forward 34% faster
+
+**Question.** Every CPU lever tried on the U-Net so far stayed inside
+PyTorch (rounds 11, 86, 97-100, 109, 134-139). Round 86 found 45% of a
+torch forward in `_slow_conv2d_forward` (im2col plus small MKL sgemms) and
+30% in oneDNN reorders. Does another runtime, here ONNX Runtime with its
+MLAS kernels, do the same float32 network faster?
+
+**Method.** `onnx` 1.23.2 and `onnxruntime` 1.23.2 were pip-installed with
+`--target` into `/dev/shm` and put on `PYTHONPATH` inside `r2d2.sif`
+(torch 2.13, Python 3.10). The image is unchanged. Each checkpoint was
+exported with `torch.onnx.export(dynamo=False, opset_version=17)`, giving
+124 MB per checkpoint. The session used 1 intra-op and 1 inter-op thread,
+no spinning and `ORT_ENABLE_ALL`, with torch on 1 thread and
+`mkldnn.deterministic` as in `r2d2_serve`. One 32x32 forward at batch 1,
+150-200 timed forwards after 5 warm-up forwards, on this loop's icelake
+half-node (38 CPUs, other tenants at load 10-25). The arms ran in ABAB
+order.
+
+| shape | torch, ms a forward | ORT, ms a forward | ORT / torch |
+| --- | ---: | ---: | ---: |
+| solo, pinned | 28.1, 28.3 | 16.6, 16.5 | 0.59 |
+| 36 separate processes, one per CPU | 54.0, 54.2 | 31.0, 31.4 | 0.58 |
+| 36 forked children sharing one parent's copy, one per CPU (the pool's shape) | 39.4, 39.9 | 25.8, 26.5 | 0.66 |
+
+`ORT_DISABLE_ALL`, `_BASIC` and `_EXTENDED` all give 18.8 ms solo. Only
+`ORT_ENABLE_ALL`'s layout transforms give the last 12%.
+
+**Accuracy.** For one forward, the largest difference from torch is
+6e-6 of the output peak on random input, and 0.7-3.5e-6 on a sky-like
+input (two Gaussians plus 1% noise). Across all 25 `R2D2_A1` checkpoints,
+chained the way R2D2 chains them (`out = net(cat(rec, res)) + rec`,
+`rec_res` from the second on, with the residual held fixed), the ORT chain
+stays within 1.5e-5 of the peak of torch's at worst (N4) and ends at
+8.4e-7. That is below the largest deviation accepted here so far
+(w-gridding off, 2.3e-5). Like threads >1 (round 9), it is not
+bit-identical. An ORT session built in a parent gives bit-identical outputs
+in all 36 forked children, and it runs fine after `fork`, because
+intra-op 1 starts no pool threads.
+
+**What it would be worth.** At 36 ranks a request makes ~17.6 forwards
+(round 139). At 39.6 ms a forward that is ~0.70 CPU-s of a ~0.94 CPU-s
+request, and 26 ms saves ~0.24 CPU-s. The projection is **~+30-35% R2D2 CPU
+evals/s**, which is not yet measured end to end. That is the largest R2D2
+CPU lever since round 115, and unlike batching it needs no change to how
+requests run.
+
+**What shipping it needs.**
+- `onnxruntime` in `r2d2.sif`: a Dockerfile change, so rebuild, export
+  and import. Alternatively, a `Bootstrap: localimage` layer built on a
+  compute node, the way `./ri images patch-wsclean` layers WSClean.
+- In `r2d2_serve.py`, an ORT path next to `patch_cuda_network`. The pool
+  parent exports or loads a cached `.onnx` per checkpoint (25 x 124 MB,
+  cacheable under `$RI_WORK_DIR/.cache/ri`) and builds one session per
+  checkpoint. `load_net` records `cur_iter`, and the net's call runs that
+  session. One session adds ~0.3 GB to the parent's RSS (8.2 GB for all 25
+  in the probe, with torch's copies also resident), which fork shares, so
+  `NS_R2D2_SHARED_MB` would need re-measuring.
+- An off switch (`R2D2_RUNTIME=torch`), and an interleaved end-to-end A/B
+  with log(Z) compared.
+
+No search was run, so there is no `benchmarks.jsonl` row. Scripts:
+`.probe/r140/ort.py` (export and per-process timing), `chain.py` (the
+25-checkpoint chain) and `fork.py` (the forked, shared shape for both
+runtimes). The `/dev/shm` packages and models were deleted.
