@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 160; R2D2 speed work stopped, see [the final status](#round-160-final-status-stop-condition-met)).**
+**Where it stands (round 161; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -7512,3 +7512,32 @@ change the results or are outside this scope:
 WSClean speed work closed earlier (rounds 83, 135, and the 2026-10-27
 scope decision). The one non-code lever left for it is still shipping a
 SIF with all of `docker/wsclean/patches/` (round 94).
+
+## Round 161 (pending): the 2-GPU R2D2 A/B, resubmitted
+
+**Why.** The 2026-10-27 scope has no stop condition, so after round 160
+closed the CPU side, the next R2D2 lever is more GPUs per search. Round
+128's multi-GPU change (`R2D2_CUDA_GPUS`, which deals pool workers
+round-robin over the job's cards with `torch.cuda.set_device` after the
+fork, and scales the GPU rank cap and `NS_SLURM_GPUS`) was never measured:
+round 130's job 39303263 left no output file at all, so it never started.
+
+**What was done.** The diff (`agent-node/iteration-129-multi-gpu.diff`)
+was ported onto this round's tree in a separate copy,
+`agent-node/r161-mgpu` (`BASE` holds the commit). All hunks apply except
+`bench.py`'s `WORKLOAD_KEYS` line, which `R2D2_RUNTIME` had moved, and
+which was re-added by hand. Job 39368806 (ampere, 2 x A100, 64 CPUs, 1h,
+`.probe/r161/job.sh` in that copy) runs warmG2, G1a, G2a, G1b, G2b: `./ri
+search r2d2 --device cuda --nlive 96 --num-repeats 5 --max-ndead 150
+--seed 4242`, MPS and blocking sync, 2 threads, with 19 ranks on one card
+against the default 38 over two. It was still queued 40 minutes after
+submission, so there is no result yet. Output goes to
+`agent-node/r161-mgpu/.probe/r161/job-39368806.out`, and to `row-*.json`
+and `smi-*.log` beside it.
+
+**To finish.** Read the job output. If G2 gives about 2x G1 with log(Z)
+in agreement, apply the same diff to the tree, add
+`R2D2_CUDA_GPUS` to `docs/cluster.md`'s GPU section, and copy the rows
+into `benchmarks.jsonl`. Then delete `agent-node/r161-mgpu`, whose
+`results/` count against the file quota.
+
