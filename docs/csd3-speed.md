@@ -5687,3 +5687,56 @@ the job's output, which is still in `.probe/r120/job-39297083.out`.
   independent MPS pools.
 - The first arm in a fresh ampere job runs cold (27.3 against ~41 evals/s,
   R2D2 request 475 ms). Always throw away a warm-up arm in GPU jobs.
+
+## Round 122 (diagnostic): the U-Net forward from a captured CUDA graph
+
+**Question.** Round 117 called one 32x32 U-Net forward on the A100
+"launch-bound" (3.1 ms solo). Rounds 119-120 left a GPU search at ~16
+ranks and ~300 ms an R2D2 request. If the forward's time is kernel-launch
+overhead, replaying it from a captured CUDA graph should cut both its
+latency and its CPU time. Does it, and does it move MPS's ~1,680
+forwards/s plateau?
+
+**Probe.** `scripts/probe_unet_forward.py` gained `GRAPH=1`: warm on a
+side stream, capture `net(static_x)` once with `torch.cuda.graph`, then
+copy each input into `static_x` and `replay()`. It also now prints CPU ms
+a forward (`time.process_time`) and `graph_identical`, a `torch.equal` of
+the graph's output against eager's. One ampere job
+(`.probe/r122/graph.sh`, job 39297638, `gpu-q-2`, A100-SXM4-80GB, 32 EPYC
+cores), P concurrent copies of round 117's probe, batch 1, MPS on, eager
+(G0) and graph (G1) taking turns twice, then one no-MPS pair:
+
+| P | MPS | eager forwards/s (pass 1 / 2) | graph forwards/s (pass 1 / 2) | ms a forward per copy, eager / graph |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | on | 326 / 327 | 775 / 775 | 3.06 / 1.29 |
+| 16 | on | 1,681 / 1,679 | 1,685 / 1,689 | 9.5 / 9.5 |
+| 24 | on | 1,671 / 1,666 | 1,637 / 1,636 | 14.4 / 14.7 |
+| 16 | off | 593 | 705 | 27.1 / 22.9 |
+
+Every graph copy's output was bit-identical to eager (98 of 98). CPU ms a
+forward equalled wall ms in every arm, because the synchronising copy
+spins.
+
+**Learned.**
+- Solo, the graph is 2.4x faster, so a lone forward is mostly launch
+  overhead, as round 117 said. But under MPS the plateau stays at ~1,680
+  forwards/s at 16 and 24 copies, with or without the graph. What MPS
+  saturates is the GPU's own work for 16 interleaved small forwards, not
+  the CPU-side launch path. Graphs cannot raise a 1-GPU search's U-Net
+  ceiling. Only batching can: round 117's batch-18 forward ran 4,762
+  forwards/s.
+- Without MPS the graph helps at 16 copies (+19%), because time-slicing
+  costs less with fewer launches. MPS (2.8x) is the better lever, and
+  production already has it (round 119).
+- A search at ~41.8 evals/s does ~750 forwards/s, about 45% of the plateau,
+  so between its CPU phases the GPU is not always saturated. A forward at
+  partial load may still finish sooner from a graph. Only an end-to-end
+  A/B can say whether it does (one graph per iteration's weights, captured
+  per worker, keyed like `_CUDA_WEIGHTS` in `r2d2_serve.py`). That A/B
+  was not run this round. The most it can gain is bounded by the plateau:
+  ~16 copies' forwards already take 9.5 ms each.
+- The job output is in `.probe/r122/graph-39297638.out`. The round's one
+  `benchmarks.jsonl` row (`r122-base`) is a reference CPU search on this
+  tree: 38-rank icelake WSClean (patched SIF cache, nlive 200, 5 repeats,
+  4000 dead), 232 evals/s, with simulate 30 ms (19%) and the binary 122 ms
+  (77%) an evaluation.
