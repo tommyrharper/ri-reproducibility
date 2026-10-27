@@ -5,7 +5,9 @@ Inside r2d2.sif with the checkpoints at /checkpoints:
 B batches B images per forward (prints ms per image). DIM, N (forwards),
 T (torch threads) and DEV (cpu or cuda; csd3-speed.md, round 117) as named;
 START (epoch seconds) holds the timed loop until then, so P copies overlap.
-GRAPH=1 (cuda only) replays the forward from a captured CUDA graph (round 122). Run P copies at once to see what a full node does:
+GRAPH=1 (cuda only) replays the forward from a captured CUDA graph (round 122).
+TF32 (default 1, torch's own) 0 computes float32 convolutions as r2d2_serve does;
+BENCH=1 sets cudnn.benchmark; CL=1 runs channels_last (round 125). Run P copies at once to see what a full node does:
     for i in $(seq 24); do apptainer exec ... python3 probe_unet_forward.py & done; wait
 """
 import os, sys, time
@@ -15,15 +17,18 @@ from utils.util_model import create_net_imaging
 
 torch.backends.mkldnn.deterministic = True  # as r2d2_serve.warm_imports
 torch.set_num_threads(int(os.environ.get("T", "1")))
+torch.backends.cudnn.allow_tf32 = os.environ.get("TF32", "1") == "1"
+torch.backends.cudnn.benchmark = os.environ.get("BENCH", "0") == "1"
+fmt = torch.channels_last if os.environ.get("CL", "0") == "1" else torch.contiguous_format
 net = create_net_imaging()
 ck = torch.load("/checkpoints/R2D2_A1/R2D2_UNet_N1.ckpt", map_location="cpu", weights_only=False)
 sd = ck.get("state_dict", ck)
 net.load_state_dict({'.'.join(k.split('.')[1:]): v for k, v in sd.items()}, assign=True)
 dev = torch.device(os.environ.get("DEV", "cpu"))
-net = net.eval().to(dev)
+net = net.eval().to(dev, memory_format=fmt)
 b, dim, n = int(os.environ.get("B", "1")), int(os.environ.get("DIM", "32")), int(os.environ.get("N", "200"))
 torch.manual_seed(0)
-x = torch.randn(b, 2, dim, dim).to(dev)
+x = torch.randn(b, 2, dim, dim).to(dev, memory_format=fmt)
 sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
 with torch.no_grad():
     ref = torch.cat([net(x[i:i + 1]) for i in range(b)])
@@ -59,6 +64,8 @@ with torch.no_grad():
     sync()
     dt = (time.perf_counter() - t) / n
     cpu = (time.process_time() - c) / n
+if os.environ.get("OUT"):
+    torch.save(y.cpu().contiguous(), os.environ["OUT"])  # compare arms' outputs afterwards
 print(f"{dt / b * 1e3:.2f} ms/image B={b} params={sum(p.numel() for p in net.parameters()) * 4 / 1e6:.0f}MB "
       f"batch_identical={torch.equal(y, ref)} cpu_ms={cpu * 1e3:.2f} "
       f"graph_identical={graph_identical if os.environ.get('GRAPH', '0') == '1' else '-'} maxrel={float((y - ref).abs().max() / ref.abs().max()):.2g}")

@@ -5826,3 +5826,47 @@ same node as round 123, A100-SXM4-80GB, 32 cores, MPS and blocking sync on):
   the lowest at 0.6 sigma from the 19-rank mean. Same-rank arms only, per
   round 121.
 - Unlike rounds 120 and 123, the warm-up arm was not cold (41.7).
+
+## Round 125 (diagnostic, three rejections): TF32, `cudnn.benchmark` and channels_last for the GPU U-Net
+
+**Question.** Rounds 117 and 122 measured the A100's MPS plateau with
+`scripts/probe_unet_forward.py`, which left torch's default TF32
+convolutions on, while production (`patch_cuda_network` in
+`r2d2_serve.py`) turns TF32 off. Is production's float32 forward slower
+than the plateau suggests, and do the remaining cheap cuDNN settings,
+`cudnn.benchmark` or channels_last, raise it?
+
+**Probe.** The probe gained `TF32`, `BENCH`, `CL` and `OUT` (save the
+output for comparison). One ampere job (`.probe/r125/job.sh`, job
+39299282, `gpu-q-21`, A100-SXM4-80GB, MPS on), batch 1, 1 copy (1,500
+forwards) and 19 copies (400 each, the production rank count since round
+124). Arms: F = float32 (production), B = F + `cudnn.benchmark`, C = F +
+channels_last, T = TF32 (the old probe). Order: one discarded F warm-up,
+then F B C T T C B F twice, so every arm ran 4 times at 19 copies:
+
+| arm | 1 copy, ms a forward | 19 copies, forwards/s (4 runs) | mean | vs F | output vs F |
+| --- | ---: | --- | ---: | ---: | --- |
+| F float32 (production) | 2.81 / 2.82 | 1,749 / 1,749 / 1,617 / 1,749 | 1,716 | - | identical |
+| B `cudnn.benchmark` | 2.74 / 2.84 | 1,257 / 1,447 / 1,354 / 1,259 | 1,329 | -23% | 8e-6 and 1.2e-5 off at 19 copies, identical solo |
+| C channels_last | 3.54 / 3.61 | 1,044 / 1,052 / 1,050 / 1,044 | 1,048 | -39% | 6.3e-6 off |
+| T TF32 | 3.24 / 3.13 | 1,691 / 1,629 / 1,695 / 1,640 | 1,664 | -3% | 1.7e-3 off |
+
+**Learned.**
+- Production's float32 forward is already the fastest of the four, solo
+  and at 19 copies. TF32 does not speed up this 32x32 U-Net (its convs
+  are too small for tensor cores to pay), and it moves the output by
+  1.7e-3, so the "TF32 off" choice costs nothing. The earlier plateau
+  (~1,680 forwards/s with TF32) understated production slightly: float32
+  plateaus at ~1,720-1,750.
+- `cudnn.benchmark` loses 23% under MPS and is not deterministic: timing
+  its candidate algorithms under 19 copies' contention picks different
+  ones from solo, so outputs differ by ~1e-5 between workers. Rejected on
+  both counts.
+- channels_last is 26% slower solo and 39% slower at 19 copies (layout
+  conversions around the small convs). Rejected.
+- With these, graphs (round 122), more ranks (rounds 120, 124) and MPS
+  (round 119) measured, the cheap per-forward GPU settings are exhausted.
+  What is left for one A100 is batching forwards across requests
+  (round 117's batch-18 ran ~4,760 forwards/s).
+- No search ran, so there are no `benchmarks.jsonl` rows; the job output
+  is `.probe/r125/job-39299282.out`.
