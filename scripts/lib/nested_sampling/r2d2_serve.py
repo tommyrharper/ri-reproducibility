@@ -597,6 +597,7 @@ def patch_nufft_plans() -> None:
                     upsampfac=2.0,
                     modeord=0,
                     nthreads=nthreads,
+                    spread_sort=nufft_sort(),
                 )
                 _NUFFT_PLAN_CACHE[cache_key] = made
             # Workers process one request at a time, so one shared plan can be
@@ -633,6 +634,14 @@ def patch_nufft_plans() -> None:
 NORMAL_KERNEL_EPS = 1e-9
 
 
+def nufft_sort() -> int:
+    """FINUFFT's spread_sort for a request's two type-1 NUFFTs. 0 skips the bin sort,
+    which on R2D2's tiny grids costs more than it saves: -18% a call under load, and
+    images within one float32 ulp of the peak (docs/csd3-speed.md, round 153).
+    R2D2_NUFFT_SORT=2 is upstream's."""
+    return int(os.environ.get("R2D2_NUFFT_SORT", "0"))
+
+
 class _Deferred:
     def __init__(self, image):
         self.image = image
@@ -665,7 +674,7 @@ def normal_operator(op):
     # modeord 0 puts mode m at index m + N, so ifftshift puts d at index d mod 2N.
     kernel = finufft.nufft2d1(points[0], points[1], strengths, (2 * rows, 2 * cols),
                               eps=NORMAL_KERNEL_EPS, isign=-1, modeord=0,
-                              nthreads=torch.get_num_threads())
+                              nthreads=torch.get_num_threads(), spread_sort=nufft_sort())
     spectrum = np.fft.rfft2(np.fft.ifftshift(kernel.real))
     dtype = op._dtype
 

@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 152).**
+**Where it stands (round 153).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -34,6 +34,7 @@ the Hetzner host.
   Briggs weights by `np.bincount` (round 148) cut 26 to 10 ms of that,
   byte-identical, ~1.5% end to end. A request's four FITS writes and its
   config parse skip astropy and PyYAML (round 151, byte-identical, ~6 ms).
+  Both NUFFTs skip FINUFFT's bin sort (round 153, ~6 ms a request under load).
   On balanced multi-socket jobs the ORT sessions are built once per
   socket like the torch copies: a whole icelake node went from 59.2 to
   **80.5 evals/s (+36%)** ([round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36));
@@ -57,7 +58,8 @@ the Hetzner host.
   production is not code: a run on the stale shipped SIF (0001-0006) is
   29% slower, and a search's job now patches it itself (round 94).
   One 36-rank search runs 253 evals/s, +11% over two 18-rank searches
-  raced on the same CPUs (round 152).
+  raced on the same CPUs, and a whole sapphire node (112 ranks) runs
+  ~743 evals/s (round 152).
 - **Hardware.** Half a sapphire node runs +41% more WSClean evaluations
   than half an icelake node (round 84), and about the same per core.
 
@@ -7130,11 +7132,123 @@ each), after a throwaway warm-up. Order single, pair, single, pair. Script:
 - A raced pair understates what each tree gets alone, by ~10% here. That
   is fine for a relative A/B, but absolute rates from raced arms are low.
 - log(Z) agrees across all six arms.
-- Still open: a whole sapphire node (112 ranks against 2 x 56 raced),
-  submitted as job 39351719 (`.probe/r152/job.sh`). It was still pending
-  after 35 minutes, so it was not waited for. It writes its rows and logs
-  to `.probe/r152/`.
+- Whole sapphire node, read in iteration 153: job 39351719 (`.probe/r152/job.sh`,
+  cpu-r-14, exclusive, 2 x 56 Xeon 8480+) ran a 112-rank single search
+  (nlive 600, 3600 dead) twice: **736.9 and 749.1 evals/s**, 145.9 and
+  143.2 ms an evaluation, simulate 30.4/30.1 ms, binary 114.2/111.8 ms,
+  idle 0.06%, log(Z) 0.09713 and 0.09659 (+/- 0.0003). That is ~2.9x
+  the 36-rank half icelake figure, and the best WSClean figure for one
+  node. The pair arms (2 x 56, nlive 300, 1800 dead) are **not usable**.
+  In both pairs, the second search's startup reaper (`ns_reap_leaked_sidecars`)
+  logged "killing worker pool(s) left behind by a run that is gone" and
+  killed the first search's wsclean pool 16 s after its manifest, while its
+  ranks were running. The first search's ranks died ("no wsclean-zygote
+  pool"), and `run_with_retries` resumed them after ~4.5k evaluations, so
+  they recorded no row. The second searches alone ran 415.0 and 413.1
+  evals/s (log(Z) 0.09683, 0.09700), but on CPUs the first search was
+  partly idle on, so they are not a pair rate. This is round 135's symptom
+  again, with `.launcher.pid` now renamed into place. Both of the reaper's
+  liveness tests must have failed: `pgrep` of the first run's rank
+  pattern, and `kill -0` of its launcher. The 36-rank pairs on this loop's
+  node did not hit it. The cause was not traced here. Until it is, a raced
+  A/B in a batch job can lose an arm, so check every arm's log for that
+  NOTE.
 
-Rows: `r152-lsingle-a/b`, `r152-lhalf-a1/a2/b1/b2` in `benchmarks.jsonl`
+Rows: `r152-lsingle-a/b`, `r152-lhalf-a1/a2/b1/b2`, and from the sapphire job
+`r152-single-a/b` and `r152-half-a2/b2`, in `benchmarks.jsonl`
 (commit set by hand, since an archived tree has no `.git`). Run
+directories deleted.
+
+## Round 153: FINUFFT's bin sort skipped for a request's two NUFFTs
+
+**Question.** Round 146 put FINUFFT at 12% of an onnx R2D2 worker's CPU
+in a search, sorting included (`indexSort` 1.4%, `spreadSorted` 3.5%). A
+request runs two type-1 NUFFTs over the same ~60k-330k points: the normal
+kernel (2N = 64 modes, eps 1e-9, width 10) and the adjoint dirty image
+(N = 32, eps 1e-6). Both fine grids are tiny (128x128 and 64x64,
+256 KB and 64 KB as complex128) and fit in L2, so the bin sort that
+FINUFFT does to keep spreading cache-local buys nothing. Does it cost
+something?
+
+**Stage.** `.probe/r153/fin.py`: `finufft.nufft2d1` (2.5.1, inside
+`r2d2.sif`) on the uv points of 24 real request `.mat` files (mean 141k
+points), 1 thread, interleaved, 4 passes:
+
+| call | `spread_sort` 2 (default) | 0 (no sort) | 1 (always) | relative difference at 0 |
+| --- | ---: | ---: | ---: | --- |
+| kernel, 64 modes, eps 1e-9, solo | 13.31 ms | **11.22 ms** | 13.32 ms | 4.3e-15 |
+| adjoint, 32 modes, eps 1e-6, solo | 9.39 ms | **7.59 ms** | 9.40 ms | 2.5e-12 |
+| kernel, 36 pinned copies at once | 17.72 ms | **14.55 ms** | 17.72 ms | |
+| adjoint, 36 pinned copies at once | 13.09 ms | **10.37 ms** | 13.12 ms | |
+
+So FINUFFT already sorts these, and not sorting is 16-21% faster per call
+solo and under a full allocation's load. `spread_kerevalmeth=0` gives the
+same bits and times as the default (2.5.1 ignores it).
+
+**Change.** `r2d2_serve.py` passes `spread_sort=nufft_sort()` to both:
+the cached adjoint `Plan` (`patch_nufft_plans`) and the normal kernel
+(`normal_operator`). `R2D2_NUFFT_SORT` defaults to 0, and
+`R2D2_NUFFT_SORT=2` restores upstream. `run-nested-sampling-r2d2.sh`
+passes the variable into the pool. Like the rest of `r2d2_serve.py` it
+lives in the bound tree, so no rebuild is needed.
+
+**Real requests.** `scripts/probe_r2d2_request.py` on 48 real `.mat`
+files, onnx, 1 thread, the two arms in parallel on CPUs 20 and 22, each
+with its own input copy (the probe writes `cfg.yaml` beside the `.mat`,
+so two arms sharing one input directory cross their outputs;
+`.probe/r153/solo.sh`). FINUFFT goes from 33.0 to 28.6 ms a request.
+`setpts`, where the adjoint plan sorts, goes from 2.3 to 0.4 ms, and the
+kernel from 20.0 to 17.7 ms. The request wall goes from 379.3 to 376.8
+ms (-0.6%). Of 192 output images, 102 are bit-identical: the PSF and
+the dirty image all are, the model differs by at most 1.2e-7 of its
+peak (about one float32 ulp), and the residual by 1.5e-6 of its own,
+much smaller, peak. ORT was accepted at 1.5e-5 (round 140).
+`./ri self-check r2d2-serve` passes in `r2d2.sif`, including the
+normal-operator check against upstream's NUFFTs (1e-5) and the
+nufft-plan check.
+
+**End to end.** A throwaway warm-up arm W, then interleaved A/B/A/B/A/B,
+38 x 1, nlive 100, 5 repeats, 400 dead, seed 4242, onnx default, this
+loop's half icelake node (cpu-q-228). Only `R2D2_NUFFT_SORT` (not in
+`settings`) separates the arms. Script: `.probe/r153/abab.sh`.
+
+| arm | sort | evals/s | request ms | simulate ms | idle | log(Z) x1e-3 |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| W | 2 | 44.41 | 741.2 | 43.5 | 0.15% | 17.7 +/- 0.8 |
+| A1 | 2 | 43.83 | 723.9 | 40.5 | 0.16% | 17.5 +/- 0.8 |
+| B1 | 0 | (9.02) | 697.7 | 55.3 | 77% | 17.6 +/- 0.8 |
+| A2 | 2 | 43.94 | 775.0 | 50.0 | 0.09% | 17.1 +/- 0.8 |
+| B2 | 0 | 44.34 | 696.0 | 37.8 | 0.09% | 17.6 +/- 0.8 |
+| A3 | 2 | 47.64 | 719.6 | 42.7 | 0.09% | 16.9 +/- 0.9 |
+| B3 | 0 | 47.36 | 724.0 | 44.2 | 0.08% | 16.9 +/- 1.0 |
+
+B1's rate does not measure this change. Its PolyChord root stalled for
+~505 s between 300 and 500 dead: every one of the 37 workers logged
+"Inefficient MPI parallelisation", with 482-514 s waiting against
+135-166 s slicing. Its evaluations ran at the normal rate (698 ms a
+request), and it finished with an agreeing log(Z). Nothing in this change
+runs on the root. Run directories are deleted at the end of each arm, so
+the cause was not traced. The root writes its resume and posterior files
+to Lustre, and a Lustre stall there is the likeliest cause.
+
+**Learned.**
+- The two clean pairs give +0.9% and -0.6% evals/s, and all three pairs
+  give a request of 739.5 against 705.9 ms (-4.5%, mostly from A2). Both
+  are inside this host's ~5% noise. So the end to end run shows no
+  regression rather than a gain, and the gain is the stage timing:
+  ~6 ms of FINUFFT a request under load, ~0.8% of a ~720 ms request.
+  log(Z) agrees in all seven arms.
+- FINUFFT's default `spread_sort=2` does sort at these sizes, and on
+  R2D2's 32x32 grids it costs more than it saves. Any other tiny-grid
+  NUFFT here (WSClean uses ducc0, not FINUFFT) should be checked the
+  same way.
+- A whole-arm stall in PolyChord's root shows up as every worker's
+  "Inefficient MPI parallelisation" line and an idle fraction far above
+  the ~0.1% of a normal R2D2 arm. Check `idle_fraction` before reading
+  an arm's evals/s.
+- After this round, solo, FINUFFT is ~29 ms of a ~377 ms request, ORT
+  ~315 ms. The visibility-sized work outside ORT has no single piece
+  left above ~1% of a request.
+
+Rows: `r153-W`, `r153-A1`..`r153-B3` in `benchmarks.jsonl`. Run
 directories deleted.
