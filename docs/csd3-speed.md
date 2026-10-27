@@ -6090,3 +6090,43 @@ most forked requests with SIGBUS (exit 135), so that arm has no number.
 - Real-draw MSs and argv for a zygote probe are quickest to get from a
   short `--keep-measurement-sets` search (16 s for 175 MSs). The argv is
   in each `evaluations/records.jsonl` line, after the eval id and a tab.
+
+## Round 132 (diagnostic): record writes into a 100k-entry `evaluations/`
+
+**Question.** A live run keeps each evaluation's record as its own file in
+one `evaluations/` directory until it finishes or resumes (round 93). The
+22 Sep production R2D2 run reached 71k evaluations, and a WSClean search
+at nlive 1000 would reach ~100k. Do Lustre's create, write and rename get
+slower as that directory fills up? If they do, large runs pay for it and
+packing records during the run (not only at the end) would be worth
+building.
+
+**Method.** `.probe/r132/probe.py` (not committed) filled a directory
+under `hpc-work` with 100,000 4.2 KB files (41 s from 32 threads). Then 16
+unpinned processes each made 150 records with `_write_text_atomic`'s calls
+(a `.partial` file, `write_text`, `replace`). Arms alternated between a
+fresh directory (`small`, 0 to 2.4k entries) and the full one (`big`, 100k
+to 107k), three pairs, on this job's icelake CPUs (load average ~13).
+
+| arm | records/s | mean | p50 | p90 | `os.listdir` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small 1 / 2 / 3 | 865 / 1,575 / 1,492 | 9.0 / 8.4 / 8.6 ms | 3.0 / 3.2 / 3.1 ms | 20.3 / 19.5 / 20.7 ms | 2 ms |
+| big 1 / 2 / 3 | 1,670 / 1,380 / 1,468 | 8.3 / 9.1 / 9.2 ms | 3.3 / 3.0 / 2.5 ms | 20.3 / 20.4 / 22.1 ms | 67-71 ms |
+
+The 865/s in `small 1` was the cold first arm. After the run, the 114k
+probe files were deleted in 17 s with 32 unlink threads.
+
+**Learned.**
+- At this scale a record write costs the same in a 100k-entry directory
+  as in an empty one: means 8.3-9.2 ms against 8.4-9.0 ms, with the same
+  p50 and p90. Lustre's directory index does not slow creates or renames
+  with size, so a large live run's records cost no throughput. Packing
+  records mid-run would only save inodes, and `ns_warn_file_quota`
+  already warns about those before a run starts.
+- Listing the directory scales with it, at ~0.7 ms per 1,000 entries
+  (70 ms at 100k). Every live reader (`./ri health`, live summaries) pays
+  that once per read, which does not matter.
+- Unloaded record writes take ~9 ms here, against the ~50 ms the record
+  writer's comment gives for a write during a 36-rank search. What costs
+  time in-run is contention (round 54's directory lock), not the
+  directory's size.
