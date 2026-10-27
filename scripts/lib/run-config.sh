@@ -49,6 +49,7 @@ write_run_config() {
     # Without it `./ri resume` brought a GPU run back on the CPU.
     if [ "${algorithm}" = r2d2 ]; then
       printf 'R2D2_DEVICE=%q\n' "${R2D2_DEVICE:-cpu}"
+      printf 'R2D2_RUNTIME=%q\n' "${R2D2_RUNTIME:-torch}"
     fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"

@@ -194,9 +194,32 @@ if [ "${R2D2_DEVICE}" = cuda ]; then
     R2D2_POOL_FLAGS+=(${CUDA_MPS_FLAGS[@]+"${CUDA_MPS_FLAGS[@]}"})
   fi
 fi
+# R2D2_RUNTIME=onnx runs the CPU U-Net through ONNX Runtime, ~34% faster a
+# forward but not bit-identical (patch_onnx_network in r2d2_serve.py,
+# docs/csd3-speed.md rounds 140-141). r2d2.sif has no onnxruntime, so it is
+# pip-installed once into the work-dir cache - compute nodes reach PyPI - and
+# its exported checkpoints are cached beside it. numpy is dropped from the
+# install so the image's own is the one imported.
+case "${R2D2_RUNTIME:=torch}" in
+  torch) ;;
+  onnx)
+    R2D2_ONNX_DIR="${_ri_cache}/r2d2-onnx"
+    if [ ! -d "${R2D2_ONNX_DIR}/py/onnxruntime" ]; then
+      mkdir -p "${R2D2_ONNX_DIR}"
+      rm -rf "${R2D2_ONNX_DIR}/py.$$"
+      "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
+        --target "${R2D2_ONNX_DIR}/py.$$" onnxruntime==1.23.2 onnx==1.23.2
+      rm -rf "${R2D2_ONNX_DIR}/py.$$"/numpy "${R2D2_ONNX_DIR}/py.$$"/numpy-* "${R2D2_ONNX_DIR}/py.$$"/numpy.libs
+      mv -T "${R2D2_ONNX_DIR}/py.$$" "${R2D2_ONNX_DIR}/py" 2>/dev/null || rm -rf "${R2D2_ONNX_DIR}/py.$$"
+    fi
+    R2D2_POOL_FLAGS+=(--bind "${R2D2_ONNX_DIR}:/opt/r2d2-onnx")
+    ;;
+  *) echo "FATAL: R2D2_RUNTIME must be torch or onnx, got '${R2D2_RUNTIME}'" >&2; exit 1 ;;
+esac
 sidecar_launch "${R2D2_SIF}" \
   ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
   --env R2D2_DEVICE="${R2D2_DEVICE}" \
+  --env R2D2_RUNTIME="${R2D2_RUNTIME}" \
   --bind "${CHECKPOINTS_DIR}:/checkpoints:ro" \
   --env OMP_NUM_THREADS="${R2D2_OMP_THREADS}" \
   --env MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \

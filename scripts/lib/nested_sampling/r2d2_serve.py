@@ -199,6 +199,91 @@ def patch_cuda_network() -> None:
     optimiser.forward = forward
 
 
+def r2d2_runtime() -> str:
+    """What runs a CPU U-Net forward: `torch` (the default) or `onnx` (R2D2_RUNTIME)."""
+    return os.environ.get("R2D2_RUNTIME", "torch").strip().lower() or "torch"
+
+
+# Where the run script binds onnxruntime and the exported checkpoints.
+ONNX_DIR = Path(os.environ.get("R2D2_ONNX_DIR", "/opt/r2d2-onnx"))
+# One session per R2D2 iteration, built in the pool parent and shared by fork.
+_ORT_SESSIONS: dict[int, object] = {}
+
+
+class OrtNet:
+    """Stands in for the U-Net in `model.inference.forward`, which only calls it."""
+
+    def __init__(self, session):
+        self.session = session
+
+    def __call__(self, x):
+        import torch
+
+        return torch.from_numpy(self.session.run(None, {"x": x.numpy()})[0])
+
+
+def patch_onnx_network(checkpoint_path: Path) -> None:
+    """Run each CPU U-Net forward through ONNX Runtime instead of torch.
+
+    MLAS does this float32 network in 26ms against torch's 39.6ms with 36
+    forked workers sharing one copy (docs/csd3-speed.md, round 140); outputs
+    differ by up to 1.5e-5 of the peak over 25 chained checkpoints, so it is
+    not bit-identical to torch and stays opt-in. Each checkpoint is exported
+    once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
+    and its session built here, before the fork: one intra-op thread starts no
+    pool threads, so it survives the fork and every worker shares its pages.
+    A request running more than one torch thread (the tail of an async run)
+    keeps torch, which threads; so does R3D3 (layers > 1).
+    """
+    import hashlib
+
+    import torch
+
+    sys.path.insert(0, str(ONNX_DIR / "py"))
+    import onnxruntime as ort
+
+    util_model = sys.modules["utils.util_model"]
+    num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
+    dnn_dict = util_model.get_DNNs(num_iter, str(checkpoint_path))
+    stats = sorted((p.name, p.stat().st_size, int(p.stat().st_mtime)) for p in checkpoint_path.iterdir())
+    key = hashlib.sha1(repr((str(checkpoint_path), torch.__version__, ort.__version__, stats)).encode()).hexdigest()[:16]
+    models = ONNX_DIR / "models" / key
+    models.mkdir(parents=True, exist_ok=True)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    net = None
+    for cur_iter in range(1, num_iter + 1):
+        path = models / f"N{cur_iter}.onnx"
+        if not path.exists():
+            if net is None:
+                net = util_model.create_net_imaging().eval()
+            util_model.load_state_dict_from_state_dict(net, dnn_dict[f"N{cur_iter}"])
+            partial = path.with_suffix(f".{os.getpid()}.tmp")
+            with torch.no_grad():
+                torch.onnx.export(net, (torch.zeros(1, 2, 32, 32),), str(partial), dynamo=False, opset_version=17,
+                                  input_names=["x"], output_names=["y"],
+                                  dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+            partial.replace(path)
+        _ORT_SESSIONS[cur_iter] = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
+
+    optimiser = sys.modules["optimiser.R2D2"]
+    upstream_load_net = optimiser.load_net
+
+    def load_net(net, cur_iter, layers, dnn_dict):
+        if isinstance(net, OrtNet):
+            net = net.torch_net
+        session = _ORT_SESSIONS.get(int(cur_iter))
+        if layers != 1 or session is None or torch.get_num_threads() > 1:
+            return upstream_load_net(net, cur_iter, layers, dnn_dict)
+        wrapper = OrtNet(session)
+        wrapper.torch_net = net
+        return wrapper
+
+    optimiser.load_net = load_net
+
+
 def job_numa_cpus() -> dict[int, list[int]]:
     """This process's allowed CPUs, by the NUMA node holding them."""
     allowed = os.sched_getaffinity(0)
@@ -340,6 +425,8 @@ def warm_imports() -> None:
                 # Load before fork: tensor pages stay shared until a child
                 # writes them, instead of paying torch.load once per rank.
                 load_checkpoints(checkpoint_path)
+                if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
+                    patch_onnx_network(checkpoint_path)
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,

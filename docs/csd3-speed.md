@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 140).**
+**Where it stands (round 141).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -21,10 +21,10 @@ the Hetzner host.
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
-  -52% or worse, because the server cannot keep up). Open: ONNX Runtime
-  runs the same float32 forward 34% faster in the pool's shape and stays
-  within 1.5e-5 of the peak across all 25 checkpoints (round 140), so
-  ~+30% is projected once `r2d2.sif` ships it.
+  -52% or worse, because the server cannot keep up). Shipped opt-in:
+  `R2D2_RUNTIME=onnx` runs the U-Net through ONNX Runtime, **+33% evals/s**
+  end to end on a half icelake node (round 141; 1.5e-5 of the peak at
+  worst, round 140). Open: whether to make it the default.
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6559,3 +6559,63 @@ No search was run, so there is no `benchmarks.jsonl` row. Scripts:
 `.probe/r140/ort.py` (export and per-process timing), `chain.py` (the
 25-checkpoint chain) and `fork.py` (the forked, shared shape for both
 runtimes). The `/dev/shm` packages and models were deleted.
+
+## Round 141: `R2D2_RUNTIME=onnx`, +33% R2D2 CPU evals/s end to end
+
+**Change.** Round 140's ONNX Runtime lever, shipped as an opt-in.
+`patch_onnx_network` in `r2d2_serve.py` runs in the pool parent after the
+checkpoints load. It exports each of the 25 checkpoints once (legacy
+exporter, opset 17, height and width dynamic) to
+`$RI_WORK_DIR/.cache/ri/r2d2-onnx/models/<key>/N<i>.onnx` and builds one
+1-thread `ORT_ENABLE_ALL` session per checkpoint, which every forked worker
+shares. The key hashes the checkpoint directory listing and both runtime
+versions. `optimiser.R2D2.load_net` then returns a stand-in that
+`model.inference.forward` calls like the net. A request running more than
+one torch thread (an async run's tail) keeps torch, and so does R3D3.
+`r2d2.sif` has no onnxruntime, so the run script pip-installs
+`onnxruntime==1.23.2 onnx==1.23.2` once into `.cache/ri/r2d2-onnx/py`
+(compute nodes reach PyPI), drops the numpy pip pulls in, and binds that
+directory into the pool. Nothing needs a rebuild. `run.env` and the
+benchmark row record `R2D2_RUNTIME`.
+
+**Unit check (in `r2d2.sif`).** All 25 sessions were built. The ORT
+forward against torch's at 1 thread differs by 1.1-5.8e-6 of the peak (N1,
+N13 and N25 on random input). With 2 torch threads, `load_net` hands back
+torch's net. Pool warm-up takes 49 s on the first export and 13 s with the
+cache, against a few seconds for torch alone. This is overlapped with
+PolyChord's start, but short benchmarks see it.
+
+**A/B.** ABAB async searches on this loop's half icelake node, 38 ranks x
+1, `--nlive 100 --num-repeats 5 --max-ndead 400 --seed 4242`, shipped
+SIFs, other tenants at load ~25. B1 also did the one-off pip install
+before its search (outside PolyChord's wall). The models were pre-seeded.
+
+| arm | runtime | evals | wall | evals/s | request ms | simulate ms | log(Z) x1e3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | torch | 5977 | 184.1 s | 32.5 | 1068 | 50 | 17.44 +/- 0.75 |
+| B1 | onnx | 6659 | 156.1 s | 42.7 | 804 | 48 | 16.48 +/- 0.98 |
+| A2 | torch | 5528 | 178.8 s | 30.9 | 1124 | 45 | 17.54 +/- 0.78 |
+| B2 | onnx | 5904 | 142.6 s | 41.4 | 817 | 50 | 17.60 +/- 0.78 |
+
+**Result.** 42.0 against 31.7 evals/s mean, **+33%**, with both onnx arms
+above both torch arms. The request fell 26% (811 against 1096 ms), as
+round 140's per-forward numbers projected. Async runs do not repeat
+chains (round 102), and every log(Z) agrees within its error. Rows are in
+`benchmarks.jsonl` (`r141-*`, dirty tree at 39c68e4).
+
+**Costs and caveats.**
+- Not bit-identical to torch (round 140: at most 1.5e-5 of the peak over
+  25 chained checkpoints). It is opt-in for that reason, and a
+  synchronous seeded run with it does not reproduce a torch one.
+- Per-worker peak RSS reads 8.1 GB against 3.9 GB, because the 25 shared
+  sessions (~0.17 GB each) count in every worker's RSS. They are one copy,
+  but `NS_R2D2_SHARED_MB` (4.2 GB) does not include them. That does not
+  matter on a half node (38 x 0.4 + 8.5 GB is well within memory), but the
+  budget should add ~4.3 GB before it becomes the default.
+- The sessions are one copy on the parent's socket, so per-socket copies
+  (round 106) do not apply to them. Whole-node A/B still to do.
+- The cache is 3.1 GB and ~6.7k files (onnx, onnxruntime, sympy and
+  protobuf, plus 25 models), once per work directory.
+
+Probe: `.probe/r141/ab.sh`. Run directories deleted.
+
