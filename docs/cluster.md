@@ -373,8 +373,9 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   ~0.4GB per rank (the workers share the checkpoints after the fork;
   `docs/csd3-speed.md`, round 18), so on CPU nodes the cores set the rank count.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the
-  run scripts needs no change. `NS_R2D2_MAX_RANKS` (56) caps an R2D2 job;
-  it was measured on a whole sapphire node (`docs/csd3-experiments.md`, E4).
+  run scripts needs no change. `NS_R2D2_MAX_RANKS` (112) caps an R2D2 job
+  at a whole sapphire node's cores: one rank per CPU beat 56 x 2 by ~20% on
+  whole icelake and sapphire nodes (`docs/csd3-speed.md`, round 105).
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
   whole toolchain, and a job purges the rest (above). `uv` is still needed for
   the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,

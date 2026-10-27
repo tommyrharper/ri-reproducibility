@@ -5069,3 +5069,53 @@ chains differ.
 - Every sapphire allocation in this round and round 84 shared its node
   with other jobs (load 47-139 on 112 cores), so the gains above are what
   a shared node gives.
+
+## Round 105: one R2D2 rank per CPU on whole nodes (cap 56 -> 112)
+
+`NS_R2D2_MAX_RANKS = 56` dated from E4 (`csd3-experiments.md`), a sapphire
+scaling test at ~12 evals/s that predates every round here. It only binds on
+a whole node, which is the default `./ri search r2d2` job: there it gave 56
+ranks x ceil(CPUs/56) = 2 threads, i.e. 112 threads on icelake's 76 cores.
+Round 99 measured an explicit 76 x 1 and never the shipped shape.
+
+**Setup.** Two exclusive whole-node jobs (icelake 39285695, sapphire 39286524),
+each running ABAB async searches back to back: `./ri search r2d2 --nlive 200
+--num-repeats 5 --max-ndead 1000 --seed 4242`, shipped SIFs, commit 632611d.
+Sapphire's B pair ran after the cap edit, but with explicit `--mpi-procs`, so
+the cap played no part.
+
+| node | arm | ranks x threads | evals/s | wall to 1000 dead | request ms | log(Z) x1e3 |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| icelake 76 | A1 | 56 x 2 (shipped) | 38.4 | 427 s | 1369 | 18.15 +/- 0.34 |
+| icelake 76 | B1 | 76 x 1 | 47.2 | 319 s | 1515 | 18.03 +/- 0.35 |
+| icelake 76 | A2 | 56 x 2 (shipped) | 41.0 | 445 s | 1290 | 17.86 +/- 0.36 |
+| icelake 76 | B2 | 76 x 1 | 47.1 | 353 s | 1519 | 17.83 +/- 0.38 |
+| sapphire 112 | A1 | 56 x 2 (shipped) | 66.2 | 263 s | 781 | 17.94 +/- 0.34 |
+| sapphire 112 | B1 | 112 x 1 | 83.2 | 170 s | 1229 | 17.84 +/- 0.37 |
+| sapphire 112 | A2 | 56 x 2 (shipped) | 73.8 | 241 s | 705 | 17.97 +/- 0.35 |
+| sapphire 112 | B2 | 112 x 1 | 86.0 | 197 s | 1199 | 17.74 +/- 0.40 |
+
+(Wall is PolyChord's, from the benchmark row; request ms is the
+`image_container` stage.)
+
+**Result.** One rank per CPU wins on both partitions: +19% on icelake
+(47.2 against 39.7 evals/s mean) and +21% on sapphire (84.6 against 70.0),
+with the time to 1000 dead points down 21% and 24%. Every pair's log(Z)s
+agree within their errors (async runs, so chains are not compared;
+round 102). `NS_R2D2_MAX_RANKS` is now 112, sapphire's core count, so it no
+longer binds on any CSD3 CPU node and the memory clamp (4.2 GB + 0.4 GB per
+rank, ~49 GB at 112) decides, as it already did for half nodes.
+
+**Learned.**
+- A whole node with the shipped default ran ~20% under what its cores give.
+  Every whole-node R2D2 search before this round paid that.
+- Half the ranks at two threads each makes each request faster (705-781
+  against ~1200 ms on sapphire) but not twice as fast, so the product
+  favours more ranks. This matches round 18 on half nodes.
+- An exclusive whole sapphire node (load 0.5 at start) gave 84.6 evals/s,
+  0.76 per core. Round 103's shared half node gave 0.96 per core at 56 x 1,
+  so the per-core rate falls off by a whole node, or the node's other
+  tenants differ. Not separated here.
+- `--qos=intr` allows one job per user; a second submit fails with
+  `QOSMaxSubmitJobPerUserLimit`. The default QOS whole sapphire node
+  started within ~5 minutes.

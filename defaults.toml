@@ -33,12 +33,13 @@ R2D2_CKPT_NAME = "R2D2_A1"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
 # Most concurrent R2D2 evaluations worth running on the CPU, before the memory
-# clamp in scripts/lib/rank-budget.sh has its say. Measured on a whole CSD3
-# sapphire node (112 cores, 6-7 min per arm): 8 ranks 2.9 evaluations/s, 16
-# 5.6, 32 9.4, 56 12.0 - still rising, so the cap is the best measured rather
-# than a plateau. The 20-thread rig this was once measured on saturated at 8
-# (docs/nested-sampling-throughput.md). docs/csd3-experiments.md, E4.
-NS_R2D2_MAX_RANKS = 56
+# clamp in scripts/lib/rank-budget.sh has its say. One rank per CPU is fastest
+# on every CSD3 CPU node now: a whole icelake node does 47 evals/s at 76 x 1
+# against 38-41 at 56 x 2, and a whole sapphire node 83 at 112 x 1 against 66
+# at 56 x 2 (docs/csd3-speed.md, round 105). 112 is sapphire's core count, so
+# the cap no longer binds there; the old 56 (E4 in docs/csd3-experiments.md)
+# predated the speed rounds.
+NS_R2D2_MAX_RANKS = 112
 
 # Where R2D2's U-Net runs: "cpu", or "cuda" for one A100 on CSD3's ampere
 # partition (`./ri search r2d2 --device cuda`; docs/cluster.md, "R2D2 on a
