@@ -161,6 +161,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (final status) stop condition met: rounds 155-158 each under 2% end to end | - | R2D2 CPU is 78% U-Net forward, memory-bound, every runtime/kernel/threading/batching option closed; levers left are a different network, GPUs, whole-node job shapes ([round 160](csd3-speed.md)) |
 | (pending) 2-GPU R2D2 search: round 128's `R2D2_CUDA_GPUS` ported, job 39368806 queued | - | not yet measured ([round 161](csd3-speed.md)) |
 | (rejected) ORT session options: fixed 32x32 input shapes (free-dimension override) and flush-to-zero (`session.set_denormal_as_zero`) | - | 36 forked children over a staggered N1..N25 walk, ABCD x3: fixed shapes 27.6 against 26.9 ms a forward (+2.5%, every rep), FTZ 26.9 (noise); all outputs bit-identical ([round 162](csd3-speed.md)) |
+| (rejected) glibc `mallopt` (mmap/trim thresholds) or ORT's CPU arena for the arena-less U-Net sessions | - | 36 forked children over a staggered N1..N25 walk, x3: shipped 27.1 ms a forward with 6.5 minor faults; arena 27.1 with 68 faults; mallopt 26.9 (-0.7%, noise); bit-identical ([round 164](csd3-speed.md)) |
 | (pending) GPU search, round-146 tree vs HEAD, 1 x A100 (job 39371931); 2-GPU jobs never start on SL3, every 1-GPU job did | - | not yet measured ([round 163](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 

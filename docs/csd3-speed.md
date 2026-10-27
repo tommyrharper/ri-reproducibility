@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 163; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 164; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), malloc tuning and the ORT arena (164), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -7609,3 +7609,35 @@ and `smi-*.log` files beside it. Compare evals/s and the R2D2 request in
 ms for B against N, check that log(Z) agrees within 1 sigma, and copy the
 rows into `benchmarks.jsonl` with `run` set to `r163-<arm>`. Then delete
 `agent-node/r163`, whose `results/` count against the file quota.
+
+## Round 164 (negative): page faults and malloc in ORT's arena-less sessions
+
+**Question.** Since round 143 the ORT sessions run without a CPU arena, so
+every activation of a forward is a glibc `malloc`/`free`. A 64-channel
+32x32 float32 tensor is 256 KB, above glibc's initial mmap threshold, so
+each forward could map, fault in and unmap fresh pages, and zeroing
+pages costs the memory bandwidth the U-Net is bound by under load (round
+146). Round 143 timed the arena solo, not under 36-way load.
+
+**Run.** `.probe/r164/malloc.py` in `r2d2.sif`: round 162's shape (25
+sessions built in the parent, 36 forked children pinned one per CPU, each
+walking N1..N25 staggered, 150 forwards, sky-like input), three arms
+alternating, three passes. `getrusage` in each child counts minor faults
+and system time over the timed forwards.
+
+| arm | ms a forward | minor faults a forward | system ms a forward |
+| --- | --- | ---: | ---: |
+| shipped (no arena) | 27.21, 27.03, 26.96 | 6.5 | 0.03 |
+| CPU arena on | 27.09, 27.18, 27.17 | 68.0 | 0.22 |
+| no arena, child `mallopt` mmap and trim thresholds at 1 GB | 26.99, 26.82, 26.79 | 6.5 | 0.03 |
+
+All outputs are bit-identical to the shipped arm.
+
+**Learned.** glibc's dynamic mmap threshold already keeps activations on
+the heap after the first free, so the shipped sessions take 6.5 faults
+and 0.03 ms of system time per forward: there is nothing to save there.
+The arena faults ten times more (its growth chunks are fresh mmaps) and is
+no faster. The `mallopt` arm is 0.7% faster on average, inside the spread
+of three passes and far below the ~5% an end-to-end A/B can see, so it is
+not shipped. Allocation is closed as an R2D2 CPU lever. Not a search, so
+no `benchmarks.jsonl` rows.
