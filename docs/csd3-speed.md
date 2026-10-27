@@ -5188,3 +5188,51 @@ allocation) is unaffected: one node, one copy.
   gives -6% per forward, so expect ~+5-10%), and a balanced half node
   such as 20/36 on sapphire.
 
+
+## Round 107: per-socket checkpoint copies on a whole icelake node
+
+This measures round 106 on the partition it had only probed. It ran as
+one exclusive whole icelake node (job 39288491, `cpu-q-482`, 76 CPUs as
+38/38), with the default shape: 76 x 1, async, nlive 200, 5 repeats,
+1000 dead and seed 4242, arms in this order:
+
+| run | weights | evals | evals/s | ms per eval | parent pages N0 / N1 | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | --- | ---: | --- |
+| node-a (first in job) | per node | 16,468 | 57.1 | 1295 | 791k / 816k | 6,840 | 0.01795 ± 0.00035 |
+| il-a | interleaved | 16,961 | 46.4 | 1599 | 436k / 413k | 3,971 | 0.01746 ± 0.00041 |
+| node-b | per node | 15,226 | 56.3 | 1313 | 833k / 773k | 6,761 | 0.01813 ± 0.00035 |
+| il-b | interleaved | 16,785 | 47.4 | 1564 | 437k / 412k | 3,791 | 0.01789 ± 0.00036 |
+
+That is **+21% evals/s** (56.7 against 46.9), and the request is 18%
+shorter (1304 against 1582 ms). Both pairs agree, and the log(Z)s agree
+within their errors. The interleaved arms match round 105's icelake 76 x 1
+(47.2). Round 106's forked probe predicted only -6% per forward here, so
+the probe under-reads the search, as it also did on sapphire (-9.5% in
+the probe, -16% in the search). The default (`auto`) needs no change:
+it was already on for whole nodes.
+
+## Round 109 (diagnostic): round 11's batching lever, re-measured at 38 copies
+
+Round 106 left "fewer weight bytes per forward" as the whole-node R2D2
+lever. Batching is the only way to get there that keeps the fp32 weights
+(118.3 MB a checkpoint), and round 11 measured it: -22% at B=4 under 24
+copies, not bit-identical. This round re-measured it at today's shape:
+round 106's forked pool, 25 checkpoints cycled, 1 thread, first touch,
+38 workers on this loop's half icelake node (all on node 0, other users'
+jobs on the other half). The probe was a pool-shaped variant of
+`scripts/probe_unet_forward.py`'s `B` knob.
+
+| workers | B | ms per image |
+| ---: | ---: | ---: |
+| 1 | 1 / 4 / 8 | 31.2 / 22.0 / 17.5 |
+| 38 | 1 | 45.7, 48.2 |
+| 38 | 8 | 30.2, 31.5 |
+| 38 | 4 | 45.0 |
+
+Under full load, B=8 cuts the time per image by **35%** (ABAB). B=4
+gained nothing this time, unlike round 11's -22% at 24 copies, so the
+benefit is not monotone in B. Rows still differ from the batch-1 forward
+of the same input by up to 3.0e-5 on outputs that peak at 18-28 (relative
+~1e-6), the same order as round 11's figure. The verdict is unchanged:
+it is not result-preserving, and it needs a pool that gathers concurrent
+requests at the same R2D2 iteration into one forward. Not attempted.
