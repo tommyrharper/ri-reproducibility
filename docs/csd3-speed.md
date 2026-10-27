@@ -5236,3 +5236,43 @@ of the same input by up to 3.0e-5 on outputs that peak at 18-28 (relative
 ~1e-6), the same order as round 11's figure. The verdict is unchanged:
 it is not result-preserving, and it needs a pool that gathers concurrent
 requests at the same R2D2 iteration into one forward. Not attempted.
+
+## Round 110 (diagnostic): per-socket copies on half a sapphire node
+
+Round 106's `auto` turns per-socket checkpoint copies on for any balanced
+split, but only whole nodes had been measured. Two half-node sapphire jobs
+(56 CPUs, async 56 x 1, nlive 200, 5 repeats, 600 dead, seed 4242,
+commit 05eab88), arms in this order. Rows `r110-*`.
+
+| job shape | run | weights | evals | evals/s | ms per eval | peak MB | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| `--cpus-per-task=56` (cpu-r-112, 0/56) | node-a (first) | auto (off: one node) | 7,862 | 45.9 | 1174 | 4,070 | 0.01774 ± 0.00065 |
+| | il-a | interleaved | 8,808 | 57.9 | 930 | 3,876 | 0.01758 ± 0.00063 |
+| | node-b | auto (off) | 8,447 | 55.4 | 973 | 4,043 | 0.01766 ± 0.00062 |
+| | il-b | interleaved | 8,425 | 55.8 | 964 | 3,807 | 0.01768 ± 0.00060 |
+| `--ntasks=2 --ntasks-per-socket=1 --cpus-per-task=28` (cpu-r-6, 28/28) | node-a (first) | per node | 8,319 | 59.9 | 901 | 6,783 | 0.01777 ± 0.00064 |
+| | il-a | interleaved | 8,327 | 63.5 | 846 | 3,888 | 0.01754 ± 0.00063 |
+| | node-b | per node | 8,758 | 74.3 | 727 | 6,960 | 0.01768 ± 0.00062 |
+| | il-b | interleaved | 8,080 | 63.2 | 855 | 3,856 | 0.01769 ± 0.00061 |
+
+All log(Z)s agree within their errors.
+
+**Learned.**
+- Slurm's default half sapphire node can be one socket (0/56 here; round
+  103 got 20/36 and 54/2). There `auto` is off and round 106 does not
+  apply, so the shape decides whether a half-node R2D2 run gets it.
+- The first arm of each job is the slow one in both jobs, including the
+  one-socket job whose four arms run identical code (45.9 against
+  55.4-57.9). A fresh node's first search pays a cold start of ~20%, so
+  the next node A/B needs a throwaway warm-up arm, or ABBA with the first
+  pair dropped.
+- With that, the 28/28 A/B is inconclusive: the warm pair gives per node
+  +17.6% (74.3 against 63.2) and the cold pair -5.7%. Not enough to call.
+- The 28/28 interleaved arms (63.2-63.5) beat the warm one-socket arms
+  (55.4-57.9) by ~12%, but on different nodes (load ~55-75 on cpu-r-6
+  against ~100-125 on cpu-r-112), so this is a lead only. Asking for two
+  sockets (`--ntasks-per-socket`) may be a half-node lever by itself,
+  since it doubles the memory channels behind the U-Net's weight stream.
+  It needs one job holding both shapes, for example a whole node split
+  into two simultaneous 56-CPU searches pinned 0/56 and 28/28, before
+  `scripts/lib/slurm.sh` asks for it.
