@@ -558,7 +558,8 @@ from 0.54s at 12 ranks to 0.92s at 18: separate CUDA contexts time-slice the
 card, so ranks queue for it rather than share it. So for production at
 `NS_IMAGE_DIM=32`, stay on icelake CPUs. The GPU would only pay with the
 contexts merged (CUDA MPS, or one GPU server batching forwards for all ranks)
-and the checkpoints held once instead of per worker; neither was tried here.
+and the checkpoints held once instead of per worker; neither was tried here
+(round 117 measured MPS: 2.8x the card's forward throughput).
 
 ## Round 12: a production-shaped run, and the convert stage
 
@@ -5521,3 +5522,61 @@ any two calls. The health self-check passes.
 - This is tooling, not search speed. It is logged here because health is
   how a live CSD3 run gets read (docs/run-health.md), and it stopped
   answering at production scale.
+
+## Round 117 (diagnostic): CUDA MPS lifts one A100's U-Net throughput 2.8x
+
+**Question.** Round 115 left the R2D2 U-Net as the whole evaluation (96%
+of worker time). On CPU it is at its memory floor (rounds 11, 86, 109).
+Round 10 found one A100 slower than 24 icelake cores, and blamed separate
+CUDA contexts time-slicing the card. Does CUDA MPS, which merges them,
+fix that?
+
+**First, what is left outside the U-Net.** `probe_r2d2_request.py`, 1
+thread, 48 round-1 `.mat` files copied to `/dev/shm` (as a run's scratch
+is): 0.65 s a request under cProfile, of which the U-Net forwards are
+~80%. The rest is the normal-operator kernel NUFFT (eps 1e-9, ~20 ms),
+the dirty adjoint (~15 ms), imaging weights (~10 ms), data load (~8 ms)
+and four FITS writes. cProfile put the writes at 3.2 ms each, but a
+direct timing of astropy's `fits.writeto` for a 32x32 image in
+`r2d2.sif` gives 1.1 ms, or ~0.5% of a production request. That is not
+worth a hand-written FITS writer. Nothing outside the U-Net is a lever.
+
+**Probe.** `scripts/probe_unet_forward.py` gained `DEV=cuda` (synchronised
+timing) and `START` (holds the timed loop until a shared epoch, so P
+copies overlap). One ampere job (`.probe/r117/mps.sh`, job 39295389,
+`gpu-q-2`, A100-SXM4-80GB in `Default` compute mode, 32 EPYC cores) ran
+P copies of the 32x32 forward at batch 1, each in its own `r2d2-cuda.sif`
+process. MPS was the host's `/usr/bin/nvidia-cuda-mps-control -d`, with
+`CUDA_MPS_PIPE_DIRECTORY` under `$TMPDIR`, bound and passed into the
+containers. No root was needed. Two passes, ABAB:
+
+| P | no MPS, forwards/s (pass 1 / 2) | MPS, forwards/s (pass 1 / 2) | ms a forward per copy, no MPS / MPS |
+| ---: | ---: | ---: | ---: |
+| 1 | 325 / 318 | 308 / 311 | 3.1 / 3.2 |
+| 8 | 599 / 596 | 1,576 / 1,610 | 13.4 / 5.0 |
+| 16 | 603 / 597 | 1,683 / 1,683 | 26.8 / 9.5 |
+| 24 | 601 / 603 | 1,669 / 1,643 | 40.1 / 14.5 |
+
+One process at batch 18 ran 4,762 forwards/s, so the card itself has
+~3x more headroom again.
+
+**Learned.**
+- Without MPS the A100 saturates at ~600 forwards/s from P = 8 on, and
+  each copy waits P times as long. That is round 10's time-slicing,
+  measured directly. With MPS it saturates at ~1,680 forwards/s: **2.8x**,
+  the same in both passes.
+- An R2D2 evaluation is ~18 forwards, so one A100 under MPS has the U-Net
+  capacity for ~93 evaluations/s. That is about a whole sapphire node's
+  103.5 evals/s (round 106), from one GPU and its 32 cores. Without MPS
+  the ceiling is ~33 evals/s. Round 10's 12.5-13.2 evals/s on the GPU was
+  below even that, because each rank also does ~100 ms of CPU work a
+  request plus simulate.
+- MPS should not change any output: each process still runs its own
+  kernels, and MPS only shares the card. The end-to-end search (start the
+  daemon in the job when `R2D2_DEVICE=cuda`, and check log(Z) against
+  round 10's GPU arms) is the next step. Its rank count is bounded by
+  `NS_R2D2_CUDA_MB_PER_RANK` (4 GB: every worker holds all 25
+  checkpoints), i.e. ~19 ranks on an 80 GB card, and P = 16 already
+  reaches the MPS plateau.
+- Whether it pays depends on what CSD3 charges for a GPU hour against
+  ~112 CPU hours, which this round did not settle.
