@@ -6044,3 +6044,49 @@ Rows `r130-*` in `benchmarks.jsonl`. Run directories deleted.
   more cards per search (round 128's multi-GPU change; its 2-GPU A/B, job
   39303263, runs from a separate copy of the tree in
   `agent-node/r130-mgpu` and is still in the queue).
+
+## Round 131 (negative): another allocator for the WSClean zygote
+
+**Question.** At 38 ranks, the `wsclean` binary is ~77% of a WSClean
+evaluation (round 122), and round 87 found ~9.5 ms of a loaded request is
+page faults on first touch of per-request memory. Every malloc lever tried
+so far was a glibc setting (rounds 28, 41, 87, 88). Does a different
+allocator, preloaded into `wsclean-zygote` so every forked request inherits
+it, touch less memory or fault less under load?
+
+**Method.** 48 real-draw MSs came from a 36-rank, 60-dead `./ri search
+wsclean --keep-measurement-sets` (row `r131-ms`, not a throughput arm). They
+were copied to `/dev/shm/r131` with each evaluation's own `wsclean` argv.
+`.probe/r131/zy.py` drives one pinned zygote (the job's patched SIF cache,
+0001-0017, with production's `GLIBC_TUNABLES`) through all 48. It does one
+warm-up pass and then timed passes, and takes an md5 of every
+`recon-image.fits` and `recon-residual.fits`. `.probe/r131/m36.sh` runs 36
+such drivers at once, one per CPU of this icelake allocation, for 2 timed
+passes each. Allocators are passed as `LD_PRELOAD`: the host's gperftools
+`libtcmalloc_minimal` 2.x, the CSD3 module's jemalloc 4.5.0, and mimalloc
+v2.1.7 built from source. Arms were interleaved.
+
+| allocator | solo, ms a request | 36-way, ms a request (arms in run order) |
+| --- | ---: | --- |
+| glibc + production tunables | **111.3** | **154.1, 154.4, 154.7, 154.5, 153.8** |
+| mimalloc 2.1.7 | 114.3 | 166.2, 165.3 |
+| mimalloc, `MIMALLOC_PURGE_DELAY=-1` | - | 161.6, 162.2 |
+| jemalloc 4.5.0 | 117.8 | 167.7, 166.7 |
+| tcmalloc_minimal | 170.2 | - |
+
+All four allocators gave byte-identical FITS solo (one md5 over 96 files).
+Adding mimalloc's `ARENA_EAGER_COMMIT=1` and `ALLOW_LARGE_OS_PAGES=1` killed
+most forked requests with SIGBUS (exit 135), so that arm has no number.
+
+**Learned.**
+- glibc with round 28/41's tunables is the fastest allocator for the
+  zygote: under load mimalloc is 5-8% slower and jemalloc 8% slower, while
+  the five glibc arms agree within 0.6%. glibc's `top_pad` and its
+  thresholds of 2^62 keep the parent's heap warm for every fork. The
+  arena allocators map fresh segments per request instead, and pay the
+  load-inflated faults round 87 measured. Not kept.
+- The allocator does not change WSClean's output bytes, so allocator
+  experiments need no tolerance checks, only timing.
+- Real-draw MSs and argv for a zygote probe are quickest to get from a
+  short `--keep-measurement-sets` search (16 s for 175 MSs). The argv is
+  in each `evaluations/records.jsonl` line, after the eval id and a tab.

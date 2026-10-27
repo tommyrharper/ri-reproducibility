@@ -140,6 +140,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (rejected) 1 or 3 CPU threads per GPU R2D2 rank instead of the derived 2 (`R2D2_OMP_THREADS`) | - | one A100, 19 ranks, MPS and blocking sync: 2 threads beat 1 in all three pairs (43.7 vs 41.5 evals/s) and 3 in two of three (42.0 vs 40.6) ([round 126](csd3-speed.md)) |
 | (rejected) batching U-Net forwards across requests on the GPU (a gathering server) | - | one A100, float32: batched forwards are bit-identical to batch 1 up to B=32, but B=19 gives only 2,326 forwards/s against 1,740 for 19 MPS copies (1.33x, not round 117's TF32 4,762); a 19-rank search uses ~790/s and is bound by its 32 CPU cores ([round 127](csd3-speed.md)) |
 | (rejected) the GPU U-Net replayed from per-iteration CUDA graphs in a search (`R2D2_CUDA_GRAPHS`) | - | one A100, 19 ranks, MPS and blocking sync: 64 of 64 FITS byte-identical and a solo request 13% faster, but the search ran 43.3 evals/s with graphs against 44.7 eager (graphs lost 2 of 3 pairs), so the GPU, not CPU launches, is what binds ([round 130](csd3-speed.md)) |
+| (rejected) mimalloc, jemalloc or tcmalloc preloaded into `wsclean-zygote` instead of glibc | - | 36 pinned zygotes on icelake, 48 real draws: glibc + production tunables 154 ms a request; mimalloc 162-166, jemalloc 167 (solo tcmalloc 170 against 111); FITS byte-identical ([csd3-speed](csd3-speed.md), round 131) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
