@@ -56,6 +56,9 @@ NS_R2D2_CUDA_MAX_RANKS = 19
 # 95% of the card holds - 19 on an 80GB A100 - and refuses an explicit
 # --mpi-procs above it: past it workers die of CUDA OOM.
 NS_R2D2_CUDA_MB_PER_RANK = 4096
+# The same for R2D2_RUNTIME=trt: 25 TensorRT engines (206MB each) and a CUDA
+# context measured ~5.6GB, so 12 fit an 80GB A100 (csd3-speed.md, round 170).
+NS_R2D2_CUDA_TRT_MB_PER_RANK = 6144
 # R2D2_DEVICE=cuda starts a CUDA MPS daemon for the run, so the workers share
 # the card rather than time-slice it (csd3-speed.md, rounds 117-118). 0 turns
 # it off, for an A/B.

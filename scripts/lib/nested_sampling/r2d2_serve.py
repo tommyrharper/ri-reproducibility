@@ -200,7 +200,7 @@ def patch_cuda_network() -> None:
 
 
 def r2d2_runtime() -> str:
-    """What runs a CPU U-Net forward: `torch` or `onnx` (R2D2_RUNTIME; the run script defaults CPU to onnx)."""
+    """What runs a U-Net forward: `torch`, `onnx` (CPU; the CPU default) or `trt` (GPU) (R2D2_RUNTIME)."""
     return os.environ.get("R2D2_RUNTIME", "torch").strip().lower() or "torch"
 
 
@@ -224,20 +224,8 @@ class OrtNet:
         return torch.from_numpy(self.session.run(None, {"x": x.numpy()})[0])
 
 
-def patch_onnx_network(checkpoint_path: Path) -> None:
-    """Run each CPU U-Net forward through ONNX Runtime instead of torch.
-
-    MLAS does this float32 network in 26ms against torch's 39.6ms with 36
-    forked workers sharing one copy (docs/csd3-speed.md, round 140); outputs
-    differ by up to 1.5e-5 of the peak over 25 chained checkpoints, so it is
-    not bit-identical to torch, but converged log(Z) agrees (round 144) and it
-    is the CPU default; R2D2_RUNTIME=torch keeps torch. Each checkpoint is
-    exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
-    and its session built here, before the fork: one intra-op thread starts no
-    pool threads, so it survives the fork and every worker shares its pages.
-    A request running more than one torch thread (the tail of an async run)
-    keeps torch, which threads; so does R3D3 (layers > 1).
-    """
+def export_onnx(checkpoint_path: Path) -> Path:
+    """Export each checkpoint once to `ONNX_DIR/models/<key>/N<i>.onnx`, height and width dynamic."""
     import hashlib
 
     import torch
@@ -252,12 +240,6 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     key = hashlib.sha1(repr((str(checkpoint_path), torch.__version__, ort.__version__, stats)).encode()).hexdigest()[:16]
     models = ONNX_DIR / "models" / key
     models.mkdir(parents=True, exist_ok=True)
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
-    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
-    # No CPU arena: bit-identical, same speed, ~8GB less PSS at 38 ranks (round 143).
-    options.enable_cpu_mem_arena = False
     net = None
     for cur_iter in range(1, num_iter + 1):
         path = models / f"N{cur_iter}.onnx"
@@ -266,11 +248,48 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
                 net = util_model.create_net_imaging().eval()
             util_model.load_state_dict_from_state_dict(net, dnn_dict[f"N{cur_iter}"])
             partial = path.with_suffix(f".{os.getpid()}.tmp")
-            with torch.no_grad():
-                torch.onnx.export(net, (torch.zeros(1, 2, 32, 32),), str(partial), dynamo=False, opset_version=17,
-                                  input_names=["x"], output_names=["y"],
-                                  dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+            # One thread: export runs a forward here in the pool parent, and an
+            # OpenMP pool started before the fork deadlocks every worker's
+            # first torch op (a GPU run's 3 threads a rank did, round 171).
+            threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                with torch.no_grad():
+                    torch.onnx.export(net, (torch.zeros(1, 2, 32, 32),), str(partial), dynamo=False, opset_version=17,
+                                      input_names=["x"], output_names=["y"],
+                                      dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+            finally:
+                torch.set_num_threads(threads)
             partial.replace(path)
+    return models
+
+
+def patch_onnx_network(checkpoint_path: Path) -> None:
+    """Run each CPU U-Net forward through ONNX Runtime instead of torch.
+
+    MLAS does this float32 network in 26ms against torch's 39.6ms with 36
+    forked workers sharing one copy (docs/csd3-speed.md, round 140); outputs
+    differ by up to 1.5e-5 of the peak over 25 chained checkpoints, so it is
+    not bit-identical to torch, but converged log(Z) agrees (round 144) and it
+    is the CPU default; R2D2_RUNTIME=torch keeps torch. Each checkpoint is
+    exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
+    and its session built here, before the fork: one intra-op thread starts no
+    pool threads, so it survives the fork and every worker shares its pages.
+    A request running more than one torch thread (the tail of an async run)
+    keeps torch, which threads; so does R3D3 (layers > 1).
+    """
+    import torch
+
+    models = export_onnx(checkpoint_path)
+    import onnxruntime as ort
+
+    num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    # No CPU arena: bit-identical, same speed, ~8GB less PSS at 38 ranks (round 143).
+    options.enable_cpu_mem_arena = False
 
     def build() -> dict[int, object]:
         return {cur_iter: ort.InferenceSession(str(models / f"N{cur_iter}.onnx"), options,
@@ -304,6 +323,137 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
         if layers != 1 or session is None or torch.get_num_threads() > 1:
             return upstream_load_net(net, cur_iter, layers, dnn_dict)
         wrapper = OrtNet(session)
+        wrapper.torch_net = net
+        return wrapper
+
+    optimiser.load_net = load_net
+
+
+# Where the run script binds tensorrt-cu13 and the GPU's plans (R2D2_RUNTIME=trt).
+TRT_DIR = Path(os.environ.get("R2D2_TRT_DIR", "/opt/r2d2-trt"))
+# Per iteration, its serialised plan's path (set in the pool parent) and, per
+# worker, its deserialised engine and context (made on first use: CUDA does
+# not survive fork).
+_TRT_PLANS: dict[int, Path] = {}
+_TRT_CONTEXTS: dict[int, tuple] = {}
+
+
+def build_trt_plans(models: Path, dim: int, num_iter: int) -> Path:
+    """Build each missing fp32 plan for this GPU and image size; return their directory.
+
+    Runs in a child of the pool parent (`--build-trt-plans`), which must not
+    make a CUDA context. TF32 is cleared, as for eager. One fixed input shape,
+    1x2xDIMxDIM: a forward of any other shape runs eager instead.
+    """
+    import torch
+
+    sys.path.insert(0, str(TRT_DIR / "py"))
+    import tensorrt as trt
+
+    gpu = "".join(c if c.isalnum() else "_" for c in torch.cuda.get_device_name())
+    plans = TRT_DIR / "plans" / f"{models.name}-{trt.__version__}-{gpu}-{dim}"
+    plans.mkdir(parents=True, exist_ok=True)
+    log = trt.Logger(trt.Logger.ERROR)
+    shape = (1, 2, dim, dim)
+    for cur_iter in range(1, num_iter + 1):
+        path = plans / f"N{cur_iter}.plan"
+        if path.exists():
+            continue
+        builder = trt.Builder(log)
+        network = builder.create_network(0)
+        parser = trt.OnnxParser(network, log)
+        if not parser.parse((models / f"N{cur_iter}.onnx").read_bytes()):
+            raise RuntimeError(f"TensorRT could not parse N{cur_iter}.onnx: {parser.get_error(0)}")
+        config = builder.create_builder_config()
+        config.clear_flag(trt.BuilderFlag.TF32)
+        profile = builder.create_optimization_profile()
+        profile.set_shape("x", shape, shape, shape)
+        config.add_optimization_profile(profile)
+        plan = builder.build_serialized_network(network, config)
+        if plan is None:
+            raise RuntimeError(f"TensorRT could not build N{cur_iter}")
+        partial = path.with_suffix(f".{os.getpid()}.tmp")
+        partial.write_bytes(bytes(plan))
+        partial.replace(path)
+    return plans
+
+
+class TrtNet:
+    """Stands in for the U-Net on the GPU, as OrtNet does on the CPU; other shapes run eager."""
+
+    def __init__(self, cur_iter, eager):
+        self.cur_iter = cur_iter
+        self.eager = eager
+
+    def __call__(self, x):
+        import torch
+
+        context, shape, out_shape = trt_context(self.cur_iter)
+        if tuple(x.shape) != shape or x.dtype != torch.float32:
+            return self.eager()(x)
+        x = x.contiguous()
+        y = torch.empty(out_shape, dtype=torch.float32, device=x.device)
+        context.set_tensor_address("x", x.data_ptr())
+        context.set_tensor_address("y", y.data_ptr())
+        if not context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
+            raise RuntimeError(f"TensorRT N{self.cur_iter} failed")
+        return y
+
+
+def trt_context(cur_iter: int) -> tuple:
+    entry = _TRT_CONTEXTS.get(cur_iter)
+    if entry is None:
+        import tensorrt as trt
+
+        runtime = _TRT_CONTEXTS.get(0)
+        if runtime is None:
+            runtime = _TRT_CONTEXTS[0] = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+        engine = runtime.deserialize_cuda_engine(_TRT_PLANS[cur_iter].read_bytes())
+        context = engine.create_execution_context()
+        shape = tuple(engine.get_tensor_profile_shape("x", 0)[1])
+        context.set_input_shape("x", shape)
+        entry = _TRT_CONTEXTS[cur_iter] = (context, shape, tuple(context.get_tensor_shape("y")), engine)
+    return entry[:3]
+
+
+def patch_trt_network(checkpoint_path: Path) -> None:
+    """Run each GPU U-Net forward through a TensorRT fp32 engine instead of torch eager.
+
+    On an A100 under MPS, 12 workers' engines put 2,700 forwards/s through the
+    card against eager's best of 1,470 at 16 (docs/csd3-speed.md, rounds
+    168-170), at ~1e-5 of the peak from the CPU path. An engine holds ~206MB
+    on the card against eager's 126MB, so the run script sizes GPU ranks from
+    NS_R2D2_CUDA_TRT_MB_PER_RANK. Plans are exported (export_onnx) and built
+    (build_trt_plans, in a child) once per checkpoint set, TensorRT version,
+    GPU model and image size, and cached under TRT_DIR/plans. A plan that
+    cannot be built leaves the run on eager; R2D2_TRT_STATUS says which ran.
+    """
+    import subprocess
+
+    models = export_onnx(checkpoint_path)
+    num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
+    dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
+    built = subprocess.run([sys.executable, __file__, "--build-trt-plans", str(models), str(dim), str(num_iter)],
+                           capture_output=True, text=True)
+    # Warm-up output goes to /dev/null, so which engine ran is recorded here.
+    status = Path(os.environ.get("R2D2_TRT_STATUS", os.devnull))
+    if built.returncode != 0:
+        status.write_text(f"eager: TensorRT plans not built\n{built.stderr[-4000:]}\n")
+        return
+    plans = Path(built.stdout.strip().splitlines()[-1])
+    status.write_text(f"trt: {plans}\n")
+    _TRT_PLANS.update({cur_iter: plans / f"N{cur_iter}.plan" for cur_iter in range(1, num_iter + 1)})
+    sys.path.insert(0, str(TRT_DIR / "py"))
+
+    optimiser = sys.modules["optimiser.R2D2"]
+    upstream_load_net = optimiser.load_net
+
+    def load_net(net, cur_iter, layers, dnn_dict):
+        if isinstance(net, TrtNet):
+            net = net.torch_net
+        if layers != 1 or int(cur_iter) not in _TRT_PLANS:
+            return upstream_load_net(net, cur_iter, layers, dnn_dict)
+        wrapper = TrtNet(int(cur_iter), lambda: upstream_load_net(net, cur_iter, layers, dnn_dict))
         wrapper.torch_net = net
         return wrapper
 
@@ -458,6 +608,8 @@ def warm_imports() -> None:
                 load_checkpoints(checkpoint_path)
                 if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
                     patch_onnx_network(checkpoint_path)
+                if r2d2_device() == "cuda" and r2d2_runtime() == "trt":
+                    patch_trt_network(checkpoint_path)
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
@@ -1268,6 +1420,21 @@ def self_check_net_reuse() -> None:
     print("r2d2 net reuse self-check passed")
 
 
+def self_check_trt_fallback() -> None:
+    """A forward of a shape (or dtype) the engine was not built for runs eager."""
+    import torch
+
+    _TRT_CONTEXTS[7] = (None, (1, 2, 32, 32), (1, 1, 32, 32), None)
+    try:
+        net = TrtNet(7, lambda: (lambda x: x * 2))
+        x = torch.ones(1, 2, 64, 64)
+        assert torch.equal(net(x), x * 2)
+        assert torch.equal(net(x[:, :, :32, :32].double()), x[:, :, :32, :32].double() * 2)
+    finally:
+        _TRT_CONTEXTS.clear()
+    print("r2d2 trt fallback self-check passed")
+
+
 def self_check_interleaved_pages() -> None:
     nodes = job_numa_nodes()
     if Path("/sys/devices/system/node/node0").is_dir():
@@ -1311,6 +1478,9 @@ if __name__ == "__main__":
         self_check_serve_pool()
         self_check_interleaved_pages()
         self_check_worker_nodes()
+        self_check_trt_fallback()
+    elif sys.argv[1:2] == ["--build-trt-plans"]:
+        print(build_trt_plans(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])))
     elif sys.argv[1:2] == ["--fifo-dir"]:
         serve_pool(sys.argv[2])
     else:

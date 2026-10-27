@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 170; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 171; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -7969,3 +7969,78 @@ gpu-q-44), A100-SXM4-80GB, MPS restarted for each arm in job 2.
   completing, so a replacement job cannot be submitted until the old one
   is cancelled.
 - No search ran, so there are no `benchmarks.jsonl` rows.
+
+## Round 171 (shipped opt-in): `R2D2_RUNTIME=trt` in the GPU pool, +4% end to end
+
+**Question.** Rounds 168-170 measured TensorRT at +84% forwards through
+an A100 at the 12 workers that fit. Wired into the pool, what does a 1-GPU
+search gain?
+
+**Change.** `R2D2_RUNTIME=trt` with `--device cuda` (GPU only; the GPU
+default stays torch). The run script pip-installs `tensorrt-cu13==11.4.0.106`
+(`--no-deps`, 2m38s once, 2.6 GB after it drops the Windows builder
+resources) into `$RI_WORK_DIR/.cache/ri/r2d2-trt`, beside the onnxruntime
+cache that the export needs. `patch_trt_network` (`r2d2_serve.py`) exports
+the checkpoints (`export_onnx`, split out of `patch_onnx_network`) and builds
+missing fp32 plans (TF32 off, fixed 1x2xDIMxDIM) in a child process, because
+the pool parent must not make a CUDA context. The plans are cached per
+checkpoint set, TensorRT version, GPU model and image size (25 plans in
+~5 minutes, the first time only). Each worker deserialises its engines on
+first use. A forward of another shape or dtype runs eager. GPU ranks are
+sized from `NS_R2D2_CUDA_TRT_MB_PER_RANK = 6144` (12 on an 80 GB card).
+`<run>/r2d2-engine.txt` records which engine ran, since warm-up output
+goes to /dev/null.
+
+**Run.** Job 39390703, gpu-q-20, 1 x A100-SXM4-80GB, 32 CPUs, MPS.
+`./ri search r2d2 --device cuda --nlive 48 --num-repeats 5 --max-ndead 150
+--seed 4242` as in round 165, alternating E (`R2D2_RUNTIME=torch`, 19 ranks)
+and T (`trt`, 12 ranks), after a warm-up arm.
+
+| arm | ranks | evals/s | R2D2 request, ms | simulate, ms | GPU peak | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| E1 | 19 | 43.3 | 345 | 56 | 67.9 GB | 0.01376 +/- 0.00360 |
+| T1 | 12 | 47.7 | 178 | 38 | 64.7 GB | 0.01385 +/- 0.00332 |
+| E2 | 19 | 45.6 | 332 | 41 | 67.9 GB | 0.01637 +/- 0.00259 |
+| T2 | 12 | 47.5 | 182 | 34 | 64.7 GB | 0.01562 +/- 0.00254 |
+| E3 | 19 | 44.8 | 341 | 41 | 67.9 GB | 0.01665 +/- 0.00254 |
+| T3 | 12 | 44.3 | 197 | 33 | 64.7 GB | 0.01741 +/- 0.00189 |
+
+Means: E 44.6, T 46.5 evals/s (+4%), and the arms' ranges overlap
+(43.3-45.6 against 44.3-47.7). Every log(Z) agrees within about 1 sigma.
+
+**Learned.**
+- TensorRT cuts a GPU request by 45% (mean 339 to 186 ms), but the search
+  gains only ~4%, because memory holds it to 12 ranks against eager's 19.
+  The card now runs at 58% utilisation, so it is no longer the bound; the
+  rank count is. 12 workers peaked at 64.7 GB, ~5.4 GB each, so 14 would
+  fit in 95% of the card (75.6 GB). The next step is to measure 13-14 ranks
+  (`NS_R2D2_CUDA_TRT_MB_PER_RANK=5500`). Cutting an engine's footprint
+  (weight-stripped or refittable plans sharing one weight copy) would allow
+  more.
+- **Bug found and fixed:** the first export ran `torch.onnx.export`, a CPU
+  forward, in the pool parent on its 3 OpenMP threads (32 CPUs over 12
+  ranks). libgomp's thread pool does not survive `fork`, so every forked
+  worker deadlocked in a futex on its first torch op. The 0.0-CPU workers
+  never touched the GPU, and the search sat at "generating live points"
+  until it was killed (the warm-up arm, rc 143). This reproduces on CPU
+  (fork after a 3-thread export: the child hangs; after a 1-thread export
+  it exits 0). `export_onnx` now exports on one thread. A CPU run with
+  `R2D2_OMP_THREADS > 1` and no cached export had the same latent hang.
+- CPU default unchanged: a base/new pair of 38 x 1 `--max-ndead 100`
+  searches on cpu-q-119 gave 18.4/17.2 against 18.3/17.8 evals/s with the
+  same request times. That node was slow throughout (simulate at
+  ~155 ms against 43-49 on cpu-q-228), so these rows are a check of the
+  code path, not of speed. One open point: the first 38 x 1 smoke run
+  hit an ordering bug, since fixed before commit (`patch_onnx_network`
+  imported onnxruntime before `export_onnx` put it on `sys.path`, so
+  warm-up fell back to torch). It measured 1,369 ms a request against
+  ONNX's 1,628-1,687 on the same node. That is a single sample on a
+  loaded node, but it is worth a torch-vs-onnx recheck on whatever node
+  the next CPU job lands on.
+- No WSClean A/B: no WSClean code path changed (`defaults.toml` only gained
+  a key).
+
+Rows: `r171-E1`..`r171-T3`, `r171-cpu-*` in `benchmarks.jsonl`. Run
+directories deleted. Plans are cached in
+`$RI_WORK_DIR/.cache/ri/r2d2-trt/plans` (5.3 GB).
+

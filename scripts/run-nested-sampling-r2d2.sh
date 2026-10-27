@@ -80,6 +80,11 @@ if [ "${R2D2_DEVICE}" = cuda ]; then
     exit 1
   fi
   NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
+  # A TensorRT worker's 25 engines hold ~5.1GB on the card against eager's
+  # ~3.1GB of weights, so an 80GB A100 fits 12, not 19 (csd3-speed.md, round 170).
+  if [ "${R2D2_RUNTIME}" = trt ]; then
+    NS_R2D2_CUDA_MB_PER_RANK="${NS_R2D2_CUDA_TRT_MB_PER_RANK}"
+  fi
   # Each worker holds all 25 checkpoints on the GPU. Past what the card holds,
   # workers die with CUDA OOM and their evaluations score as failures - a
   # silent fake worst case - so an explicit rank count over it is refused.
@@ -207,28 +212,53 @@ fi
 # its exported checkpoints are cached beside it. numpy is dropped from the
 # install so the image's own is the one imported. A failed install (no PyPI)
 # runs the pool on torch rather than ending the search.
-case "${R2D2_RUNTIME}" in
-  torch) ;;
-  onnx)
+# r2d2_pip_install DIR MODULE PKG...: pip-install PKG... once into DIR/py,
+# which must then hold MODULE; numpy is dropped so the image's own is imported,
+# and TensorRT's Windows builder resources (2GB) with it.
+r2d2_pip_install() {
+  local dir="$1" module="$2"
+  shift 2
+  [ -d "${dir}/py/${module}" ] && return 0
+  mkdir -p "${dir}"
+  rm -rf "${dir}/py.$$"
+  if "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
+    --target "${dir}/py.$$" "$@"; then
+    rm -rf "${dir}/py.$$"/numpy "${dir}/py.$$"/numpy-* "${dir}/py.$$"/numpy.libs \
+      "${dir}/py.$$"/tensorrt_libs/libnvinfer_builder_resource_win_*
+    mv -T "${dir}/py.$$" "${dir}/py" 2>/dev/null || rm -rf "${dir}/py.$$"
+  else
+    rm -rf "${dir}/py.$$"
+    return 1
+  fi
+}
+case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
+  *:torch) ;;
+  cpu:onnx | cuda:trt)
     R2D2_ONNX_DIR="${_ri_cache}/r2d2-onnx"
-    if [ ! -d "${R2D2_ONNX_DIR}/py/onnxruntime" ]; then
-      mkdir -p "${R2D2_ONNX_DIR}"
-      rm -rf "${R2D2_ONNX_DIR}/py.$$"
-      if "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
-        --target "${R2D2_ONNX_DIR}/py.$$" onnxruntime==1.23.2 onnx==1.23.2; then
-        rm -rf "${R2D2_ONNX_DIR}/py.$$"/numpy "${R2D2_ONNX_DIR}/py.$$"/numpy-* "${R2D2_ONNX_DIR}/py.$$"/numpy.libs
-        mv -T "${R2D2_ONNX_DIR}/py.$$" "${R2D2_ONNX_DIR}/py" 2>/dev/null || rm -rf "${R2D2_ONNX_DIR}/py.$$"
-      else
-        rm -rf "${R2D2_ONNX_DIR}/py.$$"
-        echo "WARNING: could not pip-install onnxruntime; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
-        R2D2_RUNTIME=torch
-      fi
+    if ! r2d2_pip_install "${R2D2_ONNX_DIR}" onnxruntime onnxruntime==1.23.2 onnx==1.23.2; then
+      echo "WARNING: could not pip-install onnxruntime; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
+      R2D2_RUNTIME=torch
     fi
-    if [ "${R2D2_RUNTIME}" = onnx ]; then
+    # R2D2_RUNTIME=trt (GPU only) builds each exported checkpoint into a
+    # TensorRT fp32 engine: ~+84% forwards through an A100 at 12 workers
+    # against eager's best (patch_trt_network, csd3-speed.md rounds 168-171).
+    # tensorrt-cu13 matches the CUDA 13 torch in r2d2-cuda.sif; its builds are
+    # cached beside it, per GPU model and image size.
+    R2D2_TRT_DIR="${_ri_cache}/r2d2-trt"
+    if [ "${R2D2_RUNTIME}" = trt ] && ! r2d2_pip_install "${R2D2_TRT_DIR}" tensorrt --no-deps \
+      tensorrt-cu13==11.4.0.106 tensorrt-cu13-bindings==11.4.0.106 tensorrt-cu13-libs==11.4.0.106; then
+      echo "WARNING: could not pip-install tensorrt; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
+      R2D2_RUNTIME=torch
+    fi
+    if [ "${R2D2_RUNTIME}" != torch ]; then
       R2D2_POOL_FLAGS+=(--bind "${R2D2_ONNX_DIR}:/opt/r2d2-onnx")
     fi
+    if [ "${R2D2_RUNTIME}" = trt ]; then
+      R2D2_POOL_FLAGS+=(--bind "${R2D2_TRT_DIR}:/opt/r2d2-trt" --env R2D2_TRT_STATUS="${OUTPUT_DIR}/r2d2-engine.txt"
+        --env NS_IMAGE_DIM="${NS_IMAGE_DIM}")
+    fi
     ;;
-  *) echo "FATAL: R2D2_RUNTIME must be torch or onnx, got '${R2D2_RUNTIME}'" >&2; exit 1 ;;
+  *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;
 esac
 sidecar_launch "${R2D2_SIF}" \
   ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
