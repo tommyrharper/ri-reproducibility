@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 161; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 162; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -7541,3 +7541,37 @@ in agreement, apply the same diff to the tree, add
 into `benchmarks.jsonl`. Then delete `agent-node/r161-mgpu`, whose
 `results/` count against the file quota.
 
+
+## Round 162 (negative): fixed input shapes and flush-to-zero in ONNX Runtime
+
+**Question.** The shipped sessions (round 141) are exported with dynamic
+height and width and run with ORT's defaults for shapes and denormals. Two
+session options are left untried. `add_free_dimension_override_by_name`
+pins `h` and `w` to `NS_IMAGE_DIM` (32), which lets the optimiser fold
+shape arithmetic and plan memory statically. `session.set_denormal_as_zero`
+sets FTZ/DAZ on the thread, which pays if the U-Net's activations underflow
+into denormals, since x86 handles those slowly.
+
+**Method.** `.probe/r162/opts.py` runs inside `r2d2.sif` with the cached
+onnxruntime 1.23.2 and the cached 25 `.onnx` checkpoints. It builds four
+session sets in one parent: dyn (as shipped: 1 thread, no spinning, no
+arena), static, ftz and both. It then forks 36 children, one per CPU, each
+walking N1..N25 staggered (round 157's production-like shape), with 150
+timed forwards each on a sky-like 2x32x32 input (two Gaussians plus 1%
+noise). The four arms alternate, three repeats, on this loop's icelake
+half-node.
+
+| arm | ms a forward (rep 0, 1, 2) |
+| --- | ---: |
+| dyn (shipped) | 26.81, 26.91, 26.98 |
+| static 32x32 | 27.48, 27.57, 27.74 |
+| ftz | 26.97, 26.98, 26.68 |
+| static + ftz | 27.60, 27.69, 27.83 |
+
+**Result.** Every arm's output is bit-identical to dyn's on all 25
+checkpoints. Fixed shapes are slower in every repeat (+2.5%), so the
+dynamic-shape kernels ORT picks are already the better ones. FTZ is noise:
+the forward makes no denormals worth flushing. Nothing ships, and the R2D2
+CPU forward stays where round 160 left it. Round 161's 2-GPU job
+(39368806) was still queued when this round ended, with no output file.
+No search was run, so there is no `benchmarks.jsonl` row.
