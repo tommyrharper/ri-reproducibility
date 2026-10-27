@@ -5979,3 +5979,68 @@ forwarded alone, relative to the output's largest value.
   remaining GPU levers are CPU-side: less R2D2 CPU work around the U-Net
   (NUFFTs, weights, data load) and simulate, or more cores per card (a
   4-GPU node as four MPS pools, round 120).
+
+## Round 130 (negative): the GPU U-Net replayed from CUDA graphs in a search
+
+**Question.** Round 122 found that a captured CUDA graph makes a solo
+32x32 U-Net forward 2.4x faster, because a lone forward is mostly the CPU
+launching ~110 module calls of kernels. It left the end-to-end A/B unrun.
+Rounds 120 and 127 say a 1-GPU search is bound by its 32 CPU cores, not by
+the card, so cutting launch CPU should help a search even though the MPS
+plateau does not move.
+
+**Where a GPU request's CPU goes.** A cProfile of warm GPU requests
+(`scripts/probe_r2d2_request.py` with `R2D2_DEVICE=cuda`, 2 threads,
+`.probe/r130/prof.sh`, job 39303336, gpu-q-12) gives ~190 ms a request
+under cProfile, of which ~80 ms is the eager U-Net's Python and launch path
+(`unet_model.forward`), ~19 ms waiting on the blocking event, ~13 ms the
+two normal-operator NUFFTs, ~10 ms `gen_imaging_weights` and ~9 ms
+`load_data_to_tensor`. Solo and as 1 of 19 MPS copies, the
+split was about the same. In the probe, `.mat` reads from Lustre cost up to
+75 ms a request. Runs read the file from tmpfs, so this is a probe artifact.
+
+**Change tried.** The patched `forward` in `patch_cuda_network()` passed
+upstream a `net` that, per worker and per iteration's weights (keyed like
+`_CUDA_WEIGHTS`), captured the forward once (three warm passes on a side
+stream, one shared graph pool per worker) and replayed it afterwards, with
+the `cat`, add and clip left eager (`R2D2_CUDA_GRAPHS`). The diff is saved
+in `agent-node/iteration-130-cuda-graphs.diff`.
+
+**Identity.** Requests run solo at 1 thread, 16 `.mat` files, graphs off
+then on: **64 of 64 output FITS byte-identical**. The warm request went
+from 155 to 135 ms (-13%).
+
+**A/B.** One ampere job (`.probe/r130/job.sh`, job 39303377, gpu-q-21,
+A100-SXM4-80GB, 32 cores, MPS and blocking sync), `./ri search r2d2
+--device cuda --mpi-procs 19 --nlive 48 --num-repeats 5 --max-ndead 150
+--seed 4242`, with a warm-up and then E (eager) / G (graphs) taking turns:
+
+| arm | graphs | evals/s | ms an evaluation | R2D2 request, ms | simulate, ms | peak GPU memory | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| warm | on | 44.9 | 381 | 320 | 61 | 69.8 GB | 0.01658 +/- 0.00230 |
+| E1 | off | 42.4 | 404 | 360 | 43 | 67.9 GB | 0.01666 +/- 0.00254 |
+| G1 | on | 43.4 | 395 | 352 | 42 | 69.8 GB | 0.01349 +/- 0.00326 |
+| E2 | off | 47.0 | 367 | 327 | 39 | 67.9 GB | 0.01319 +/- 0.00365 |
+| G2 | on | 44.8 | 383 | 344 | 38 | 69.8 GB | 0.01241 +/- 0.00390 |
+| E3 | off | 44.6 | 386 | 345 | 40 | 67.9 GB | 0.01622 +/- 0.00275 |
+| G3 | on | 41.6 | 409 | 364 | 45 | 69.8 GB | 0.01658 +/- 0.00259 |
+
+Rows `r130-*` in `benchmarks.jsonl`. Run directories deleted.
+
+**Learned.**
+- Graphs give **no gain in a search**: a mean of 43.3 evals/s against eager's
+  44.7 (-3%, inside the arm spread). Graphs lost two of three pairs, and the R2D2
+  request did not shrink (~353 against ~344 ms). The ~20 ms of launch CPU
+  a request saves solo does not show at 19 ranks. So at 19 ranks the
+  request is bound by the shared GPU under MPS (round 122's plateau: ~9.5
+  ms a forward at 16 copies, with or without graphs), not by the CPU
+  launch path. Not kept.
+- Graphs cost ~0.1 GB of GPU memory per rank (69.8 against 67.9 GB at 19)
+  and are bit-identical, so they remain safe to retry if the GPU ever stops
+  being the bottleneck, for example with fewer ranks per card.
+- The GPU-side levers on one A100 are now all measured: MPS (kept), blocking
+  sync (kept), 19 ranks (kept), and TF32, cudnn.benchmark, channels_last,
+  2 threads, batching and graphs (all rejected). What is left for GPU R2D2 is
+  more cards per search (round 128's multi-GPU change; its 2-GPU A/B, job
+  39303263, runs from a separate copy of the tree in
+  `agent-node/r130-mgpu` and is still in the queue).
