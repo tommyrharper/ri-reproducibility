@@ -65,6 +65,9 @@ write_run_config() {
     if [ -n "${R2D2_WEIGHTS_PER_NODE:-}" ]; then
       printf 'R2D2_WEIGHTS_PER_NODE=%q\n' "${R2D2_WEIGHTS_PER_NODE}"
     fi
+    if [ -n "${R2D2_CUDA_BLOCKING_SYNC:-}" ]; then
+      printf 'R2D2_CUDA_BLOCKING_SYNC=%q\n' "${R2D2_CUDA_BLOCKING_SYNC}"
+    fi
   } >"${output_dir}/run.env"
 }
 

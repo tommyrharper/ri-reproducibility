@@ -5740,3 +5740,49 @@ spins.
   tree: 38-rank icelake WSClean (patched SIF cache, nlive 200, 5 repeats,
   4000 dead), 232 evals/s, with simulate 30 ms (19%) and the binary 122 ms
   (77%) an evaluation.
+
+## Round 123: GPU workers wait for the U-Net in the kernel, not in a spin loop
+
+**Change.** Round 122 found a GPU R2D2 worker burns a whole CPU while it
+waits on the card: the copy of the U-Net's output back to the CPU
+spin-waits. `patch_cuda_network()`'s `forward` in `r2d2_serve.py` now
+records a `torch.cuda.Event(blocking=True)` after the forward and
+`synchronize()`s on it before the copy, so a waiting worker sleeps and its
+CPU goes to the other ranks' simulate and NUFFT work. The arithmetic is
+unchanged. `R2D2_CUDA_BLOCKING_SYNC` (default 1; 0 restores the spin) is
+passed to the pool, recorded in `run.env` and in `benchmarks.jsonl` settings.
+
+**A/B.** One ampere job (`.probe/r123/job.sh`, job 39298339, `gpu-q-21`,
+A100-SXM4-80GB, 32 cores, MPS on): `./ri search r2d2 --device cuda
+--mpi-procs 16 --nlive 48 --num-repeats 5 --max-ndead 150 --seed 4242`,
+a warm-up and then S (spin) / B (blocking) alternating three times. The
+job's B24 arms were refused by the GPU-memory cap (24 x 4 GB > 80 GB, at
+most 19 ranks) and ran nothing.
+
+| arm | blocking | evals/s | ms an evaluation | R2D2 request, ms | simulate, ms | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| warm | on | 31.9 | 457 | 404 | 52 | 0.01466 +/- 0.00333 |
+| S1 | off | 37.1 | 381 | 331 | 49 | 0.01712 +/- 0.00232 |
+| B1 | on | 40.9 | 349 | 307 | 42 | 0.01679 +/- 0.00251 |
+| S2 | off | 36.8 | 384 | 333 | 50 | 0.01691 +/- 0.00237 |
+| B2 | on | 39.3 | 363 | 320 | 42 | 0.01714 +/- 0.00232 |
+| S3 | off | 38.6 | 370 | 323 | 46 | 0.01713 +/- 0.00223 |
+| B3 | on | 39.2 | 364 | 320 | 44 | 0.01673 +/- 0.00251 |
+
+**Learned.**
+- Blocking sync is **+6%**: a mean of 39.8 against 37.5 evals/s, and every
+  B arm beats every S arm (pairs +10%, +7%, +1.6%). The mechanism shows in
+  the stage that never touches the GPU: the CPU-only simulate falls from
+  ~48 to ~43 ms (-11%) once waiting workers stop spinning, and the R2D2
+  request from ~329 to ~316 ms. The log(Z)s agree within their errors (async
+  runs, so chains differ in both arms alike). GPU memory (58.5 GB) and
+  utilisation (95-99%) are the same.
+- This node's spin arms (37.5) ran below round 119's MPS arms on `gpu-q-9`
+  (41.8) with the same command, so compare GPU arms only within one job.
+- The warm-up arm was cold again (31.9), as in round 120.
+- `/usr/bin/time` around `./ri search` does not see the containers' CPU
+  time (~110-120 s user for 16 busy ranks over ~70 s), so it cannot measure
+  the freed CPU; the simulate stage is the measure.
+- With CPU freed, more than 16 ranks per card may now pay, but a 24-rank
+  arm needs either a smaller `NS_R2D2_CUDA_MB_PER_RANK` (it fits ~19) or
+  round 120's shared weights. 18 ranks is the next A/B.

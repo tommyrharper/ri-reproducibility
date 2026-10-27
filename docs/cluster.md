@@ -324,7 +324,9 @@ CUDA MPS daemon on the host first (`sidecar_cuda_mps_flags` in
 `start-sidecars.sh`; no root needed, pipe directory in the run's scratch) so
 those contexts share the card instead of time-slicing it: 16 ranks on an A100
 went from ~16 to ~41 evals/s. `NS_CUDA_MPS=0` turns it off
-(`docs/csd3-speed.md`, rounds 117 and 119).
+(`docs/csd3-speed.md`, rounds 117 and 119). A worker waits for the card on a
+blocking CUDA event, not by spinning in the copy back, so its CPU goes to the
+other ranks while it waits (+6%; `R2D2_CUDA_BLOCKING_SYNC=0` spins, round 123).
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:

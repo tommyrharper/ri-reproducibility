@@ -204,6 +204,7 @@ sidecar_launch "${R2D2_SIF}" \
   --env R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}" \
   --env R2D2_INTERLEAVE_WEIGHTS="${R2D2_INTERLEAVE_WEIGHTS:-1}" \
   --env R2D2_WEIGHTS_PER_NODE="${R2D2_WEIGHTS_PER_NODE:-auto}" \
+  --env R2D2_CUDA_BLOCKING_SYNC="${R2D2_CUDA_BLOCKING_SYNC:-1}" \
   --env OMP_WAIT_POLICY=PASSIVE \
   -- python3 "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py" --fifo-dir "${R2D2_FIFO_DIR}"
 

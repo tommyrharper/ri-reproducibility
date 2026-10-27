@@ -166,6 +166,9 @@ def patch_cuda_network() -> None:
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    # Wait for the U-Net in the kernel, not in a spin loop: the copy back alone
+    # spin-waits, burning a CPU per waiting worker (R2D2_CUDA_BLOCKING_SYNC).
+    blocking_sync = os.environ.get("R2D2_CUDA_BLOCKING_SYNC", "1") != "0"
 
     def load_net(net, cur_iter, layers, dnn_dict):
         if layers != 1:
@@ -186,6 +189,10 @@ def patch_cuda_network() -> None:
                 input_order="res_rec"):
         output = upstream_forward(layers, i, net, to_gpu(res_n), to_gpu(output_n), to_gpu(mean),
                                   eps, to_gpu(dirty), to_gpu(PSF), input_order)
+        if blocking_sync:
+            done = torch.cuda.Event(blocking=True)
+            done.record()
+            done.synchronize()
         return output.to(res_n.device)
 
     optimiser.load_net = load_net
