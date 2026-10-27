@@ -376,6 +376,9 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   run scripts needs no change. `NS_R2D2_MAX_RANKS` (112) caps an R2D2 job
   at a whole sapphire node's cores: one rank per CPU beat 56 x 2 by ~20% on
   whole icelake and sapphire nodes (`docs/csd3-speed.md`, round 105).
+  On such a node the R2D2 pool loads one checkpoint copy per socket and
+  pins each worker to its socket (+19% on a whole sapphire node, round 106);
+  `R2D2_WEIGHTS_PER_NODE=0` keeps one shared copy.
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
   whole toolchain, and a job purges the rest (above). `uv` is still needed for
   the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,

@@ -9,7 +9,9 @@
 # Rounded-up warm-worker RSS estimates from this repo's images. R2D2's pool
 # parent loads the checkpoints once and forks every rank's worker from it, so
 # the run pays them once (SHARED) and each rank only its own working set
-# (docs/csd3-speed.md, round 18).
+# (docs/csd3-speed.md, round 18). On a balanced multi-socket job it loads one
+# copy per NUMA node (R2D2_WEIGHTS_PER_NODE): 6.8GB peak on two, still inside
+# SHARED (round 106).
 NS_R2D2_SHARED_MB="${NS_R2D2_SHARED_MB:-8000}"
 NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-600}"
 # shellcheck disable=SC2034  # read by the scripts that source this

@@ -192,19 +192,65 @@ def patch_cuda_network() -> None:
     optimiser.forward = forward
 
 
-def job_numa_nodes() -> list[int]:
-    """NUMA nodes holding at least one CPU this process may run on."""
+def job_numa_cpus() -> dict[int, list[int]]:
+    """This process's allowed CPUs, by the NUMA node holding them."""
     allowed = os.sched_getaffinity(0)
-    nodes = []
-    for path in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+    nodes = {}
+    for path in sorted(Path("/sys/devices/system/node").glob("node[0-9]*"), key=lambda p: int(p.name[4:])):
         cpus = set()
         for part in (path / "cpulist").read_text().strip().split(","):
             if part:
                 low, _, high = part.partition("-")
                 cpus.update(range(int(low), int(high or low) + 1))
         if cpus & allowed:
-            nodes.append(int(path.name[4:]))
+            nodes[int(path.name[4:])] = sorted(cpus & allowed)
     return nodes
+
+
+def job_numa_nodes() -> list[int]:
+    """NUMA nodes holding at least one CPU this process may run on."""
+    return list(job_numa_cpus())
+
+
+def set_mempolicy(mode: int, nodes: list[int]) -> bool:
+    if sys.platform != "linux" or os.uname().machine != "x86_64":
+        return False
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    mask = ctypes.c_ulong(sum(1 << node for node in nodes))
+    # 238 is x86_64's set_mempolicy; MPOL_DEFAULT takes no mask.
+    return libc.syscall(238, mode, ctypes.byref(mask) if nodes else None, 64 if nodes else 0) == 0
+
+
+def weights_per_node(nodes: dict[int, list[int]] | None = None) -> dict[int, list[int]]:
+    """Nodes to give their own checkpoint copy, or {} for one shared copy.
+
+    R2D2_WEIGHTS_PER_NODE=1 or 0 forces it. The default, auto, takes it when
+    every node holds at least half its fair share of the job's CPUs: a whole
+    sapphire node's search ran +19% (docs/csd3-speed.md, round 106). A
+    lopsided split like 32/6 keeps the shared copy, since pinning a node's
+    few CPUs cost round 98's per-node copies 5-6% there.
+    """
+    mode = os.environ.get("R2D2_WEIGHTS_PER_NODE", "auto")
+    nodes = job_numa_cpus() if nodes is None else nodes
+    if mode == "0" or len(nodes) < 2:
+        return {}
+    if mode != "1":
+        smallest, total = min(len(cpus) for cpus in nodes.values()), sum(len(cpus) for cpus in nodes.values())
+        if 2 * smallest * len(nodes) < total:
+            return {}
+    return nodes
+
+
+def worker_nodes(count: int, nodes: dict[int, list[int]]) -> list[int]:
+    """Worker i's node, in proportion to each node's share of the job's CPUs.
+
+    Round-robin would put half of 38 workers on a 6-CPU node of a 32/6
+    allocation; this puts 32 and 6.
+    """
+    slots = [node for node, cpus in nodes.items() for _ in cpus]
+    return [slots[i * len(slots) // count] for i in range(count)] if slots else []
 
 
 @contextmanager
@@ -217,20 +263,45 @@ def interleaved_pages():
     weights across the interconnect. R2D2_INTERLEAVE_WEIGHTS=0 turns it off.
     """
     nodes = job_numa_nodes() if os.environ.get("R2D2_INTERLEAVE_WEIGHTS", "1") != "0" else []
-    if len(nodes) < 2 or sys.platform != "linux" or os.uname().machine != "x86_64":
-        yield
-        return
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    set_mempolicy = 238  # x86_64 syscall number
-    mask = ctypes.c_ulong(sum(1 << node for node in nodes))
-    interleaving = libc.syscall(set_mempolicy, 3, ctypes.byref(mask), 64) == 0  # MPOL_INTERLEAVE
+    interleaving = len(nodes) > 1 and set_mempolicy(3, nodes)  # MPOL_INTERLEAVE
     try:
         yield
     finally:
         if interleaving:
-            libc.syscall(set_mempolicy, 0, None, 0)  # MPOL_DEFAULT
+            set_mempolicy(0, [])  # MPOL_DEFAULT
+
+
+# One checkpoint cache per NUMA node (R2D2_WEIGHTS_PER_NODE); a worker swaps
+# its node's in for _CHECKPOINT_CACHE after the fork.
+_NODE_CHECKPOINTS: dict[int, dict] = {}
+
+
+def load_checkpoints(checkpoint_path: Path) -> None:
+    def load():
+        sys.modules["utils"].get_DNNs(int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path))
+
+    # A CUDA worker reads its weights from the GPU, so only CPU runs pin.
+    nodes = weights_per_node() if r2d2_device() != "cuda" else {}
+    if not nodes:
+        with interleaved_pages():
+            load()
+        return
+    for node in nodes:
+        _CHECKPOINT_CACHE.clear()
+        bound = set_mempolicy(2, [node])  # MPOL_BIND: this copy's pages on its node
+        try:
+            load()
+        finally:
+            if bound:
+                set_mempolicy(0, [])
+        _NODE_CHECKPOINTS[node] = dict(_CHECKPOINT_CACHE)
+
+
+def enter_node(node: int, nodes: dict[int, list[int]]) -> None:
+    """Run a forked worker on its node's CPUs, reading its node's weights."""
+    os.sched_setaffinity(0, nodes[node])
+    _CHECKPOINT_CACHE.clear()
+    _CHECKPOINT_CACHE.update(_NODE_CHECKPOINTS[node])
 
 
 def warm_imports() -> None:
@@ -261,10 +332,7 @@ def warm_imports() -> None:
             if checkpoint_path.is_dir():
                 # Load before fork: tensor pages stay shared until a child
                 # writes them, instead of paying torch.load once per rank.
-                with interleaved_pages():
-                    sys.modules["utils"].get_DNNs(
-                        int(os.environ.get("R2D2_NUM_ITER", "25")), str(checkpoint_path)
-                    )
+                load_checkpoints(checkpoint_path)
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
@@ -458,6 +526,8 @@ def serve_pool(fifo_dir: str) -> None:
     # inherited already cost.
     _PEAK_FLOOR = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     children = {}
+    nodes = weights_per_node() if _NODE_CHECKPOINTS else {}
+    node_of = dict(zip(bases, worker_nodes(len(bases), nodes)))
 
     def fork(base: str, replacement: bool = False) -> None:
         pid = os.fork()
@@ -481,6 +551,8 @@ def serve_pool(fifo_dir: str) -> None:
             # say); the rank's own retry waits at least this long.
             if replacement:
                 time.sleep(1.0)
+            if base in node_of:
+                enter_node(node_of[base], nodes)
             answer(base)
         except Exception:
             traceback.print_exc()
@@ -904,6 +976,25 @@ def self_check_interleaved_pages() -> None:
     print(f"r2d2 interleaved pages self-check passed ({len(nodes)} node(s))")
 
 
+def self_check_worker_nodes() -> None:
+    lopsided = {0: list(range(32)), 1: list(range(32, 38))}
+    placed = worker_nodes(38, lopsided)
+    assert (placed.count(0), placed.count(1)) == (32, 6), placed
+    assert worker_nodes(4, {0: [0, 2], 1: [1, 3]}) == [0, 0, 1, 1]
+    assert worker_nodes(3, {}) == []
+    os.environ.pop("R2D2_WEIGHTS_PER_NODE", None)
+    whole = {0: [0, 2], 1: [1, 3]}
+    assert weights_per_node(whole) == whole, "a balanced split gets per-node copies"
+    assert weights_per_node(lopsided) == {}, "a 32/6 split keeps one shared copy"
+    assert weights_per_node({0: [0, 1]}) == {}
+    os.environ["R2D2_WEIGHTS_PER_NODE"] = "1"
+    assert weights_per_node(lopsided) == lopsided
+    os.environ["R2D2_WEIGHTS_PER_NODE"] = "0"
+    assert weights_per_node(whole) == {}
+    os.environ.pop("R2D2_WEIGHTS_PER_NODE")
+    print("r2d2 worker nodes self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_net_reuse()
@@ -915,6 +1006,7 @@ if __name__ == "__main__":
         self_check_serve_fifo()
         self_check_serve_pool()
         self_check_interleaved_pages()
+        self_check_worker_nodes()
     elif sys.argv[1:2] == ["--fifo-dir"]:
         serve_pool(sys.argv[2])
     else:

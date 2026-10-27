@@ -5119,3 +5119,72 @@ rank, ~49 GB at 112) decides, as it already did for half nodes.
 - `--qos=intr` allows one job per user; a second submit fails with
   `QOSMaxSubmitJobPerUserLimit`. The default QOS whole sapphire node
   started within ~5 minutes.
+
+## Round 106: one R2D2 checkpoint copy per socket on whole nodes
+
+**Question.** Round 105 found a whole node gives R2D2 ~20% less per core
+than half a node (sapphire 0.76 against 0.96 evals/s a core). Round 99
+interleaves the one shared checkpoint copy across both sockets, so every
+worker still reads half its weights across the interconnect. Round 98's
+per-node copies lost 5-6%, but only on a lopsided 32/6 half node. Does a
+copy per socket win on a whole node?
+
+**Probe** (`.probe/r106/forkunet.py`). Pool-shaped: the parent loads all 25
+checkpoints and forks P workers, and each worker runs 200 1-thread U-Net
+forwards cycling through the checkpoints. Exclusive whole nodes, ABAB,
+ms per forward (mean of workers):
+
+| node | P | interleaved (shipped) | first touch | per-node copies, workers pinned to node |
+| --- | ---: | ---: | ---: | ---: |
+| icelake cpu-q-481 (job 39287408) | 76 | 51.4 / 52.6 | 50.9 | **48.5 / 49.4** (-6%) |
+| icelake | 38 | 36.0 / 34.8 | 36.1 | 36.3 / 35.3 |
+| sapphire cpu-r-65 (job 39287529) | 112 | 38.9 / 38.9 | 38.4 | **35.7 / 34.8** (-9.5%) |
+| sapphire | 56 | 29.4 / 29.2 | 29.7 | 27.0 / 26.9 |
+
+At full load locality is worth 6-10% of a forward. The 76/112-copy forward
+is still 35-45% slower than at half load: most of round 105's per-core
+drop is memory bandwidth, not distance.
+
+**Change.** `r2d2_serve.load_checkpoints()`: when the job's CPUs span
+NUMA nodes and each node holds at least half its fair share of them, the
+pool parent loads the checkpoint series once per node under
+`MPOL_BIND`. `serve_pool()` assigns worker i to a node in proportion to
+the node's CPU count (`worker_nodes()`; round 98 had split them evenly),
+and each forked worker pins itself to that node's allowed CPUs and swaps
+its node's copy into the checkpoint cache. `R2D2_WEIGHTS_PER_NODE`
+(`auto`, `1` or `0`) controls it; a lopsided allocation such as 32/6 or
+54/2, a single node, and `R2D2_DEVICE=cuda` keep round 99's one
+interleaved copy. Weights and arithmetic are unchanged; only where pages
+live and which CPUs a worker may use move.
+
+**Measured.** One exclusive sapphire node (cpu-r-65, job 39287894), 112 x 1
+async (the default shape), nlive 200, 5 repeats, 1000 dead, seed 4242,
+arms in this order:
+
+| run | weights | evals | evals/s | ms per eval | parent pages N0 / N1 | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | --- | ---: | --- |
+| node-a (first in job) | per node | 13,804 | 96.6 | 1124 | 831k / 776k | 6,864 | 0.01788 ± 0.00037 |
+| il-a | interleaved | 16,579 | 87.9 | 1243 | 446k / 402k | 3,767 | 0.01764 ± 0.00038 |
+| node-b | per node | 19,116 | 110.3 | 989 | 790k / 816k | 6,786 | 0.01742 ± 0.00047 |
+| il-b | interleaved | 14,535 | 85.6 | 1272 | 420k / 429k | 3,905 | 0.01780 ± 0.00037 |
+
+**+19% evals/s** (103.5 against 86.8), and the request is 16% shorter.
+log(Z)s agree within their errors (async runs are not reproducible, round
+102). The interleaved arms match round 105's 112 x 1 (83.2/86.0), so the
+gain is not a node effect. The second copy costs ~5 s more start-up and
+~3 GB more peak in the pool parent, which still fits `NS_R2D2_SHARED_MB`
+(8000). A half icelake node with all 38 CPUs on node 0 (this loop's
+allocation) is unaffected: one node, one copy.
+
+**Learned.**
+- Round 98's per-node copies failed on placement, not on pinning as such:
+  with workers split evenly, a 32/6 allocation puts 19 workers on 6 CPUs.
+  On a balanced node, pinning a worker to its socket's 38 or 56 CPUs
+  costs nothing measurable.
+- Whole-node R2D2 is bound on memory bandwidth: 112 forwards at once run
+  33% slower than 56, even with local weights. Fewer bytes per forward
+  (smaller weights or reuse across ranks) is the lever left there.
+- Not yet measured: a whole icelake node in a real search (the probe
+  gives -6% per forward, so expect ~+5-10%), and a balanced half node
+  such as 20/36 on sapphire.
+

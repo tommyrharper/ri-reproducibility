@@ -62,6 +62,9 @@ write_run_config() {
     if [ -n "${R2D2_INTERLEAVE_WEIGHTS:-}" ]; then
       printf 'R2D2_INTERLEAVE_WEIGHTS=%q\n' "${R2D2_INTERLEAVE_WEIGHTS}"
     fi
+    if [ -n "${R2D2_WEIGHTS_PER_NODE:-}" ]; then
+      printf 'R2D2_WEIGHTS_PER_NODE=%q\n' "${R2D2_WEIGHTS_PER_NODE}"
+    fi
   } >"${output_dir}/run.env"
 }
 
