@@ -8,7 +8,9 @@ START (epoch seconds) holds the timed loop until then, so P copies overlap.
 GRAPH=1 (cuda only) replays the forward from a captured CUDA graph (round 122).
 TF32 (default 1, torch's own) 0 computes float32 convolutions as r2d2_serve does;
 BENCH=1 sets cudnn.benchmark; CL=1 runs channels_last (round 125);
-DET=1 sets cudnn.deterministic (round 127). Run P copies at once to see what a full node does:
+DET=1 sets cudnn.deterministic (round 127). BF16=1 (cpu) runs the forward under
+bfloat16 autocast, AMX on sapphire (round 134), BF16=2 with the weights cast to
+bfloat16 once; maxrel_fp32 is then its error. Run P copies at once to see what a full node does:
     for i in $(seq 24); do apptainer exec ... python3 probe_unet_forward.py & done; wait
 """
 import os, sys, time
@@ -33,6 +35,13 @@ torch.manual_seed(0)
 x = torch.randn(b, 2, dim, dim).to(dev, memory_format=fmt)
 sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
 with torch.no_grad():
+    fp32 = net(x)
+    module = net
+    if os.environ.get("BF16") == "1":
+        net = torch.autocast("cpu", dtype=torch.bfloat16)(module)
+    elif os.environ.get("BF16") == "2":  # weights cast once, not per forward
+        net = module.to(torch.bfloat16)
+        x = x.to(torch.bfloat16)
     ref = torch.cat([net(x[i:i + 1]) for i in range(b)])
     y = net(x)
     for _ in range(5):
@@ -68,6 +77,7 @@ with torch.no_grad():
     cpu = (time.process_time() - c) / n
 if os.environ.get("OUT"):
     torch.save(y.cpu().contiguous(), os.environ["OUT"])  # compare arms' outputs afterwards
-print(f"{dt / b * 1e3:.2f} ms/image B={b} params={sum(p.numel() for p in net.parameters()) * 4 / 1e6:.0f}MB "
+print(f"{dt / b * 1e3:.2f} ms/image B={b} params={sum(p.numel() for p in module.parameters()) * 4 / 1e6:.0f}MB "
       f"batch_identical={torch.equal(y, ref)} cpu_ms={cpu * 1e3:.2f} "
-      f"graph_identical={graph_identical if os.environ.get('GRAPH', '0') == '1' else '-'} maxrel={float((y - ref).abs().max() / ref.abs().max()):.2g}")
+      f"graph_identical={graph_identical if os.environ.get('GRAPH', '0') == '1' else '-'} maxrel={float((y - ref).abs().max() / ref.abs().max()):.2g} "
+      f"maxrel_fp32={float((y.float() - fp32).abs().max() / fp32.abs().max()):.2g}")

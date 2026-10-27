@@ -6180,3 +6180,48 @@ files were dealt over (S=1 is today's layout) and T the thread count.
   node (more ranks, faster evaluations, or the WSClean binary halving),
   the record writers will lag and the end-of-run drain will grow. Deal
   records over ~16 subdirectories by a hash of the name then.
+
+## Round 134 (negative): bfloat16 for the CPU U-Net, AMX on sapphire
+
+**Question.** The CPU U-Net is ~96% of an R2D2 evaluation (round 115), and
+every lever tried on it so far kept float32. Sapphire Rapids has AMX
+bfloat16 tiles (`amx_bf16` in `/proc/cpuinfo`; icelake has neither AMX nor
+`avx512_bf16`). Does a bfloat16 forward pay, and how far does it move the
+output?
+
+**Method.** `scripts/probe_unet_forward.py` gained `BF16=1` (the forward
+under `torch.autocast("cpu", dtype=torch.bfloat16)`) and `BF16=2` (weights
+and input cast to bfloat16 once), and prints `maxrel_fp32`, the largest
+difference from the float32 output over the float32 peak. One checkpoint
+(`R2D2_A1/N1`), 32x32 as production, 1 thread, 150 forwards per copy, each
+copy pinned to its own CPU. Two `sapphire --qos=intr` jobs of 56 CPUs (job
+39305469 on cpu-r-109 for autocast, job 39306384 on cpu-r-73 for pre-cast
+weights), arms in ABBA order after a discarded warm-up. Accuracy was also
+checked on sky-like inputs (`.probe/r134/r134acc.py`: random noise, a
+PSF-like blob with a second source, and the same scaled by 1e-3).
+
+| arm | solo, ms a forward | 56 copies, ms a forward (mean of copies) | `maxrel_fp32` |
+| --- | ---: | ---: | ---: |
+| float32 (job 39305469) | 18.8, 19.1 | 31.9, 32.0 | 0 |
+| bfloat16 autocast | 36.1, 36.3 | 75.3, 74.9 | 0.11 |
+| float32 (job 39306384) | 22.9, 22.7 | 32.9, 32.6 | 0 |
+| bfloat16 weights cast once | 19.1, 19.5 | 33.8, 33.8 | 0.11 |
+
+On icelake (this loop's node, solo) float32 is 28.8 ms, autocast 68.4 ms
+and pre-cast weights 45.9 ms. Error over the three accuracy inputs, autocast on
+sapphire: max 1.3-12% and rms 2.0-5.4% of the float32 output.
+
+**Learned.**
+- bfloat16 is not a lever for this U-Net. Autocast re-casts the 124 MB of
+  float32 weights on every forward and is 1.9x slower solo and 2.3x slower
+  at 56 copies. With weights cast once, AMX makes a solo forward 15% faster,
+  but at 56 copies it is 3% slower: under load the 32x32 forward is bound by
+  memory traffic and per-layer overhead, not by the convolution FLOPs that
+  AMX speeds up (round 86: im2col + small sgemm, oneDNN reorders, instance
+  norms).
+- Its error alone rules it out: 1-12% of the image peak, ~1000x the
+  largest deviation ever accepted here (w-gridding off, 2.3e-5), and R2D2
+  feeds each network's output into the next, so it would compound.
+- Neither job wrote a search, so there are no `benchmarks.jsonl` rows.
+  Reduced precision stays closed for CPU R2D2 unless a future network is
+  much larger than 32x32.
