@@ -6225,3 +6225,63 @@ sapphire: max 1.3-12% and rms 2.0-5.4% of the float32 output.
 - Neither job wrote a search, so there are no `benchmarks.jsonl` rows.
   Reduced precision stays closed for CPU R2D2 unless a future network is
   much larger than 32x32.
+
+## Round 135 (diagnostic, one fix): rounds 90-134 for WSClean, raced against round 89's tree
+
+**Question.** Round 89 last measured WSClean end to end (250 evals/s, 36
+ranks). Rounds 90-134 shipped simulate, record and harness changes for
+WSClean, each measured alone. What do they give together?
+
+**Run.** `git archive b63c209` (round 89's tree) into `/dev/shm`, raced
+against HEAD (a1b6621) on this loop's half icelake node (cpu-q-141). Each
+arm ran 18 ranks, nlive 150, 15 repeats, 900 dead and seed 4242. Both used
+one patched 0001-0017 `wsclean.sif` through a `SIF_DIR` of symlinks,
+`NS_PATCH_WSCLEAN=0`. Launch order alternated by pair. Script:
+`.probe/r135/race.sh` (old launched first) and `raceB.sh` (HEAD first).
+
+| pair | launched first | b63c209 evals/s | HEAD evals/s | b63c209 simulate | HEAD simulate | b63c209 binary | HEAD binary |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | b63c209 | 111.7 | 130.1 | 27.2 ms | 21.6 ms | 121.2 ms | 105.3 ms |
+| B | HEAD | 122.3 | 118.2 | 24.6 ms | 22.7 ms | 110.4 ms | 117.3 ms |
+| C | b63c209 | died | 130.4 | - | 20.1 ms | - | 106.6 ms |
+| D | HEAD | 119.4 | 120.9 | 25.1 ms | 22.4 ms | 113.3 ms | 114.6 ms |
+| mean (A, B, D) | | 117.8 | **123.1** | 25.6 ms | **22.2 ms** | 115.0 ms | 112.4 ms |
+
+log(Z) is 0.0962-0.0973 with errors of ±0.0005-0.0010 in all seven runs
+that finished. The runs are async, so they are not identical.
+
+**Learned.**
+- Rounds 90-134 make WSClean +4.5% faster end to end (123.1 against
+  117.8 evals/s, mean of three pairs). That is at this node's ~5% noise
+  floor. The part that is clearly real is simulate (MeqTrees): it is
+  **-13%** (25.6 to 22.2 ms) and faster in every pair, mostly from round
+  90's splice. The `wsclean` binary is the same SIF in both arms, and it
+  swings ±8% from pair to pair.
+- **Launch order is a ~9% effect on this allocation, as large as anything
+  being measured.** In every pair the second search launched was the
+  faster one, and solving the two pairs with opposite launch orders (A
+  and B) for both factors gives tree +6% and launch position +10%. The
+  cause is the CPU lock walk (`pin_rank_cpu`). The first search takes the
+  lowest 18 CPUs of the sorted affinity list, and here that list is CPU 0,
+  CPUs 1 and 5 on socket 1, and the 36 even CPUs of socket 0. So the first
+  search gets CPU 0 (interrupts, this loop's own processes) and the two
+  remote-socket CPUs. Any raced A/B on a split allocation must alternate
+  launch order and average over it, as this round does.
+- **Fixed: racing two searches could kill one's worker pool.** In pair C,
+  HEAD's startup reaper (`ns_reap_leaked_sidecars`) killed the old arm's
+  wsclean pool ("NOTE: killing worker pool(s) left behind by a run that
+  is gone"), and its 18 ranks aborted after 268 evaluations. The reaper
+  treats a pool as leaked if its run has no ranks and `.launcher.pid` names
+  no live shell. `sidecar_launch` rewrote that file with `echo $$ >` once
+  per pool. While the run's first pool was up and its ranks had not yet
+  started, a read that hit the second launch's truncation found an empty
+  file, and an empty file counts as "no launcher". On Lustre, a reader
+  racing the old write saw it empty on 10 of 69 reads (`.probe/r135/torn.sh`).
+  With the write now renamed into place, it saw 0 empty reads in 6,925.
+  This affects any two searches started close together on one host, which
+  is what `--interleave`-style races do. The old tree has the same race,
+  so A/Bs against trees older than this round can still lose an arm.
+  `bash scripts/lib/start-sidecars.sh --self-check` passes and asserts that
+  no temp file is left behind.
+- Rows: `r135-new-A..D` and `r135-old-A, B, D` in `benchmarks.jsonl`. All
+  run directories were deleted (~1.4k files each).

@@ -147,9 +147,13 @@ sidecar_launch() {
   name="$(basename "${sif}" .sif)"
   # Which shell owns these pools, for the leak rule in rank-budget.sh: a pool
   # whose run has no ranks is only leaked once this pid is gone too - between
-  # retries the ranks are dead and the pools are not.
+  # retries the ranks are dead and the pools are not. Renamed into place:
+  # each pool's launch rewrites it, and a `>` truncation read by another
+  # search's reaper while this run's first pool is up and its ranks are not
+  # yet started looks like no launcher, so that pool was killed (round 135).
   if [ -n "${OUTPUT_DIR:-}" ]; then
-    echo "$$" >"${OUTPUT_DIR}/.launcher.pid"
+    echo "$$" >"${OUTPUT_DIR}/.launcher.pid.$$"
+    mv -f "${OUTPUT_DIR}/.launcher.pid.$$" "${OUTPUT_DIR}/.launcher.pid"
   fi
   sidecar_binds
   if [ "${sif}" = "${MEQTREES_SIF:-}" ] && [ -n "${NS_FASTNOISE_DIR:-}" ]; then
@@ -252,6 +256,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   { [ -f "${_tmp}/workers-a.log" ] && [ -f "${_tmp}/workers-b.log" ]; } \
     || { echo "FAIL: pool logs not written beside the run"; exit 1; }
   [ "$(cat "${_tmp}/.launcher.pid")" = "$$" ] || { echo "FAIL: launcher pid not recorded"; exit 1; }
+  compgen -G "${_tmp}/.launcher.pid.*" >/dev/null && { echo "FAIL: launcher pid temp file left behind"; exit 1; }
 
   # Restore starts a dead pool again with its own command, and leaves the
   # live one alone.
