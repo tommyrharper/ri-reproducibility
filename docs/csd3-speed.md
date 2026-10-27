@@ -5276,3 +5276,43 @@ All log(Z)s agree within their errors.
   It needs one job holding both shapes, for example a whole node split
   into two simultaneous 56-CPU searches pinned 0/56 and 28/28, before
   `scripts/lib/slurm.sh` asks for it.
+
+## Round 111 (diagnostic): one socket against two, same sapphire node
+
+Round 110's lead, on one node: an exclusive sapphire node (job 39291533,
+cpu-r-6) ran 56-CPU R2D2 searches pinned with `taskset` either to 56 CPUs
+of socket 0 (S) or to 28 + 28 across both sockets, with per-socket copies
+(P, `auto`) or one shared copy (Z, `R2D2_WEIGHTS_PER_NODE=0`). Async 56 x 1,
+nlive 200, 5 repeats, 600 dead, seed 4242, commit e0d9672; a throwaway
+warm-up arm, then S P Z Z P S. Rows `r111-pin-*`.
+
+| run | CPUs | weights | evals | evals/s | ms per eval | peak MB | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| warm-S (discarded) | 56/0 | auto (off) | 9,608 | 55.7 | 974 | 4,044 | 0.01689 ± 0.00086 |
+| S1 | 56/0 | auto (off) | 8,373 | 55.7 | 972 | 3,900 | 0.01767 ± 0.00061 |
+| P1 | 28/28 | per socket | 9,800 | 74.4 | 727 | 6,986 | 0.01649 ± 0.00091 |
+| Z1 | 28/28 | one copy | 9,396 | 63.4 | 852 | 3,888 | 0.01699 ± 0.00092 |
+| Z2 | 28/28 | one copy | 8,373 | 65.2 | 825 | 3,982 | 0.01770 ± 0.00061 |
+| P2 | 28/28 | per socket | 8,468 | 75.3 | 716 | 6,777 | 0.01756 ± 0.00064 |
+| S2 | 56/0 | auto (off) | 8,434 | 53.3 | 1013 | 3,925 | 0.01767 ± 0.00059 |
+
+All log(Z)s agree within their errors.
+
+**Learned.**
+- Spreading over both sockets is worth +18% by itself (Z 64.3 against S
+  54.5, both pairs agree) and per-socket copies another +16% on top (P 74.9
+  against Z), +37% in all. Every pair is consistent, so placement, not
+  noise. The warm-up arm was not slow this time (55.7), unlike round 110.
+- Caveat: here the other 56 CPUs were idle, so each 28/28 socket had half
+  its cores (and their share of L3 and memory bandwidth) free. On a shared
+  node the neighbour uses them; round 110's real `--ntasks-per-socket` job
+  with neighbours still ran 63.2-63.5 one-copy and 74.3 per-socket, close to
+  this table, so most of the gain should survive.
+- Production default is a whole node (`--exclusive`), which already gets
+  both sockets and per-socket copies. Only a sized (`--mpi-procs`) R2D2 job
+  is exposed: `scripts/lib/slurm.sh` asks for `--ntasks 1 --cpus-per-task N`,
+  which Slurm may place on one socket. Asking for
+  `--ntasks=2 --ntasks-per-socket=1 --cpus-per-task=N/2` fixes the shape but
+  queued ~30 minutes against ~3 in round 110, so it is documented in
+  `docs/cluster.md` as the by-hand half-node shape rather than made the
+  default.
