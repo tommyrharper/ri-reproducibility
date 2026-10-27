@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 143).**
+**Where it stands (round 144).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -25,7 +25,9 @@ the Hetzner host.
   `R2D2_RUNTIME=onnx` runs the U-Net through ONNX Runtime, **+33% evals/s**
   end to end on a half icelake node (round 141; 1.5e-5 of the peak at
   worst, round 140). It runs without ORT's memory arena and is budgeted
-  at 1 GB a rank (round 143). Open: whether to make it the default.
+  at 1 GB a rank (round 143). Run to convergence on two seeds (round 144)
+  it matches torch's log(Z) within 0.25 sigma and its posterior, at +44%
+  evals/s. Open: making it the default (GPU, old `run.env`, first-run cost).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6679,3 +6681,49 @@ Rows: `r143-onnx`, `r143-torch` and `r143-noarena` are the 250-dead
 memory probes, run sequentially and dominated by warm-up, so do not read
 speed from them. `r143-A1..B2` are the ABAB. Probes are in `.probe/r143/`.
 Run directories were deleted.
+
+## Round 144 (validation): `R2D2_RUNTIME=onnx` against torch, run to convergence
+
+**Question.** Rounds 141 and 143 compared the runtimes over 400 dead points.
+Does onnx (not bit-identical, at most 1.5e-5 of the peak) find the same
+evidence and posterior as torch when a search runs to convergence?
+
+**Setup.** Two seeds. For each seed, a torch search and an onnx search ran
+at the same time on this loop's half icelake node, 19 ranks x 1 thread each,
+`--nlive 50 --num-repeats 5 --max-ndead -1`, async, shipped SIFs. Other
+tenants were at load ~25. The onnx arm finished first each time, so the
+torch arm had the node to itself for its last few minutes. That favours
+torch.
+
+| seed | runtime | evals | wall | evals/s | request ms | simulate ms | dead | log(Z) x1e3 | worst `total_rms_jy` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| 4242 | torch | 10865 | 701.0 s | 15.5 | 1101 | 46 | 511 | 18.89 +/- 0.58 | 0.03281 |
+| 4242 | onnx | 10714 | 468.3 s | 22.9 | 751 | 30 | 507 | 19.09 +/- 0.60 | 0.03284 |
+| 4343 | torch | 7942 | 475.9 s | 16.7 | 1030 | 42 | 527 | 17.62 +/- 0.72 | 0.03125 |
+| 4343 | onnx | 10273 | 437.0 s | 23.5 | 729 | 31 | 522 | 17.44 +/- 0.70 | 0.03342 |
+
+**Result.**
+- **The evidence agrees.** Converged log(Z) differs by 0.21e-3 (seed 4242)
+  and 0.18e-3 (seed 4343). That is 0.25 and 0.18 of the combined error,
+  and smaller than the 1.3e-3 spread between seeds within one runtime.
+- **The posterior agrees.** Means of the ~60-70 equal-weight samples per run
+  differ by at most 0.3 of a posterior standard deviation in all nine
+  parameters, which is within sampling noise and no larger than the
+  differences between seeds. The worst evaluation found has the same
+  `total_rms_jy` to 3e-5 for seed 4242. Seed 4343's onnx search went further
+  into the tail (0.0334 against 0.0313); with async runs that is down to the
+  path the search took, not to the runtime.
+- **Speed.** onnx is 23.2 against 16.1 evals/s mean, **+44%** with both
+  searches sharing the node, and the request is 30% faster (740 against
+  1066 ms). This is more than round 141's +33% at 38 ranks per arm, which
+  fits round 140: torch's forward slows down more under load.
+
+So nothing seen over a converged search argues against making onnx the
+default. Before switching, these need settling: GPU runs keep torch; runs
+whose `run.env` predates round 141 (no `R2D2_RUNTIME`) must resume as torch;
+a synchronous seeded run no longer reproduces an archived torch one; and the
+first search in a work directory pip-installs onnxruntime and exports 25
+checkpoints (~50 s, 3.1 GB).
+
+Rows: `r144-{torch,onnx}-{4242,4343}` in `benchmarks.jsonl` (clean tree at
+6b02d68). Probe: `.probe/r144/race.sh <seed>`. Run directories deleted.
