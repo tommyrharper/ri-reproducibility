@@ -6350,3 +6350,58 @@ patch 0006's accepted 2.3e-5.
   patch 0006, plus a check that 16 chained iterations do not grow it.
 - No search was run, so there is no `benchmarks.jsonl` row and nothing to
   delete. Scripts: `.probe/r136/tb.py`, `run.sh`.
+
+## Round 137 (negative): real R2D2 requests in lockstep, forwards batched
+
+**Question.** Round 136's +47-64% was for U-Net forwards alone. If a worker
+runs B real requests together and batches each iteration's forward over the
+ones still running, does the whole request get faster?
+
+**Run.** `.probe/r137/lockstep.py` inside `r2d2.sif`. It warms up like the
+pool (`r2d2_serve.warm_imports`, checkpoints loaded before the fork) and
+forks P workers, each pinned to T of the same 36 socket-0 CPUs as round 136.
+Each worker runs its B requests as B threads over the 48 `.probe/mats`
+requests (production's 32x32 config, `prune: True`). A gatherer wraps
+`optimiser.R2D2.forward`. When every running request is waiting, it
+concatenates their inputs and runs one forward on a single T-thread forward
+thread. A request that stops lowers the count it waits for. FINUFFT plans are
+kept per thread. B = 1 calls the forward directly, as production does. Each
+worker ran one untimed group and then 6 timed groups. Order was mirrored.
+
+| P workers x T threads, batch B | pass 1 req/s | pass 2 req/s | vs 36 x 1 | mean batch | forward share of wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 36 x 1, B 1 (production) | 34.7 | 38.1 | - | 1 | - |
+| 9 x 4, B 4 | 27.1 | 28.1 | **-24%** | 2.99 | 0.64 |
+| 4 x 9, B 9 | 24.8 | 24.7 | **-32%** | 6.53 | 0.53 |
+| 2 x 18, B 18 | 19.9 | 20.1 | **-45%** | 12.84 | - |
+
+Accuracy: across 252 requests per arm, the final model images differ from
+batch 1 by at most 3.0e-6 of the peak, the same in every arm. That is ~3x one
+forward's 1e-6 after ~16 chained iterations, so the error does not compound
+much. B = 1 through the same code was bit-identical to production.
+
+**Learned.**
+- Lockstep batching inside one worker is a loss end to end: -24% at B 4 and
+  -45% at B 18. The bigger the batch, the bigger the loss.
+- Two things eat round 136's forward gain. First, prune thins the batch:
+  requests stop at different iterations, so B 4 averages 3.0 images per
+  forward, B 9 6.5 and B 18 12.8. Second, everything outside the forward
+  (data load, imaging weights, PSF kernel, residuals) now runs on B Python
+  threads in one process, behind the GIL and the slowest request of each
+  iteration. That is 36-47% of a worker's wall time, with T-1 of its CPUs
+  idle for it. In production, each rank does this work on its own CPU in
+  parallel.
+- Load alone costs a request 55%: 0.64 CPU-s solo (1 x 1) against 0.94-1.04
+  CPU-s with all 36 CPUs busy. The loaded cost is memory traffic, which is
+  what batching was meant to cut.
+- Batching could only win with a separate forward server. Each rank would
+  keep its own process for the non-forward work and send just the forward's
+  two 32x32 inputs through shared memory to a server that batches across
+  ranks. Even with perfect overlap the ceiling is ~+30%: about 65% of a
+  loaded request is forward, sped up 1.5x at the batch sizes prune leaves.
+  Ranks would also sit idle while they wait, unless CPUs are oversubscribed.
+  The GPU path (rounds 119-124) already takes the forward off the CPUs, so
+  the CPU version is not pursued.
+- No search was run, so there is no `benchmarks.jsonl` row. The `/dev/shm`
+  outputs were deleted. Scripts: `.probe/r137/lockstep.py`, `run.sh`,
+  `cmp.py`.
