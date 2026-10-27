@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 137).**
+**Where it stands (round 139).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -20,8 +20,9 @@ the Hetzner host.
   changes (round 86), MKL packing (100), bfloat16/AMX (134), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
-  lockstep (137, -24 to -45%). The one CPU lever left is a cross-rank
-  forward server, with a ceiling of about +30%.
+  lockstep (137, -24 to -45%), and a cross-rank forward server (139,
+  -52% or worse, because the server cannot keep up). No CPU lever is left
+  for the U-Net.
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6433,3 +6434,60 @@ much. B = 1 through the same code was bit-identical to production.
 - No search was run, so there is no `benchmarks.jsonl` row. The `/dev/shm`
   outputs were deleted. Scripts: `.probe/r137/lockstep.py`, `run.sh`,
   `cmp.py`.
+
+## Round 139 (negative): a cross-rank U-Net forward server
+
+**Question.** Round 137 left one CPU batching design untried. Ranks keep their
+own processes for everything outside the forward, and one server batches
+their forwards. Does that beat production's one rank per CPU?
+
+**Run.** `.probe/r139/fserver.py` inside `r2d2.sif`, on the same 36 socket-0
+icelake CPUs as rounds 136-137 (the other half of the node was busy). The parent
+warms up like the pool and forks R ranks, each pinned to one CPU, plus one
+server pinned to S CPUs with S torch threads. A rank runs real requests one at
+a time (the 48 `.probe/mats`, production's 32x32 config, `prune: True`),
+skips `load_net`, and sends each forward's inputs to the server as numpy over a
+pipe. The server groups pending forwards by iteration (that is, by checkpoint),
+loads that checkpoint, and runs the largest group as one batch. A pair runs as
+two single forwards, because batch 2 is slower than batch 1. Each rank does
+one untimed request and then 6 timed ones. Order was mirrored, and both passes
+are shown.
+
+| arm | ranks | server CPUs | req/s, pass 1 / 2 | vs production | mean batch | server busy / span |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| production, forward in the rank | 36 | 0 | 38.1 / 38.6 | - | 1 | - |
+| server on 9 of its own CPUs | 27 | 9 | 18.1 / 18.6 | **-52%** | 6.3-6.6 | 100% |
+| server on 9 CPUs that ranks share | 36 | 9 | 17.3 / 17.9 | -54% | 9.4-9.6 | 100% |
+| server on 4 of its own CPUs | 32 | 4 | 11.5 / 11.3 | -70% | 7.5-7.9 | 100% |
+| server on 18 of its own CPUs | 18 | 18 | 17.9 / 18.5 | -53% | 3.7-3.8 | 100% |
+
+Accuracy: across 126-252 requests per arm, the final model images differ from
+production by at most 3.0e-6 of the peak, the same figure as round 137. A
+first version of the probe was off by up to 53% of the peak because it
+dropped `forward`'s `input_order` argument. From iteration 1 on, R2D2 passes
+`rec_res`, not the default `res_rec`, so any forward wrapper has to pass
+through every positional argument.
+
+**Learned.**
+- A request makes ~17.6 forwards. Production does ~670 forwards/s on 36
+  CPUs and runs the rest of each request on the same CPUs. In every arm the
+  server is busy for 100% of the run, so it sets the rate: ~290 forwards/s on
+  9 CPUs (32 per CPU-second at batch 6-10), 190 on 4 CPUs (48 at batch 8),
+  and 280 on 18 CPUs (16 at batch 3.7). Production's forwards cost about
+  0.65 x 36 / 670 = 1/29 CPU-s each, so a batching server is at best 1.6x more
+  efficient per CPU, and only when few CPUs serve many ranks.
+- The two needs conflict. Large batches need many ranks queued per checkpoint
+  on few server CPUs, but then the server cannot keep up with 32 ranks.
+  Giving the server more CPUs takes them from the ranks and shrinks the
+  batches (3.7 at 18+18), and batch-3 efficiency is no better than batch 1
+  (round 136). Several smaller servers would split the queue and shrink the
+  batches further. Even with perfect balance and no rank idle,
+  0.33 CPU-s of non-forward work plus 17.6/48 = 0.37 CPU-s of forwards gives
+  0.70 CPU-s per request against production's 0.94, a ceiling of +35% that no
+  arm came near.
+- CPU-side batching of the R2D2 U-Net is closed in all three forms: in a pool
+  (rounds 109 and 136), in lockstep inside a worker (137), and across ranks
+  (139). The remaining R2D2 lever is the GPU.
+- No search was run, so there is no `benchmarks.jsonl` row. The `/dev/shm`
+  outputs were deleted. Scripts: `.probe/r139/fserver.py`, `run.sh`, and the
+  results in `pass1.txt`.
