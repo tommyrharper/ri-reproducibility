@@ -423,6 +423,16 @@ touched, so an ordinary restart costs one `kill -0` each, and the line naming a
 pool it had to start again is teed into `run.log`. Re-launching is safe because
 the pools hold no run state.
 
+Two things kept that from landing on the cluster branch (round 101 of
+`docs/csd3-speed.md`). Each rank waited `NS_POOL_CONNECT_SECONDS` (300s, sized
+for 112 ranks warming up at once) for a worker that would never come, so a
+dead pool idled the whole job five minutes before the retry; a *reconnect*
+now gives up once `<rank>.pid` has named a dead process, unreplaced, for
+`NS_POOL_GONE_SECONDS` (30s) - a live pool's loop rewrites it the moment it
+spawns a worker. And `sidecar_restore` ran on the left of a pipe, so the pool
+it started never reached the launcher's `SIDECAR_PIDS`: it outlived the run,
+and a second retry would have started another beside it on the same FIFOs.
+
 ## Finding and resuming a run that stopped
 
 A run writes `summary.json` only once PolyChord returns, so a run directory

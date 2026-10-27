@@ -194,7 +194,7 @@ the containers replaced by processes:
   that dies, or exits because its rank's end of the FIFO closed, is started
   again by the shell loop around it; the R2D2 pool forks a replacement from
   its warm parent (`serve_pool`). The rank reconnects to the same FIFOs
-  (`_connect_shell_started_worker` in `common.py`, sixty seconds' grace). A
+  (`_connect_shell_started_worker` in `common.py`, `NS_POOL_CONNECT_SECONDS`' grace, 300s; 30s once the pool itself is gone). A
   rank kills a wedged worker itself: every worker writes `<rank>.pid` beside
   its FIFOs, Apptainer shares the host's pid namespace, and
   `FifoWorker.kill()` walks `/proc` for its children, since `polychord.sif`

@@ -4827,6 +4827,30 @@ Python 3.10 has no `tomllib`), and `EXTRA` still appends to it.
   8e-16. At 1 thread two runs are byte-identical (48 of 48). Identity
   checks of R2D2 changes must run at 1 thread, or compare to tolerance.
 
+## Round 98 (negative): one checkpoint copy per NUMA node, workers pinned
+
+**Tried.** The pool parent loaded one copy of the R2D2 checkpoints per NUMA
+node holding the job's CPUs (`set_mempolicy(MPOL_PREFERRED)` through ctypes
+syscall 238), and each worker was pinned to its node's CPUs.
+
+**Probe** (38 pinned copies of `probe_unet_forward.py` at once, this
+allocation's 32/6 split): weights node-local 51.4 ms per forward, interleaved
+59.4 ms, weights on node 0 57.5 ms, on node 1 102 ms (1.9x worst case).
+
+**Search** (synchronous 38 x 1, same draws, ABBA): per request 1116/1117 ms
+first touch against 1170/1188 ms per-node copies, **5-6% slower**. Rejected;
+pinning takes away the scheduler's choice of idle CPU, which is worth more
+than locality here.
+
+**Learned.**
+- `kernel.numa_balancing` is 0, so the parent's single load puts all
+  ~3.1 GB of weights on the node it ran on, and nothing moves them.
+- Upstream `set_common_args` caps torch threads at the affinity mask, so
+  pinning a worker silently caps its request threads too.
+- Synchronous 38 x 1 R2D2 searches with seed 4242 gave four different chain
+  md5s, even within one arm, though a 1-thread request is byte-identical.
+  Chain identity is not an R2D2 A/B gate until that is explained.
+
 ## Round 99: R2D2 checkpoint pages interleaved across the job's sockets
 
 **Why.** The R2D2 pool parent loads every checkpoint (~3.4 GB) once and
@@ -4874,3 +4898,79 @@ fits a parent that landed on the minority node.
 - Short 76-rank runs (300 dead, ~300 evaluations, ~4 per rank) measure
   only the cold first request (1.7-1.8 s); a whole-node R2D2 A/B needs
   ~20k evaluations (~7.5 minutes a run), so an `intr` hour fits ~6 runs.
+
+## Round 100 (negative): MKL-packed weights for the U-Net's 2x2 convs
+
+**Tried.** The U-Net's 2x2 convs as `_mkl_linear` with prepacked weights,
+round 86's isolated-conv winner, inside the real forward.
+
+| | solo forward | 38 copies, one socket | max abs diff |
+| --- | ---: | ---: | ---: |
+| stock | 28.2 ms | 58.8 ms | - |
+| MKL-packed | 29.5 ms | 65.4 ms | 4e-6 |
+
+**5% slower solo, 11% slower loaded.** Rejected. Round 86's win came from an
+isolated random-weight 1024->1024 conv that took 17.5 ms where the same conv
+inside the network takes ~3.5 ms: time conv levers inside the real network.
+
+**Also ruled out.**
+- Huge pages: THP `always` already backs 4,598 of 5,926 MB of the anonymous
+  memory of all 25 loaded checkpoints.
+- A 1-thread request (0.70 s warm, ~18 forwards) is conv2d 59%,
+  conv_transpose 7%, instance norm 5%, FINUFFT 5%, `gen_imaging_weights` 3%,
+  `.mat` load 1.8%, FITS writes 1.8%. No non-U-Net target is left; the
+  forward goes 28.2 -> 58.8 ms from solo to 38 copies (weight streaming), so
+  the only CPU lever left is cross-rank batching.
+- This allocation was all 38 CPUs of node 0 this time, not rounds 98-99's
+  32/6: record the allocation shape with any NUMA-sensitive result.
+
+## Round 101 (robustness): a lost worker pool costs 40s, not 5 minutes
+
+**Why.** `./ri self-check self-heal`, owed since round 92, had not run. Its
+host-side pass failed first: round 99 added `self_check_interleaved_pages`
+without classifying it in `scripts/test_self_checks.py` (CI's check), now
+listed as host-runnable (ctypes only). The fifth scenario, killing the
+WSClean pool's process group, then failed its 300s budget.
+
+**Found.** Timed alone (3 ranks, nlive 20), the pool died at 00:51:35 and
+the ranks gave up at 00:56:36: each reconnect waited the full
+`NS_POOL_CONNECT_SECONDS` (300s) for a worker no pool would start. The retry
+then finished in 7s. On a production node that is five idle minutes of every
+rank per lost pool. A second bug came with it: `sidecar_restore` ran on the
+left of `| tee`, in a subshell, so the pool it started never reached
+`SIDECAR_PIDS`. It outlived the run (the next search's leak check reaped
+it), and a second retry would have started a duplicate pool on the same
+FIFOs - for R2D2, another ~4 GB.
+
+**Changed.**
+- `_connect_shell_started_worker`: a reconnect (the rank has had a worker on
+  these FIFOs) gives up once `<rank>.pid` has named a dead, unreplaced
+  process for `NS_POOL_GONE_SECONDS` (30s), read once a second since the
+  file is on Lustre. A first connect keeps the full 300s for slow warm-ups.
+  `self_check_worker_pool_connect` covers it.
+- `run_with_retries` runs `sidecar_restore` in its own shell, its stderr
+  through a file and then into `run.log`. A process substitution was tried
+  first: the restored pool inherits its pipe (fd 63), which kept a `tee`
+  alive as long as the pool's FUSE daemons. The progress-bar self-check now
+  asserts the hook runs in the launcher's shell, and fails on the old pipe.
+
+| | pool killed -> run finished | `./ri self-check self-heal` |
+| --- | ---: | --- |
+| before | > 300s (ranks gave up at 301s) | FAIL at scenario five |
+| after | 39s, 41s | passed, 2 min 37 s and 3 min 0 s |
+
+No throughput change: evaluations never see this path, so there is no
+`benchmarks.jsonl` row (the self-heal runs sit outside
+`results/nested-sampling/` and were deleted).
+
+**Learned.**
+- `./ri self-check self-heal` is the only test of pool loss, and it was last
+  run before round 92; host-side CI checks had broken in round 99 unnoticed.
+  Run `python3.13 scripts/test_self_checks.py` (the host `python3` is 3.6)
+  after adding any `self_check_*`.
+- Apptainer's `squashfuse_ll` and `fuse-overlayfs` daemons are not in a
+  pool's process group, so every pool killed as a group leaves two to four
+  of them behind, reparented to init, until the job ends. 68 had piled up
+  from this round's runs alone. Harmless inside a Slurm job; worth knowing
+  when counting processes.
+

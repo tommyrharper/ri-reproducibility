@@ -149,8 +149,14 @@ run_with_retries() {
     if declare -F sidecar_reset_workers >/dev/null; then
       sidecar_reset_workers 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
     fi
+    # Not piped: a pipeline runs it in a subshell, and the pid of the pool it
+    # starts must reach this shell's SIDECAR_PIDS, or the exit trap leaves
+    # that pool running and the next retry starts a second one beside it. Nor
+    # a process substitution, whose pipe the new pool would hold open.
     if declare -F sidecar_restore >/dev/null; then
-      sidecar_restore 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
+      sidecar_restore 2>"${output_dir}/.restore.log" || true
+      tee -a "${output_dir}/run.log" <"${output_dir}/.restore.log" >&2 || true
+      rm -f "${output_dir}/.restore.log"
     fi
     attempt=$((attempt + 1))
     printf '%s exit %s after %s evaluations\n' \
@@ -1007,12 +1013,18 @@ self_check() {
   # not by this file, which keeps the retry loop runnable without apptainer.
   local hook_dir="${tmp}/hook"
   mkdir -p "${hook_dir}/chains"
-  sidecar_restore() { echo r >>"${hook_dir}/restores"; }
+  _restored_here=0
+  sidecar_restore() { echo r >>"${hook_dir}/restores"; _restored_here=$((_restored_here + 1)); }
   run_with_retries 2 "${hook_dir}" -1 2 -- sh -c "${progressing}" "${hook_dir}" \
     >/dev/null 2>&1 || true
   unset -f sidecar_restore
   [ "$(_ns_count_lines "${hook_dir}/restores")" = "2" ] || {
     echo "FAIL: sidecar_restore called $(_ns_count_lines "${hook_dir}/restores") times, want 2"
+    exit 1
+  }
+  # In this shell, not a subshell: the real hook records the pool it starts.
+  [ "${_restored_here}" = "2" ] || {
+    echo "FAIL: sidecar_restore ran in a subshell; the pools it starts would leak"
     exit 1
   }
 

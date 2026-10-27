@@ -2728,6 +2728,25 @@ POOL_CONNECT_SECONDS = float(os.environ.get("NS_POOL_CONNECT_SECONDS", "300"))
 # Added to a newly connected worker's first reply bound, for the same reason:
 # the bounds below are sized for a warm worker on a quiet node.
 WORKER_FIRST_REPLY_SLACK = float(os.environ.get("NS_WORKER_FIRST_REPLY_SLACK", "120"))
+# A reconnect - this rank has had a worker on these FIFOs - gives up this soon
+# once the pid file names a dead worker nothing has replaced. A live pool's
+# loop rewrites it the moment it spawns one, so only a pool that is gone (its
+# process group killed) leaves it dead. Without this a dead pool cost each
+# rank the whole POOL_CONNECT_SECONDS before the retry that restores it.
+POOL_GONE_SECONDS = float(os.environ.get("NS_POOL_GONE_SECONDS", "30"))
+_CONNECTED_BASES: set[str] = set()
+
+
+def _pid_file_dead(base: Path) -> str | None:
+    """The pid file's contents if they name a process that is gone, else None."""
+    try:
+        text = Path(f"{base}.pid").read_text()
+        os.kill(int(text), 0)
+    except ProcessLookupError:
+        return text
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
@@ -2736,16 +2755,28 @@ def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
     if not fifo_dir:
         return None
     base = Path(fifo_dir) / str(mpi_rank())
+    reconnect = str(base) in _CONNECTED_BASES
     # Nonblocking open returns ENXIO until the worker opens its end.
     deadline = time.monotonic() + POOL_CONNECT_SECONDS
+    # The pid file is on Lustre, so it is read once a second, not per poll.
+    next_pid_check, dead_pid, dead_since = 0.0, None, 0.0
     while True:
         try:
             write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
         except OSError:
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 return None
+            if reconnect and now >= next_pid_check:
+                next_pid_check = now + 1.0
+                dead = _pid_file_dead(base)
+                if dead is None or dead != dead_pid:
+                    dead_pid, dead_since = dead, now
+                elif now - dead_since > POOL_GONE_SECONDS:
+                    return None
             time.sleep(0.002)
             continue
+        _CONNECTED_BASES.add(str(base))
         os.set_blocking(write_fd, True)
         if _PINNED_CPU is not None:
             # The pool loop writes the pid at spawn, before the worker's warm-up
@@ -3107,6 +3138,7 @@ def self_check_worker_timeout() -> None:
 
 
 def self_check_worker_pool_connect() -> None:
+    global POOL_GONE_SECONDS
     import subprocess
     import tempfile
 
@@ -3157,6 +3189,20 @@ def self_check_worker_pool_connect() -> None:
                         pass
                     assert time.monotonic() < deadline, "the worker's child survived kill()"
                     time.sleep(0.02)
+            # The pool gone with it: a reconnect gives up once the dead pid has
+            # gone unreplaced for POOL_GONE_SECONDS, not POOL_CONNECT_SECONDS.
+            for worker in workers:
+                worker.terminate()
+            for fd in ends:
+                os.close(fd)
+            ends = []
+            saved_gone, POOL_GONE_SECONDS = POOL_GONE_SECONDS, 0.5
+            try:
+                started = time.monotonic()
+                assert _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR") is None
+                assert time.monotonic() - started < 10, time.monotonic() - started
+            finally:
+                POOL_GONE_SECONDS = saved_gone
             # No pool at all is a WorkerDied, not a rank-started fallback.
             _SIMULATE_WORKERS.pop("meqtrees-self-check", None)
             del os.environ["NS_SIMULATE_FIFO_DIR"]
