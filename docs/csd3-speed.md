@@ -5479,4 +5479,45 @@ flush 1.3 s, prune 8.2 s, `summary.json` 4.5 s and packing 18.4 s.
   of 225k.
 - `./ri health` on this live run (~20k flat records, running on the job's
   node) did not answer within 120 s from this loop's node, so it was
-  killed. It was not looked into further.
+  killed. Round 116 found the cause (serial record reads) and fixed it.
+
+## Round 116: `./ri health` reads records on a thread pool
+
+**Question.** In round 115, `./ri health` on the live production run
+(~20k flat records) did not answer within 120 s. Why?
+
+**Cause.** `evaluation_scan` in `scripts/nested-sampling-health.py` did
+a stat, a read and a `meqserver-wedged.log` probe for each evaluation,
+one at a time. Each of those is a Lustre round trip. Round 8 found the
+same problem in `common.py`'s record readers and fixed it with a
+32-thread pool (`RECORD_READ_THREADS`); health never got that fix.
+
+**Change.** The per-record work (stat and read of the flat record or
+`metrics.json`, plus the wedge-log probe for evaluations that kept a
+dir) now runs on a fixed 32-thread pool. The pool size is not taken from
+the core count, because login nodes have few CPUs to share, and these
+threads only wait on IO. Records are sorted afterwards, as before, so
+the order the pool returns them in does not matter.
+
+**Measured** on this loop's icelake node, against two baseline WSClean
+runs of similar size that had not been read for days (legacy layout:
+`eval-*/metrics.json`, so the costliest path):
+
+| | records | `evaluation_scan` | per record |
+|---|---:|---:|---:|
+| old (serial), `wsclean-vlaa-20261025T015503Z` | 11,249 | 382.2 s | 34 ms |
+| new (32 threads), `wsclean-vlaa-20261025T015300Z` | 10,010 | **8.9 s** | 0.89 ms |
+
+Old and new code return the same report for the same run (checked on
+`015503Z` and on a 1,102-evaluation R2D2 run). The one exception is
+`last_activity_seconds`, which is `now - last` and so changes between
+any two calls. The health self-check passes.
+
+**Learned.**
+- Every per-evaluation reader of a run directory needs the threaded
+  pattern, not only the ones on the search's own path. At ~34 ms a cold
+  record, health took ~11 minutes on round 115's 20k-record run and
+  would take ~40 minutes on a 71k run. Now those take ~18 s and ~65 s.
+- This is tooling, not search speed. It is logged here because health is
+  how a live CSD3 run gets read (docs/run-health.md), and it stopped
+  answering at production scale.

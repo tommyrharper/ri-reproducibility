@@ -14,6 +14,7 @@ import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
 
@@ -351,6 +352,10 @@ class Evaluation(NamedTuple):
     peak_memory_bytes: float | None
 
 
+# Lustre reads are latency-bound, not CPU-bound: a fixed pool, never sized
+# from the core count (login nodes have a few CPUs to share).
+RECORD_READ_THREADS = 32
+
 ENDED_EPOCH_PATTERN = re.compile(r'"ended_epoch":\s*([0-9.eE+-]+)')
 
 
@@ -374,7 +379,6 @@ def packed_records(evaluations: Path) -> dict[str, tuple[float, str]]:
 def evaluation_scan(run_dir: Path, procs: int = 0,
                     checkpoint: float | None = None) -> dict[str, object]:
     evaluations = run_dir / "evaluations"
-    directories = 0
     records: list[Evaluation] = []
     wedged_lines = 0
     # A record is eval-*.json beside the dir of what the evaluation keeps
@@ -390,10 +394,11 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # Records packed into records.jsonl (round 93) by a finish or a resume:
     # a `name<TAB>record` line each, timed by the record's own end.
     packed = packed_records(evaluations)
-    for name in flat | dirs | packed.keys():
+
+    def _read(name: str) -> tuple[Evaluation | None, int]:
         entry = evaluations / name
         metrics = evaluations / f"{name}.json" if name in flat else entry / "metrics.json"
-        directories += 1
+        record = None
         try:
             if name in packed and name not in flat:
                 when, text = packed[name]
@@ -404,16 +409,27 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
         else:
             cost = WALL_SECONDS_PATTERN.search(text)
             peak = PEAK_MEMORY_PATTERN.search(text)
-            records.append(Evaluation(
+            record = Evaluation(
                 when, FAILURE_OBJECTIVE_MARKER in text, entry,
                 float(cost.group(1)) if cost else None,
-                float(peak.group(1)) if peak else None))
+                float(peak.group(1)) if peak else None)
         if name not in dirs:
-            continue
+            return record, 0
         try:
-            wedged_lines += len((entry / "meqserver-wedged.log").read_text().splitlines())
+            return record, len((entry / "meqserver-wedged.log").read_text().splitlines())
         except OSError:
-            pass
+            return record, 0
+
+    # Threaded like common.py's record reader: serially, a cold Lustre
+    # record cost ~34ms here, so a 20k-record live run took minutes to
+    # report; 32 threads bring it under 1ms a record (round 116).
+    names = flat | dirs | packed.keys()
+    directories = len(names)
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        for record, wedged in pool.map(_read, names):
+            if record is not None:
+                records.append(record)
+            wedged_lines += wedged
     records.sort()
     times = [r.when for r in records]
     failed = sum(1 for r in records if r.failed)
