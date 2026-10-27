@@ -385,7 +385,9 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   round 111), so for half a node set `NS_SLURM_SOCKETS=2`: the job asks
   for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice the
   shared memory (it may queue longer, ~30 minutes against ~3 in round 110,
-  though round 113's started at once).
+  though round 113's started at once). It is for R2D2 only: 56-rank
+  WSClean ran the same either way (round 114), so a WSClean job need not wait
+  for it.
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
   whole toolchain, and a job purges the rest (above). `uv` is still needed for
   the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,

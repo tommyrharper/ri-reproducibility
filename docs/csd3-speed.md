@@ -5386,3 +5386,42 @@ fallback, not production.
   `--mem` request covered both checkpoint copies, and auto engaged.
 - MeqTrees simulate has no lever left above ~1% of a WSClean evaluation.
   The remaining WSClean time is the binary (ducc0, rounds 83-88).
+
+## Round 114 (diagnostic): socket placement does not matter for WSClean
+
+Rounds 110-111 found R2D2 on half a sapphire node 18-37% faster split
+28/28 across sockets than on one, because the U-Net is bound on memory
+bandwidth. This round asked whether WSClean is too, which would make
+`NS_SLURM_SOCKETS=2` worth setting for sized WSClean jobs. Same method as
+round 111: one exclusive sapphire node (cpu-r-6, other 56 CPUs idle),
+async 56-rank `./ri search wsclean --nlive 200 --num-repeats 5 --seed 4242`
+pinned by `taskset` to one socket (S, 0/56) or both (P, 28/28), on the
+patched SIF cache (0001-0017), commit d2c6035, after a discarded warm-up.
+Rows `r114-*`; arms converge by themselves at ~21k evaluations (~50 s), so
+`--max-ndead` above ~3000 changes nothing.
+
+| job | order | S evals/s | P evals/s |
+| --- | --- | --- | --- |
+| 39292656 | S P P S | 476, 564 | 517, 532 |
+| 39292822 | S P P S S P P S | 426, 463, 439, 407 | 439, 445, 426, 489 |
+| mean of 6 | | 462 | 475 (+2.6%) |
+
+All 13 log(Z)s lie in 0.0962-0.0972 (± 0.0004-0.0010) and agree. Per
+evaluation, simulate and the WSClean binary moved together in every arm
+(e.g. 22.0 / 69.8 ms in the fastest arm, 28.2 / 98.5 ms in the slowest),
+so the spread is node-wide drift, not placement.
+
+**Learned.**
+- WSClean has no socket effect worth a longer queue: +2.6% against an
+  arm-to-arm spread of ~±10% (ABBA pair means: S 445 / P 442, then S 423 /
+  P 457). `NS_SLURM_SOCKETS=2` stays R2D2-only advice.
+- 56 WSClean ranks on half a sapphire node now run ~400-560 evals/s
+  (93-130 ms an evaluation), against round 84's 307 for 54 ranks before
+  patches 0007-0017 and rounds 90-95.
+- Even on an exclusive node, 50-second WSClean arms drift by ±10% from one
+  to the next (the first job climbed 476 -> 564 over five arms). Below
+  ~10%, a WSClean A/B on a node needs many interleaved arms or a direct
+  stage timing, as AGENTS.md already says for the 20-CPU host.
+- Reusing an `--output-dir` that holds a finished run resumes it and
+  records a bogus row (here 69,607 evals/s in 0.3 s); that row was dropped
+  from `benchmarks.jsonl`. Give every arm of a resubmitted job a new label.
