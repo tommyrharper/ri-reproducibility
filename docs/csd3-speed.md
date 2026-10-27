@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 157).**
+**Where it stands (round 158).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -29,12 +29,14 @@ the Hetzner host.
   it matches torch's log(Z) within 0.25 sigma and its posterior, at +44%
   evals/s. `R2D2_RUNTIME=torch` brings torch back; GPU runs and runs
   started before round 141 keep it ([round 145](#round-145-r2d2_runtimeonnx-is-the-cpu-default)).
-  In a search, ORT is 68% of worker CPU and the visibility-sized data
+  In a search, ORT was 68% of worker CPU and the visibility-sized data
   prep (torch element-wise ops, FINUFFT) ~25% ([round 146](#round-146-diagnostic-where-an-onnx-default-r2d2-workers-cpu-goes)).
   Briggs weights by `np.bincount` (round 148) cut 26 to 10 ms of that,
   byte-identical, ~1.5% end to end. A request's four FITS writes and its
   config parse skip astropy and PyYAML (round 151, byte-identical, ~6 ms).
   Both NUFFTs skip FINUFFT's bin sort (round 153, ~6 ms a request under load).
+  After those, ORT is 78% of worker CPU and nothing outside it is above 4%
+  (FINUFFT 8% in all), so that side is closed ([round 158](#round-158-diagnostic-an-r2d2-workers-cpu-after-rounds-148-153)).
   On balanced multi-socket jobs the ORT sessions are built once per
   socket like the torch copies: a whole icelake node went from 59.2 to
   **80.5 evals/s (+36%)** ([round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36));
@@ -7417,3 +7419,56 @@ would add.
 24.7 ms when they share the parent's. Keep the build-in-parent design, and
 probe the forward with staggered checkpoints, not all on N1. Not a search,
 so no `benchmarks.jsonl` rows.
+
+## Round 158 (diagnostic): an R2D2 worker's CPU after rounds 148-153
+
+**Question.** Round 146 put ~25% of worker CPU outside ONNX Runtime and
+named it the next R2D2 lever. Rounds 148, 151 and 153 then cut the
+imaging weights, the FITS/config I/O and FINUFFT's bin sort. How much is
+left outside ORT, and is any single piece worth a round?
+
+**Method.** Round 146's perf probe, unchanged apart from sampling 8 random
+pool workers (`.probe/r158/perf.sh`): one default search (38 x 1, onnx,
+nlive 100, 5 repeats, 400 dead, seed 4242, half icelake node), then
+`perf record -F 499 -g` for 20 s mid-run. The libraries were copied out of
+`r2d2.sif` for `--symfs`. Row `r158-perf`: **46.4 evals/s**, against
+44.8 for round 146's identical probe (`r146-perf`), +3.5%, about what
+rounds 148-153 claimed together.
+
+| library | round 146 | round 158 |
+| --- | ---: | ---: |
+| ONNX Runtime (the U-Net) | 67.8% | **78.4%** |
+| libfinufft | 12.2% | 8.2% |
+| libtorch_cpu | 12.5% | 4.8% |
+| numpy | | 3.5% |
+| libc, libpython | 6.7% (with numpy) | 4.5% |
+
+Nothing outside ORT is above 4% of worker CPU now. The largest items:
+
+| symbol | share |
+| --- | ---: |
+| FINUFFT width-10 spread (the eps 1e-9 normal kernel) | 3.9% |
+| FINUFFT width-7 spread (the eps 1e-6 dirty adjoint) | 2.5% |
+| FINUFFT `spreadSorted` (adding subproblems into the grid) | 1.5% |
+| torch complex128 `mul` | 1.5% |
+| every other torch or numpy kernel | 0.4% or less each |
+
+Solo, under `scripts/probe_r2d2_request.py` (48 warm requests, 1 thread,
+`.probe/r158/solo.sh`), a request is 375 ms, 320 ms of it ORT. What is
+left is FINUFFT execute at 29 ms, data load at 8 ms, weights at 5.6 ms,
+the normal kernel's plan creation at 1.6 ms (`nufft2d1` plans each call;
+caching it saves at most ~0.4%), and a few ms of config and operator
+setup.
+
+**Learned.** The ~25% outside ORT that round 146 named is now ~22% of
+worker CPU, spread over a dozen kernels. Removing *all* of FINUFFT would
+be worth 8%. Narrowing the normal kernel's width from 10 to 8 (eps 1e-7)
+would save about 1.4%, well under what an end-to-end A/B can see, and it
+gives up round 10's headroom. Merging the two type-1 NUFFTs into one
+`ntransf=2` plan on the 2N grid would change the dirty image (eps 1e-9 instead of
+1e-6), and FINUFFT spreads each transform separately anyway. So the
+per-request Python and visibility-side work on R2D2's CPU path is closed.
+R2D2's CPU speed is now the U-Net's forward under load (78%), and rounds
+86-157 have already closed every runtime, kernel, threading, page and
+batching option for that.
+Run directory deleted. Probe scripts in `.probe/r158/`.
