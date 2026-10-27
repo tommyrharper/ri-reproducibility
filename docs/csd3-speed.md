@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 145).**
+**Where it stands (round 146).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -29,6 +29,8 @@ the Hetzner host.
   it matches torch's log(Z) within 0.25 sigma and its posterior, at +44%
   evals/s. `R2D2_RUNTIME=torch` brings torch back; GPU runs and runs
   started before round 141 keep it ([round 145](#round-145-r2d2_runtimeonnx-is-the-cpu-default)).
+  In a search, ORT is 68% of worker CPU and the visibility-sized data
+  prep (torch element-wise ops, FINUFFT) ~25% ([round 146](#round-146-diagnostic-where-an-onnx-default-r2d2-workers-cpu-goes)).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -6775,3 +6777,72 @@ already installed here.
 Rows: `r145-{A1,B1,A2,B2}`, plus two warm-up-dominated 150-dead smoke rows
 `r145-default` and `r145-final`, in `benchmarks.jsonl`. Run directories
 deleted.
+
+## Round 146 (diagnostic): where an onnx-default R2D2 worker's CPU goes
+
+**Question.** With onnx the default (round 145), a request at 38 x 1 is
+~780 ms, but solo it is ~400 ms and its forwards ~25 ms each in the pool's
+shape. What fills the rest, and is any of it a lever?
+
+**Whole job.** One default search (38 x 1, nlive 100, 5 repeats, 400 dead,
+seed 4242, 43.7 evals/s, row `r146-base`), with every process of this
+user sampled from `/proc/<pid>/stat` over 40 s mid-run
+(`.probe/r146/cpu.py`): 37.3 of 38 CPUs busy. The R2D2 pool workers took
+**92%** of them, MeqTrees simulate servers 4.5% and the PolyChord ranks
+3.2%. The node is saturated, and the worker is the whole cost.
+
+**Inside the workers.** `perf record -F 499 -g` on 8 workers for 20 s
+of a second search (row `r146-perf`, 44.8 evals/s, so perf cost nothing
+visible). Symbols came from libraries copied out of `r2d2.sif` and
+passed as `--symfs`:
+
+| library | share of worker CPU | what it is |
+| --- | ---: | --- |
+| ONNX Runtime | 67.8% | the U-Net forwards |
+| libtorch_cpu | 12.5% | element-wise data prep over the visibilities: complex `mul`, `nonzero`/`index`/`index_put`, `div`, `reciprocal`, `lt` (imaging weights, data load) |
+| libfinufft | 12.2% | width-10 spread (the eps 1e-9 normal kernel, 4.5%), width-7 spread (the eps 1e-6 dirty adjoint, 2.7%), `spreadSorted` 3.5%, `indexSort` 1.4% |
+| libpython, libc, numpy | 6.7% | |
+
+Solo, under cProfile (`scripts/probe_r2d2_request.py`, 48 `.mat` files
+in `/dev/shm`, 1 thread), FINUFFT is 28 ms of a 404 ms request (7%), so
+the visibility-sized work inflates under load about as much as the U-Net
+does (12% of worker CPU in the search). Everything outside ORT is ~25%
+of worker CPU together.
+
+**Inside a forward.** ORT's own profiler, solo, 100 forwards of N1
+(`.probe/r146/prof.py`, `prof2.py`): Conv 86.7%, ConvTranspose 6.7%,
+InstanceNorm 2.7%, NCHWc reorders 2.4%. The three convs at the U-Net's
+bottom (2x2 and 4x4 spatial, 1024 channels) hold 76 MB of the network's
+124 MB of weights and take 41% of the forward: 37.7 MB in 3.26 ms is
+~11.6 GB/s, a single core's DRAM stream. The forward is weight-bandwidth
+bound, which is why it slows under 36 neighbours and why only fewer
+weight bytes (quantisation: a different network, so out of scope for a
+search of R2D2's failure modes) or more requests per weight read
+(rounds 109, 136-139, all rejected) would move it.
+
+**Null: ORT session options.** In the pool's shape (36 forked children
+sharing one parent's session, `.probe/r146/fork.py`, two passes): default
+24.64/24.69 ms a forward, h and w fixed at 32 with
+`add_free_dimension_override_by_name` 24.79/24.85, `set_denormal_as_zero`
+24.73/24.81, both 24.72/24.79, `enable_mem_pattern=False` 24.92/24.83.
+All bit-identical, none faster. Not kept.
+
+**Rejected: the normal kernel at eps 1e-6.** It is the largest single
+FINUFFT call (width 10). At 1e-6 (width 7) the kernel NUFFT drops from
+19.9 to 14.9 ms solo, and the request from 403.7/403.6 to 399.8/399.1 ms
+(ABAB, 47 warm requests each): -1.1%. Even if contention doubled that, it
+would be under the ~5% an end-to-end A/B can see, and it gives up the
+1e-9 headroom round 10 chose. Not kept.
+
+**Learned.**
+- `perf` works on this node for your own processes
+  (`perf_event_paranoid` 2) and adds nothing visible to a search, but
+  libraries inside a SIF need copying out and passing as `--symfs`.
+- The next R2D2 CPU lever, if any, is the ~25% outside ORT: per-request
+  visibility work (imaging weights, data load, the two FINUFFT spreads,
+  point sorting twice over the same points). It needs a per-function
+  split under load, since solo cProfile shows it at about half its
+  in-search share.
+
+Rows: `r146-base`, `r146-perf` in `benchmarks.jsonl` (both the shipped
+default, no change). Run directories deleted.
