@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 167; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 168; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -52,6 +52,9 @@ the Hetzner host.
   card: today's tree runs 43.1 evals/s against round 146's 43.4, so a
   1-GPU search is bound by the card, not its 32 cores ([round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146)).
   2-GPU jobs never start on SL3 (round 163): scale out with 1-GPU searches.
+  Open: TensorRT's fp32 engine puts **+62% forwards/s** through the card
+  at 19 MPS copies, 1e-5 off the CPU path, so a 1-GPU search should gain
+  ~30%; it is not wired into the pool yet ([round 168](#round-168-positive-probe-tensorrt-for-the-gpu-u-net-62-forwards-on-one-a100-under-mps)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -7787,3 +7790,63 @@ session unbound. That was fixed between passes, so G has no solo time.)
   1.33x ceiling) as the only GPU options.
 - No search ran, so there are no `benchmarks.jsonl` rows. The job output is
   `.probe/r167/job-39376600.out`.
+
+## Round 168 (positive probe): TensorRT for the GPU U-Net, +62% forwards on one A100 under MPS
+
+**Question.** Round 167 left TensorRT as the last single-forward engine. A GPU
+search is bound by the card (round 165), so only a lever that cuts the
+card's kernel time counts. Does TensorRT's fp32 engine put more forwards
+through one A100 under 19 MPS copies than torch eager does?
+
+**Probe.** `onnxruntime-gpu` 1.23.2's TensorRT EP needs `libnvinfer.so.10`
+and `libnvonnxparser.so.10`. `tensorrt-cu12-libs` 10.13.3 supplies both
+(2.8 GB without the Windows builder resource; carried as one file,
+`agent-node/trt-py.tar`, beside round 167's `ortgpu-py.tar`).
+`scripts/probe_ort_cuda.py` gained `EP=trt`. It preloads the TensorRT
+libraries from `TRT_LIBS`, puts the TensorRT EP in front of the CUDA EP with
+fp16 off and an engine cache, and asserts that the session really got the
+EP, because ORT otherwise falls back to the CPU without raising.
+`NVIDIA_TF32_OVERRIDE=0` keeps the builder off TF32 (TensorRT logs
+"Disabling TF32"). The engine is built once solo, in about 10 s, and the 19
+copies load it from the cache. One ampere job (`.probe/r168/job.sh`, job
+39379761, gpu-q-1, A100-SXM4-80GB, MPS on, batch 1, 32x32, the same
+`N1.onnx` and seeded input as round 167) ran each arm solo, then 19 copies
+in E T3 T5 T3G T3G T5 T3 E order, twice:
+
+| arm | solo ms a forward | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs CPU ORT |
+| --- | ---: | --- | ---: | ---: |
+| E torch eager (production) | 2.69 | 1,768 / 1,764 / 1,770 / 1,766 | - | (torch) |
+| T3 TensorRT EP, builder optimisation level 3 | 1.57 | 2,860 / 2,850 / 2,844 / 2,836 | **+61%** | 1.0e-5 |
+| T5 as T3, optimisation level 5 | 1.57 | 2,857 / 2,852 / 2,875 / 2,842 | +62% | 8.9e-6 |
+| T3G as T3, plus the EP's CUDA graph | 1.46 | 2,867 / 2,866 / 2,858 / 2,850 | +62% | 1.0e-5 |
+
+**Learned.**
+- TensorRT is the first GPU lever since MPS (round 119) that moves the card
+  bound: +61-62% forwards/s at 19 copies in every run. It is 42% faster
+  solo too. Unlike ORT's CUDA EP and Inductor, it does not end on the same
+  cuDNN kernels. It fuses the U-Net's conv, norm and activation layers and
+  picks its own fp32 tactics, so the card does less work per forward.
+- The builder's optimisation level (3 against 5) and the EP's CUDA graph
+  make no difference under load. Level 3, the default, with no graph is
+  enough.
+- Accuracy: with TF32 off, the output is 1e-5 (relative to the peak) from
+  the CPU ORT path. That is the same order as round 140's ORT-against-torch
+  gap (1.5e-5), which round 144 showed leaves log(Z) and the posterior
+  unchanged. GPU searches are already not bit-reproducible (round 165), so
+  an end-to-end check must judge log(Z) within sigma.
+- **Not yet shipped. Expect about +30% end to end, not +62%.** A request
+  walks N1..N25, so round 165's 43.4 evals/s is ~1,085 forwards/s. That
+  is ~61% of the card's 1,774 eager forwards/s; the rest of the card's
+  time is the request's data prep. Cutting the forward by 1.62x gives
+  1/(0.39 + 0.61/1.62), ~1.3x evals/s for a 1-GPU search. Integration has
+  one obstacle. The pool process imports CUDA 13 torch for data prep, and
+  `onnxruntime-gpu` is a CUDA 12 build, and both load a `libcudnn.so.9`.
+  The cleaner route is TensorRT's own Python API from `tensorrt-cu13`,
+  which matches the image's CUDA and runs the engine on torch's device
+  buffers. Its engine can be built from the same `N1.onnx` with TensorRT's
+  ONNX parser and installed into `$RI_WORK_DIR/.cache/ri` the way
+  `R2D2_RUNTIME=onnx` installs onnxruntime, with no SIF rebuild. Then a
+  raced 1-GPU search A/B (warm-up arm first, log(Z) within sigma) decides
+  it.
+- No search ran, so there are no `benchmarks.jsonl` rows. The job output is
+  `.probe/r168/job-39379761.out`.

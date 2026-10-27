@@ -165,6 +165,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (null) GPU search, round-146 tree vs today's, 1 x A100 (job 39371931); 2-GPU jobs never start on SL3, every 1-GPU job did | - | B 43.4, N 43.1 evals/s x3 interleaved; card at 99-100%, ~2 of 32 cores busy: card-bound, no regression; log(Z) within 0.6 sigma ([rounds 163](csd3-speed.md), [165](csd3-speed.md)) |
 | (rejected) `torch.compile` (default and max-autotune-no-cudagraphs) for the GPU U-Net | - | 1 x A100, MPS, 19 copies x4: eager 1,772 forwards/s, compiled 1,060-1,068 (-40%); 183 kernels a forward against 142, 7e-6 off eager ([round 166](csd3-speed.md)) |
 | (rejected) ONNX Runtime's CUDA EP (onnxruntime-gpu 1.23.2, CUDA 12 wheels in the CUDA 13 SIF) for the GPU U-Net | - | 1 x A100, MPS, 19 copies x4: torch eager 1,774 forwards/s, ORT 1,740 (-2%), with its CUDA graph 1,723, heuristic conv search 1,720; 15% faster solo; 7e-6 off the CPU path ([round 167](csd3-speed.md)) |
+| (probe, not shipped) TensorRT EP (tensorrt-cu12-libs 10.13, fp32, TF32 off) for the GPU U-Net | - | 1 x A100, MPS, 19 copies: eager 1,764-1,770 forwards/s, TensorRT 2,836-2,875 (+61-62%) in all runs; 1.57 against 2.69 ms solo; opt level 5 and CUDA graph add nothing; 1e-5 off the CPU path; ~+30% expected end to end ([round 168](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
