@@ -60,7 +60,7 @@ evaluations/s for 10.5 hours is ~265k evaluations and ~560k files, against
 | setting | was | now | measured |
 | --- | ---: | ---: | --- |
 | `NS_R2D2_MAX_RANKS` (CPU) | 8 | 56, then 112 | sapphire, 112 cores: 8 ranks 2.9 evals/s, 16 5.6, 32 9.4, 56 12.0; raised to 112 after the speed rounds (`csd3-speed.md` round 105: 112 x 1 83 against 56 x 2 66 evals/s) |
-| `NS_R2D2_CUDA_MAX_RANKS` (GPU) | 8 | 16 | one A100: 8 ranks 2.5 evals/s, 16 4.6; 24+ exceed the card's memory |
+| `NS_R2D2_CUDA_MAX_RANKS` (GPU) | 8 | 16, then 19 | one A100: 8 ranks 2.5 evals/s, 16 4.6; 24+ exceed the card's memory; raised to 19 (the card's limit) after MPS and blocking sync (`csd3-speed.md` round 124: 19 ranks 43.9 against 16 41.1 evals/s) |
 
 Both were measured on a 20-thread rig where 8 ranks saturated the cores. The
 CPU figure was still rising at 56, so it is the best measured rather than a

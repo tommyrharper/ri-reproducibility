@@ -5785,4 +5785,44 @@ most 19 ranks) and ran nothing.
   the freed CPU; the simulate stage is the measure.
 - With CPU freed, more than 16 ranks per card may now pay, but a 24-rank
   arm needs either a smaller `NS_R2D2_CUDA_MB_PER_RANK` (it fits ~19) or
-  round 120's shared weights. 18 ranks is the next A/B.
+  round 120's shared weights. 18 ranks is the next A/B (round 124 ran 19: +7%).
+
+## Round 124: 19 GPU ranks per A100, not 16
+
+**Change.** Round 123's blocking sync freed the CPU that waiting workers
+used to spin on, so more ranks per card might now pay. `NS_R2D2_CUDA_MAX_RANKS`
+(the default rank cap for `--device cuda`) goes from 16 to 19, which is all
+an 80GB card holds under `NS_R2D2_CUDA_MB_PER_RANK` (4096 MB, 95% of the
+card), so the memory clamp and the cap now agree on an A100.
+
+**A/B.** One ampere job (`.probe/r124/job.sh`, job 39298805, `gpu-q-21`, the
+same node as round 123, A100-SXM4-80GB, 32 cores, MPS and blocking sync on):
+`./ri search r2d2 --device cuda --mpi-procs {16,19} --nlive 48 --num-repeats 5
+--max-ndead 150 --seed 4242`, a warm-up and then 16/19 alternating three times.
+
+| arm | ranks | evals/s | ms an evaluation | R2D2 request, ms | simulate, ms | peak GPU memory | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| warm | 16 | 41.7 | 342 | 302 | 39 | 58.5 GB | 0.01692 +/- 0.00228 |
+| A1 | 16 | 40.8 | 351 | 309 | 42 | 58.5 GB | 0.01506 +/- 0.00284 |
+| C1 | 19 | 41.9 | 409 | 361 | 46 | 67.9 GB | 0.01677 +/- 0.00231 |
+| A2 | 16 | 41.3 | 349 | 312 | 36 | 58.5 GB | 0.01509 +/- 0.00319 |
+| C2 | 19 | 46.5 | 368 | 327 | 40 | 67.9 GB | 0.01292 +/- 0.00352 |
+| A3 | 16 | 41.1 | 348 | 312 | 36 | 58.5 GB | 0.01483 +/- 0.00329 |
+| C3 | 19 | 43.4 | 394 | 354 | 39 | 67.9 GB | 0.01682 +/- 0.00213 |
+
+**Learned.**
+- 19 ranks are **+7%**: a mean of 43.9 against 41.1 evals/s, and every
+  19-rank arm beats every 16-rank arm (pairs +2.7%, +12.6%, +5.5%). The
+  16-rank arms are tight (40.8-41.3), the 19-rank ones spread (41.9-46.5),
+  so the gain is real but its size is uncertain to a few percent.
+- Each evaluation is slower at 19 (~390 against ~349 ms; R2D2 request ~347
+  against ~311 ms), so the card and the 32 cores are close to saturated and
+  the throughput gain comes from three more requests in flight. Past 19 needs
+  less GPU memory per rank (round 120's shared weights), and round 120 showed
+  32 ranks lose to 16 on the 32-core cap, so 19 is near the top for one GPU.
+- Peak GPU memory is 3.57 GB a rank (67.9 GB at 19), inside the 4096 MB cap.
+- log(Z): every arm agrees within 1 sigma. These async runs stop at 150 dead
+  points and their chains differ run to run, and C2's 0.01292 +/- 0.00352 is
+  the lowest at 0.6 sigma from the 19-rank mean. Same-rank arms only, per
+  round 121.
+- Unlike rounds 120 and 123, the warm-up arm was not cold (41.7).

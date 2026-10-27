@@ -327,6 +327,8 @@ went from ~16 to ~41 evals/s. `NS_CUDA_MPS=0` turns it off
 (`docs/csd3-speed.md`, rounds 117 and 119). A worker waits for the card on a
 blocking CUDA event, not by spinning in the copy back, so its CPU goes to the
 other ranks while it waits (+6%; `R2D2_CUDA_BLOCKING_SYNC=0` spins, round 123).
+That freed CPU is why the default is 19 ranks a card, the most its memory
+holds (`NS_R2D2_CUDA_MAX_RANKS`; 43.9 against 41.1 evals/s at 16, round 124).
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:

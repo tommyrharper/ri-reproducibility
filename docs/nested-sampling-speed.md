@@ -135,6 +135,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (rejected) One GPU copy of R2D2's weights shared with the workers over CUDA IPC | - | GPU memory at 16 ranks 58.5 -> 14.7 GB, but 16 ranks no faster (40.6 -> 41.7 evals/s, noise) and 32 ranks slower (38.8): the 32 cores per A100 are the cap, not GPU memory ([round 120](csd3-speed.md)) |
 | (diagnostic) The R2D2 U-Net forward replayed from a captured CUDA graph | - | Bit-identical to eager; solo 3.06 -> 1.29 ms a forward (2.4x), but under MPS the 16- and 24-copy plateau stays at ~1,680 forwards/s (1,679/1,689 at 16), so the plateau is GPU work, not launch overhead; without MPS 593 -> 705 at 16 copies. Not shipped: worth an end-to-end A/B only below the plateau ([round 122](csd3-speed.md)) |
 | GPU R2D2 workers wait for the U-Net on a blocking CUDA event instead of spin-waiting in the copy back (`R2D2_CUDA_BLOCKING_SYNC`, default on) | `r2d2_serve.py` `patch_cuda_network()` | 16 ranks on one A100 with MPS: 37.5 -> 39.8 evals/s (+6%, three ABAB pairs, no overlap), CPU-only simulate ~48 -> ~43 ms, log(Z)s agree ([round 123](csd3-speed.md)) |
+| A GPU search runs 19 R2D2 ranks per A100 by default, not 16 (`NS_R2D2_CUDA_MAX_RANKS`, the most the card's memory holds) | `defaults.toml` | one A100 with MPS and blocking sync: 41.1 -> 43.9 evals/s (+7%, three pairs, every 19-rank arm above every 16-rank one), log(Z)s agree ([round 124](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
