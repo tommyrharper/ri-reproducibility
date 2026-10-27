@@ -163,6 +163,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (rejected) ORT session options: fixed 32x32 input shapes (free-dimension override) and flush-to-zero (`session.set_denormal_as_zero`) | - | 36 forked children over a staggered N1..N25 walk, ABCD x3: fixed shapes 27.6 against 26.9 ms a forward (+2.5%, every rep), FTZ 26.9 (noise); all outputs bit-identical ([round 162](csd3-speed.md)) |
 | (rejected) glibc `mallopt` (mmap/trim thresholds) or ORT's CPU arena for the arena-less U-Net sessions | - | 36 forked children over a staggered N1..N25 walk, x3: shipped 27.1 ms a forward with 6.5 minor faults; arena 27.1 with 68 faults; mallopt 26.9 (-0.7%, noise); bit-identical ([round 164](csd3-speed.md)) |
 | (null) GPU search, round-146 tree vs today's, 1 x A100 (job 39371931); 2-GPU jobs never start on SL3, every 1-GPU job did | - | B 43.4, N 43.1 evals/s x3 interleaved; card at 99-100%, ~2 of 32 cores busy: card-bound, no regression; log(Z) within 0.6 sigma ([rounds 163](csd3-speed.md), [165](csd3-speed.md)) |
+| (rejected) `torch.compile` (default and max-autotune-no-cudagraphs) for the GPU U-Net | - | 1 x A100, MPS, 19 copies x4: eager 1,772 forwards/s, compiled 1,060-1,068 (-40%); 183 kernels a forward against 142, 7e-6 off eager ([round 166](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

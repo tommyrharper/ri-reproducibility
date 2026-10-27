@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 165; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 166; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -47,7 +47,7 @@ the Hetzner host.
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
   shared weight copy (120), CUDA graphs (122, 130), TF32, `cudnn.benchmark`
-  and channels_last (125), more CPU threads per rank (126) and batching
+  and channels_last (125), `torch.compile` (166, -40%), more CPU threads per rank (126) and batching
   across requests (127). Rounds 148-153's CPU cuts change nothing on the
   card: today's tree runs 43.1 evals/s against round 146's 43.4, so a
   1-GPU search is bound by the card, not its 32 cores ([round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146)).
@@ -7690,3 +7690,51 @@ one tree either (B1-B3 differ), as for every GPU arm since round 119.
 Rows: `r163-warmN`, `r163-B1`..`r163-N3` in `benchmarks.jsonl` (commit set
 to the archived tree's). `agent-node/r163` and the never-run round-161
 2-GPU tree deleted.
+
+## Round 166 (negative): `torch.compile` for the GPU U-Net, -40% under MPS
+
+**Question.** Round 165 left the U-Net on the card as the only GPU lever.
+Rounds 122 and 125 tried graphs and cuDNN settings, but not kernel fusion.
+Would TorchInductor (Triton kernels that fuse each instance norm and
+activation) cut the kernels a forward launches and raise the MPS plateau?
+
+**Probe.** `r2d2-cuda.sif` (torch 2.13, Triton 3.7.1) has no C compiler,
+and Triton needs one to build its launcher. `pip install --target ziglang`
+plus a two-line `CC` wrapper (`python3 -m ziglang cc -target
+x86_64-linux-gnu.2.36`) works as one, with no image change. It is carried
+to the GPU node as one tar file (`agent-node/zig-py.tar`, because the
+unpacked copy is 20k files). `scripts/probe_unet_forward.py` gained
+`COMPILE=<mode>` (`torch.compile(dynamic=False)`) and `KERN=1`, which counts
+one forward's CUDA kernels with `torch.profiler`. One ampere job
+(`.probe/r166/job.sh`, job 39373826, gpu-q-27, A100-SXM4-80GB, MPS on,
+TF32 off as in `r2d2_serve.py`, batch 1, 32x32) ran first solo, then 19
+copies (the production rank count) in E C M M C E order twice, with the
+Inductor and Triton caches shared and warmed by the solo arms:
+
+| arm | solo ms a forward | kernels a forward | kernel time, us | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs eager |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| E eager (production) | 3.29 | 142 | 2,507 | 1,769 / 1,774 / 1,772 / 1,771 | - | 0 |
+| C `compile`, default | 3.09 | 183 | 2,955 | 1,072 / 1,067 / 1,068 / 1,064 | -40% | 6.7e-6 |
+| M `max-autotune-no-cudagraphs` | 3.11 | 182 | 2,954 | 1,055 / 1,061 / 1,056 / 1,056 | -40% | 7.0e-6 |
+
+**Learned.**
+- Rejected, both modes. Inductor makes the forward *more* kernels (183
+  against 142) and more GPU time (2.95 against 2.51 ms). Its Triton
+  reductions for the instance norms cost more than ATen's, and the convs
+  stay cuDNN calls, so nothing is fused away. Solo it is 6% faster, because
+  its Python launch path is shorter. Under MPS, where card time is what
+  counts, it loses 40% in all eight runs. Its output also moves by ~7e-6,
+  so it would not be bit-identical either. max-autotune changes nothing.
+- A solo eager forward is 2.5 ms of kernels in 3.3 ms of wall: 142 kernels
+  at ~18 us each. These are low-occupancy kernels (batch 1 at 32x32 with
+  124 MB of weights), not launch gaps. Concurrency is what fills the card
+  (MPS, round 119), and with that, kernel *count* is not the bound.
+- With graphs (122, 130), TF32, `cudnn.benchmark` and channels_last (125),
+  and now Inductor, the framework-level settings for the GPU forward are
+  exhausted. Only cross-request batching raises the ceiling (round 127,
+  1.33x at B=19, bit-identical), and so far the CPU-side gather has cost
+  more than it gives. A different engine (TensorRT, ORT's CUDA EP) would
+  need a CUDA-12 stack beside the image's CUDA 13 torch.
+- A zig `CC` makes Triton (and so `torch.compile`) usable in any SIF with
+  no rebuild. No search ran, so there are no `benchmarks.jsonl` rows; the
+  job output is `.probe/r166/job-39373826.out`.
