@@ -5,6 +5,12 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
+**Where it stands (round 115).** The 22 Sep production R2D2 search below,
+rerun on the same 24 sapphire CPUs with the same images and seed, now
+converges in **41 minutes instead of 6h20m (7.0x)**, at 26.6 evals/s
+instead of 4.12, with log(Z) in agreement. Simulate (MeqTrees) went from
+39% of worker time to 3.8%. See [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree).
+
 ## Where the time went
 
 `./ri profile` on the two most recent finished 9-parameter runs:
@@ -5425,3 +5431,52 @@ so the spread is node-wide drift, not placement.
 - Reusing an `--output-dir` that holds a finished run resumes it and
   records a bogus row (here 69,607 evals/s in 0.3 s); that row was dropped
   from `benchmarks.jsonl`. Give every arm of a resubmitted job a new label.
+
+## Round 115 (diagnostic): the 22 Sep production search, rerun on today's tree
+
+**Question.** Every round so far timed one lever, or a short search.
+What do rounds 1-114 together do to the run that started this work?
+That run was the 22 Sep production R2D2 search (job 36031480,
+`cb59233`): 6h20m to convergence, with simulate 39% of worker time.
+
+**Run.** The same search, rerun on `5ced3d0` with the same SIFs (same
+imager, meqtrees and polychord image ids), the same seed (190182240),
+nlive 150, 15 repeats, 24 ranks x 1 thread, async, run to convergence.
+It was a sized sapphire job, as before (`./ri search r2d2 --mpi-procs 24`
+from the compute node, job 39293372 on cpu-r-73, started at once). Row
+`r115-bigrun`.
+
+| | 22 Sep (`cb59233`) | round 115 (`5ced3d0`) | change |
+| --- | ---: | ---: | ---: |
+| wall to convergence | 17,331 s (6h 19m) | **2,459 s (41 min)** | **7.0x faster** |
+| evaluations | 71,395 | 65,420 | |
+| evals/s | 4.12 | **26.6** | 6.5x |
+| worker seconds per evaluation | 4.94 s | 0.858 s | 5.8x less |
+| simulate (MeqTrees) per evaluation | 1,936 ms (39.2%) | **32 ms (3.8%)** | 60x less |
+| R2D2 request per evaluation | 2,868 ms (58.0%) | 825 ms (96.1%) | 3.5x less |
+| convert | 97 ms (2.0%) | gone: simulate writes the `.mat` (round 13) | |
+| idle fraction | 11.5% | 0.05% | |
+| after PolyChord returns | ~88 min | 34.5 s | |
+| files left | ~225k | 6,647 | |
+| dead points | 1,373 | 1,368 | |
+| log(Z) | 0.01722 ± 0.00042 | 0.01683 ± 0.00041 | 0.7 sigma apart |
+
+The two log(Z)s agree: their difference, 0.0004, is 0.7 of the combined
+error. They are not expected to be identical, because async runs draw
+different points. The post-run phase was 34.5 s in total: records 2.0 s,
+flush 1.3 s, prune 8.2 s, `summary.json` 4.5 s and packing 18.4 s.
+
+**Learned.**
+- The 6h20m production search now takes 41 minutes on the same 24
+  sapphire CPUs and the same images. Every gain is in the tree, plus the
+  host-built `fastnoise.so` (round 42). A whole sapphire node (112 x 1,
+  per-socket copies, rounds 105-106) ran 103.5 evals/s, ~4x this run's
+  rate.
+- MeqTrees went from 39% of worker time to 3.8%, so the user's 30-50%
+  figure is gone on CSD3 too. The R2D2 U-Net is now the evaluation.
+- In this run nothing else costs much: workers were idle 0.05% of the
+  time, the post-run phase was 35 s, and the run left 6.6k files instead
+  of 225k.
+- `./ri health` on this live run (~20k flat records, running on the job's
+  node) did not answer within 120 s from this loop's node, so it was
+  killed. It was not looked into further.
