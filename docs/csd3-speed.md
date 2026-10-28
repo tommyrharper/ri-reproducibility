@@ -11254,3 +11254,82 @@ Rows: `r231-bigrun` (bench) and `r231-root-blocks` (stage, with the release
 instants and full-precision log(Z)) are in `benchmarks.jsonl`. The run
 directory (9,272 files) is deleted. `summary.json`, `.stats` and the
 samples are kept in `.probe/r231/`.
+
+## Round 232 (diagnosis + fix): the "root blocks" are Lustre stalls on the ranks' own threads
+
+**Question.** Round 231 read the 15-48 s release instants as PolyChord's
+root computing. Where in PolyChord?
+
+**Method.** Round 231's command again (seed 190182240, nlive 150, 15
+repeats, async, 39 ranks, `91ac997`), stopped at ~1,100 s. Three samplers
+(`.probe/r232/`): gdb every ~2 s on the root, reading its `$pc` and 600
+stack words, symbolized offline against `libchord.so` pulled out of
+`polychord.sif` (gdb cannot open the SIF's libraries through
+`/proc/PID/root`: permission denied); every process's main-thread state
+and syscall every 0.5 s; and, for every thread of mine in D state, the
+path argument of its syscall, read from `/proc/PID/mem`.
+
+**Results.**
+- The root is not computing. All ~360 gdb samples, including the ones
+  inside the blocks (606-625, 660-683, 691-702 s: the root stays on one
+  CPU), are in `catch_babies`, i.e. `MPI_Recv` for babies, with the same
+  user CPU per sample (~35%, MPI polling) as outside them. The root is
+  waiting for the workers. Staying on one CPU is just an idle node, with
+  nothing to push it off.
+- The workers are stuck in Lustre. From 979 to 1008 s, up to 14 rank main
+  threads piled up in D state and were all released at one instant. That is
+  round 231's signature. The paths: rank **main threads** in `rmdir` and
+  `getdents64` on `evaluations/eval-*` (1,150 + 44 samples in a 90 s
+  window), and the record-writer threads in `openat` and `rename` of
+  `eval-*.json(.partial)` (~20,000 samples), which is harmless off the
+  critical path. The whole 90 s window was one long metadata stall.
+- The main-thread calls are `_strip_to_record`, which
+  `retain_evaluation_detail` runs when a rank's extreme so far is evicted.
+  Before round 232 the strip ran inline. A held extreme is in tmpfs, so
+  evicting it is free, but every `NS_RETAIN_FLUSH_SECONDS` (600 s)
+  `flush_held_evaluations` publishes the survivors to Lustre, also on the
+  main thread. From then on, each eviction of a published one walks,
+  unlinks and rmdirs on Lustre. That is why round 231 saw no blocks before
+  t~600 s and more blocks after it.
+
+**Fix.** Both Lustre jobs go to the rank's record writer, the single
+ordered thread that already writes records (`_defer_lustre`). The periodic
+flush (`_publish_held`) and an eviction's strip are queued in order, so a
+strip still follows its own publish. A forced flush, at the end of a run,
+stays inline, because `finished_run_records()` and the prune need the files
+in place. The end-of-run reader drains the writer first, as before.
+`self_check_streaming_retention` now parks the writer on an event and
+asserts that a periodic flush and an eviction leave Lustre untouched until
+it is released. It fails with the old inline behaviour ("the rank's thread
+published"). All 30 host self-checks pass.
+
+**Not yet measured.** The gain needs a production-length search with a
+Lustre stall in it. Stalls are random (round 230 lost 4,145 worker-s,
+round 231 12,463), so this round could not A/B it within one iteration.
+The bound is round 231's 19% of worker-time. The change does not touch the
+sampler, so chains and log(Z) cannot move. Next: a converged rerun of round
+230's command on this commit, comparing the busy share (`.probe/r230/idle.py`)
+and the count of D-state main threads.
+
+**WSClean guard (shared code).** A raced synchronous pair (seed 229,
+nlive 100, max-ndead 4000, 9 ranks each; base `91ac997` on CPUs 0-18, this
+change on 19-37) gave bit-identical `dead-birth.txt`, `.txt` and `.stats`,
+log(Z) = 0.0962001628097257 +/- 0.000453662936636545 in both, and 35.77
+against 35.46 evals/s (-0.9%, inside the ~5% spread and on different CPU
+halves).
+
+Rows: `r232-base`, `r232-new` (bench) and `r232-lustre-strip` (stage) in
+`benchmarks.jsonl`. The probe run directory was deleted; the samplers and
+their output are in `.probe/r232/`.
+
+**Learned.**
+- "One CPU, state R, all ranks released at one instant" is also what the root
+  looks like while it busy-polls MPI waiting on workers stalled together.
+  Before blaming the root, check the workers' D states and syscall paths
+  (`.probe/r232/paths.py` reads the path from `/proc/PID/mem`).
+- gdb on the host cannot read a SIF process's libraries. Sample `$pc` and raw
+  stack words, then symbolize against the `.so` copied out with
+  `apptainer exec <sif> cat`.
+- Any Lustre metadata call left on a rank's thread is a whole-search stall
+  risk, because a stall holds every rank at once. Grep the evaluation path
+  for mkdir, rmdir, iterdir and rename that are not handed to the writer.

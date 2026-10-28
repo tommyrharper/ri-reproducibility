@@ -2735,7 +2735,11 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
         # This evaluation's own dir is empty, or not made yet, while its
         # output is still in scratch: no Lustre walk for it (round 14).
         elif name != key or evaluation_scratch_dir(eval_dir) is None:
-            _strip_to_record(eval_dir.parent / name)
+            # One already on Lustre: its walk, unlinks and rmdir go to the
+            # record writer, after its own move there. On the rank's thread a
+            # Lustre metadata stall froze every rank at once for 15-48s,
+            # ~19% of a 1,500-dead search (docs/csd3-speed.md, round 232).
+            _defer_lustre(lambda path=eval_dir.parent / name: _strip_to_record(path))
     if key in evicted:
         for image_key in RETAINED_IMAGE_KEYS:
             (record.get("paths") or {}).pop(image_key, None)
@@ -2788,12 +2792,29 @@ def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) ->
         if keep is not None and name not in keep:
             shutil.rmtree(held, ignore_errors=True)
             continue
-        eval_dir.mkdir(parents=True, exist_ok=True)
-        for produced in held.iterdir():
-            shutil.move(str(produced), eval_dir / produced.name, copy_function=shutil.copyfile)
-        held.rmdir()
+        # The periodic flush is the record writer's (round 232); a forced
+        # one is the end of a run, whose readers need the files there.
+        (_defer_lustre if not force else (lambda job: job()))(
+            lambda held=held, eval_dir=eval_dir: _publish_held(held, eval_dir))
     _HELD.clear()
     _HELD_SINCE = None
+
+
+def _publish_held(held: Path, eval_dir: Path) -> None:
+    import shutil
+
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    for produced in held.iterdir():
+        shutil.move(str(produced), eval_dir / produced.name, copy_function=shutil.copyfile)
+    held.rmdir()
+
+
+def _defer_lustre(job: Any) -> None:
+    """Run a Lustre job on the record writer if there is one, else now."""
+    if _RECORD_WRITER is None:
+        job()
+    else:
+        _submit_record_job(job)
 
 
 def self_check_streaming_retention() -> None:
@@ -2888,6 +2909,35 @@ def self_check_streaming_retention() -> None:
                     write_evaluation_record(eval_dir, {"objective": 1e3, "paths": {}})
                     os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
                     assert not _HELD and (eval_dir / "wsclean").is_dir()
+
+                if background:
+                    # The periodic flush, and stripping an extreme it published,
+                    # are the writer's: with it stuck (a Lustre stall), the
+                    # rank's thread touches neither (round 232).
+                    import threading
+
+                    names = [n for n in (f"eval-hi-{i}" for i in range(40)) if not _keeps_detail(n)]
+                    published = evaluations / names[0]  # an extreme so far, on Lustre
+                    (published / "wsclean").mkdir(parents=True)
+                    retain_evaluation_detail(published, {"objective": 1.5e3})
+                    write_records_in_background()
+                    gate = threading.Event()
+                    _submit_record_job(gate.wait)
+                    held = evaluations / "eval-held"
+                    (evaluation_scratch_dir(held) / "wsclean").mkdir(parents=True)
+                    hold_evaluation_scratch(held, {"paths": {}})
+                    try:
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                        flush_held_evaluations()
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                        for rank, name in enumerate(names[1:IMAGE_KEEP_ENDS + 1]):
+                            retain_evaluation_detail(evaluations / name, {"objective": 2e3 + rank})
+                        assert not _HELD and not (held / "wsclean").exists(), "the rank's thread published"
+                        assert (published / "wsclean").is_dir(), "the rank's thread stripped"
+                    finally:
+                        gate.set()
+                    drain_record_writes(flush_held=False)
+                    assert (held / "wsclean").is_dir() and not published.exists()
 
                 if background:
                     # A write that fails in the background still fails the run.
