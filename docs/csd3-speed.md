@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 181; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 183; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -52,6 +52,9 @@ the Hetzner host.
   card: today's tree runs 43.1 evals/s against round 146's 43.4, so a
   1-GPU search is bound by the card, not its 32 cores ([round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146)).
   2-GPU jobs never start on SL3 (round 163): scale out with 1-GPU searches.
+  The job's 32 cores are not idle: racing a 16-rank CPU onnx search beside
+  a 16-core GPU search gives 47.3 evals/s against 54.9 for the GPU search
+  alone, -14% ([round 183](#round-183-negative-cpu-onnx-ranks-beside-a-1-gpu-search--14)).
   Open: TensorRT's fp32 engine puts **+62% forwards/s** through the card
   at 19 MPS copies, 1e-5 off the CPU path, so a 1-GPU search should gain
   ~30%; it is not wired into the pool yet ([round 168](#round-168-positive-probe-tensorrt-for-the-gpu-u-net-62-forwards-on-one-a100-under-mps)).
@@ -8600,3 +8603,57 @@ and the job was cancelled before the 19-copy and second-pass arms. The
 baseline reproduced round 170 (2,710 forwards/s at 4.4 ms). The lever is
 closed: TensorRT engine memory per worker cannot be cut by refitting. No
 search was run, so there is no `benchmarks.jsonl` row.
+
+## Round 183 (negative): CPU onnx ranks beside a 1-GPU search, -14%
+
+**Question.** Round 165 measured ~2 of a 1-GPU job's 32 cores of user time
+and concluded the search is bound by the card. If ~30 cores sit idle, CPU
+(`R2D2_RUNTIME=onnx`) ranks on them would add evaluations for free: a GPU
+job is charged per GPU, not per core. Is that worth building as a hybrid pool?
+
+**Method.** Before writing any pool code, two searches were raced in one
+1-GPU job (39416385, gpu-q-18, A100-SXM4-80GB, 32 Milan cores split across
+two NUMA nodes: 48-63 = LO, 96-111 = HI). `.probe/r183/job.sh` ran each search
+under `taskset` with `nlive 48`, `5 repeats` and seed 4242: the GPU search
+(torch, MPS, 300 dead) and the CPU search (onnx, 150 dead). The order was
+two warm-ups, then two passes of G32, G16, R and C16. The tree was `20c1fbf`.
+
+| arm | CPUs | ranks x threads | evals/s (pass 1, 2) | request ms | simulate ms |
+| --- | --- | --- | ---: | ---: | ---: |
+| G32: GPU search alone | all 32 | 19 x 2 | 56.6, 53.1 | 277, 291 | 33, 38 |
+| G16: GPU search alone | LO | 16 x 1 | 40.4, 37.0 | 311, 337 | 45, 53 |
+| R, GPU half (RG) | LO | 16 x 1 | 32.4, 37.8 | 381, 336 | 63, 47 |
+| R, CPU half (RC) | HI | 16 x 1 | 12.1, 12.3 | 1165, 1152 | 54, 53 |
+| C16: CPU search alone | HI | 16 x 1 | 10.5, 12.2 | 1122, 1157 | 45, 58 |
+
+**Result.** The raced pair totals **47.3 evals/s** (35.1 + 12.2), against
+**54.9** for the GPU search alone on all 32 cores (**-14%**). The cores
+are not idle. Giving the GPU search 16 cores instead of 32 costs it 30%
+(38.7 against 54.9), partly because the rank count follows the cores (16
+instead of 19), so fewer requests share the card. With a CPU search on the other 16 it loses another 9%
+(35.1), with request and simulate both slower, although the two halves
+share no core. One CPU onnx rank on a Milan core does 0.71-0.77 evals/s,
+against 1.2 on sapphire (round 179), so it cannot make up for the GPU
+ranks it displaces. The GPU arms' log(Z)s agree within their errors
+(0.0174-0.0187 ± 0.0006-0.0010). The CPU arms stop at 150 dead with
+0.0135-0.0152 ± 0.003. The hybrid pool was not built.
+
+**Learned.**
+- Round 165's "2 of 32 cores" was a measurement artefact: `/usr/bin/time`
+  counts only the processes it waits for, not the apptainer sidecar pools,
+  so it misses the workers' CPU. A 1-GPU search needs its cores: 19 x 2 on
+  32 CPUs beats 16 x 1 on 16 by 42%. Ranks and cores were not varied
+  separately here, so this does not contradict round 165's finding that
+  cheaper CPU work per request does not speed the card.
+- An ampere job's 32 cores span two NUMA nodes of a 128-core, 8-node
+  Milan host. Load on one node slows a GPU search pinned to the other by
+  ~9%.
+- At 300 dead and nlive 48, a warm 1-GPU search runs 53-57 evals/s, more
+  than round 165's 43 at 150 dead, because start-up is a smaller share of
+  the run.
+- The first CPU search on a fresh GPU node runs at 4 evals/s (3.4 s a
+  request): cold caches, as for round 165's first GPU arm.
+
+Rows: `r183-warm`, `r183-cwarm`, `r183-G32-1`..`r183-C16-2` in
+`benchmarks.jsonl` (commit 20c1fbf, gpu-q-18). The run directories (~9.3k
+files) were deleted.
