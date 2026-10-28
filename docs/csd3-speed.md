@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 185; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 186; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -45,6 +45,9 @@ the Hetzner host.
   before it, onnx ran a whole node at torch's rate. A whole sapphire node
   now runs **117 evals/s**, +40% over the pre-149 onnx default and +22%
   over torch ([round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40)).
+  A default CPU run takes one rank more than its CPUs, because PolyChord's
+  root never evaluates: 39 ranks on 38 CPUs won 5 of 5 pairs, **+3.7%**
+  ([round 186](#round-186-one-more-r2d2-rank-than-cpus-37)).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -8750,3 +8753,48 @@ A tiny R2D2 search (8 ranks, default 12 dead) wrote its block too.
 
 Rows: `r185w-*` in `benchmarks.jsonl` (built from `git archive`, so
 `commit` reads `unknown`). Script and logs in `.probe/r185w/`.
+
+## Round 186: one more R2D2 rank than CPUs, +3.7%
+
+**Why.** A per-process CPU sample of today's default search (38 x 1, onnx,
+half icelake node, row `r186-base`, 47.3 evals/s) still splits as round 146
+did: R2D2 workers 91.4%, simulate servers 5.0%, PolyChord ranks 3.3%. perf
+on the 38 ranks put 63% of the ranks' samples in one process, the root,
+inside Open MPI's shared-memory progress loop (`mca_btl_vader`,
+`libopen-pal`). PolyChord's root only hands out points and never calls the
+likelihood, so 38 ranks run 37 R2D2 workers and the 38th CPU only hosts the
+root's spin.
+
+**Change.** A default CPU R2D2 run whose rank count reaches the job's CPUs
+now takes one rank more (`run-nested-sampling-r2d2.sh`; after the
+`NS_R2D2_MAX_RANKS` cap and before the memory clamp), so every CPU has a
+worker. An `NS_MPI_PROCS` above `nproc` now sets `--oversubscribe` itself,
+which mpirun needs past one rank per slot. GPU runs are unchanged.
+
+**A/B.** Half icelake node (cpu-q-164), nlive 100, 5 repeats, 400 dead,
+seed 4242, onnx, async, run back to back. A = 38 ranks (the old default),
+B = 39 ranks with the root at `nice 19` (a probe knob, not kept), C = 39
+ranks (the change):
+
+| pass | A evals/s | B evals/s | C evals/s |
+| --- | ---: | ---: | ---: |
+| 1 (A B C) | 46.46 | 46.72 | 46.65 |
+| 2 (A B C) | 47.09 | 47.59 | 49.31 |
+| 3 (C A) | 44.04 | | 47.20 |
+| 4 (C A) | 46.49 | | 47.06 |
+| 5 (C A) | 47.82 | | 50.14 |
+| mean | 46.38 | 47.15 | 48.07 (+3.7%) |
+
+C beat A in all five pairs, in both orders. Time per evaluation did not
+move (A 761-781 ms, C 734-796 ms), so the gain is the 38th worker:
+38/37 = +2.7% is the expectation, and +3.7% is that within noise. `nice 19`
+on the root added nothing over C: the root's spin was not taking CPU from
+a worker, because the job had ~0.85 CPU idle (37.15 of 38 busy). log(Z) x1e-3
+over all 13 searches: 17.0-17.7, errors 0.74-0.91, so every arm agrees.
+
+**Not measured.** Whole nodes get the same +1 rank (113 on a sapphire node,
+77 on icelake), where the expectation is +0.9-1.3%, below what an A/B can
+see; the mechanism is the same.
+
+Rows: `r186-*` in `benchmarks.jsonl` (`dirty`: the probe knob and the
+change were uncommitted). Scripts in `.probe/r186/`. Run directories deleted.

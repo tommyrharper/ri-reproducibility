@@ -388,6 +388,8 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   run scripts needs no change. `NS_R2D2_MAX_RANKS` (112) caps an R2D2 job
   at a whole sapphire node's cores: one rank per CPU beat 56 x 2 by ~20% on
   whole icelake and sapphire nodes (`docs/csd3-speed.md`, round 105).
+  A CPU run then takes one rank more than its cores, because PolyChord's
+  root rank never evaluates (+3.7% on half an icelake node, round 186).
   On such a node the R2D2 pool loads one checkpoint copy per socket and
   pins each worker to its socket (+19% on a whole sapphire node, round 106; +21% on a whole icelake
   node, round 107), and builds the ONNX Runtime sessions once per socket the

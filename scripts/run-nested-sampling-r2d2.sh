@@ -113,11 +113,22 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_MPI_PROCS}" -gt "${NS_R2D2_MAX_RANKS}" ]; then
     NS_MPI_PROCS="${NS_R2D2_MAX_RANKS}"
   fi
+  # PolyChord's root rank only hands out points: it never evaluates, so a
+  # rank per CPU leaves one CPU without an R2D2 worker. One more rank fills it:
+  # 38 -> 39 ranks on 38 icelake CPUs won 5 of 5 pairs, +3.7% evals/s, with
+  # the same time per evaluation (csd3-speed.md, round 186).
+  if [ "${R2D2_DEVICE}" = cpu ] && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
+    NS_MPI_PROCS="$((HOST_CPUS + 1))"
+  fi
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2)"
 else
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2
+fi
+# mpirun counts one slot per CPU and refuses -np past it.
+if [ "${NS_MPI_PROCS}" -gt "${HOST_CPUS}" ]; then
+  NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-1}"
 fi
 
 if [ -z "${R2D2_OMP_THREADS:-}" ]; then
