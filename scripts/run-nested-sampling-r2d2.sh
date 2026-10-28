@@ -213,7 +213,10 @@ R2D2_POOL_FLAGS=()
 if [ "${R2D2_DEVICE}" = cuda ]; then
   R2D2_POOL_FLAGS=(--nv)
   # NS_CUDA_MPS=0 leaves the workers time-slicing the card, for an A/B.
-  if [ "${NS_CUDA_MPS}" != 0 ]; then
+  # R2D2_TRT_SHARED=1 never starts MPS: its one server is the only process on
+  # the card, and through an MPS daemon it ran 32% slower (steady 61.9 against
+  # 90.9 evals/s, 3 of 3 interleaved pairs; docs/csd3-speed.md, round 211).
+  if [ "${NS_CUDA_MPS}" != 0 ] && [ "${R2D2_TRT_SHARED:-0}" != 1 ]; then
     sidecar_cuda_mps_flags
     R2D2_POOL_FLAGS+=(${CUDA_MPS_FLAGS[@]+"${CUDA_MPS_FLAGS[@]}"})
   fi

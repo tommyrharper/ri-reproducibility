@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 210; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 211; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -93,6 +93,12 @@ the Hetzner host.
   60.6 for per-worker `trt` and 61.1 for eager (3/2/3 arms), because a
   forward through the server takes 10.9 ms against 2.7; whether MPS or
   the server's Python is to blame is pending ([round 209](#round-209-negative-so-far-the-shared-tensorrt-server-loses-9-at-19-ranks-because-its-forwards-take-4x-longer)).
+  It was MPS: without it, shared mode runs **90.9 steady evals/s against
+  61.9** (+47%, 3 of 3 pairs, log(Z) agreeing), so shared mode no longer
+  starts MPS. Short GPU arms are compared on `steady_evals_per_s`, because
+  start-up and meqserver wedges move a 3-minute arm by up to 50%
+  ([round 211](#round-211-positive-opt-in-mode-shared-tensorrt-without-mps-47-steady-and-short-gpu-arms-were-measuring-start-up-and-meqserver-wedges)).
+  Open: race it, steady, against per-worker `trt` and eager.
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -9920,3 +9926,115 @@ by 12:33. No Slurm call was made this round; read its output
 
 Rows: `r210-*` in `benchmarks.jsonl` (`dirty`: the knob was uncommitted).
 Probe sources and output are in `.probe/r210/`. Run directories deleted.
+
+## Round 211 (positive, opt-in mode): shared TensorRT without MPS, +47% steady; and short GPU arms were measuring start-up and meqserver wedges
+
+Three results from round 209's race (job 39455763, gpu-q-28) and a new job
+(39458000, gpu-q-40, `.probe/r211/job.sh`), all 1 x A100, nlive 48, 600 dead
+points, seed 4242, `R2D2_RUNTIME=trt R2D2_TRT_SHARED=1`.
+
+**1. The headline evals/s of a 3-minute GPU arm is mostly noise.** Each
+evaluation records its start and end epochs. Read across the whole search,
+they show two kinds of stretch in which *no rank starts anything*:
+
+- **Start-up**, before the first evaluations finish (the pool and the
+  TensorRT server warm up): 23-28 s in most arms, but 52-88 s in some.
+- **Mid-run stalls**: one evaluation's *simulate* took 81-93 s instead of
+  ~40 ms (`timing.simulate_seconds`), and the whole search waited. These are
+  meqserver wedges sitting out their retry ladder: with a 1 s dump and a
+  15.5-minute observation (931 time samples) the predict bound is ~17 s, the
+  worker restarts its meqserver and retries, and the rank's reply timeout
+  sits above both (docs/robustness.md). Every other rank meanwhile waits in
+  PolyChord's collective. It hit 3 of 17 arms (N19b twice, M19b twice at
+  ~30 s, A1 once), all within the first ~100 s.
+
+So r209-N19b recorded 42.6 evals/s, yet outside its 99 s of gaps it ran at
+87.0. That is why round 208's arms spread by 15% and r211-A1 (36.2) looks
+like a regression. `scripts/bench.py` now records `startup_s`, `stall_s` and
+`steady_evals_per_s` (evaluations over the span minus both; a gap is more
+than max(2 s, 10x the median evaluation) with no evaluation starting), and
+`./ri bench` prints the steady rate under evals/s. Short arms should be
+compared on it. The headline rate is still the honest cost of a short run,
+and wedges are a real cost in production too, but they are rare per
+evaluation and land early. A long run pays its start-up once.
+
+**2. Shared mode should not run under MPS.** Round 209's race, read
+steady (`.probe/r211/stalls.py` on the summaries, rows `r209-*`):
+
+| arm | MPS | ranks | headline evals/s | start-up + stalls (s) | steady evals/s | log(Z) | ndead / nlike |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| warm | off | 19 | 56.7 | 88 | 106.7 | 0.0189927813399692 +/- 0.000626 | 479 / 10,201 |
+| M19a | on | 19 | 58.4 | 24 | 68.1 | 0.01891316616849 +/- 0.000615 | 498 / 9,426 |
+| N19a | off | 19 | 76.7 | 24 | 93.5 | 0.0170521010639902 +/- 0.001351 | 467 / 9,911 |
+| N27a | off | 27 | 69.8 | 28 | 85.9 | 0.0184899289058102 +/- 0.000642 | 502 / 11,155 |
+| N27b | off | 27 | 59.1 | 27 | 74.5 | 0.0191127010051921 +/- 0.000638 | 512 / 7,368 |
+| N19b | off | 19 | 42.6 | 24 + 75 (wedges) | 87.0 | 0.0188079202755247 +/- 0.000601 | 506 / 8,028 |
+| M19b | on | 19 | 48.9 | 23 + 22 (wedges) | 62.8 | 0.0191770161313821 +/- 0.000622 | 500 / 9,360 |
+| M19c | on | 19 | 49.5 | 23 | 54.8 | 0.0188530433043638 +/- 0.000595 | 490 / 11,399 |
+| N19c | off | 19 | 71.3 | 23 | 92.1 | 0.018943729817722 +/- 0.000607 | 500 / 7,845 |
+
+At 19 ranks MPS off wins 3 of 3 pairs: steady **90.9 against 61.9
+evals/s (+47%)**, headline 63.5 against 52.3 (+21%). 27 ranks without MPS
+are no better than 19 (80.2 steady). log(Z) agrees everywhere
+(0.0185-0.0192, errors ~0.0006; N19a's 0.0171 +/- 0.0014 is within 1.4
+sigma). The reason is plain: in shared mode only the server process touches
+the card, so an MPS daemon has nothing to share and only adds its client
+path to every launch. `run-nested-sampling-r2d2.sh` now never starts MPS when
+`R2D2_TRT_SHARED=1`; other GPU runs keep it (round 119).
+
+For scale, round 208's per-worker TensorRT and eager arms (another node,
+headline only) ran 60.6 and 61.1. A steady race of shared-without-MPS
+against both is the next GPU round, and it decides whether shared becomes
+the GPU default.
+
+**3. Round 207's probe rate is not an artefact of lanes in step.** In
+`scripts/probe_trt_shared.py` every lane ran N1..N25 from the same start,
+so concurrent forwards could share L2. With `STAGGER=1` (lane t starts at
+net t), job 39458000 part 1, no MPS, K = 19, two passes:
+
+| lanes | threads mode forwards/s | pipes mode forwards/s |
+| --- | ---: | ---: |
+| aligned | 2,460, 2,465 | 2,460, 2,459 |
+| staggered | 2,462, 2,462 | 2,457, 2,460 |
+
+No difference. Outputs were bit-identical (0 mismatches).
+
+**Threads per rank, and MPS again** (job 39458000 part 2, gpu-q-40). The
+job runs the working tree, and the MPS change above landed at 13:04:58,
+between C2's start and B2's. So warm-C2 ran with MPS and B2 and A2 without,
+which turned the end of the job into a second MPS check:
+
+| arm | MPS | ranks x threads | headline | start-up + stalls (s) | steady | log(Z) | ndead / nlike |
+| --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| warm | on | 19 x 2 | 45.1 | 66 | 66.4 | 0.0194020963996079 +/- 0.000653 | 491 / 8,935 |
+| A1 | on | 19 x 2 | 36.2 | 23 + 81 (wedge) | 55.4 | 0.0189331320186553 +/- 0.000599 | 503 / 10,526 |
+| B1 | on | 19 x 1 | 53.9 | 52 | 70.1 | 0.0187737438179926 +/- 0.000688 | 481 / 11,727 |
+| C1 | on | 27 x 1 | 48.4 | 27 | 55.9 | 0.0188803031693729 +/- 0.000615 | 558 / 9,286 |
+| C2 | on | 27 x 1 | 53.5 | 26 | 61.9 | 0.0185734460403887 +/- 0.000582 | 580 / 9,929 |
+| B2 | off | 19 x 1 | 56.9 | 23 + 38 | 99.0 | 0.0188558686390048 +/- 0.000592 | 488 / 7,792 |
+| A2 | off | 19 x 2 | 42.3 | 21 + 107 | 98.8 | 0.0192080305249269 +/- 0.000633 | 506 / 9,154 |
+
+Without MPS the steady rate is 99 at both thread counts, against 55-70 with
+it on the same node. That matches job 39455763's +47%. With MPS, 19 x 1
+looked better than 19 x 2 (70.1 against 55.4-66.4), but without it the
+difference disappears, so `R2D2_OMP_THREADS` stays as it is. A2's 107 s and
+B2's 38 s of stalls came from no slow simulate; what the search waited on
+there is not identified yet. log(Z) agrees everywhere (0.0186-0.0194).
+C2 exited 127 after its search finished, so it has no ledger row. Its bash
+was reading `run-nested-sampling-r2d2.sh` when the file was edited under it.
+Do not edit a shell script that a running job is executing.
+
+**Slurm hygiene.** The scancel of 39457795 (the first version of this job,
+before the stagger probe was added) came 80 s after its sbatch, inside the
+2-minute rule. The resubmission came 2 minutes after the scancel.
+
+**Learned.**
+- Read a short GPU arm through its evaluations' epochs before trusting
+  evals/s. One wedge, or a slow start-up, moves a 3-minute arm by up to 50%.
+- A job that runs the working tree picks up edits mid-job: arms after the
+  edit run the new code, and a shell script edited while it runs can fail.
+  Write down which arms ran which tree.
+- MeqTrees wedges reach the GPU searches too, early in a run, at large
+  time-sample counts. Each one stops every rank for its whole retry ladder.
+  Shortening that ladder for those shapes is a lever for production runs
+  (WSClean shares this code, so it needs the WSClean guard).

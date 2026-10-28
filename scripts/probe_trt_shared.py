@@ -11,6 +11,8 @@ MODE=threads  K threads, each with its own 25 contexts, stream and buffers,
 MODE=pipes    the same, but each thread serves a forked CPU-only client over a
               pipe pair: client writes x (2x32x32 fp32), server copies it in,
               runs the net, copies y back and replies (a rank's round trip)
+STAGGER=1     lane t starts at net t % 25 instead of every lane at N1, as a
+              search's workers are spread over the nets (round 211)
 Both print aggregate forwards/s, per-forward latency, device memory, and check
 that every thread's output equals one reference context's bit for bit.
 """
@@ -20,6 +22,7 @@ import numpy as np
 K = int(os.environ.get("K", "12"))
 N = int(os.environ.get("N", "2500"))
 MODE = os.environ.get("MODE", "threads")
+STAGGER = int(os.environ.get("STAGGER", "0"))
 NETS = 25
 XB, YB = 2 * 32 * 32 * 4, 32 * 32 * 4
 
@@ -114,7 +117,7 @@ def serve(t):
         ln.forward(k % NETS)
     start.wait()
     t0 = time.perf_counter()
-    for k in range(N + (2 * NETS if MODE == "pipes" else 0)):
+    for k in range(STAGGER * t, STAGGER * t + N + (2 * NETS if MODE == "pipes" else 0)):
         if MODE == "pipes":
             got = 0
             while got < XB:
@@ -139,7 +142,7 @@ for th in ths:
     th.join()
 wall, cpu = time.perf_counter() - w0, time.process_time() - c0
 n_tot = K * N if MODE == "threads" else K * (N + 2 * NETS)
-print(f"== shared mode={MODE} K={K} agg_forwards_per_s={n_tot / wall:.0f} mean_ms_per_forward={1e3 * sum(lat) / K:.2f} "
+print(f"== shared mode={MODE} K={K} stagger={STAGGER} agg_forwards_per_s={n_tot / wall:.0f} mean_ms_per_forward={1e3 * sum(lat) / K:.2f} "
       f"worst_ms={1e3 * max(lat):.2f} server_cpu_s_per_s={cpu / wall:.2f} engines_MB={eng_mb:.0f} lanes_MB={lane_mb:.0f} "
       f"act_MB={act / 2**20:.1f} bit_mismatches={mism}")
 if MODE == "pipes":

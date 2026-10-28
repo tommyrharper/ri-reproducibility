@@ -168,6 +168,34 @@ def resolve_run(raw: str) -> Path:
     return target.resolve()
 
 
+def start_gaps(records: Any) -> tuple[float, float, float] | None:
+    """(startup, stall, span) seconds from the evaluations' own start epochs.
+
+    A gap is a stretch in which no rank started an evaluation for longer than
+    max(2s, 10x the median evaluation). The first is start-up (the first
+    evaluations load the imager: 23-88s on a GPU node); later ones are the whole
+    search waiting on one evaluation, e.g. a meqserver wedge sitting out its
+    retry ladder (~80s). Both swamp a 3-minute arm, so evals over the span minus
+    the gaps is the rate a long run settles at (docs/csd3-speed.md, round 211).
+    """
+    timed = sorted((float(t["started_epoch"]), float(t["ended_epoch"]))
+                   for t in ((record.get("timing") or {}) for record in records)
+                   if t.get("started_epoch") is not None and t.get("ended_epoch") is not None)
+    if len(timed) < 2:
+        return None
+    bound = max(2.0, 10.0 * statistics.median(end - start for start, end in timed))
+    first_end = min(end for _, end in timed)
+    startup = stall = 0.0
+    for (earlier, _), (later, _) in zip(timed, timed[1:]):
+        if later - earlier > bound:
+            # Every rank starts together, so start-up opens before any ends.
+            if earlier < first_end:
+                startup += later - earlier
+            else:
+                stall += later - earlier
+    return startup, stall, max(end for _, end in timed) - timed[0][0]
+
+
 def row_for(run_dir: Path) -> dict[str, Any] | None:
     """One ledger row for a finished run, or None with a reason on stderr.
 
@@ -210,6 +238,8 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
          or record.get("peak_memory_bytes")),
         default=0.0,
     )
+    gaps = start_gaps(summary.get("evaluations", []))
+    steady = gaps and gaps[2] - gaps[0] - gaps[1]
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -229,6 +259,9 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "idle_fraction": round(max(0.0, 1.0 - busy_wall / wall), 4)
         if busy_wall else None,
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
+        "startup_s": round(gaps[0], 1) if gaps else None,
+        "stall_s": round(gaps[1], 1) if gaps else None,
+        "steady_evals_per_s": round(evals / steady, 4) if steady and steady > 0 else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
@@ -366,7 +399,8 @@ def load_rows() -> list[dict[str, Any]]:
                 # A row half written by a killed run costs that row, not the file.
                 print(f"benchmark: skipping unreadable line in {LEDGER.name}",
                       file=sys.stderr)
-    return rows
+    # Hand-logged stage timings ("kind": "stage", rounds 201-203) are not runs.
+    return [row for row in rows if "imager" in row]
 
 
 def commit_order() -> dict[str, int]:
@@ -484,6 +518,8 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
     line("Δ evals/s", [delta(series(by_commit[new], ("evals_per_s",)),
                             series(by_commit[old], ("evals_per_s",)))
                        for new, old in zip(labels, labels[1:])])
+    row_for_path("steady evals/s", ("steady_evals_per_s",))
+    row_for_path("stall s", ("stall_s",))
     row_for_path("ms/eval", ("ms_per_eval",))
     row_for_path("busy wall s", ("busy_wall_s",))
     row_for_path("idle fraction", ("idle_fraction",))
@@ -612,6 +648,15 @@ def self_check() -> None:
             accepted = False
         assert accepted is expected, probe
 
+    # Start-up and a mid-run stall are cut; ordinary spacing is not.
+    timed = [{"timing": {"started_epoch": t, "ended_epoch": t + 0.3}}
+             for t in [0.0, 0.0] + [30.0 + 0.1 * n for n in range(100)] + [50.0 + 0.1 * n for n in range(100)]]
+    startup, stall, span = start_gaps(timed)
+    assert (startup, round(stall, 1), round(span, 1)) == (30.0, 10.1, 60.2), (startup, stall, span)
+    assert start_gaps([{"timing": {"started_epoch": 0.0, "ended_epoch": 1.0}},
+                       {"timing": {"started_epoch": 0.5, "ended_epoch": 1.5}}]) == (0.0, 0.0, 1.5)
+    assert start_gaps([{"timing": {}}]) is None
+
     import tempfile
 
     with tempfile.TemporaryDirectory() as raw:
@@ -634,7 +679,7 @@ def self_check() -> None:
                 "peak_memory_mb": 256.0,
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
                 "busy_wall_s": 0.9, "idle_fraction": 0.1,
-            }) + "\nnot json\n")
+            }) + "\nnot json\n" + json.dumps({"kind": "stage", "stage": "s"}) + "\n")
             rows = load_rows()
             assert len(rows) == 1, rows
             do_table()
