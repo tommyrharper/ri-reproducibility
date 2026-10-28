@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 205; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 206; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9616,3 +9616,51 @@ R2D2 throughput can still grow.
 Probe only, no searches, so there is no `benchmarks.jsonl` row. The
 probe's binaries in `/dev/shm` were deleted, and its sources are in
 `.probe/r205/`.
+
+## Round 206 (diagnostic): the U-Net weights cannot be shrunk losslessly
+
+**Question.** Round 205 left two ways past the CPU's DRAM wall: fewer weight
+bytes per evaluation, or more evaluations per weight read. Reuse was already
+rejected (rounds 109, 136, 137, 139). Can the bytes shrink without changing
+a single output bit? That would work if the fp32 weights were bfloat16 or
+fp16 values stored as fp32 (low mantissa bits zero), held exact zeros, were
+shared between nets, or compressed well.
+
+**Method.** `.probe/r206/mantissa.py`, run in `r2d2.sif` on the 25
+`R2D2_A1` checkpoints. It looks at every float32 tensor: how many low
+mantissa bits are zero, how many weights are exactly zero, whether any two
+tensors are byte-identical (within a net or across nets), and how well zlib
+compresses the largest layer.
+
+| check | result | random-mantissa expectation |
+| --- | --- | --- |
+| weights over 25 nets | 3.102 GB (124.1 MB a net) | - |
+| low 16 bits zero | 1.49e-5 | 1.5e-5 (1/65536) |
+| low 12 bits zero | 2.44e-4 | 2.44e-4 (1/4096) |
+| exact zeros | 0 | - |
+| byte-identical tensors | none | - |
+| zlib-6, 1024x1024x3x3 bottleneck | 0.929 of its size | - |
+
+| layer (spatial size at 32x32) | MB a net | share of bytes |
+| --- | ---: | ---: |
+| `conv.layers.4` 1024x1024x3x3 (2x2) | 37.7 | 30.4% |
+| `conv.layers.0` 1024x512x3x3 (2x2) | 18.9 | 15.2% |
+| `up_conv.0.layers.0` 512x1024x3x3 (4x4) | 18.9 | 15.2% |
+| `down_sample_layers.3.layers.4` 512x512x3x3 (4x4) | 9.4 | 7.6% |
+| `up_conv.0.layers.4` 512x512x3x3 (4x4) | 9.4 | 7.6% |
+| `up_transpose_conv.0` 1024x512x2x2 | 8.4 | 6.8% |
+
+**Result.** None of the ways works. The mantissas are fully used: the
+zero-low-bit counts are exactly what random bits give, so no narrower float
+holds them. There are no zeros to skip and no tensors shared between nets.
+zlib saves 7%, all of it from the exponent bytes, and decompressing 3.1 GB
+an evaluation would cost far more CPU than the 7% of DRAM traffic it saves.
+Three layers at the 2x2 and 4x4 bottleneck hold 61% of the bytes, and every
+3x3 tap there is used by some output pixel even at 2x2, so a forward has to
+read all of them. With reuse already rejected, the CPU R2D2 path has no
+bit-identical lever left past round 205's ~53 evals/s ceiling. Only the GPU
+path, or a changed network (quantised or distilled, which is out of scope),
+can go faster.
+
+Probe only. No search was run, so there is no `benchmarks.jsonl` row. The
+probe source is in `.probe/r206/`.
