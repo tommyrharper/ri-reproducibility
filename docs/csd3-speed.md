@@ -11333,3 +11333,62 @@ their output are in `.probe/r232/`.
 - Any Lustre metadata call left on a rank's thread is a whole-search stall
   risk, because a stall holds every rank at once. Grep the evaluation path
   for mkdir, rmdir, iterdir and rename that are not handed to the writer.
+
+## Round 233 (validation): round 232's fix in the production search, busy share 0.995
+
+**Question.** Round 232 moved the Lustre strip and the periodic flush off
+the ranks' main threads. Does that remove round 230-231's whole-search
+blocks in the production search, and does log(Z) still agree?
+
+**Method.** Round 230's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs), on
+`5c7b03c`, with round 232's main-thread sampler running alongside it
+(`.probe/r233/`). Other users' jobs loaded the node heavily: load 21 at the
+start, 120-124 mid-run. Two new readers of `summary.json`: `dips.py`
+(windows longer than 5 s with fewer than 34 of 38 workers in flight, i.e.
+round 231's blocks) and `dcount.py` (D-state pile-ups in the sampler's
+output).
+
+| | round 230 (`69e2a2f`) | round 231 (`7ff6f6e`) | round 233 (`5c7b03c`) |
+| --- | ---: | ---: | ---: |
+| evaluations | 72,429 | 73,645 | 77,526 |
+| search wall | 1,418.8 s | ~1,694 s | 1,595.6 s |
+| evals/s | 51.1 | 43.5 | 48.6 |
+| request (`image_container`) | 660 ms | - | 743 ms |
+| busy share of 38 workers | 0.923 | 0.806 | **0.995** |
+| worker-s lost below 38 in flight | 4,145 | 12,463 | **327** |
+| windows > 5 s below 34 in flight | 6 (154 s) | 18 (528 s) | **0** |
+| post-run drain | 0.0 s | 5.1 s | **60.0 s** |
+| log(Z) | 0.0171997434919644 +/- 0.000400520669269346 | 0.0173747444767856 +/- 0.000410586136794265 | 0.0172880612106121 +/- 0.000403960591240749 |
+| ndead, nlike | 1,481, 71,014 | 1,464, 72,010 | 1,471, 75,436 |
+
+**Results.**
+- The blocks are gone. Busy share is 0.995. The only bin below 0.9 is the
+  last 6 s of the run. No window had fewer than 34 workers in flight for
+  more than 5 s. No rank main thread was in D state after t=4 s (start-up);
+  the D samples left are the host's progress-bar `find` and the record
+  packer, both off the critical path.
+- evals/s is 48.6, below round 230's 51.1, only because the request took
+  743 ms against 660 under the heavier node load. At round 230's request
+  time, a busy share of 0.995 against 0.923 is worth +7.8% (~55 evals/s).
+  Against round 231's run of the same command it is +23% of worker-time.
+- log(Z) agrees with round 230 within 0.15 sigma (difference 0.000088,
+  combined error 0.000569).
+- New cost: the post-run drain took 60.0 s (round 231: 5.1 s). The drain
+  is `drain_record_writes` plus a barrier. The suspect is a backlog on
+  some rank's record writer: the strips round 232 deferred, queued behind a
+  Lustre stall. The pack was also slow (43.9 s against 26.1), so Lustre
+  was slow at the end. Not proven, because the sampler does not see the
+  writer threads or futex waits. It costs once per run (3.8% of this
+  1,600 s search, less in longer ones), against ~8-23% of worker-time
+  recovered during the search.
+
+**Next.** Log the writer-queue depth and the per-rank drain time at the
+start of `finished_run_records`. If strips dominate, the end of a run can
+drop the queued strips of extremes that the run does not keep, since the
+end-of-run prune removes them anyway.
+
+Rows: `r233-bigrun` (bench) and `r233-validation` (stage, with full-precision
+log(Z)) in `benchmarks.jsonl`. `summary.json`, `.stats`, the profile and the
+sampler output are kept in `.probe/r233/`. The run directory (9,537 files) is
+deleted.
