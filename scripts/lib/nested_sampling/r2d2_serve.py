@@ -672,13 +672,16 @@ def serve_trt_shared(socks: list, dim: int) -> None:
             done.synchronize()
             sock.send(header + hy.numpy().tobytes() if ok else header)
 
-    lanes = [lane(sock) for sock in socks]
-    torch.cuda.synchronize()
+    # Each lane serves as soon as its 25 contexts exist: making all 19 took
+    # 12.2s, which every worker used to wait out (round 221).
+    threads = []
+    for sock in socks:
+        args = lane(sock)
+        torch.cuda.synchronize()
+        threads.append(threading.Thread(target=run, args=args, daemon=True))
+        threads[-1].start()
     with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
-        status.write(f"shared: one server, {len(lanes)} lanes\n")
-    threads = [threading.Thread(target=run, args=args, daemon=True) for args in lanes]
-    for thread in threads:
-        thread.start()
+        status.write(f"shared: one server, {len(threads)} lanes\n")
     for thread in threads:
         thread.join()
 

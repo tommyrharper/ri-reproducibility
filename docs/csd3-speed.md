@@ -10521,3 +10521,37 @@ line (silent). `test_self_checks.py` passes 27. Nothing in a forward or
 in scoring changed, and the new code only runs after the server has
 exited, so results and throughput cannot change. CPU and WSClean searches
 never start a server, so no A/B was run.
+
+## Round 221 (start-up, GPU confirmation pending): each shared TensorRT lane serves as soon as it is made
+
+**Why.** Round 219 found that the shared server makes its 19 lanes (475
+execution contexts) in 12.2 s, and threads do not help (13.4 s on 19
+threads). Before this round, `serve_trt_shared()` started serving only
+after every lane existed. So every worker waited the full 12.2 s for its
+first forward, even though lane 0 was ready after ~0.6 s.
+
+**Change.** Each lane's thread now starts as soon as its 25 contexts are
+made. Lane *k* serves from about 0.64(*k*+1) s, so the mean wait drops
+from ~12 s to ~6 s per worker. That is roughly 6 s x 19 workers of
+evaluation time returned at the start of every GPU search. The contexts,
+buffers and engines are the same objects as before, so forwards cannot
+change. The status line `shared: one server, N lanes` is still written
+once, after the last lane starts. CPU and WSClean searches never start a
+server.
+
+**Checks here (cpu-q, no GPU).** `py_compile`, `test_self_checks.py` (27
+pass) and `self_check_trt_shared_protocol` in `r2d2.sif` pass.
+
+**Pending: job 39485592** (`.probe/r221/job.sh`, 1 x A100). It runs a
+default seed-4242 search with r219-D's settings (rc, log(Z) against
+0.01884 +/- 0.00065, `startup_s` against 22.3 s warm), then
+`.probe/r221/probe.py`, which alternates the old server
+(`r2d2_serve_old.py`, HEAD before this round) and the new one 3 times. The
+probe records when each of 19 raw-socket clients gets its first and 25th
+reply, checks that the outputs are bit-identical across versions and
+lanes, and splits one lane's context set-up into `create_execution_context`,
+`set_input_shape` and address binding, for both the `USER_MANAGED` and
+`ON_PROFILE_CHANGE` allocation strategies. The job had not started ~35
+minutes after submission. Read `.probe/r221/job-39485592.out` next round.
+The job runs `./ri search` from the live worktree, so leave
+`r2d2_serve.py` untouched until it has run.
