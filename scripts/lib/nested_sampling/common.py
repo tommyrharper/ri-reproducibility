@@ -1452,6 +1452,17 @@ class PolyChordFinish:
                   "after PolyChord finished", flush=True)
 
 
+def evidence_record(output: Any) -> dict[str, Any] | None:
+    """log(Z) and its error from the PolyChordOutput run_polychord() returns,
+    which has already parsed chains/<root>.stats, so it costs nothing. In the
+    summary because a validation run in tmpfs loses its chains, and run.log
+    gives log(Z) to 2 decimals at a checkpoint before the end (round 184)."""
+    try:
+        return {"log_z": output.logZ, "log_z_err": output.logZerr, "ndead": output.ndead, "nlike": output.nlike}
+    except AttributeError:
+        return None
+
+
 def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     """Drain every rank's records and settle its held extremes; rank 0 gets
     every record, the others None. Collective: every rank calls it.
@@ -3754,6 +3765,17 @@ def self_check_fits_reader() -> None:
     assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
     assert header["SIMPLE"] is True
     assert int(header["NAXIS"]) == int(expected_header["NAXIS"])
+
+
+def self_check_evidence_record() -> None:
+    """The summary's evidence block reads PolyChordOutput's fields, and an
+    output without them (an older pypolychord returned None) records None."""
+    from types import SimpleNamespace
+
+    output = SimpleNamespace(logZ=-12.5, logZerr=0.25, ndead=300, nlike=4567)
+    assert evidence_record(output) == {"log_z": -12.5, "log_z_err": 0.25, "ndead": 300, "nlike": 4567}
+    assert evidence_record(None) is None
+    print("evidence record reads log(Z) from PolyChordOutput")
 
 
 def self_check_polychord_finish() -> None:

@@ -25,6 +25,7 @@ from common import (
     cube_like_from_theta,
     cube_to_params,
     drain_record_writes,
+    evidence_record,
     PolyChordFinish,
     finished_run_records,
     follow_r2d2_worker_node,
@@ -53,6 +54,7 @@ from common import (
     self_check_metric_resolution,
     self_check_parameter_space,
     self_check_parameter_toggle,
+    self_check_evidence_record,
     self_check_profiling,
     self_check_resume_adoption,
     self_check_source_offset,
@@ -593,7 +595,7 @@ def main() -> None:
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
     finish = PolyChordFinish()
-    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
@@ -637,6 +639,7 @@ def main() -> None:
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "evidence": evidence_record(output),
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
@@ -669,6 +672,7 @@ if __name__ == "__main__":
         self_check_r2d2_config_thread_cap()
         self_check_source_offset()
         self_check_profiling()
+        self_check_evidence_record()
         self_check_failure_record_persistence()
         self_check_worker_death_is_not_scored()
         self_check_resume_adoption()

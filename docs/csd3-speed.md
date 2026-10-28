@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 184; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 185; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -8709,8 +8709,44 @@ sigma), so this run is a speed figure only.
   `.venv` (70 s), which a production checkout pays once.
 - A validation job that extracts a tree into `/dev/shm` must copy the
   run's `chains/*.stats` (or the packed archive) out before it cleans up,
-  or log(Z) is lost. `summary.json` does not carry it.
+  or log(Z) is lost. `summary.json` did not carry it until round 185.
 
 Rows: `r184-bigrun` in `benchmarks.jsonl` (commit 7e5caf9). The run
 directory was in the job's `/dev/shm` and is gone; the job log and
 profile are in `.probe/r184/`.
+
+## Round 185: `summary.json` records log(Z)
+
+**Why.** Round 184's validation could only quote log(Z) to two decimals,
+from a status print before the end, because its chains went with the
+job's `/dev/shm`. Every speed change here has to keep log(Z), so the
+summary should carry it.
+
+**Change.** `run_polychord()` already returns a `PolyChordOutput` that has
+parsed `chains/<root>.stats` on every rank; it was thrown away. Both
+drivers now keep it, and `summary.json` gains an `evidence` block
+(`common.py` `evidence_record`: `log_z`, `log_z_err`, `ndead`, `nlike`
+as PolyChord writes them; `None` if the output lacks them). No new IO.
+Self-check `self_check_evidence_record` (host-runnable).
+
+**WSClean guard.** Two raced pairs of 18-rank WSClean searches on this
+half icelake node (A = 7b14e19, B = this diff; synchronous, nlive 100,
+400 dead, seed 4242):
+
+| arm | pass 1 evals/s | pass 2 evals/s | chains |
+|---|---|---|---|
+| A | 27.91 | 28.36 | byte-identical |
+| B | 27.92 | 28.32 | byte-identical |
+
+B's summaries record log(Z) = 0.0961695969470598 +/- 0.00072 (500 dead).
+A tiny R2D2 search (8 ranks, default 12 dead) wrote its block too.
+
+**Learned.**
+- `.stats` gives log(Z) to full double precision; `run.log`'s status
+  line does not. Compare validation runs on `summary.json`'s
+  `evidence.log_z` from now on.
+- `nlike` is PolyChord's own count (4,123 here against 4,255 evaluations
+  in the benchmark row), not the run's evaluation count.
+
+Rows: `r185w-*` in `benchmarks.jsonl` (built from `git archive`, so
+`commit` reads `unknown`). Script and logs in `.probe/r185w/`.

@@ -181,6 +181,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (diagnostic) a 76-rank search's request time split by socket, and the pool's page placement | - | cpu-q-170, W H W: halves 92.8 evals/s in total against 85.2/86.2 (+8%), socket 0 749-751 against bound 706 ms, socket 1 883-892 against bound 798 (socket 1 is 13% slower even bound), weight copies correctly per node, idle ~0, log(Z)s agree ([round 178](csd3-speed.md)) |
 | (validation) round 177's socket-follow on a whole sapphire node, 112 ranks | `common.py` `follow_r2d2_worker_node` | cpu-r-67, A B B A: 135.9/135.5 against 132.2/131.5 evals/s (+2.9%), 54-56 of 112 ranks off their worker's socket before, 0 after, simulate 64.6 to 58.0 ms, log(Z)s agree ([round 179](csd3-speed.md)) |
 | (validation) The 22 Sep production R2D2 search rerun again, on round 183's tree (onnx default) | - | 24 x 1 sapphire (shared node), same seed and SIFs, to convergence: 41 -> 29 min (9.9x on 22 Sep), 26.6 -> 39.7 evals/s, request 825 -> 546 ms, simulate 29 ms (5%); log(Z) only as printed (0.01 +/- 0.00), chains lost with the job's /dev/shm ([round 184](csd3-speed.md)) |
+| (tooling) `summary.json` records log(Z), its error, ndead and nlike from the `PolyChordOutput` `run_polychord()` already returns | `common.py` `evidence_record` | no cost: raced WSClean pairs 27.9/28.4 vs 27.9/28.3 evals/s, byte-identical chains ([round 185](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

@@ -16,6 +16,7 @@ HOST_RUNNABLE = {
     "common": (
         "self_check_backfilled_intervals",
         "self_check_evaluation_pruning",
+        "self_check_evidence_record",
         "self_check_clean_convergence",
         "self_check_image_dim",
         "self_check_image_retention",
