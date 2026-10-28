@@ -38,6 +38,7 @@ if [[ "${TARGET}" == "all" || "${TARGET}" == "simulate" ]]; then
   echo
   echo "=== simulate (${MEQTREES_SIF##*/}) ==="
   image_run "${MEQTREES_SIF}" python3 -u "$(nested_sampling simulate_point_source_ms.py)" --self-check
+  image_run "${MEQTREES_SIF}" python3 -u "$(nested_sampling ms_to_r2d2_mat.py)" --self-check
 fi
 
 if [[ "${TARGET}" == "all" || "${TARGET}" == "r2d2-serve" ]]; then

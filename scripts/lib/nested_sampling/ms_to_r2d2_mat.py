@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import os
+import struct
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
 from casacore.tables import table
-from scipy.io import savemat
 
 SPEED_OF_LIGHT = 299792458.0
 
@@ -53,22 +56,67 @@ def write_r2d2_mat(
     n_chan = vis.shape[1]
     u_lambda = (uvw[:, 0, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
     v_lambda = (uvw[:, 1, None] * freqs_hz / SPEED_OF_LIGHT).reshape(-1)
-    y = np.asarray(vis, dtype=np.complex128).reshape(-1)
+    # complex128(vis) split into its halves, without the complex temporary.
+    y = tuple(np.ascontiguousarray(half, dtype=np.float64).reshape(-1) for half in (vis.real, vis.imag))
     # Convert MS inverse-variance weights to R2D2 nW, applying simulated sigma.
     nW = np.repeat(np.sqrt(np.asarray(row_weight, dtype=np.float64)) / noise_sigma_jy, n_chan)
 
     mat_path.parent.mkdir(parents=True, exist_ok=True)
-    savemat(
-        str(mat_path),
-        {
-            "u": u_lambda.reshape(-1, 1),
-            "v": v_lambda.reshape(-1, 1),
-            "y": y.reshape(-1, 1),
-            "nW": nW.reshape(-1, 1),
-        },
-        # Small per-evaluation MAT; compression costs more CPU than its I/O saves.
-        do_compression=False,
-    )
+    write_mat_columns(mat_path, {"u": (u_lambda,), "v": (v_lambda,), "y": y, "nW": (nW,)})
+
+
+def write_mat_columns(mat_path: Path, columns: dict[str, tuple[np.ndarray, ...]]) -> None:
+    """Byte for byte what scipy's savemat(do_compression=False) writes for
+    these float64 (n, 1) columns, a (real, imag) pair being one complex column,
+    straight from the arrays: savemat's per-element tobytes() copies (and the
+    complex128 temporary) were a third of R2D2's simulate (docs/csd3-speed.md,
+    round 187). self_check_write_mat_columns() is the guard."""
+    # 116-byte description, subsystem offset, version 0x0100, 'IM' endian test.
+    header = struct.pack("<116sqH2s", f"MATLAB 5.0 MAT-file Platform: {os.name}, Created on: {time.asctime()}".encode(),
+                         0, 0x0100, b"IM")
+    parts: list = [header]
+    for name, halves in columns.items():
+        n = len(halves[0])
+        raw = name.encode("latin1")
+        assert n and len(raw) <= 4 and all(h.dtype == np.float64 and h.flags.c_contiguous and len(h) == n for h in halves)
+        # miMATRIX; array flags (miUINT32, mxDOUBLE_CLASS, complex bit); dims
+        # (miINT32, n x 1); the name as a small miINT8 element; then miDOUBLE data.
+        parts.append(struct.pack("<II IIII IIii I4s", 14, 40 + len(halves) * (8 + 8 * n),
+                                 6, 8, 6 | (len(halves) == 2) << 11, 0, 5, 8, n, 1, len(raw) << 16 | 1, raw))
+        for half in halves:
+            parts += [struct.pack("<II", 9, 8 * n), memoryview(half).cast("B")]
+    with open(mat_path, "wb") as stream:
+        stream.writelines(parts)
+
+
+def self_check_write_mat_columns() -> None:
+    """write_r2d2_mat() against savemat's bytes, with both on one clock."""
+    import tempfile
+    from unittest import mock
+
+    from scipy.io import loadmat, savemat
+
+    rng = np.random.default_rng(1)
+    # complex64 is the simulator's .mat; complex128 is ms_to_r2d2_mat()'s.
+    for rows, n_chan, dtype in ((1, 1, np.complex64), (7, 3, np.complex64), (2000, 4, np.complex64),
+                                (300, 5, np.complex128)):
+        vis = (rng.normal(size=(rows, n_chan)) + 1j * rng.normal(size=(rows, n_chan))).astype(dtype)
+        uvw = rng.normal(0.0, 300.0, (rows, 3))
+        freqs = 1e9 + np.arange(n_chan) * 1e6
+        weight = rng.uniform(0.5, 2.0, rows)
+        with tempfile.TemporaryDirectory() as tmp:
+            got, want = Path(tmp) / "got.mat", Path(tmp) / "want.mat"
+            with mock.patch("time.asctime", return_value="Wed Oct 28 05:30:00 2026"):
+                write_r2d2_mat(got, vis, uvw, freqs, weight, 0.3)
+                savemat(str(want), {
+                    "u": (uvw[:, 0, None] * freqs / SPEED_OF_LIGHT).reshape(-1, 1),
+                    "v": (uvw[:, 1, None] * freqs / SPEED_OF_LIGHT).reshape(-1, 1),
+                    "y": np.asarray(vis, dtype=np.complex128).reshape(-1, 1),
+                    "nW": np.repeat(np.sqrt(weight) / 0.3, n_chan).reshape(-1, 1),
+                }, do_compression=False)
+            assert got.read_bytes() == want.read_bytes(), (rows, n_chan)
+            assert np.array_equal(loadmat(str(got))["y"], np.asarray(vis, np.complex128).reshape(-1, 1))
+    print("write_mat_columns: OK")
 
 
 def ms_to_r2d2_mat(
@@ -106,6 +154,9 @@ def ms_to_r2d2_mat(
 
 
 def main(argv: list[str] | None = None) -> None:
+    if argv is None and sys.argv[1:] == ["--self-check"]:
+        self_check_write_mat_columns()
+        return
     args = parse_args(argv)
     stats = ms_to_r2d2_mat(
         Path(args.ms_path),

@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 186; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 187; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -8798,3 +8798,65 @@ see; the mechanism is the same.
 
 Rows: `r186-*` in `benchmarks.jsonl` (`dirty`: the probe knob and the
 change were uncommitted). Scripts in `.probe/r186/`. Run directories deleted.
+
+## Round 187: R2D2's `.mat` without `savemat`, -9% of simulate
+
+**Profile.** Round 186 left simulate (the MeqTrees server's `--mat-only`
+request) at 5-6% of an R2D2 worker's time, 45 ms an evaluation in a
+default search (row `r187-base`, 39 x 1, 46.4 evals/s). A cProfile of that
+request alone, in `meqtrees.sif` on one pinned CPU with the host-built
+`fastnoise.so`, over 96 real draws from that search (`.probe/r187/prof.py`):
+17.1 ms a call, of which the noise draw is 6.2 ms, scipy's `savemat` of the
+`.mat` 3.9 ms, `write_r2d2_mat()` around it 1.5 ms and the phase ramp 1.8 ms.
+`savemat` copies every element with `tobytes(order='F')`, the complex
+column's halves through strided `.real`/`.imag` views of a complex128
+temporary, and a typical `.mat` here is ~13 MB.
+
+**Change.** `write_r2d2_mat()` now writes the MAT-v5 file itself
+(`write_mat_columns()` in `ms_to_r2d2_mat.py`): the same 128-byte header,
+then per column the matrix tag, array flags, dims, name and miDOUBLE
+data, straight from float64 arrays through `memoryview`s. The complex
+column's halves are converted from complex64 once each. The file is byte
+for byte what `savemat(do_compression=False)` wrote; only the header's
+creation time differs, as it did between any two runs.
+`self_check_write_mat_columns()` compares the bytes with `savemat` on one
+mocked clock, for complex64 and complex128 input, and is part of
+`./ri self-check simulate`. The noise draw stays: it must reproduce the
+4-correlation stream, and round 65 already skips what it can.
+
+**Stage A/B.** `.probe/r187/stage.sh`: N `meqtrees.sif` processes, one
+per CPU, half on HEAD's `ms_to_r2d2_mat.py` (A) and half on this one (B),
+all at once, each warming then timing 2 x 96 real draws from a shared
+start file. Passes alternate which CPUs get which arm.
+
+| load | A ms a call (wall / user / sys) | B ms a call | change |
+| --- | ---: | ---: | ---: |
+| 2 copies | 17.79 / 14.27 / 3.44 | 15.68 / 12.35 / 3.27 | -2.1 ms |
+| 36 copies, pass 1 | 29.41 / 22.07 / 7.13 | 26.73 / 19.11 / 7.41 | -2.7 ms |
+| 36 copies, pass 2 (swapped) | 29.19 / 21.86 / 7.11 | 26.56 / 19.03 / 7.34 | -2.6 ms |
+| 36 copies, pass 3 | 29.39 / 22.04 / 7.14 | 26.84 / 19.11 / 7.52 | -2.6 ms |
+| 36 copies, pass 4 (swapped) | 29.44 / 22.05 / 7.18 | 26.77 / 19.12 / 7.45 | -2.7 ms |
+
+B is faster in every pass by 2.6-2.7 ms under load (-9% of the
+stage), all of it user time. The 96 `.mat` files of the two arms are
+identical outside the header clock.
+
+**End to end.** One default search on the change (`r187-new`, same
+settings as `r187-base`: nlive 100, 5 repeats, 400 dead, seed 4242) ran,
+scored and converged: log(Z) 0.01687 +/- 0.00084 against 0.01753 +/- 0.00077,
+inside round 186's spread of async runs. Its rate (39.1 evals/s, request
+921 against 753 ms) says the node was busier than in `r187-base`, so
+the pair is not an A/B. ~2.7 ms of a ~770 ms evaluation is ~0.35%, well
+under the ~5% an end-to-end A/B resolves, which is why the stage was
+timed directly. WSClean never writes a `.mat`, so its path is unchanged.
+
+**Also found.** PolyChord's final `nlike` (5,111 in `r187-base`, now in
+`summary.json`'s evidence) is ~10% below the run's evaluations (5,675).
+The likely cause is the stop: the 38 workers' part-run chains (up to ~22
+evaluations each at 5 repeats, ~840 at most) are dropped uncounted. That
+was not traced further. If so it is a fixed cost of workers x part of a
+chain, under ~1.2% of round 184's 69k-evaluation production search, so
+not a lever, but short runs overstate it.
+
+Rows: `r187-base`, `r187-new` in `benchmarks.jsonl`. Scripts in
+`.probe/r187/`. Run directories deleted.
