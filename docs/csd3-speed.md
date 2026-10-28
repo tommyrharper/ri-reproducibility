@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 177; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 178; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -77,6 +77,10 @@ the Hetzner host.
   On one whole icelake node, two socket-bound 38-rank searches run +9%
   more in total than one 76-rank search (request -8%), so a single
   search loses ~8% to spanning both sockets ([round 176](#round-176-diagnostic-two-socket-bound-searches-on-a-whole-icelake-node-give-9-total-but-each-one-takes-twice-as-long)).
+  After round 177 the gap is still ~8% (85.2/86.2 against 92.8). It is
+  spread over both sockets' request time, with weights correctly placed and
+  idle ~0, and one icelake socket can run 13% slower than the other even when
+  fully bound ([round 178](#round-178-diagnostic-the-whole-node-penalty-by-socket-weights-are-placed-right-and-socket-1-is-slower-anyway)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -8413,3 +8417,69 @@ with **byte-identical chains** in all four arms (`.probe/r177w/`).
 - Rows `r177-*` and `r177w-*` were built from `git archive`; their commit
   was rewritten to 4e8156d, with `dirty: true` on the B arms. Run
   directories were in `/dev/shm` and are gone.
+
+## Round 178 (diagnostic): the whole-node penalty by socket; weights are placed right, and socket 1 is slower anyway
+
+**Question.** Round 177 left ~4-5% of round 176's whole-node penalty
+unexplained and suspected the pool parent, MPI, or remote pages. Which
+socket's ranks pay it, and do any worker pages sit on the wrong node?
+
+**Method.** One exclusive whole icelake node (cpu-q-170, job 39410328),
+`git archive a32315a` in `/dev/shm`, onnx defaults, nlive 200, 5 repeats,
+1000 dead points, seed 4242, async. The only change is a probe print
+(`.probe/r178/probe.py`): each rank's per-evaluation stdout line also gets
+its pid, its CPU (so its socket) and the request and simulate seconds.
+Arms: a 300-dead warm-up, W1 (76 ranks), H1 (two concurrent 38-rank searches
+under `numactl --cpunodebind=N --membind=N`), and W2. Two minutes into each W
+arm, `sample.sh` copied every pool process's `/proc/<pid>/numa_maps`.
+
+| arm | evals | wall s | evals/s | request ms (socket 0 / 1) | simulate ms (0 / 1) | log(Z) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| W1 | 16,789 | 197 | 85.2 | 751 / 892 | 44 / 56 | 0.01786 ± 0.00036 |
+| H1-n0 | 16,438 | 334 | 49.2 | 706 / - | 36 / - | 0.01801 ± 0.00035 |
+| H1-n1 | 16,807 | 386 | 43.6 | - / 798 | - / 43 | 0.01761 ± 0.00034 |
+| W2 | 17,315 | 201 | 86.2 | 749 / 883 | 39 / 47 | 0.01754 ± 0.00041 |
+
+**Result.** The halves total 92.8 evals/s against 85.2/86.2 for one search
+(+8%), the same gap as round 176 had before round 177's fix. It splits as
+follows:
+- **Socket 1 on this node is 13% slower per request, even fully bound**
+  (H1: 798 against 706 ms, simulate 43 against 36). Round 176 found socket 0
+  4% slower on cpu-q-60, so this is per machine, not per socket number.
+- **In one 76-rank search both sockets lose time** against their bound
+  halves: socket 0 +6% (749-751 against 706 ms), socket 1 +11% (883-892
+  against 798). Idle stays at 0.04-0.05%, so ranks are not starved by the
+  PolyChord master or MPI. The loss is inside the evaluation.
+- **Worker pages are where round 149 put them.** Every pooled worker maps
+  ~6.3 GB on node 0 and ~6.4 GB on node 1, which is both per-node weight
+  copies in its heap. Only ~0.4 GB of the parent's own data leans to node 0.
+  So glibc reusing freed node-0 heap for the node-1 sessions (MPOL_BIND only
+  governs new faults) is not happening at any size that matters. Rank and
+  simulate pages follow their socket after round 177. The workers' mapped
+  library text is mostly on node 1, yet socket 0 is the faster one, so that
+  is not the cause either. Node 0 holds 13.4 GB of page cache to node 1's
+  5.2 GB, but none of it is mapped by the pool.
+- All four log(Z)s agree within their errors.
+
+**Learned.**
+- What is left of the whole-node penalty is contention a single search
+  cannot place away: both sockets slow when one search spans them, and
+  the per-node weight copies, rank, and simulate placement are already
+  right. No page in the pool sits on the wrong node.
+- Socket speed differs per machine by 4-13% under identical bound loads,
+  so a per-socket A/B must compare the same socket, and a whole-node search
+  runs at the mean of its two sockets. Async PolyChord loses nothing to the
+  imbalance: the faster socket simply does more evaluations (9.0-9.3k
+  against 7.8-8.1k here).
+- The only remaining lever this points to is running a whole node as two
+  socket-bound searches (+8-9% total, rounds 176 and 178) and combining them
+  afterwards. That is a workflow change (two seeds, merged posteriors), not a
+  speed change to one search, so it is left for a decision.
+- A probe print on the rank's per-evaluation stdout line (pid, CPU, request
+  seconds) is enough to split a search's stage times by socket. No change
+  to the records is needed.
+
+Rows: `r178-warm`, `r178-W1`, `r178-W2`, `r178-H1-n0`, `r178-H1-n1` in
+`benchmarks.jsonl`. Their commit is rewritten to a32315a with `dirty: true`
+(probe print only). The run directories were in `/dev/shm` and are gone, and
+the numa_maps dumps were deleted.
