@@ -75,11 +75,27 @@ fi
 # job's own environment rather than the login node's (slurm.sh).
 export OUTPUT_DIR
 ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling-r2d2.sh
+# Every exec reads the image through squashfuse, and a cold node pages it in
+# off Lustre one fault at a time: a cold `import torch` took 46 s against 23 s
+# after this read, 64MB pieces 16 at a time (~1.8GB/s against one reader's
+# ~0.45GB/s), which costs ~3 s cold and ~1 s warm and overlaps the setup
+# below (csd3-speed.md, rounds 216 and 218).
+(sif_bytes="$(stat -c %s "${R2D2_SIF}")" && seq 0 $(((sif_bytes - 1) >> 26)) \
+  | xargs -P 16 -I{} dd if="${R2D2_SIF}" of=/dev/null bs=64M skip={} count=1 status=none) &
 # On a node without a GPU every worker would fail its first request, and a
 # failed evaluation is scored rather than fatal - so it is checked here, once,
 # before anything starts.
 if [ "${R2D2_DEVICE}" = cuda ]; then
-  if ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c \
+  # Asked of the driver, not torch: a torch import through squashfuse is
+  # 14-20 s even warm (round 218). The driver must run the image's CUDA major;
+  # anything this check cannot answer falls back to torch's own.
+  if ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c '
+import ctypes, glob, re, sys
+need = re.search(r"cuda: .*= .(\d+)\.", open(glob.glob("/opt/venv/lib/python3*/site-packages/torch/version.py")[0]).read())
+cu, n, v = ctypes.CDLL("libcuda.so.1"), ctypes.c_int(), ctypes.c_int()
+sys.exit(0 if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0
+         and cu.cuDriverGetVersion(ctypes.byref(v)) == 0 and v.value >= 1000 * int(need[1]) else 1)' 2>/dev/null \
+    && ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c \
       'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
     echo "FATAL: R2D2_DEVICE=cuda but no GPU is visible here - submit from a login node (it asks for one), or sintr -p ampere --gres=gpu:1" >&2
     rmdir "${OUTPUT_DIR}" 2>/dev/null || true

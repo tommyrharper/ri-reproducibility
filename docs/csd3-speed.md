@@ -10333,3 +10333,68 @@ tree, to check that it finishes rc 0 with log(Z) identical to
 against new, interleaved, along with deserialization and lane creation. It
 replaces round 216's probe job 39475003, which was cancelled before it ran.
 It had not started 35 minutes after submission. Read it in the next round.
+
+## Round 218 (start-up, GPU confirmation pending): a driver-only GPU check, and the R2D2 image read ahead
+
+**Why.** Round 217 left the torch import as the largest start-up cost: 35 s
+cold, 14 s warm. A GPU search pays it twice before its first evaluation:
+once in `run-nested-sampling-r2d2.sh`'s "is there a GPU" check (`import
+torch; torch.cuda.is_available()`) and once in the pool.
+
+**Why a warm import is still slow.** Apptainer 1.5.4 on CSD3 mounts each
+SIF through `squashfuse_ll` under `fuse-overlayfs`, one fresh mount per
+`exec`. Every exec therefore decompresses the image's libraries again
+(`torch/lib` is 946 MB and `nvidia/` is 2.7 GB in `r2d2-cuda.sif`), so the
+page cache only removes the Lustre reads. Warm on this node (cpu-q-203,
+load ~26): `apptainer exec ... true` takes 0.8 s, `python3 -c pass` takes
+1.6 s, and `import torch` takes 20.1 s (`-X importtime`: torch 14.1 s, of
+which `torch._C` is 3.7 s).
+
+**Cold image.** The image was dropped with `posix_fadvise(DONTNEED)`, which
+is only partial on Lustre (round 217), then one of two arms ran:
+`import torch` alone, or `import torch` after a 16-way 64 MB-piece read of
+the whole 3.9 GB SIF. The arms alternated, 3 pairs:
+
+| pair | import alone | read + import |
+|---|---|---|
+| 1 (the only truly cold one) | 46.3 s | 2.7 + 20.2 = 22.9 s |
+| 2 | 22.7 s | 0.8 + 19.9 = 20.7 s |
+| 3 | 22.8 s | 0.9 + 20.3 = 21.2 s |
+
+The read takes 2.7 s when the pages really are cold (1.4 GB/s) and 0.75 s
+when they are cached. In pairs 2 and 3 the eviction failed, so they only
+show the warm floor.
+
+**Change** (`run-nested-sampling-r2d2.sh` only, so WSClean is untouched):
+- Once inside the job, the script reads the R2D2 SIF in the background:
+  `dd` of 64 MB pieces, 16 at a time, finished in ~3 s cold. It overlaps the
+  GPU check and the rank budget, so the pool's import is served from the
+  page cache. The CPU path does the same with `r2d2.sif`, at ~0.1 s warm.
+- The GPU check now asks the driver directly through ctypes inside the
+  image: `cuInit`, `cuDeviceGetCount` > 0, and a `cuDriverGetVersion` major
+  of at least the image's torch CUDA major, which is read from
+  `torch/version.py` as text. It never imports torch. If this check fails or
+  errors, the old torch check runs, so it cannot reject a GPU that torch
+  would accept. On this GPU-less node the new check fails in 3.0 s, against
+  27.2 s for the torch check.
+
+Results cannot change: the read only fills the page cache, and the check
+only gates start-up. A short CPU search on this tree (9 ranks, nlive 24,
+60 dead points, seed 4242) finished rc 0: 338 evaluations, log(Z)
+0.01082 +/- 0.00832 (async, so it is not compared bit for bit), with its
+row `r218-cpu` in `benchmarks.jsonl` and its summary in
+`.probe/r218/summary-cpu.json`. `test_self_checks.py` (27) and
+`test-defaults.sh` pass. shellcheck 0.11 is clean on the changed script;
+its one finding is a pre-existing SC2217 in `progress-bar.sh`.
+
+**Expected.** On a warm GPU node, about 20 s less start-up from skipping the
+second torch import. On a cold node, a further ~20 s, because the pool's
+import no longer page-faults the image in from Lustre. That is against
+round 215's 90.9 s `startup_s`, or ~5% of a 13-minute converged search.
+
+**Pending.** GPU job 39478176 (`.probe/r218/job.sh`, 10 minutes, 1 A100)
+times the torch check and the driver check, alternated 3 times starting
+cold, to confirm that the driver check passes on a GPU node. Round 217's job
+39475183 runs `./ri search` from this working tree, so if it starts after
+this round its `startup_s` includes both rounds' changes. Neither had
+started when this round ended.
