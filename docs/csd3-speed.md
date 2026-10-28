@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 211; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 213; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -98,7 +98,14 @@ the Hetzner host.
   starts MPS. Short GPU arms are compared on `steady_evals_per_s`, because
   start-up and meqserver wedges move a 3-minute arm by up to 50%
   ([round 211](#round-211-positive-opt-in-mode-shared-tensorrt-without-mps-47-steady-and-short-gpu-arms-were-measuring-start-up-and-meqserver-wedges)).
-  Open: race it, steady, against per-worker `trt` and eager.
+  Raced steady against both on one A100 (600 dead points, 3 arms each):
+  shared 82.2 evals/s, per-worker `trt` 74.3, eager 66.4, log(Z) agreeing,
+  but shared won only 2 of 3 pairs against either. Run to convergence on
+  the 22 Sep production search it takes 13.5 minutes at **80.5 evals/s
+  against 69.6** for per-worker (+16%; steady 89.6 against 71.7), log(Z)
+  0.01708 and 0.01735 +/- 0.00042, with no meqserver wedge in either. The
+  default stays eager until the converged race against it (job 39470312)
+  is read ([round 213](#round-213-positive-opt-in-converged-shared-tensorrt-runs-the-production-search-16-faster-than-per-worker-tensorrt)).
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -10038,3 +10045,97 @@ before the stagger probe was added) came 80 s after its sbatch, inside the
   time-sample counts. Each one stops every rank for its whole retry ladder.
   Shortening that ladder for those shapes is a lever for production runs
   (WSClean shares this code, so it needs the WSClean guard).
+
+## Round 213 (positive, opt-in): converged, shared TensorRT runs the production search 16% faster than per-worker TensorRT
+
+**Question.** Round 211 found shared TensorRT without MPS at +47% steady over
+shared *with* MPS. Does it beat the other two GPU modes, per-worker
+`trt` (12 x 3, round 172's best) and eager torch (19 x 2, the GPU default)?
+
+**Run.** Job 39460028 (gpu-q-41, 1 x A100, 32 cores, `.probe/r212/job.sh`),
+submitted by gnhf iteration 212, which was cut off before it could read
+it. Tree `b41063c`; nlive 48, 5 repeats, 600 dead points, seed 4242, a
+discarded warm-up arm, then three interleaved triples. The iteration's
+reset dropped the ledger rows its arms had written, so this round rebuilt
+them (`r212-*`) from the saved `summary.json`s through `bench.row_for`,
+with host, commit and time set to the job's. Two
+settings the ledger did not group by, `R2D2_TRT_SHARED` and
+`R2D2_DEVICE`, are now `WORKLOAD_KEYS`; until now a shared and a
+per-worker arm at the same ranks and threads landed in one cell.
+
+| arm | mode | ranks x threads | evals/s | start-up + stall s | steady evals/s | simulate ms | request ms | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| S1 | shared | 19 x 2 | 77.2 | 24 | 97.2 | 33.9 | 193 | 0.0188058162526177 +/- 0.000598 |
+| T1 | per-worker | 12 x 3 | 66.7 | 12 + 2 | 75.0 | 22.3 | 136 | 0.0190883982001229 +/- 0.000659 |
+| E1 | eager | 19 x 2 | 56.2 | 14 | 61.5 | 32.0 | 281 | 0.0189418368847199 +/- 0.000607 |
+| E2 | eager | 19 x 2 | 56.2 | 11 | 60.1 | 29.1 | 284 | 0.0190002868972952 +/- 0.000605 |
+| S2 | shared | 19 x 2 | 69.9 | 23 | 83.0 | 37.1 | 214 | 0.0189079731728229 +/- 0.000611 |
+| T2 | per-worker | 12 x 3 | 68.7 | 13 + 2 | 77.7 | 22.4 | 131 | 0.0188547315624287 +/- 0.000653 |
+| T3 | per-worker | 12 x 3 | 63.5 | 13 + 2 | 70.2 | 26.1 | 140 | 0.018743075134026 +/- 0.000662 |
+| E3 | eager | 19 x 2 | 71.1 | 11 | 77.8 | 28.3 | 218 | 0.0182637019071869 +/- 0.000751 |
+| S3 | shared | 19 x 2 | 57.0 | 23 | 66.4 | 49.8 | 258 | 0.0188935993662264 +/- 0.000608 |
+
+(The warm-up arm, shared, ran 53.7 evals/s with 90 s of start-up, 98.0
+steady.)
+
+**Result.** Mean steady rate: shared **82.2**, per-worker 74.3, eager 66.4.
+Shared beat per-worker in triples 1 and 2 and lost in 3; it beat eager in
+1 and 2 and lost in 3. Its own arms span 66-97, against 70-78 for
+per-worker: S3's simulate (49.8 ms against ~34) shows the whole node
+slowed under it, and shared's 19 ranks x 2 threads already ask 38
+threads of 32 cores, so it feels CPU contention the 12-rank per-worker
+layout does not. No mode stalled mid-run (per-worker's 2 s is the
+TensorRT engine load after the first evaluations). log(Z) agrees across all
+nine (0.0183-0.0191, errors 0.0006-0.0008). Shared's +11% over per-worker
+is inside this node's spread, so the GPU default stays eager torch. The
+decider is round 211's priority: a converged, production-shaped race
+(the 22 Sep search: seed 190182240, nlive 150, 15 repeats), shared
+19 x 2 against per-worker 12 x 3 in one 1-GPU job.
+
+**Converged race.** Job 39467111 (gpu-q-16, `.probe/r213/job.sh`), one
+arm each, shared first, on this round's tree (`b41063c` plus the
+`WORKLOAD_KEYS` edit, which no search reads). Rows `r213-S`, `r213-T`.
+
+| | shared 19 x 2 | per-worker 12 x 3 | round 195 (CPU, 38 icelake) |
+| --- | ---: | ---: | ---: |
+| search wall (job's clock) | **865 s** | 924 s | 1,393 s |
+| evaluations | 65,071 | 62,024 | 66,973 |
+| evals/s | **80.5** | 69.6 | 48.1 |
+| start-up + stall s | 77 + 4.8 | 16.7 + 9.1 | |
+| steady evals/s | **89.6** | 71.7 | |
+| request ms per evaluation | 186 | 125 | 744 |
+| simulate ms per evaluation | 31.0 | 26.5 | 35 |
+| idle fraction | 0.59% | 0.79% | 1.0% |
+| dead points / likelihood calls | 1,322 / 64,364 | 1,283 / 61,593 | 1,472 / |
+| log(Z) | 0.0170806350771138 +/- 0.000422116 | 0.0173488323913882 +/- 0.000424796 | 0.017334457686004 +/- 0.000411387 |
+
+Shared mode converges 16% faster by the headline rate and 25% by the
+steady one, and it would be more on a longer search: its start-up is 77 s
+against 17 (the server builds or loads all 25 engines before the first
+forward). The two log(Z)s are 0.45 sigma apart and both within 0.6 sigma of
+round 195's CPU run. Neither run had a single slow simulate: no
+evaluation's simulate took over 5 s, so on a production-shaped GPU search
+meqserver wedges cost nothing here. Round 211's wedges were all in short
+arms' first ~100 s, and these two runs' first 100 s had none, so the
+wedge rate is low enough that priority 1 needs many more runs (or a
+forced wedge) to measure. One converged pair is not an interleaved A/B,
+but the effect is 4x this host's ~4% sequential bias. A GPU on the
+production search now does in 14 minutes what half an icelake node does
+in 23.
+
+**Pending.** The GPU default is eager torch, which neither arm measured
+converged. Job 39470312 (`.probe/r214/job.sh`) runs eager 19 x 2 and then
+shared on the same search, to decide whether `R2D2_TRT_SHARED=1
+R2D2_RUNTIME=trt` becomes the GPU default.
+
+**Learned.**
+- When an iteration is reset, the ledger rows its job writes before the
+  reset are lost; rows written afterwards survive uncommitted. Have a job
+  save each `summary.json` itself (this one did), so rows can be rebuilt.
+- A production-shaped GPU search (65k evaluations, 14 minutes) had no
+  meqserver wedge in either of two runs, so wedges are not a steady cost
+  of GPU searches; they need a forced reproduction to study.
+- In shared mode the CPU, not the card, sets the spread: its slowest arm
+  was the one where simulate ran 47% slow. 15-16 ranks x 2 threads (no
+  oversubscription) may be the steadier shared layout.
+
