@@ -11109,3 +11109,82 @@ worktree are deleted. Self-checks: `self_check_chains_mirror` now asserts that a
 text file keeps its inode (rewritten in place) and that the `.resume` gets a
 new one (renamed); 30 host checks pass. GPU job 39497293 (round 224's
 gathering A/B) still had no output at 20:49 and was not read.
+
+## Round 230 (validation): rounds 201-229 in the 22 Sep production search, +5%, and a new idle source
+
+**Question.** The last end-to-end check of the R2D2 CPU defaults was round
+200 (`d96a8e0`). Rounds 201-229 changed start-up (202, 203, 228), the
+post-run work (201) and where PolyChord writes `chains/` (227, 229). What do
+they add up to in the production search, and does log(Z) still agree?
+
+**Method.** Round 200's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs), on
+`69e2a2f`. Script `.probe/r230/run.sh`. Other users' jobs shared the node
+on socket 1 (load 34 at the start, 90-121 during the run, against 20-85 in
+round 200). Two short warm-up searches came first: `r230-t1` (default nlive
+8, 9 ranks) and `r230-t2` (nlive 48, 20 ranks, with timing prints in the
+post-run path that have since been removed, so its row is marked dirty).
+
+| | round 200 (`d96a8e0`) | round 230 (`69e2a2f`) |
+| --- | ---: | ---: |
+| evaluations | 77,570 | 72,429 |
+| search wall | 1,597.1 s | 1,418.8 s |
+| evals/s | 48.6 | **51.1** (+5.1%) |
+| request (`image_container`) | 737 ms | **660 ms** (-10.4%) |
+| simulate (MeqTrees) | 32 ms, 4.0% | 26 ms, 3.5% |
+| evaluating share of worker-time | 98.3% | 92.3% |
+| PolyChord (no evaluation in flight) | 0.2% | 1.4% (19.5 s of wall) |
+| idle (waiting on other workers) | 1.5% | **6.3%** |
+| post-run: records, flush, prune, summary, pack | 2.3, 0.6, 5.6, 2.6, 2.9 s | 1.9, 0.5, 3.2, **13.0**, 2.8 s |
+| command wall minus search wall | 24.8 s | 30.4 s |
+| log(Z) | 0.0174329374131255 +/- 0.000408558342628129 | 0.0171997434919644 +/- 0.000400520669269346 |
+| ndead, nlike | 1,455, 75,995 | 1,481, 71,014 |
+
+**Results.**
+- The current defaults run the production search at 51.1 evals/s against
+  round 200's 48.6. log(Z) agrees within 0.41 sigma (difference 0.000233,
+  combined error 0.000572).
+- The request itself is 10% faster (660 ms against 737). No change since
+  round 200 touched the U-Net forward, so this is most likely a quieter
+  socket 0 this time, not a lever. At 51.1 evals/s x 3.10 GB, the search
+  is drawing 158 GB/s of weights, 96% of round 205's measured read peak.
+- Idle is the new cost: 6.3% of worker-time against 1.5%. Binning the
+  evaluations' start and end times (`.probe/r230/idle.py`) shows where it
+  goes:
+  - One gap with no starts at all: 16.9 s at t=616 s, which is `stall_s`
+    (round 200 had a 3.6 s gap at t=610 s, likely the same PolyChord
+    event).
+  - Four or five drains at t~720, 870, 1020, 1320 and 1410 s. Starts per
+    10 s drop from ~550 to 160-350 for 10-30 s, while requests in those
+    bins get *faster* (0.43-0.51 s against 0.65). The workers are not slow:
+    they are waiting for seeds. The root hands them out more slowly there,
+    without stopping. Round 200's bins show none of this (only t=600 and
+    the end fall below 90% busy).
+  - Below 38 in flight, the run lost 4,145 worker-s against round 200's
+    1,017.
+- Post-run `summary` took 13.0 s against 2.6. It is `write_json_atomic` to
+  Lustre, a create plus a rename, and round 229 measured that blocking for
+  up to 41 s under load. It is a one-off per run, but it is now the biggest
+  post-run part.
+
+**Learned.**
+- With chains on tmpfs (round 227), the remaining whole-search idle in the
+  CPU production search is not blocked creates. It is the root dispatching
+  slowly for 10-30 s at a time, and it costs ~5% of worker-time. Next step:
+  sample `/proc/<root pid>/stack`, `wchan`, `syscall` and the CPU it is on,
+  every 0.5 s through a production-length run, then match the samples to
+  the drain windows. Candidates are the root's own PolyChord work (posterior
+  and cluster files, which grow with ndead), CPU contention on rank 0's CPU
+  (39 ranks on 38 CPUs, round 186, plus the mirror child and record packer
+  on the unpinned CPUs), and stdout back-pressure through the `run.log` tee
+  on Lustre.
+- Binned starts, not just the idle total, separate a stall (no starts, the
+  root blocked) from a drain (fewer starts, faster requests, the root
+  slowed). `stall_s` sees only the first.
+
+Rows: `r230-bigrun` (bench), `r230-t1`, `r230-t2` (short warm-ups) and stage
+row `r230-validation`, with log(Z) at full precision and the drain windows,
+are in `benchmarks.jsonl`. `summary.json`, `chains/r2d2_vlaa.stats`, the
+profile and the row are kept in `.probe/r230/`. The run directory (10,116
+files) is deleted. GPU job 39497293 (round 224's gathering A/B) is still
+pending: at 21:30 Slurm put its start at 07:35 on 29 Oct.
