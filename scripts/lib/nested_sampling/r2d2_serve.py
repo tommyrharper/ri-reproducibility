@@ -1174,8 +1174,10 @@ def serve_pool(fifo_dir: str) -> None:
     while True:
         pid, _status = os.wait()
         if pid == server:
-            # Its workers notice (closed socket) and run the CPU U-Net.
-            print(f"r2d2 TensorRT forward server exited ({_status})", file=sys.stderr)
+            # Its workers notice (closed socket) and run the CPU U-Net: right
+            # answers at a sixth of the rate, which nothing else shows (round
+            # 219), so it is recorded where `./ri health` looks.
+            record_trt_server_exit(_status)
             continue
         base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
@@ -1186,6 +1188,13 @@ def serve_pool(fifo_dir: str) -> None:
         for fd in keeper.pop(base, ()):
             os.close(fd)
         fork(base, replacement=True)
+
+
+def record_trt_server_exit(wait_status: int) -> None:
+    print(f"r2d2 TensorRT forward server exited ({wait_status})", file=sys.stderr)
+    with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
+        status.write(f"fallback: server exited ({wait_status}) at "
+                     f"{time.strftime('%Y-%m-%dT%H:%M:%S')}, CPU U-Net from here\n")
 
 
 def start_trt_server(bases: list[str]) -> int:
@@ -1733,6 +1742,7 @@ def self_check_trt_fallback() -> None:
 def self_check_trt_shared_protocol() -> None:
     """A worker's forwards round-trip, drop stale replies, and fall back to the CPU net."""
     import socket
+    import tempfile
     import threading
 
     import torch
@@ -1772,6 +1782,18 @@ def self_check_trt_shared_protocol() -> None:
         _TRT_SOCKET[:] = [None, 0]
         worker_end.close()
         os.environ.pop("NS_IMAGE_DIM")
+    # The server's exit lands in the status file `./ri health` reads.
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = Path(tmp, "r2d2-engine.txt")
+        engine.write_text("shared: one server, 19 lanes\n")
+        os.environ["R2D2_TRT_STATUS"] = str(engine)
+        try:
+            with redirect_fds(Path(os.devnull), Path(os.devnull)):
+                record_trt_server_exit(139)
+        finally:
+            os.environ.pop("R2D2_TRT_STATUS")
+        last = engine.read_text().splitlines()[-1]
+        assert last.startswith("fallback: server exited (139) at "), last
     print("r2d2 trt shared protocol self-check passed")
 
 

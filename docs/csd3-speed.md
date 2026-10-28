@@ -10494,3 +10494,30 @@ threading does not help. That is now the largest single item in a shared
 search's start-up after the imports. Sharing one context per net across
 lanes is not possible, because a context holds its own bindings. The next
 step is to profile what `create_execution_context` spends its time on.
+
+## Round 220 (robustness, no speed change): a dead shared TensorRT server is now reported
+
+Round 219 showed that when the shared TensorRT server dies, every worker
+quietly falls back to the CPU U-Net. The search keeps going with right
+answers but at CPU speed (14.9 against 100 steady evals/s), and the only
+sign was one line in stderr. A production GPU search could lose most of
+its allocation that way without anyone noticing.
+
+**Change.** When the pool parent sees the server exit
+(`record_trt_server_exit` in `r2d2_serve.py`), it now appends
+`fallback: server exited (<wait status>) at <time>, CPU U-Net from here`
+to `<run>/r2d2-engine.txt`. `./ri health` warns on that line while the run
+is unfinished: it says the forwards are on the CPU and that stopping the
+run and running `./ri resume <run>` starts a new server. A finished run
+stays silent. The server is not restarted inside the pool because its
+socket ends are closed in the parent. A crash that came from the plans
+(as round 219's CUDA graphs did) would just crash again, so resuming is
+the honest remedy.
+
+**Checks.** `self_check_trt_shared_protocol` (in r2d2.sif) checks the
+record line. The health self-check covers three cases: unfinished with
+the fallback line (warns), the same run finished (silent), and no fallback
+line (silent). `test_self_checks.py` passes 27. Nothing in a forward or
+in scoring changed, and the new code only runs after the server has
+exited, so results and throughput cannot change. CPU and WSClean searches
+never start a server, so no A/B was run.
