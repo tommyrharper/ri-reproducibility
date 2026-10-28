@@ -294,7 +294,8 @@ case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
     fi
     if [ "${R2D2_RUNTIME}" = trt ]; then
       R2D2_POOL_FLAGS+=(--bind "${R2D2_TRT_DIR}:/opt/r2d2-trt" --env R2D2_TRT_STATUS="${OUTPUT_DIR}/r2d2-engine.txt"
-        --env NS_IMAGE_DIM="${NS_IMAGE_DIM}" --env R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}")
+        --env NS_IMAGE_DIM="${NS_IMAGE_DIM}" --env R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}"
+        --env R2D2_TRT_BATCH="${R2D2_TRT_BATCH:-1}" --env R2D2_TRT_LANES="${R2D2_TRT_LANES:-2}")
     fi
     ;;
   *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;

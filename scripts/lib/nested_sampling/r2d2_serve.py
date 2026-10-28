@@ -396,12 +396,15 @@ _TRT_PLANS: dict[int, Path] = {}
 _TRT_CONTEXTS: dict[int, tuple] = {}
 
 
-def build_trt_plans(models: Path, dim: int, num_iter: int) -> Path:
+def build_trt_plans(models: Path, dim: int, num_iter: int, batch: int = 1) -> Path:
     """Build each missing fp32 plan for this GPU and image size; return their directory.
 
     Runs in a child of the pool parent (`--build-trt-plans`), which must not
     make a CUDA context. TF32 is cleared, as for eager. One fixed input shape,
-    1x2xDIMxDIM: a forward of any other shape runs eager instead.
+    1x2xDIMxDIM: a forward of any other shape runs eager instead. With `batch`
+    above 1 (R2D2_TRT_BATCH), for the gathering server, each plan has a fixed
+    profile per batch size in trt_batch_sizes(batch), in a directory of its
+    own: one dynamic 1..8 profile ran 27-28% slower at every size (round 224).
     """
     import torch
 
@@ -409,7 +412,9 @@ def build_trt_plans(models: Path, dim: int, num_iter: int) -> Path:
     import tensorrt as trt
 
     gpu = "".join(c if c.isalnum() else "_" for c in torch.cuda.get_device_name())
-    plans = TRT_DIR / "plans" / f"{models.name}-{trt.__version__}-{gpu}-{dim}"
+    sizes = trt_batch_sizes(batch)
+    suffix = "-b" + "-".join(map(str, sizes)) if batch > 1 else ""
+    plans = TRT_DIR / "plans" / f"{models.name}-{trt.__version__}-{gpu}-{dim}{suffix}"
     plans.mkdir(parents=True, exist_ok=True)
     log = trt.Logger(trt.Logger.ERROR)
     shape = (1, 2, dim, dim)
@@ -424,9 +429,15 @@ def build_trt_plans(models: Path, dim: int, num_iter: int) -> Path:
             raise RuntimeError(f"TensorRT could not parse N{cur_iter}.onnx: {parser.get_error(0)}")
         config = builder.create_builder_config()
         config.clear_flag(trt.BuilderFlag.TF32)
-        profile = builder.create_optimization_profile()
-        profile.set_shape("x", shape, shape, shape)
-        config.add_optimization_profile(profile)
+        if batch > 1:
+            # The ONNX is exported with batch 1; this rebuild is no further
+            # from the production plan than a batch-1 rebuild (round 223).
+            network.get_input(0).shape = (-1, *shape[1:])
+        for size in sizes:
+            profile = builder.create_optimization_profile()
+            fixed = (size, *shape[1:])
+            profile.set_shape("x", fixed, fixed, fixed)
+            config.add_optimization_profile(profile)
         plan = builder.build_serialized_network(network, config)
         if plan is None:
             raise RuntimeError(f"TensorRT could not build N{cur_iter}")
@@ -509,7 +520,8 @@ def patch_trt_network(checkpoint_path: Path) -> None:
     models = export_onnx(checkpoint_path)
     num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
     dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
-    built = subprocess.run([sys.executable, __file__, "--build-trt-plans", str(models), str(dim), str(num_iter)],
+    built = subprocess.run([sys.executable, __file__, "--build-trt-plans", str(models), str(dim), str(num_iter),
+                            str(trt_batch())],
                            capture_output=True, text=True)
     concurrent.futures.wait(prefetched)
     prefetch.shutdown()
@@ -552,6 +564,22 @@ def trt_shared() -> bool:
     """
     return (r2d2_device() == "cuda" and r2d2_runtime() == "trt"
             and os.environ.get("R2D2_TRT_SHARED", "0") == "1")
+
+
+def trt_batch() -> int:
+    """R2D2_TRT_BATCH=N (shared server only): run up to N workers' forwards of one net as one launch.
+
+    One 32x32 forward leaves most of an A100 idle: batches of 8 on 4 streams
+    put 3.05x the batch-1 ceiling through it (csd3-speed.md, round 223). The
+    gathering server (serve_trt_gathered) serves whichever net has the most
+    forwards waiting, so batches form without a waiting window.
+    """
+    return max(1, int(os.environ.get("R2D2_TRT_BATCH") or 1)) if trt_shared() else 1
+
+
+def trt_batch_sizes(batch: int) -> list[int]:
+    """The batch sizes a gathering plan has a profile for: powers of two below `batch`, then `batch`."""
+    return sorted({1 << k for k in range(batch.bit_length()) if 1 << k < batch} | {batch})
 
 
 # A forward request is (iteration, worker pid, sequence) then the input's
@@ -684,6 +712,154 @@ def serve_trt_shared(socks: list, dim: int) -> None:
         status.write(f"shared: one server, {len(threads)} lanes\n")
     for thread in threads:
         thread.join()
+
+
+def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> None:
+    """Serve workers' forward requests in batches: one reader thread, `lanes` threads running batches.
+
+    The reader queues each request by net; a free lane takes up to `batch` of
+    the net with most waiting and calls forward(lane, cur_iter, requests),
+    which returns each request's output bytes, or None if it cannot run that
+    net (each worker is then answered with the bare header and runs it on the
+    CPU). Returns once every worker's socket has closed.
+    """
+    import selectors
+    import threading
+
+    pending: dict[int, list] = {}
+    ready = threading.Condition()
+    reading = [True]
+
+    def read():
+        selector = selectors.DefaultSelector()
+        for sock in socks:
+            selector.register(sock, selectors.EVENT_READ)
+        while selector.get_map():
+            for key, _ in selector.select():
+                try:
+                    request = key.fileobj.recv(size)
+                except OSError:
+                    request = b""
+                if not request:
+                    selector.unregister(key.fileobj)
+                    continue
+                header = request[:_TRT_HEADER.size]
+                if len(request) != size:
+                    try:
+                        key.fileobj.send(header)
+                    except OSError:
+                        pass
+                    continue
+                with ready:
+                    pending.setdefault(_TRT_HEADER.unpack(header)[0], []).append((key.fileobj, request))
+                    ready.notify()
+        with ready:
+            reading[0] = False
+            ready.notify_all()
+
+    def run(lane):
+        while True:
+            with ready:
+                while not pending and reading[0]:
+                    ready.wait()
+                if not pending:
+                    return
+                cur_iter = max(pending, key=lambda net: len(pending[net]))
+                group, pending[cur_iter] = pending[cur_iter][:batch], pending[cur_iter][batch:]
+                if not pending[cur_iter]:
+                    del pending[cur_iter]
+            try:
+                outputs = forward(lane, cur_iter, [request for _, request in group])
+            except Exception:
+                # A lane gone would leave its workers waiting for ever; the
+                # whole server going shows each a closed socket instead.
+                traceback.print_exc()
+                os._exit(1)
+            for i, (sock, request) in enumerate(group):
+                try:
+                    sock.send(request[:_TRT_HEADER.size] + (b"" if outputs is None else outputs[i]))
+                except OSError:
+                    pass
+
+    threads = [threading.Thread(target=read, daemon=True)]
+    threads += [threading.Thread(target=run, args=(lane,), daemon=True) for lane in range(lanes)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
+    """The forward server for R2D2_TRT_BATCH: each plan loaded once, a few lanes running batched forwards.
+
+    A lane is a stream, buffers for `batch` images and a context per net and
+    batch size; R2D2_TRT_LANES (default 2) of them keep the card busy while
+    the others copy (round 223's simulation put 2 ahead of 1 and 4). A group
+    runs at the smallest size that holds it; the rows past it are whatever
+    the buffer held, since a row's output does not depend on the others'
+    (round 224).
+    """
+    import concurrent.futures
+
+    import numpy as np
+    import torch
+
+    import tensorrt as trt
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+    with concurrent.futures.ThreadPoolExecutor(8) as reader:
+        blobs = reader.map(Path.read_bytes, _TRT_PLANS.values())
+        engines = {cur_iter: runtime.deserialize_cuda_engine(blob) for cur_iter, blob in zip(_TRT_PLANS, blobs)}
+    scratch = max(engine.device_memory_size_v2 for engine in engines.values())
+    device = torch.device("cuda")
+    size = _TRT_HEADER.size + 2 * dim * dim * 4
+    row = 2 * dim * dim * 4
+    sizes = trt_batch_sizes(batch)
+    lanes = []
+    for _ in range(max(1, int(os.environ.get("R2D2_TRT_LANES") or 2))):
+        x = torch.empty(batch, 2, dim, dim, device=device)
+        y = torch.empty(batch, 1, dim, dim, device=device)
+        hx = torch.empty(batch, 2, dim, dim, pin_memory=True)
+        hy = torch.empty(batch, 1, dim, dim, pin_memory=True)
+        # Each lane's own scratch, kept alive in the tuple (see serve_trt_shared).
+        memory = torch.empty(scratch, dtype=torch.uint8, device=device)
+        stream = torch.cuda.Stream()
+        contexts = {}
+        for cur_iter, engine in engines.items():
+            for index, size in enumerate(sizes):
+                context = engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                context.set_optimization_profile_async(index, stream.cuda_stream)
+                context.set_input_shape("x", (size, 2, dim, dim))
+                context.set_tensor_address("x", x.data_ptr())
+                context.set_tensor_address("y", y.data_ptr())
+                context.set_device_memory(memory.data_ptr(), scratch)
+                contexts[cur_iter, size] = context
+        lanes.append((stream, x, y, hx, hy, hx.numpy().reshape(-1).view(np.uint8),
+                      hy.numpy().reshape(batch, -1), contexts, memory))
+    torch.cuda.synchronize()
+
+    def forward(lane, cur_iter, requests):
+        stream, x, y, hx, hy, hx_bytes, hy_rows, contexts, _memory = lanes[lane]
+        n = len(requests)
+        padded = next(size for size in sizes if size >= n)
+        context = contexts.get((cur_iter, padded))
+        if context is None:
+            return None
+        for i, request in enumerate(requests):
+            hx_bytes[i * row:(i + 1) * row] = np.frombuffer(request, np.uint8, offset=_TRT_HEADER.size)
+        with torch.cuda.stream(stream):
+            x[:n].copy_(hx[:n], non_blocking=True)
+            ok = context.execute_async_v3(stream.cuda_stream)
+            hy[:n].copy_(y[:n], non_blocking=True)
+            done = torch.cuda.Event(blocking=True)
+            done.record(stream)
+        done.synchronize()
+        return [hy_rows[i].tobytes() for i in range(n)] if ok else None
+
+    with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
+        status.write(f"shared: one server, {len(socks)} workers gathered into batches of up to {batch} "
+                     f"on {len(lanes)} lanes\n")
+    gather_forwards(socks, size, batch, len(lanes), forward)
 
 
 def job_numa_cpus() -> dict[int, list[int]]:
@@ -1223,7 +1399,10 @@ def start_trt_server(bases: list[str]) -> int:
         try:
             for sock in _TRT_WORKER_SOCKETS.values():
                 sock.close()
-            serve_trt_shared(server_ends, dim)
+            if trt_batch() > 1:
+                serve_trt_gathered(server_ends, dim, trt_batch())
+            else:
+                serve_trt_shared(server_ends, dim)
         except Exception:
             traceback.print_exc()
             status = 1
@@ -1800,6 +1979,64 @@ def self_check_trt_shared_protocol() -> None:
     print("r2d2 trt shared protocol self-check passed")
 
 
+def self_check_trt_gathered() -> None:
+    """Gathered forwards reach the right worker, in batches no larger than asked, and the server ends."""
+    import array
+    import socket
+    import threading
+
+    dim, batch, workers, nets = 2, 4, 9, 5
+    row = 2 * dim * dim * 4
+    size = _TRT_HEADER.size + row
+    pairs = [socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET) for _ in range(workers)]
+    batches = []
+    lock = threading.Lock()
+
+    def forward(lane, cur_iter, requests):
+        if cur_iter == nets:  # a net the server has no engine for
+            return None
+        time.sleep(0.002)  # long enough that others' requests queue behind this one
+        with lock:
+            batches.append(len(requests))
+        # Each output is the first half of the input times the net's number.
+        return [array.array("f", [v * cur_iter for v in array.array("f", request[_TRT_HEADER.size:])[:dim * dim]]
+                            ).tobytes() for request in requests]
+
+    server = threading.Thread(target=gather_forwards, args=([b for _, b in pairs], size, batch, 2, forward), daemon=True)
+    server.start()
+    failures = []
+
+    def worker(index, sock):
+        for seq in range(3 * nets):
+            cur_iter = seq % nets + 1
+            x = array.array("f", [index * 1000 + seq + k for k in range(2 * dim * dim)])
+            header = _TRT_HEADER.pack(cur_iter, index, seq)
+            sock.send(header + x.tobytes())
+            reply = sock.recv(size)
+            want = b"" if cur_iter == nets else array.array("f", [v * cur_iter for v in x[:dim * dim]]).tobytes()
+            if reply != header + want:
+                failures.append((index, seq))
+        sock.send(b"short")
+        if sock.recv(size) != b"short"[:_TRT_HEADER.size]:
+            failures.append((index, "short"))
+        sock.close()
+
+    clients = [threading.Thread(target=worker, args=(i, a)) for i, (a, _) in enumerate(pairs)]
+    for client in clients:
+        client.start()
+    for client in clients:
+        client.join()
+    server.join(10)
+    assert not server.is_alive(), "server did not end when every worker's socket closed"
+    for _, b in pairs:
+        b.close()
+    assert not failures, failures
+    assert sum(batches) == workers * 3 * (nets - 1), batches
+    assert max(batches) <= batch, batches
+    assert max(batches) > 1, f"nothing was gathered: {batches}"
+    print(f"r2d2 trt gathered self-check passed (mean batch {sum(batches) / len(batches):.1f})")
+
+
 def self_check_interleaved_pages() -> None:
     nodes = job_numa_nodes()
     if Path("/sys/devices/system/node/node0").is_dir():
@@ -1846,8 +2083,9 @@ if __name__ == "__main__":
         self_check_worker_nodes()
         self_check_trt_fallback()
         self_check_trt_shared_protocol()
+        self_check_trt_gathered()
     elif sys.argv[1:2] == ["--build-trt-plans"]:
-        print(build_trt_plans(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])))
+        print(build_trt_plans(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])))
     elif sys.argv[1:2] == ["--fifo-dir"]:
         serve_pool(sys.argv[2])
     else:

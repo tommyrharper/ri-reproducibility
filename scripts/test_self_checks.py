@@ -42,6 +42,7 @@ HOST_RUNNABLE = {
         "self_check_serve_fifo",
         "self_check_serve_pool",
         "self_check_serve_reply_stream",
+        "self_check_trt_gathered",
         "self_check_worker_nodes",
     ),
 }

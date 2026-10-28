@@ -10697,3 +10697,77 @@ would quadruple the 5.3 GB of plans. Check that a row's output does not
 depend on its position or on the other rows in the batch, then build the
 gathering server behind an opt-in (`R2D2_TRT_BATCH`) and race it against
 today's shared server for log(Z) and steady evals/s.
+
+## Round 224 (opt-in, GPU A/B pending): a gathering TensorRT server with one fixed profile per batch size
+
+**Why.** Round 223 found batches of 8 on 4 streams put 3.05x the batch-1
+ceiling through an A100, and left two questions before building a server:
+can one engine per net serve every batch size (so the weights are held
+once), and does a row's output depend on its batch-mates?
+
+**Probe.** 1-GPU ampere job 39496395 (gpu-q-12, `.probe/r224/probe.py`)
+rebuilt N1 and N13 from the production ONNX four ways and timed N1 on 4
+streams, 3 s per arm, 2 passes (images/s; a size between profiles is
+padded up and counts only its real rows):
+
+| N1 engine | plan | B1 | B2 | B3 | B4 | B6 | B8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| production (fixed 1) | 212.5 MB | 1,757 | - | - | - | - | - |
+| fixed 1 rebuild | 212.5 MB | 1,765, 1,770 | - | - | - | - | - |
+| fixed 8 | 212.6 MB | - | - | - | - | - | 6,955, 6,970 |
+| one profile, min 1 opt 8 max 8 | 136.0 MB | 1,285, 1,286 | 2,310, 2,312 | 2,953, 3,021 | 3,732, 3,767 | 4,400, 4,400 | 5,014, 4,975 |
+| one profile, min 1 opt 4 max 8 | 169.0 MB | 1,514, 1,515 | 2,467, 2,477 | 3,024, 3,025 | 3,534, 3,525 | 4,164, 4,129 | 4,666, 4,690 |
+| **four fixed profiles 1, 2, 4, 8** | 415.2 MB | **1,773, 1,764** | **2,882, 2,877** | 3,807, 3,792 | **5,083, 5,054** | 5,538, 5,523 | **7,372, 7,374** |
+
+- A dynamic batch dimension costs 27-28% at *every* size, B=1 included:
+  TensorRT picks kernels for the range, not the size. Fixed profiles in one
+  engine keep each size's fixed-shape rate (B1 1,773 as production's 1,757;
+  B8 7,372 as fixed-8's 6,955-6,970), for 2x the plan (415 MB; 25 nets
+  ~10 GB on an 80 GB card) and a 35-38 s build per net instead of 9-11 s.
+- **A row's output does not depend on its position or its batch-mates**:
+  bit-identical with the image first or last and with other mates, in every
+  engine and at every size. In a dynamic engine it is even bit-identical
+  across sizes; across fixed profiles it is not (each profile has its own
+  kernels). So the padding rows can hold anything, and a batched search's
+  outputs differ from a batch-1 one only as two TensorRT builds do.
+- Largest difference from the production plan as a fraction of the peak:
+  N1 3.6e-6 (fixed-1 rebuild), 4.8e-6 (fixed 8), 6.5e-6 / 6.7e-6 (dynamic),
+  9.1e-6 (four profiles); N13 4.4e-6, 6.3e-6, 11.5e-6 / 9.2e-6, 9.9e-6. All
+  at round 168's ~1e-5 TensorRT-to-CPU gap that converged searches accept,
+  so the test is log(Z) agreement, as for every GPU change since round 171.
+
+**Change (opt-in, default unchanged).** `R2D2_TRT_BATCH=N` (with the shared
+server, the GPU default) builds plans with a fixed profile per size in
+`trt_batch_sizes(N)` (powers of two below N, then N: 1, 2, 4, 8 for 8)
+into their own `-b1-2-4-8` directory, and forks `serve_trt_gathered`
+instead of `serve_trt_shared`. Workers and the socket protocol are
+unchanged. The server is one selector thread that queues requests by net
+and `R2D2_TRT_LANES` (default 2, the simulation's best) lane threads, each
+with its own stream, scratch, pinned buffers and a context per net and
+size (200 contexts at 2 lanes, ~5 s, against 475 today); a free lane takes
+up to N requests of whichever net has most waiting and runs them at the
+smallest size that holds them. A lane that raises takes the server down
+(`os._exit`), so workers see a closed socket and fall back to the CPU, as
+round 220 reports, rather than waiting for ever. `R2D2_TRT_BATCH=1` (the
+default) builds and serves exactly as before: same plan directory, one
+fixed 1x2x32x32 profile. Both settings are recorded in `run.env` for
+`./ri resume` and in each `benchmarks.jsonl` row's settings.
+
+**Checks.** New host-runnable `self_check_trt_gathered`: 9 threads x 15
+forwards over 5 nets through `gather_forwards` with a fake 2 ms forward;
+every reply reaches its own worker with its own output, no batch exceeds
+the cap, batches do form (mean 2.4-2.8), a net with no engine and a short
+request get the bare header, and the server returns once every socket
+closes. `scripts/test_self_checks.py` 28 pass; `bench.py`, `run-config.sh`
+self-checks, `test_cli.py`, `bash -n`, `compileall` pass. WSClean is not
+touched: the `run-config.sh` lines sit in its R2D2-only branch and print
+nothing unless the variables are set.
+
+**Pending.** 1-GPU job 39497293 (`.probe/r224/ab.sh`) builds the 25
+four-profile plans once (~15 min), then alternates default (A) and
+`R2D2_TRT_BATCH=8` (B) seed-4242 searches with round 221-D's settings
+(`--nlive 48 --num-repeats 5 --max-ndead 600`; r221-D: steady 85.0
+evals/s, log(Z) 0.0169791852331699 +/- 0.00171834943813729) as A B A B,
+then `R2D2_TRT_LANES=4`. Read `.probe/r224/ab-39497293.out` next round:
+compare `steady_evals_per_s` and log(Z), and check `r2d2-engine.txt` says
+"gathered" rather than "fallback".
