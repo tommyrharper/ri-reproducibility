@@ -1509,6 +1509,137 @@ class PolyChordFinish:
                   "after PolyChord finished", flush=True)
 
 
+CHAINS_MIRROR_SECONDS = 2.0
+
+
+def chains_base_dir(output_dir: Path) -> Path:
+    """Where PolyChord writes: node tmpfs, mirrored to <run>/chains (round 227).
+
+    The root creates <root>_temp.resume at every checkpoint, and on CSD3's
+    Lustre about one such create in 60-80 blocks 15-45s; no worker gets a seed
+    meanwhile, so the whole search stops (round 225). mpirun forks every
+    rank on one node, so they all see the same tmpfs.
+    """
+    chains = output_dir / "chains"
+    if os.environ.get("NS_CHAINS_TMPFS", "1") == "0" or not os.path.isdir("/dev/shm"):
+        return chains
+    import hashlib
+
+    tag = hashlib.sha1(str(chains.resolve()).encode()).hexdigest()[:16]
+    return Path("/dev/shm") / f"ri-chains-{tag}"
+
+
+def sync_chains(src: Path, dst: Path, seen: dict[Path, tuple[int, int]]) -> int:
+    """Copy each file changed since `seen` to dst, through a temp name and a
+    rename, so <run>/chains never holds half a checkpoint. PolyChord renames
+    its .resume into place, so the copy reads a whole one; a text file caught
+    mid-write is copied again on the next pass, its stamp having moved."""
+    import shutil
+
+    copied = 0
+    for path in sorted(src.rglob("*")):
+        if "_temp." in path.name:
+            continue
+        try:
+            stat = path.stat()
+            if not path.is_file() or seen.get(path) == (stat.st_mtime_ns, stat.st_size):
+                continue
+            target = dst / path.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_name(f".{target.name}.mirror")
+            shutil.copyfile(path, partial)
+            partial.replace(target)
+        except FileNotFoundError:
+            continue  # renamed away under us; the next pass sees its successor
+        seen[path] = (stat.st_mtime_ns, stat.st_size)
+        copied += 1
+    return copied
+
+
+class ChainsMirror:
+    """Rank 0: seed tmpfs from <run>/chains, then mirror it back every
+    CHAINS_MIRROR_SECONDS from a child process, which Lustre may block without
+    stopping the root. Not a thread: run_polychord holds the GIL in Fortran,
+    so a thread never runs. stop() is the blocking final sync. A crash loses
+    the mirror's lag: one pass, up to ~40s while Lustre blocks its copy
+    (round 227). `./ri resume` and run_with_retries read <run>/chains."""
+
+    def __init__(self, output_dir: Path, base_dir: Path) -> None:
+        import shutil
+
+        self.lustre, self.tmpfs = output_dir / "chains", base_dir
+        self.child: subprocess.Popen | None = None
+        if self.tmpfs == self.lustre:
+            return
+        shutil.rmtree(self.tmpfs, ignore_errors=True)  # a killed run's leftovers: Lustre is the authority
+        if self.lustre.is_dir():
+            shutil.copytree(self.lustre, self.tmpfs, ignore=shutil.ignore_patterns(".*.mirror"))
+        self.tmpfs.mkdir(parents=True, exist_ok=True)
+        # Until rank 0 is gone too, so a crash orphans it for one pass at most.
+        code = ("import os, sys, time; sys.path.insert(0, sys.argv[1]); import common\n"
+                "if sys.argv[5]: os.sched_setaffinity(0, map(int, sys.argv[5].split(',')))\n"
+                "src, dst = common.Path(sys.argv[2]), common.Path(sys.argv[3])\n"
+                "seen = {}  # one full pass first: whatever changed before it started\n"
+                "while os.getppid() == int(sys.argv[4]):\n"
+                "    time.sleep(common.CHAINS_MIRROR_SECONDS)\n"
+                "    try:\n"
+                "        common.sync_chains(src, dst, seen)\n"
+                "    except OSError as error:\n"
+                "        print(f'chains mirror: {error}', file=sys.stderr, flush=True)\n")
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", code, str(Path(__file__).resolve().parent), str(self.tmpfs),
+             str(self.lustre), str(os.getpid()), ",".join(map(str, _UNPINNED_CPUS))],
+            stdin=subprocess.DEVNULL)
+        atexit.register(self.stop)
+
+    def stop(self) -> None:
+        import shutil
+
+        if self.child is None:
+            return
+        self.child.kill()  # a copy it cut short is a .mirror file the sync below replaces
+        self.child.wait()
+        self.child = None
+        sync_chains(self.tmpfs, self.lustre, {})
+        shutil.rmtree(self.tmpfs, ignore_errors=True)
+
+
+def start_chains_mirror(output_dir: Path, base_dir: Path) -> ChainsMirror | None:
+    return ChainsMirror(output_dir, base_dir) if mpi_rank() == 0 else None
+
+
+def self_check_chains_mirror() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run, shm = Path(tmp) / "run", Path(tmp) / "shm"
+        (run / "chains").mkdir(parents=True)
+        (run / "chains" / "r.resume").write_text("old")
+        (run / "chains" / "r.paramnames").write_text("p")
+        mirror = ChainsMirror(run, shm)
+        assert (shm / "r.resume").read_text() == "old", "seeded from <run>/chains"
+        (shm / "r.resume").write_text("new")
+        (shm / "r_temp.resume").write_text("half")
+        (shm / "clusters").mkdir()
+        (shm / "clusters" / "r_1.txt").write_text("c")
+        time.sleep(CHAINS_MIRROR_SECONDS * 2.5)
+        assert (run / "chains" / "r.resume").read_text() == "new", "mirrored while running"
+        (shm / "r.stats").write_text("s")
+        mirror.stop()
+        assert (run / "chains" / "r.stats").read_text() == "s", "final sync"
+        assert (run / "chains" / "clusters" / "r_1.txt").read_text() == "c"
+        assert not (run / "chains" / "r_temp.resume").exists(), "temp files stay behind"
+        assert not list((run / "chains").glob(".*.mirror")), "no partial left"
+        assert not shm.exists(), "tmpfs removed"
+        same = ChainsMirror(run, run / "chains")
+        assert same.child is None, "NS_CHAINS_TMPFS=0 mirrors nothing"
+        os.environ["NS_CHAINS_TMPFS"] = "0"
+        try:
+            assert chains_base_dir(run) == run / "chains"
+        finally:
+            del os.environ["NS_CHAINS_TMPFS"]
+
+
 def evidence_record(output: Any) -> dict[str, Any] | None:
     """log(Z) and its error from the PolyChordOutput run_polychord() returns,
     which has already parsed chains/<root>.stats, so it costs nothing. In the

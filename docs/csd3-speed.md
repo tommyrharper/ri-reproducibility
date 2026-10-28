@@ -10875,3 +10875,97 @@ Rows `r225-S19`, `r225-S32`, `r225-P19`, `r225-G19`, `r225-H19`, `r225-H19b`
 are in `benchmarks.jsonl`. All run directories and the probe worktree are
 deleted. The scripts are in `.probe/r225/`. GPU job 39497293 was still
 pending at the end of this round (`squeue`: Priority).
+
+## Round 227: PolyChord writes `chains/` on node tmpfs, mirrored to Lustre by a child process
+
+**Why.** Round 225 traced the whole-search stalls to PolyChord's root
+blocking 20-45 s in a Lustre create of `chains/<root>_temp.resume`. No
+worker gets a seed while it waits. This round ships the fix under
+the durability constraint: `./ri resume` and self-heal restart from
+`<run>/chains`, so Lustre must keep a complete copy that is replaced atomically.
+
+**Change** (`common.py`: `chains_base_dir`, `ChainsMirror`, `sync_chains`;
+used by both `polychord_r2d2.py` and `polychord_wsclean.py`):
+
+- `settings.base_dir` is `/dev/shm/ri-chains-<sha1 of the run's chains path>`.
+  mpirun forks every rank on one node, so every rank sees it. `read_resume`
+  still tests `<run>/chains/<root>.resume` on Lustre.
+- Before `run_polychord`, rank 0 clears that tmpfs dir and seeds it from
+  `<run>/chains`. Lustre is the authority, and a killed run's tmpfs
+  leftovers are thrown away. It then starts a child process that every 2 s
+  copies each changed file to `<run>/chains/.<name>.mirror` and renames it
+  into place. It skips `*_temp.*`. PolyChord renames each `.resume` into
+  place, so every copy reads a whole one. The child exits when rank 0 is gone.
+- After `run_polychord`, `stop()` kills the child, runs one blocking full
+  sync, and removes the tmpfs dir. This happens before `summary.json`, so
+  a finished run's chains are all on Lustre. It is also registered with
+  `atexit` for Python-level failures.
+- `NS_CHAINS_TMPFS=0` (passed through both run scripts) restores the old
+  layout, for A/Bs.
+- It is a process, not a thread. The first version used a thread, and it
+  never ran: pypolychord holds the GIL for the whole Fortran run, so the
+  thread mirrored only the files written before PolyChord started. This is
+  the same reason the record packer is a subprocess.
+
+**WSClean guard (raced, simultaneous, disjoint 19-CPU halves, 19 ranks,
+nlive 100, seed 227, synchronous):**
+
+| arm | chains | evals | wall s | idle | stall s | evals/s | steady evals/s | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| r227-wa | Lustre (`NS_CHAINS_TMPFS=0`) | 5,098 | 221.4 | 38.2% | 83.3 | 23.02 | 36.97 | 0.094981819312609 +/- 0.000610189158072293 |
+| r227-wb | tmpfs + mirror | 5,098 | 205.2 | 0.4% | 63.3 | 24.85 | 35.99 | 0.094981819312609 +/- 0.000610189158072293 |
+
+log(Z) is bit-identical, and so are the two `wsclean_vlaa_dead-birth.txt`
+files (`cmp`). The mirrored `chains/` holds the same file set as the
+Lustre arm's. The headline is +7.9% and idle falls from 38% to 0.4%.
+Steady rates agree within noise (-2.6%), as they should: the fix removes
+stalls and does not change the per-evaluation cost. This is one pair, so
+the +7.9% is indicative only. A synchronous WSClean arm writes a resume
+every 100 dead points, and the faster R2D2/GPU searches are where round
+225 measured the stalls (27-113 s per arm). The 63 s that bench still
+counts as stall in the tmpfs arm is not chains (none of its writes are on
+Lustre any more). It is the next thing to trace, probably the same
+"gap after the first wave" that round 225 left open.
+
+**Durability: kill -9 and `./ri resume` of a real search.** WSClean, 37
+ranks, nlive 200, async. Every process in the search's session was
+SIGKILLed at ndead 1857. The tmpfs `.resume` was from 19:58:32.9. The
+Lustre mirror's was from 19:58:08, the 491-dead checkpoint, 25 s behind.
+`./ri resume` printed `resuming from <run>/chains/wsclean_vlaa.resume,
+1842 evaluations already done`, went on from ndead 536, and finished at
+1,875 dead, 9,590 evaluations, log(Z) 0.0956259436989396 +/-
+0.000715155684803101. No evaluation was imaged twice, because the cache
+adopts them. The run used its own scratch; nothing else ran on that run dir.
+
+**The mirror's lag is the same Lustre stall, moved off the critical path.**
+The 25 s lag at the kill was the child blocked in its own create. A
+Lustre microbenchmark (250 interleaved cycles, 800 KB, row
+`r227-lustre-unique`) shows a fresh temp name per write does not help.
+Reusing the name had 5 cycles over 1 s (max 39.3 s, 85.6 s lost). A
+unique name had 3 (max 36.8 s, 50.2 s lost). Medians were 2.2 and 2.1 ms. So round 225's "name a rename has just freed" is not the
+trigger: any create and rename on this RDS can block for tens of seconds.
+A crash can therefore lose up to ~40 s of checkpoints (a checkpoint or
+two). The evaluations behind them are adopted from the cache, not imaged
+again. Before this round, the same block stopped every rank instead.
+
+**Checks.** `self_check_chains_mirror` is host-runnable and registered in
+`scripts/test_self_checks.py` and in `polychord_wsclean.py --self-check`.
+It covers seeding, mirroring while running, the final sync, `clusters/`,
+temp files staying behind, no partial left, tmpfs removed, and
+`NS_CHAINS_TMPFS=0`. `./ri self-check self-heal` ran three times. The
+first tmpfs run failed one assertion: after the SIGKILL-and-restart, `./ri
+health` warned of one 38 s gap (89% of a 43 s run). The `NS_CHAINS_TMPFS=0`
+control then passed in full, and so did a second tmpfs run, every
+scenario included: killed, hung, killed with no retries and resumed by hand,
+workers killed, pool killed, truncated `.resume`, torn `summary.json`. In
+the truncated-resume case the torn checkpoint is copied into tmpfs, PolyChord's
+`read_write.F90` error triggers the quarantine of the Lustre copy, and the
+retry seeds without it. The 38 s gap matches round 225's open 36-40 s
+gap after the first wave, which also happened with chains on tmpfs. It is
+intermittent and so far not tied to this change. It is the next stall to trace (sample
+`/proc/<root>/syscall` during it).
+
+Rows `r227-wa`, `r227-wb` (bench), `r227-lustre-unique` and
+`r227-kill-resume` (stage) are in `benchmarks.jsonl`. The run dirs are
+deleted. The scripts are in `.probe/r227/`. GPU job 39497293 (round
+224's gathering A/B) was not read this round.

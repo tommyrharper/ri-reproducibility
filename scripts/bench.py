@@ -176,7 +176,7 @@ def start_gaps(records: Any) -> tuple[float, float, float] | None:
     max(2s, 10x the median evaluation). The first is start-up (the first
     evaluations load the imager: 23-88s on a GPU node); later ones are the whole
     search waiting, e.g. on PolyChord's root blocked 20-45s creating its resume
-    file on Lustre (round 225). Both swamp a 3-minute arm, so evals over the span
+    file on Lustre (round 225; tmpfs chains since 227). Both swamp a 3-minute arm, so evals over the span
     minus the gaps is the rate a long run settles at (docs/csd3-speed.md, round 211).
     """
     timed = sorted((float(t["started_epoch"]), float(t["ended_epoch"]))

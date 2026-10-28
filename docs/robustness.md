@@ -270,6 +270,10 @@ Verified on a copy of a real finished 54-evaluation search with its 285KB
 summary cut in half: the report built again, and the resume rewrote a whole
 summary with the same 54 evaluations in 0.014s, imaging nothing.
 
+### Where the checkpoint lives
+
+PolyChord writes `chains/` on node tmpfs (`/dev/shm/ri-chains-*`), and a child of rank 0 mirrors it to `<run>/chains` every 2 s through a temp file and a rename, with a blocking final sync before `summary.json` (round 227: a Lustre create can block 20-45 s, which used to stop the whole search). Everything that restarts or reads a run uses `<run>/chains`; a new attempt reseeds tmpfs from it. A kill loses at most the mirror's lag, normally 2 s, up to ~40 s when Lustre blocks its copy, and the evaluations in that window are adopted from the cache, not imaged again. `NS_CHAINS_TMPFS=0` writes straight to Lustre.
+
 ### One no-progress failure is retried anyway: an unreadable checkpoint
 
 A rank killed part-way through writing `chains/*.resume` leaves a truncated

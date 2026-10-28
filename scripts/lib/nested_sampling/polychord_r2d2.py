@@ -27,6 +27,8 @@ from common import (
     drain_record_writes,
     evidence_record,
     PolyChordFinish,
+    chains_base_dir,
+    start_chains_mirror,
     finished_run_records,
     follow_r2d2_worker_node,
     pack_finished_run,
@@ -571,7 +573,7 @@ def main() -> None:
         return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
-    settings.base_dir = str(output_dir / "chains")
+    settings.base_dir = str(chains_base_dir(output_dir))
     settings.file_root = "r2d2_vlaa"
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
@@ -579,7 +581,7 @@ def main() -> None:
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # Checkpoint long runs so interruptions are resumable via `--output-dir`.
-    resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
+    resume_path = output_dir / "chains" / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
     # Always adopt disk evaluations: retries can die before PolyChord writes a
@@ -597,10 +599,13 @@ def main() -> None:
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
     packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
+    mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
     finish = PolyChordFinish()
     output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
+    if mirror is not None:
+        mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
     stop_record_packer(packer)
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)

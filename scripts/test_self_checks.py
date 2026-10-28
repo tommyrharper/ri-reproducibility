@@ -15,6 +15,7 @@ os.environ.setdefault("REPO_ROOT", str(REPO_ROOT))
 HOST_RUNNABLE = {
     "common": (
         "self_check_backfilled_intervals",
+        "self_check_chains_mirror",
         "self_check_evaluation_pruning",
         "self_check_evidence_record",
         "self_check_clean_convergence",
