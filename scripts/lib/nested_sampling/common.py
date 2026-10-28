@@ -2044,6 +2044,14 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
     if os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0":
         return 0
     keep = evaluations_keeping_images(records)
+    # One listing. An extreme a rank later evicted still names the images its
+    # stripped dir lost, and was over half a run's records: resolving those
+    # paths on Lustre, ~3 stats and a realpath each, was ~95% of prune
+    # (docs/csd3-speed.md, round 198). A dir not listed holds no image.
+    try:
+        listed = set(os.listdir(evaluations_dir))
+    except FileNotFoundError:
+        listed = set()
 
     # Each record's own paths only, so records can go concurrently (see
     # RECORD_READ_THREADS: ~26ms of Lustre stats per record serially).
@@ -2051,6 +2059,8 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
         removed = 0
         paths = record.get("paths") or {}
         retained = evaluation_key(record) in keep
+        dir_name = Path(paths.get("eval_dir") or "").name
+        gone = bool(dir_name) and dir_name not in listed
         # A scored record that names no image was stripped to its record as
         # it was scored (retain_evaluation_detail() drops the paths), so its
         # dir holds nothing but metrics.json: no Lustre listing for it. That
@@ -2060,7 +2070,7 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
             recorded = paths.get(key)
             if not recorded:
                 continue
-            target = _recorded_image_path(evaluations_dir, recorded)
+            target = None if gone else _recorded_image_path(evaluations_dir, recorded)
             if target is None:
                 # Already gone; the record must not keep pointing at it.
                 paths.pop(key, None)
@@ -2070,7 +2080,7 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
             target.unlink(missing_ok=True)
             paths.pop(key, None)
             removed += 1
-        if retained or "error" in record or not named:
+        if retained or "error" in record or not named or gone:
             return removed
         eval_dir = Path(paths.get("eval_dir") or "")
         if not eval_dir.name:
@@ -2248,8 +2258,15 @@ def self_check_image_retention() -> None:
             (failed_dir / name).write_text(name)
         made.append({"eval_id": 99, "objective": FAILURE_OBJECTIVE, "error": "wsclean failed",
                      "paths": {"eval_dir": str(failed_dir)}})
+        # A rank's extreme it later evicted: stripped, dir and all, but its
+        # record still names images. Mid-ranked, so the keep set is unchanged.
+        evicted = {"eval_id": 98, "objective": 0.505, "paths": {
+            "eval_dir": str(evaluations / "eval-0098-x"),
+            "image": str(evaluations / "eval-0098-x" / "wsclean" / "recon-image.fits")}}
 
-        removed = prune_run_artefacts(evaluations, made)
+        removed = prune_run_artefacts(evaluations, made + [evicted])
+        # Gone already: no file to count, and no path left to name it.
+        assert evicted["paths"] == {"eval_dir": str(evaluations / "eval-0098-x")}, evicted
         keep = evaluations_keeping_images(made, ends=20, stride=100)
         # 60 scored evaluations, ends of 20: 40 at the ends plus every 100th of
         # the 20 between, which is just the first of them - and the failure,

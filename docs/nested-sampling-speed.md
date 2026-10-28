@@ -191,6 +191,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (validation) the 22 Sep production search on half an icelake node | none | today's default (39 ranks, onnx) converges in 23 min at 48.1 evals/s, the same rate as round 194's short A/Bs; log(Z) 0.017334 +/- 0.00041, 0.19 sigma from 22 Sep and 0.87 from round 115; MeqTrees 4.4% ([round 195](csd3-speed.md)) |
 | The stall watchdog's `sleep` holds none of the run's output | `progress-bar.sh` | a piped `./ri search \| tee` ends with the search, not up to 60 s later (62.5 to 19 s on a 13 s search); rank 0's post-run record pack (~1.3% of a 67k-evaluation run, Lustre unlinks) logged as the open per-run cost ([round 196](csd3-speed.md)) |
 | summary.json's evaluations one compact line each | `common.py` | `indent=2` uses Python's pure-Python JSON encoder: a 67k-evaluation summary is written in 2.0 s instead of 5.2 s and is 23% smaller, with the same JSON values and bit-identical log(Z) ([round 197](csd3-speed.md)) |
+| prune drops the image paths of evicted extremes whose dir is already gone, from one listing, instead of resolving each on Lustre | `common.py` | prune on a 12k-evaluation R2D2 run 3.2 -> 0.7 s (~8.3 -> ~2 s at 67k); bit-identical log(Z) for R2D2 and WSClean ([round 198](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

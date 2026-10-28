@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 197; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 198; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9155,3 +9155,61 @@ Rows: `r197-r2d2`, `r197-wsclean` in `benchmarks.jsonl` (two of each: the
 searches were run before and after the self-check's collision fix, which moved
 the splice from a NUL marker to the top-level `\n  "evaluations": []`; both
 pairs give the log(Z) above). `self_check_summary_json` covers the writer.
+
+## Round 198: prune skips the images of dirs that are already gone
+
+**Question.** Round 196 put `prune` at 8.3 s of round 195's post-run
+work. Where does it go?
+
+**Probe.** Timers inside `prune_run_artefacts` (taken out again), on an
+R2D2 search of 12,313 evaluations (seed 190182240, nlive 150, 1,500 dead,
+39 ranks onnx, this half icelake node). Script `.probe/r198/run.sh`.
+
+| part of prune (summed over its 32 threads) | thread-seconds |
+| --- | ---: |
+| `_recorded_image_path` (20,856 calls) | 94.5 |
+| `os.listdir` of 6,846 eval dirs | 3.2 |
+| log unlinks | 0.5 |
+| image unlinks | 0.2 |
+
+Prune took 3.1 s wall. 6,846 of the 12,313 records (56%) still named
+images. **Cause.** A rank keeps its 20 lowest and highest objectives so
+far. An evaluation that enters that set and is evicted later already has
+its record written with image paths, and `_strip_to_record` removes its
+dir. At the end, prune resolved each such path on Lustre: a `realpath` of
+the run root plus two failed `is_file` stats, about 4.5 ms of thread time
+per path and three paths per record.
+
+**Change.** One `os.listdir(evaluations_dir)` before the pool. A record
+whose eval dir is not listed has its image paths dropped with no stat,
+and its logs are not listed either. Records whose dir exists go through
+the old path. `self_check_image_retention` now includes an evicted
+extreme whose dir is gone.
+
+| run (same seed, ~12k evaluations) | prune | post-run total |
+| --- | ---: | ---: |
+| HEAD 6bb8143 (r198-a, 12,313 evaluations) | 3.2 s | 8.0 s |
+| this round (r198-b, 11,564 evaluations) | **0.7 s** | 4.8 s |
+
+Prune drops 4.6x. On round 195's 67k evaluations that should be about
+8.3 s down to about 2 s (0.4% of its 23 minutes). The remaining
+0.7 s is mostly the listing itself and the few hundred records that are
+really kept.
+
+**Results unchanged.** r198-b's summary names 174 images, and all 174
+exist. With seed 196, nlive 100 and 20 dead, R2D2 gives
+0.0101886951976723 +/- 0.00726107899040951 (176 evaluations) and WSClean
+gives 0.0895384119210856 +/- 0.00732350343931438 (174 evaluations). Both
+are bit-identical to round 197. The two 1,500-dead async searches agree
+within their errors: r198-a 0.0172213159642348 +/- 0.00039861149356316
+(1,465 dead) and r198-b 0.0176188970741032 +/- 0.000420757942729182
+(1,451 dead), 0.7 sigma apart. At that length the async schedule is not
+reproducible, which is the same on HEAD. Prune runs after the sampler
+finishes, so search speed is unchanged: 47.0 against 45.4 evals/s,
+sequential arms, within this host's spread.
+
+**Open.** `pack` (2.8-3.0 s here, 17.8 s at 67k: Lustre unlinks of the
+flat records) is now the only large post-run cost.
+
+Rows: `r198-a`, `r198-b`, `r198-tiny`, `r198-wsclean` in
+`benchmarks.jsonl`. All four run dirs were deleted.
