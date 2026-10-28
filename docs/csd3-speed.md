@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 180; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 181; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -66,6 +66,9 @@ the Hetzner host.
   Run 4x longer (600 dead points) it gives +7% evals/s and -48% request
   time, still inside the noise over 6 pairs (TensorRT ahead in 4), so the GPU
   default stays torch ([round 173](#round-173-null-tensorrt-against-eager-at-600-dead-points-and-onnx-against-torch-on-cpu-rechecked)).
+  One refittable engine per worker would fit ~19 workers (3.2 GB), but a
+  refit costs 34 ms of host CPU against a 1.6 ms forward, -90% forwards at
+  12 copies ([round 181](#round-181-negative-one-refittable-tensorrt-engine-per-worker)).
   fp16 engines would double forwards per card (+108% at 12 copies, 19
   fit in 37 GB), but each net lands 0.6-5.6% of the peak off float32,
   1000x round 140's gap, so they are rejected ([round 175](#round-175-negative-fp16-tensorrt-engines-2x-forwards-but-1e-2-off-float32)).
@@ -8561,3 +8564,39 @@ or a ctypes binding to the C API. Neither is worth doing. The pin stays.
 No search was run, so there is no `benchmarks.jsonl` row. The venvs in
 `/dev/shm/r180` were deleted.
 
+
+## Round 181 (negative): one refittable TensorRT engine per worker
+
+**Question.** Rounds 170-173 found the TensorRT GPU path capped by memory:
+25 fp32 engines hold 5.1 GB a worker, so an A100 fits 12 TensorRT workers
+against eager's 19, and those 12 put only ~1,070 forwards/s through the card
+in a search. Can one `REFIT` engine per worker, refitted from the 25 nets'
+weights held on the card (`TensorLocation.DEVICE`) before each forward, keep
+TensorRT's forward speed at eager's memory?
+
+**Method.** `scripts/probe_trt_refit.py` (MODE=build/acc/time) on one A100
+(job 39415157, gpu-q-39, MPS). It builds one fp32 REFIT engine from N1.onnx
+(TF32 off, 1x2x32x32, 12 s, 213 MB) and checks it, refitted to each of N1..N25,
+against round 170's per-net plans on three input scales. Then timed arms:
+1000 or 2500 forwards walking N1..N25, with and without a refit before each,
+solo and at 12 MPS copies beside round 170's 12 x 25-engine baseline
+(`probe_trt_memory.py KIND=T SHARED=1`).
+
+| Arm | ms a forward | refit call ms | CPU ms a forward | forwards/s (card) | MB a worker |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| solo, no refit | 1.56 | - | 0.37 | 640 | 3,236 |
+| solo, refit each forward | 35.98 | 34.38 | 34.60 | 28 | 3,236 |
+| 12 x 25 engines (round 170 baseline) | 4.40-4.44 | - | 0.5-0.6 | **2,710** | ~5,000 |
+| 12 x refit | 43.9-51.5 | 41.8-42.0 | 42.2 | 262 | 3,236 |
+
+**Result.** Accuracy is fine: the refitted engine is within 5.0e-6 of each
+per-net plan's peak (4 of 25 nets bit-identical), and a worker holds 3.2 GB
+(228 MB engine plus 25 weight sets) against 5.1 GB, so ~19 would fit a card.
+But a refit of the 68 weights costs **34 ms of host CPU** even with the
+weights already on the device, against a 1.6 ms forward: the call's CPU time equals
+its wall time, so the refit's work runs on the host, not the card. At 12 copies the card does 262
+forwards/s against the baseline's 2,710 (-90%), so no rank count recovers it,
+and the job was cancelled before the 19-copy and second-pass arms. The
+baseline reproduced round 170 (2,710 forwards/s at 4.4 ms). The lever is
+closed: TensorRT engine memory per worker cannot be cut by refitting. No
+search was run, so there is no `benchmarks.jsonl` row.
