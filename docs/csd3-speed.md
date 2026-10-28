@@ -11188,3 +11188,69 @@ are in `benchmarks.jsonl`. `summary.json`, `chains/r2d2_vlaa.stats`, the
 profile and the row are kept in `.probe/r230/`. The run directory (10,116
 files) is deleted. GPU job 39497293 (round 224's gathering A/B) is still
 pending: at 21:30 Slurm put its start at 07:35 on 29 Oct.
+
+## Round 231 (diagnosis): the idle is PolyChord's root computing, not dispatching slowly
+
+**Question.** Round 230 saw idle rise from 1.5% to 6.3% of worker-time and
+called it "drains": the root handing out seeds slowly. What is the root
+doing in them?
+
+**Method.** Round 230's command again (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks, `7ff6f6e`), with a 0.5 s sampler
+(`.probe/r231/sample.py`) reading the root's threads: state, syscall (and
+fd target), CPU, utime. (`wchan` reads 0 on this kernel.) After the run,
+each rank's timeline is rebuilt from `summary.json`: `eval_id` is a
+per-rank counter, so evaluation k on a rank follows evaluation k-1 on the
+same rank (`.probe/r231/` has the scripts). The same method was also run on
+round 230's summary.
+
+**Results.**
+- These are not drains. In every window, the per-rank gaps start at
+  staggered times, as each worker finishes its chain, and **all end at the
+  same instant**. Round 230: 891.6, 1038.9 and 1342.6 s. This run: 22
+  release instants from t=620 s, with waits up to 48 s. The root stops
+  dispatching completely. Seeds trickle out only because chains take
+  ~30-50 s to finish, which is why starts fell gradually instead of
+  stopping, and why round 230 read it as "slow".
+- The root is not waiting on a worker. At 761.7 s it released 38 waiting
+  ranks 17 s after the last evaluation in flight had ended (744.5 s), and
+  no evaluation took over 6 s.
+- It is not I/O or a blocked syscall. Every sample of the root's main
+  thread is state R in user space. Its user CPU stays at ~36% of a CPU
+  throughout (the rest is presumably MPI polling in system time; stime was
+  not sampled). In the 714-762 s block it stayed on cpu10 the whole time,
+  where it otherwise moves to another CPU nearly every sample. That is the
+  signature of the root computing inside PolyChord, not polling.
+- The cost grows with the run: none before t~600 s (ndead ~600), then
+  longer and more frequent blocks. This run lost 12,463 worker-s
+  (busy share 80.6%, 43.5 evals/s) against round 230's 4,145 (92.3%, 51.1).
+  log(Z) = 0.0173747444767856 +/- 0.000410586136794265, within 0.3 sigma of
+  round 230's 0.0171997434919644 +/- 0.000400520669269346.
+- The bench row's `idle_fraction` (0.023) and `stall_s` (41 s) miss almost
+  all of this: they count only time with nothing in flight.
+
+| | round 230 | round 231 |
+| --- | ---: | ---: |
+| evals/s | 51.1 | 43.5 |
+| busy share of 38 workers | 92.3% | 80.6% |
+| worker-s lost below 38 in flight | 4,145 | 12,463 |
+| release instants (>= 5 ranks freed at once) | ~6 | 22 |
+| longest wait | ~40 s | 48 s |
+
+**Learned.**
+- The open CPU lever is a CPU-bound step in PolyChord's root that grows with
+  ndead (or with phantoms or posteriors) and costs up to ~20% of
+  worker-time in a 1,500-dead search. Production runs are longer, so the
+  cost will be worse there.
+- Next: attach to the root during a block and read its Fortran stack.
+  Host `gdb`, `eu-stack` and `pstack` are installed and
+  `ptrace_scope` is 0. Trigger the dump on "the root stays on one CPU for
+  more than 3 s". Then fix the step (cache it, do it less often, or move
+  it off the dispatch path) in a patch to PolyChord.
+- To tell a root block from slow dispatch, look at the instants when
+  per-rank gaps end, not at starts per bin.
+
+Rows: `r231-bigrun` (bench) and `r231-root-blocks` (stage, with the release
+instants and full-precision log(Z)) are in `benchmarks.jsonl`. The run
+directory (9,272 files) is deleted. `summary.json`, `.stats` and the
+samples are kept in `.probe/r231/`.
