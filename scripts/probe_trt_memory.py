@@ -12,6 +12,13 @@ took (cudaMemGetInfo, so run it alone for MEM numbers):
 Then it times N forwards walking N1..N25 in turn, as a request does, each
 waiting on a blocking event as patch_cuda_network's does; START (epoch
 seconds) holds the timed loop so P copies under MPS overlap.
+
+PREC=fp16 (round 175) builds fp16 engines instead: TensorRT 11 has no FP16
+builder flag, only strongly typed networks, so each checkpoint is exported
+afresh as a half-precision U-Net wrapped in float32 casts (input and output
+stay float32) into ENGDIR/N<i>.onnx. ACC=1 then prints, per net, the max
+abs difference of the engines in ENGDIR from torch eager float32 on the card
+(TF32 off), relative to the eager output's peak, for inputs at three scales.
 """
 import glob, os, sys, time
 import numpy as np
@@ -26,17 +33,46 @@ ITERS = range(1, int(os.environ.get("ITERS", "25")) + 1)
 eng_dir = os.environ["ENGDIR"]
 
 
+fp16 = os.environ.get("PREC") == "fp16"
+
+
+def eager_net(i, dev):
+    sys.path.insert(0, "/opt/r2d2/R2D2-RI/src")
+    from utils.util_model import create_net_imaging
+    net = create_net_imaging().eval()
+    ck = torch.load(f"/checkpoints/R2D2_A1/R2D2_UNet_N{i}.ckpt", map_location="cpu", weights_only=False)
+    sd = ck.get("state_dict", ck)
+    net.load_state_dict({'.'.join(k.split('.')[1:]): v for k, v in sd.items()})
+    return net.to(dev)
+
+
+class Half(torch.nn.Module):
+    def __init__(self, net):
+        super().__init__()
+        self.net = net.half()
+
+    def forward(self, x):
+        return self.net(x.half()).float()
+
+
 def build(i):
     path = f"{eng_dir}/N{i}.plan"
     if os.path.exists(path):
         return
+    onnx_path = f"{os.environ['ONNX_DIR']}/N{i}.onnx"
+    if fp16:
+        onnx_path = f"{eng_dir}/N{i}.onnx"
+        torch.onnx.export(Half(eager_net(i, "cuda")), (torch.zeros(1, 2, 32, 32, device="cuda"),), onnx_path,
+                          dynamo=False, opset_version=17, input_names=["x"], output_names=["y"],
+                          dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
     builder = trt.Builder(log)
-    network = builder.create_network(0)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED) if fp16 else 0)
     parser = trt.OnnxParser(network, log)
-    with open(f"{os.environ['ONNX_DIR']}/N{i}.onnx", "rb") as f:
+    with open(onnx_path, "rb") as f:
         assert parser.parse(f.read()), [parser.get_error(k) for k in range(parser.num_errors)]
     config = builder.create_builder_config()
-    config.clear_flag(trt.BuilderFlag.TF32)
+    if not fp16:
+        config.clear_flag(trt.BuilderFlag.TF32)
     profile = builder.create_optimization_profile()
     profile.set_shape("x", (1, 2, 32, 32), (1, 2, 32, 32), (1, 2, 32, 32))
     config.add_optimization_profile(profile)
@@ -56,6 +92,31 @@ if os.environ.get("BUILD") == "1":
     sys.exit()
 
 dev = torch.device("cuda")
+if os.environ.get("ACC") == "1":
+    runtime = trt.Runtime(log)
+    gen = torch.Generator(device=dev).manual_seed(175)
+    worst = 0.0
+    for i in ITERS:
+        net = eager_net(i, dev)
+        with open(f"{eng_dir}/N{i}.plan", "rb") as f:
+            eng = runtime.deserialize_cuda_engine(f.read())
+        ctx = eng.create_execution_context()
+        ctx.set_input_shape("x", (1, 2, 32, 32))
+        row = []
+        for scale in (1e-3, 1.0, 1e3):
+            x = torch.randn(1, 2, 32, 32, device=dev, generator=gen) * scale
+            y = torch.empty(1, 1, 32, 32, device=dev)
+            ctx.set_tensor_address("x", x.data_ptr())
+            ctx.set_tensor_address("y", y.data_ptr())
+            assert ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+            ref = net(x)
+            torch.cuda.synchronize()
+            rel = ((y - ref).abs().max() / ref.abs().max()).item()
+            worst = max(worst, rel)
+            row.append(f"{scale:g}:{rel:.1e}")
+        print(f"acc N{i} " + " ".join(row))
+    print(f"acc worst maxrel={worst:.2e} engdir={eng_dir}")
+    sys.exit()
 x = torch.randn(1, 2, 32, 32, device=dev)
 y = torch.empty(1, 1, 32, 32, device=dev)
 torch.cuda.synchronize()

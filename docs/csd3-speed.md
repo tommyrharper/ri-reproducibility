@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 174; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 175; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -66,6 +66,9 @@ the Hetzner host.
   Run 4x longer (600 dead points) it gives +7% evals/s and -48% request
   time, still inside the noise over 6 pairs (TensorRT ahead in 4), so the GPU
   default stays torch ([round 173](#round-173-null-tensorrt-against-eager-at-600-dead-points-and-onnx-against-torch-on-cpu-rechecked)).
+  fp16 engines would double forwards per card (+108% at 12 copies, 19
+  fit in 37 GB), but each net lands 0.6-5.6% of the peak off float32,
+  1000x round 140's gap, so they are rejected ([round 175](#round-175-negative-fp16-tensorrt-engines-2x-forwards-but-1e-2-off-float32)).
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -8231,3 +8234,53 @@ behind Raven (`csd3.cam.ac.uk/charges`), so they are not compared here.
   38-rank halves of one whole node against one 76-rank search, same tree)
   would settle that figure.
 - No code changed, so no WSClean A/B, and no new `benchmarks.jsonl` rows.
+
+## Round 175 (negative): fp16 TensorRT engines, 2x forwards but 1e-2 off float32
+
+**Question.** Rounds 172-173 left the A100 itself as the bound at 12
+TensorRT fp32 workers, so only a cheaper forward helps. TF32 was rejected
+in round 125. Do half-precision engines cut the card's time per forward,
+and how far do they land from float32?
+
+**Probe.** TensorRT 11.4 has no `BuilderFlag.FP16`, only strongly typed
+networks. So `scripts/probe_trt_memory.py` gained `PREC=fp16`: each
+checkpoint is exported again as `net.half()` wrapped in float32 casts
+(input and output stay float32) and built with `STRONGLY_TYPED`. The
+image's torch has no `onnx` module, so the export borrows the
+`r2d2-onnx/py` install that `R2D2_RUNTIME=onnx` already caches. `ACC=1`
+compares each engine with torch eager float32 on the card (TF32 off) on
+seeded inputs at scales 1e-3, 1 and 1e3, and reports the max abs
+difference over the eager output's peak. One ampere job
+(`.probe/r175/job.sh`, 39401129, gpu-q-17, A100-SXM4-80GB, MPS restarted
+per arm, batch 1, 32x32, 25 engines a worker walking N1..N25, shared
+activation buffer as in round 170). The first job (39400761) died on the
+missing `onnx` module, but its fp32 accuracy pass finished and is quoted
+below.
+
+| arm | copies | forwards/s (2 runs) | vs fp32 x 12 | ms a forward | peak GPU memory | worst maxrel vs eager fp32 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| fp32, solo | 1 | 633 | | 1.58 | 5.6 GB (204 MB a net) | 9.9e-6 (all 25 nets 0.9-9.9e-6) |
+| fp16, solo | 1 | 1,111 | | 0.90 | 2.0 GB (62 MB a net) | 5.6e-2 (N1); N2-N25 6e-3 to 2.7e-2 |
+| fp32 (production `trt`) | 12 | 2,689 / 2,707 | - | 4.4-4.5 | 66.4 GB | |
+| fp16 | 12 | 5,573 / 5,645 | **+108%** | 2.1-2.2 | 23.6 GB | |
+| fp16 | 19 | 6,050 / 6,137 | +126% | 3.2-3.3 | 37.3 GB | |
+
+**Learned.**
+- fp16 halves the card's time per forward and cuts an engine to 62 MB,
+  so 19 workers fit in 37 GB where fp32 fits 12 in 66 GB. By round 168's
+  model (forwards ~61% of a GPU request's card time) that is ~1.4x evals/s
+  for a 1-GPU search, more if 19 ranks also cover simulate time.
+- **Rejected on accuracy.** Each fp16 net is 0.6-1.5% of the peak off
+  float32 (N1 5.6%), the same at every input scale, against 1e-5 for the
+  fp32 engine and round 140's 1.5e-5 that round 144 showed leaves log(Z)
+  alone. A request chains 25 nets, so the error compounds. This is 1000x
+  outside anything validated, and the rule is to trade no result for
+  speed, so no search was run with it.
+- The error is spread over every net, not one bad layer. A mixed-precision
+  engine (InstanceNorm and the first and last convolutions in float32) is
+  the only fp16 route left. It needs a per-layer accuracy sweep before any
+  speed number means anything.
+- Building 25 strongly typed fp16 plans took 330 s (1.57 GB on disk).
+  They were deleted after the job.
+- No search ran and no code outside the probe changed, so there are no
+  `benchmarks.jsonl` rows and no WSClean A/B.
