@@ -2173,8 +2173,23 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
                 removed += 1
         return removed
 
+    # Only a record naming an image in a dir still listed touches Lustre: ~1%
+    # of them. The rest go inline, since a future each cost ~1s of the pool's
+    # own overhead at 78k records (round 201).
+    def touches_lustre(record: dict[str, Any]) -> bool:
+        paths = record.get("paths") or {}
+        dir_name = Path(paths.get("eval_dir") or "").name
+        return (not dir_name or dir_name in listed) and any(
+            paths.get(key) for key in RETAINED_IMAGE_KEYS)
+
+    slow, removed = [], 0
+    for record in records:
+        if touches_lustre(record):
+            slow.append(record)
+        else:
+            removed += prune(record)
     with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        return sum(pool.map(prune, records))
+        return removed + sum(pool.map(prune, slow))
 
 
 

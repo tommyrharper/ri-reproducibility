@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 200; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 201; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9336,3 +9336,46 @@ jobs shared the node (load 20 to 85) on their own CPUs.
 Rows: `r200-bigrun` in `benchmarks.jsonl` (commit d96a8e0). `summary.json`
 and `chains/r2d2_vlaa.stats` are kept in `.probe/r200/`. The run directory
 (9,472 files) was deleted.
+
+## Round 201: prune runs the records that touch no Lustre inline
+
+Round 200 left prune as the largest post-run part: 5.6 s at 78k
+evaluations. Only ~1% of records touch Lustre at the end (the 1 in 100
+kept whole, `_keeps_detail`). The rest either name no image or name
+images whose dir round 198's listing already shows gone. But every record
+still went through `ThreadPoolExecutor.map`, and a future each costs
+~1.0-1.2 s at 78k records with a no-op body on this node. **Change:**
+`prune_run_artefacts` runs records that touch no Lustre inline, and the
+pool gets only the ones naming an image in a listed dir.
+
+Fixture (`.probe/r201/prune_bench.py`): 77,570 records shaped like round
+200's run, with 56% naming images in gone dirs and 776 dirs on hpc-work
+holding 3 images and 4 logs each. Interleaved pairs against HEAD's
+`common.py`:
+
+| pair | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD `af9b5e3` | 2.75 s | 3.00 s | 3.07 s | 2.92 s | 2.94 s |
+| inline | 1.64 s | 1.65 s | 1.64 s | 1.62 s | **1.64 s** |
+
+Both arms remove 5,348 files and leave records with the same sha256
+(`4b59358aa70a`). Ruled out on the same fixture: caching
+`evaluations_dir.resolve()` (no change) and 128 threads instead of 32
+(no change, before or after). What is left (~1.6 s) is the 776 dirs'
+Lustre unlinks, stats and listings.
+
+Guards: tiny seed-196 runs are bit-identical (R2D2 log(Z)
+0.0101886951976723, WSClean 0.0895384119210856). In a raced WSClean pair
+(19 ranks each, nlive 100, seed 196, HEAD from a detached worktree), the
+new arm ran 143.3 evals/s against 120.7 and HEAD's `image_binary` was 114
+against 94 ms. That gap is the binary and which CPUs each arm landed on,
+not prune. log(Z) 0.0968399 +/- 0.00056 against 0.0972371 +/- 0.00058
+(async, 0.5 sigma); prune took 0.2 s in both.
+
+Expected in production: prune 5.6 s -> ~4.5 s at 78k evaluations. The
+fixture's 3.0 s is below the real 5.6 s, so part of the real prune is
+something the fixture lacks. The next production run's `post-run seconds`
+line will show it.
+
+Rows: `r201-prune-fixture`, `r201-tiny`, `r201-wsclean`, `r201-wsa`,
+`r201-wsb` in `benchmarks.jsonl`. All run dirs were deleted.
