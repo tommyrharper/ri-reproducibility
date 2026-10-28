@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 199; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 200; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9285,3 +9285,54 @@ packer arm ran at 146.0 evals/s against 138.8, with pack 0.8 s against
 Rows: `r199-tiny`, `r199-wsclean`, `r199-b`, `r199-c`, `r199-wsa` and
 `r199-wsb` (twice each, 300 and 3,000 dead) in `benchmarks.jsonl`. All
 run dirs were deleted.
+
+## Round 200 (validation): rounds 197-199 in the 22 Sep production search
+
+**Question.** Rounds 197-199 cut rank 0's post-run work on 12k-evaluation
+runs and predicted roughly 34 s down to about 7 s at round 195's 67k.
+Does that hold in the full production search, and does round 199's
+in-run packer cost any throughput?
+
+**Method.** Round 195's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs),
+on `d96a8e0`. Script `.probe/r200/run.sh`. As in round 195, other users'
+jobs shared the node (load 20 to 85) on their own CPUs.
+
+| | round 195 (`5723db6`) | round 200 (`d96a8e0`) |
+| --- | ---: | ---: |
+| evaluations | 66,973 | 77,570 |
+| search wall | 1,392.8 s | 1,597.1 s |
+| evals/s | 48.1 | **48.6** |
+| request (`image_container`) | 744 ms | 737 ms |
+| simulate (MeqTrees) | 35 ms, 4.4% | 32 ms, 4.0% |
+| idle | 1.0% | 1.5% |
+| post-run: records, flush | 1.9, 1.0 s | 2.3, 0.6 s |
+| post-run: prune | 8.3 s | 5.6 s |
+| post-run: summary | 5.1 s | 2.6 s |
+| post-run: pack | 17.8 s | **2.9 s** |
+| post-run total | 34.3 s | **14.1 s** |
+| command wall minus search wall | 43.1 s | **24.8 s** |
+| log(Z) | 0.0173344576860040 +/- 0.000411387 | 0.0174329374131255 +/- 0.000408558 |
+| ndead, nlike | 1,472, 65,470 | 1,455, 75,995 |
+
+**Results.**
+- Post-run work fell from 34.3 s to 14.1 s, on a run with 16% more
+  evaluations, and the time outside the search fell from 43 s to 25 s.
+  Pack (2.9 s) and summary (2.6 s) land where rounds 197 and 199 predicted.
+- Prune takes 5.6 s, not the ~2 s that round 198 extrapolated from 12k
+  evaluations. It is now the largest post-run part and the next one to look at.
+- The packer costs no visible throughput: 48.6 evals/s against 48.1, at
+  the same request time.
+- log(Z) agrees with round 195 within 0.17 sigma. The async schedule is
+  not reproducible at this length (round 198), and this run needed 16%
+  more evaluations to converge. Its wall is longer for that reason, not
+  because it ran slower.
+
+**Learned.**
+- Between async runs of the same seed, the number of evaluations to
+  convergence moves by ~15% at a fixed rate. Compare production runs by
+  evals/s and request time, not by wall.
+
+Rows: `r200-bigrun` in `benchmarks.jsonl` (commit d96a8e0). `summary.json`
+and `chains/r2d2_vlaa.stats` are kept in `.probe/r200/`. The run directory
+(9,472 files) was deleted.
