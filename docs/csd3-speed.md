@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 179; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 180; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -17,7 +17,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), malloc tuning and the ORT arena (164), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), ORT 1.31.1 over 1.23.2 (180), malloc tuning and the ORT arena (164), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -8532,3 +8532,32 @@ log(Z)s agree within their errors.
 Rows: `r179-Bwarm`, `r179-A1`, `r179-B1`, `r179-B2`, `r179-A2` in
 `benchmarks.jsonl`. Their commit is rewritten to the archived tree (4e8156d
 for A, a32315a for B). The run directories were in `/dev/shm` and are gone.
+
+## Round 180 (null): ONNX Runtime 1.31.1 against the shipped 1.23.2
+
+**Question.** The CPU default pins `onnxruntime==1.23.2` (round 141), and
+PyPI is now at 1.31.1. Do eight releases of MLAS make the U-Net forward faster?
+
+**Method.** ORT 1.24 and later need Python 3.11 or newer, and `r2d2.sif`
+runs 3.10, so pip inside the image offers nothing past 1.23.2. To isolate the
+version, two uv venvs on the host's Python 3.12 in `/dev/shm` hold
+onnxruntime 1.23.2 and 1.31.1 (numpy 2.2). `.probe/r180/ver.py` uses round
+162's shape: the shipped session options (1 thread, no spinning, no arena),
+the 25 cached `.onnx` checkpoints, 36 forked children, one per CPU, each
+walking N1..N25 staggered, and 150 timed forwards on the sky-like 2x32x32
+input. The versions alternate (ABABAB) on this loop's icelake half-node at
+load ~4.
+
+| ORT | ms a forward (rep 0, 1, 2) |
+| --- | ---: |
+| 1.23.2 (shipped) | 25.88, 25.90, 25.70 |
+| 1.31.1 | 25.95, 25.69, 25.70 |
+
+**Result.** The two versions run at the same speed (25.83 against 25.78 ms,
+-0.2%, inside the rep spread), and all 25 nets' outputs are byte-identical
+between them. So MLAS's float32 conv path for this network has not changed
+since 1.23. Shipping 1.31 would also need Python 3.11 or newer in `r2d2.sif`,
+or a ctypes binding to the C API. Neither is worth doing. The pin stays.
+No search was run, so there is no `benchmarks.jsonl` row. The venvs in
+`/dev/shm/r180` were deleted.
+
