@@ -26,6 +26,7 @@ HOST_RUNNABLE = {
         "self_check_profiling",
         "self_check_resume_adoption",
         "self_check_streaming_retention",
+        "self_check_summary_json",
         "self_check_worker_pool_connect",
         "self_check_cpu_pinning",
         "self_check_follow_worker_node",

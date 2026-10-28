@@ -1738,13 +1738,36 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
 
 def _json_text(payload: Any) -> str:
-    return json.dumps(payload, indent=2) + "\n"
+    # A summary's evaluations go one compact line each: indent=2 takes the
+    # pure-Python encoder, 5.1s of a 67k-evaluation summary against ~1.6s
+    # this way (round 197). The same JSON values; the head stays indented.
+    evaluations = payload.get("evaluations") if isinstance(payload, dict) else None
+    if not isinstance(evaluations, list) or not evaluations:
+        return json.dumps(payload, indent=2) + "\n"
+    # Two spaces and a newline: only the top-level key (a string holds no raw newline).
+    slot = '\n  "evaluations": []'
+    head = json.dumps({**payload, "evaluations": []}, indent=2)
+    body = ",\n    ".join(map(json.dumps, evaluations))
+    return head.replace(slot, slot[:-1] + "\n    " + body + "\n  ]", 1) + "\n"
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
     partial = path.with_name(path.name + ".partial")
     partial.write_text(text)
     partial.replace(path)
+
+
+def self_check_summary_json() -> None:
+    summary = {"evaluation_count": 2, "note": '"evaluations": []', "nested": {"evaluations": []},
+               "evaluations": [{"eval_id": 1, "objective": float("nan")}, {"eval_id": 2, "params": {}}],
+               "after": [1, 2]}
+    text = _json_text(summary)
+    assert text.startswith('{\n  "evaluation_count": 2,'), text  # the head readers' layout
+    assert '\n    {"eval_id": 2, "params": {}}\n  ],\n  "after"' in text, text
+    assert repr(json.loads(text)) == repr(summary)
+    for payload in ({}, {"evaluations": []}, [1], {"eval_id": 1}):
+        assert _json_text(payload) == json.dumps(payload, indent=2) + "\n"
+    print("OK: summary.json writer")
 
 
 # Scored evaluations keep only replayable inputs, metrics and the three images

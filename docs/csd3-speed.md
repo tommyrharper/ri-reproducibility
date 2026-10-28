@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 196; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 197; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9111,3 +9111,47 @@ runs has changed.
   watchdog on. It fails on the old code and passes on the new.
 
 Rows: `r196-s1`, `r196-s2` (HEAD, piped) and `r196-w1` in `benchmarks.jsonl`.
+
+## Round 197: summary.json writes its evaluations one compact line each
+
+**Question.** Round 196 put `summary` at 5.1 s of round 195's 34 s of
+post-run work. What is it?
+
+**Probe.** Round 195's kept 218 MB `summary.json` (66,973 evaluations),
+re-encoded inside `polychord.sif`, three times each. Script
+`.probe/r197/encode.py`; the searches are `.probe/r197/run.sh`.
+
+| encoder | bytes | encode | encode + Lustre write |
+| --- | ---: | ---: | ---: |
+| `json.dumps(indent=2)` (HEAD) | 218,355,737 | 4.36 s | 5.2 s |
+| head indented, evaluations one compact line each (this round) | 168,526,337 | **1.81 s** | **2.0 s** |
+
+**Cause.** With `indent` set, Python's `json` uses its pure-Python
+encoder. The C encoder only runs with `indent=None`. `_json_text` now
+indents the run-level head as before and splices in each evaluation as
+one `json.dumps` line. That is the same JSON values (`json.loads` of both
+files compares equal) in a file 23% smaller. Flat per-evaluation records
+and every other `write_json_atomic` payload have no `evaluations` list and
+are written exactly as before.
+
+**Readers.** `./ri runs` (`summary_evaluation_count`) and
+`read_summary_head` both find the head in the new layout. `./ri profile`
+reads the new file.
+
+**Results unchanged.** On this tree, a tiny R2D2 and a tiny WSClean search
+(nlive 100, 20 dead, seed 196) give bit-identical log(Z) to round 196:
+R2D2 0.0101886951976723 +/- 0.00726107899040951 (137 dead, 176
+evaluations), WSClean 0.0895384119210856 +/- 0.00732350343931438 (136
+dead, 174 evaluations). Only the summary's bytes changed, and an
+evaluation never runs this code, so no raced A/B was needed.
+
+**Worth.** About 3.2 s off rank 0's post-run work on a 67k-evaluation
+production run (0.2% of its 23 minutes), growing with the evaluation
+count. The live summary (`summary.live.json`) goes through the same
+writer and gains the same factor. `pack` (17.8 s, Lustre unlinks) and
+`prune` (8.3 s) are still the open post-run costs.
+
+Rows: `r197-r2d2`, `r197-wsclean` in `benchmarks.jsonl` (two of each: the
+searches were run before and after the self-check's collision fix, which moved
+the splice from a NUL marker to the top-level `\n  "evaluations": []`; both
+pairs give the log(Z) above). `self_check_summary_json` covers the writer.
