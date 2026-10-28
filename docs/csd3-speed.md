@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 201; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 202; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9379,3 +9379,60 @@ line will show it.
 
 Rows: `r201-prune-fixture`, `r201-tiny`, `r201-wsclean`, `r201-wsa`,
 `r201-wsb` in `benchmarks.jsonl`. All run dirs were deleted.
+
+## Round 202: the R2D2 pool loads pre-optimised ONNX graphs, -3 s of startup
+
+Round 200 left ~11 s of startup outside a production search. In a tiny
+R2D2 search (seed 196, nlive 100, 20 dead, 39 ranks) the first 38
+requests each took ~8.4 s against ~0.8 s warm: they wait for the pool's
+warm-up. Its parts, timed in the SIF (`.probe/r202/warm_probe.py`, two runs):
+
+| warm-up part | seconds |
+| --- | ---: |
+| imager imports (`runpy` of `imager.py`) | 2.5 |
+| torch checkpoints (`load_checkpoints`) | 1.9 |
+| 25 ORT sessions (`patch_onnx_network`) | 4.8-5.0 |
+| total | 9.1-9.4 |
+
+Session builds hold the GIL: 25 sessions take 4.7 s on 1, 4, 8 or 25
+threads (`sess_probe.py`). With graph optimisation off they take 1.7 s,
+so ~3 s of the build is ORT's graph optimiser, which does the same work
+for the same models in every pool. **Change:** the first pool on a CPU
+saves each optimised graph (`optimized_model_filepath`) beside the
+exported models, in `opt-<cpu hash>/`, keyed by the CPU's model name and
+flags because the graph may hold CPU-specific NCHWc layouts. Later pools
+load those with `ORT_DISABLE_ALL`. 25 nets (`opt_probe.py`, `fwd_probe.py`):
+
+| | build | output sha256 (128x128 and 96x160) | forward, 128x128 |
+| --- | ---: | --- | ---: |
+| as before | 3.97-4.93 s | `8b1d13c3ee77` | 144.5 ms |
+| optimised graph, optimisation off | 1.40-1.57 s | `8b1d13c3ee77` | 144.7 ms |
+
+Interleaved pairs of tiny searches against HEAD (from a detached worktree),
+`.probe/r202/ab.sh`:
+
+| pair | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| command wall, HEAD | 20.65 | 21.73 | 20.13 | 19.19 | 20.43 s |
+| command wall, new | 16.30 | 16.43 | 16.83 | 16.46 | **16.51 s** |
+| first request, HEAD | 8.35 | 8.55 | 8.40 | 8.42 | 8.43 s |
+| first request, new | 5.59 | 5.60 | 5.45 | 5.36 | **5.50 s** |
+
+log(Z) is 0.0101886951976723 +/- 0.00726107899040951 in all 8 runs,
+bit-identical to round 198's reference. The first pool on a new CPU
+pays ~6 s once to write the 2.9 GB of optimised graphs to hpc-work
+(23.7 s command wall), then every pool after it gains ~3 s. A whole
+node builds a session set per socket (round 149), so it gains this
+twice from the second pool on. The change is in `r2d2_serve.py` only,
+so WSClean is not touched.
+
+In production this is ~3 s of ~25 s outside a 27-minute search
+(0.2%), more on short jobs, resumes and retries. It also halves a
+tiny benchmark's startup tax, which tightens the A/B loop. What is left
+of the warm-up: imager imports 2.5 s, torch checkpoints 1.9 s (kept
+because a request with more than one thread falls back to torch), and
+1.5 s of session loads.
+
+Rows: `r202-startup-ab` in `benchmarks.jsonl`, with the new arm's
+`r202-abb` rows (HEAD's landed in the removed worktree). Run dirs deleted.
+

@@ -291,10 +291,41 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     # No CPU arena: bit-identical, same speed, ~8GB less PSS at 38 ranks (round 143).
     options.enable_cpu_mem_arena = False
 
+    # Graph optimisation is ~3 of the 25 sessions' ~4.5s build, so the first
+    # build on a CPU saves each optimised graph and later pools load that with
+    # optimisation off: bit-identical outputs and forward time (round 202). It
+    # may hold CPU-specific layouts (NCHWc), so it is keyed by the CPU.
+    import hashlib
+
+    cpuinfo = Path("/proc/cpuinfo").read_text().split("\n\n")[0]
+    cpu = [line for line in cpuinfo.splitlines() if line.startswith(("model name", "flags"))]
+    optimised = models / f"opt-{hashlib.sha1(repr(cpu).encode()).hexdigest()[:12]}"
+    optimised.mkdir(exist_ok=True)
+
+    def session(cur_iter: int):
+        path = optimised / f"N{cur_iter}.onnx"
+        if path.exists():
+            loaded = ort.SessionOptions()
+            for name in ("intra_op_num_threads", "inter_op_num_threads", "enable_cpu_mem_arena"):
+                setattr(loaded, name, getattr(options, name))
+            loaded.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            loaded.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            return ort.InferenceSession(str(path), loaded, providers=["CPUExecutionProvider"])
+        partial = path.with_suffix(f".{os.getpid()}.tmp")
+        options.optimized_model_filepath = str(partial)
+        try:
+            built = ort.InferenceSession(str(models / f"N{cur_iter}.onnx"), options,
+                                         providers=["CPUExecutionProvider"])
+        finally:
+            options.optimized_model_filepath = ""
+        try:
+            partial.replace(path)
+        except OSError:  # not saved (read-only cache, say): the next pool optimises again
+            pass
+        return built
+
     def build() -> dict[int, object]:
-        return {cur_iter: ort.InferenceSession(str(models / f"N{cur_iter}.onnx"), options,
-                                               providers=["CPUExecutionProvider"])
-                for cur_iter in range(1, num_iter + 1)}
+        return {cur_iter: session(cur_iter) for cur_iter in range(1, num_iter + 1)}
 
     # Where the torch checkpoints went, the sessions' weights go too: a set
     # per NUMA node when load_checkpoints made one (enter_node swaps it in),
