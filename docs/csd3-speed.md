@@ -10522,7 +10522,7 @@ in scoring changed, and the new code only runs after the server has
 exited, so results and throughput cannot change. CPU and WSClean searches
 never start a server, so no A/B was run.
 
-## Round 221 (start-up, GPU confirmation pending): each shared TensorRT lane serves as soon as it is made
+## Round 221 (start-up, confirmed in round 222): each shared TensorRT lane serves as soon as it is made
 
 **Why.** Round 219 found that the shared server makes its 19 lanes (475
 execution contexts) in 12.2 s, and threads do not help (13.4 s on 19
@@ -10555,3 +10555,77 @@ lanes, and splits one lane's context set-up into `create_execution_context`,
 minutes after submission. Read `.probe/r221/job-39485592.out` next round.
 The job runs `./ri search` from the live worktree, so leave
 `r2d2_serve.py` untouched until it has run.
+
+**Result (read in round 222, gpu-q-4).** Old against new, alternated 3
+times, bit-identical across versions and lanes:
+
+| | old (all lanes, then serve) | new (each lane as made) |
+|---|---:|---:|
+| first reply, earliest lane | 16.93, 14.54, 14.63 s | 3.01, 3.06, 3.01 s |
+| mean lane done (25 forwards) | 17.11, 14.73, 14.82 s | 8.91, 8.95, 8.90 s |
+| last lane done | 17.12, 14.74, 14.83 s | 14.80, 14.83, 14.79 s |
+
+The mean worker now gets its first forwards ~6 s sooner, as expected. One
+lane's 25 contexts take 0.64-0.65 s, all of it in
+`create_execution_context`; `set_input_shape` and address binding cost
+nothing measurable, and `ON_PROFILE_CHANGE` is no faster than
+`USER_MANAGED`. Lazy context creation would not help either, since every
+lane needs all 25 nets within its first request. The default search in the
+same job finished rc 0 with log(Z) 0.0169791852331699 +/- 0.00171834943813729
+(r219-D: 0.01884 +/- 0.00065, 1.0 sigma apart), `startup_s` 18.8 s against
+22.3 s and 85.0 steady evals/s against r219-D's 100.0 on gpu-q-44. That last
+gap is a single arm on a different node, and the server code that sets the
+steady rate did not change, so it is node noise (ledger row `r221-D`;
+`r221-lanes-probe` holds the probe). The search ran while round 222's
+opt-in edit was in the tree, so the row is marked dirty, but the edit only
+added a branch that the default path never takes.
+
+## Round 222 (negative): the shared TensorRT server is bound by the card, not the GIL
+
+**Why.** A default GPU search runs ~100 steady evals/s at 25 forwards a
+request, i.e. ~2,500 forwards/s, which is the shared server's ceiling from
+round 207 (2,450/s at 12-32 clients). The server answers 19 lanes from 19
+Python threads. A pure-Python echo of its protocol on a CPU node (same
+SOCK_SEQPACKET pairs, numpy copies, no GPU; `.probe/r222/echo.py`) shows
+heavy GIL convoying:
+
+| echo server, 19 clients | forwards/s |
+|---|---:|
+| 1 process x 19 threads (the server's layout) | 4,412, 4,531 |
+| 2 processes x 9-10 threads | 8,290, 8,252 |
+| 3 processes x 6-7 threads | 30,235, 30,608 |
+| 1 process, 1 thread over a selector | 93,440, 94,991 |
+
+Adding the CUDA calls could plausibly bring 4,400/s down to ~2,450/s, so
+the ceiling might have been the GIL rather than the card.
+
+**Tried.** `R2D2_TRT_SERVER=select`: one thread serves every lane over a
+selector, enqueues each forward on its lane's stream and waits on the
+oldest pending blocking event (no spin), while a second thread makes the
+lanes so round 221's early start is kept. It had a CPU self-check with
+faked CUDA. GPU job 39489396 (gpu-q-36, `.probe/r222/probe.py`) put 19
+raw-socket clients against each server variant for 20 s, 2 rounds in
+mirrored order, after each lane had answered all 25 nets:
+
+| server | forwards/s |
+|---|---:|
+| **today's: 1 process, 19 lane threads** | **2,447, 2,368** |
+| same, lanes split over 2 processes | 2,144, 2,141 |
+| same, lanes split over 3 processes | 1,898, 1,896 |
+| one selector thread, spinning on `Event.query()` | 2,011, 2,015 |
+| one selector thread, blocking on the oldest event | 1,929, 1,912 |
+| the opt-in as written (`R2D2_TRT_SERVER=select`) | 1,917, 1,973 |
+
+All six give bit-identical outputs. Every alternative loses 12-23%, so
+the server is not GIL-bound: its 19 threads keep 19 streams' kernels
+queued on the card, and one thread or several CUDA contexts (time-sliced
+without MPS) keep fewer in flight. The change is reverted, and
+`.probe/r222/selector-server.diff` keeps it.
+
+**What it means.** A default GPU search is already at the card's
+throughput with this engine set (~2,400 forwards/s at batch 1, 32x32).
+CPU-side cuts to a request, and more ranks, cannot raise a 1-GPU search's
+rate. Only cheaper forwards can: fewer or fused kernels per net, or more
+work per launch. fp16 (round 175) and TF32 are off the table for accuracy,
+and batching across requests (rounds 127, 137) depends on clients wanting
+the same net at the same time.
