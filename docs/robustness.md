@@ -272,7 +272,7 @@ summary with the same 54 evaluations in 0.014s, imaging nothing.
 
 ### Where the checkpoint lives
 
-PolyChord writes `chains/` on node tmpfs (`/dev/shm/ri-chains-*`), and a child of rank 0 mirrors it to `<run>/chains` every 2 s through a temp file and a rename, with a blocking final sync before `summary.json` (round 227: a Lustre create can block 20-45 s, which used to stop the whole search). Everything that restarts or reads a run uses `<run>/chains`; a new attempt reseeds tmpfs from it. A kill loses at most the mirror's lag, normally 2 s, up to ~40 s when Lustre blocks its copy, and the evaluations in that window are adopted from the cache, not imaged again. `NS_CHAINS_TMPFS=0` writes straight to Lustre.
+PolyChord writes `chains/` on node tmpfs (`/dev/shm/ri-chains-*`), and a child of rank 0 mirrors it to `<run>/chains` every 2 s, with a blocking final sync before `summary.json` (round 227: a Lustre create can block 20-45 s, which used to stop the whole search). Only the `.resume` goes through a temp file and a rename; the text files are rewritten in place, because under load creates blocked 12 times in 1,211 and in-place rewrites never (round 229). A text file torn by a kill is rewritten at the next checkpoint, and a finished run's final sync completes before its `summary.json`. Everything that restarts or reads a run uses `<run>/chains`; a new attempt reseeds tmpfs from it. A kill loses at most the mirror's lag, normally 2 s, up to ~40 s when Lustre blocks its copy, and the evaluations in that window are adopted from the cache, not imaged again. `NS_CHAINS_TMPFS=0` writes straight to Lustre.
 
 ### One no-progress failure is retried anyway: an unreadable checkpoint
 

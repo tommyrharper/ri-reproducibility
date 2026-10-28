@@ -594,7 +594,9 @@ def main() -> None:
         print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
 
-    write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    if mpi_rank() == 0:  # one writer: rank 0's mirror seeds tmpfs from it, and another
+        # rank's truncating rewrite once seeded an empty file (round 229)
+        write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()

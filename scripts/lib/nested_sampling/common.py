@@ -1530,9 +1530,12 @@ def chains_base_dir(output_dir: Path) -> Path:
 
 
 def sync_chains(src: Path, dst: Path, seen: dict[Path, tuple[int, int]]) -> int:
-    """Copy each file changed since `seen` to dst, through a temp name and a
-    rename, so <run>/chains never holds half a checkpoint. PolyChord renames
-    its .resume into place, so the copy reads a whole one; a text file caught
+    """Copy each file changed since `seen` to dst. A .resume goes through a
+    temp name and a rename, so <run>/chains never holds half a checkpoint;
+    the text files PolyChord only writes are rewritten in place, because a
+    Lustre create blocks for up to ~40 s (12 of 1,211 under load) while an
+    in-place rewrite never passed 1 s (round 229). PolyChord renames its
+    .resume into place, so the copy reads a whole one; a text file caught
     mid-write is copied again on the next pass, its stamp having moved."""
     import shutil
 
@@ -1546,9 +1549,14 @@ def sync_chains(src: Path, dst: Path, seen: dict[Path, tuple[int, int]]) -> int:
                 continue
             target = dst / path.relative_to(src)
             target.parent.mkdir(parents=True, exist_ok=True)
-            partial = target.with_name(f".{target.name}.mirror")
-            shutil.copyfile(path, partial)
-            partial.replace(target)
+            if path.suffix != ".resume" and target.is_file():
+                with open(path, "rb") as source, open(target, "r+b") as out:
+                    shutil.copyfileobj(source, out)
+                    out.truncate()
+            else:
+                partial = target.with_name(f".{target.name}.mirror")
+                shutil.copyfile(path, partial)
+                partial.replace(target)
         except FileNotFoundError:
             continue  # renamed away under us; the next pass sees its successor
         seen[path] = (stat.st_mtime_ns, stat.st_size)
@@ -1625,8 +1633,15 @@ def self_check_chains_mirror() -> None:
         time.sleep(CHAINS_MIRROR_SECONDS * 2.5)
         assert (run / "chains" / "r.resume").read_text() == "new", "mirrored while running"
         (shm / "r.stats").write_text("s")
+        paramnames, resume = ((run / "chains" / name).stat().st_ino for name in ("r.paramnames", "r.resume"))
+        (shm / "r.paramnames").write_text("longer than before")
+        (shm / "r.resume").write_text("x")
         mirror.stop()
         assert (run / "chains" / "r.stats").read_text() == "s", "final sync"
+        assert (run / "chains" / "r.paramnames").read_text() == "longer than before"
+        assert (run / "chains" / "r.paramnames").stat().st_ino == paramnames, "text rewritten in place: no create"
+        assert (run / "chains" / "r.resume").read_text() == "x"
+        assert (run / "chains" / "r.resume").stat().st_ino != resume, ".resume renamed into place"
         assert (run / "chains" / "clusters" / "r_1.txt").read_text() == "c"
         assert not (run / "chains" / "r_temp.resume").exists(), "temp files stay behind"
         assert not list((run / "chains").glob(".*.mirror")), "no partial left"

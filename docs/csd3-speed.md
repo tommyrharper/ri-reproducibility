@@ -11046,3 +11046,66 @@ r1-r4's and w1's log(Z) were 0.01538, 0.01370, 0.01310, 0.01359 and 0.09461
 copied). All run directories are deleted. The scripts are in
 `.probe/r228/`. GPU job 39497293 (round 224's gathering A/B) had produced
 no output file at 20:18. It was still pending, and it is not read here.
+
+## Round 229: the chains mirror rewrites text files in place; only the `.resume` is created
+
+**Question.** Round 228 saw `ChainsMirror.stop()`'s final sync block the end
+of a search for ~44 s in one of its 14 Lustre creates. A quiet-spell
+microbenchmark found nothing. Under load, does an in-place rewrite of an
+existing file block the way a create does?
+
+**Probe** (`.probe/r229/lb2.py`). Over 300 s, during and after a 19-rank
+WSClean search (`r229-load3`), each cycle did both of these, alternating
+which went first: create `.a.mirror`, write 200 KB and rename it over `a.txt`;
+and open the existing `ip.txt` with `O_TRUNC` and write 200 KB.
+
+| step | n | median | max | over 1 s | lost |
+|---|---:|---:|---:|---:|---:|
+| create + write + rename | 1,211 | 0.93 ms | **40.9 s** | 12 | 175.4 s |
+| in-place rewrite | 1,211 | 0.52 ms | 0.0 s | **0** | 0 |
+
+The block is in the metadata ops a create and a rename make. Rewriting a file
+that already exists never blocked.
+
+**Change.** `sync_chains` now rewrites every file except `*.resume` in place
+when it already exists on Lustre: it writes over the old bytes and then
+truncates, so a reader never sees an empty file. The `.resume` is what `./ri resume`
+restarts from, so it keeps the copy-and-rename that makes it atomic. A
+full sync used to make 14 creates and now makes one, apart from a file's
+first appearance. So the 2-s mirror passes and the end-of-run sync each take
+about 1/14 of the chance of a 40-s block. A kill during a rewrite can tear a
+text file, but PolyChord rewrites those files whole at every checkpoint, and a
+finished run's final sync completes before `summary.json` is written.
+
+**Bug found on the way (pre-existing since round 227).** The base arm of the
+first synchronous pair ended with an **empty** `chains/<root>.paramnames`.
+Every rank called `write_polychord_paramnames`, which truncates the file and
+rewrites it. Meanwhile rank 0's mirror seeded tmpfs with a copytree, so it
+could copy another rank's truncated file and then sync the empty file back to Lustre.
+anesthetic and `./ri plot` need the paramnames. Now only rank 0 writes it,
+before it starts the mirror, in both `polychord_wsclean.py` and
+`polychord_r2d2.py`.
+
+**WSClean guard** (raced; base is a `d5ef7a9` worktree; seed 229, nlive 100,
+max-ndead 4000, each arm on half the CPUs):
+
+| pair | base | new | log(Z) |
+|---|---:|---:|---|
+| async 1 (a1 on CPUs 0-18, b1 on 19-37) | 50.7 steady | 69.5 | async runs differ from run to run; all four agree within 1 sigma (0.0963-0.0970 +/- 0.0005) |
+| async 2 (CPUs swapped) | 73.7 | 75.6 | |
+| sync, 9 ranks each (sc, sd) | 35.81 | 35.54 (-0.8%, noise) | **0.0962001628097257 +/- 0.000453662936636545 in both, `diff -rq chains/` identical** |
+
+No end-of-run block happened in any arm, so this guard shows no wall-time
+gain. That is expected: the old code blocked on about 1% of its creates. The
+gain is the 175-s-against-0 probe above. Two side notes. A pair needs a pinned
+`--mpi-procs`, because `taskset` halves gave 10 ranks on CPUs 0-18 and 9 on
+19-37, so the first synchronous pair could not be bit-compared. And command
+wall time ran 70-85 s above search wall time in the first async pair only,
+which is a start-up cost this round did not trace.
+
+Rows `r229-*` and stage rows `r229-lustre-inplace` and `r229-guard` (log(Z) to
+full precision) are in `benchmarks.jsonl`. All run directories and the base
+worktree are deleted. Self-checks: `self_check_chains_mirror` now asserts that a
+text file keeps its inode (rewritten in place) and that the `.resume` gets a
+new one (renamed); 30 host checks pass. GPU job 39497293 (round 224's
+gathering A/B) still had no output at 20:49 and was not read.
