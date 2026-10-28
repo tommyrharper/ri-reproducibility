@@ -157,8 +157,11 @@ PolyChord container. `NS_MPI_PROCS` sets the rank count (default
 evaluations for debugging.
 
 The target builds any missing WSClean, MeqTrees, and PolyChord images first.
-Each likelihood evaluation runs one MeqTrees simulate and one WSClean imaging
-step in this rank's already-running sidecar containers.
+Each likelihood evaluation runs one simulate and one WSClean imaging step in
+this rank's already-running sidecar containers. The simulate runs in the
+MeqTrees container but computes the point source analytically; the MeqTrees
+predict itself runs only in self-checks, as the reference the analytic one is
+checked against.
 
 ### R2D2
 
@@ -169,7 +172,7 @@ step in this rank's already-running sidecar containers.
 Output: `results/nested-sampling/r2d2-vlaa-<UTC timestamp>/`.
 
 The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
-evaluation runs one MeqTrees simulate, one MeqTrees-hosted MS-to-`.mat`
+evaluation runs one simulate (analytic, as above), one MeqTrees-hosted MS-to-`.mat`
 conversion and one R2D2 imaging job, each a request to a long-lived process
 inside one of the run's two sidecar containers.
 

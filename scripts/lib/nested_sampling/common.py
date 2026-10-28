@@ -981,7 +981,7 @@ def format_share(fraction: float | None) -> str:
 
 # (stage key, eval-count key, label, indented under the row above it).
 PROFILING_VIEW_STAGES = (
-    ("simulate", "simulate_seconds", "simulate (MeqTrees)", False),
+    ("simulate", "simulate_seconds", "simulate (visibilities + noise)", False),
     ("convert", "convert_seconds", "convert (MS -> .mat)", False),
     ("image_container", "image_container_seconds", "{imager} container (total)", False),
     ("image_binary", "image_binary_seconds", "of which: {imager} itself", True),
@@ -4162,12 +4162,12 @@ def self_check_profiling() -> None:
     assert mpi["worker_seconds_budget"] == 30.0  # not 40.0: rank 0 is not a worker
     assert abs(mpi["subtotal_share"] - 0.65) < 1e-9
     assert abs(mpi["remainder_rows"][0]["seconds"] - 10.5) < 1e-9
-    assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
+    assert mpi["rows"][0]["label"] == "simulate (visibilities + noise)"
 
     oversubscribed = profiling_breakdown(summarize_profiling(evaluations, total_wall_seconds=1.0, mpi_procs=2))
     assert oversubscribed["worker_seconds_budget"] == 19.5
     assert oversubscribed["remainder_rows"][0]["seconds"] == 0.0
-    assert oversubscribed["rows"][0]["label"] == "simulate (MeqTrees)"
+    assert oversubscribed["rows"][0]["label"] == "simulate (visibilities + noise)"
 
     for unsplit in (serial, mpi):
         assert [row["label"] for row in unsplit["remainder_rows"]] == [UNACCOUNTED_LABEL]

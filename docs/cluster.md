@@ -330,8 +330,14 @@ other ranks while it waits (+6%; `R2D2_CUDA_BLOCKING_SYNC=0` spins, round 123).
 That freed CPU is why the default is 19 ranks a card, the most its memory
 holds (`NS_R2D2_CUDA_MAX_RANKS`; 43.9 against 41.1 evals/s at 16, round 124).
 `R2D2_RUNTIME=trt` runs the U-Net as TensorRT fp32 engines instead: requests
-are 45% faster, but only 12 ranks fit, so a search gains ~4% (opt-in; plans
-are built on first use and cached, ~5 minutes; round 171).
+are 45% faster, but only 12 ranks fit, so a search gains ~4% (plans are built
+on first use and cached, ~5 minutes; round 171). Since round 215 the GPU
+default is TensorRT with `R2D2_TRT_SHARED=1`: one forward server holds the 25
+engines for every worker, the workers stay on the CPU and no MPS daemon is
+started, so the 19 ranks fit again. It converged the 22 Sep search in 785 s
+against 1,165 s for eager torch (90.8 against 64.2 evals/s, log(Z) 0.06 sigma
+apart). `R2D2_RUNTIME=torch` brings back eager torch with MPS, and
+`R2D2_TRT_SHARED=0` brings back per-worker engines.
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:

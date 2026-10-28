@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 213; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 215; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -104,8 +104,10 @@ the Hetzner host.
   the 22 Sep production search it takes 13.5 minutes at **80.5 evals/s
   against 69.6** for per-worker (+16%; steady 89.6 against 71.7), log(Z)
   0.01708 and 0.01735 +/- 0.00042, with no meqserver wedge in either. The
-  default stays eager until the converged race against it (job 39470312)
-  is read ([round 213](#round-213-positive-opt-in-converged-shared-tensorrt-runs-the-production-search-16-faster-than-per-worker-tensorrt)).
+  converged race against eager 19 x 2 settles it: **785 s against 1,165 s**
+  (90.8 against 64.2 evals/s, 100.1 against 66.4 steady), log(Z) 0.06
+  sigma apart, so shared TensorRT is the GPU default since
+  [round 215](#round-215-gpu-default-shared-tensorrt-converges-the-production-search-in-785-s-against-eagers-1165).
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -10206,3 +10208,81 @@ and `summary-{E,S}.json` next round.
   the run directory. A 137 there points at the worker going silent, most
   likely CPU or memory starvation while the shared TensorRT server starts
   up, not at the simulate code.
+
+
+## Round 215 (GPU default): shared TensorRT converges the production search in 785 s against eager's 1,165
+
+**Question.** Round 213 found shared TensorRT 16% faster than per-worker
+TensorRT on the converged 22 Sep search, but never raced it against the
+GPU default, eager torch 19 x 2 with MPS. Does it beat that too?
+
+**Run.** Job 39470312 (gpu-q-1, 1 x A100-80GB, 32 cores,
+`.probe/r214/job.sh`), submitted by round 213, read here. The 22 Sep
+search (seed 190182240, nlive 150, 15 repeats, to convergence), eager
+first, then shared, one arm each on tree `99e1bea`. Rows `r214-E`,
+`r214-S`; both `summary.json`s are kept in `.probe/r214/`.
+
+| | eager torch 19 x 2 (MPS) | shared TensorRT 19 x 2 (no MPS) |
+| --- | ---: | ---: |
+| search wall (job's clock) | 1,165 s | **785 s** |
+| evaluations | 68,476 | 68,756 |
+| evals/s | 64.2 | **90.8 (+41%)** |
+| start-up + stall s | 31.0 + 3.8 | 65.3 + 4.3 |
+| steady evals/s | 66.4 | **100.1 (+51%)** |
+| request ms per evaluation | 253 | 166 |
+| simulate ms per evaluation (max) | 21.7 (1.53 s) | 26.0 (0.86 s) |
+| idle fraction | 0.35% | 0.56% |
+| dead points / likelihood calls | 1,346 / 67,629 | 1,311 / 67,874 |
+| log(Z) | 0.0169929843910844 +/- 0.000418239 | 0.0170325527068095 +/- 0.000448107 |
+
+**Result.** Shared TensorRT finishes the production search a third
+sooner: 785 s against 1,165 s, +41% evals/s by the headline rate and +51%
+steady. The two log(Z)s are 0.06 sigma apart and within 0.6 sigma of round
+213's two runs and round 195's CPU run. With round 213 (+16% over
+per-worker TensorRT), shared TensorRT beats both other GPU modes
+converged. One converged pair is not an interleaved A/B, but the effect
+is 10x this host's ~4% sequential bias, and round 212's interleaved short
+arms ranked the modes the same way. No evaluation in either run had a
+simulate over 1.6 s, so neither run stalled.
+
+**Change.** `run-nested-sampling-r2d2.sh`: on a GPU, `R2D2_RUNTIME`
+defaults to `trt` and, with it, `R2D2_TRT_SHARED` to 1 (recorded in
+`run.env`). The default layout on a 32-core A100 job is still 19 ranks x
+2 threads (`NS_R2D2_CUDA_MAX_RANKS`, and the 4 GB-per-rank card budget
+fits 19), which is the layout raced. `R2D2_RUNTIME=torch` brings back eager
+torch with MPS, and `R2D2_TRT_SHARED=0` brings back per-worker engines.
+`resume-nested-sampling-run.sh`: a `run.env` with no `R2D2_TRT_SHARED`
+resumes with 0, so an old per-worker TensorRT run does not change mode on
+resume (eager runs record `R2D2_RUNTIME=torch` and stay eager). CPU
+searches and WSClean are untouched: the new lines run only for
+`R2D2_DEVICE=cuda`, so no WSClean race was needed. The first default GPU
+search on a node with no cached plans builds them first (~5 minutes, round
+171).
+
+**Also.** The profiler's first row is now "simulate (visibilities +
+noise)", not "simulate (MeqTrees)" (`PROFILING_VIEW_STAGES` in
+`common.py`), and `docs/nested-sampling.md` says that the search's
+simulate is analytic, with the MeqTrees predict only run in self-checks
+(round 214). That label is the likely source of the "MeqTrees takes 30-50% of the
+runtime" reading came from: the stage was 39% on 22 Sep (round 184's
+table) and is 3-5% of worker time now, none of it MeqTrees.
+
+**Default checked.** Job 39474141 (gpu-q-44, `.probe/r215/job.sh`) ran
+`./ri search r2d2 --device cuda` with no runtime, thread or rank variables
+(nlive 48, 5 repeats, 600 dead points, seed 4242), on this round's tree.
+Its `run.env` recorded `R2D2_RUNTIME=trt`, `R2D2_TRT_SHARED=1`,
+`NS_MPI_PROCS=19` and `R2D2_OMP_THREADS=2`, and it finished rc 0 in 281 s:
+46.4 evals/s with 90.9 s of start-up, 80.7 steady (round 212's shared short
+arms: 66-97), no stall. Its log(Z), 0.0187108469398579 +/- 0.000591, agrees
+with round 212's three shared arms (0.0188-0.0189). Row `r215-default`.
+A cold node's start-up runs to ~90 s, against 23-24 s in round 212.
+
+**Learned.**
+- Shared TensorRT's start-up (65-91 s, the server loading 25 engines
+  before its first forward) is the only thing it does worse than eager (31
+  s). On a 13-minute search that costs ~5%, so cutting it is the next
+  GPU lever.
+- Three converged GPU searches in a row (rounds 213-215, 202k evaluations)
+  had no simulate over 1.6 s. The ~80 s stalls are confined to round 211's
+  short arms.
+

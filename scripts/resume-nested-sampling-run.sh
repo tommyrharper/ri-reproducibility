@@ -177,6 +177,11 @@ export OUTPUT_DIR="${RUN_DIR}"
 if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_RUNTIME=' "${RUN_DIR}/run.env"; then
   export R2D2_RUNTIME="${R2D2_RUNTIME:-torch}"
 fi
+# Likewise a TensorRT run.env from before round 215 without R2D2_TRT_SHARED
+# ran per-worker engines, not the newer shared default.
+if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_TRT_SHARED=' "${RUN_DIR}/run.env"; then
+  export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}"
+fi
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"

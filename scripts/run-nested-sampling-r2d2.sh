@@ -21,10 +21,16 @@ esac
 export R2D2_DEVICE
 # A CPU forward runs through ONNX Runtime unless R2D2_RUNTIME=torch: 33-44%
 # more evals/s, log(Z) within 0.25 sigma of torch's at convergence
-# (docs/csd3-speed.md, rounds 140-145). GPU runs keep torch. Set before
-# rank-budget.sh, which budgets onnx ranks larger.
-: "${R2D2_RUNTIME:=$([ "${R2D2_DEVICE}" = cpu ] && echo onnx || echo torch)}"
+# (docs/csd3-speed.md, rounds 140-145). A GPU forward runs through TensorRT,
+# all workers' engines in one server (R2D2_TRT_SHARED=1): the converged 22 Sep
+# search took 785 s against eager torch's 1,165 (90.8 against 64.2 evals/s),
+# log(Z) 0.06 sigma apart (round 215). Set before rank-budget.sh, which budgets
+# onnx ranks larger.
+: "${R2D2_RUNTIME:=$([ "${R2D2_DEVICE}" = cpu ] && echo onnx || echo trt)}"
 export R2D2_RUNTIME
+if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}" = cuda:trt ]; then
+  export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-1}"
+fi
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
