@@ -506,16 +506,155 @@ def patch_trt_network(checkpoint_path: Path) -> None:
     optimiser = sys.modules["optimiser.R2D2"]
     upstream_load_net = optimiser.load_net
 
+    wrap = TrtSharedNet if trt_shared() else TrtNet
+
     def load_net(net, cur_iter, layers, dnn_dict):
-        if isinstance(net, TrtNet):
+        if isinstance(net, (TrtNet, TrtSharedNet)):
             net = net.torch_net
         if layers != 1 or int(cur_iter) not in _TRT_PLANS:
             return upstream_load_net(net, cur_iter, layers, dnn_dict)
-        wrapper = TrtNet(int(cur_iter), lambda: upstream_load_net(net, cur_iter, layers, dnn_dict))
+        wrapper = wrap(int(cur_iter), lambda: upstream_load_net(net, cur_iter, layers, dnn_dict))
         wrapper.torch_net = net
         return wrapper
 
     optimiser.load_net = load_net
+
+
+def trt_shared() -> bool:
+    """R2D2_TRT_SHARED=1 (with R2D2_RUNTIME=trt): one process holds the engines for every worker.
+
+    A worker's 25 engines take 5.1GB, which caps an A100 at 12 TensorRT
+    workers; one process holding them once, with an execution context per
+    worker, puts 90% of 12 processes' forwards through the card on 6GB, and a
+    pipe round trip per forward costs nothing measurable (csd3-speed.md, round
+    207). Workers then stay off the GPU entirely: everything but the forward
+    runs on the CPU, as it does for R2D2_DEVICE=cpu (round 208).
+    """
+    return (r2d2_device() == "cuda" and r2d2_runtime() == "trt"
+            and os.environ.get("R2D2_TRT_SHARED", "0") == "1")
+
+
+# A forward request is (iteration, worker pid, sequence) then the input's
+# bytes; the reply echoes the header then the output's. A SOCK_SEQPACKET pair
+# keeps each one whole, and the echo lets a replacement worker drop a reply
+# meant for the worker it replaced.
+_TRT_HEADER = __import__("struct").Struct("<iiq")
+# In the pool parent, each worker base's end of its pair; in a worker, its own.
+_TRT_WORKER_SOCKETS: dict[str, object] = {}
+_TRT_SOCKET: list = [None, 0]  # [socket, last sequence number]
+
+
+def trt_shared_forward(sock, cur_iter: int, x, seq: int):
+    """Send `x` (float32, CPU) to the server for net `cur_iter`; None if it did not answer."""
+    import torch
+
+    sock.send(_TRT_HEADER.pack(cur_iter, os.getpid(), seq) + x.numpy().tobytes())
+    want = _TRT_HEADER.pack(cur_iter, os.getpid(), seq)
+    size = _TRT_HEADER.size + x.numel() // 2 * 4
+    while True:
+        reply = sock.recv(size)
+        if not reply:
+            raise ConnectionError("TensorRT forward server closed")
+        if reply[:_TRT_HEADER.size] == want:
+            break
+    if len(reply) != size:  # the server could not run this net
+        return None
+    return torch.frombuffer(bytearray(reply[_TRT_HEADER.size:]), dtype=torch.float32).view(1, 1, *x.shape[2:])
+
+
+class TrtSharedNet:
+    """Stands in for the U-Net in a worker, sending its forwards to the shared server; others run on the CPU."""
+
+    def __init__(self, cur_iter, eager):
+        self.cur_iter = cur_iter
+        self.eager = eager
+
+    def __call__(self, x):
+        import torch
+
+        sock = _TRT_SOCKET[0]
+        dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
+        if sock is not None and tuple(x.shape) == (1, 2, dim, dim) and x.dtype == torch.float32:
+            _TRT_SOCKET[1] += 1
+            try:
+                y = trt_shared_forward(sock, self.cur_iter, x.contiguous(), _TRT_SOCKET[1])
+            except OSError:
+                # Rather than fail every evaluation from here on, the worker
+                # runs the CPU U-Net, and says so in the run's stderr.
+                traceback.print_exc(file=sys.__stderr__)
+                _TRT_SOCKET[0] = None
+                y = None
+            if y is not None:
+                return y
+        return self.eager()(x)
+
+
+def serve_trt_shared(socks: list, dim: int) -> None:
+    """The forward server: load each plan once, one lane (contexts, stream, buffers) a worker, a thread a lane."""
+    import threading
+
+    import numpy as np
+    import torch
+
+    import tensorrt as trt
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+    engines = {cur_iter: runtime.deserialize_cuda_engine(path.read_bytes()) for cur_iter, path in _TRT_PLANS.items()}
+    scratch = max(engine.device_memory_size_v2 for engine in engines.values())
+    device = torch.device("cuda")
+    size = _TRT_HEADER.size + 2 * dim * dim * 4
+
+    def lane(sock):
+        stream = torch.cuda.Stream()
+        x = torch.empty(1, 2, dim, dim, device=device)
+        y = torch.empty(1, 1, dim, dim, device=device)
+        hx = torch.empty(1, 2, dim, dim, pin_memory=True)
+        hy = torch.empty(1, 1, dim, dim, pin_memory=True)
+        memory = torch.empty(scratch, dtype=torch.uint8, device=device)
+        contexts = {}
+        for cur_iter, engine in engines.items():
+            context = engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+            context.set_input_shape("x", tuple(x.shape))
+            context.set_tensor_address("x", x.data_ptr())
+            context.set_tensor_address("y", y.data_ptr())
+            context.set_device_memory(memory.data_ptr(), scratch)
+            contexts[cur_iter] = context
+        hx_bytes = hx.numpy().reshape(-1).view(np.uint8)
+        # `memory` is returned only to stay alive: dropped here, torch's
+        # allocator hands the same block to the next lane, every lane's
+        # contexts then share one scratch, and concurrent forwards corrupt
+        # each other (3,798 of 3,800 wrong at 19 lanes; round 208).
+        return sock, stream, x, y, hx, hy, hx_bytes, contexts, memory
+
+    def run(sock, stream, x, y, hx, hy, hx_bytes, contexts, _memory):
+        while True:
+            request = sock.recv(size)
+            if not request:
+                return
+            header = request[:_TRT_HEADER.size]
+            context = contexts.get(_TRT_HEADER.unpack(header)[0])
+            if context is None or len(request) != size:
+                sock.send(header)
+                continue
+            hx_bytes[:] = np.frombuffer(request, np.uint8, offset=_TRT_HEADER.size)
+            with torch.cuda.stream(stream):
+                x.copy_(hx, non_blocking=True)
+                ok = context.execute_async_v3(stream.cuda_stream)
+                hy.copy_(y, non_blocking=True)
+                done = torch.cuda.Event(blocking=True)
+                done.record(stream)
+            done.synchronize()
+            sock.send(header + hy.numpy().tobytes() if ok else header)
+
+    lanes = [lane(sock) for sock in socks]
+    torch.cuda.synchronize()
+    with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
+        status.write(f"shared: one server, {len(lanes)} lanes\n")
+    threads = [threading.Thread(target=run, args=args, daemon=True) for args in lanes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
 
 
 def job_numa_cpus() -> dict[int, list[int]]:
@@ -657,7 +796,7 @@ def warm_imports() -> None:
             patch_request_io()
             patch_checkpoint_loading()
             patch_net_reuse()
-            if r2d2_device() == "cuda":
+            if r2d2_device() == "cuda" and not trt_shared():
                 patch_cuda_network()
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
             if checkpoint_path.is_dir():
@@ -979,6 +1118,11 @@ def serve_pool(fifo_dir: str) -> None:
             for fds in keeper.values():
                 for fd in fds:
                     os.close(fd)
+            for other, sock in _TRT_WORKER_SOCKETS.items():
+                if other == base:
+                    _TRT_SOCKET[0] = sock
+                else:
+                    sock.close()
             # In the child, so the parent stays at os.wait() and lets go of a
             # dead worker's ends the moment it dies. The pause bounds the churn
             # if the replacement cannot serve either (its FIFO directory gone,
@@ -995,6 +1139,7 @@ def serve_pool(fifo_dir: str) -> None:
         # stdio buffers and must run neither.
         os._exit(status)
 
+    server = start_trt_server(bases) if trt_shared() and _TRT_PLANS else None
     for base in bases:
         fork(base)
     # Serves until killed: a worker that exits - on EOF when its rank goes, or
@@ -1002,6 +1147,10 @@ def serve_pool(fifo_dir: str) -> None:
     # (or the next attempt's rank) reconnects to the same FIFOs.
     while True:
         pid, _status = os.wait()
+        if pid == server:
+            # Its workers notice (closed socket) and run the CPU U-Net.
+            print(f"r2d2 TensorRT forward server exited ({_status})", file=sys.stderr)
+            continue
         base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
         # them a rank whose worker died would write into a pipe nobody reads
@@ -1011,6 +1160,39 @@ def serve_pool(fifo_dir: str) -> None:
         for fd in keeper.pop(base, ()):
             os.close(fd)
         fork(base, replacement=True)
+
+
+def start_trt_server(bases: list[str]) -> int:
+    """Fork the shared TensorRT forward server, with a socket pair per worker; return its pid.
+
+    The pool parent keeps each worker's end, so a replacement worker inherits
+    it; the server's ends are closed here, so the server going shows each
+    worker a closed socket rather than a wait for ever.
+    """
+    import socket
+
+    dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
+    server_ends = []
+    for base in bases:
+        worker_end, server_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        for end in (worker_end, server_end):
+            end.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * (_TRT_HEADER.size + 8 * dim * dim))
+        _TRT_WORKER_SOCKETS[base] = worker_end
+        server_ends.append(server_end)
+    pid = os.fork()
+    if pid == 0:
+        status = 0
+        try:
+            for sock in _TRT_WORKER_SOCKETS.values():
+                sock.close()
+            serve_trt_shared(server_ends, dim)
+        except Exception:
+            traceback.print_exc()
+            status = 1
+        os._exit(status)
+    for sock in server_ends:
+        sock.close()
+    return pid
 
 
 def serve(fifo_base: str | None = None) -> None:
@@ -1522,6 +1704,51 @@ def self_check_trt_fallback() -> None:
     print("r2d2 trt fallback self-check passed")
 
 
+def self_check_trt_shared_protocol() -> None:
+    """A worker's forwards round-trip, drop stale replies, and fall back to the CPU net."""
+    import socket
+    import threading
+
+    import torch
+
+    worker_end, server_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    os.environ["NS_IMAGE_DIM"] = "4"
+    size = _TRT_HEADER.size + 2 * 4 * 4 * 4
+
+    def fake_server():
+        while request := server_end.recv(size):
+            header, x = request[:_TRT_HEADER.size], torch.frombuffer(bytearray(request[_TRT_HEADER.size:]),
+                                                                     dtype=torch.float32)
+            cur_iter, pid, seq = _TRT_HEADER.unpack(header)
+            server_end.send(_TRT_HEADER.pack(cur_iter, pid + 1, seq) + bytes(64))  # someone else's
+            if cur_iter == 9:  # a net the server has no engine for
+                server_end.send(header)
+                continue
+            server_end.send(header + (x[:16] * 3).numpy().tobytes())
+
+    thread = threading.Thread(target=fake_server, daemon=True)
+    thread.start()
+    _TRT_SOCKET[:] = [worker_end, 0]
+    try:
+        x = torch.arange(32, dtype=torch.float32).view(1, 2, 4, 4)
+        net = TrtSharedNet(3, lambda: (lambda x: x[:, :1] * 2))
+        assert torch.equal(net(x), x[:, :1] * 3), "served forward"
+        assert torch.equal(net(x), x[:, :1] * 3), "second forward skips the stale reply"
+        assert torch.equal(TrtSharedNet(9, lambda: (lambda x: x[:, :1] * 2))(x), x[:, :1] * 2), "no engine"
+        assert torch.equal(net(torch.ones(1, 2, 8, 8)), torch.ones(1, 1, 8, 8) * 2), "other shape"
+        server_end.shutdown(socket.SHUT_RDWR)  # wakes the fake server's recv; close() would not
+        thread.join()
+        server_end.close()
+        with redirect_fds(Path(os.devnull), Path(os.devnull)):
+            assert torch.equal(net(x), x[:, :1] * 2), "server gone"
+        assert _TRT_SOCKET[0] is None
+    finally:
+        _TRT_SOCKET[:] = [None, 0]
+        worker_end.close()
+        os.environ.pop("NS_IMAGE_DIM")
+    print("r2d2 trt shared protocol self-check passed")
+
+
 def self_check_interleaved_pages() -> None:
     nodes = job_numa_nodes()
     if Path("/sys/devices/system/node/node0").is_dir():
@@ -1567,6 +1794,7 @@ if __name__ == "__main__":
         self_check_interleaved_pages()
         self_check_worker_nodes()
         self_check_trt_fallback()
+        self_check_trt_shared_protocol()
     elif sys.argv[1:2] == ["--build-trt-plans"]:
         print(build_trt_plans(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])))
     elif sys.argv[1:2] == ["--fifo-dir"]:

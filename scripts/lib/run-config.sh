@@ -50,6 +50,9 @@ write_run_config() {
     if [ "${algorithm}" = r2d2 ]; then
       printf 'R2D2_DEVICE=%q\n' "${R2D2_DEVICE:-cpu}"
       printf 'R2D2_RUNTIME=%q\n' "${R2D2_RUNTIME:-torch}"
+      if [ -n "${R2D2_TRT_SHARED:-}" ]; then
+        printf 'R2D2_TRT_SHARED=%q\n' "${R2D2_TRT_SHARED}"
+      fi
     fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"

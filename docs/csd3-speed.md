@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 207; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 208; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -86,7 +86,9 @@ the Hetzner host.
   Open: one process holding the 25 engines once, with a context per
   client, serves 12-32 pipe clients at 2,450 forwards/s (90% of 12 MPS
   workers) on 5.7 GB instead of 66, bit-identical, so a shared TensorRT
-  forward server lifts the 12-worker cap; not wired in yet ([round 207](#round-207-positive-probe-one-process-sharing-25-tensorrt-engines-feeds-the-a100-from-57-gb)).
+  forward server lifts the 12-worker cap ([round 207](#round-207-positive-probe-one-process-sharing-25-tensorrt-engines-feeds-the-a100-from-57-gb)).
+  Wired in as opt-in `R2D2_TRT_SHARED=1`, bit-identical to per-worker
+  TensorRT at 19 concurrent workers; the search race is pending ([round 208](#round-208-wired-in-race-pending-opt-in-r2d2_trt_shared1-one-tensorrt-forward-server-for-the-pool)).
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -9728,3 +9730,61 @@ Then race it against eager and per-worker `trt` in 1-GPU searches at
 19 ranks and 600 dead points (round 173's shape), log(Z) to agree.
 
 Probe only. No search was run, so there is no `benchmarks.jsonl` row.
+
+## Round 208 (wired in, race pending): opt-in `R2D2_TRT_SHARED=1`, one TensorRT forward server for the pool
+
+**Change.** With `R2D2_DEVICE=cuda R2D2_RUNTIME=trt R2D2_TRT_SHARED=1`
+the R2D2 pool forks one forward server (`start_trt_server`,
+`serve_trt_shared` in `r2d2_serve.py`) before its workers. The server holds
+the 25 engines once and gives each worker a lane: 25 user-managed contexts,
+a scratch buffer, a stream and pinned buffers, served by one thread.
+Workers never touch the GPU. `patch_cuda_network` is skipped, so
+everything but the U-Net runs on the CPU as on `R2D2_DEVICE=cpu`, and
+`TrtSharedNet` sends each 1x2xDxD float32 forward down the worker's own
+`SOCK_SEQPACKET` pair. A request is a (net, pid, sequence) header plus the
+input, and the reply echoes the header, so a replacement worker drops a
+reply meant for the worker it replaced. Other shapes, a net with no
+engine, or a server that has gone all fall back to the CPU torch net. The
+run script skips the 6 GB/rank TensorRT sizing in this mode, and
+`run.env` records `R2D2_TRT_SHARED` for `./ri resume`. The default is
+unchanged: off.
+
+**Bug found and fixed before shipping.** The first search (gpu-q-25, job
+39453723, cancelled) ran ~114 likelihood calls/s, but PolyChord needed 136
+calls per slice where round 173 needed ~56, and log(Z) was heading off.
+After 12 min it had 82k calls at 365 dead points, against round 173's
+8-11k for all 600. A one-lane check (job 39454736) was bit-identical to
+per-worker `TrtNet` on all 25 nets. With 19 forked workers at once (job
+39454864, `.probe/r208/check2.py`), 3,798 of 3,800 forwards were wrong,
+worst |diff| 3.4e38. `lane()` did not keep its scratch tensor, so torch's
+caching allocator gave the same block to the next lane and every context
+shared one scratch. Once the lane holds it, 19 concurrent workers x 200
+forwards are **bit-identical** to per-worker TensorRT (3,800 of 3,800,
+job 39454893). Round 207's probe kept its scratch on the lane object,
+which is why it never saw this.
+
+**Pending.** The race in round 173's shape (1 x A100, 600 dead points,
+nlive 48, seed 4242; shared at 19 ranks, per-worker `trt` at 12, eager at
+19, interleaved S T E / T E S / E S) is job 39455029, `.probe/r208/job.sh`.
+Its output goes to `.probe/r208/job-39455029.out` and its run directories
+delete themselves. Read it next round. Ship as default only if log(Z)
+agrees with the other two arms. First arms, read at 11:41 (gpu-q-12):
+
+| arm | evals/s | wall (s) | log(Z) | ndead / nlike | card peak (MiB) | GPU util |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| warm, shared, 19 ranks | 45.9 | 287.9 | 0.0184173527579479 +/- 0.000819 | 492 / 11,509 | 5,779 | 74% |
+| S1, shared, 19 ranks | 52.5 | 227.7 | 0.018861009306903 +/- 0.000643 | 509 / 10,706 | 5,779 | 84% |
+
+log(Z) sits inside round 173's 0.0179-0.0190 for both runtimes, and no
+evaluation failed. At 52.5 evals/s, S1 is not yet ahead of round 173's
+58-64 for per-worker `trt` and 51-63 for eager. The same-job T and E arms
+decide it.
+
+Self-checks: `self_check_trt_shared_protocol` (round trip, stale reply,
+no-engine reply, other shape, server gone) and the full
+`r2d2_serve.py --self-check` pass in `r2d2.sif`, and
+`test_self_checks.py` passes. The only shared-code edit is in
+`run-config.sh`, inside its `r2d2` branch: a WSClean `run.env` is
+byte-identical before and after (checked with `write_run_config`), so no
+WSClean A/B was run. Slurm etiquette slip: this round made three Slurm
+calls less than 2 minutes apart (17 s, 64 s and 115 s).

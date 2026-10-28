@@ -82,7 +82,9 @@ if [ "${R2D2_DEVICE}" = cuda ]; then
   NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
   # A TensorRT worker's 25 engines hold ~5.1GB on the card against eager's
   # ~3.1GB of weights, so an 80GB A100 fits 12, not 19 (csd3-speed.md, round 170).
-  if [ "${R2D2_RUNTIME}" = trt ]; then
+  # R2D2_TRT_SHARED=1 holds them once, in one forward server, and its workers
+  # stay off the card, so eager's sizing is an over-estimate (round 208).
+  if [ "${R2D2_RUNTIME}" = trt ] && [ "${R2D2_TRT_SHARED:-0}" != 1 ]; then
     NS_R2D2_CUDA_MB_PER_RANK="${NS_R2D2_CUDA_TRT_MB_PER_RANK}"
   fi
   # Each worker holds all 25 checkpoints on the GPU. Past what the card holds,
@@ -266,7 +268,7 @@ case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
     fi
     if [ "${R2D2_RUNTIME}" = trt ]; then
       R2D2_POOL_FLAGS+=(--bind "${R2D2_TRT_DIR}:/opt/r2d2-trt" --env R2D2_TRT_STATUS="${OUTPUT_DIR}/r2d2-engine.txt"
-        --env NS_IMAGE_DIM="${NS_IMAGE_DIM}")
+        --env NS_IMAGE_DIM="${NS_IMAGE_DIM}" --env R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}")
     fi
     ;;
   *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;
