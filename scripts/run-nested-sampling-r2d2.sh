@@ -173,10 +173,10 @@ done
 #
 # The simulate workers are each kept alive by their own loop: a worker that
 # dies - or exits when its rank's end of the FIFO closes - is started again
-# and reopens the same pair, and the rank reconnects (common.py). The pid
-# file is how a rank kills a worker that has wedged (FifoWorker.kill). The
-# working tree is bound over the baked copy so the run executes the code in
-# this checkout; there is no `docker build` here to keep them in step.
+# and reopens the same pair; the rank reconnects (common.py). The pid
+# file is how a rank kills a wedged worker (FifoWorker.kill); a mid-run
+# "exited 137" in workers-meqtrees.log is that (round 214).
+# The tree overlays the SIF.
 #
 # The single quotes are deliberate: $1, ${fifo} and ${base} are for the
 # container's own sh, which gets its arguments below, not for this one.
@@ -190,6 +190,7 @@ sidecar_launch "${MEQTREES_SIF}" \
     ( while :; do
         python3 /opt/ri-nested-sampling/simulate_point_source_ms.py \
           --serve --fifo "${base}" & echo $! >"${base}.pid"; wait $!
+        echo "$(date +%s) simulate worker ${base##*/} exited $?"
       done ) &
   done
   wait

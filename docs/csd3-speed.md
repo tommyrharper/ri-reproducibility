@@ -9947,7 +9947,9 @@ they show two kinds of stretch in which *no rank starts anything*:
 - **Start-up**, before the first evaluations finish (the pool and the
   TensorRT server warm up): 23-28 s in most arms, but 52-88 s in some.
 - **Mid-run stalls**: one evaluation's *simulate* took 81-93 s instead of
-  ~40 ms (`timing.simulate_seconds`), and the whole search waited. These are
+  ~40 ms (`timing.simulate_seconds`), and the whole search waited. [Round 214:
+  not MeqTrees, which an R2D2 simulate never runs; most likely a silent
+  worker killed at the rank's reply bound.] Read at the time as
   meqserver wedges sitting out their retry ladder: with a 1 s dump and a
   15.5-minute observation (931 time samples) the predict bound is ~17 s, the
   worker restarts its meqserver and retries, and the rank's reply timeout
@@ -10139,3 +10141,68 @@ R2D2_RUNTIME=trt` becomes the GPU default.
   was the one where simulate ran 47% slow. 15-16 ranks x 2 threads (no
   oversubscription) may be the steadier shared layout.
 
+
+## Round 214 (diagnostic): round 211's "meqserver wedges" were not MeqTrees; simulate workers now log how they exit
+
+**Question.** Priority 1 is the ~80 s whole-search stalls that round 211
+called meqserver wedges. What wedges, and how can it be shortened?
+
+**Finding: no meqserver is involved.** An R2D2 search's simulate does not
+use MeqTrees. `simulate_point_source_ms.py --mat-only` fills the
+visibilities with the analytic predict (`point_source_visibilities`).
+`run_meqtrees_predict` runs only in self-checks. So round 211's reading,
+which was that the predict bound expires twice and the meqserver restarts,
+cannot be right, and shortening the predict ladder would change nothing.
+Two facts narrow down what it was:
+
+- 81-93 s brackets the *rank's* reply bound for a 931-sample observation,
+  `simulate_reply_timeout(931)` = 30 + 2 x 17.0 + 20.5 = 84.4 s, plus the
+  1 s retry delay. That is the pattern of a worker that went silent: the
+  rank waits out its bound, kills the worker (`FifoWorker.kill`), and
+  retries on the respawned worker. A legitimately slow build would have
+  no reason to land on that number.
+- They are rare and not reproducible from the seed. Round 212's ten arms
+  and round 213's two converged searches ran 221,908 evaluations with the
+  same code and seeds (4242; 190182240). In those, no simulate that started
+  after the first 5 s took longer than 1.58 s. The 37 that took over 1 s
+  are all at t = 0, where cold observation-cache builds run concurrently.
+  All of round 211's stalls were in shared-TensorRT arms within ~100 s of
+  start-up, while the server was loading its 25 engines.
+
+The summaries of the stalled arms (jobs 39455763 and 39458000) were
+deleted, and the pool's log did not record worker exits. So whether the
+worker died, hung or was killed cannot be settled after the fact.
+
+**Change.** In `run-nested-sampling-r2d2.sh`, each simulate worker's
+respawn loop now writes `<epoch> simulate worker <rank> exited <status>`
+to `workers-meqtrees.log` beside the run. A mid-run `137` at the time of a
+slow simulate means the rank killed a silent worker. Any other status
+means the worker died on its own, and its traceback is in the same log.
+No line means the worker was slow but alive. This is an R2D2-only script
+and the line runs only when a worker exits, so the evaluation path and the
+WSClean search are unchanged.
+
+**Check (cpu-q-203, 8 ranks, nlive 24, 60 dead points, seed 4242,
+`r214-probe`).** SIGKILLing rank 1's worker mid-run logged `simulate worker
+1 exited 137`. The loop respawned the worker and the search finished rc=0
+(log(Z) 0.01027 +/- 0.00858; 504 evaluations, ledger row `r214-probe`).
+At the end, every worker logged `exited 0` when its FIFO closed. The run
+directory is deleted. `bash -n` and `scripts/test_self_checks.py` pass.
+The edit was made length-neutral (18,514 bytes before and after), because
+GPU job 39470312 was executing this script from the working tree at the
+time (round 211's exit-127 trap).
+
+**Pending.** Job 39470312 (gpu-q-1, started 14:23): converged eager
+19 x 2 against shared TensorRT on the 22 Sep production search. It had
+not finished at the end of this round. Read `.probe/r214/job-39470312.out`
+and `summary-{E,S}.json` next round.
+
+**Learned.**
+- The profiler's "simulate (MeqTrees)" label (`common.py`) is historical.
+  The stage has been the analytic fill plus noise and the .mat write since
+  the analytic predict landed, so a large simulate share is never MeqTrees
+  time in these searches.
+- When the next stall happens, read `workers-meqtrees.log` before deleting
+  the run directory. A 137 there points at the worker going silent, most
+  likely CPU or memory starvation while the shared TensorRT server starts
+  up, not at the simulate code.
