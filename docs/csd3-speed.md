@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 188; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 189; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -8899,3 +8899,44 @@ chains go stale. (Clustering changes also discard in-flight chains through
 async PolyChord is not a lever.
 
 Docs only. No searches were run. Script in `.probe/r188/`.
+
+## Round 189 (check): self-heal after rounds 154-188, and an R2D2 rank killed at 39 on 38 CPUs
+
+**Why.** `./ri self-check self-heal` last ran in round 101. Since then,
+round 154 changed the startup reaper and round 186 made default R2D2
+CPU runs take one rank more than the job's CPUs, with `--oversubscribe`.
+Both of those are in the retry path. The self-heal check only starts
+WSClean searches, so it does not cover the second one.
+
+**Self-heal.** Run on this loop's half icelake node with the `squeue`
+shim, `NS_SBATCH=0` and `OMP_NUM_THREADS` unset, on 1ac668c. It
+**passes** all scenarios in about 2.5 minutes, including the 26 host
+self-checks it runs first:
+
+| scenario | broken at | finished at |
+| --- | ---: | ---: |
+| sampler killed before any checkpoint | 8 evals | 54 |
+| a rank frozen (SIGSTOP) | 9 evals | 51 |
+| killed with no retries left, then `./ri resume` | 9 evals | 51 |
+| every WSClean worker killed | 8 evals | 54 |
+| the WSClean pool killed | 9 evals | 54 |
+| torn `.resume` | 54 evals | 82 |
+| torn `summary.json` | 82 evals | rewritten |
+
+It left no run directories and no worker loops behind.
+
+**R2D2 kill at 39 ranks.** `.probe/r189/r2d2kill.sh` ran a default
+search: `./ri search r2d2 --nlive 100 --num-repeats 5 --max-ndead 400
+--seed 4242 --retries 2`, which picks 39 ranks on 38 CPUs. Once the run
+had 336 evaluation entries, the script sent `kill -9` to one of its own
+`polychord_r2d2.py` ranks, matched on that run's `--output-dir`. mpirun
+reported rank 38 killed. `sidecar_reset_workers` then killed the 78 pool
+workers (39 R2D2 and 39 simulate), and `run_with_retries` resumed from
+PolyChord's checkpoint at 385 evaluations (retry 1 of 2) on the same
+oversubscribed 39-rank command. The run finished 2 minutes after the
+kill, with 6,077 evaluations and 500 dead points. Its log(Z) is
+0.01759 ± 0.00079, inside round 186's 13-search range of 0.0170-0.0177.
+
+No speed change and no `benchmarks.jsonl` row: the run was killed and
+retried on purpose, so its rate does not count. The run directory was
+deleted, and its `summary.json` is kept in `.probe/r189/`.
