@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 206; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 207; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -83,6 +83,10 @@ the Hetzner host.
   fp16 engines would double forwards per card (+108% at 12 copies, 19
   fit in 37 GB), but each net lands 0.6-5.6% of the peak off float32,
   1000x round 140's gap, so they are rejected ([round 175](#round-175-negative-fp16-tensorrt-engines-2x-forwards-but-1e-2-off-float32)).
+  Open: one process holding the 25 engines once, with a context per
+  client, serves 12-32 pipe clients at 2,450 forwards/s (90% of 12 MPS
+  workers) on 5.7 GB instead of 66, bit-identical, so a shared TensorRT
+  forward server lifts the 12-worker cap; not wired in yet ([round 207](#round-207-positive-probe-one-process-sharing-25-tensorrt-engines-feeds-the-a100-from-57-gb)).
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -9664,3 +9668,63 @@ can go faster.
 
 Probe only. No search was run, so there is no `benchmarks.jsonl` row. The
 probe source is in `.probe/r206/`.
+
+## Round 207 (positive probe): one process sharing 25 TensorRT engines feeds the A100 from 5.7 GB
+
+**Question.** TensorRT on the GPU is held to single digits end to end
+(rounds 171-173) because each worker holds its own 25 engines, 5.1 GB, so
+an A100 fits only 12 TensorRT workers. Those 12 put ~1,070 forwards/s
+through the card in a search (round 173: 61.3 evals/s x 17.6 forwards)
+against the ~2,700/s it sustains (round 170). Refitting one engine per
+worker was 20x too slow (round 181). TensorRT does share an engine's weights
+between the execution contexts of one process, and a context needs only
+1.5 MB of activations. Can one process holding the 25 engines once serve
+every rank at the card's rate, including a pipe round trip per forward?
+
+**Method.** `scripts/probe_trt_shared.py`, in `r2d2-cuda.sif` with
+TensorRT 11.4 (cu13) and round 170's fp32 plans, one A100-SXM4-80GB
+(gpu-q-25, job 39451031, `.probe/r207/`). One process loads N1..N25 once;
+each of K threads gets its own 25 user-managed contexts, scratch buffer,
+CUDA stream and input/output buffers, and walks N1..N25 for 2,500 forwards
+with a blocking sync after each, as a request does. In `pipes` mode each
+thread also serves a forked CPU-only client: the client writes the 8 KB
+input down a pipe, the thread copies it to the card, runs the net, copies
+the 4 KB output back and replies. The baseline is round 170/181's 12
+separate processes under MPS, each with its own 25 engines, in the same
+job. Two passes.
+
+| arm | forwards/s (pass 1, 2) | ms a forward | card memory (MiB) | server CPU (cores) |
+| --- | ---: | ---: | ---: | ---: |
+| 12 processes x 25 engines, MPS (baseline) | 2,719, 2,717 | 4.43 | 66,421 | - |
+| 1 process, 12 threads | 2,457, 2,438 | 4.86 | 5,729 | 1.43-1.46 |
+| 1 process, 19 threads | 2,458, 2,445 | 7.68-7.70 | 5,821 | 1.51-1.52 |
+| 1 process, 32 threads | 2,450, 2,453 | 12.95 | 5,977 | 1.60 |
+| 1 process, 12 pipe clients | 2,445, 2,449 | 4.97-4.98 | 5,729 | 1.75-1.80 |
+| 1 process, 19 pipe clients | 2,444, 2,446 | 7.87 | 5,821 | 1.87-1.88 |
+| 1 process, 32 pipe clients | 2,455, 2,448 | 13.18-13.24 | 5,977 | 1.90-1.93 |
+
+Every thread's output matched one reference context's bit for bit for all
+25 nets (0 mismatches in every arm), as it must: the contexts run the same
+plan.
+
+**Result.** One process reaches 90% of the 12-process MPS rate (2,450
+against 2,718 forwards/s) on 5.7-6.0 GB of card memory instead of 66 GB,
+and the rate does not move from 12 to 32 clients, so the card is the bound,
+not the server. The pipe round trip costs nothing measurable (2,445-2,455
+against 2,438-2,458 for bare threads) and adds ~0.3 cores of server CPU.
+Each extra client adds only ~8 MB on the card. So a GPU search no longer
+has to choose between TensorRT's speed and eager's rank count: with a
+shared forward server, every rank the 32 cores can feed gets TensorRT
+forwards, and the card has ~2.3x the forward rate that round 173's 12
+TensorRT ranks used. What limits such a search is then the CPU side
+(round 120: the 32 cores bind at ~19 ranks), which this probe does not
+measure.
+
+**Next.** Wire it in as an opt-in GPU runtime: the pool starts one
+TensorRT server process before forking workers; a worker's `trt` network
+writes its input down its own pipe pair and reads the output back instead
+of holding engines; ranks are sized like eager (no 5.1 GB per worker).
+Then race it against eager and per-worker `trt` in 1-GPU searches at
+19 ranks and 600 dead points (round 173's shape), log(Z) to agree.
+
+Probe only. No search was run, so there is no `benchmarks.jsonl` row.
