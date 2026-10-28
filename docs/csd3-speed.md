@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 178; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 179; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -81,6 +81,8 @@ the Hetzner host.
   spread over both sockets' request time, with weights correctly placed and
   idle ~0, and one icelake socket can run 13% slower than the other even when
   fully bound ([round 178](#round-178-diagnostic-the-whole-node-penalty-by-socket-weights-are-placed-right-and-socket-1-is-slower-anyway)).
+  Round 177's fix holds on a whole sapphire node too, at +2.9%: 135.7 evals/s
+  against 131.8, up from round 150's 117 ([round 179](#round-179-validation-round-177-on-a-whole-sapphire-node-29)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -8483,3 +8485,50 @@ Rows: `r178-warm`, `r178-W1`, `r178-W2`, `r178-H1-n0`, `r178-H1-n1` in
 `benchmarks.jsonl`. Their commit is rewritten to a32315a with `dirty: true`
 (probe print only). The run directories were in `/dev/shm` and are gone, and
 the numa_maps dumps were deleted.
+
+## Round 179 (validation): round 177 on a whole sapphire node, +2.9%
+
+**Question.** Round 177 was measured on a whole icelake node (76 ranks).
+Production R2D2 runs whole sapphire nodes (112 ranks). Does the same
+rank/socket mismatch happen there, and does the fix pay?
+
+**Method.** One exclusive sapphire node (cpu-r-67, job 39411746; 2 x 56
+cores, 2 NUMA nodes, CPUs numbered alternately by socket like icelake).
+A is `git archive 4e8156d` (before round 177) and B is `a32315a` (round 177),
+both in `/dev/shm`. Every arm runs the defaults (112 x 1 async, onnx) with
+nlive 200, 5 repeats, 1000 dead and seed 4242, in the order B warm-up
+(300 dead), A, B, B, A. Two minutes into each arm, `.probe/r179/job.sh`
+compares each rank's affinity with its R2D2 worker's. The job was requeued
+once (its first node dropped it before A1), so all rows are from cpu-r-67.
+
+| arm | ranks on their worker's socket | evals | evals/s | ms per eval | simulate ms | request ms | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | 56 of 112 | 15,234 | 132.2 | 819 | 66.7 | 751 | 0.01780 ± 0.00038 |
+| B1 | 112 of 112 | 17,663 | 135.9 | 802 | 56.4 | 745 | 0.01792 ± 0.00039 |
+| B2 | 112 of 112 | 16,307 | 135.5 | 803 | 59.7 | 742 | 0.01762 ± 0.00037 |
+| A2 | 58 of 112 | 16,680 | 131.5 | 821 | 62.6 | 757 | 0.01766 ± 0.00039 |
+
+**Result.** **+2.9% evals/s** (135.7 against 131.8). The two arms of each
+tree are within 0.6% of each other, so the ranges do not overlap. Most of the
+gain is simulate, 64.6 to 58.0 ms (-10%); the request drops ~1%. All four
+log(Z)s agree within their errors.
+
+**Learned.**
+- Sapphire has the same mismatch as icelake: before round 177, half of a
+  whole node's ranks (54-56 of 112) ran on the other socket from their
+  R2D2 worker. After it, none do.
+- The gain is a little smaller than icelake's +3.5%, and as there, most of
+  it is simulate (-10% here, -10 to -19% on icelake). The request itself
+  barely moves, because round 149's per-node weight copies already kept
+  each worker's U-Net local.
+- Today's tree runs a whole sapphire node at **135.7 evals/s**, up from
+  round 150's 117 (+16%). Rounds 151-153 and 177 account for that, though
+  the two rounds ran on different nodes.
+- An exclusive sapphire job started after ~15 minutes, at 02:00 GMT.
+  Slurm requeued it onto a second node with no message in the job output
+  other than a fresh header, which overwrote the first node's partial
+  output. Write a per-arm log beside the job output, as `search.sh` does.
+
+Rows: `r179-Bwarm`, `r179-A1`, `r179-B1`, `r179-B2`, `r179-A2` in
+`benchmarks.jsonl`. Their commit is rewritten to the archived tree (4e8156d
+for A, a32315a for B). The run directories were in `/dev/shm` and are gone.
