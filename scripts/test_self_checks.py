@@ -78,7 +78,7 @@ IMAGE_ONLY = {
         "self_check_worker_death_is_not_scored",
     ),
     "polychord_wsclean": ("self_check_failure_record_persistence",),
-    "r2d2_serve": ("self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback"),
+    "r2d2_serve": ("self_check_checkpoint_series", "self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback"),
 }
 
 MODULES = sorted(set(HOST_RUNNABLE) | set(IMAGE_ONLY))

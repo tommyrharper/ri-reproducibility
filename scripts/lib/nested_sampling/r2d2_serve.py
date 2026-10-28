@@ -72,11 +72,38 @@ def install_lazy_utils() -> None:
     sys.modules["utils"] = package
 
 
+def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
+    """Upstream `get_DNNs`, with its torch.loads on 4 threads.
+
+    Same checks, same dict. torch.load releases the GIL while it reads, so
+    the pool's 25 checkpoints (6.2 GB) load in 0.9s instead of 2.0s
+    (docs/csd3-speed.md, round 203). Pool threads inherit the caller's NUMA
+    policy, so `load_checkpoints` still places the pages.
+    """
+    import glob
+    from concurrent.futures import ThreadPoolExecutor
+
+    import torch
+
+    paths = []
+    for i in range(num_iter):
+        dnn = glob.glob(os.path.join(ckpt_path, f'*N{i+1}.ckpt'))
+        if len(dnn) == 0:
+            raise ValueError(f'Checkpoint for N{i+1} not found')
+        elif len(dnn) > 1:
+            raise ValueError(f'Checkpoint conflict for N{i+1}')
+        paths.append(dnn[0])
+
+    def load(path):
+        return torch.load(path, map_location=torch.device('cpu'), weights_only=False)['state_dict']
+
+    with ThreadPoolExecutor(max(1, min(4, len(paths)))) as pool:
+        return {f'N{i+1}': state_dict for i, state_dict in enumerate(pool.map(load, paths))}
+
+
 def patch_checkpoint_loading() -> None:
     """Load each checkpoint series once and share it across forked workers."""
     import utils.util_model as util_model
-
-    original = util_model.get_DNNs
 
     def load_state_dict_from_state_dict(net, state_dict):
         # Keyed by identity because a state dict is not hashable. The entry
@@ -94,7 +121,7 @@ def patch_checkpoint_loading() -> None:
     def get_DNNs(num_iter: int, ckpt_path):
         key = (int(num_iter), os.path.abspath(str(ckpt_path)))
         if key not in _CHECKPOINT_CACHE:
-            _CHECKPOINT_CACHE[key] = original(num_iter, ckpt_path)
+            _CHECKPOINT_CACHE[key] = load_checkpoint_series(num_iter, ckpt_path)
         return _CHECKPOINT_CACHE[key]
 
     util_model.get_DNNs = get_DNNs
@@ -1397,6 +1424,9 @@ def self_check_checkpoint_cache() -> None:
         calls.append((num_iter, ckpt_path))
         return {"N1": object()}
 
+    global load_checkpoint_series
+    series = load_checkpoint_series
+    load_checkpoint_series = loader
     module.get_DNNs = loader
     module.load_state_dict_from_state_dict = lambda net, state_dict: net
     optimiser = types.ModuleType("optimiser.R2D2")
@@ -1425,12 +1455,38 @@ def self_check_checkpoint_cache() -> None:
         # dict's for as long as the cache holds the answer.
         assert _NORMALIZED_CHECKPOINT_CACHE[id(state_dict)][0] is state_dict
     finally:
+        load_checkpoint_series = series
         _CHECKPOINT_CACHE.clear()
         _NORMALIZED_CHECKPOINT_CACHE.clear()
         del sys.modules["utils.util_model"]
         del sys.modules["utils"]
         del sys.modules["optimiser.R2D2"]
     print("r2d2 checkpoint cache self-check passed")
+
+
+def self_check_checkpoint_series() -> None:
+    import tempfile
+
+    import torch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for i in range(1, 7):
+            torch.save({"state_dict": {"unet.w": torch.full((3,), float(i))}, "optimizer": [i]},
+                       Path(tmp) / f"R2D2_UNet_N{i}.ckpt")
+        loaded = load_checkpoint_series(6, tmp)
+        assert list(loaded) == [f"N{i}" for i in range(1, 7)], list(loaded)
+        for i in range(1, 7):
+            assert torch.equal(loaded[f"N{i}"]["unet.w"], torch.full((3,), float(i)))
+        for num_iter, message in ((7, "Checkpoint for N7 not found"), (6, "Checkpoint conflict for N2")):
+            if num_iter == 6:
+                torch.save({"state_dict": {}}, Path(tmp) / "copy_N2.ckpt")
+            try:
+                load_checkpoint_series(num_iter, tmp)
+            except ValueError as exc:
+                assert str(exc) == message, exc
+            else:
+                raise AssertionError(f"no {message!r}")
+    print("r2d2 checkpoint series self-check passed")
 
 
 def self_check_net_reuse() -> None:
@@ -1504,6 +1560,7 @@ if __name__ == "__main__":
         self_check_request_io()
         self_check_lazy_utils()
         self_check_checkpoint_cache()
+        self_check_checkpoint_series()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()

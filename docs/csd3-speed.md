@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 202; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 203; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9436,3 +9436,55 @@ because a request with more than one thread falls back to torch), and
 Rows: `r202-startup-ab` in `benchmarks.jsonl`, with the new arm's
 `r202-abb` rows (HEAD's landed in the removed worktree). Run dirs deleted.
 
+
+## Round 203: the R2D2 pool loads its torch checkpoints on 4 threads, -1 s of startup
+
+Round 202 left 1.9 s of the pool's warm-up in `load_checkpoints`: upstream
+`get_DNNs` runs 25 `torch.load`s of 248 MB Lightning checkpoints (6.2 GB,
+optimiser state included) one after another, before any worker forks.
+Probes in `r2d2.sif` (`.probe/r203/`, page cache warm):
+
+| load of the 25 checkpoints | seconds | weights |
+| --- | ---: | --- |
+| serial `torch.load` (as before) | 2.01-2.12 | reference |
+| `mmap=True` | 0.39-0.41 | identical |
+| `mmap=True`, `state_dict` cloned to anonymous memory | 1.80-1.85 | identical |
+| 4 threads (`ThreadPoolExecutor`) | 0.88-0.91 | identical |
+| 8 threads | 0.91 | identical |
+
+`mmap=True` is not free: its pages are Lustre-backed page cache, and every
+forked worker that touches them pays ~0.57 s of faults (0.85 s against 0.28 s
+to read all 775M weights in a child, `fork_probe.py`). That would land on
+the multi-thread torch fallback at the end of a run (9 of round 200's
+77,570 requests) and lose the NUMA placement `load_checkpoints` gives torch
+CPU runs. Threads keep the pages anonymous: `torch.load` releases the GIL
+while it reads, and pool threads inherit the caller's `set_mempolicy`, so
+per-node and interleaved placement still hold. **Change:**
+`load_checkpoint_series` in `r2d2_serve.py` is upstream `get_DNNs` (same
+glob, same errors, same dict) with the loads on 4 threads; the pool's
+`get_DNNs` cache calls it. New image self-check `checkpoint_series`.
+
+Interleaved pairs of tiny searches (seed 196, nlive 100, 20 dead, 39
+ranks) against HEAD from a detached worktree, `.probe/r203/ab.sh`:
+
+| pair | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| first request, HEAD `88014b9` | 5.41 | 5.49 | 5.57 | 5.51 | 5.50 s |
+| first request, new | 4.49 | 4.47 | 4.32 | 4.60 | **4.47 s** |
+| search wall, HEAD | 10.69 | 10.51 | 10.58 | 10.63 | 10.60 s |
+| search wall, new | 9.83 | 9.63 | 9.47 | 9.53 | **9.62 s** |
+| command wall, HEAD | 22.33 | 17.02 | 17.37 | 18.07 | 18.70 s |
+| command wall, new | 18.91 | 17.52 | 16.32 | 17.72 | 17.62 s |
+
+First request and search wall fall by ~1.0 s in 4 of 4 pairs; command wall
+is noisier (apptainer and mpirun start-up) but follows. log(Z) is
+0.0101886951976723 in all 8 runs, bit-identical to rounds 198-202. The
+change is in `r2d2_serve.py` only, so WSClean is not touched.
+
+What is left of the warm-up (~5.3 s): imager imports 2.5 s, torch
+checkpoints 0.9 s, ORT session loads 1.5 s. In production this is ~1 s of
+~22 s outside the search; it matters more to resumes, retries and the tiny
+A/B loop.
+
+Rows: `r203-startup-ab` and the new arm's `r203-abb` rows in
+`benchmarks.jsonl`. Run dirs and the temporary worktree were removed.
