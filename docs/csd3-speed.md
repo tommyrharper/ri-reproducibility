@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 209; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 210; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -22,7 +22,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), ORT 1.31.1 over 1.23.2 (180), lower ORT graph optimisation levels (190), malloc tuning and the ORT arena (164), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), a quarter of the weights on the other socket (210), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), ORT 1.31.1 over 1.23.2 (180), lower ORT graph optimisation levels (190), malloc tuning and the ORT arena (164), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -9834,3 +9834,89 @@ probe lifts it with `NS_R2D2_CUDA_MB_PER_RANK=2000 --mpi-procs 27`.
 If MPS off brings the forward back towards round 207's latency, shared
 mode should skip MPS and size ranks by CPUs; if not, the server's
 per-forward Python (one thread a lane, under the GIL) is next.
+
+## Round 210 (negative): a quarter of the U-Net weights on the other socket's memory
+
+**Question.** Round 205 put the half-node R2D2 CPU search at ~91% of its
+socket's DRAM read bandwidth. This job's cpuset allows memory on both NUMA
+nodes (`Mems_allowed_list: 0-1`) although its CPUs are all on node 0.
+Could putting some weights on node 1 add the interconnect's bandwidth to
+the local controllers'?
+
+**Bandwidth probe** (`.probe/r210/bw2.c`: round 205's read test with 1 in
+K 2 MB blocks `mbind`ed to node 1; 38 threads on socket 0; a neighbour
+job was running on socket 1 at load ~26):
+
+| pages on node 1 | read GB/s (best of 6) |
+| --- | ---: |
+| none | 172 |
+| 1/8 | 195 |
+| 1/5 | 206 |
+| 1/4 | 216 (+25%) |
+| 1/3 | 170 |
+| 1/2 (`numactl --interleave=0,1`) | 117 |
+| all (`--membind=1`) | 57 |
+
+The local and remote paths add up when the split is about 3:1 (165 local
++ 57 remote would be ~220).
+
+**Prototype knob** (not kept): `R2D2_REMOTE_NETS=k` bound every k-th net's
+ORT session to the job's memory-only node while the pool built it. With
+k = 4, 6 of the 25 nets (24% of the weights) went to node 1, and
+`/proc/<pid>/numa_maps` showed ~720 MB of each worker's pages there,
+as intended.
+
+**Search A/B** (cpu-q-197, half icelake node, default 39 ranks, onnx,
+nlive 100, 5 repeats, 400 dead, seed 4242; A = default, B = k 4;
+order B0, A1 B1, B2 A2 A3 B3):
+
+| arm | evals/s | ms/eval | log(Z) | ndead / nlike |
+| --- | ---: | ---: | --- | --- |
+| B0 (first after the edit) | 36.9 | 1015 | 0.0174128417571236 +/- 0.000814 | 500 / 5369 |
+| A1 | 46.4 | 796 | 0.0174040483674829 +/- 0.000864 | 500 / 6060 |
+| B1 | 48.3 | 774 | 0.0170199562761951 +/- 0.001055 | 500 / 6198 |
+| B2 | 46.9 | 784 | 0.017599403113552 +/- 0.000735 | 500 / 4977 |
+| A2 | 49.8 | 751 | 0.0163660879634581 +/- 0.001172 | 500 / 7202 |
+| A3 | 45.9 | 799 | 0.0174918176415889 +/- 0.00074 | 500 / 5555 |
+| B3 | 47.8 | 773 | 0.0175286517214831 +/- 0.000774 | 500 / 4729 |
+
+Paired means: A 47.4, B 47.7 evals/s (+0.7%, inside the ~5% control
+spread); ms/eval 782 against 777. B0 was a cold first start and is left
+out. Every log(Z) agrees (0.0164-0.0176, errors 0.0007-0.0012).
+
+**Forward probe** (`.probe/r210/remote.py`: 38 forked children pinned
+one per CPU, each walking the 25 optimised ORT sessions staggered, 100
+forwards each, two reps):
+
+| nets on node 1 | ms/forward | forwards/s |
+| --- | ---: | ---: |
+| none | 28.59, 28.51 | 1,329, 1,333 |
+| 1/4 (6 nets) | 28.46, 28.27 | 1,335, 1,344 |
+| 1/8 (3 nets) | 28.64, 28.49 | 1,327, 1,334 |
+
+**Result.** Null at both levels, so the knob was reverted. 1,330
+forwards/s x 124 MB is 165 GB/s, which is round 205's local read peak.
+The forwards still do not go past it when a quarter of the weights stream
+from node 1, a split that gave STREAM +25%. What limits a forward at 38
+cores is therefore not the node-0 memory controllers alone. Per core it
+is ~4.4 GB/s of weight reads mixed with compute, which looks more like
+per-core latency or prefetch than channel bandwidth, and remote lines
+only add latency. Even a gain would have taken bandwidth from whatever
+job holds the other socket, which is another user's in production.
+
+**Learned.**
+- On CSD3 a half-node job may allocate on the other socket even though
+  its CPUs are all on one: Slurm's cpuset sets `cpuset.mems` to 0-1.
+- STREAM's read peak overstates the gain a weight-streaming workload can
+  get from more memory channels. Before wiring a placement change in,
+  check it with the forward probe (`.probe/r210/remote.py`, a couple of
+  minutes), not with bandwidth arithmetic.
+- The first search after an edit to `r2d2_serve.py` ran 21% slow (B0).
+  The A/B order needs a warm-up arm, as round 209's GPU races have.
+
+GPU: job 39455763 (round 209's MPS-off and 27-rank race) had not started
+by 12:33. No Slurm call was made this round; read its output
+(`.probe/r209/job-39455763.out`) next round.
+
+Rows: `r210-*` in `benchmarks.jsonl` (`dirty`: the knob was uncommitted).
+Probe sources and output are in `.probe/r210/`. Run directories deleted.
