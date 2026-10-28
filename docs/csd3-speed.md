@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 204; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 205; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9550,3 +9550,69 @@ second pass (~1 s) sits before its pool. mpirun and apptainer start-up
 Rows: `r204-tiny` in `benchmarks.jsonl` (the clean run: 176 evaluations,
 log(Z) 0.0101886951976723, bit-identical to rounds 198-203). The two
 instrumented runs' rows were removed. Run dirs deleted.
+
+## Round 205 (diagnostic): the R2D2 CPU search is at the socket's DRAM bandwidth
+
+**Question.** Round 146 called the U-Net forward weight-bandwidth bound.
+How close is a production search to the hardware limit? That decides
+whether any CPU lever that keeps the network unchanged can still pay.
+
+**Method.** This loop's allocation is all 38 cores of socket 0 of an
+icelake node (Xeon 8368Q, one NUMA node, 57 MB L3). `.probe/r205/bw.c` is
+a STREAM-style OpenMP probe (`gcc -O3 -march=native`, 2 GB arrays, threads
+pinned with `OMP_PROC_BIND=spread`). Its read test sums two arrays, and its
+triad test is `c = a + 3b`. The exported networks are 25 `.onnx` files
+averaging 124.2 MB of fp32 weights. A 32x32 activation is at most 256 KB a
+layer, so it stays in L2, and DRAM traffic is the weights.
+
+| threads | read GB/s | triad GB/s |
+| ---: | ---: | ---: |
+| 1 | 12.2 | 13.6 |
+| 19 | 150.7 | 113.8 |
+| 38 | 164.2-165.3 | 152.1-152.5 |
+
+**Arithmetic.** An evaluation runs all 25 nets once (no early stop, round
+204), so it reads 25 x 124.2 = 3.10 GB of weights. A net is twice the L3,
+and the workers are staggered across nets, so almost every forward streams
+its weights from DRAM. Round 157's aligned-versus-staggered probe shows
+only ~6% L3 sharing.
+
+| run | evals/s | weight demand | share of 165 GB/s |
+| --- | ---: | ---: | ---: |
+| round 200, production, 39 ranks | 48.6 | 151 GB/s | 91% |
+| round 195, production, 39 ranks | 48.1 | 149 GB/s | 90% |
+| ceiling, weights only, nothing else | ~53 | 165 GB/s | 100% |
+
+The forward-only probe of round 157 (36 staggered children, 26.0 ms a
+forward) implies ~172 GB/s, slightly above the read peak. That fits a few
+percent of weight lines being shared through L3 by children on the same
+net.
+
+**Result.** The half-node R2D2 CPU search uses ~90% of its socket's
+measured DRAM read bandwidth for U-Net weights alone. Even if FINUFFT,
+simulate, data prep and PolyChord cost nothing, it could go no faster than
+~53 evals/s (+9%). This is why runtime, kernel, thread and layout changes
+all came out null after round 149 (rounds 155-157, 162, 180, 190): they
+change compute, and compute is not the bound. Only two things move the
+ceiling. One is fewer weight bytes per evaluation, which means quantisation,
+a different network, and is out of scope. The other is more evaluations per
+weight read, through batching or lockstep, already rejected in rounds 109,
+136, 137 and 139 because the waits cost more than the reuse saves. The
+GPU has headroom the CPU does not: at 44 evals/s, one A100 streams ~137
+GB/s of weights, under a tenth of its HBM bandwidth (rounds 119, 124).
+Weight bytes do not bound it, so GPU work (TensorRT, round 171-173) is where
+R2D2 throughput can still grow.
+
+**Learned.**
+- A half icelake job (`--ntasks 38`) here is exactly socket 0 (the even
+  CPUs), so it owns one socket's memory controllers. A neighbour job on
+  socket 1 (load ~26 during this probe) does not share them.
+- For R2D2 on CPU, evals/s x 3.10 GB against the socket's read bandwidth
+  is the quick check of how much any change could still give. Whole
+  nodes are further from it: 80.5 evals/s on icelake (round 149) is ~250
+  GB/s of 2 x 165, and the gap is the cross-socket loss rounds 176-178
+  measured.
+
+Probe only, no searches, so there is no `benchmarks.jsonl` row. The
+probe's binaries in `/dev/shm` were deleted, and its sources are in
+`.probe/r205/`.
