@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 203; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 204; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9488,3 +9488,65 @@ A/B loop.
 
 Rows: `r203-startup-ab` and the new arm's `r203-abb` rows in
 `benchmarks.jsonl`. Run dirs and the temporary worktree were removed.
+
+
+## Round 204 (diagnostic): what is left of R2D2 startup, and no early stop
+
+**Question.** After rounds 202-203, where do the ~4.5 s before a tiny
+search's first live point go, and is any of it worth a round? Also: can
+the 25 R2D2 iterations end early?
+
+**Method.** One clean tiny search on `849692e` (seed 196, nlive 100, 20
+dead, 39 ranks), with timestamped output. One run under `strace -f -e
+execve` to locate gaps, read for ordering only, because strace inflates
+every fork. Each suspect timed alone without strace. Imports timed with
+`python3 -X importtime` in `r2d2.sif`, twice. Probes are in `.probe/r204/`.
+
+| startup piece (clean run unless noted) | seconds |
+| --- | ---: |
+| `./ri`, `uv`, defaults, rank budget (two `pgrep -f` at ~0.15 s each) | ~0.6 |
+| `.job-settings.env` written on Lustre (only inside an allocation the run did not submit) | 0-0.5, first write to a fresh file |
+| `job-env.sh` (rebuild and check, `uv python find` included), alone | 0.45-0.50 |
+| run script's second pass up to the R2D2 pool launch | ~1.0 |
+| of which the 78-FIFO `mkfifo` loop (one call instead: 0.06) | 0.14 |
+| of which the `apptainer exec ... test -e fastnoise.so` probe (shared `start-sidecars.sh`) | ~0.25 |
+| pool warm-up: imager imports | 2.51 |
+| of which `import torch` | 1.95 (`torch._C` own time 0.54) |
+
+The pool launches ~2.7 s after the command starts when the run is started
+inside this allocation, which re-enters job-env (this benchmark loop and
+`sintr`). A submitted production job starts in `job-env.sh`, so only the
+second pass (~1 s) sits before its pool. mpirun and apptainer start-up
+(~1.7 s) and the manifest overlap the pool's warm-up and cost nothing.
+
+**Results.**
+- What is left of startup is many 0.05-0.3 s pieces, about 1 s before the
+  pool in production and 2.5 s of mostly-GIL imports inside it. All of it
+  together is about 0.1% of a 27-minute production search. Nothing in it is
+  worth a round: merging the `mkfifo` loop saves 0.08 s at 39 ranks, and the
+  bigger pieces (`pgrep`, the fastnoise probe) are in shared code that would
+  need a raced WSClean A/B for each 0.1-0.25 s.
+- `import torch` is 1.95 s of the 2.5 s import. The 0.54 s of it in
+  `torch._C`'s own loading is the shared-library load, and the import holds
+  the GIL, so threads cannot overlap it with the GIL-bound ORT session
+  loads (round 202).
+- Upstream R2D2 has a stopping rule (`_stop_criteria`: relative residual
+  change below `sigma_res_tol`, or two rises in a row), but it applies only
+  with `prune` on. `polychord_r2d2.py` runs without it, so every request runs
+  all 25 nets. Turning it on would change the images and log(Z), so it is
+  out under the result-preservation rule.
+- The production profile (round 200) is 94.2% request, 4.0% simulate, 1.5%
+  idle and 0.2% PolyChord. Every lever outside the U-Net is now at the 1%
+  level or below.
+
+**Learned.**
+- On Lustre the first `write` to a freshly created file can take 0.4 s
+  (0.0001 s on the next run of the same probe). Small one-off settings
+  files on hpc-work cost startup time at random.
+- `strace -f` over a search inflates every fork about 3x (`uv python find`
+  showed 1.0 s under strace and ~0 s without it). Use it to order events,
+  never to time them.
+
+Rows: `r204-tiny` in `benchmarks.jsonl` (the clean run: 176 evaluations,
+log(Z) 0.0101886951976723, bit-identical to rounds 198-203). The two
+instrumented runs' rows were removed. Run dirs deleted.
