@@ -10286,3 +10286,50 @@ A cold node's start-up runs to ~90 s, against 23-24 s in round 212.
   had no simulate over 1.6 s. The ~80 s stalls are confined to round 211's
   short arms.
 
+
+## Round 217 (start-up, GPU confirmation pending): parallel reads for the TensorRT libraries and plans
+
+**Why.** Shared TensorRT's only weakness is start-up: 65-91 s on a cold
+GPU node against 23-24 s on a warm one (rounds 212, 215). Round 216 found
+that the shared server read its 25 plans (5.3 GB) one at a time.
+
+**Where a cold start goes (this node, cpu-q-203, `r2d2-cuda.sif`).** A cold
+`apptainer exec ... python3 -c "import torch; import tensorrt"` took
+84.7 s: torch 35.0 s, and tensorrt 26.1 s. The second, warm run took 19.9 s
+(torch 14.0 s, tensorrt 0.06 s). tensorrt loads ~0.8 GB of shared libraries
+(`libnvinfer.so.11` alone is 715 MB) from `.cache/ri/r2d2-trt/py` on Lustre,
+and the mmap page faults pull them in as small reads. The plans behave the
+same way: with pages dropped by `posix_fadvise(DONTNEED)`, the 25 plans read
+one at a time in 16.3 s cold and 4.0-4.2 s afterwards, and with 8 threads in
+0.67-0.72 s (round 216: 11.6 s cold one at a time, against 3 s with 13
+threads).
+
+| step, pages dropped first (alternated) | one at a time | parallel |
+|---|---|---|
+| `import tensorrt`, alone vs after 16 x 64 MB-chunk reads of the libraries | 9.28, 9.36 s | 1.21, 0.34 s (incl. prefetch) |
+| 25 plans (5.3 GB), `read_bytes` vs 8 threads | 4.19, 3.93 s | 0.72, 0.67 s |
+
+**Change** (`r2d2_serve.py`, GPU TensorRT path only):
+- `patch_trt_network` reads the TensorRT libraries (excluding the
+  `builder_resource` ones, which only a plan build needs) in 64 MB chunks on
+  16 threads, while it exports ONNX and the `--build-trt-plans` child imports
+  torch. It joins the threads before it returns, so nothing forks while they
+  run (`read_chunk`).
+- `serve_trt_shared` reads the plans on 8 threads and deserializes each one in
+  order as it arrives, rather than reading and deserializing one at a time.
+
+Results cannot change: the same bytes reach the same engines. On this node
+(no GPU), with `export_onnx` stubbed, `patch_trt_network` still falls back to
+eager: the build child fails, the status file says `eager: TensorRT plans not
+built`, it returns in 23 s, and only the main thread is left alive.
+`scripts/test_self_checks.py` passes (27), and so does `compileall`. CPU
+searches and WSClean never call either function.
+
+**Pending.** GPU job 39475183 (`.probe/r217/job.sh`) runs round 215's
+default search (seed 4242, nlive 48, 5 repeats, 600 dead points) on this
+tree, to check that it finishes rc 0 with log(Z) identical to
+`r215-default` (0.0187108469398579 +/- 0.00059083509809515) and to compare
+`startup_s` against that run's 90.9 s. It then times the server's load, old
+against new, interleaved, along with deserialization and lane creation. It
+replaces round 216's probe job 39475003, which was cancelled before it ran.
+It had not started 35 minutes after submission. Read it in the next round.

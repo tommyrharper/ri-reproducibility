@@ -474,6 +474,16 @@ def trt_context(cur_iter: int) -> tuple:
     return entry[:3]
 
 
+def read_chunk(path: Path, offset: int) -> None:
+    """Read 64MB of `path` from `offset` into the page cache; a file gone or unreadable is skipped."""
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            handle.seek(offset)
+            handle.read(64 << 20)
+    except OSError:
+        pass
+
+
 def patch_trt_network(checkpoint_path: Path) -> None:
     """Run each GPU U-Net forward through a TensorRT fp32 engine instead of torch eager.
 
@@ -486,13 +496,23 @@ def patch_trt_network(checkpoint_path: Path) -> None:
     GPU model and image size, and cached under TRT_DIR/plans. A plan that
     cannot be built leaves the run on eager; R2D2_TRT_STATUS says which ran.
     """
+    import concurrent.futures
     import subprocess
 
+    # The child's `import tensorrt` page-faults ~0.8GB of libraries in off
+    # Lustre, 26s on a cold node; big parallel reads first take ~1s (round 217).
+    # Joined before anything forks.
+    prefetch = concurrent.futures.ThreadPoolExecutor(16)
+    libraries = [path for path in (TRT_DIR / "py").rglob("*.so*") if "builder_resource" not in path.name]
+    prefetched = [prefetch.submit(read_chunk, path, offset)
+                  for path in libraries for offset in range(0, path.stat().st_size, 64 << 20)]
     models = export_onnx(checkpoint_path)
     num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
     dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
     built = subprocess.run([sys.executable, __file__, "--build-trt-plans", str(models), str(dim), str(num_iter)],
                            capture_output=True, text=True)
+    concurrent.futures.wait(prefetched)
+    prefetch.shutdown()
     # Warm-up output goes to /dev/null, so which engine ran is recorded here.
     status = Path(os.environ.get("R2D2_TRT_STATUS", os.devnull))
     if built.returncode != 0:
@@ -591,6 +611,7 @@ class TrtSharedNet:
 
 def serve_trt_shared(socks: list, dim: int) -> None:
     """The forward server: load each plan once, one lane (contexts, stream, buffers) a worker, a thread a lane."""
+    import concurrent.futures
     import threading
 
     import numpy as np
@@ -599,7 +620,12 @@ def serve_trt_shared(socks: list, dim: int) -> None:
     import tensorrt as trt
 
     runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
-    engines = {cur_iter: runtime.deserialize_cuda_engine(path.read_bytes()) for cur_iter, path in _TRT_PLANS.items()}
+    # 5.3GB of plans: read eight at a time, deserialized in order as they land.
+    # One at a time off Lustre took 11.6s cold and 4.0s warm, eight 3s and
+    # 0.7s (docs/csd3-speed.md, rounds 216-217).
+    with concurrent.futures.ThreadPoolExecutor(8) as reader:
+        blobs = reader.map(Path.read_bytes, _TRT_PLANS.values())
+        engines = {cur_iter: runtime.deserialize_cuda_engine(blob) for cur_iter, blob in zip(_TRT_PLANS, blobs)}
     scratch = max(engine.device_memory_size_v2 for engine in engines.values())
     device = torch.device("cuda")
     size = _TRT_HEADER.size + 2 * dim * dim * 4
