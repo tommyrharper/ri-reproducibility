@@ -189,6 +189,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (null) ONNX Runtime's graph optimisation level | none | the shipped `ORT_ENABLE_ALL` (NCHWc) is 8% faster a forward than `EXTENDED` or `BASIC` with 38 forked workers (24.5 against 26.6 ms) and 7% faster at 4; its reorders pay for themselves ([round 190](csd3-speed.md)) |
 | (null) two extra R2D2 ranks past the CPU count | none | 41 ranks on 38 CPUs run 49.2 evals/s against 49.1 for the default 39 (3 warm pairs); time per evaluation rises by 40/38 and cancels the extra worker, so the job is CPU-bound at 39 ([round 194](csd3-speed.md)) |
 | (validation) the 22 Sep production search on half an icelake node | none | today's default (39 ranks, onnx) converges in 23 min at 48.1 evals/s, the same rate as round 194's short A/Bs; log(Z) 0.017334 +/- 0.00041, 0.19 sigma from 22 Sep and 0.87 from round 115; MeqTrees 4.4% ([round 195](csd3-speed.md)) |
+| The stall watchdog's `sleep` holds none of the run's output | `progress-bar.sh` | a piped `./ri search \| tee` ends with the search, not up to 60 s later (62.5 to 19 s on a 13 s search); rank 0's post-run record pack (~1.3% of a 67k-evaluation run, Lustre unlinks) logged as the open per-run cost ([round 196](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2

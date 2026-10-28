@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 195; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 196; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9055,3 +9055,59 @@ per hour than a sapphire core (744 against 546 ms a request).
   The run directory (9,596 files) was deleted.
 
 Rows: `r195-bigrun` in `benchmarks.jsonl` (commit 5723db6).
+
+## Round 196: a piped search no longer waits up to 60 s on the stall watchdog's sleep
+
+**Question.** Round 195's search took 1,393 s but its command took 1,436 s.
+Where do the other ~43 s go, and are they a cost per run or per evaluation?
+
+**Probe.** A tiny default R2D2 search (nlive 100, 20 dead, seed 196, 176
+evaluations) run four ways on `bb326f4`, with `bash -x` and a timestamped
+`PS4` for the traced runs. Script `.probe/r196/startup.sh`.
+
+| run | output | command wall | search wall |
+| --- | --- | ---: | ---: |
+| `./ri search ... \| grep \| python3` (s1, s2) | pipe | 62.5 s, 62.6 s | 13.3 s, 13.5 s |
+| `./ri search ... > file` (s5) | file | 21 s | ~13 s |
+| traced, with and without `job-env.sh` (s3, s4) | file | 19 s | ~13 s |
+| `./ri search ... \| cat`, this round's fix (s6) | pipe | **19 s** | 13.4 s |
+| WSClean, `./ri search ... \| cat`, fix (w1) | pipe | 10 s | 3.2 s |
+
+**Two costs, both outside the search.**
+- **Rank 0's post-run work** is most of round 195's 43 s: `post-run seconds:
+  drain 0.1, records 1.9, flush 1.0, prune 8.3, summary 5.1, pack 17.8` (34 s).
+  `pack` unlinks ~57k flat record files on Lustre with 32 threads, ~0.3 ms
+  each, so it grows with the evaluation count (~1.3% of the
+  evaluating wall at 67k evaluations, about the same share at any size).
+  It is bound by Lustre's per-directory lock (round 93), and
+  `RECORD_READ_THREADS` is already 32, so there is no cheap way left to
+  speed it up. Avoiding it means the record writer appends to a pack during
+  the run instead of creating one file per evaluation. That is a
+  larger change to every reader (health, live report, resume) and is left
+  open.
+- **The stall watchdog's orphaned `sleep`.** `_ns_stop_watchdog` kills the
+  watchdog subshell, but its `sleep 60` lives on and keeps the run's
+  stdout and stderr open. A file does not mind, but a pipe stays open
+  until the sleep ends. So `./ri search ... | tee` (or any harness that
+  reads the output to EOF) waited up to a whole poll after `OK:`: 43 s here.
+  The sleep now runs with its fds on `/dev/null`. The piped run takes 62.5 s
+  without the fix and 19 s with it, the same as writing to a file.
+
+**Results unchanged.** The sleep's file descriptors are all that changed.
+The piped R2D2 run gives log(Z) 0.0101886951976723 +/- 0.00726107899040951
+(137 dead), the same as s1 and s2's status lines (0.01019 +/- 0.00726, 137
+dead). The WSClean run gives 0.0895384119210856 +/- 0.00732350343931438
+(136 dead) at 55 evals/s. No A/B was needed, because nothing an evaluation
+runs has changed.
+
+**Learned.**
+- Timestamping a run's output through a pipe measures the pipe, not the
+  run. Python's `for line in sys.stdin` reads ahead, and `grep` block-buffers
+  into a pipe. File mtimes (`run.env`, `summary.json`) and a `PS4` with
+  `$(date +%s.%N)` are reliable (bash 4.4 here has no `EPOCHREALTIME`).
+- `job-env.sh` costs ~0.5 s a run (module purge and load, the checks). It is
+  not a startup cost worth chasing.
+- `progress-bar.sh`'s self-check now runs a piped `sleep 2` search with the
+  watchdog on. It fails on the old code and passes on the new.
+
+Rows: `r196-s1`, `r196-s2` (HEAD, piped) and `r196-w1` in `benchmarks.jsonl`.
