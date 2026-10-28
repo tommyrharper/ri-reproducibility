@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 173; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 174; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -66,6 +66,11 @@ the Hetzner host.
   Run 4x longer (600 dead points) it gives +7% evals/s and -48% request
   time, still inside the noise over 6 pairs (TensorRT ahead in 4), so the GPU
   default stays torch ([round 173](#round-173-null-tensorrt-against-eager-at-600-dead-points-and-onnx-against-torch-on-cpu-rechecked)).
+- **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
+  core-hours, and the GPU and CPU allowances are separate budgets, so
+  using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
+  give ~15% more evaluations per core-hour than whole nodes, and whole
+  nodes finish one search sooner ([round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -7522,8 +7527,9 @@ change the results or are outside this scope:
   Round 130's 2-GPU A/B (job 39303263) never reported back; re-run it
   before sizing a GPU production run.
 - **Job shape.** Whole nodes with sessions per NUMA node (rounds 149-150)
-  give the best per-core rate. Prefer them to half nodes for long
-  searches.
+  give the best wall-clock rate per search. (Corrected in
+  [round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu):
+  half nodes give ~15% more evaluations per core-hour.)
 
 WSClean speed work closed earlier (rounds 83, 135, and the 2026-10-27
 scope decision). The one non-code lever left for it is still shipping a
@@ -8169,3 +8175,59 @@ the CPU default stays onnx.
 
 Rows: `r173-warm`, `r173-T1`..`r173-E3` (GPU), `r173-cpu-onnx-*` and
 `r173-cpu-torch-*` (CPU) in `benchmarks.jsonl`. Run directories deleted.
+
+## Round 174 (diagnostic): R2D2 evaluations per SL3 charging unit, CPU against GPU
+
+**Question.** Rounds 117 and 160 left one question open: what does an R2D2
+evaluation cost in what CSD3 actually charges? Is a GPU search worth its
+GPU hours, and which CPU job shape gets the most evaluations per core-hour?
+No search was run. Every figure below comes from rows already in
+`benchmarks.jsonl`, measured on the shipped defaults.
+
+**Charging.** CSD3's [policies page](https://docs.hpc.cam.ac.uk/hpc/user-guide/policies.html)
+charges 1 credit for 1 CPU core for 1 hour, and 1 credit for 1 GPU for 1
+hour. The 32 cores that come with each A100 are not charged separately
+(`docs/cluster.md`). A PI's free SL3 allowance is **200,000 core-hours and
+3,000 GPU hours per quarter**, as two separate budgets. Paid prices are
+behind Raven (`csd3.cam.ac.uk/charges`), so they are not compared here.
+
+| shape (defaults) | rows | evals/s | request, ms | charged per hour | evals per charged hour |
+| --- | --- | ---: | ---: | ---: | ---: |
+| half icelake, 38 x 1, onnx | r151-*, r153-*, r158-perf (12 runs, nlive 100, 400 dead) | 45.9 | 732 | 38 core-h | **4,350 per core-h** |
+| whole icelake, 76 x 1, sessions per NUMA node | r149-new-a/b (nlive 200, 1000 dead) | 80.5 | 857 | 76 core-h | 3,810 per core-h |
+| whole sapphire, 112 x 1, sessions per NUMA node | r150-new-a/b (nlive 200, 1000 dead) | 116.9 | 845 | 112 core-h | 3,760 per core-h |
+| one A100, MPS, 19 ranks, torch | r173-E1..E3 (nlive 48, 600 dead) | 57.4 | 273 | 1 GPU-h | **206,000 per GPU-h** |
+| one A100, MPS, 12 ranks, `R2D2_RUNTIME=trt` | r173-T1..T3 | 61.3 | 143 | 1 GPU-h | 221,000 per GPU-h |
+
+**Learned.**
+- **One A100 hour does the work of 47-55 CPU core-hours** (47-59 with
+  `trt`). The two SL3 budgets are separate, so a project that uses only
+  CPUs leaves the GPU allowance unspent. At these rates, 200,000 core-hours
+  buy 750-870M evaluations a quarter, and 3,000 GPU hours another ~620M.
+  Using both raises a quarter's R2D2 evaluations by **~70-80%**, so GPU
+  searches belong in production alongside CPU ones, not instead of them.
+  With paid hours, the GPU pays only if a GPU hour costs less than ~50
+  core-hours.
+- **Half nodes give ~15% more evaluations per core-hour than whole nodes.**
+  That corrects round 160's job-shape advice, which said whole nodes gave
+  the best per-core rate. A request takes 732 ms on a half icelake node
+  against 845-857 ms on whole icelake or sapphire nodes. The likely cause
+  is memory bandwidth: the forward is bandwidth-bound under load (round
+  160), and a half node shares the bandwidth with whatever its neighbour
+  runs. The half-node rows also come from a slightly newer tree
+  (rounds 151-153, ~1.5% of a request), but the gap is ten times that.
+  Whole nodes are still the faster *wall clock* (117 against 46 evals/s for
+  one search). So choose by the binding constraint. When core-hours bind,
+  run several half-node searches. When time to one answer binds, run a
+  whole sapphire node.
+- Time to one answer: the 22 Sep production search (~65k evaluations,
+  round 115) takes about 9 minutes on a whole sapphire node, 14 on a whole
+  icelake node, 19 on one A100 and 24 on a half icelake node.
+- Caveats. The GPU rows use nlive 48 and a shorter search than the CPU
+  rows. Round 173 showed that short GPU searches understate their
+  long-run rate, so the GPU figure is a floor. The half-node rows' neighbour
+  load is unknown. Production neighbours that are themselves
+  bandwidth-heavy would shrink the half-node advantage. A raced pair (two
+  38-rank halves of one whole node against one 76-rank search, same tree)
+  would settle that figure.
+- No code changed, so no WSClean A/B, and no new `benchmarks.jsonl` rows.
