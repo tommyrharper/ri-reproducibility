@@ -30,6 +30,8 @@ from common import (
     finished_run_records,
     follow_r2d2_worker_node,
     pack_finished_run,
+    start_record_packer,
+    stop_record_packer,
     post_run_line,
     post_run_phase,
     gathered_window_fit_stats,
@@ -594,10 +596,12 @@ def main() -> None:
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
+    packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
     finish = PolyChordFinish()
     output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
+    stop_record_packer(packer)
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)
     window_fit_stats = gathered_window_fit_stats()

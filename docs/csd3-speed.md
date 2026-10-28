@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 198; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 199; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -9213,3 +9213,75 @@ flat records) is now the only large post-run cost.
 
 Rows: `r198-a`, `r198-b`, `r198-tiny`, `r198-wsclean` in
 `benchmarks.jsonl`. All four run dirs were deleted.
+
+## Round 199: rank 0 packs records while the run goes, not after it
+
+Round 198 left `pack` as the only large post-run cost: 2.8 s at 12k
+evaluations, 17.8 s at 67k (round 196). It is Lustre unlinks of the flat
+`eval-*.json` records, and threads do not help. Timing 8,000 unlinks in
+one directory on hpc-work:
+
+| unlink threads | 8 | 32 | 64 | 128 | 32, `dir_fd` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ms per file | 0.132 | 0.126 | 0.126 | 0.126 | 0.124 |
+
+The directory's lock serialises them, so the only fix is to do them
+earlier. **Change:** rank 0 starts a child process
+(`start_record_packer` in `common.py`). Every 15 s it packs the flat
+records already on disk into `records.jsonl` and unlinks them
+(`pack_flat_records`). It has to be a process, not a thread:
+pypolychord's root sits in Fortran holding the GIL and never releases
+it, so a thread would never run. Rank 0 kills it once the sampler
+finishes, before reading the records back. Supporting changes:
+
+- `pack_evaluation_records` takes an `flock` on the pack, so a resume's
+  pack, the packer's and the finish's cannot interleave. Lustre here is
+  mounted with `flock`.
+- The finish appends again any packed record that prune has edited since
+  (the last line of a name wins). Before, it only packed records that
+  still had a file.
+- A reader falls back to the pack when a flat record vanishes between
+  the listing and the read.
+
+A kill at any point leaves only whole lines plus files still on disk,
+which the next pack handles. The packer exits once rank 0 is gone, and
+`NS_PACK_DURING_RUN=0` turns it off. Records are written once each, so
+nothing is lost by packing one early. Every reader (health, progress
+bar, live report, resume) already read the pack (round 93).
+
+| R2D2, seed 190182240, nlive 150, 1,500 dead | evaluations | pack | evals/s |
+| --- | ---: | ---: | ---: |
+| HEAD 1741ccd (round 198, r198-b) | 11,564 | 2.8 s | 45.4 |
+| packer every 60 s (r199-b) | 13,434 | 2.0 s | 45.9 |
+| packer every 15 s (r199-c, shipped) | 11,403 | **1.0 s** | 45.6 |
+
+On r199-b, a pack with nothing left to do (listing, pack read, a
+`json.dumps` and compare per record) costs 0.4 s. At 67k evaluations
+that part should be about 2 s, plus a 15 s tail of about 700 unlinks,
+so about 3 s in place of 17.8 s (about 1% of round 195's 23 minutes).
+Midway through r199-b the packer had packed 2,554 records and was using
+4% of one CPU. The evaluations dir also stays small all run, which makes
+every listing of it cheaper.
+
+**Results unchanged.** r199-b's packed records match its `summary.json`
+exactly (13,434 records), and no flat record was left behind. Tiny runs
+(seed 196, nlive 100, 20 dead) are bit-identical to round 198: R2D2
+0.0101886951976723 +/- 0.00726107899040951 (176 evaluations) and WSClean
+0.0895384119210856 +/- 0.00732350343931438 (174). The longer async runs
+agree within their errors, since at that length the schedule is not
+reproducible (round 198): r199-b 0.0173614393642752 +/-
+0.000453561067864136 (1,424 dead) and r199-c 0.0172358992631756 +/-
+0.000404025511300453 (1,491 dead).
+
+**WSClean guard.** Raced arms at 19 ranks each, seed 196, nlive 100,
+packer off (a) and on (b). At 300 dead they ran too briefly for the
+packer to make a pass: 94.0 against 107.2 evals/s, log(Z)
+0.0963770839100248 +/- 0.00102518803495449 against 0.0962595297249822
++/- 0.00103354886806531. At 3,000 dead (converged at about 910 dead) the
+packer arm ran at 146.0 evals/s against 138.8, with pack 0.8 s against
+1.3 s. log(Z) 0.0964384128004458 +/- 0.000567244216178665 (b) against
+0.0968260213400991 +/- 0.000556456159211854 (a), 0.5 sigma apart.
+
+Rows: `r199-tiny`, `r199-wsclean`, `r199-b`, `r199-c`, `r199-wsa` and
+`r199-wsb` (twice each, 300 and 3,000 dead) in `benchmarks.jsonl`. All
+run dirs were deleted.

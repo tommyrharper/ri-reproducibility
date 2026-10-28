@@ -1267,7 +1267,8 @@ def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
 
     def read(name: str) -> dict[str, Any] | None:
         path = paths.get(name)
-        if name in packed and (path is None or path.parent != evaluations_dir):
+        if name in packed and (path is None or path.parent != evaluations_dir
+                               or not path.exists()):  # the run's packer just moved it
             try:
                 record = json.loads(packed[name])
             except ValueError:
@@ -1285,21 +1286,30 @@ def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
 def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]]) -> int:
     """Move the records named in `known` ({name: record}) into the pack and
     unlink their files - a flat record, or a pre-round-92 metrics.json and
-    then its dir if that held nothing else; how many moved. No process may be
-    writing records."""
+    then its dir if that held nothing else - and append again any packed one
+    `known` has edited since; how many lines it appended. Writers of the pack
+    (a resume, the run's packer, the finish) take its lock in turn."""
+    import fcntl
     from concurrent.futures import ThreadPoolExecutor
 
-    paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
-    texts, whole = _read_record_pack(evaluations_dir)
-    # A packed name's dir has no record file: only a flat one is newer.
-    moving = [name for name in sorted(known) if name in paths
-              and (paths[name].parent == evaluations_dir or name not in texts)]
-    if not moving:
-        return 0
-    text = "".join(f"{name}\t{json.dumps(known[name])}\n" for name in moving)
     with open(evaluations_dir / RECORD_PACK, "ab") as pack:
+        fcntl.flock(pack, fcntl.LOCK_EX)
+        paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
+        texts, whole = _read_record_pack(evaluations_dir)
+        lines: dict[str, str] = {}
+        moving = []
+        for name in sorted(known):
+            if name in paths and (paths[name].parent == evaluations_dir or name not in texts):
+                moving.append(name)  # a packed name's dir has no record file: only a flat one is newer
+            elif name not in texts:
+                continue
+            text = json.dumps(known[name])
+            if name in moving or text != texts[name]:
+                lines[name] = text  # the last line of a name is its record
+        if not lines:
+            return 0
         pack.truncate(whole)  # a torn last line from a killed packer
-        pack.write(text.encode())
+        pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
         pack.flush()
         os.fsync(pack.fileno())
 
@@ -1316,7 +1326,54 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
     # cost ~6ms rather than ~0.2ms (round 93).
     with ThreadPoolExecutor(RECORD_READ_THREADS, initializer=_unpin_thread) as pool:
         list(pool.map(unlink, moving))
-    return len(moving)
+    return len(lines)
+
+
+# A Lustre unlink holds the evaluations dir's lock, ~0.13ms each whatever the
+# thread count, so packing 67k records after the sampler cost 17.8s (round
+# 196). A run's rank 0 packs the flat records as they land instead, in a
+# child process: pypolychord's root holds the GIL, so a thread would never
+# run (round 199).
+RECORD_PACK_SECONDS = 15.0
+
+
+def pack_flat_records(evaluations_dir: Path) -> int:
+    """Pack every flat record on disk now; how many lines it appended."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    flat = [path for path in evaluation_record_paths(evaluations_dir).values()
+            if path.parent == evaluations_dir]
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        records = dict(zip((path.name.removesuffix(RECORD_SUFFIX) for path in flat),
+                           pool.map(read_evaluation_record, flat)))
+    return pack_evaluation_records(
+        evaluations_dir, {name: record for name, record in records.items() if record is not None})
+
+
+def start_record_packer(evaluations_dir: Path) -> subprocess.Popen | None:
+    """Rank 0: pack records every RECORD_PACK_SECONDS until stop_record_packer()."""
+    if os.environ.get("NS_PACK_DURING_RUN", "1") == "0":
+        return None
+    # Until rank 0 is gone too: a packer orphaned by a crash ends at its next pass.
+    code = ("import os, sys, time; sys.path.insert(0, sys.argv[1]); import common\n"
+            "if sys.argv[4]: os.sched_setaffinity(0, map(int, sys.argv[4].split(',')))\n"
+            "while os.getppid() == int(sys.argv[3]):\n"
+            "    time.sleep(common.RECORD_PACK_SECONDS)\n"
+            "    try:\n"
+            "        common.pack_flat_records(common.Path(sys.argv[2]))\n"
+            "    except OSError as error:\n"
+            "        print(f'record packer: {error}', file=sys.stderr, flush=True)\n")
+    return subprocess.Popen(
+        [sys.executable, "-c", code, str(Path(__file__).resolve().parent), str(evaluations_dir),
+         str(os.getpid()), ",".join(map(str, _UNPINNED_CPUS))],
+        stdin=subprocess.DEVNULL)
+
+
+def stop_record_packer(packer: subprocess.Popen | None) -> None:
+    """Before rank 0 reads the run's records back: none may move under it."""
+    if packer is not None:
+        packer.kill()  # a pack it cut short is whole lines and files still on disk
+        packer.wait()
 
 
 def evaluation_record_file(eval_dir: Path) -> Path:
@@ -1714,6 +1771,24 @@ def self_check_resume_adoption() -> None:
         assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
         assert (evaluations_dir / RECORD_PACK).read_text().count("\n") == 4  # 1, 2, 2 again, 4
         assert load_evaluations_from_dir(evaluations_dir) == records
+        # The run's packer (round 199): flat records into the pack as they
+        # land, then the finish appends only what prune edited since.
+        write_evaluation_record(evaluations_dir / "eval-0007-stu",
+                                {"eval_id": 7, "params": {"a": 7}, "objective": 0.2,
+                                 "paths": {"image": "x"}})
+        assert pack_flat_records(evaluations_dir) == 1 and pack_flat_records(evaluations_dir) == 0
+        assert not flat_record_path(evaluations_dir / "eval-0007-stu").exists()
+        _WRITTEN_RECORDS.clear()  # a second finish, from records on disk alone
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 7]
+        assert pack_finished_run(evaluations_dir) == 0  # nothing edited
+        records[3]["paths"] = {}
+        assert pack_finished_run(evaluations_dir) == 1
+        assert load_evaluations_from_dir(evaluations_dir) == records
+        packer = start_record_packer(evaluations_dir)
+        assert packer is not None and packer.poll() is None
+        stop_record_packer(packer)
+        assert packer.returncode is not None
         # A pre-round-92 run: metrics.json goes, and its dir unless it keeps something.
         for name, keeps in (("eval-0005-mno", False), ("eval-0006-pqr", True)):
             (evaluations_dir / name).mkdir()
@@ -1721,10 +1796,10 @@ def self_check_resume_adoption() -> None:
                 {"eval_id": 5 + keeps, "params": {"a": 5 + keeps}, "objective": 0.2}))
             if keeps:
                 (evaluations_dir / name / "wsclean").mkdir()
-        assert adopt_completed_evaluations(evaluations_dir, {}) == 5
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 6
         assert sorted(p.name for p in evaluations_dir.iterdir()) == [
             "eval-0001-abc", "eval-0006-pqr", RECORD_PACK]
-        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6]
+        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6, 7]
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
