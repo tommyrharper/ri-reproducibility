@@ -27,6 +27,7 @@ from common import (
     drain_record_writes,
     PolyChordFinish,
     finished_run_records,
+    follow_r2d2_worker_node,
     pack_finished_run,
     post_run_line,
     post_run_phase,
@@ -48,6 +49,7 @@ from common import (
     resolve_metric,
     run_r2d2_imaging,
     self_check_lazy_numpy,
+    self_check_follow_worker_node,
     self_check_metric_resolution,
     self_check_parameter_space,
     self_check_parameter_toggle,
@@ -521,13 +523,16 @@ def main() -> None:
     # id counter the list length used to supply.
     cache: dict[str, float] = {}
     scored = 0
+    # After the first evaluation, not at connect: the pool holds both FIFO
+    # ends, so a rank connects before its worker has forked onto its node.
+    followed = False
 
     def prior(cube: np.ndarray) -> np.ndarray:
         params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
-        nonlocal scored
+        nonlocal scored, followed
         if finish.finished():
             return finish.discarded(), []
         params = cube_to_params(cube_like_from_theta(theta))
@@ -555,6 +560,9 @@ def main() -> None:
                 salvage_evaluation_logs(eval_dir)
                 abort_run(traceback.format_exc())
             cache[key] = float(record["objective"])
+            if not followed:
+                followed = True
+                follow_r2d2_worker_node(args.r2d2_image, args.meqtrees_image)
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
         return cache[key], []
 
@@ -666,6 +674,7 @@ if __name__ == "__main__":
         self_check_resume_adoption()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
+        self_check_follow_worker_node()
         print("metric resolution self-check passed")
     else:
         main()

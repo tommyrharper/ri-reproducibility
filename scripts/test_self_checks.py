@@ -27,6 +27,7 @@ HOST_RUNNABLE = {
         "self_check_streaming_retention",
         "self_check_worker_pool_connect",
         "self_check_cpu_pinning",
+        "self_check_follow_worker_node",
         "self_check_worker_timeout",
     ),
     "r2d2_serve": (

@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 176; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 177; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -8343,3 +8343,73 @@ searches when many are queued.
 - Rows `r176-*` were built from `git archive` and so logged commit
   `unknown`; they were rewritten to `21c7330`. Run directories were in
   `/dev/shm` and are gone. No code changed, so there was no WSClean A/B.
+
+## Round 177: an R2D2 rank and its simulate worker follow their R2D2 worker's socket, +3.5% on a whole node
+
+**Question.** Round 176 found that a 76-rank search loses ~8% a request
+against two socket-bound halves, and named the processes nobody pins as
+the suspects. Where does each one actually run?
+
+**Cause.** The R2D2 `mpirun` (unlike WSClean's) has no `--bind-to none`,
+so Open MPI binds every rank to a socket by its own rule. The pool puts
+worker *i* on a node by its place in the string-sorted FIFO list
+(`r2d2_serve.worker_nodes`). The two rules disagree for about half the
+ranks: sampled 2 minutes into each HEAD arm, **36 of 76 ranks ran on the
+other socket from their R2D2 worker**. The simulate worker was not
+pinned at all. The rank, its simulate worker and its R2D2 worker hand
+each other the MS and the visibilities through files in `/dev/shm`, so
+for those 36 the pages were on the far socket.
+
+**Change.** `follow_r2d2_worker_node` (`common.py`) reads the R2D2
+worker's affinity from its `.pid` and moves every thread of the rank and
+of its simulate worker's process tree there. `polychord_r2d2.py` calls it
+once, after the rank's first evaluation and not at connect: the pool
+parent holds both FIFO ends, so a rank connects before its worker has
+forked onto its node, and the `.pid` is not there yet. That is why the
+first attempt, called right after `warm()`, moved nothing (an A/A pair
+gave 86.0 against 87.6 evals/s). It does nothing when the worker may run
+anywhere the rank may: a single-socket job, a shared checkpoint copy, the
+GPU pool, or `NS_PIN_CPUS=0`. New `self_check_follow_worker_node` (host
+runnable, in `test_self_checks.py` and `./ri self-check r2d2`).
+
+**Run.** One exclusive whole icelake node (cpu-q-170, job 39408338).
+Trees were `git archive 4e8156d` (A) and the same plus this diff (B) in
+`/dev/shm`. Onnx defaults, 76 ranks, nlive 200, 5 repeats, 1000 dead
+points, seed 4242, async, with a 300-dead warm-up and then A B B A
+(`.probe/r177/`).
+
+| arm | ranks on worker's CPUs | evals | wall s | evals/s | request ms | simulate ms | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | 40/76 | 14,880 | 184 | 81.1 | 851 | 53 | 13,753 | 0.01807 ± 0.00035 |
+| B1 | 76/76 | 15,424 | 181 | 85.1 | 819 | 47 | 13,469 | 0.01806 ± 0.00035 |
+| B2 | 76/76 | 15,278 | 179 | 85.2 | 819 | 47 | 13,615 | 0.01799 ± 0.00035 |
+| A2 | 40/76 | 15,654 | 187 | 83.6 | 824 | 58 | 13,583 | 0.01803 ± 0.00035 |
+
+**Result.** **85.1/85.2 against 81.1/83.6 evals/s (+3.5%)**, with both B
+arms above both A arms. Simulate drops from 53-58 to 47 ms and the
+request from 824-851 to 819 ms. All four log(Z)s agree. That is under the
+~5% three-repeat noise floor end to end, but the stage times move the way
+the cause predicts and the B arms are tight. It closes about 4 points of
+round 176's 8-9%.
+
+**WSClean guard.** `common.py` gained only functions that the WSClean
+path never calls. Even so, two raced pairs of 18-rank WSClean searches
+on this half node (A = 4e8156d, B = this diff; synchronous, nlive 100,
+400 dead, seed 4242) gave 27.9/28.4 (A) against 28.0/28.3 (B) evals/s,
+with **byte-identical chains** in all four arms (`.probe/r177w/`).
+
+**Learned.**
+- R2D2 ranks are socket-bound by Open MPI's default binding; WSClean's
+  are not (`--bind-to none`, one pinned CPU each). Any per-socket
+  placement in the R2D2 pool has to be matched to the rank, not assumed.
+- A pooled worker's `.pid` appears only when its forked child starts
+  answering, after the rank has connected. Anything that needs the
+  worker's placement must wait for its first reply.
+- What is left of round 176's gap (~4-5%) is something else: the pool
+  parent, MPI's shared-memory segments, or remote page-cache pages of
+  the run's files. Next check: the same A/B with the rank's evaluation
+  directory and MS on the worker's node (first touch by the rank, now
+  local) against round 176's halves.
+- Rows `r177-*` and `r177w-*` were built from `git archive`; their commit
+  was rewritten to 4e8156d, with `dirty: true` on the B arms. Run
+  directories were in `/dev/shm` and are gone.

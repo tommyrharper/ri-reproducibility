@@ -2827,6 +2827,53 @@ def pin_rank_cpu() -> int | None:
     return None
 
 
+def _process_tree_tids(pid: int | str) -> list[int]:
+    """Every thread of `pid` and of its descendants."""
+    tids, pending = [], [str(pid)]
+    while pending:
+        for task in Path(f"/proc/{pending.pop()}/task").glob("*"):
+            tids.append(int(task.name))
+            try:
+                pending.extend((task / "children").read_text().split())
+            except OSError:
+                pass
+    return tids
+
+
+def _set_tree_affinity(pid: int | str, cpus: set[int]) -> None:
+    for tid in _process_tree_tids(pid):
+        try:
+            os.sched_setaffinity(tid, cpus)
+        except OSError:
+            pass
+
+
+# On a whole node each R2D2 worker sits on one socket (r2d2_serve.enter_node),
+# but mpirun binds its rank to a socket by its own rule, the far one for about
+# half of them, and the simulate worker floats across both: each read what the
+# other wrote from the far socket's memory. Two socket-bound searches ran +9%
+# over one whole-node search (round 176).
+def follow_r2d2_worker_node(r2d2_image: str, meqtrees_image: str) -> set[int] | None:
+    """Move this rank and its simulate worker onto its R2D2 worker's CPUs."""
+    r2d2, simulate = _R2D2_WORKERS.get(r2d2_image), _SIMULATE_WORKERS.get(meqtrees_image)
+    if r2d2 is None or not hasattr(os, "sched_setaffinity") or os.environ.get("NS_PIN_CPUS", "1") == "0":
+        return None
+    try:
+        cpus = os.sched_getaffinity(int(Path(f"{r2d2.base}.pid").read_text()))
+    except (OSError, ValueError):
+        return None
+    # Already there, or a worker free to run wherever this rank may: stay put.
+    if cpus >= os.sched_getaffinity(0):
+        return None
+    _set_tree_affinity(os.getpid(), cpus)
+    if simulate is not None:
+        try:
+            _set_tree_affinity(Path(f"{simulate.base}.pid").read_text().strip(), cpus)
+        except OSError:
+            pass
+    return cpus
+
+
 def simulate_worker(meqtrees_image: str, platform: str) -> FifoWorker:
     """This rank's warm simulator worker, one of the pool the run script started."""
     if meqtrees_image not in _SIMULATE_WORKERS:
@@ -3280,6 +3327,52 @@ def self_check_cpu_pinning() -> None:
         stand_in.kill()
         stand_in.wait()
     print("cpu pinning self-check passed")
+
+
+def self_check_follow_worker_node() -> None:
+    import signal
+    import subprocess
+    import tempfile
+    from types import SimpleNamespace
+
+    allowed = os.sched_getaffinity(0) if hasattr(os, "sched_setaffinity") else set()
+    if len(allowed) < 2:
+        print("worker node following self-check skipped")
+        return
+    node = set(sorted(allowed)[: len(allowed) // 2])
+    r2d2 = subprocess.Popen(["sleep", "30"])
+    # A shell with a child: the simulate worker's whole tree must move.
+    simulate = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], start_new_session=True)
+    side = threading.Thread(target=time.sleep, args=(1,))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "r.pid").write_text(f"{r2d2.pid}\n")
+            Path(tmp, "s.pid").write_text(f"{simulate.pid}\n")
+            _R2D2_WORKERS["r"], _SIMULATE_WORKERS["m"] = SimpleNamespace(base=Path(tmp, "r")), SimpleNamespace(base=Path(tmp, "s"))
+            # A worker that may run anywhere this rank may: nothing moves.
+            assert follow_r2d2_worker_node("r", "m") is None and os.sched_getaffinity(0) == allowed
+            os.sched_setaffinity(r2d2.pid, node)
+            deadline = time.monotonic() + 5
+            while not Path(f"/proc/{simulate.pid}/task/{simulate.pid}/children").read_text().split():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            side.start()
+            # mpirun bound this rank to the other socket: it moves anyway.
+            _set_tree_affinity(os.getpid(), allowed - node)
+            os.sched_setaffinity(r2d2.pid, node)  # a child here, so it moved too
+            assert follow_r2d2_worker_node("r", "m") == node
+            assert os.sched_getaffinity(0) == node and os.sched_getaffinity(side.native_id) == node
+            assert all(os.sched_getaffinity(tid) == node for tid in _process_tree_tids(simulate.pid))
+            assert len(_process_tree_tids(simulate.pid)) >= 2
+    finally:
+        _R2D2_WORKERS.pop("r", None)
+        _SIMULATE_WORKERS.pop("m", None)
+        _set_tree_affinity(os.getpid(), allowed)
+        os.killpg(simulate.pid, signal.SIGKILL)
+        for process in (r2d2, simulate):
+            process.kill()
+            process.wait()
+    print("worker node following self-check passed")
 
 
 def self_check_parameter_space() -> None:
