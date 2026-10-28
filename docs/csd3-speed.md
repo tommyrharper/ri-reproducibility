@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 175; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 176; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -74,6 +74,9 @@ the Hetzner host.
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
   give ~15% more evaluations per core-hour than whole nodes, and whole
   nodes finish one search sooner ([round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu)).
+  On one whole icelake node, two socket-bound 38-rank searches run +9%
+  more in total than one 76-rank search (request -8%), so a single
+  search loses ~8% to spanning both sockets ([round 176](#round-176-diagnostic-two-socket-bound-searches-on-a-whole-icelake-node-give-9-total-but-each-one-takes-twice-as-long)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -8284,3 +8287,59 @@ below.
   They were deleted after the job.
 - No search ran and no code outside the probe changed, so there are no
   `benchmarks.jsonl` rows and no WSClean A/B.
+
+## Round 176 (diagnostic): two socket-bound searches on a whole icelake node give +9% total, but each one takes twice as long
+
+**Question.** Round 174 found that a request takes 732 ms on this loop's
+half icelake node against 845-857 ms on whole nodes. Is that because a
+whole-node search has some inefficiency, or because a half node's
+neighbour was idle?
+
+**Run.** One exclusive whole icelake node (cpu-q-60, job 39403468). The
+tree was `git archive 21c7330` in `/dev/shm`, with the onnx defaults,
+nlive 200, 5 repeats, 1000 dead points, seed 4242 and async. Each **W**
+arm was one 76-rank search (one session set per socket, round 149). Each
+**H** arm was two 38-rank searches run at the same time, each under
+`numactl --cpunodebind=N --membind=N`, so each took the single-socket
+path. The order was a 300-dead warm-up, then W1, H1, H2, W2
+(`.probe/r176/`).
+
+| arm | ranks | evals | wall s | evals/s | request ms | simulate ms | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 | 76 | 17,234 | 204 | 84.6 | 820 | 51 | 13,753 | 0.01776 ± 0.00043 |
+| H1 socket 0 | 38 | 17,824 | 405 | 44.0 | 782 | 50 | 7,305 | 0.01755 ± 0.00047 |
+| H1 socket 1 | 38 | 19,898 | 430 | 46.2 | 747 | 46 | 7,263 | 0.01739 ± 0.00049 |
+| H2 socket 0 | 38 | 18,132 | 400 | 45.3 | 762 | 47 | 7,354 | 0.01799 ± 0.00035 |
+| H2 socket 1 | 38 | 16,844 | 344 | 49.0 | 711 | 36 | 7,499 | 0.01809 ± 0.00036 |
+| W2 | 76 | 17,656 | 209 | 84.6 | 819 | 51 | 13,513 | 0.01761 ± 0.00052 |
+
+**Result.** The two halves together run **90.2 and 94.3 evals/s, against
+84.6 and 84.6** for one whole-node search (+9%). The request takes 751 ms
+against 820 ms (-8%). That matches the half-node allocation's per-core
+rate (round 174: 4,350 evals per core-hour, which is 1.21 evals/s per
+core; the halves here give 1.19-1.24). All log(Z)s agree within their
+errors.
+
+So most of round 174's 15% is real and specific to running one search
+across two sockets, not to an idle neighbour. Whole nodes still finish a
+single search about twice as fast (204-209 s against 344-430 s for the
+same 1000 dead points), so the job-shape advice stands: run one
+whole-node search when one answer is wanted soon, and pack socket-bound
+searches when many are queued.
+
+**Learned.**
+- A 76-rank search loses ~8% per request to something that two
+  independent socket-bound searches avoid. The workers are already
+  pinned and read their own socket's weights (round 149), so the
+  candidates are the unpinned processes: the PolyChord ranks and MPI
+  (`--bind-to none`), the pool parent, and the simulate/MeqTrees
+  sidecars, which float across sockets and touch remote memory.
+  Socket 0 also runs about 4% slower than socket 1 in both H arms
+  (44.0/45.3 against 46.2/49.0), which suggests that the shared or OS
+  work lands there. Next check: pin each PolyChord rank and its
+  simulate sidecar to the socket of the worker it feeds, then rerun W.
+- Two concurrent searches in one tree on one node (round 154's case)
+  ran cleanly with distinct `--output-dir`s; neither reaped the other.
+- Rows `r176-*` were built from `git archive` and so logged commit
+  `unknown`; they were rewritten to `21c7330`. Run directories were in
+  `/dev/shm` and are gone. No code changed, so there was no WSClean A/B.
