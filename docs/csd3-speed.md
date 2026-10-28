@@ -10398,3 +10398,99 @@ cold, to confirm that the driver check passes on a GPU node. Round 217's job
 39475183 runs `./ri search` from this working tree, so if it starts after
 this round its `startup_s` includes both rounds' changes. Neither had
 started when this round ended.
+
+## Round 219 (negative, reverted): CUDA graphs crash the shared TensorRT server; rounds 217-218 confirmed on a GPU
+
+**Why.** Shared TensorRT is now the GPU default (round 215, 100 steady
+evals/s at 19 ranks). Round 209 found that a shared worker's forward takes
+~4x its solo latency (10.9 ms against 2.7). With 19 lanes, each a Python
+thread in one server process, every forward costs three stream operations
+(copy in, the engine's own launches, copy out) issued under one GIL and one
+CUDA context. At ~2,500 forwards/s the launch path, not the A100's
+arithmetic, is the likely ceiling.
+
+**Change tried (opt-in `R2D2_TRT_GRAPHS=1`; reverted, see Result).** `serve_trt_shared()` captures
+one CUDA graph per lane and net at lane set-up: the copy from the pinned
+input buffer, `execute_async_v3`, and the copy to the pinned output.
+Requests then call `graph.replay()` on the lane's stream instead of making
+three launches. The graph runs the same kernels on the same buffers, so
+outputs should be bit-identical; the probe checks this. Each context
+flushes its deferred set-up with one ordinary enqueue before capture. A
+net whose capture fails keeps its context. The knob reaches the pool
+through `--env` in `run-nested-sampling-r2d2.sh`, and is recorded in
+`run.env` (so `./ri resume` keeps it) and in `bench.py`'s `WORKLOAD_KEYS`
+(so ledger rows with and without it are not grouped together). The default
+stays 0, so no current run changes. CPU and WSClean searches never reach
+these lines. The `run-config.sh` line prints only for `r2d2` runs, so a
+WSClean `run.env` is byte-for-byte unchanged and no WSClean race was
+needed.
+
+**Checks here (cpu-q-203, no GPU).** `compileall`, `bash -n`,
+`test_self_checks.py` (27 pass) and `./ri self-check r2d2-serve` in
+`r2d2.sif` (including the shared-protocol check) pass. shellcheck is not
+installed on this node. The two shell edits copy their neighbouring lines
+exactly.
+
+**Result: job 39479990** (gpu-q-44, `.probe/r219/job.sh`). Round 218's
+check, now confirmed on a GPU node: the driver-only check passes (rc 0) in
+1.03 s cold and 0.95 s warm, against 31.2 s cold and 5.8 s warm for the
+torch check. The two seed-4242 searches (rows `r219-G` and `r219-D`):
+
+| arm | evals | steady evals/s | headline | start-up s | request ms | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| G, graphs | 10,181 | **14.9** | 14.2 | 36.5 | 1,204 | 0.01878 +/- 0.00060 |
+| D, default | 8,850 | 100.0 | 79.8 | 22.3 | 193 | 0.01884 +/- 0.00065 |
+
+The graph arm is 6.7x *slower*. A 1.2 s request is the CPU U-Net's time
+(round 218's CPU row was 1.3 s), so in that arm the workers were almost
+certainly running on the CPU fallback. `TrtSharedNet` falls back to the
+CPU when the server's socket breaks, and log(Z) still agrees because the
+CPU path gives the same reconstructions. The probe confirms that the
+server dies. The context server answered all 25 nets, bit-identical
+between lanes, but the graph server, with lanes made and the status line
+written, closed its socket on the first forward (`recv` returned 0
+bytes). Its stderr went nowhere, so whether the replay raised or the
+process faulted is unknown. One likely cause is replaying from the lane
+threads a graph captured on the main thread with torch's global capture
+mode. **The change is reverted**: an opt-in mode that silently drops a
+search to CPU speed must not ship. To retry, capture graphs inside each
+lane's own thread, log the server's stderr, and run the probe before any
+search.
+
+Also learned: a *silent* fallback is the dangerous part. A search whose
+server dies keeps going at 15% of its rate with only a traceback in
+stderr. `./ri health` and the benchmark row do not flag it. The next
+round should make the run log a server exit loudly (the pool already
+prints "TensorRT forward server exited"), or have the `trt-shared` run
+fail fast.
+
+**Read: round 217's job 39475183** (gpu-q-26, started 16:18). It ran on
+this round's tree, so its search includes rounds 217 and 218 together;
+`R2D2_TRT_GRAPHS` was unset, i.e. 0. The default GPU search at
+r215-default's settings (19 x 2, shared TensorRT; row `r217-default`):
+
+| | r215-default (round 215) | r217-default (rounds 217+218) |
+| --- | ---: | ---: |
+| start-up s | 90.9 | **54.1** |
+| headline evals/s | 46.4 | **56.2** |
+| steady evals/s | 80.7 | 80.6 |
+| log(Z) | 0.0187108469398579 +/- 0.000591 | 0.0186358109606784 +/- 0.000613 |
+
+Start-up is 37 s shorter (-40%), the steady rate is unchanged, and log(Z)
+agrees within 0.1 sigma (async searches are not bit-reproducible, so
+"identical" was the wrong test). The headline gains 21% only because this
+search is a 3-minute one; on a converged 13-minute search the 37 s is ~5%.
+These are two runs on two nodes, not an interleaved pair. The summary is
+in `.probe/r217/summary-default.json`; the run directory is deleted. The
+probe on the same node, warm after the search, alternated 3 times:
+
+| | old (one plan at a time) | new (8 readers) |
+| --- | ---: | ---: |
+| read + deserialize 25 plans | 5.05 / 5.22 / 5.08 s | 1.59 / 0.96 / 0.94 s |
+
+**New start-up cost found.** Making the server's 19 lanes (475 execution
+contexts) takes **12.2 s** sequentially and 13.4 s on 19 threads, so
+threading does not help. That is now the largest single item in a shared
+search's start-up after the imports. Sharing one context per net across
+lanes is not possible, because a context holds its own bindings. The next
+step is to profile what `create_execution_context` spends its time on.
