@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 208; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 209; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -88,7 +88,11 @@ the Hetzner host.
   workers) on 5.7 GB instead of 66, bit-identical, so a shared TensorRT
   forward server lifts the 12-worker cap ([round 207](#round-207-positive-probe-one-process-sharing-25-tensorrt-engines-feeds-the-a100-from-57-gb)).
   Wired in as opt-in `R2D2_TRT_SHARED=1`, bit-identical to per-worker
-  TensorRT at 19 concurrent workers; the search race is pending ([round 208](#round-208-wired-in-race-pending-opt-in-r2d2_trt_shared1-one-tensorrt-forward-server-for-the-pool)).
+  TensorRT at 19 concurrent workers ([round 208](#round-208-wired-in-race-pending-opt-in-r2d2_trt_shared1-one-tensorrt-forward-server-for-the-pool)).
+  Raced in a search it agrees on log(Z) but runs 55.5 evals/s against
+  60.6 for per-worker `trt` and 61.1 for eager (3/2/3 arms), because a
+  forward through the server takes 10.9 ms against 2.7; whether MPS or
+  the server's Python is to blame is pending ([round 209](#round-209-negative-so-far-the-shared-tensorrt-server-loses-9-at-19-ranks-because-its-forwards-take-4x-longer)).
 - **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
   core-hours, and the GPU and CPU allowances are separate budgets, so
   using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
@@ -9767,7 +9771,7 @@ which is why it never saw this.
 nlive 48, seed 4242; shared at 19 ranks, per-worker `trt` at 12, eager at
 19, interleaved S T E / T E S / E S) is job 39455029, `.probe/r208/job.sh`.
 Its output goes to `.probe/r208/job-39455029.out` and its run directories
-delete themselves. Read it next round. Ship as default only if log(Z)
+delete themselves. Read in [round 209](#round-209-negative-so-far-the-shared-tensorrt-server-loses-9-at-19-ranks-because-its-forwards-take-4x-longer): log(Z) agrees, shared is ~9% slower. Ship as default only if log(Z)
 agrees with the other two arms. First arms, read at 11:41 (gpu-q-12):
 
 | arm | evals/s | wall (s) | log(Z) | ndead / nlike | card peak (MiB) | GPU util |
@@ -9788,3 +9792,45 @@ no-engine reply, other shape, server gone) and the full
 byte-identical before and after (checked with `write_run_config`), so no
 WSClean A/B was run. Slurm etiquette slip: this round made three Slurm
 calls less than 2 minutes apart (17 s, 64 s and 115 s).
+
+## Round 209 (negative, so far): the shared TensorRT server loses ~9% at 19 ranks, because its forwards take 4x longer
+
+Round 208's race (job 39455029, gpu-q-12, 1 x A100, nlive 48, 600 dead
+points, seed 4242, arms interleaved S T E / T E S / E S) finished. Its run
+directories deleted themselves; every arm has a `benchmarks.jsonl` row.
+
+| arm | ranks x threads | evals/s | log(Z) | ndead / nlike |
+| --- | --- | ---: | --- | --- |
+| S1 shared `trt` | 19 x 2 | 52.5 | 0.018861009306903 +/- 0.000643 | 509 / 10,706 |
+| T1 per-worker `trt` | 12 x 3 | 61.2 | 0.0189784187873873 +/- 0.000658 | 460 / 8,735 |
+| E1 eager | 19 x 2 | 58.0 | 0.0187401703551069 +/- 0.000614 | 518 / 10,454 |
+| T2 per-worker `trt` | 12 x 3 | 60.0 | 0.0188407201060907 +/- 0.000654 | 466 / 8,187 |
+| E2 eager | 19 x 2 | 59.0 | 0.019108752703253 +/- 0.000621 | 514 / 6,877 |
+| S2 shared `trt` | 19 x 2 | 52.9 | 0.0191202259860594 +/- 0.000617 | 506 / 7,797 |
+| E3 eager | 19 x 2 | 66.4 | 0.0191175531218563 +/- 0.000621 | 488 / 8,204 |
+| S3 shared `trt` | 19 x 2 | 61.1 | 0.0191878668615988 +/- 0.000629 | 497 / 8,012 |
+
+Means: shared 55.5, per-worker `trt` 60.6, eager 61.1 evals/s. log(Z)
+agrees across all three (0.0187-0.0192, errors ~0.0006), and no evaluation
+failed, so shared mode is correct but not faster. It stays opt-in.
+
+Why, from `./ri profile --r2d2-phases` on S1, T1 and E1 before they were
+deleted: a shared worker's "model update" (one U-Net forward plus
+R2D2's few element-wise ops) takes **10.9 ms** a call, against **2.7 ms**
+for per-worker `trt` and 8.9 ms for eager. That is 260 of a 310 ms
+request; T1's request is 143 ms. Everything else in the request is the
+same CPU code in all three. By Little's law the server held ~14 forwards
+in flight at ~1,250 forwards/s (52.5 evals/s x 24 forwards), so it was
+running at about half round 207's 2,450/s, whose 12-lane latency was
+4.9 ms. Round 207's probe ran the server alone on the card with no MPS
+daemon; in a search the pool, and so the server, run as an MPS client,
+beside 18 workers' CPU work. Either could be the difference.
+
+**Pending:** job 39455763 (`.probe/r209/job.sh`, ampere, normal QoS) races
+shared mode with MPS on against `NS_CUDA_MPS=0` at 19 ranks (3 pairs,
+alternating), plus 27 ranks without MPS (2 arms). Shared mode puts no
+worker on the card, so the 19-rank GPU cap does not apply to it; the
+probe lifts it with `NS_R2D2_CUDA_MB_PER_RANK=2000 --mpi-procs 27`.
+If MPS off brings the forward back towards round 207's latency, shared
+mode should skip MPS and size ranks by CPUs; if not, the server's
+per-forward Python (one thread a lane, under the GIL) is next.
