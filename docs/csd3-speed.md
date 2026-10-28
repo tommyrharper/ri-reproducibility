@@ -5,12 +5,14 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 183; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 184; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
-  sapphire CPUs with the same images and seed, converges in **41 minutes
+  sapphire CPUs with the same images and seed, converged in **41 minutes
   instead of 6h20m (7.0x)**: 26.6 evals/s against 4.12, log(Z) in
   agreement ([round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree)).
+  Rerun again on round 183's tree it takes **29 minutes (9.9x)**: 39.7
+  evals/s and a 546 ms request against 825 ([round 184](#round-184-validation-the-22-sep-production-search-on-round-183s-tree-29-minutes)).
   Simulate (MeqTrees) went from 39% of worker time to 3.8%, idle from
   11.5% to 0.05%. A whole sapphire node (112 ranks x 1, one checkpoint
   copy per socket, rounds 105-106) runs 103.5 evals/s. The request is now
@@ -7525,6 +7527,7 @@ Where R2D2 ends up on CSD3:
 | shape | evals/s | against | source |
 | --- | ---: | --- | --- |
 | 22 Sep production search, 24 sapphire CPUs | 26.6 (torch, round 115) | 4.12 before (7.0x) | [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree) |
+| 22 Sep production search, 24 sapphire CPUs, round 183's tree | 39.7 (onnx, round 184) | 26.6 in round 115, 4.12 on 22 Sep (9.9x in wall time) | [round 184](#round-184-validation-the-22-sep-production-search-on-round-183s-tree-29-minutes) |
 | half icelake node, default onnx, 38 x 1 | 46.4 | 44.8 in round 146 | [round 158](#round-158-diagnostic-an-r2d2-workers-cpu-after-rounds-148-153) |
 | whole icelake node, onnx, sessions per NUMA node | 80.5 | 59.2 before round 149 | [round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36) |
 | whole sapphire node, onnx, sessions per NUMA node | 117 | 83.2 pre-149 onnx, 96-104 torch | [round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40) |
@@ -8657,3 +8660,57 @@ ranks it displaces. The GPU arms' log(Z)s agree within their errors
 Rows: `r183-warm`, `r183-cwarm`, `r183-G32-1`..`r183-C16-2` in
 `benchmarks.jsonl` (commit 20c1fbf, gpu-q-18). The run directories (~9.3k
 files) were deleted.
+
+## Round 184 (validation): the 22 Sep production search on round 183's tree, 29 minutes
+
+**Question.** Round 115 reran the 22 Sep production R2D2 search (job
+36031480, 6h20m) on the tree of that day: 41 minutes. Since then the CPU
+default moved to ONNX Runtime (rounds 141-145), the data prep got cheaper
+(148-153), and ranks follow their worker's socket (177). What does the same
+search take on today's tree?
+
+**Run.** Same command as round 115 on `7e5caf9` with today's defaults
+(`R2D2_RUNTIME=onnx`), the same SIFs (same three image ids), seed
+190182240, nlive 150, 15 repeats, 24 ranks x 1 thread, async, to
+convergence. It was a sized 24-CPU sapphire job, as before (39418598 on
+cpu-r-75, started at once, `.probe/r184/job.sh`). The node was shared:
+load 56 when the job started. Row `r184-bigrun`.
+
+| | 22 Sep (`cb59233`) | round 115 (`5ced3d0`) | round 184 (`7e5caf9`) |
+| --- | ---: | ---: | ---: |
+| search wall to convergence | 17,331 s (6h 19m) | 2,459 s (41 min) | **1,749 s (29 min)** |
+| against 22 Sep | 1x | 7.0x | **9.9x** |
+| evaluations | 71,395 | 65,420 | 69,478 |
+| evals/s | 4.12 | 26.6 | **39.7 (+49% on round 115)** |
+| R2D2 request per evaluation | 2,868 ms | 825 ms | **546 ms (-34%)** |
+| simulate (MeqTrees) per evaluation | 1,936 ms (39.2%) | 32 ms (3.8%) | 29 ms (5.0%) |
+| idle fraction | 11.5% | 0.05% | 0.6% (end-of-run tail) |
+| post-run phase | ~88 min | 34.5 s | 19 s |
+| files left | ~225k | 6,647 | 6,675 |
+
+**Result.** The production search now converges in 29 minutes on the same
+24 CPUs and images: 9.9x faster than 22 Sep and 1.41x faster than round
+115. The whole gain since round 115 is in the request (825 to 546 ms),
+which matches what the onnx default (+33-44%, rounds 141 and 144) and
+rounds 148-153 predicted. Simulate is 5% of worker time and the user's
+30-50% MeqTrees share stays gone. log(Z) is not resolved here: the run
+directory lived in the job's `/dev/shm` and was deleted with the chains,
+and the last status print (1,063 dead, before the end) reads log(Z) =
+0.01 +/- 0.00, consistent with round 115's 0.0168 +/- 0.0004. Round 144
+already checked onnx against torch to convergence on two seeds (0.25
+sigma), so this run is a speed figure only.
+
+**Learned.**
+- The rate fell during the run, from ~50 evals/s in its first ten minutes
+  to ~35 later, on a node other jobs were also loading. A sized job on a
+  shared sapphire node has that much noise. Exclusive whole nodes (round
+  179) are steadier.
+- The ~110 s outside the search wall was mostly the fresh tree's uv
+  `.venv` (70 s), which a production checkout pays once.
+- A validation job that extracts a tree into `/dev/shm` must copy the
+  run's `chains/*.stats` (or the packed archive) out before it cleans up,
+  or log(Z) is lost. `summary.json` does not carry it.
+
+Rows: `r184-bigrun` in `benchmarks.jsonl` (commit 7e5caf9). The run
+directory was in the job's `/dev/shm` and is gone; the job log and
+profile are in `.probe/r184/`.
