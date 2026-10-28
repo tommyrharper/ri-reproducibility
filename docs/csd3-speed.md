@@ -10969,3 +10969,80 @@ Rows `r227-wa`, `r227-wb` (bench), `r227-lustre-unique` and
 `r227-kill-resume` (stage) are in `benchmarks.jsonl`. The run dirs are
 deleted. The scripts are in `.probe/r227/`. GPU job 39497293 (round
 224's gathering A/B) was not read this round.
+
+## Round 228: the "gap after the first wave" is a cold R2D2 pool; it now prefetches its weights
+
+**What the gap is.** Rounds 225 and 227 left open a 36-40 s gap right after
+the first wave of evaluations. A gap sampler (`.probe/r228/gap.py`: on a
+4 s pause in evaluation lines it dumps `/proc/<pid>/syscall` and the path of
+every process in the search) found no gap in the middle of a 19-rank async
+WSClean search (r228-w1, 4,013 evaluations, stall 0). In R2D2 (r228-r1, CPU
+onnx, 39 ranks), every rank's *first* evaluation took 35.9-36.7 s and every
+later one 0.3-1 s. `simulate` was 0.8 s of that and the R2D2 request was 35 s.
+It is start-up, not a stall: the pool's warm-up off a cold page cache. A
+second search straight after it (r228-r2) had no gap: warm-up 5.8 s, hidden
+behind the ranks' own start. Evicting the files (`posix_fadvise(DONTNEED)`
+on `r2d2.sif`, the checkpoints and the ONNX cache, `.probe/r228/evict.py`)
+brought the gap back (r228-r3: startup 37 s). Timed inside the pool (r228-r4,
+cold): imports 3.0 s, `load_checkpoints` 8.9 s, ONNX sessions 10.3 s. Both
+read their files (25 x 240 MB checkpoints, 25 optimised graphs, 8.7 GB
+together) one at a time off Lustre.
+
+**Change** (`r2d2_serve.py` `prefetch_weights`): first thing in
+`serve_pool`, the pool parent forks a child that reads the checkpoints and
+(onnx) this CPU's `opt-<key>/N*.onnx` with 16 threads into the page cache,
+then exits. The loads then read from memory. It is forked before any import,
+and before the FIFO ends are opened, so it holds none of them, and the
+parent's peak RSS (every worker's reported floor) never sees the reads. After
+the warm-up the parent kills it and reaps it, so the pool's `os.wait()` loop
+never mistakes it for a dead worker. It only reads files, so outputs cannot
+change. New host-runnable `self_check_prefetch_weights` (the checkpoints are
+FIFOs, so a write-open succeeds only once the prefetcher has opened each one
+to read).
+
+**A/B** (stage row `r228-prefetch-ab`; 12 arms interleaved B A A B B A A B
+B A A B, files evicted before every arm, 39 ranks, nlive 48, max-ndead 150,
+seed 228, async):
+
+| | pool warm-up s | checkpoints s | ONNX sessions s | first request s (max) | search wall s |
+|---|---|---|---|---|---|
+| A, no prefetch | 7.2, 20.9, 7.3, 30.1, 7.2, 18.0 (mean 15.1) | 1.5-7.2 | 2.7-20.1 | 6.5, 57.9, 6.7, 1.6, 40.7, 17.5 | 30.6, 83.5, 32.9, 27.0, 67.0, 43.6 (sum 284.6) |
+| B, prefetch | 7.9, 6.0, 6.1, 6.0, 6.1, 6.2 (mean 6.4) | 0.9-1.0 | 1.9-3.8 | 7.2, 5.2, 4.9, 39.6, 5.4, 5.2 | 32.2, 31.1, 30.7, 64.5, 31.4, 31.1 (sum 220.9) |
+
+Eviction does not make every arm cold: the Lustre servers keep their own
+cache, so 3 of 6 A arms came up cold (18-30 s) and 3 warm (7.2-7.3 s). B
+was 6.0-7.9 s in all 6, and about 1 s faster than A even when A was warm
+(checkpoints 1.5 -> 1.0 s, sessions 2.7 -> 1.9 s). log(Z) 0.0132-0.0138 +/-
+0.004 in all 12 arms (async, so not bit-identical between runs, and no arm
+differs beyond its error). It is worth 10-25 s per cold search start, and
+once per retry segment, which matters little to an hours-long production run.
+The GPU path gets the checkpoint half (its TensorRT plans were already read
+eight at a time, round 217).
+
+**Still open: a second cold start-up on the worker side.** c8B (prefetch,
+warm-up 6.0 s) and c10A (warm-up 7.2 s) still had a ~40 s first request,
+and c7A had a 30 s warm-up but a 1.6 s first request because its ranks
+started late. So something else read on first use (the worker's first
+R2D2 run, or the ranks' own start) also pages in cold off Lustre at times.
+Next: put the per-worker "child ready" and per-request probe times beside
+the rank's start in a cold arm to name it.
+
+**Also seen: the end-of-run chains sync can block on Lustre.** In r228-w1
+the last evaluation ended ~44 s before `summary.json`. All of it was rank 0
+in `ChainsMirror.stop()`'s blocking final sync, stuck in `openat` of
+`chains/clusters/.wsclean_vlaa_1.txt.mirror` (one of 14 creates the full sync
+makes). It costs no evaluations, but it adds to a search's wall time. A
+microbenchmark during a quiet spell (300 cycles each of create, write and
+rename timed separately, a pre-created spare opened with `O_TRUNC`, and an
+in-place rewrite) had no step over 0.52 s. The block is intermittent, and
+this round did not find which step it hits. An end sync that copies only the
+`.resume` atomically and rewrites the text files in place would make one
+create instead of 14.
+
+Bench rows `r228-w1`, `r228-r1`..`r228-r4` and `r228-c1B`..`r228-c12B` are in
+`benchmarks.jsonl` (the c-arms are dirty because the probe lines were in).
+r1-r4's and w1's log(Z) were 0.01538, 0.01370, 0.01310, 0.01359 and 0.09461
+(5 decimals; their summaries were deleted before full-precision values were
+copied). All run directories are deleted. The scripts are in
+`.probe/r228/`. GPU job 39497293 (round 224's gathering A/B) had produced
+no output file at 20:18. It was still pending, and it is not read here.

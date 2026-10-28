@@ -40,6 +40,7 @@ HOST_RUNNABLE = {
         "self_check_net_reuse",
         "self_check_normal_operator",
         "self_check_nufft_plan_reuse",
+        "self_check_prefetch_weights",
         "self_check_serve_fifo",
         "self_check_serve_pool",
         "self_check_serve_reply_stream",

@@ -291,6 +291,45 @@ def export_onnx(checkpoint_path: Path) -> Path:
     return models
 
 
+def onnx_cpu_key() -> str:
+    import hashlib
+
+    cpuinfo = Path("/proc/cpuinfo").read_text().split("\n\n")[0]
+    cpu = [line for line in cpuinfo.splitlines() if line.startswith(("model name", "flags"))]
+    return hashlib.sha1(repr(cpu).encode()).hexdigest()[:12]
+
+
+def prefetch_weights() -> int:
+    """Fork a child that reads the pool's weights into the page cache, 16 files at a time; return its pid.
+
+    A cold pool reads 5.8GB of checkpoints and (onnx) 2.9GB of optimised
+    graphs one file at a time off Lustre: 8.9s and 10.3s of a 22-34s warm-up,
+    against 5.8s warm (round 228). Forked before any import, so the parent's
+    peak RSS, which every worker reports as its floor, does not see the reads.
+    """
+    pid = os.fork()
+    if pid:
+        return pid
+    try:
+        import concurrent.futures
+
+        files = sorted(Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1")).glob("*.ckpt"))
+        if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
+            files += sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
+
+        def read(path: Path) -> None:
+            chunk = bytearray(1 << 22)
+            with open(path, "rb", buffering=0) as stream:
+                while stream.readinto(chunk):
+                    pass
+
+        with concurrent.futures.ThreadPoolExecutor(16) as reader:
+            list(reader.map(read, files))
+    except Exception:
+        pass  # only ever a head start: the loads read whatever this missed
+    os._exit(0)
+
+
 def patch_onnx_network(checkpoint_path: Path) -> None:
     """Run each CPU U-Net forward through ONNX Runtime instead of torch.
 
@@ -322,11 +361,7 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     # build on a CPU saves each optimised graph and later pools load that with
     # optimisation off: bit-identical outputs and forward time (round 202). It
     # may hold CPU-specific layouts (NCHWc), so it is keyed by the CPU.
-    import hashlib
-
-    cpuinfo = Path("/proc/cpuinfo").read_text().split("\n\n")[0]
-    cpu = [line for line in cpuinfo.splitlines() if line.startswith(("model name", "flags"))]
-    optimised = models / f"opt-{hashlib.sha1(repr(cpu).encode()).hexdigest()[:12]}"
+    optimised = models / f"opt-{onnx_cpu_key()}"
     optimised.mkdir(exist_ok=True)
 
     def session(cur_iter: int):
@@ -1297,9 +1332,14 @@ def serve_pool(fifo_dir: str) -> None:
     # blocks. Holding a writer on it is also what keeps the rank's reply read
     # from hitting a spurious EOF in the moment between the fork and the child
     # opening its own end.
+    prefetcher = prefetch_weights()  # first, so it holds none of the FIFO ends below
     keeper = {base: (os.open(f"{base}.in", os.O_RDONLY | os.O_NONBLOCK), os.open(f"{base}.out", os.O_RDWR))
               for base in bases}
     warm_imports()
+    # Whatever it has not read by now the loads already have. Reaped here, not
+    # by the os.wait() below, which forks a replacement for every pid it gets.
+    os.kill(prefetcher, signal.SIGKILL)
+    os.waitpid(prefetcher, 0)
     # Set before the fork, so every child reports at least what the warm-up it
     # inherited already cost.
     _PEAK_FLOOR = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
@@ -2066,6 +2106,36 @@ def self_check_worker_nodes() -> None:
     print("r2d2 worker nodes self-check passed")
 
 
+def self_check_prefetch_weights() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # FIFOs: a write-open succeeds only once the prefetcher has opened one to read it.
+        ckpts = [Path(tmp) / f"R2D2_UNet_N{i}.ckpt" for i in (1, 2)]
+        for path in ckpts:
+            os.mkfifo(path)
+        os.environ["R2D2_CKPT_PATH"] = tmp
+        try:
+            pid = prefetch_weights()
+            deadline = time.monotonic() + 10
+            for path in ckpts:
+                while True:
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                        break
+                    except OSError:  # ENXIO: no reader yet
+                        assert time.monotonic() < deadline, f"{path.name} never read"
+                        time.sleep(0.01)
+                os.write(fd, b"weights")
+                os.close(fd)
+            assert os.waitpid(pid, 0)[1] == 0
+            os.environ["R2D2_CKPT_PATH"] = str(Path(tmp) / "missing")
+            assert os.waitpid(prefetch_weights(), 0)[1] == 0, "no checkpoints is not an error"
+        finally:
+            os.environ.pop("R2D2_CKPT_PATH")
+    print("r2d2 prefetch weights self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_net_reuse()
@@ -2079,6 +2149,7 @@ if __name__ == "__main__":
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
+        self_check_prefetch_weights()
         self_check_interleaved_pages()
         self_check_worker_nodes()
         self_check_trt_fallback()
