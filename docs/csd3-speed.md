@@ -10629,3 +10629,71 @@ rate. Only cheaper forwards can: fewer or fused kernels per net, or more
 work per launch. fp16 (round 175) and TF32 are off the table for accuracy,
 and batching across requests (rounds 127, 137) depends on clients wanting
 the same net at the same time.
+
+## Round 223 (positive probe): batched TensorRT forwards put 3x more images through the A100
+
+**Why.** Round 222 showed a 1-GPU search runs at the card's batch-1
+ceiling: ~2,400 forwards/s from 19 lanes of 1x2x32x32 forwards. A 32x32
+image leaves most of an A100 idle per kernel, so more images per launch
+should cost little. Round 127 rejected gathering across requests on
+eager torch, where batch 32 gave only 1.33x over the MPS plateau, and at
+the time the search was CPU-bound anyway. Neither holds for TensorRT now:
+the card is the limit.
+
+**Probe.** One 1-GPU ampere job (39492566, gpu-q-12, A100-SXM4-80GB,
+`.probe/r223/probe.py`) rebuilt N1 and N13 from the production ONNX
+(`7794e01823b588cc`) with the input batch fixed at B (TF32 off, as in
+`build_trt_plans`), compared each row with the production B=1 plan's
+output for 19 seeded images, and timed N1 on S concurrent streams for
+4 s per arm, 2 passes:
+
+| B | S=1 | S=2 | S=4 | S=19/B |
+|---:|---:|---:|---:|---:|
+| production plan, 1 | 654, 655 | 1,218, 1,217 | 1,762, 1,760 | **2,406, 2,403** |
+| 2 | 1,193, 1,192 | 2,019, 2,020 | 2,885, 2,880 | 3,587, 3,592 (S=9) |
+| 4 | 2,072, 2,063 | 3,473, 3,491 | 4,936, 4,949 | - |
+| 8 | 3,619, 3,620 | 5,826, 5,817 | **7,345, 7,326** | - |
+| 19 | 4,959, 4,958 | 5,656, 5,616 | 6,604, 6,607 | - |
+
+(forwards/s, i.e. images/s.) Eight images on four streams put **3.05x**
+today's ceiling through the card. Accuracy: no rebuilt engine is
+bit-identical to the production plan, *including the B=1 rebuild*
+(TensorRT's tactic timing picks kernels per build). The largest difference
+from the production plan, as a fraction of the output's peak:
+
+| net | B=1 rebuild | B=2 | B=4 | B=8 | B=19 |
+|---|---:|---:|---:|---:|---:|
+| N1 | 3.6e-6 | 4.5e-6 | 5.1e-6 | 5.2e-6 | 6.7e-6 |
+| N13 | 2.5e-6 | 3.6e-6 | 6.6e-6 | 6.0e-6 | 4.9e-6 |
+
+So batching moves outputs by no more than rebuilding the same plan does,
+and both sit inside round 168's 1e-5 TensorRT-to-CPU gap that converged
+searches already accept (rounds 213, 215). Async GPU searches are not
+bit-reproducible run to run anyway (round 219), so a batched server is
+judged on log(Z) agreement, like every GPU change since round 171.
+
+**Will requests line up?** Each evaluation runs N1..N25 in order, so a
+server can only batch clients that want the same net at once.
+`.probe/r223/sim.py` is an event simulation: 19 clients, a CPU prep
+per evaluation, 1 ms between forwards, and a card that runs up to K
+batches at the measured rate for (B, K). When the card frees it serves
+the net with the most waiting clients. Clients bunch up on their own:
+mean batches of 2-9 form without any waiting window.
+
+| prep per evaluation | lanes today (B=1, 19 streams) | gather, K=1 | K=2 | K=4 |
+|---:|---:|---:|---:|---:|
+| 20 ms | 78.3 | 129.6 (+65%) | 140.8 (+80%) | 122.5 (+56%) |
+| 40 ms | 72.3 | 111.1 (+54%) | 125.9 (+74%) | 112.6 (+56%) |
+| 80 ms | 62.8 | 99.9 (+59%) | 97.7 (+56%) | 94.6 (+51%) |
+
+The model's absolute rates are below the real ~100 steady evals/s (it
+leaves out how lanes overlap with the CPU), so only the ratios are an
+estimate: **+50-80% evals/s for a 1-GPU search**, the largest GPU lever
+left.
+
+**Next.** Keep weights once: one engine per net with several
+optimisation profiles (B = 1, 2, 4, 8) rather than one plan per B, which
+would quadruple the 5.3 GB of plans. Check that a row's output does not
+depend on its position or on the other rows in the batch, then build the
+gathering server behind an opt-in (`R2D2_TRT_BATCH`) and race it against
+today's shared server for log(Z) and steady evals/s.
