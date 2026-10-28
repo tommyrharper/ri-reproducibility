@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 187; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 188; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -8860,3 +8860,42 @@ not a lever, but short runs overstate it.
 
 Rows: `r187-base`, `r187-new` in `benchmarks.jsonl`. Scripts in
 `.probe/r187/`. Run directories deleted.
+
+## Round 188 (null): two PolyChord-side costs that are not there
+
+**Root spin.** Round 186 left PolyChord's root rank busy-polling Open MPI
+on a CPU it now shares with a worker (39 ranks on 38 CPUs). Open MPI 4.1.4
+in `polychord.sif` documents `mpi_yield_when_idle` as on by default when
+oversubscribed. `.probe/r188/spin.py` (rank 0 waits 5 s in `recv`) shows
+it is: at `-np 4` the wait is 5.01 s user, 0.01 s system; at
+`--oversubscribe -np 39` (and 50) it is 0.84 s user, 4.36 s system, the
+`sched_yield` loop, the same as `-np 4` with
+`OMPI_MCA_mpi_yield_when_idle=1`. Round 186's default already yields its
+root's CPU to a worker when one is runnable, so there is no MPI knob left
+there.
+
+**Stale async chains.** In an async run the root accepts a returned
+chain's point only if it is above the *current* contour
+(`replace_point`, `run_time_info.f90` at 370f6af), and every other worker's
+chain that lands meanwhile moves that contour. If returned points were
+uniform inside their seed contour, the rejected fraction would be
+~1 - exp(-(ranks-1)/nlive): ~40% at 112 ranks and nlive 200, so more
+ranks would buy fewer dead points per evaluation. `benchmarks.jsonl`
+says otherwise. At nlive 200, 5 repeats, 1000 dead (rounds 104-179, all
+async):
+
+| ranks | rows | mean evaluations |
+| ---: | ---: | ---: |
+| 38 | 6 | 17,657 |
+| 56 | 4 | 17,455 |
+| 76 | 18 | 16,096 |
+| 112 | 15 | 15,931 |
+
+Evaluations per dead point do not grow with ranks. A 5-repeat chain ends
+close to its seed, a live point usually well inside the contour, so few
+chains go stale. (Clustering changes also discard in-flight chains through
+`administrator_epoch`, but round 184's production search clustered once in
+1,063 dead points.) Whole-node rank counts cost no extra sampling, and
+async PolyChord is not a lever.
+
+Docs only. No searches were run. Script in `.probe/r188/`.
