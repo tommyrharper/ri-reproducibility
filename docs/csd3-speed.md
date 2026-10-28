@@ -10771,3 +10771,107 @@ evals/s, log(Z) 0.0169791852331699 +/- 0.00171834943813729) as A B A B,
 then `R2D2_TRT_LANES=4`. Read `.probe/r224/ab-39497293.out` next round:
 compare `steady_evals_per_s` and log(Z), and check `r2d2-engine.txt` says
 "gathered" rather than "fallback".
+
+## Round 225 (diagnostic): the whole-search stalls are PolyChord's root blocked creating its resume file on Lustre
+
+**Why.** GPU job 39497293 (round 224's gathering-server A/B) had not
+started, so this round used the CPU node for two questions. (1) How fast
+can a 32-core GPU node go if the U-Net forward cost nothing? That caps
+what any gathering server can give. (2) Priority 1: what stalls a whole
+search for ~30-100 s (round 211's "wedges", which round 214 showed were
+not MeqTrees)?
+
+**Probe.** A throwaway worktree (`/rds/user/th773/hpc-work/r225-wt`,
+deleted) with `R2D2_PROBE_NOFWD=1`. That replaces R2D2's
+`optimiser.forward` with `output + residual` and `load_net` with a no-op,
+so every request still runs the data load, imaging weights, both NUFFTs,
+the PSF and the per-iteration residuals, but no U-Net. Searches used
+`R2D2_RUNTIME=torch`, nlive 48, 5 repeats, 600 dead points and seed 4242,
+pinned with `taskset` to 32 of this job's CPUs (an A100 node's core
+count). The stub's log(Z)s (35,529, 1,819, 74,382, 57,295, ...) are those of a
+meaningless image and say nothing about the science. Only the timings
+count. A first zero-output stub ended after 357 evaluations because every
+likelihood was equal, so the stub adds the residual.
+
+| arm | chains on | ranks x threads | evals | wall s | start-up s | stall s | idle | steady evals/s |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| S19 | Lustre | 19 x 2 | 8,899 | 119.2 | 2.8 | **61.6** | 51% | 162.7 |
+| S32 | Lustre | 32 x 1 | 8,987 | 112.3 | 39.7 | **27.2** | 24% | 197.6 |
+| P19 (perf on root) | Lustre | 19 x 2 | 9,683 | 150.9 | 36.3 | **51.7** | 34% | 154.5 |
+| G19 (gdb on ranks) | Lustre | 19 x 2 | 10,711 | 215.9 | 2.9 | **113.4** | 54% | 113.2 |
+| H19 | `/dev/shm` (symlink) | 19 x 2 | 10,724 | 104.1 | 40.2 | **0.0** | 0.2% | 168.1 |
+| H19b | `/dev/shm` (symlink) | 19 x 2 | 8,259 | 50.1 | 10.5 | **0.0** | 0.4% | 209.4 |
+
+Headline evals/s: Lustre arms 49.6-80.0, tmpfs arms 103.0 and 164.9.
+
+**(1) The CPU ceiling of a GPU node.** With free forwards, 19 x 2 on
+32 CPUs runs 168-209 steady evals/s with no stall (H19, H19b; 155-163 in
+the Lustre arms not perturbed by a debugger), and 32 x 1 runs 198. Today's
+shared TensorRT runs 85-100 (rounds 215, 221). So round 223's predicted
++50-80% from gathering (128-180) fits under the 19 x 2 node's CPU
+ceiling, but near its top. Beyond that, the CPU-side work (simulate
+26-31 ms, the rest of the request 70-140 ms at 2 threads) becomes the limit. More ranks raise the
+ceiling (32 x 1 is +20% over 19 x 2). With the shared server, workers
+hold no GPU memory, so `NS_R2D2_CUDA_MAX_RANKS=19` (sized for per-worker
+engines) is worth racing at 31 ranks once gathering lands.
+
+**(2) What stalls.** Every Lustre arm had 1-3 gaps of 24-36 s in which no
+rank started an evaluation, yet no evaluation lasted over 2.8 s. The
+workers printed "Inefficient MPI parallelisation, I spend more time
+waiting than slicing" (~65 s waiting against ~49 s slicing). perf on rank
+0 showed only Open MPI shared-memory polling (`mca_btl_vader`, ~80%), so
+the root was waiting, not computing. During a gap its
+`/proc/<pid>/syscall` was 257 (`openat`, flags `O_WRONLY|O_CREAT|O_CLOEXEC`,
+gfortran's open, not Python's, which adds `O_TRUNC`), in state `I`.
+Sampling that syscall every 0.5 s and reading its path argument from
+`/proc/<pid>/mem` gave the same file every time:
+`chains/r2d2_vlaa_temp.resume`, PolyChord's checkpoint temp file (written,
+then renamed onto `.resume`). One open blocked 25 s, the next 45.6 s, the
+next 19.6 s: 83 s of a 2-minute window. While the root waits, no worker
+gets a new seed, so the whole search stops.
+
+The filesystem does this on its own, with no search running. A Python
+loop on `/rds/user/th773/hpc-work` doing PolyChord's pattern (create a
+temp file, write 784 KB, rename it onto the target), then 0.2 s of sleep:
+
+| pattern, 162 cycles each, interleaved | median | max | cycles over 1 s | seconds lost |
+|---|---:|---:|---:|---:|
+| create temp + write + rename onto target (PolyChord's) | 3.0 ms | **31.5 s** | 2 | 46.9 |
+| rewrite the existing file in place (`O_TRUNC`, no create) | 2.2 ms | 4 ms | 0 | 0 |
+| create + write + rename on `/dev/shm` | 0.8 ms | 1 ms | 0 | 0 |
+
+An earlier 118-cycle run of the rename pattern alone had a 19.2 s worst
+case against a 0.7 ms median. So on this RDS Lustre, about one create in
+60-80 of a name that a rename has just freed blocks for 15-30 s. Rewriting in place never did.
+PolyChord's root writes its resume file every `update_files` (= nlive)
+dead points, and the root is the only rank that cannot stall without
+stopping everyone. Moving `chains/` to tmpfs (H19, H19b) removed every stall:
+idle 24-54% -> 0.2-0.4%, stall 27-113 s -> 0, in 2 of 2 arms against 4 of 4.
+
+**What this explains.** Round 211's 38-107 s GPU-arm "wedges", round
+214's finding that no worker was slow, and the 2-9 s stalls in rounds
+213-221's ledger rows. The rate scales with resume writes per second.
+Faster searches (gathering, nlive 48 short arms) write more often, so they
+hit more of them. A converged nlive 150 production search writes one
+every 150 dead points and loses less (rounds 213-215: 3.8-9.1 s per
+13-minute run, ~0.5-1%), but every faster search will lose more.
+
+**Not changed yet (next round).** The fix keeps PolyChord's base_dir on
+node-local tmpfs and mirrors `chains/` to the run directory from a
+separate process that never blocks the root: copy, then rename onto the
+Lustre target, after each `.resume` change, plus a blocking final sync
+before `summary.json`. `./ri resume` and every reader of `chains/` (merge,
+report, health, `dead_points_now`) must see the mirror, and a crash may
+lose at most the last checkpoint's mirror lag. That touches the shared run
+scripts, so it needs a raced WSClean A/B and `./ri self-check self-heal`
+(the kill-and-resume path). Also open: S32, P19 and H19 each had a 36-40 s
+gap right after the first wave of evaluations, which bench counts as
+start-up. H19 had it with chains on tmpfs, so it is something else
+(possibly another create on Lustre by the root). Sample `/proc/<root>/syscall`
+during it next time.
+
+Rows `r225-S19`, `r225-S32`, `r225-P19`, `r225-G19`, `r225-H19`, `r225-H19b`
+(plus the 357-evaluation zero-stub row) and stage row `r225-lustre-create`
+are in `benchmarks.jsonl`. All run directories and the probe worktree are
+deleted. The scripts are in `.probe/r225/`. GPU job 39497293 was still
+pending at the end of this round (`squeue`: Priority).
