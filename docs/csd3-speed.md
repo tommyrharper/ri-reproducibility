@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 189; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 190; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -19,7 +19,7 @@ the Hetzner host.
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), ORT 1.31.1 over 1.23.2 (180), malloc tuning and the ORT arena (164), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), ORT 1.31.1 over 1.23.2 (180), lower ORT graph optimisation levels (190), malloc tuning and the ORT arena (164), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -8940,3 +8940,29 @@ kill, with 6,077 evaluations and 500 dead points. Its log(Z) is
 No speed change and no `benchmarks.jsonl` row: the run was killed and
 retried on purpose, so its rate does not count. The run directory was
 deleted, and its `summary.json` is kept in `.probe/r189/`.
+
+## Round 190 (null): ONNX Runtime's graph optimisation level
+
+**Why.** Round 146's ORT profile put NCHWc reorders at 2.4% of a forward.
+The pool's sessions run at ORT's default level, `ORT_ENABLE_ALL`, which
+includes the NCHWc layout transformer. The question was whether, on a
+32x32 U-Net that is weight-bandwidth bound, the blocked layout pays for
+its reorders. It had not been measured.
+
+**Probe.** `.probe/r190/fork.py` is round 146's `fork.py` with a level
+per mode. It builds one N1 session per level in a parent with the pool's
+options (1 thread, no spinning, no arena), then forks P children pinned
+one per CPU. Each child times 100 forwards of 1x2x32x32, two passes:
+
+| level | P=4 (ms a forward) | P=38 (ms a forward) | max diff / peak |
+| --- | ---: | ---: | ---: |
+| `ORT_ENABLE_ALL` (shipped) | 17.60 / 17.67 | 24.49-24.53 (4 runs) | 0 |
+| `ORT_ENABLE_EXTENDED` | 19.01 / 19.01 | 26.54-26.76 (4 runs) | 6.6e-6 |
+| `ORT_ENABLE_BASIC` | 18.96 / 18.97 | - | 6.6e-6 |
+
+The default is **8% faster** than the levels without NCHWc at 38-way,
+and 7% faster at 4-way. The runs do not overlap. The reorders cost less
+than the blocked AVX-512 convolutions save. No change.
+
+Probe only. No searches were run, so there is no `benchmarks.jsonl`
+row. Scripts are in `.probe/r190/`.
