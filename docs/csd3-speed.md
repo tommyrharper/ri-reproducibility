@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 194; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 195; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -13,6 +13,9 @@ the Hetzner host.
   agreement ([round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree)).
   Rerun again on round 183's tree it takes **29 minutes (9.9x)**: 39.7
   evals/s and a 546 ms request against 825 ([round 184](#round-184-validation-the-22-sep-production-search-on-round-183s-tree-29-minutes)).
+  On half an icelake node (39 ranks) today's default converges in **23
+  minutes** at 48.1 evals/s, log(Z) 0.01733 +/- 0.00041, within 0.9 sigma of
+  22 Sep and round 115 ([round 195](#round-195-validation-the-22-sep-production-search-on-half-an-icelake-node-23-minutes)).
   Simulate (MeqTrees) went from 39% of worker time to 3.8%, idle from
   11.5% to 0.05%. A whole sapphire node (112 ranks x 1, one checkpoint
   copy per socket, rounds 105-106) runs 103.5 evals/s. The request is now
@@ -9003,3 +9006,52 @@ log(Z) x1e-3 (full values in `.probe/r194/*.summary.json`): A 16.89, 17.59,
 
 Rows: `r194-*` in `benchmarks.jsonl`. Script in `.probe/r194/ab.sh`. Run
 directories deleted.
+
+## Round 195 (validation): the 22 Sep production search on half an icelake node, 23 minutes
+
+**Question.** Round 184 reran the 22 Sep production search on round 183's
+tree, but lost its log(Z) with the job's `/dev/shm`. Since then a default
+run takes one rank more than its CPUs (186) and R2D2's `.mat` skips
+`savemat` (187). Does today's default still converge to the same log(Z),
+with full precision this time, and what does it take on the half icelake
+node this loop runs on?
+
+**Run.** Same command as rounds 115 and 184 (seed 190182240, nlive 150,
+15 repeats, async, to convergence) on `5723db6` with today's defaults:
+39 ranks x 1 thread on this job's 38 icelake CPUs (cpu-q-197), `onnx`,
+the same three SIF image ids. The other half of the node was loaded by
+other users' jobs (load 15-56). Row `r195-bigrun`. Script
+`.probe/r195/run.sh`.
+
+| | 22 Sep (24 sapphire) | round 115 (24 sapphire) | round 184 (24 sapphire) | round 195 (38 icelake) |
+| --- | ---: | ---: | ---: | ---: |
+| search wall to convergence | 17,331 s | 2,459 s | 1,749 s | **1,393 s (23 min)** |
+| evaluations | 71,395 | 65,420 | 69,478 | 66,973 |
+| evals/s | 4.12 | 26.6 | 39.7 | **48.1** |
+| evaluations per core-hour | 618 | 3,990 | 5,960 | 4,560 |
+| R2D2 request per evaluation | 2,868 ms | 825 ms | 546 ms | 744 ms |
+| simulate (MeqTrees) per evaluation | 1,936 ms (39.2%) | 32 ms (3.8%) | 29 ms (5.0%) | 35 ms (4.4%) |
+| idle fraction | 11.5% | 0.05% | 0.6% | 1.0% (end-of-run tail) |
+| dead points | 1,373 | 1,368 | (lost) | 1,472 |
+| log(Z) | 0.01722 ± 0.00042 | 0.01683 ± 0.00041 | ~0.01 (status line) | **0.017334457686004 ± 0.000411387** |
+
+**Result.** Today's default converges in 23 minutes on half an icelake
+node, at 48.1 evals/s. That matches the short-run rate of round 194
+(49.1 at nlive 100, 400 dead), so nothing in a long run costs more than
+the short A/Bs measure. log(Z) agrees with 22 Sep (0.19 sigma) and with
+round 115 (0.87 sigma). Async runs draw different points, so the
+log(Z)s are not expected to be identical. MeqTrees is 4.4% of worker
+time, against the 39% of the 22 Sep run. An icelake core does ~24% less
+per hour than a sapphire core (744 against 546 ms a request).
+
+**Learned.**
+- The half-node rate held for the whole run (36.7k evaluations in the
+  first 12.5 minutes, 67k in 23), unlike round 184's shared sapphire
+  job, which fell from ~50 to ~35 evals/s.
+- A whole run to convergence fits one iteration on this node (~24 min
+  plus ~40 s outside the search), so validating today's defaults
+  production-shaped needs no Slurm job.
+- `chains/r2d2_vlaa.stats` and `summary.json` are kept in `.probe/r195/`.
+  The run directory (9,596 files) was deleted.
+
+Rows: `r195-bigrun` in `benchmarks.jsonl` (commit 5723db6).
