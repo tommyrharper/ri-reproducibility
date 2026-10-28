@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 190; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 194; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -47,7 +47,7 @@ the Hetzner host.
   over torch ([round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40)).
   A default CPU run takes one rank more than its CPUs, because PolyChord's
   root never evaluates: 39 ranks on 38 CPUs won 5 of 5 pairs, **+3.7%**
-  ([round 186](#round-186-one-more-r2d2-rank-than-cpus-37)).
+  ([round 186](#round-186-one-more-r2d2-rank-than-cpus-37)); a second and third extra rank add nothing (round 194).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
@@ -8966,3 +8966,40 @@ than the blocked AVX-512 convolutions save. No change.
 
 Probe only. No searches were run, so there is no `benchmarks.jsonl`
 row. Scripts are in `.probe/r190/`.
+
+## Round 194 (null): two extra R2D2 ranks past the CPU count, and round 191 cancelled
+
+**Round 191 cancelled.** The two cclake jobs that were to measure R2D2
+evaluations per core-hour on Cascade Lake (39426905, whole node exclusive;
+39426997, one 28-core socket) were still pending after about two hours, over
+iterations 191-193. Both were cancelled, so cclake is still unmeasured.
+
+**Why.** Round 186 gave a 38-CPU job 39 ranks so the root's CPU got a worker,
+and noted ~0.85 CPU idle beforehand. The question was whether workers still
+wait on I/O or the rank round trip, which would let a 40th and 41st worker use
+time the CPUs do not fill.
+
+**A/B.** Half icelake node (cpu-q-197), nlive 100, 5 repeats, 400 dead, seed
+4242, onnx, async, commit 0f5751c, run back to back with alternating order.
+A = default (39 ranks), B = `NS_MPI_PROCS=41`:
+
+| pass | A evals/s | B evals/s | A ms/eval | B ms/eval |
+| --- | ---: | ---: | ---: | ---: |
+| 1 (A B) | 37.34 (cold) | 47.59 | 1005 | 821 |
+| 2 (B A) | 48.32 | 50.96 | 774 | 770 |
+| 3 (A B) | 50.50 | 49.35 | 739 | 796 |
+| 4 (B A) | 48.56 | 47.26 | 761 | 829 |
+| mean, passes 2-4 | 49.13 | 49.19 | 758 | 798 |
+
+A1 was the node's first search of the session (cold page cache); it is the
+only outlier, so the means leave pass 1 out. With 40 workers on 38 CPUs the
+time per evaluation rises by ~5%, matching 40/38, and cancels the extra
+worker. The job is CPU-bound at 39 ranks (idle fraction 0.03-0.08% in both
+arms), so round 186's +1 is the right count. No change.
+
+log(Z) x1e-3 (full values in `.probe/r194/*.summary.json`): A 16.89, 17.59,
+17.18, 17.36 (errors 0.75-0.94); B 17.47, 16.79, 17.01, 16.37 (errors
+0.78-1.09). All agree with each other and with round 186's 17.0-17.7.
+
+Rows: `r194-*` in `benchmarks.jsonl`. Script in `.probe/r194/ab.sh`. Run
+directories deleted.

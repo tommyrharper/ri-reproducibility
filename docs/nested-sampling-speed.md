@@ -187,6 +187,7 @@ Cumulative. Rounds 1-32 first, then this round.
 | (null) PolyChord's root wait and stale async chains | none | an oversubscribed `mpirun` already yields the root's CPU (`mpi_yield_when_idle`, 87% of its wait in `sched_yield`); mean evaluations at nlive 200 / 1000 dead fall from 17.7k at 38 ranks to 15.9k at 112, so stale chains cost nothing ([round 188](csd3-speed.md)) |
 | (check) Self-heal and an R2D2 rank kill after rounds 154-188 | none | `./ri self-check self-heal` passes every scenario in ~2.5 min. A default R2D2 search (39 ranks on 38 CPUs) with one rank `kill -9`'d retried on the same oversubscribed command and converged, log(Z) 0.0176 ± 0.0008, agreeing with round 186 ([round 189](csd3-speed.md)) |
 | (null) ONNX Runtime's graph optimisation level | none | the shipped `ORT_ENABLE_ALL` (NCHWc) is 8% faster a forward than `EXTENDED` or `BASIC` with 38 forked workers (24.5 against 26.6 ms) and 7% faster at 4; its reorders pay for themselves ([round 190](csd3-speed.md)) |
+| (null) two extra R2D2 ranks past the CPU count | none | 41 ranks on 38 CPUs run 49.2 evals/s against 49.1 for the default 39 (3 warm pairs); time per evaluation rises by 40/38 and cancels the extra worker, so the job is CPU-bound at 39 ([round 194](csd3-speed.md)) |
 | cfitsio and casacore init moved to the zygote parent | `zygote.cpp` | -2.39 ms/eval ([warm-up](nested-sampling-process-warm-up.md)) |
 
 ### Round 33: R2D2
