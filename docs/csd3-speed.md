@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 172; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 173; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converges in **41 minutes
@@ -63,6 +63,9 @@ the Hetzner host.
   Wired in as opt-in `R2D2_RUNTIME=trt` it gave +4% (round 171), inside
   the +/-10% run noise; 13-14 ranks or 1-2 threads a rank add nothing,
   since 12 TensorRT workers already saturate the card ([round 172](#round-172-negative-more-tensorrt-ranks-per-a100-or-fewer-cpu-threads-each-gain-nothing)).
+  Run 4x longer (600 dead points) it gives +7% evals/s and -48% request
+  time, still inside the noise over 6 pairs (TensorRT ahead in 4), so the GPU
+  default stays torch ([round 173](#round-173-null-tensorrt-against-eager-at-600-dead-points-and-onnx-against-torch-on-cpu-rechecked)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -8095,3 +8098,74 @@ Every log(Z) is 0.013-0.018 (+/- 0.002-0.004), in agreement.
   and SIF reads), so a warm-up arm is required.
 
 Rows: `r172-*` in `benchmarks.jsonl`. Run directories deleted.
+
+## Round 173 (null): TensorRT against eager at 600 dead points, and onnx against torch on CPU, rechecked
+
+**Question.** Rounds 171-172 put TensorRT's end-to-end gain (+4%) inside
+the +/-10% noise of a 150-dead-point GPU search. Does a 4x longer search
+settle it? And round 171 left a single CPU sample (cpu-q-119) in which torch
+ran a request faster than onnx. Does that hold up?
+
+**GPU run.** Job 39398852, gpu-q-25, 1 x A100-SXM4-80GB, 32 CPUs, MPS.
+`./ri search r2d2 --device cuda --nlive 48 --num-repeats 5 --max-ndead 600
+--seed 4242`, with E (`R2D2_RUNTIME=torch`, 19 ranks) and T (`trt`, 12 ranks)
+in ABBA order (T E E T T E), after a TensorRT warm-up arm (46.8 evals/s).
+No evaluation failed.
+
+| arm | evals | sampling wall, s | evals/s | request, ms | simulate, ms | GPU peak | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| T1 | 8,044 | 131 | 61.3 | 143 | 29 | 64.7 GB | 0.01889 +/- 0.00064 |
+| E1 | 11,051 | 189 | 58.6 | 272 | 29 | 67.9 GB | 0.01869 +/- 0.00058 |
+| E2 | 9,385 | 150 | 62.7 | 248 | 31 | 67.9 GB | 0.01911 +/- 0.00063 |
+| T2 | 9,911 | 170 | 58.2 | 150 | 32 | 64.7 GB | 0.01894 +/- 0.00064 |
+| T3 | 9,412 | 146 | 64.3 | 135 | 29 | 64.7 GB | 0.01790 +/- 0.00102 |
+| E3 | 9,175 | 181 | 50.8 | 299 | 47 | 67.9 GB | 0.01902 +/- 0.00061 |
+
+Means: T 61.3, E 57.4 evals/s (+7%). Sampling wall to 600 dead points:
+T 149 s, E 173 s (-14%). A request: T 143 ms, E 273 ms (-48%). The
+evals/s ranges overlap (58.2-64.3 against 50.8-62.7), and the evaluation
+count at one seed varies by 37% (8,044-11,051). Every log(Z) agrees within
+about 1 sigma.
+
+**CPU run.** On this job's 38 icelake CPUs (cpu-q-119), two 19 x 1 searches
+were raced on disjoint halves of the allocation (`taskset`), onnx against
+torch, and the halves swapped for the second pass.
+`--nlive 48 --num-repeats 5 --max-ndead 100 --seed 4242`.
+
+| pass | onnx evals/s | torch evals/s | onnx request, ms | torch request, ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 19.1 | 15.8 | 855 | 1,060 |
+| 2 | 19.7 | 15.9 | 832 | 1,046 |
+
+onnx is +22% evals/s and -20% a request, and log(Z) agrees
+(0.0132-0.0142 +/- 0.005). Round 171's torch sample was a fluke, and
+the CPU default stays onnx.
+
+**Learned.**
+- TensorRT is ahead in 4 of 6 interleaved pairs over rounds 171 and 173
+  (+4% and +7% evals/s). Its request time is halved, but the search gains
+  single digits because only 12 ranks fit against eager's 19. At this run
+  length the gain still cannot be told apart from noise, so `trt` stays
+  opt-in. Its first-use cost (a 2.6 GB pip install and ~5 minutes of plan
+  builds) is also not worth making a default for a gain this small.
+- At 600 dead points a GPU search runs ~60 evals/s against round 172's
+  ~45 at 150, on both engines. The short runs were dominated by ramp-up
+  (or gpu-q-25 is a faster node), so short GPU rows understate the rate
+  a long search reaches, and they are comparable only within one job.
+- Evaluations per dead point vary by over a third at one seed (8.0k-11.1k
+  for 600 dead points), since asynchronous ranks change the stream. That
+  noise is larger than the engine effect, so a search's evals/s, not its
+  wall time, is the metric to compare. A wall-time comparison needs many
+  more pairs.
+- cpu-q-119 ran at normal speed this time (simulate 49-52 ms, against
+  round 171's ~155 ms there), so round 171's slowness was transient load,
+  not the node.
+- Sharp edge: two concurrent probes that both used `r173-T1`-style names
+  under `results/nested-sampling` collided, because the GPU job and this
+  node share the RDS working tree, and the GPU arm's `rm -rf` deleted the
+  CPU run's directory. The benchmark rows had already been written. Give
+  each concurrent job a distinct run-name prefix.
+- No code changed, so no WSClean A/B.
+
+Rows: `r173-warm`, `r173-T1`..`r173-E3` (GPU), `r173-cpu-onnx-*` and
+`r173-cpu-torch-*` (CPU) in `benchmarks.jsonl`. Run directories deleted.
