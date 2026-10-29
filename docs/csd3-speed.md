@@ -12416,3 +12416,34 @@ Rows `r253-*`, stage row `r253-root-rank-extra`, script `.probe/r253/ab.sh`.
   no WSClean guard was needed. CI's shellcheck 0.9.0 is clean,
   `scripts/test_self_checks.py` passes 30 of 30 host checks, and
   `slurm.sh --self-check` passes. The `r253-*` run dirs are deleted.
+
+## Round 254 (diagnostic, validation pending): ampere is booked to 31 Oct; a whole-sapphire check of today's defaults is queued
+
+**GPU race.** Round 243's 1-GPU job 39544674 had still not started after
+3h15m. `sbatch --test-only .probe/r243/ab.sh` (one Slurm call) estimates a
+start of **2026-10-31 07:07** (gpu-q-18). A second probe with `-t 00:40:00
+--cpus-per-task=16` gave 2026-10-31 07:10 (gpu-q-2) and still 32 CPUs:
+CSD3 gives a 1-GPU ampere job 32 cores whatever it asks for, and a shorter
+limit does not backfill it. So the delay is the partition, not the shape. The
+job stays queued (resubmitting would only lose its place). Round 243's
+rank-count change and the `NS_R2D2_CUDA_MAX_RANKS` question wait until
+`.probe/r243/ab-39544674.out` exists, after 31 Oct 07:00.
+
+**Sapphire check (pending).** `sbatch --test-only` for an exclusive sapphire
+node estimated a start ~80 minutes out, so the whole-node validation that
+rounds 150-253 never had is queued as job 39560906. It is round 239's
+production command (seed 190182240, nlive 150, 15 repeats, async, to
+convergence), submitted through `ns_submit_run` with no `--mpi-procs`, so a
+user's default whole-node shape is used: `--exclusive`, ranks = CPUs + 1,
+and per-socket ORT sessions (`.probe/r254/submit.sh`, run dir
+`results/nested-sampling/r254-sapphire`). The baselines are round 150's
+117 evals/s (short search, 112 ranks, before the root rank, stall and
+root-block fixes of rounds 186, 227 and 232) and round 252's 58.8 steady
+evals/s on 38 split icelake CPUs. A later round reads the job's
+`summary.json` and bench row, copies log(Z) at full precision, and deletes
+the run dir.
+
+**Slurm hygiene.** The `--test-only` probes and the submission were three
+calls in ~3 minutes. The last came 22 s after the one before it, which breaks
+the two-minute rule: leave the full gap even for `--test-only`. Two jobs of
+this account are pending (39544674 and 39560906), the limit.
