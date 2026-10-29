@@ -197,6 +197,23 @@ def start_gaps(records: Any) -> tuple[float, float, float] | None:
     return startup, stall, max(end for _, end in timed) - timed[0][0]
 
 
+def first_request(records: Any) -> float | None:
+    """Median seconds of the evaluations started within 1s of the first.
+
+    When every rank starts together and a cold first request is shorter than
+    start_gaps()'s bound (an async whole node: 112 first requests of 5-8s
+    against 0.7s warm), no start-to-start gap opens and startup_s reads 0.0,
+    so this is the start-up figure there (docs/csd3-speed.md, round 259).
+    """
+    starts = [(float(t["started_epoch"]), float(t["ended_epoch"]))
+              for t in ((record.get("timing") or {}) for record in records)
+              if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    if not starts:
+        return None
+    first = min(start for start, _ in starts)
+    return statistics.median(end - start for start, end in starts if start - first < 1.0)
+
+
 def row_for(run_dir: Path) -> dict[str, Any] | None:
     """One ledger row for a finished run, or None with a reason on stderr.
 
@@ -241,6 +258,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     )
     gaps = start_gaps(summary.get("evaluations", []))
     steady = gaps and gaps[2] - gaps[0] - gaps[1]
+    first = first_request(summary.get("evaluations", []))
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -262,6 +280,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
         "startup_s": round(gaps[0], 1) if gaps else None,
         "stall_s": round(gaps[1], 1) if gaps else None,
+        "first_request_s": round(first, 2) if first is not None else None,
         "steady_evals_per_s": round(evals / steady, 4) if steady and steady > 0 else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
@@ -522,6 +541,7 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                        for new, old in zip(labels, labels[1:])])
     row_for_path("steady evals/s", ("steady_evals_per_s",))
     row_for_path("stall s", ("stall_s",))
+    row_for_path("first request s", ("first_request_s",))
     row_for_path("ms/eval", ("ms_per_eval",))
     row_for_path("busy wall s", ("busy_wall_s",))
     row_for_path("idle fraction", ("idle_fraction",))
@@ -658,6 +678,11 @@ def self_check() -> None:
     assert start_gaps([{"timing": {"started_epoch": 0.0, "ended_epoch": 1.0}},
                        {"timing": {"started_epoch": 0.5, "ended_epoch": 1.5}}]) == (0.0, 0.0, 1.5)
     assert start_gaps([{"timing": {}}]) is None
+    # All ranks' cold first requests together: no gap, but the first wave is slow.
+    wave = [{"timing": {"started_epoch": 0.1 * n, "ended_epoch": 6.0 + 0.1 * n}} for n in range(5)]
+    wave += [{"timing": {"started_epoch": 6.0 + 0.1 * n, "ended_epoch": 6.7 + 0.1 * n}} for n in range(20)]
+    assert start_gaps(wave)[0] == 0.0 and first_request(wave) == 6.0, first_request(wave)
+    assert first_request([{"timing": {}}]) is None
 
     import tempfile
 

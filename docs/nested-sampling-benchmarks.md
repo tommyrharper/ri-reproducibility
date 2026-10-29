@@ -99,6 +99,11 @@ max(2s, 10x the median evaluation), such as a meqserver wedge sitting out
 its retry ladder). On a 3-minute GPU arm those two can be 25-105s and halve
 the headline rate, so compare short arms on the steady rate
 ([CSD3 speed](csd3-speed.md), round 211).
+`startup_s` only sees start-up that opens a gap, so it reads 0.0 when every
+rank starts at once and the cold first requests are under that bound (an async
+whole node: 5-8s against 0.7s warm). `first_request_s`, the median duration of
+the evaluations started within 1s of the first, is the start-up figure there
+([CSD3 speed](csd3-speed.md), rounds 259-260).
 
 Rows are grouped by **machine, imager and settings**, and only rows in one
 group are ever compared. The machine id is derived from `/etc/machine-id` (the

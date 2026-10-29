@@ -12768,3 +12768,36 @@ No code change. Rows: stage row `r259-spr-layout` (arm means, the first
 request timings and full-precision log(Z)) in `benchmarks.jsonl`, plus the
 job's own `r257-*` bench rows. Run dirs deleted. The job script, output and
 arm logs are in `.probe/r257/`.
+
+## Round 260 (tooling; sapphire A/B pending): `first_request_s` in every ledger row, and a record-writer A/B queued
+
+**Why.** Round 259 found `startup_s` reads 0.0 in async whole-node runs:
+all 112 ranks start their first evaluation together, and a 5-8 s cold first
+request is shorter than `start_gaps()`'s bound (10x the median evaluation),
+so no start-to-start gap opens. Round 259 had to dig the first-request time
+out of `summary.json` by hand.
+
+**Change** (`scripts/bench.py`). Each row gains `first_request_s`: the median
+duration of the evaluations that start within 1 s of the first. `./ri bench`
+shows it as "first request s". `startup_s`, `stall_s` and
+`steady_evals_per_s` are unchanged, so older rows still compare. The
+self-check gains a synthetic wave (5 first requests of 6.0 s, then 0.7 s
+evaluations): `startup_s` 0.0, `first_request_s` 6.0. A tiny real search on
+this half icelake node (`--nlive 100 --max-ndead 60 --seed 196`, 222
+evaluations, log(Z) 0.0101886951976723 +/- 0.00726) recorded
+`startup_s` 0.0 and `first_request_s` 4.17 against a 1.33 s mean evaluation.
+Its run dir is deleted.
+
+**Pending: does the record writer cost throughput on a whole node?** Round
+259's post-run lines show that at 113 ranks every rank's record writer is busy
+for the whole search. The flat writer spent 8,774-11,635 writer-seconds over
+113 ranks in ~87-90 s searches (~0.8 s a Lustre create), and 10,075-13,635
+records went out coalesced. At 57 ranks it spent 534-542 writer-seconds with 2-8
+coalesced. On half icelake, append (one held fd, no creates) gained nothing
+(rounds 240-241), but there the writers had slack. Exclusive sapphire job
+39567902 (`.probe/r260/job.sh`) runs round 259's arms, interleaved W0 A1 B1
+B2 A2 A3 B3 (113 x 1, nlive 200, 5 repeats, 1000 dead, seed 4242). A is the
+default writer, B is `NS_RECORD_APPEND=1`. Read `.probe/r260/job-39567902.out`
+and the `r260-*` dirs in a later round, record the evals/s, steady evals/s,
+`first_request_s` and full-precision log(Z), then delete the dirs.
+
