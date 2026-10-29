@@ -12179,7 +12179,8 @@ values are in the stage row.
   (R2D2 nlike 8,630/8,021 against 9,000/10,155). This is not explained.
   Synchronous runs are identical, and the record path returns before
   PolyChord sees anything, so it is most likely async scheduling noise (a
-  1-in-16 sign run). A converged production pair would settle it.
+  1-in-16 sign run). Round 248 settled it: two more pairs split the other
+  way, so it was noise.
 
 **Decision.** Coalescing is the default. It closes most of the durability gap
 that rounds 244-245 left to `NS_RECORD_APPEND=1`, at no measured speed cost.
@@ -12191,3 +12192,48 @@ bench rows `r247-coal1/2`, `r247-flat1/2`, `r247-scoal3/4`, `r247-sflat3/4`,
 `r247-wcoal1/2`, `r247-wflat1/2` are in `benchmarks.jsonl`. Run directories
 are deleted. Scripts, samples and gzipped logs are in `.probe/r247/`. The
 round 243 GPU race (job 39544674) still had no output at ~04:25.
+
+## Round 248 (check): the coalescing writer's fewer evaluations were async noise
+
+**Question.** Round 247's coalescing arms scored fewer evaluations than the
+flat-writer arms in all four async pairs (R2D2 nlike 8,630/8,021 against
+9,000/10,155). Does the writer change what PolyChord does, or was it noise?
+The round 243 GPU race (job 39544674) still had not started, so this was the
+lever left on this node.
+
+**Method.** Round 247's race (`.probe/r248/race.sh`, the same script
+relabelled): async R2D2, seed 242, `--nlive 48 --num-repeats 5 --max-ndead
+600 --mpi-procs 20`, the default (coalescing) writer raced against
+`NS_RECORD_COALESCE=0` on the two CPU halves, swapped between pairs, with
+round 244's on-disk sampler every 10 s. RDS was quiet: the slowest
+`evaluations/` listing took 2.2 s. No code changed.
+
+| pair | arm | CPUs | evals | nlike | ndead | steady evals/s | most behind mid-run | writer record-s, all ranks | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 3 | coalesce | 0-36 | 9,114 | **8,894** | 505 | 25.50 | **18** | 2,143 (1,187 coalesced) | 0.0164846043164777 +/- 0.000752693229578682 |
+| 3 | flat | 38-74 | 7,769 | 7,576 | 506 | 22.34 | 136 | 2,769 | 0.0167907852843659 +/- 0.000753398519439781 |
+| 4 | coalesce | 38-74 | 10,654 | **10,372** | 540 | 23.97 | **18** | 2,494 (1,515 coalesced) | 0.0166996149713455 +/- 0.000731411426587789 |
+| 4 | flat | 0-36 | 9,635 | 9,380 | 510 | 25.35 | 211 | 4,178 | 0.0164839594724794 +/- 0.000733945161498962 |
+
+**Results.**
+- This time the coalescing arm scored *more* evaluations in both pairs
+  (+17% and +11% nlike). Across rounds 247-248 the R2D2 pairs split 2-2, so
+  the round 247 deficit was async scheduling noise. Async nlike for this
+  shape spreads 7,576-10,574 between arms with the same seed, whatever the
+  writer.
+- The durability result holds: the coalescing writer was at most 18 records
+  behind, against 136-211 for flat files, and it spent 10-40% less writer
+  time. Both archives were complete at the end (no records behind).
+- Speed: coalesce/flat steady evals/s was 1.142 and 0.946. With round 247's
+  0.949 and 1.048, the four-pair geometric mean is **+1.8%**, inside the
+  noise. The CPU-half effect flipped this round (CPUs 0-36 won pair 3 by 14%),
+  which fits it being load from the node's other tenants and not the
+  hardware.
+- log(Z) agrees within 0.3 sigma in both pairs.
+
+**Decision.** No change. Coalescing stays the default with no open question.
+Stage row `r248-coalesce-recheck` and bench rows `r248-coal1/2`,
+`r248-flat1/2` are in `benchmarks.jsonl`. Run directories are deleted.
+Scripts, samples and gzipped logs are in `.probe/r248/`. The round 243 GPU
+race (job 39544674, output `.probe/r243/ab-39544674.out`) still had no
+output at ~04:45.
