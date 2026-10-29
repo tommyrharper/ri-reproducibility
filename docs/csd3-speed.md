@@ -5,12 +5,49 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 266; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 304; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
+- **Rounds 266-303 in brief.** The 22 Sep production search, run to
+  convergence as its own 1-node icelake job on round 299's tree, gives
+  log(Z) 0.0172602 +/- 0.00040 (within 0.25 sigma of rounds 239 and 278)
+  at **60.2 evals/s (62.8 steady)** in 21 minutes
+  ([round 302](#round-302-validation-rounds-287-299-in-the-production-search-logz-agrees-602-evalss)).
+  That beats round 205's "~53 evals/s ceiling" with no change to the
+  U-Net path: the request fell from 763 to 598 ms because the node was
+  nearly idle. The ~53 was a busy-node estimate, not a hard limit, so
+  absolute evals/s across nodes says nothing about a change; only raced
+  A/Bs do. Simulate (MeqTrees) is 29 ms of a ~630 ms evaluation (~5%).
+  - **Multi-node** is the lever left for wall time on CPU.
+    `./ri search r2d2 --nodes N` runs one search over N nodes, with one pool
+    set, scratch and record pack per node. Two icelake nodes converge
+    round 278's search in 790 s against 1,586 s (99.1 evals/s, 94% per
+    node), with log(Z) agreeing
+    ([round 288](#round-288-measurement-two-nodes-run-a-converged-r2d2-search-in-half-the-time)).
+    PolyChord needs ~0.4 x workers/nlive more evaluations to converge, so
+    raise `--nlive` with `--nodes` (a launch warns below 4 x workers)
+    ([round 293](#round-293-measurement-more-ranks-per-live-point-cost-polychord-evaluations-4-node-scaling-corrected)).
+    A resumed multi-node search used to deadlock (fixed, round 289).
+    Node packs (round 290) and batched appends, the default since
+    [round 298](#round-298-default-batched-record-appends-the-scratch-fix-proven-end-to-end),
+    mean a 2-node kill -9 loses no records, and a resume in the same job
+    survives the killed attempt's `/dev/shm` scratch.
+  - **Start-up.** The pool's 1-thread ORT sessions are built over the
+    shared weight arrays (round 274). Round 273 had found that
+    multi-thread requests silently ran torch; with that fixed, 39 x 1
+    still beats 20 x 2 by ~15% (round 276). A fresh node costs ~25-30 s
+    once per job (cold page cache for the weights, not the SIFs), and
+    reading the SIFs first does not help
+    ([round 303](#round-303-negative-a-fresh-nodes-slow-start-is-not-the-sifs-so-reading-them-first-does-not-help)).
+  - **Resume and finish** scale to large runs: rank 0 alone reads the
+    records and broadcasts them (all-rank RSS at 67k records 42 GB down
+    to 3 GB, round 267), and the packed records are parsed off the read
+    pool (-27% on a production-sized adoption, round 268).
+  - **GPU.** Round 299's converged gathered-batch TensorRT pair is still
+    queued (job 39654485, on a frozen worktree).
 - **Rounds 216-265 in brief.** The CPU R2D2 forward is at the hardware
   wall: a half-icelake search draws ~90-96% of its socket's measured
-  DRAM read bandwidth for U-Net weights alone, so ~53 evals/s is the
-  one-socket ceiling ([round 205](#round-205-diagnostic-the-r2d2-cpu-search-is-at-the-sockets-dram-bandwidth)).
+  DRAM read bandwidth for U-Net weights alone, so ~53 evals/s looked like
+  the one-socket ceiling on a busy node; round 302 ran 60 on a quiet one ([round 205](#round-205-diagnostic-the-r2d2-cpu-search-is-at-the-sockets-dram-bandwidth)).
   The weights cannot shrink without changing results ([round 206](#round-206-diagnostic-the-u-net-weights-cannot-be-shrunk-losslessly)),
   and batching through ORT loses at a fixed CPU count ([round 265](#round-265-diagnostic-batched-onnx-runtime-forwards-are-bit-identical-but-lose-at-a-fixed-cpu-count)).
   What still paid came from layout and from the filesystem:
@@ -14667,3 +14704,17 @@ which runs on a frozen worktree of `dffbf8d`
 Its output goes to `.probe/r303/ab-39654485.out`, and its bench rows go to
 `.probe/r303/bench-rows.jsonl`. Remove the frozen worktree
 (`git worktree remove ../frozen-r303`) once that file shows DONE.
+
+## Round 304 (docs only): "Where it stands" brought up to round 303
+
+The status block at the top of this file still described round 266, and it
+still called round 205's ~53 evals/s the one-socket ceiling, which round
+302's 60.2 evals/s on a quiet node disproved. The block now opens with a
+summary of rounds 266-303: the round 302 validation, multi-node search and
+its rules (rounds 288, 289, 290, 293, 298), the start-up findings (rounds
+273, 274, 276, 303), the faster resume and finish (rounds 267, 268), and
+the pending GPU pair. The ceiling line says it was a busy-node estimate.
+Every anchor in the block was checked against this file's headings. No code
+changed, no search ran, and there is no `benchmarks.jsonl` row. The GPU
+pair (job 39654485, `.probe/r303/ab.sh`) still has no output file at 19:45
+on 29 Oct.
