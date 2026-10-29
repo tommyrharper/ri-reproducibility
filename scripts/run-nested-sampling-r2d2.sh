@@ -189,11 +189,13 @@ if [ "${NS_NODES}" -gt 1 ] && [ "${NS_NODE_ROLE:-}" != pools ]; then
   ns_node_hosts="$(ns_expand_hostlist "${SLURM_JOB_NODELIST}" "${NS_NODES}")"
   # A worker slices inside the contour it was handed, which has risen by the
   # time it returns, so each dead point compresses less: a converged PolyChord
-  # run needs ~0.4 x workers/nlive more evaluations (round 293, toy likelihood;
-  # 4 nodes at nlive 300 is +22%). evals/s still scales; time-to-answer less.
+  # run costs about as many evaluations as one with ~0.4 x workers more live
+  # points, whatever nlive is (round 307: fits round 293's toy within 2% and
+  # R2D2's 112-worker search within 1%). A bigger --nlive dilutes the share but
+  # adds more evaluations than it saves, so it buys precision, never speed.
   ns_workers=$((NS_NODES * NS_MPI_PROCS - 1))
   if [ "$((ns_workers * 4))" -gt "${NS_NLIVE}" ]; then
-    echo "WARNING: ${ns_workers} workers against --nlive ${NS_NLIVE}: PolyChord will need ~$((ns_workers * 40 / NS_NLIVE))% more evaluations to converge; --nlive $((ns_workers * 4)) or more keeps that under ~10% (docs/cluster.md)" >&2
+    echo "WARNING: ${ns_workers} workers against --nlive ${NS_NLIVE}: PolyChord will need ~$((ns_workers * 40 / NS_NLIVE))% more evaluations to converge than with few workers; a larger --nlive does not remove that cost (it adds evaluations), so raise it only for precision (docs/cluster.md)" >&2
   fi
 fi
 # mpirun counts one slot per CPU and refuses -np past it.

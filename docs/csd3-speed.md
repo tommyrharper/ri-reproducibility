@@ -14772,3 +14772,62 @@ adds only that key, and `./ri bench` now prints those cells with
 `nodes=2` or `nodes=4`. `docs/nested-sampling-benchmarks.md` notes the key.
 No search ran and the run scripts did not change, so no WSClean guard was
 needed.
+
+## Round 307 (analysis, guidance fix): the async overhead is a fixed ~0.4 x workers live points, so a bigger nlive never buys speed
+
+**Question.** Round 293 measured that a converged async search with more
+workers needs more evaluations, ~0.4 x workers/nlive more, and its launcher
+warning and `docs/cluster.md` advised raising `--nlive` with `--nodes` to keep
+that "under ~10%". Does raising nlive reduce the cost, or only its share?
+
+**Method.** No search ran. A least-squares fit of
+`nlike = k x nlive + c x workers` to round 293's twelve converged toy runs
+(nlive 300 and 1200; 8, 38, 77 and 157 ranks), then the same model against
+R2D2's converged production search (seed 190182240, nlive 150, 15 repeats):
+seven 38-rank runs (rounds 230, 231, 233, 239, 252, 278, 302: nlike 68,540 to
+80,834, mean 73,773, sd 4,101) and round 255's whole sapphire node (112
+workers, nlike 87,360).
+
+**Results.**
+- Toy: k = 1021 evaluations per live point, c = 417 per worker, so
+  c/k = 0.41. Every one of the twelve runs is within 2.1% of the fit, both
+  nlive values included. The extra evaluations are a fixed ~0.41 x workers
+  live points' worth, independent of nlive: at 157 ranks, nlive 300 costs
+  ~62k more evaluations than at 8 ranks, and nlive 1200 ~50k more for 119
+  more workers, the same per worker.
+- R2D2: k = 444 from the 38-rank mean predicts 88,219 for 112 workers;
+  round 255 measured 87,360 (-1.0%, inside the 38-rank runs' 5.6% sd). The
+  toy's coefficient carries over to the real likelihood.
+- So the converged cost is `k x (nlive + 0.41 x workers)` and the time to
+  converge goes as `nlive/workers + 0.41` at a fixed per-worker rate. Raising
+  nlive from 300 to 620 for 155 workers (round 293's advice) costs ~88% more
+  evaluations to remove a 21% share. A bigger nlive buys precision and never
+  wall time. The overhead puts a floor under wall time: workers beyond a few
+  times nlive add little.
+
+Speedup over one node of 39 ranks, from the fit alone (time to converge;
+real runs also lose round 288/292's 5-11% per-node rate):
+
+| nlive | 2 nodes | 4 nodes | 8 nodes |
+| ---: | ---: | ---: | ---: |
+| 150 | 1.85x | 3.16x | 4.88x |
+| 300 | 1.93x | 3.54x | 6.04x |
+| 600 | 1.98x | 3.78x | 6.93x |
+
+Round 288's converged 2-node pair (nlive 300, 1,586 to 790 s, 2.01x) is
+above the 1.93 x 0.94 the fit predicts, but its 1-node arm ran on a busier
+node, so it does not contradict the fit.
+
+Not settled: whether the extra dead points also buy precision. Round 255's
+log(Z) error (0.000371) is ~9% below the 38-rank runs' 0.000401-0.000411,
+which matches an effective nlive of ~180. The toy's errors did not move
+(0.131-0.136 at 8 and 157 ranks), so one R2D2 run cannot decide it.
+
+**Change.** The multi-node warning in `run-nested-sampling-r2d2.sh` keeps its
+threshold (workers x 4 > nlive) and its estimate. It no longer suggests a
+larger nlive: it says a larger `--nlive` adds evaluations and is for
+precision only. `docs/cluster.md` gives the time-to-converge rule and the
+table above instead of "at least 4x the total ranks". The message text is all
+that changed. Single-node launches never reach it, so no WSClean guard was
+needed. shellcheck 0.9.0.6 is clean. Row: stage `r307-async-overhead-fit` in
+`benchmarks.jsonl`.

@@ -187,9 +187,15 @@ retry and resume deadlocked). Each node appends its records to its own
 (`NS_RECORD_BATCH=1`), so a kill -9 on 2 nodes at 3,000 scored evaluations lost
 no record, and a same-job `./ri resume` clears the killed attempt's `/dev/shm`
 scratch on every node first (rounds 297-298). More nodes buy evaluations/s (4 nodes:
-3.57x one), but PolyChord spends ~0.4 x workers/nlive more of them to
-converge, so raise `--nlive` with `--nodes`: at least 4x the total ranks keeps
-the overhead under ~10%, and the launcher warns below that (round 293).
+3.57x one), but an async PolyChord search converges on about as many
+evaluations as one with ~0.4 x workers more live points, whatever `--nlive`
+is (rounds 293 and 307). Time to converge therefore goes as
+`nlive/workers + 0.4`, and extra nodes stop paying once workers pass a few
+times nlive: at nlive 150, 2, 4 and 8 nodes of 39 ranks converge ~1.85x,
+~3.2x and ~4.9x faster than one, and at nlive 300 ~1.9x, ~3.5x and ~6x
+(before the ~5-10% per-node rate loss). A larger `--nlive` does not remove the
+extra evaluations: it adds more than it saves, so raise it for precision,
+never for speed. The launcher warns when the extra share passes ~10%.
 
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit
