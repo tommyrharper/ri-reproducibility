@@ -1689,6 +1689,13 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     for future in _RECORD_WRITES:
         if future.kind == "record":
             future.cancel()
+    # And a queued publish of a held extreme goes back to being held, so that
+    # the keep-filtered flush below drops it in tmpfs unless the run keeps it.
+    for name in list(_PUBLISHING):
+        cancelled = _cancel_held_publish(name)
+        if cancelled is not None:
+            _HELD[name] = cancelled
+    _PUBLISHING.clear()
     _RECORD_WRITES[:] = [future for future in _RECORD_WRITES if not future.cancelled()]
     drain_record_writes(flush_held=False)
     backlog = (queued, time.monotonic() - started, dict(_WRITER_SECONDS))
@@ -1756,8 +1763,11 @@ def post_run_line() -> str:
             backlog.pop("writer_max_s"), backlog.pop("queued_max"))
         line += "".join(f", {kind} {count:.0f}" for kind, count in backlog.items()
                         if not kind.endswith("_s"))
+        cancelled = backlog.pop("cancelled_held_s", None)
         line += "; writer seconds, all ranks: " + ", ".join(
             f"{kind[:-2]} {spent:.0f}" for kind, spent in backlog.items() if kind.endswith("_s"))
+        if cancelled is not None:
+            line += f"; held publishes cancelled {cancelled:.0f}"
     return line
 
 
@@ -2655,13 +2665,14 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     return record
 
 
-def _submit_record_job(job: Any, kind: str = "record") -> None:
+def _submit_record_job(job: Any, kind: str = "record") -> Any:
     for done in [future for future in _RECORD_WRITES if future.done()]:
         _RECORD_WRITES.remove(done)
         done.result()  # a failed write raises here, on the rank's own thread
     future = _RECORD_WRITER.submit(_timed_record_job, job, kind)
     future.kind = kind
     _RECORD_WRITES.append(future)
+    return future
 
 
 def _timed_record_job(job: Any, kind: str) -> None:
@@ -2683,7 +2694,8 @@ _RECORD_WRITER: Any = None
 _RECORD_WRITES: list[Any] = []
 # Every record this process wrote, by eval dir, for finished_run_records().
 _WRITTEN_RECORDS: dict[str, str] = {}
-# Seconds this rank's writer spent on each kind of job, for post_run_line().
+# Seconds this rank's writer spent on each kind of job, for post_run_line(),
+# and as cancelled_held a count: the held publishes it was spared (round 235).
 _WRITER_SECONDS: dict[str, float] = {}
 
 
@@ -2793,6 +2805,10 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
     for name in evicted:
         if name in _HELD:
             shutil.rmtree(_HELD.pop(name)[0], ignore_errors=True)
+        elif (cancelled := _cancel_held_publish(name)) is not None:
+            # Its copy to Lustre had not started, so nothing of it is there:
+            # dropped in tmpfs, with no publish or strip for the writer.
+            shutil.rmtree(cancelled[0], ignore_errors=True)
         # This evaluation's own dir is empty, or not made yet, while its
         # output is still in scratch: no Lustre walk for it (round 14).
         elif name != key or evaluation_scratch_dir(eval_dir) is None:
@@ -2819,6 +2835,21 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
 # paths that no longer exist.
 _HELD: dict[str, tuple[Path, Path]] = {}
 _HELD_SINCE: float | None = None
+# Held extremes the periodic flush queued on the writer, by name. Most are
+# evicted again, and on a loaded Lustre the writer runs minutes behind, so the
+# eviction usually comes first: cancelling the publish then saves its copies
+# and the strip that would undo them, ~27% of the writer's time (round 235).
+_PUBLISHING: dict[str, tuple[Any, Path, Path]] = {}
+
+
+def _cancel_held_publish(name: str) -> tuple[Path, Path] | None:
+    """(held, eval_dir) if `name`'s queued publish was cancelled, else None."""
+    entry = _PUBLISHING.pop(name, None)
+    if entry is None or not entry[0].cancel():
+        return None
+    _RECORD_WRITES.remove(entry[0])  # a cancelled future's result() raises
+    _WRITER_SECONDS["cancelled_held"] = _WRITER_SECONDS.get("cancelled_held", 0) + 1
+    return entry[1:]
 
 
 def hold_evaluation_scratch(eval_dir: Path, record: dict[str, Any]) -> None:
@@ -2855,8 +2886,13 @@ def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) ->
             continue
         # The periodic flush is the record writer's (round 232); a forced
         # one is the end of a run, whose readers need the files there.
-        (_defer_lustre if not force else (lambda job, kind: job()))(
-            lambda held=held, eval_dir=eval_dir: _publish_held(held, eval_dir), "held")
+        publish = lambda held=held, eval_dir=eval_dir: _publish_held(held, eval_dir)  # noqa: E731
+        if force or _RECORD_WRITER is None:
+            publish()
+        else:
+            _PUBLISHING[name] = (_submit_record_job(publish, "held"), held, eval_dir)
+    for name in [name for name, entry in _PUBLISHING.items() if entry[0].done()]:
+        del _PUBLISHING[name]
     _HELD.clear()
     _HELD_SINCE = None
 
@@ -2943,6 +2979,17 @@ def self_check_streaming_retention() -> None:
                     _HELD[other.name] = (held_root / other.name, other)
                     _write_record(flat_record_path(other), _json_text(
                         {"objective": 15.05, "paths": {"eval_dir": str(other)}}))
+                    # Its periodic publish still queued behind a stuck writer
+                    # when the run ends: cancelled, and dropped with the rest.
+                    import threading
+
+                    gate = threading.Event()
+                    _submit_record_job(gate.wait)
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                    flush_held_evaluations()
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                    assert other.name in _PUBLISHING and not _HELD
+                    threading.Timer(0.5, gate.set).start()
                     records = finished_run_records(evaluations)
                     assert records is not None and len(records) == len(objectives) + 1
                     assert not other.exists()
@@ -3000,6 +3047,35 @@ def self_check_streaming_retention() -> None:
                     drain_record_writes(flush_held=False)
                     assert (held / "wsclean").is_dir() and not published.exists()
 
+                    # An extreme the periodic flush queued but the writer has
+                    # not reached, evicted again: never copied to Lustre and
+                    # never stripped, just dropped in tmpfs (round 235).
+                    _LOWEST.clear()
+                    _HIGHEST.clear()
+                    write_records_in_background()
+                    gate = threading.Event()
+                    _submit_record_job(gate.wait)
+                    try:
+                        evicted = evaluations / names[IMAGE_KEEP_ENDS + 1]
+                        (evaluation_scratch_dir(evicted) / "wsclean").mkdir(parents=True)
+                        retain_evaluation_detail(evicted, {"objective": 50.0})
+                        hold_evaluation_scratch(evicted, {"paths": {}})
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                        flush_held_evaluations()
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                        assert evicted.name in _PUBLISHING
+                        others = names[IMAGE_KEEP_ENDS + 2:3 * IMAGE_KEEP_ENDS + 2]
+                        for rank, name in enumerate(others):
+                            objective = 100.0 + rank if rank < IMAGE_KEEP_ENDS else rank
+                            retain_evaluation_detail(evaluations / name, {"objective": objective})
+                        assert evicted.name not in _PUBLISHING, "the evicted extreme's publish stayed queued"
+                        assert not (held_root / evicted.name).exists(), "the evicted extreme outlived tmpfs"
+                        assert "held" not in [f.kind for f in _RECORD_WRITES if not f.done()]
+                    finally:
+                        gate.set()
+                    drain_record_writes(flush_held=False)
+                    assert not evicted.exists(), "a cancelled publish reached Lustre"
+
                 if background:
                     # A write that fails in the background still fails the run.
                     write_records_in_background()
@@ -3030,6 +3106,7 @@ def self_check_streaming_retention() -> None:
         os.environ.pop("NS_SCRATCH_DIR", None)
         os.environ.pop("NS_RETAIN_FLUSH_SECONDS", None)
         _HELD.clear()
+        _PUBLISHING.clear()
         IMAGE_KEEP_ENDS = saved[0]
         if saved[1] is None:
             os.environ.pop("NS_KEEP_DETAIL_EVERY", None)

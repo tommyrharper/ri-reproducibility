@@ -11464,3 +11464,72 @@ Rows: `r234-a`, `r234-b`, `r234-c` (bench), `r234-base`, `r234-new`,
 `r234-sbase`, `r234-snew` (guard), and stage row `r234-writer-backlog` in
 `benchmarks.jsonl`. Run directories are deleted; `.probe/r234/` keeps the
 scripts.
+
+## Round 235 (fix): a held extreme evicted before its publish runs is never copied
+
+**Question.** Round 234 left 1,345-1,705 periodic publishes of held
+extremes queued when a run ended, plus ~1,000 strips. Each publish copies
+an extreme from tmpfs to Lustre, and most of those extremes are evicted
+again soon after, which queues a strip to delete what the publish copied.
+On a loaded Lustre the writer runs minutes behind, so the eviction usually
+happens before the publish has even started.
+
+**Fix.** `flush_held_evaluations` keeps each queued publish's future in
+`_PUBLISHING`. When `retain_evaluation_detail` evicts an extreme whose
+publish has not started, it cancels the publish and deletes the extreme in
+tmpfs. Nothing of it reaches Lustre, so it needs no strip either. At the
+end of a run, `finished_run_records` also cancels the publishes still
+queued and returns those extremes to `_HELD`. The keep-filtered final
+flush then copies only the ones the run keeps. A publish that has already
+started is left to finish, and the strip is queued after it as before.
+The `post-run seconds` line now ends with `held publishes cancelled N`.
+`self_check_streaming_retention` has two new parked-writer tests, one for
+the eviction and one for the end of the run. Each fails when its half of
+the fix is reverted.
+
+**R2D2, one short search** (round 234's command: nlive 150, 15 repeats,
+400 dead, seed 190182240, 39 ranks, `NS_RETAIN_FLUSH_SECONDS=60`, node
+load 22-112). The cancel counter was added after this run, so it does not
+report one.
+
+| | r234-c (base) | r235-a |
+| --- | ---: | ---: |
+| evals/s | 51.2 | 53.2 |
+| held publishes queued at end | 1,705 | 723 |
+| strips queued at end | 1,205 | 340 |
+| writer seconds: held / strip / record | 2,104 / 749 / 7,823 | 1,368 / 915 / 9,751 |
+| slowest rank's drain | 6.2 s | 45.3 s |
+
+log(Z) is 0.0164202934118867 +/- 0.000954286828397633 (ndead 550, nlike
+13,203). Lustre was slower in this run: record writes took 25% more writer
+time per record. Even so, the held share of writer time fell from 19.7% to
+11.3%. The drain still varies with Lustre, as in round 234. Most of the
+queue at the end is record writes, and those were already cancelled. The
+rank-0 phases are 0.2-2.4 s each.
+
+**WSClean guard.** Raced synchronous WSClean, base `aa4fc68` from a
+`/dev/shm` worktree against this change, run as round 234 did but with
+`NS_RETAIN_FLUSH_SECONDS=20` so that the new path runs. Each arm had 19
+CPUs, base on the upper half of the job's CPUs. All 8 chain files were
+bit-identical. log(Z) was 0.0967023094179472 +/- 0.000520957293962581 in
+both, the same as round 234. Throughput was 37.53 vs 37.47 evals/s
+(-0.1%, noise). The new arm cancelled 1,330 held publishes, and its
+records.jsonl holds all 4,071 distinct records. A first async pair
+(`r235-base`, `r235-new`) was pinned with `taskset -c 0-18` / `19-37`.
+This job's CPUs are the even numbers 0-74, so each arm got only ~10 of
+them. Ignore that pair.
+
+**Found on the way (next lever).** In both arms, most evaluation dirs left
+after the prune hold only `simulation.json` and an empty `wsclean/`, and
+their records no longer name an image: 555 of 601 dirs in the base, 337 of
+383 in the new arm. They are extremes that were published and then pruned
+(or stripped) without removing the dir, at 3 inodes each. That is a file
+quota leak of roughly 1,000 inodes per 4,000-evaluation run, scaling with
+how many extremes reach Lustre. This change shrinks it but does not close
+it. Find which path leaves `simulation.json` behind (the prune, or
+`_strip_to_record` racing the publish) and remove the dir.
+
+Rows: `r235-a` (bench), `r235-sbase`, `r235-snew` (guard), the mis-pinned
+`r235-base`, `r235-new`, and stage row `r235-held-cancel` in
+`benchmarks.jsonl`. Run directories are deleted; `.probe/r235/` keeps the
+scripts and logs.
