@@ -13668,3 +13668,59 @@ n2 n3 h3, `.probe/r275/run.sh`; node load ~24 from the other half):
 Rows: bench `r275-{n,h}{1,2,3}` (HEAD rows copied back from the `/dev/shm`
 worktree) and stage `r275-net-prefork` in `benchmarks.jsonl`. The run dirs
 and the worktree are deleted. `r2d2_serve.py` is unchanged.
+
+## Round 276 (diagnostic): with ORT on 2 threads, 39 x 1 still beats 20 x 2 by ~15%
+
+**Question.** Round 273 found that every multi-thread request had been
+running torch, because the pool never saw `R2D2_OMP_THREADS`. That bug
+affects round 259's sapphire verdict (57 x 2 at -40%: its B arms derived 2
+threads from `NS_MPI_PROCS`, so they ran torch) and round 273's own 1-minute
+19 x 2 arms, which were measured before round 274's faster warm-up. Now that
+2-thread requests really run ONNX Runtime, does a 2-thread layout catch the
+default 39 x 1?
+
+**Method.** Interleaved at HEAD (`935f287`), async, 38 CPUs, `--nlive 48
+--num-repeats 5 --max-ndead 400 --seed 276` (~2.5-3 min arms, so start-up
+is ~3% of an arm), order d1 a1 b1 b2 a2 d2 d3 b3 a3 (`.probe/r276/`). d is
+the default (39 ranks x 1 thread), a is `--mpi-procs 19` (19 x 2, one rank
+is the root, so 18 workers) and b is `--mpi-procs 20` (20 x 2, 19 workers
+on 38 CPUs). The run's `run.env` confirms `R2D2_OMP_THREADS=2` and
+`R2D2_RUNTIME=onnx`. Node load was 50-64 from the other half's tenant.
+
+| arm | layout | evals/s | first request s | image_container ms | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| d1 | 39 x 1 | 49.51 | 6.37 | 713.4 | 8223 | 0.0167461843166156 +/- 0.000614087153352181 |
+| a1 | 19 x 2 | 39.37 | 5.98 | 420.4 | 8595 | 0.0172007916576586 +/- 0.000637270747989700 |
+| b1 | 20 x 2 | 40.62 | 5.91 | 442.6 | 8639 | 0.0177522096621114 +/- 0.000676091188338956 |
+| b2 | 20 x 2 | 42.40 | 5.95 | 418.5 | 8454 | 0.0171200723030129 +/- 0.000658224038932077 |
+| a2 | 19 x 2 | 40.23 | 5.86 | 422.4 | 8622 | 0.0172034461573496 +/- 0.000646363348098511 |
+| d2 | 39 x 1 | 49.65 | 6.00 | 715.8 | 8156 | 0.0164851964645636 +/- 0.000661880870174482 |
+| d3 | 39 x 1 | 44.99 | 6.09 | 789.4 | 8188 | 0.0168976680702627 +/- 0.000630527107245824 |
+| b3 | 20 x 2 | 42.35 | 5.92 | 416.9 | 8582 | 0.0176983298165699 +/- 0.000674983156220804 |
+| a3 | 19 x 2 | 42.10 | 5.99 | 395.0 | 8561 | 0.0170989667420389 +/- 0.000634174058605387 |
+
+**Learned.**
+- The default stays. 39 x 1 averages 48.1 evals/s, 20 x 2 41.8 (-13%)
+  and 19 x 2 40.6 (-16%). 39 x 1 wins all three triples, including d3,
+  which ran while the node's load rose to 64.
+- A 2-thread ORT request takes 395-443 ms against 713-789 ms on 1 thread,
+  1.7x for twice the CPUs (0.85 per CPU). Half the workers then lose ~15%.
+  That is the DRAM-bandwidth wall again (rounds 205, 259): the second thread
+  mostly waits on the same weight stream.
+- Round 259's -40% on sapphire overstated the gap, since its 2-thread arms
+  ran torch. With ORT the gap here is -13%, so a re-run on sapphire would
+  still come out for 1 thread. It is not worth a whole-node job.
+- 2-thread arms peak ~350 MB *higher* (8.45-8.64 against 8.16-8.22 GB)
+  despite having half the workers. Each 2-thread worker builds its own
+  multi-thread sessions from `ort_shared_parts`, on top of the pool's 1-thread
+  sessions. So fewer ranks does not buy memory headroom on this path either.
+- log(Z) agrees: 39 x 1 gives 0.01649-0.01690 and 2 thread gives
+  0.01710-0.01775 (sigma ~0.00065). The widest pair, d2 against b1, is
+  1.4 combined sigma. The 2-thread arms sit ~1 sigma higher, as in round 259:
+  async searches with different worker counts take different paths.
+- The first request no longer differs (5.86-6.37 s in every layout), since
+  round 274 removed round 273's extra ~3 s.
+
+No code change. Rows: bench `r276-{d,a,b}{1,2,3}` and stage `r276-layout-ort`
+(every arm's figures and full-precision log(Z)) in `benchmarks.jsonl`. The run
+dirs are deleted, and the arm summary is `.probe/r276/run.out.gz`.
