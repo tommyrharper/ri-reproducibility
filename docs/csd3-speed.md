@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 316; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 318; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -51,6 +51,12 @@ the Hetzner host.
     flat), so a chain on an adopted, higher contour pays more per step; no
     slice-width fix can recover it
     ([round 316](#round-316-diagnostic-adopted-r2d2-chains-cost-more-because-r2d2s-cost-per-slice-step-rises-with-the-contour)).
+    A converged search slows ~12% mid-run because R2D2's early stop
+    (`prune: True`) runs more U-Net iterations as the posterior moves to
+    costlier images (18.6 -> 20.9 -> 22.8), at a flat ~37 ms an iteration;
+    bench rows carry `r2d2_iterations`, so compare arms per iteration
+    ([round 317](#round-317-diagnostic--tooling-r2d2s-early-stop-not-the-node-slows-a-search-mid-run),
+    [round 318](#round-318-validation-the-mid-run-slowdown-is-the-iteration-count-logz-agrees)).
     `./ri bench` prints this as `converging evals/s`; judge rank and layout
     A/Bs on it at the production nlive
     ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
@@ -15323,4 +15329,57 @@ is not a speed lever. Short bench arms sit in the cheap early phase and
 overstate a converged search's evals/s by ~10-15%, and arms at different
 phases should be compared per iteration. A converged run to confirm that
 the mid-run step is the iteration count was started and then stopped at the
-iteration limit. That is next round's job.
+iteration limit. That is next round's job (round 318 ran it).
+
+## Round 318 (validation): the mid-run slowdown is the iteration count; log(Z) agrees
+
+**Question.** Round 317 predicted that a converged search's mid-run drop
+in evals/s is R2D2 running more U-Net iterations per request, at a flat
+cost per iteration. Does a converged search with the new
+`timing.r2d2_iterations` field show that, and does HEAD still give round
+302's log(Z)?
+
+**Method.** Round 302's command (`.probe/r317/conv.sh`: seed 190182240,
+nlive 150, 15 repeats, async, to convergence, 39 ranks) on `fe35e0b`,
+inside the gnhf job on cpu-q-190. Neighbour load was 43 at the start and
+64-68 throughout, so the absolute rate (40.3 evals/s against round 302's
+60.2 on its own node) is the shared node, not the code. Per-tenth table
+from `.probe/r318/tenths.py` (output in `.probe/r318/tenths.txt`); the
+first 120 s are not skipped here.
+
+| tenth of wall | evals/s | mean iterations | request ms | ms per iteration above the intercept | objective |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 42.1 | 18.52 | 842 | 37.6 | 0.0178 |
+| 1 | 44.2 | 18.61 | 818 | 36.1 | 0.0190 |
+| 2 | 45.5 | 18.58 | 798 | 35.1 | 0.0198 |
+| 3 | 43.8 | 18.90 | 825 | 35.9 | 0.0209 |
+| 4 | 38.7 | 20.95 | 931 | 37.5 | 0.0228 |
+| 5 | 38.7 | 20.93 | 929 | 37.4 | 0.0244 |
+| 6 | 38.4 | 20.78 | 937 | 38.0 | 0.0249 |
+| 7 | 38.5 | 20.35 | 929 | 38.4 | 0.0255 |
+| 8 | 37.5 | 21.52 | 961 | 37.9 | 0.0256 |
+| 9 | 35.4 | 22.76 | 1,017 | 38.3 | 0.0250 |
+
+Whole run: 69,418 evaluations in 1,723 s, request ms = 146.0 + 37.2 x
+iterations (R^2 0.62), mean 20.09 iterations. log(Z)
+0.0173296529175051 +/- 0.000405335657033951 (ndead 1,453, nlike 67,635)
+against round 302's 0.0172602493141394 +/- 0.000402502115363966: +0.12
+sigma.
+
+**Results.**
+- Confirmed. The step lands in the fifth tenth, as in rounds 239-313:
+  evals/s falls 44.2 -> 38.6 (-13%) while mean iterations rise 18.6 ->
+  20.9 (+12%) and request time 818 -> 930 ms (+14%). The cost per
+  iteration stays at 35-38 ms throughout, so the node and the code do not
+  slow down; the search asks for harder images. The last tenth climbs
+  again to 22.8 iterations.
+- The 20.1-iteration mean is 9% above a 550-dead bench arm's ~18.5
+  (round 317), the size of the overstatement short arms carry.
+- log(Z) agrees with round 302 (+0.12 sigma) on HEAD with round 317's
+  counter in place, so the counter changes nothing in the results.
+
+**Decision.** No code change. The mid-run slowdown is fixed by the
+posterior, not a lever; an A/B between arms that reach different phases
+should compare `r2d2_iterations`-normalised cost. Bench row `r317-conv`
+(the search's own row) and stage row `r318-conv-iters` are in
+`benchmarks.jsonl`; the run directory is deleted.
