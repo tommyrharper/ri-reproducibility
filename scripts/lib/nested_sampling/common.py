@@ -1292,10 +1292,20 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
     import fcntl
     from concurrent.futures import ThreadPoolExecutor
 
+    clock = [time.monotonic()]
+
+    def lap(phase: str) -> None:
+        clock.append(time.monotonic())
+        LAST_PACK_SECONDS[phase] = clock[-1] - clock[-2]
+
+    LAST_PACK_SECONDS.clear()
     with open(evaluations_dir / RECORD_PACK, "ab") as pack:
         fcntl.flock(pack, fcntl.LOCK_EX)
+        lap("lock")
         paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
+        lap("list")
         texts, whole = _read_record_pack(evaluations_dir)
+        lap("read")
         lines: dict[str, str] = {}
         moving = []
         for name in sorted(known):
@@ -1305,6 +1315,7 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
             # Not on disk at all: a record write the finish cancelled.
             if name in moving or text != texts.get(name):
                 lines[name] = text  # the last line of a name is its record
+        lap("encode")
         # A torn last line from a killed packer, or a killed rank's append,
         # which the next append would otherwise run on into.
         if whole < os.fstat(pack.fileno()).st_size:
@@ -1314,6 +1325,7 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
         pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
         pack.flush()
         os.fsync(pack.fileno())
+        lap("write")
 
     def unlink(name: str) -> None:
         paths[name].unlink(missing_ok=True)
@@ -1328,7 +1340,15 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
     # cost ~6ms rather than ~0.2ms (round 93).
     with ThreadPoolExecutor(RECORD_READ_THREADS, initializer=_unpin_thread) as pool:
         list(pool.map(unlink, moving))
+    lap("unlink")
+    LAST_PACK_SECONDS["lines"], LAST_PACK_SECONDS["files"] = len(lines), len(moving)
     return len(lines)
+
+
+# Where the last pack_evaluation_records() call's time went, for the post-run
+# line: a whole sapphire node's final pack took 18.2s against 4.3s on 38
+# icelake CPUs for 12% more records, and nothing said why (round 256).
+LAST_PACK_SECONDS: dict[str, float] = {}
 
 
 # A Lustre unlink holds the evaluations dir's lock, ~0.13ms each whatever the
@@ -1765,6 +1785,10 @@ def post_run_phase(name: str, started: float) -> float:
 
 def post_run_line() -> str:
     line = "post-run seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in POST_RUN_SECONDS.items())
+    if "pack" in POST_RUN_SECONDS and LAST_PACK_SECONDS:
+        pack = dict(LAST_PACK_SECONDS)
+        counts = f"{pack.pop('lines', 0):.0f} lines, {pack.pop('files', 0):.0f} files"
+        line += " (" + ", ".join(f"{k} {v:.1f}" for k, v in pack.items()) + f"; {counts})"
     if POST_RUN_BACKLOG:
         backlog = dict(POST_RUN_BACKLOG)
         line += "; slowest rank's drain {:.1f}, most queued on one rank {:.0f}".format(

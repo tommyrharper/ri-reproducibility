@@ -12502,3 +12502,68 @@ No default changes. Rows: bench `r254-sapphire` (written by the job) and
 stage `r254-sapphire-validation` (full-precision log(Z) for rounds 239, 252
 and 255). `.probe/r254/` keeps the submit script, `run.env`, `.stats`,
 gzipped `summary.json`, job output and run log. The run directory is deleted.
+
+## Round 256 (diagnostic): where the final record pack's time goes
+
+**Question.** Round 255's whole-sapphire search spent 18.2 s in the
+post-run `pack`, against 4.3 s for round 252's 82.5k records on 38 icelake
+CPUs. It has 12% more records but takes 4x longer. Is that CPU work that
+can be cut, or something about the node?
+
+**Method.** `.probe/r256/packbench.py` builds a synthetic run on RDS
+(`/rds/user/th773/hpc-work`): 92,553 records (round 255's count),
+90,553 of them already in `records.jsonl` and 2,000 left as flat files,
+with every 50th record edited as prune would. It then times
+`pack_evaluation_records` with every record known, as
+`pack_finished_run` does, inside `polychord.sif`'s Python 3.11 on this
+icelake allocation. The records are round 159's WSClean ones (~2.9 kB).
+Round 255's R2D2 records are 2.5 kB each (from its `summary.json`).
+
+| step | seconds |
+| --- | ---: |
+| lock | 0.0 |
+| list `evaluations/` | 0.0 |
+| read the pack (~260 MB) | 0.5 |
+| encode: `json.dumps` of every known record, to compare it with its packed line | 2.4 |
+| write + fsync 3,812 lines | 0.9 |
+| unlink 2,000 flat files | 0.3 |
+| **total** | **4.1** |
+
+**Result.** The pack's own work on a quiet node is ~4 s, matching round
+252's 4.3 s. Most of it is the `json.dumps` comparison (~60%). Encoding
+round 255's 92,553 R2D2 records takes 3.7 s with this loop's Python 3.13.
+So about 14 s of the sapphire run's 18.2 s is not the pack's CPU. It is
+I/O (the read of a pack that 112 ranks appended to through Lustre, or the
+unlinks) or contention at the end of the job, and this node cannot
+reproduce it. The pack runs after `summary.json` is written, so it never
+delays a result. On a whole node it costs ~18 s x 112 CPUs of allocation,
+~2.6% of an 11-minute search, and less for longer ones. That is too small
+to change the default without knowing the cause.
+
+**Change (diagnostic only).** `pack_evaluation_records` now times its
+steps into `LAST_PACK_SECONDS`, and the `post-run seconds` line shows them
+after `pack`, e.g. `pack 4.1 (lock 0.0, list 0.0, read 0.5, encode 2.4,
+write 0.9, unlink 0.3; 3812 lines, 2000 files)`. The next whole-node
+validation will name the slow step. If it is `encode`, the fix is to
+re-dump only the records prune edited. If it is `read` or `unlink`, the
+fix is Lustre-side.
+
+**Also seen in round 255's line.** `writer seconds, all ranks: record
+57237` over 112 workers x 655 s is ~78% of each rank's wall in its record
+writer thread. Round 252 shows the same share: 41,033 of 37 x 1,410 s.
+The writer is off the critical path (idle fraction 0.0001) and mostly
+waits on RDS, so it costs no evals/s. "coalesced" in that list is a
+count of records, not seconds.
+
+**WSClean guard.** One raced synchronous pair, run as round 235 did (seed
+229, nlive 100, 2 repeats, 4,000 dead, 19 ranks per arm on separate halves
+of the job's CPUs, `.probe/r256/ws.sh`). The base was `b762e2c` from a
+`/dev/shm` worktree. Both arms ran at 37.8 evals/s and made 4,071
+evaluations. All 10 chain files were bit-identical, and log(Z) was
+0.0967023094179472 +/- 0.000520957293962581 in both (ndead 861, nlike
+4,004), the same as round 234. The new arm's line read `pack 0.2 (lock 0.0,
+list 0.0, read 0.0, encode 0.1, write 0.0, unlink 0.0; 2932 lines, 165
+files)`. `scripts/test_self_checks.py` passes 30 of 30 host checks. The
+only exception was a run alongside the race, where `self_check_cpu_pinning`
+found every CPU claimed (`[None, None]`). That check cannot pass while a
+search holds the node's CPU claims. Run it on an idle allocation.
