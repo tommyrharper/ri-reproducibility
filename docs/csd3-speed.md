@@ -13398,3 +13398,73 @@ no bit-identical lever worth a rebuild left.
 
 No code change, no search; stage row `r271-noise-lanes`. Probe in
 `.probe/r271/`.
+
+## Round 272 (negative): a shorter R2D2 pool warm-up is not on a warm start's critical path
+
+**Question.** A fresh 38-rank R2D2 search (HEAD, nlive 48, 5 repeats, 150
+dead) spent 17.8 s of its 48 s before the first replies: all 38 first
+requests ended within 0.7 s of each other at ~17 s, so they were all waiting
+on the pool. How much of the pool's warm-up can go?
+
+**Warm-up, timed in `r2d2.sif`** (`.probe/r272/warm.py`, async defaults,
+warm page cache, three runs):
+
+| step | s |
+| --- | ---: |
+| `warm_imports` total | 8.2-8.3 (13.0 part-cold) |
+| `patch_onnx_network` | 4.9-5.1 (9.7) |
+| of it: 25 file-loaded 1-thread sessions | 1.9 |
+| of it: `ort_shared_parts` (async only) | 2.5-2.9 |
+| `load_checkpoints` | 0.64 |
+| imports (imager, torch) | ~2.5 |
+
+**Probe** (`.probe/r272/parts.py`, diff in
+`.probe/r272/sessions-from-parts.diff`). An async pool loads every optimised
+graph twice: once as file sessions and once as `ort_shared_parts`' aligned
+arrays. Building the 1-thread sessions over those arrays (`add_initializer`,
+as `threaded_session` does) is bit-identical over all 25 nets, runs a forward
+in 17.9 ms against 18.0, and builds in 0.29 s against 1.9 s. File sessions do
+not build faster on threads (1.88 s on 8). `ort_shared_parts` does (1.43 s
+against 2.53 s). Together, `patch_onnx_network` fell to 2.35 s and the
+warm-up to 5.5-6.8 s.
+
+**Search A/B** (interleaved against HEAD in a `/dev/shm` worktree, 38 CPUs,
+same settings, seed 272). The last four arms evicted the weight files from
+the page cache first (`posix_fadvise DONTNEED`, `.probe/r272/evict.py`):
+
+| arm | evals/s | first-wave request, median s | log(Z) |
+| --- | ---: | ---: | --- |
+| old1 | 41.58 | 4.68 | 0.0136886471941661 +/- 0.00420578 |
+| new1 | 42.13 | 4.42 | 0.0136110212808840 +/- 0.00429186 |
+| new2 | 40.70 | 4.65 | 0.0142161030146327 +/- 0.00372652 |
+| old2 | 40.93 | 4.62 | 0.0140562894142729 +/- 0.00372555 |
+| old3 | 39.33 | 4.64 | 0.0137478469470203 +/- 0.00438074 |
+| new3 | 37.45 | 8.86 | 0.0136397427887049 +/- 0.00429189 |
+| cnew1 (evicted) | 35.00 | 11.47 | 0.0138746997916213 +/- 0.00387888 |
+| cold1 (evicted) | 40.59 | 4.69 | 0.0141546376264786 +/- 0.00372602 |
+| cold2 (evicted) | 42.05 | 4.53 | 0.0130829161189566 +/- 0.00484644 |
+| cnew2 (evicted) | 41.92 | 4.68 | 0.0138312213096774 +/- 0.00403914 |
+
+**Learned.**
+- With the page cache warm, the first wave is bound by each worker's own
+  first request (4.0-5.3 s, spread over ~1 s), not by the pool. The pool's
+  warm-up overlaps the ranks' own start-up (mpirun and PolyChord). A 2.8 s
+  shorter warm-up therefore does not show.
+- Two of five new arms had a slow, synchronized first wave (8.9 and 11.5 s),
+  and none of five old arms did. That is unexplained, so nothing ships. The
+  change is a contained diff if a later round can show it helps a
+  genuinely cold node.
+- `posix_fadvise DONTNEED` on the Lustre weight files does evict one file
+  (1.28 s re-read against 0.02 s), but whole-arm evictions did not bring
+  back the 17 s of this round's first search. A true cold start needs a fresh node.
+- Every arm reports the same 6.16 GB worker peak floor, so the pool
+  parent's high-water mark is not set by the duplicate graph copy.
+- The next start-up lever is the worker's ~4 s first request against
+  0.35-0.8 s steady. It is ~0.3% of a 25-minute run on half icelake, but it
+  is paid at every pool restart.
+- log(Z) agrees across all eleven arms (0.0131-0.0142, sigma ~0.004).
+
+Rows: bench `r272-a`, `r272-{old,new}{1,2,3}`, `r272-{cold,cnew}{1,2}` and
+stage `r272-pool-warmup` in `benchmarks.jsonl`. The run dirs and the HEAD
+worktree are deleted. Scripts and gzipped logs are in `.probe/r272/`. Round
+243's ampere job 39544674 still has no output file in `.probe/r243/`.
