@@ -13144,3 +13144,76 @@ writer and the round 263 validation). Every anchor it links to was checked
 against this file's headings. No code changed, no search ran, and there
 is no `benchmarks.jsonl` row. Round 243's ampere race (job 39544674) still
 has no output file in `.probe/r243/`.
+
+## Round 267: a resume reads the records on rank 0 only
+
+**Why.** Every `./ri resume`, and every self-heal restart, runs
+`adopt_completed_evaluations()` on every rank, and each rank parsed every
+record into memory just to fill its `{key: objective}` cache. The Hetzner
+note in [run scaling](nested-sampling-run-scaling.md) called that harmless
+at 20 ranks. At CSD3 rank counts it is not: memory is the problem, not time.
+
+**Method.** Synthetic `records.jsonl` packs on RDS, 67,058 lines (the 22 Sep
+production search, round 263) and 400,000 lines (a large run), made from a
+real record with its parameters perturbed (2.7 KB a line, 181 MB and 1.08
+GB). The function was timed under `mpirun` in `polychord.sif` on half
+icelake, with HEAD's `common.py` against the change. Each rank hashed its
+sorted cache, and every arm gave one hash for all ranks
+(`.probe/r267/mpi_adopt.py`).
+
+**Change.** Rank 0 reads the records and broadcasts `(count, {key:
+objective})`. The keys are 16 hex characters, ~14 MB at 400k. The other
+ranks read nothing, and the `bcast` takes the place of the old `Barrier`
+(no rank reads a flat record after rank 0 packs). Rank 0 also passes to the
+pack only records that have a file. A record it read from the pack is already
+in it, and re-encoding it to compare was 1.6 s of a 67k resume.
+
+| arm | ranks | records | wall | rank-0 RSS | other ranks' RSS | all ranks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD | 38 | 67k | 10.62, 10.61 s | 1.30 GB | 1.10 GB | 42.0 GB |
+| broadcast only | 38 | 67k | 7.30, 7.56 s | 1.30 GB | 0.05 GB | 3.2 GB |
+| broadcast + pack skip | 38 | 67k | 5.29, 5.25 s | 1.09 GB | 0.05 GB | 3.0 GB |
+| HEAD | 8 | 400k | 52.8 s | 7.53 GB | 6.45 GB | 52.6 GB |
+| broadcast only | 38 | 400k | 47.4 s | 7.54 GB | 0.17 GB | 13.4 GB |
+| broadcast + pack skip | 38 | 400k | 32.3 s | 6.42 GB | 0.17 GB | 12.2 GB |
+
+HEAD was not run at 38 ranks on the 400k pack, because 38 x 6.45 GB is more
+than this node's 231 GB free. A whole sapphire resume (113 ranks) of a 400k
+run would have asked for ~730 GB, so it could not restart at all. It now
+needs ~25 GB.
+
+**WSClean guard** (shared code). HEAD in a `/dev/shm` worktree raced against
+the change: seed 229, nlive 100, 2 repeats, 2,000 max dead, synchronous,
+19 ranks per half, halves swapped per pair.
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 33.73 | 34.26 (+1.6%) |
+| 2 | 35.00 | 35.10 (+0.3%) |
+
+Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms. A fresh search adopts nothing, so
+this was only a check for regressions.
+
+**Kill and resume** (`.probe/r267/kill.sh`). A default R2D2 search (seed 242,
+nlive 48, 5 repeats, 600 max dead, 39 ranks) got `kill -9` at 150 s, with
+6,930 evaluations scored in its log, and then `./ri resume` ran on the change.
+All 39 ranks printed "6933 evaluations already done", which includes
+evaluations in flight whose records landed. The resume converged with rc 0
+in 153 s: log(Z) = 0.0165788375728644 +/- 0.0006268553649935, 618 dead,
+11,378 likelihood calls.
+
+**Learned.**
+- At CSD3 rank counts, per-rank copies of run-sized state are a memory
+  problem before they are a time problem. Before this change, a large run
+  on a whole sapphire node could not resume, which also means self-heal
+  could not restart it.
+- Most of rank 0's remaining 32 s at 400k is `json.loads` in a 32-thread
+  pool: a serial loop parses the 67k pack in 2.5 s, against 3.3 s through
+  the pool. That is the next step if large resumes matter.
+- A `/dev/shm` HEAD worktree has its own `benchmarks.jsonl`, and
+  its arms write their bench rows there. Copy them back before
+  removing it.
+- Rows: bench `r267-w{old,new}{1,2}` and stage `r267-resume-adopt`, which has
+  every timing, the guard, and the kill/resume log(Z). Run dirs and the
+  synthetic packs are deleted. Logs and scripts are in `.probe/r267/`.

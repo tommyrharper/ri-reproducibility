@@ -1807,41 +1807,53 @@ def adopt_completed_evaluations(
     evaluations_dir: Path,
     cache: dict[str, float],
 ) -> int:
-    """Cache finished evaluations and remove incomplete directories."""
+    """Cache finished evaluations and remove incomplete directories.
+
+    Rank 0 alone reads the records and broadcasts {key: objective}: every
+    rank parsing every record cost 1 GB and 6 s a rank at 67k evaluations,
+    and 6.4 GB a rank at 400k, which a 113-rank resume cannot hold (round 267).
+    """
     import shutil
 
+    try:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+        if comm.Get_size() == 1:
+            comm = None
+    except Exception:
+        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    if comm is not None and comm.Get_rank() != 0:
+        adopted, keys = comm.bcast(None, root=0)
+        cache.update(keys)
+        return adopted
     adopted = 0
+    keys: dict[str, float] = {}
     good: dict[str, dict[str, Any]] = {}
     # A record a killed writer left half-written: the record it was replacing,
     # if any, is still there beside it.
     for partial in evaluations_dir.glob("eval-*" + RECORD_SUFFIX + ".partial"):
         partial.unlink(missing_ok=True)
+    # Only these can need packing: a record read from the pack is in it.
+    listed = evaluation_record_paths(evaluations_dir)
     for eval_dir, record in read_evaluation_records(evaluations_dir):
-        if record is not None:
+        if record is not None and eval_dir.name in listed:
             good[eval_dir.name] = record
         if record is None:
             # A half-written record goes too, or every resume warns about it.
             flat_record_path(eval_dir).unlink(missing_ok=True)
             if not eval_dir.is_dir():
                 continue
-            # ignore_errors because every rank runs this, and they are all
-            # removing the same directories at the same moment.
+            # ignore_errors: best effort, the next resume sweeps what is left.
             shutil.rmtree(eval_dir, ignore_errors=True)
             continue
-        cache[params_key(record["params"])] = float(record["objective"])
+        keys[params_key(record["params"])] = float(record["objective"])
         adopted += 1
-    # Collective: every rank adopts, and none may still be reading a flat
-    # record when rank 0 unlinks it - a missing record reads as a torn one,
-    # whose dir the loop above removes.
-    try:
-        from mpi4py import MPI
-
-        comm = MPI.COMM_WORLD
-    except Exception:
-        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    cache.update(keys)
+    # Collective, and before the pack: no rank reads a flat record after it.
     if comm is not None:
-        comm.Barrier()
-    if mpi_rank() == 0 and good:
+        comm.bcast((adopted, keys), root=0)
+    if good:
         started = time.monotonic()
         packed = pack_evaluation_records(evaluations_dir, good)
         if packed:
