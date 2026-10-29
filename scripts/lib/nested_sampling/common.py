@@ -2021,10 +2021,11 @@ def self_check_resume_adoption() -> None:
             "eval-0001-abc", "eval-0006-pqr", RECORD_PACK]
         assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6, 7]
         # A record still queued when the run ends goes into the pack, never
-        # to its own file (round 234).
+        # to its own file (round 234), with the flat writer too.
         import threading
 
         _WRITTEN_RECORDS.clear()
+        os.environ["NS_RECORD_APPEND"] = "0"
         write_records_in_background()
         gate = threading.Event()
         _submit_record_job(gate.wait, "held")
@@ -2056,8 +2057,9 @@ def self_check_resume_adoption() -> None:
         records = finished_run_records(evaluations_dir)
         assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 20, 21, 22, 23]
         assert pack_finished_run(evaluations_dir) == 1  # the flat one; the appended are packed
-        # A run's writer appends its records to the pack, never a flat file,
-        # and the finish then has nothing to add (round 240). A torn last
+        # A run's writer (the default since round 264) appends its records
+        # to the pack, never a flat file, and the finish then has nothing to
+        # add (round 240). A torn last
         # line - a rank killed mid-append - is cut by the next pack writer,
         # so the next append does not run on into it.
         _WRITTEN_RECORDS.clear()
@@ -2739,7 +2741,7 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
     if _RECORD_WRITER is None:
         _write_record(flat_record_path(eval_dir), text)
-    elif os.environ.get("NS_RECORD_APPEND", "0") == "1":
+    elif os.environ.get("NS_RECORD_APPEND", "1") == "1":
         line = f"{eval_dir.name}\t{json.dumps(record)}\n".encode()
         _submit_record_job(lambda: _append_record(eval_dir.parent, line))
     elif os.environ.get("NS_RECORD_COALESCE", "1") == "0":
@@ -2796,15 +2798,15 @@ def _write_record(path: Path, text: str) -> None:
     _write_text_atomic(path, text)
 
 
-# NS_RECORD_APPEND=1: a run's writer appends each record to the pack instead
-# of creating a flat file - one write on a descriptor held open, against a
-# create and a rename in the evaluations dir (on RDS, 38 processes: 0.15-0.24
-# against 1.9-2.1 ms, worst 0.01 against 1.2 s). It cuts the records a run
-# holds only in memory 3-11x (round 239's durability gap) at no speed gain:
-# R2D2 -3.1% and -1.0% in two swapped pairs, WSClean +0.2% (round 240), so it
-# is opt-in. O_APPEND keeps concurrent lines whole; the shared lock keeps them
-# out of a pack writer's truncate of a torn last line, which takes it
-# exclusively.
+# A run's writer appends each record to the pack instead of creating a flat
+# file - one write on a descriptor held open, against a create and a rename in
+# the evaluations dir (on RDS, 38 processes: 0.15-0.24 against 1.9-2.1 ms,
+# worst 0.01 against 1.2 s). A kill loses none (rounds 245, 261), and at 113
+# ranks on whole sapphire flat creates convoyed in the MDS (~40x the
+# writer-seconds, load ~200) for +1.9% evals/s, so it is the default (round
+# 264; NS_RECORD_APPEND=0 for the coalescing flat writer). O_APPEND keeps
+# concurrent lines whole; the shared lock keeps them out of a pack writer's
+# truncate of a torn last line, which takes it exclusively.
 _PACK_FDS: dict[str, int] = {}
 
 

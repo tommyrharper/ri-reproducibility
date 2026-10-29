@@ -13002,3 +13002,43 @@ default coalescing writer, B is `NS_RECORD_APPEND=1`.
   make `NS_RECORD_APPEND=1` the default, with the WSClean guard that a
   `common.py` change needs. The run dirs are deleted, and the arm logs are
   gzipped in `.probe/r260/`. Stage row `r260-spr-append`.
+
+
+## Round 264: `NS_RECORD_APPEND=1` is the default
+
+**Change.** Round 263 made the case: on a whole sapphire node, append costs
+~2% steady evals/s and takes 113 record writers off Lustre's create path
+(~40x fewer writer-seconds, end-of-arm load 103-119 against 175-203), and it
+lost 0 records at a kill -9 under load (round 245) and on a quiet RDS (round
+261). So `write_evaluation_record` now appends every record to
+`evaluations/records.jsonl` unless `NS_RECORD_APPEND=0`, which brings back
+round 247's coalescing flat writer (`NS_RECORD_COALESCE=0` still gives the
+oldest one on top of that). The self-check runs its flat-writer cases under
+`NS_RECORD_APPEND=0` and its append cases under the default. Every
+`common.py` self-check passes in `polychord.sif`, and
+`scripts/test_self_checks.py` passes 30 of 30 host checks. `docs/robustness.md`
+describes the new writer.
+
+**WSClean guard.** Two raced synchronous pairs on the same tree, set up as
+in round 256 (seed 229, nlive 100, 2 repeats, 4,000 dead, 19 ranks per arm on
+separate halves of the job's CPUs, halves swapped for pair 2,
+`.probe/r264/ws.sh`). The flat arm sets `NS_RECORD_APPEND=0`, which is
+41ff6b3's code path exactly. The only other change is to comments and the
+self-check.
+
+| pair | arm | CPUs | evals/s | steady | writer-s (record) | pack files |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | flat | half 1 | 33.78 | 33.84 | 1,261 (+1,617 coalesced) | 156 |
+| 1 | append | half 2 | 33.73 | 33.78 | 146 | 0 |
+| 2 | flat | half 2 | 32.57 | 32.62 | 1,339 (+1,648 coalesced) | 28 |
+| 2 | append | half 1 | 32.84 | 32.90 | 150 | 0 |
+
+- Append minus flat: -0.2% and +0.8% steady, with the same sign as the CPU
+  half. That is noise, so there is no WSClean slowdown.
+- The 10 chain files and `clusters/` are bit-identical in both pairs. All
+  four arms made 4,071 evaluations, and log(Z) is 0.0967023094179472 +/-
+  0.000520957293962581 (ndead 861, nlike 4,004), the same as rounds 234 and
+  256.
+- The run dirs are deleted, and the gzipped logs are in `.probe/r264/`. The
+  bench rows are `r264-w{flat,app}{1,2}` and the stage row is
+  `r264-ws-guard`.
