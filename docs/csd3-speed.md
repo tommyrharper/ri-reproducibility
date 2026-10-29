@@ -14739,3 +14739,36 @@ The negative cases above it, including the Nix-store binary, still fail the
 check as they should. No search ran, the run scripts' behaviour is
 unchanged (only a self-check changed), and there is no `benchmarks.jsonl`
 row.
+
+## Round 306 (fix): the benchmark ledger keeps multi-node searches out of 1-node cells
+
+With the GPU pair still queued (job 39654485, no output file at 19:52 on
+29 Oct), this round checked how `./ri bench` files multi-node searches,
+which are now the CPU lever for wall time. A row's group is its imager,
+preset, machine and `WORKLOAD_KEYS` settings. Its `NS_MPI_PROCS` comes from
+run.env, which holds the per-node count (39). `NS_NODES` was not a key,
+although run.env has named it on every multi-node run since round 288. So a
+2-node row at 39 ranks per node landed in the same cell as a 1-node row, and
+the table printed one median for both. At the same commit, three cells were
+mixed:
+
+| commit | rows | 1 node (median) | N nodes (median) | pooled median shown |
+| --- | --- | ---: | ---: | ---: |
+| 139345e (round 288) | s1, s2 / d1, d2 | 53.0 | 96.9 (2) | 72.6 |
+| ca3ab3c (round 291) | n1a / n4a, n4b | 53.0 | 179.2 (4) | 169.4 |
+| 0e0976f (round 295) | c1, c2 / b1, b2 | 49.0 | 61.1 (2) | 50.4 |
+
+The figures are evals/s, and every one of these cells mixed workloads that
+differ by 2-4x. `NS_NODES` is now a workload key in `scripts/bench.py`. A
+single-node run.env does not name it (`run-config.sh --self-check` asserts
+this), so every 1-node cell, past and future, keeps its group. The bench
+self-check now asserts that a 2-node row and a 1-node row with the same
+per-node `NS_MPI_PROCS` get different group keys, and it fails with the key
+removed. The 29 multi-node rows already in `benchmarks.jsonl` were backfilled
+with their node count, taken from each round's `.probe/<round>/*.sh`:
+`NS_NODES` "2" for r287-2nodeb, r288-d1/d2/conv, r290-c, r292-*, r294-*,
+r295-a1/a2/b1/b2, r296-* and r297-*, and "4" for r291-n4a/n4b. The diff
+adds only that key, and `./ri bench` now prints those cells with
+`nodes=2` or `nodes=4`. `docs/nested-sampling-benchmarks.md` notes the key.
+No search ran and the run scripts did not change, so no WSClean guard was
+needed.

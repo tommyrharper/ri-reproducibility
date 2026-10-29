@@ -67,6 +67,8 @@ consistent ~4% false positives here.
 `NS_WSCLEAN_MGAIN`, `NS_WSCLEAN_LOG_TIME`, `R2D2_OMP_THREADS`,
 `R2D2_INTEROP_THREADS`, and the rest). Anything else is rejected, because the
 two arms would land in one cell and the comparison would read as noise.
+`NS_MPI_PROCS` is per node, so a multi-node search (`--nodes N`) is grouped
+by `NS_NODES` too; its run.env names it only when N is above 1.
 
 Interleaving a setting the preset itself pins splits the arms across two
 groups: the arm that matches the preset stays in it, the other lands in

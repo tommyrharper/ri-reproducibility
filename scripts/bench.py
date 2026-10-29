@@ -40,9 +40,11 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 # NS_STALL_TIMEOUT are absent because they cost nothing until something breaks.
 # The three image ids are here because the images bake the code: two rows at
 # one commit measured different binaries if a rebuild landed between them.
+# NS_MPI_PROCS is per node, so NS_NODES (in run.env only when above 1) keeps a
+# 2-node search out of its 1-node cell (docs/csd3-speed.md, round 306).
 WORKLOAD_KEYS = (
     "NS_NLIVE", "NS_NUM_REPEATS", "NS_MAX_NDEAD", "NS_METRIC", "NS_MPI_PROCS",
-    "NS_IMAGE_DIM",
+    "NS_NODES", "NS_IMAGE_DIM",
     "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_WSCLEAN_NITER", "NS_WSCLEAN_LOG_TIME",
     "NS_KEEP_MEASUREMENT_SETS", "WSCLEAN_TARGET_CPU",
     "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS", "R2D2_MAX_THREADS", "R2D2_INTERLEAVE_WEIGHTS",
@@ -641,6 +643,11 @@ def self_check() -> None:
     assert preset_for({**preset_settings("default", "wsclean"),
                        "NS_MPI_PROCS": "3"}, "wsclean") == "default"
     assert preset_for({}, "wsclean") == "custom"
+    # Two nodes at the same per-node NS_MPI_PROCS is twice the work rate.
+    one, two = ({key: value for key, value in env.items() if key in WORKLOAD_KEYS}
+                for env in ({"NS_MPI_PROCS": "39"}, {"NS_MPI_PROCS": "39", "NS_NODES": "2"}))
+    assert group_key({"imager": "r2d2", "preset": "custom", "machine": "m", "settings": one}) \
+        != group_key({"imager": "r2d2", "preset": "custom", "machine": "m", "settings": two})
 
     timeout = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                                start_new_session=True)
