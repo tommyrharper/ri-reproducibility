@@ -766,6 +766,14 @@ def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> 
     reading = [True]
 
     def read():
+        try:
+            receive()
+        except Exception:
+            # As for a lane: a dead reader would leave every worker waiting.
+            traceback.print_exc()
+            os._exit(1)
+
+    def receive():
         selector = selectors.DefaultSelector()
         for sock in socks:
             selector.register(sock, selectors.EVENT_READ)
@@ -861,14 +869,14 @@ def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
         stream = torch.cuda.Stream()
         contexts = {}
         for cur_iter, engine in engines.items():
-            for index, size in enumerate(sizes):
+            for index, rows in enumerate(sizes):
                 context = engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
                 context.set_optimization_profile_async(index, stream.cuda_stream)
-                context.set_input_shape("x", (size, 2, dim, dim))
+                context.set_input_shape("x", (rows, 2, dim, dim))
                 context.set_tensor_address("x", x.data_ptr())
                 context.set_tensor_address("y", y.data_ptr())
                 context.set_device_memory(memory.data_ptr(), scratch)
-                contexts[cur_iter, size] = context
+                contexts[cur_iter, rows] = context
         lanes.append((stream, x, y, hx, hy, hx.numpy().reshape(-1).view(np.uint8),
                       hy.numpy().reshape(batch, -1), contexts, memory))
     torch.cuda.synchronize()

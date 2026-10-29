@@ -10772,6 +10772,9 @@ then `R2D2_TRT_LANES=4`. Read `.probe/r224/ab-39497293.out` next round:
 compare `steady_evals_per_s` and log(Z), and check `r2d2-engine.txt` says
 "gathered" rather than "fallback".
 
+**Result (round 238).** No gain, and a bug in the first B arm. See
+[round 238](#round-238-negative-the-gathering-tensorrt-server-gives-no-search-speed-and-its-first-arm-hung).
+
 ## Round 225 (diagnostic): the whole-search stalls are PolyChord's root blocked creating its resume file on Lustre
 
 **Why.** GPU job 39497293 (round 224's gathering-server A/B) had not
@@ -11588,3 +11591,68 @@ the number of ranks. An R2D2 run leaves the same shape of dir (with
 Rows: `r236-sbase`, `r236-snew` (bench) and stage row `r236-prune-strip`
 in `benchmarks.jsonl`. Run directories are deleted; `.probe/r236/` keeps
 the script and logs.
+
+## Round 238 (negative): the gathering TensorRT server gives no search speed, and its first arm hung
+
+**Why.** This reads round 224's A/B, 1-GPU job 39497293 (gpu-q-43,
+A100-SXM4-80GB). It ran seed-4242 searches with `--nlive 48 --num-repeats 5
+--max-ndead 600` at 19 ranks x 2 threads on 32 CPUs, alternating today's
+shared server (A) and `R2D2_TRT_BATCH=8` (B). The 25 four-profile plans
+took 1,266 s to build once. They are cached under
+`$RI_WORK_DIR/.cache/ri/r2d2-trt/plans/...-b1-2-4-8`.
+
+**Bug.** Arm B1 never scored a point: it was killed at its 900 s cap
+while still "generating live points". In `serve_trt_gathered`, the loop
+`for index, size in enumerate(sizes)` that builds each lane's contexts
+overwrote the request `size`. That left it at 8, so `gather_forwards`
+read every SEQPACKET request with `recv(8)`. The kernel truncated the
+request to 8 bytes, and the 16-byte header unpack raised in the reader
+thread. Only the lanes had the `os._exit` guard, so the server stayed up
+with no reader, and every worker waited on its socket for ever.
+`self_check_trt_gathered` missed it because it drives `gather_forwards`
+with a fake forward and never calls `serve_trt_gathered`. The fix renames
+the loop variable to `rows`. The reader now also takes the server down on
+any exception, as a lane already did, so workers see a closed socket and
+fall back to the CPU (round 220) instead of hanging. It was applied
+mid-job, after A2 had started; A2 uses `serve_trt_shared`, which the
+fix does not touch, so B2 and C1 ran the fixed server.
+
+| arm | server | evals | wall s | start-up s | stall s | steady evals/s | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---|
+| A1 | shared, 19 lanes (default) | 9,182 | 117.4 | 11.9 | 8.4 | **94.55** | 0.0193405665097373 +/- 0.000642797829427586 |
+| B1 | gathered, batch 8, 2 lanes | 0 | 900 (cap) | - | - | hung (bug above) | - |
+| A2 | shared, 19 lanes (default) | 12,001 | 157.7 | 10.2 | 8.5 | **86.40** | 0.0185146212358272 +/- 0.000604130194794121 |
+| B2 | gathered, batch 8, 2 lanes | 8,614 | 122.7 | 18.9 | 0.0 | **83.00** | 0.0186554266665952 +/- 0.000652643949993908 |
+| C1 | gathered, batch 8, 4 lanes | 8,861 | 151.3 | 56.2 | 0.0 | **93.16** | 0.0189905115905253 +/- 0.000611129824384573 |
+
+- The four log(Z)s agree (spread 0.0008, about 1.3 sigma), so the
+  batched engines are acceptable for science. Speed is the problem.
+- The default's two arms average 90.5 steady evals/s, against 83.0 for
+  B2 and 93.2 for C1. Each arm is a single run, and the A arms alone
+  differ by 9%, so neither gathered arm is distinguishable from the
+  default. That is nowhere near round 223's predicted +50-80%. Start-up
+  is worse: 200 contexts per lane took 19 s at 2 lanes and 56 s at 4,
+  against 10-12 s.
+- Why the simulation missed (not proven): it put 1 ms between a client's
+  forwards. In R2D2 each forward is followed by that iteration's NUFFT
+  residual on the CPU, so a worker spends most of its time between
+  forwards, and the 19 workers are spread over 25 nets. Few requests for
+  the same net wait at once. The forward's cost to a worker is then one
+  round trip's latency, which batching does not cut, rather than card
+  throughput, which batching raises. C1 beating B2 points the same way:
+  more lanes (concurrency) helped, not bigger batches. Logging the mean
+  batch per lane would test this, but it is not worth a GPU job.
+- Decision: `R2D2_TRT_BATCH` stays opt-in at its default of 1, now
+  fixed. The GPU batching lever is closed for 1-GPU, 19-rank searches. A
+  batch server could only pay with many more workers per card (e.g.
+  several CPU nodes feeding one GPU), which is not how this repo runs.
+
+**Checks.** `scripts/test_self_checks.py`: 30 host self-checks pass
+(python3.12, Slurm off PATH), `self_check_trt_gathered` included. The
+fix touches only `r2d2_serve.py`'s opt-in path, which WSClean never
+imports, so no WSClean guard was needed.
+
+Rows: `r224-A1`, `r224-A2`, `r224-B2`, `r224-C1` (bench) and stage row
+`r238-trt-gathered-ab` in `benchmarks.jsonl`. `.probe/r224/` keeps the
+job script, its output and the four `summary-*.json`. The run directories
+are deleted.
