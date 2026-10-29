@@ -13724,3 +13724,51 @@ on 38 CPUs). The run's `run.env` confirms `R2D2_OMP_THREADS=2` and
 No code change. Rows: bench `r276-{d,a,b}{1,2,3}` and stage `r276-layout-ort`
 (every arm's figures and full-precision log(Z)) in `benchmarks.jsonl`. The run
 dirs are deleted, and the arm summary is `.probe/r276/run.out.gz`.
+
+## Round 278 (validation): rounds 263-276 in the production search; log(Z) agrees, 47.5 evals/s
+
+**Question.** Since round 263's validation, the record writer became append
+by default (round 264), resume and finish got faster (rounds 267-269), and
+the R2D2 pool now sees its thread settings and builds its 1-thread ORT
+sessions over shared arrays (rounds 273-274). Do these still converge to
+the same log(Z) in the production search, and at what speed?
+
+**Method.** Round 239's command unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs,
+`.probe/r278/run.sh`) on `101346b`, node cpu-q-124. Node load was 19 at the
+start and 50-75 for most of the run (round 263: 95-120).
+
+| | round 239 (`d41efab`) | round 263 (`8afee6e`) | round 278 (`101346b`) |
+| --- | ---: | ---: | ---: |
+| evaluations | 70,202 | 67,058 | 75,278 |
+| evals/s (= steady) | 51.2 | 44.9 | 47.5 |
+| request (`r2d2 container`) | 712 ms | 802 ms | 763 ms |
+| simulate | 26.6 ms | 38.7 ms | 33.3 ms |
+| idle | 0.0% | 0.5% | 0.4% |
+| first request | - | 5.61 s | 5.81 s |
+| peak memory | - | - | 8,342 MB |
+| post-run phases (pack) | 21.6 s (14.0 s) | 13.8 s (2.5 s) | 11.6 s (2.6 s) |
+| wrapper wall | 1,427 s | 1,514 s | 1,610 s |
+| files left in the run dir | 711 | 749 | 776 |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.01710037195271 +/- 0.000395823425917893 | 0.0172503990041623 +/- 0.000401752587890735 |
+| ndead, nlike | 1,488, 68,540 | 1,459, 65,526 | 1,457, 73,707 |
+
+**Results.**
+- log(Z) agrees: -0.27 sigma from round 239, +0.27 sigma from round 263 and
+  -0.07 sigma from round 252. No failures, stalls or meqserver wedges in
+  `run.log`. Rounds 263-276 are validated for results.
+- 47.5 evals/s sits between round 239 (51.2, load 120-145 on another node)
+  and round 263 (44.9, load 95-120). Request and simulate time track node
+  load as in round 263, so the speed is consistent with the raced A/Bs of
+  rounds 264-276 and shows no regression. It is 90% of round 205's ~53
+  evals/s DRAM ceiling.
+- The wall is longer (1,610 s) only because this async path drew 12% more
+  evaluations (nlike 73,707 against 65,526-68,540) for the same ndead: the
+  async order differs run to run, as rounds 246 and 248 saw.
+- Append records (round 264): the pack took 2.6 s with every rank's queue
+  at most 2 at the end, as with round 263's coalescing writer, so the
+  durability default cost nothing visible here.
+
+No code change. Rows: bench `r278-bigrun` and stage `r278-validation` in
+`benchmarks.jsonl`. `.probe/r278/` keeps the script, `summary.json`,
+`.stats`, the profile and the gzipped log. The run directory is deleted.
