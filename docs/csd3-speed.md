@@ -14253,3 +14253,51 @@ with status 2 after it had written `summary.json`. The cause was this round
 editing `run-nested-sampling-r2d2.sh` while that job was still executing it,
 and bash reads a script as it runs ("unexpected EOF" at line 566). The
 search itself was intact. Never edit a script that a running job executes.
+
+## Round 293 (measurement): more ranks per live point cost PolyChord evaluations; 4-node scaling corrected
+
+Round 292 left one thing unexplained. At `--max-ndead 600`, 4-node R2D2 needed
+40% of one node's likelihood calls (nlike 8,124 against 20,298). That run's
+late arm finished afterwards: n1b had nlike 19,838 and log(Z)
+0.0167115 ± 0.00067, the same as n1a. This round reproduced the effect without
+R2D2. It used pypolychord from `polychord.sif` with a 6-d Gaussian
+(σ 0.1 in the unit cube, analytic log(Z) -8.301), a 3 ms sleep for the
+likelihood, `num_repeats` 15 and oversubscribed `mpirun` on this node
+(`.probe/r293/toy.py`).
+
+At `max_ndead` 600 and nlive 300, nlike falls with the rank count: 21,983
+(8 ranks), 20,330 (38), 18,326 (77) and 14,327 (157). So the 4-node gap is
+PolyChord's, and the reason is truncation. A worker slices inside the
+contour it was handed, and that contour has risen by the time it returns.
+With many workers in flight, each dead point is cheaper but compresses less.
+Run to convergence, the sign flips:
+
+| nlive | ranks | workers/nlive | nlike (seeds 1, 2) | vs fewest ranks | ndead |
+| ---: | ---: | ---: | --- | ---: | --- |
+| 300 | 8 | 0.02 | 302,771, 306,085 | - | 4,784, 4,834 |
+| 300 | 38 | 0.12 | 318,165, 323,659 | +5.5% | 5,024, 5,071 |
+| 300 | 77 | 0.25 | 334,616, 342,538 | +11% | 5,307, 5,460 |
+| 300 | 157 | 0.52 | 369,142, 371,081 | +22% | 5,875, 5,928 |
+| 1200 | 38 | 0.03 | 1,239,017, 1,243,482 | - | 19,635, 19,660 |
+| 1200 | 157 | 0.13 | 1,287,895, 1,296,153 | +4.1% | 20,421, 20,553 |
+
+The overhead depends on workers/nlive, not on the rank count alone (157
+ranks cost +4.1% at nlive 1200 and +22% at nlive 300). It is about
+0.4 x workers/nlive. log(Z) errors are unchanged (0.131-0.136 at nlive 300,
+0.068 at 1200), and every log(Z) lies within ~1σ of -8.301 (full precision in
+the `r293-ranks-vs-nlive` row of `benchmarks.jsonl`).
+
+**What this means for multi-node R2D2.** Round 292's 4-node 3.57x is in
+evals/s. At nlive 300 (155 workers, ratio 0.52), a converged search needs
+~16% more evaluations than one node (ratio 0.13), so the time to converge
+improves ~3.1x, not 3.57x. Round 288's converged 2-node result (1,586 to
+790 s, with 77 workers at nlive 300) already includes this overhead. The
+cure is cheap, because memory does not depend on nlive: raise `--nlive` with
+`--nodes`. `run-nested-sampling-r2d2.sh` now warns on a multi-node launch
+whenever workers x 4 > nlive, and suggests an nlive that keeps the overhead
+under ~10%. Single-node runs are unchanged (no warning, no behaviour change),
+so no WSClean guard was needed. `docs/cluster.md` states the rule.
+
+Benchmarks that stop at a fixed `--max-ndead` and compare different rank
+counts are biased by this effect. Compare them in evals/s, or run them to
+convergence.

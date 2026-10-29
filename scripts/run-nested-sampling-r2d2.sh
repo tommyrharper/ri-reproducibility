@@ -187,6 +187,14 @@ if [ "${NS_NODES}" -gt 1 ] && [ "${NS_NODE_ROLE:-}" != pools ]; then
     exit 1
   fi
   ns_node_hosts="$(ns_expand_hostlist "${SLURM_JOB_NODELIST}" "${NS_NODES}")"
+  # A worker slices inside the contour it was handed, which has risen by the
+  # time it returns, so each dead point compresses less: a converged PolyChord
+  # run needs ~0.4 x workers/nlive more evaluations (round 293, toy likelihood;
+  # 4 nodes at nlive 300 is +22%). evals/s still scales; time-to-answer less.
+  ns_workers=$((NS_NODES * NS_MPI_PROCS - 1))
+  if [ "$((ns_workers * 4))" -gt "${NS_NLIVE}" ]; then
+    echo "WARNING: ${ns_workers} workers against --nlive ${NS_NLIVE}: PolyChord will need ~$((ns_workers * 40 / NS_NLIVE))% more evaluations to converge; --nlive $((ns_workers * 4)) or more keeps that under ~10% (docs/cluster.md)" >&2
+  fi
 fi
 # mpirun counts one slot per CPU and refuses -np past it.
 if [ "${NS_MPI_PROCS}" -gt "${HOST_CPUS}" ]; then
