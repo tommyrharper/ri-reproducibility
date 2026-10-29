@@ -13208,7 +13208,7 @@ in 153 s: log(Z) = 0.0165788375728644 +/- 0.0006268553649935, 618 dead,
   problem before they are a time problem. Before this change, a large run
   on a whole sapphire node could not resume, which also means self-heal
   could not restart it.
-- Most of rank 0's remaining 32 s at 400k is `json.loads` in a 32-thread
+- (Done in round 268.) Most of rank 0's remaining 32 s at 400k is `json.loads` in a 32-thread
   pool: a serial loop parses the 67k pack in 2.5 s, against 3.3 s through
   the pool. That is the next step if large resumes matter.
 - A `/dev/shm` HEAD worktree has its own `benchmarks.jsonl`, and
@@ -13217,3 +13217,56 @@ in 153 s: log(Z) = 0.0165788375728644 +/- 0.0006268553649935, 618 dead,
 - Rows: bench `r267-w{old,new}{1,2}` and stage `r267-resume-adopt`, which has
   every timing, the guard, and the kill/resume log(Z). Run dirs and the
   synthetic packs are deleted. Logs and scripts are in `.probe/r267/`.
+
+## Round 268: packed records are parsed off the read pool
+
+Round 267 left rank 0's resume cost to `json.loads` running in
+`read_evaluation_records`' 32-thread pool. A packed record needs no IO, and
+holding the GIL across 32 threads made the parsing slower, not faster. Now
+`_read_records` (`common.py`) sends only names that have a record file
+(flat, or a pre-round-92 `metrics.json` dir) through the pool, and the
+calling thread parses the packed ones while the pool is busy. This covers
+`read_evaluation_records` (resume adoption, `load_evaluations_from_dir`:
+summary, report, merge) and `gathered_and_earlier_records` (the finish).
+
+Synthetic packs from `.probe/r267/mk.py` (2.9 KB records from r159-base) on
+`/dev/shm`, single process in `polychord.sif`, HEAD and the change
+alternating. Records were checked with a sha of `[(name, record)]`, which
+was identical in every pair.
+
+| case | HEAD | change |
+| --- | ---: | ---: |
+| `read_evaluation_records`, 67k packed (3 pairs) | 4.48, 4.15, 3.90 s | 2.73, 2.77, 2.76 s |
+| same, 67k packed + 3k flat files | 4.75, 3.82, 4.58 s | 3.27, 3.32, 3.32 s |
+| same, 400k packed (1 pair) | 28.20 s | 19.02 s |
+| `adopt_completed_evaluations`, 67k packed (2 pairs) | 5.86, 5.44 s | 4.14, 4.15 s |
+
+That is -33% on the read and -27% on a production-sized adoption. At 400k,
+9 s comes off every resume and every self-heal restart.
+
+**WSClean guard** (shared code): `.probe/r268/ws.sh`, which is round 267's
+script raced against a HEAD (d7b86d6) worktree on `/dev/shm`: seed 229,
+nlive 100, 2 repeats, 2,000 max dead, synchronous, 19 ranks per half,
+halves swapped per pair.
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 37.16 | 36.94 (-0.6%) |
+| 2 | 37.50 | 37.56 (+0.1%) |
+
+Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms. The change arms' larger publish and
+flush writer-seconds come from where they ran (the RDS worktree against
+`/dev/shm`), not from the code, which a fresh search does not reach.
+
+**Learned.**
+- A GIL-bound map in a thread pool is slower than a plain loop. Keep the
+  pool for IO only: here 32 threads of `json.loads` cost ~1.4 s against
+  one thread at 67k records.
+- The rest of a 67k adoption is ~2.7 s of serial parse plus ~1.4 s of pack
+  read and params keys. A faster parser (orjson is not in the image) or
+  caching each record's key in the pack line are what is left, and neither
+  is worth an image rebuild at today's run sizes.
+- Rows: bench `r268-w{old,new}{1,2}` and stage `r268-record-read`. Run dirs,
+  packs and the HEAD worktree are deleted. Scripts and timings are in
+  `.probe/r268/`.

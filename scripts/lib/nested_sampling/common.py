@@ -1260,8 +1260,9 @@ def packed_record_texts(evaluations_dir: Path) -> dict[str, str]:
     return _read_record_pack(evaluations_dir)[0]
 
 
-def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
-    """(every evaluation name, a function reading one's record or None)."""
+def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any, dict[str, Path]]:
+    """(every evaluation name, a function reading one's record or None,
+    evaluation_record_paths())."""
     paths = evaluation_record_paths(evaluations_dir)
     packed = packed_record_texts(evaluations_dir)
 
@@ -1280,7 +1281,21 @@ def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
             return None
         return read_evaluation_record(path)
 
-    return sorted(paths.keys() | packed.keys()), read
+    return sorted(paths.keys() | packed.keys()), read, paths
+
+
+def _read_records(names: list[str], read: Any, files: dict[str, Path]) -> list[dict[str, Any] | None]:
+    """read() of each name. Only names with a record file go through the
+    pool: a packed one is a json.loads, which holds the GIL, so 32 threads
+    parsed the pack slower than this one does meanwhile (round 268)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    on_disk = [name for name in names if name in files]
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        pending = pool.map(read, on_disk)  # submitted now, run while this thread parses
+        records = {name: read(name) for name in names if name not in files}
+        records.update(zip(on_disk, pending))
+    return [records[name] for name in names]
 
 
 def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]]) -> int:
@@ -1431,12 +1446,9 @@ RECORD_READ_THREADS = 32
 
 def read_evaluation_records(evaluations_dir: Path) -> list[tuple[Path, dict[str, Any] | None]]:
     """(eval dir, record or None) for every eval-* entry, in name order."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    names, read = _record_reader(evaluations_dir)
-    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        records = pool.map(read, names)
-        return [(evaluations_dir / name, record) for name, record in zip(names, records)]
+    names, read, files = _record_reader(evaluations_dir)
+    records = _read_records(names, read, files)
+    return [(evaluations_dir / name, record) for name, record in zip(names, records)]
 
 
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
@@ -1446,13 +1458,10 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
 def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """The run's records in name order, as load_evaluations_from_dir() gives
     them, reading from disk only those not already in `written`."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    listed, read_one = _record_reader(evaluations_dir)
+    listed, read_one, files = _record_reader(evaluations_dir)
     names = set(listed)
     earlier = sorted(names - written.keys())
-    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        read = dict(zip(earlier, pool.map(read_one, earlier)))
+    read = dict(zip(earlier, _read_records(earlier, read_one, files)))
     _FINISHED_RECORDS.clear()
     for name in sorted(names | written.keys()):
         record = written.get(name) or read.get(name)
