@@ -66,6 +66,10 @@ if ns_should_submit; then
   export OUTPUT_DIR
   if [ "${R2D2_DEVICE}" = cuda ]; then
     NS_SLURM_GPUS=1
+  elif [ "${NS_MPI_PROCS:-0}" -ge 4 ]; then
+    # A sized CPU job spreads over both sockets, so the pool's per-socket
+    # copies switch on: +37% on sapphire (round 111), +26% on icelake (round 250).
+    export NS_SLURM_SOCKETS="${NS_SLURM_SOCKETS:-2}"
   fi
   NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }

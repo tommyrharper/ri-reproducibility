@@ -404,10 +404,11 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   `R2D2_WEIGHTS_PER_NODE=0` keeps one shared copy. A sized (`--mpi-procs`)
   R2D2 job can land on one socket, which turns this off; on one sapphire
   node, 56 CPUs split 28/28 ran 75 evals/s against 54 on one socket (+37%,
-  round 111), so for half a node set `NS_SLURM_SOCKETS=2`: the job asks
-  for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice the
-  shared memory (it may queue longer, ~30 minutes against ~3 in round 110,
-  though round 113's started at once). It is for R2D2 only: 56-rank
+  round 111; +26% on icelake, round 250), so a sized CPU R2D2 search
+  (`--mpi-procs` >= 4) submits with `NS_SLURM_SOCKETS=2` by default: the job
+  asks for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice
+  the shared memory (`sbatch --test-only` gives it the same start estimate as
+  one socket, round 250; `NS_SLURM_SOCKETS=1` keeps one). It is for R2D2 only: 56-rank
   WSClean ran the same either way (round 114), so a WSClean job need not wait
   for it.
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the

@@ -29,7 +29,8 @@ ns_should_submit() {
 # A sized job may land on one socket; NS_SLURM_SOCKETS=2 spreads its cores
 # over two (one task per socket, mpirun ignores the tasks) and counts the
 # shared memory once per socket, for the R2D2 pool's per-socket checkpoint
-# copies: 56 R2D2 CPUs split 28/28 ran +37% over one socket (round 111).
+# copies: 56 R2D2 CPUs split 28/28 ran +37% over one socket (round 111), so
+# run-nested-sampling-r2d2.sh defaults to it for sized CPU jobs (round 250).
 # NS_SLURM_GPUS=N (R2D2_DEVICE=cuda sets 1) asks for N GPUs on the ampere
 # partition instead, with the 32 cores per GPU CSD3 allows there: a GPU job is
 # charged in GPU hours, so the cores and their 8000MB each cost nothing extra.

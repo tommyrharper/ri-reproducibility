@@ -12237,3 +12237,54 @@ Stage row `r248-coalesce-recheck` and bench rows `r248-coal1/2`,
 Scripts, samples and gzipped logs are in `.probe/r248/`. The round 243 GPU
 race (job 39544674, output `.probe/r243/ab-39544674.out`) still had no
 output at ~04:45.
+
+## Round 250: sized R2D2 CPU jobs default to two sockets
+
+Round 249 submitted the question this node cannot answer, because all 38 of
+its CPUs are on NUMA node 0: does round 111's sapphire split (+37%) hold on
+icelake? An exclusive icelake node (job 39554885, cpu-q-127, commit ed95e23)
+ran 38-CPU R2D2 searches pinned with `taskset` either to 38 CPUs of socket 0
+(S) or to 19 + 19 across both (P). `R2D2_WEIGHTS_PER_NODE=auto` gives P one
+checkpoint copy and ONNX session set per socket and gives S one copy. The
+searches were async with 38 ranks x 1 thread, nlive 200, 5 repeats, 800 dead
+and seed 4242. The order was a discarded warm-up, then S P P S. Rows
+`r249-pin-*`; scripts in `.probe/r249/`.
+
+| run | CPUs | evals | evals/s | steady evals/s | ms per eval | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| warm-S (discarded) | 38/0 | 8,830 | 38.1 | 38.1 | 726 | 7,016 | 0.0176803896513862 +/- 0.000536954799123213 |
+| S1 | 38/0 | 8,623 | 50.6 | 50.6 | 734 | 7,018 | 0.0177660865473744 +/- 0.000548696286726532 |
+| P1 | 19/19 | 8,894 | 62.3 | 66.3 | 601 | 12,883 | 0.0178452563838658 +/- 0.000578845342925804 |
+| P2 | 19/19 | 8,719 | 56.2 | 59.6 | 604 | 13,104 | 0.0176170876679297 +/- 0.000546396226557011 |
+| S2 | 38/0 | 9,304 | 49.1 | 49.1 | 756 | 7,083 | 0.0177109331970481 +/- 0.000524522877461155 |
+
+**Learned.**
+- The split is worth **+26%** on icelake (steady 62.9 against 49.9 evals/s;
+  +31% and +21% for the two pairs), and ms per evaluation drops 18% (601-604
+  against 734-756). It is the same direction as sapphire's +37% and smaller.
+  The P arms' parent held 1.58M + 1.58M pages, one per NUMA node, and the S
+  arms' parent held 1.64M on node 0 only.
+- Peak memory nearly doubles (12.9-13.1 GB against 7.0 GB), as the two
+  copies predict.
+- All five log(Z)s agree within their errors (spread 0.0176-0.0178, sigma
+  ~0.00055).
+- Caveat, as in round 111: the other 38 CPUs were idle, so each socket had
+  spare L3 and memory bandwidth. A neighbour on a shared node will take some
+  of that back.
+- Queue cost, which held the default at one socket in round 112: `sbatch
+  --test-only` on icelake gave the same start estimate on the same node for
+  `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task 19` and `--ntasks 1
+  --cpus-per-task 38` (06:55 and 06:47 the next day). The split shape is not
+  predicted to wait longer.
+
+**Change.** `scripts/run-nested-sampling-r2d2.sh` now defaults
+`NS_SLURM_SOCKETS=2` when it submits a sized (`--mpi-procs` >= 4) CPU job.
+Whole-node, GPU and WSClean submissions are unchanged, and
+`NS_SLURM_SOCKETS=1` restores one socket. A fake `sbatch` on PATH confirmed
+the shapes: `./ri search r2d2 --mpi-procs 20` now asks for `--ntasks 2
+--ntasks-per-socket 1 --cpus-per-task 10 --mem 40096` (one extra 8000 MB
+shared budget), it asked for `--ntasks 1 --cpus-per-task 20 --mem 32096`
+with `NS_SLURM_SOCKETS=1`, and without `--mpi-procs` it still asks for
+`--exclusive`. No WSClean guard was needed, because only the R2D2 run
+script's submit branch changed. Stage row `r250-socket-split`. The
+`r249-pin-*` run directories are deleted.
