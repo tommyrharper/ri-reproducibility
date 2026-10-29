@@ -11714,7 +11714,7 @@ gap. This was already true before round 234: the backlog builds up during
 the search, and round 234 only cancels it at the end. So it is not a
 regression. A cheaper record store (one append file per rank instead of
 one create+rename per record) would fix it, but would touch eight readers
-(round 237). That is the next lever here, on durability rather than speed.
+(round 237). That is the next lever here, on durability rather than speed. (Corrected in round 242: a mid-search kill loses at most a couple of records; the end-of-run backlog does not exist mid-run.)
 
 Rows: `r239-bigrun` (bench) and stage row `r239-validation` (full
 precision log(Z)) in `benchmarks.jsonl`. `.probe/r239/` keeps the
@@ -11840,7 +11840,8 @@ All four arms reached ndead 448 (nlike 7,795, 7,676, 6,819, 6,625).
   times, so the raw pair-by-pair figures (+1.9%, -6.3%) mostly measure
   the two halves.
 - Async flat runs end with many more records held only in memory than
-  sync ones: 3,303 of 8,073 (41%) in pair 1. Append leaves 0-22.
+  sync ones: 3,303 of 8,073 (41%) in pair 1. Append leaves 0-22. (Round 242: only at the end; a kill -9 mid-search lost 2
+  of 5,779 records flat.)
 - Publish writer-s again rises 4-9x under append, with the same work. As
   round 240 found, writer-seconds measure the thread waiting for a CPU or
   the GIL. The cost probably comes from the writer thread competing for
@@ -11859,3 +11860,65 @@ record path is closed for speed.
 Rows: stage row `r241-record-append-async`, and bench rows `r241-aflat`,
 `r241-aapp`, `r241-aflat2` and `r241-aapp2`. Run directories are deleted.
 Gzipped logs and scripts are in `.probe/r241/`.
+
+## Round 242 (diagnostic): a killed search loses almost no records; rounds 239 and 241 misread the end-of-run backlog
+
+**Question.** Rounds 239 and 241 read the end-of-run "records queued"
+figure (3,303 of 8,073 in an async flat run, 33,144 of 70,202 in
+production) as records that exist only in rank memory for the whole run,
+so a mid-search kill would lose them. That was the case for making
+`NS_RECORD_APPEND=1` the default despite its ~2% cost. What does a kill
+-9 mid-search actually leave on disk, flat against append, and what does
+`./ri resume` then redo?
+
+**Method.** Round 241's async R2D2 shape (`--nlive 48 --num-repeats 5
+--mpi-procs 20`, `--max-ndead 600`, seed 242), flat (default) on CPUs
+0-36 raced against `NS_RECORD_APPEND=1` on 38-74 (`.probe/r242/arm.sh`,
+`arm2.sh`). Each search was killed -9 mid-run. The search log prints one
+line per scored evaluation, so "scored" below is exact; "on disk" is what
+`read_evaluation_records` finds (flat files plus the pack,
+`.probe/r242/count.py`).
+
+| kill | arm | scored | on disk | lost |
+| --- | --- | ---: | ---: | ---: |
+| 240 s, every process in one `kill` | flat | 5,779 | 5,777 | **2** |
+| 240 s, every process in one `kill` | append | 6,075 | 6,075 | **0** |
+| 210 s, launcher's process group only | flat | 4,875 | 4,894 | 0 |
+| 210 s, launcher's process group only | append | 5,003 | 5,022 | 0 |
+
+**Results.**
+- A mid-search kill loses at most a couple of records in either mode
+  (2 of 5,779 flat, the "last record or two" `docs/robustness.md` already
+  states). The end-of-run backlog is not the mid-run state: the same flat
+  shape, resumed to the end, again reported 1,587 records queued at its
+  finish. So the claim in rounds 239 and 241 that half a run's records
+  live only in memory is wrong, and so is `NS_RECORD_APPEND`'s durability
+  case. Why the queue builds up only at the end is not traced; one lead is
+  that the single writer thread runs `gate.wait` jobs (`common.py`), and
+  records queue behind a gated one.
+- Killing only the launcher's process group (what `kill -9` of `./ri`
+  does outside Slurm) leaves 62-64 processes of the run alive: the MPI
+  ranks and pools sit outside that group. They went on scoring for the
+  5 s until the script killed them (19 more records on disk than scored
+  lines). Slurm's cgroup kill does not have this gap.
+- What a resume redoes. After the first (group-only) kill both runs were
+  resumed with `./ri resume` (rc 0, 294-295 s each). Every evaluation
+  scored after PolyChord's last checkpoint is imaged again: the resumed
+  async sampler draws different points, so none of them is adopted (the
+  final archive has as many distinct parameter sets as records, 11,620
+  and 10,534, each the sum of both attempts). Flat was killed 2,110
+  evaluations past its checkpoint (nlike 2,765 against 4,875 scored),
+  append 265 (4,738 against 5,003). That is the kill's phase within a
+  checkpoint interval (~68 dead points here), not the record mode. A kill
+  costs up to one checkpoint interval of evaluations, half on average.
+- Both resumed runs finished: log(Z) 0.0164620242943086 +/-
+  0.000717897445059914 (flat, ndead 503, nlike 9,271) and
+  0.0165702887519633 +/- 0.000726415219078128 (append, ndead 532, nlike
+  9,911), within 0.1 sigma.
+
+**Decision.** No code change. `NS_RECORD_APPEND` stays opt-in, now
+without a durability argument: the default flat writer is already
+durable to within a couple of records at a kill.
+
+Stage row `r242-kill-records` is in `benchmarks.jsonl`. The run
+directories are deleted. Scripts and outputs are in `.probe/r242/`.
