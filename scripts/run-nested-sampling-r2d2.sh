@@ -238,6 +238,7 @@ else
     node=0
     for host in ${ns_node_hosts}; do
       mkdir -p "${SIMULATE_FIFO_DIR}/${host}" "${R2D2_FIFO_DIR}/${host}" "${OUTPUT_DIR}/.node-${host}"
+      rm -f "${OUTPUT_DIR}/.node-${host}/reset"
       for ((rank = node * NS_MPI_PROCS; rank < (node + 1) * NS_MPI_PROCS; rank++)); do
         mkfifo "${SIMULATE_FIFO_DIR}/${host}/${rank}.in" "${SIMULATE_FIFO_DIR}/${host}/${rank}.out"
         mkfifo "${R2D2_FIFO_DIR}/${host}/${rank}.in" "${R2D2_FIFO_DIR}/${host}/${rank}.out"
@@ -411,10 +412,30 @@ if [ "${NS_NODES}" -gt 1 ]; then
   OUTPUT_DIR="${OUTPUT_DIR_RUN}"
   if [ "${NS_NODE_ROLE:-}" = pools ]; then
     # Held until the launcher's srun ends this step; the trap removes the pools.
-    sleep infinity &
-    wait $!
+    # Before a retry the launcher asks, through a file, for this node's workers
+    # to be reset, as its own are (sidecar_reset_workers).
+    while sleep 1; do
+      if [ -e "${OUTPUT_DIR}/.node-${ns_host}/reset" ]; then
+        sidecar_reset_workers
+        rm -f "${OUTPUT_DIR}/.node-${ns_host}/reset"
+      fi
+    done
     exit 0
   fi
+  sidecar_reset_remote() {
+    local host waited=0
+    for host in ${others//,/ }; do
+      : >"${OUTPUT_DIR}/.node-${host}/reset"
+    done
+    while compgen -G "${OUTPUT_DIR}/.node-*/reset" >/dev/null; do
+      if [ "${waited}" -ge 30 ]; then
+        echo "sidecar_reset_remote: a node did not reset its workers in 30s" >&2
+        return 0
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+  }
   trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null || true' EXIT
   trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null; exit 130' INT
   trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null; exit 143' TERM

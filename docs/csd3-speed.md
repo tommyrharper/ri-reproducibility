@@ -13901,3 +13901,76 @@ The single-node path was smoke-tested at this change (`--mpi-procs 8
 `RUN_COMMAND` is now built in three pieces. The other changes are WSClean-inert
 (`NS_NODES` unset): slurm.sh's `--nodes "${NS_NODES:-1}"` and an R2D2-only
 except clause. The slurm self-check, test_cli.py and shellcheck 0.9.0.6 pass.
+
+## Round 288 (measurement): two nodes run a converged R2D2 search in half the time
+
+Round 287 made `./ri search r2d2 --nodes N` work; this round measures it.
+One 2-node icelake job (39603719, 2 x 38 CPUs, `.probe/r288/ab.sh`, nodes
+cpu-q-141/142) ran single-node and 2-node arms back to back, so both see the
+same nodes: `--nlive 150 --num-repeats 15 --seed 288`, the default 39 ranks
+per node, order s1 d1 d2 s2 at `--max-ndead 300`, then one converged 2-node
+search. The single-node arms run on the job's first node only.
+
+| arm | nodes | evals/s | wall s | nlike | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| s1 | 1 | 52.6 | 160.0 | 7236 | 0.0153636807030894 +/- 0.00151323758138805 |
+| d1 | 2 | 102.0 | 53.5 | 4121 | 0.0146976670966879 +/- 0.00205033363394707 |
+| d2 | 2 | 91.9 | 57.3 | 3988 | 0.0145814437135266 +/- 0.00207633957920502 |
+| s2 | 1 | 53.3 | 156.5 | 7164 | 0.0153284322771618 +/- 0.00151296680481375 |
+| conv | 2 | 99.1 | 790.4 | 75427 | 0.0168288512870019 +/- 0.000360325682981326 |
+
+- **Throughput scales.** Two nodes give 1.83x (short arms) to 1.88x
+  (converged, 99.1 against 52.9) one node's evals/s: 49.6 per node, 94% of
+  the single-node rate. The off-root node's simulate stage is a little slower
+  (37.6 ms mean against 31.7 on one node), and the ranks' MPI traffic now
+  crosses the network; neither costs much.
+- **The short arms' wall-time ratio (2.9x) overstates it.** To the same 450
+  dead points the 2-node search made 44% fewer likelihood calls. That is an
+  early-run effect: the converged 2-node search needed 75427 calls for 1690
+  dead, the same as round 278's single-node search (73707 for 1457). Compare
+  multi-node arms by evals/s, or by converged wall time.
+- **Converged:** 790 s against round 278's 1586 s on one half-node (a
+  different seed and node load, so the ratio is approximate: 2.0x). log(Z)
+  0.01683 +/- 0.00036 is 0.78 sigma from round 278's 0.01725 +/- 0.00040.
+
+**Fixes for multi-node runs that this round also ships** (none of them
+changes the single-node path):
+
+- Before a retry, `sidecar_reset_workers` now also kills the pid files in this
+  host's `.<pool>-workers/<host>/` directory. A pid in another host's
+  directory belongs to a process on that host, and is never killed here. It
+  then calls `sidecar_reset_remote` if one is defined. In a multi-node launch,
+  that function writes `.node-<host>/reset` for each other node, and waits up
+  to 30 s for the files to go. The pools step on each node checks for its
+  file once a second (one Lustre stat), resets its own workers, and removes
+  the file. The start-sidecars self-check covers the own-host and other-host
+  cases. The remote half has not yet run in a real retry: that needs a kill -9
+  test on 2 nodes, the next item.
+- `run.env` records `NS_NODES` when it is above 1, so `./ri resume` submits
+  and relaunches on as many nodes. Before this, a 2-node run resumed on one
+  node. The run-config self-check covers both cases.
+
+**Sharp edge seen:** arm s1 ended with exit 2 after the search had finished
+(`unexpected EOF` at line 564). The fixes above were edited into
+`run-nested-sampling-r2d2.sh` while s1's bash was still reading it, and bash
+reads a script as it runs. Its summary was complete, and its bench row was
+added afterwards with `bench.py record`. Never edit a script that a running
+job is executing.
+
+**WSClean guard** (`start-sidecars.sh`, `run-config.sh` and the run script are
+shared): `.probe/r288/ws.sh`, round 269's script raced against a HEAD
+(139345e) worktree on `/dev/shm`, halves swapped by pair:
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 38.93 | 36.91 (-5.2%) |
+| 2 | 36.56 | 39.59 (+8.3%) |
+
+Mean +1.3%, which is within noise; the sign flips with the CPU half. Chains
+are bit-identical in both pairs, and log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms. The changed code runs only on a
+retry, or writes `NS_NODES` only when it is above 1.
+
+Still open: kill -9 plus `./ri resume` on 2 nodes, which would also exercise
+the remote reset; the stall watchdog's `pkill`, which still reaches only the
+launcher node; and `./ri health` / `./ri runs` on a multi-node run.

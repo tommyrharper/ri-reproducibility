@@ -174,9 +174,11 @@ are a second `srun --mpi=pmix` step rather than the image's `mpirun`, which
 cannot reach another node. A FIFO on Lustre is a pipe on each node by itself,
 so each host's ranks and pools meet in `.r2d2-workers/<host>/` and
 `.simulate-workers/<host>/`; pool logs are in `.node-<host>/`. Only rank 0's node
-holds the chains tmpfs and its Lustre mirror. Not yet covered: a retry resets
-only the launcher node's workers, and no speedup is measured yet
-(docs/csd3-speed.md, round 287).
+holds the chains tmpfs and its Lustre mirror. Before a retry each other node
+resets its own workers when the launcher drops a `.node-<host>/reset` file, and
+`run.env` keeps `NS_NODES`, so `./ri resume` comes back on as many nodes. Two
+icelake half-nodes ran a converged search in half the wall time of one, at 94%
+of the single-node rate per node (docs/csd3-speed.md, rounds 287-288).
 
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit
