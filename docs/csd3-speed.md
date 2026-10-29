@@ -12638,3 +12638,77 @@ run dirs.
 
 Rows: `r257-weights-cache` stage row and the new arm's `r257-abb` rows in
 `benchmarks.jsonl`. Run dirs deleted.
+
+## Round 258: requests on more than one thread run ONNX Runtime, not torch
+
+**Question.** Round 257's queued sapphire job races 113 x 1 against 57 x 2.
+But `load_net` hands any request running more than one torch thread back
+to torch (round 141), so its 57 x 2 arm would have compared torch with
+ORT, not one layout with another. The same fallback covers every async
+run's tail, where `r2d2_thread_count` widens requests up to
+`R2D2_MAX_THREADS` (16).
+
+**Stage** (`.probe/r258/fwd.py`, `mem.py`, N1 and N13 U-Net, 32 x 32,
+`r2d2.sif`, icelake):
+
+| threads | 1 | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ORT (saved optimised graph), ms | 16.5 | 9.0 | 5.5 | 3.9 | 4.2 |
+| torch, ms | 28.3 | 16.5 | | | |
+
+ORT's output is bit-identical at every one of these thread counts. A
+pool thread does not survive fork, so a multi-thread session has to be
+built in the worker. Loading the 25 graphs there costs 2.9 GB of private
+memory and 1.8 s per worker (`add_external_initializers` copies too). With
+`add_initializer` over arrays the pool parent made before the fork, on a
+graph whose weights are declared external (0.8 MB for all 25), a worker
+builds the 25 sessions in 0.34 s for +0.25 GB, still bit-identical
+(`.probe/r258/share.py`). The arrays must be 64-byte aligned. At numpy's
+default alignment the 1-thread forward is 19.2 ms against 16.5 ms.
+
+**Change.** `r2d2_serve.py`: when a run's requests can take more than one
+thread (`R2D2_OMP_THREADS` or `R2D2_MAX_THREADS` > 1, i.e. every async
+run), `patch_onnx_network` also keeps each optimised graph's weights as
+aligned OrtValues (`ort_shared_parts`; one set per NUMA node, like the
+sessions; ~2.9 GB per set in the pool parent, not per rank). `load_net`
+gives a request on N > 1 threads `threaded_session(cur_iter, N)`, built on
+first use in the worker. N is floored to a power of two, and every count's
+sessions are kept (at most four sets, ~1 GB). R3D3 keeps torch. The image
+self-check `threaded_session` checks bit-identity with a file-loaded
+session and the per-count cache.
+
+**A/B, 19 ranks x 2 threads** (async, nlive 100, 150 dead, seed 196,
+interleaved ab ba ab ba against HEAD in a `/dev/shm` worktree; every
+request here is a 2-thread request):
+
+| pair | 0 | 1 | 2 | 3 |
+| --- | ---: | ---: | ---: | ---: |
+| evals/s, HEAD (torch) | 21.94 | 21.31 | 21.53 | 21.90 |
+| evals/s, new (ORT) | 27.27 | 27.54 | 28.64 | 28.30 |
+| mean request s, HEAD | 0.742 | 0.748 | 0.754 | 0.745 |
+| mean request s, new | 0.575 | 0.576 | 0.555 | 0.563 |
+
+That is **+29% evals/s**, with the request 24% shorter and search wall
+29.5 s against 23.3 s (4 of 4 pairs). The new arm's `steady_evals_per_s`
+(39-41) exceeds its `evals_per_s` because its first requests build
+sessions. Compare `evals_per_s` here. log(Z) is 0.01444-0.01477 for HEAD
+and 0.01435-0.01492 for new. Async runs do not repeat, and the U-Net
+moves from torch to ORT, which already differs by ~1e-5 of the peak
+(round 141), so the results are agreeing rather than bit-identical.
+
+**Guard, default layout** (39 x 1 async, otherwise the same). Here only
+the tail's requests change. The first version kept one thread count per
+worker and lost 4 of 5 pairs by ~1.5% (32.65-33.37 against 33.09-33.79
+evals/s), because the tail changes the count request by request and each
+change rebuilt 25 sessions. With power-of-two counts all kept, it won 3
+of 4 pairs: 33.53 against 32.52 evals/s mean (+3.1%, inside the ~5%
+noise, load 45-56). So the default is not slowed. The 1-thread path and
+synchronous runs (`R2D2_MAX_THREADS` = `R2D2_OMP_THREADS` = 1) are untouched.
+The change is in `r2d2_serve.py` only, so WSClean is not affected.
+
+**Consequence for job 39563276.** It runs this worktree when it starts,
+so its 57 x 2 arm now runs ORT at 2 threads. It is now the layout A/B it
+was meant to be. Read it as in round 257.
+
+Rows: `r258-ab{a,b}` and `r258-def{a,b}` bench rows and the
+`r258-threaded-ort` stage row in `benchmarks.jsonl`. Run dirs deleted.

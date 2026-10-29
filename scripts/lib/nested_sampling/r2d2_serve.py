@@ -273,6 +273,14 @@ ONNX_DIR = Path(os.environ.get("R2D2_ONNX_DIR", "/opt/r2d2-onnx"))
 # with per-node checkpoints, one such set per NUMA node.
 _ORT_SESSIONS: dict[int, object] = {}
 _NODE_ORT_SESSIONS: dict[int, dict[int, object]] = {}
+# For requests on more than one thread (round 258): per iteration, the
+# optimised graph without its weights and the weights as 64-byte-aligned
+# arrays, made in the pool parent (per NUMA node, like the sessions) so a
+# worker's multi-thread sessions share them. A pool thread does not survive
+# fork, so those sessions are built in the worker and kept.
+_ORT_SHARED: dict[int, tuple] = {}
+_NODE_ORT_SHARED: dict[int, dict[int, tuple]] = {}
+_ORT_THREADED: dict[tuple[int, int], object] = {}
 
 
 class OrtNet:
@@ -380,8 +388,10 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
     and its session built here, before the fork: one intra-op thread starts no
     pool threads, so it survives the fork and every worker shares its pages.
-    A request running more than one torch thread (the tail of an async run)
-    keeps torch, which threads; so does R3D3 (layers > 1).
+    A request running more than one torch thread (the tail of an async run,
+    or R2D2_OMP_THREADS > 1) gets a session of that many threads built in the
+    worker over the parent's weights (threaded_session, round 258); R3D3
+    (layers > 1) keeps torch.
     """
     import torch
 
@@ -428,6 +438,14 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     def build() -> dict[int, object]:
         return {cur_iter: session(cur_iter) for cur_iter in range(1, num_iter + 1)}
 
+    # Only a run whose requests can take more than one thread (async, or
+    # R2D2_OMP_THREADS > 1) pays the arrays' memory, ~2.9GB per set.
+    threaded = max(int(os.environ.get(name) or 1) for name in ("R2D2_OMP_THREADS", "R2D2_MAX_THREADS")) > 1
+
+    def build_shared() -> dict[int, tuple]:
+        return {cur_iter: ort_shared_parts(optimised / f"N{cur_iter}.onnx")
+                for cur_iter in range(1, num_iter + 1)} if threaded else {}
+
     # Where the torch checkpoints went, the sessions' weights go too: a set
     # per NUMA node when load_checkpoints made one (enter_node swaps it in),
     # else one set interleaved across the job's nodes (round 149).
@@ -436,14 +454,17 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
             bound = set_mempolicy(2, [node])  # MPOL_BIND
             try:
                 _NODE_ORT_SESSIONS[node] = build()
+                _NODE_ORT_SHARED[node] = build_shared()
             finally:
                 if bound:
                     set_mempolicy(0, [])
         # Like _CHECKPOINT_CACHE, the parent keeps the last node's set.
         _ORT_SESSIONS.update(_NODE_ORT_SESSIONS[node])
+        _ORT_SHARED.update(_NODE_ORT_SHARED[node])
     else:
         with interleaved_pages():
             _ORT_SESSIONS.update(build())
+            _ORT_SHARED.update(build_shared())
 
     optimiser = sys.modules["optimiser.R2D2"]
     upstream_load_net = optimiser.load_net
@@ -451,14 +472,74 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     def load_net(net, cur_iter, layers, dnn_dict):
         if isinstance(net, OrtNet):
             net = net.torch_net
-        session = _ORT_SESSIONS.get(int(cur_iter))
-        if layers != 1 or session is None or torch.get_num_threads() > 1:
+        threads = torch.get_num_threads()
+        session = _ORT_SESSIONS.get(int(cur_iter)) if threads == 1 else threaded_session(int(cur_iter), threads)
+        if layers != 1 or session is None:
             return upstream_load_net(net, cur_iter, layers, dnn_dict)
         wrapper = OrtNet(session)
         wrapper.torch_net = net
         return wrapper
 
     optimiser.load_net = load_net
+
+
+def ort_shared_parts(path: Path) -> tuple:
+    """`path`'s graph with its weights declared external, and the weights as aligned OrtValues."""
+    import numpy as np
+    import onnx
+    import onnxruntime as ort
+    from onnx import numpy_helper
+
+    def aligned(array):
+        # numpy's 16-byte alignment costs MLAS 15% at 1 thread; 64 matches a file-loaded session.
+        buffer = np.empty(array.nbytes + 64, np.uint8)
+        offset = -buffer.ctypes.data % 64
+        out = buffer[offset:offset + array.nbytes].view(array.dtype).reshape(array.shape)
+        out[...] = array
+        return out
+
+    model = onnx.load(str(path))
+    names, values = [], []
+    for tensor in model.graph.initializer:
+        names.append(tensor.name)
+        values.append(ort.OrtValue.ortvalue_from_numpy(aligned(numpy_helper.to_array(tensor))))
+        for field in ("raw_data", "float_data", "int32_data", "int64_data", "double_data"):
+            tensor.ClearField(field)
+        tensor.data_location = onnx.TensorProto.EXTERNAL
+        entry = tensor.external_data.add()
+        entry.key, entry.value = "location", "shared"
+    return model.SerializeToString(), names, values
+
+
+def threaded_session(cur_iter: int, threads: int):
+    """A `threads`-thread session over the parent's weights, or None (no shared parts).
+
+    ORT's output is bit-identical at 1-16 intra-op threads, and at 2 threads
+    its forward takes 9.2ms against torch's 16.5ms (round 258). add_initializer
+    uses the arrays in place: 25 sessions build in 0.34s for ~0.25GB. An
+    async tail changes the count request by request, so it is floored to a
+    power of two and every count's sessions are kept: at most four sets.
+    """
+    parts = _ORT_SHARED.get(cur_iter)
+    if parts is None:
+        return None
+    threads = 1 << (threads.bit_length() - 1)
+    session = _ORT_THREADED.get((cur_iter, threads))
+    if session is None:
+        import onnxruntime as ort
+
+        graph, names, values = parts
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = threads
+        options.inter_op_num_threads = 1
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        options.enable_cpu_mem_arena = False
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        for name, value in zip(names, values):
+            options.add_initializer(name, value)
+        session = _ORT_THREADED[(cur_iter, threads)] = ort.InferenceSession(
+            graph, options, providers=["CPUExecutionProvider"])
+    return session
 
 
 # Where the run script binds tensorrt-cu13 and the GPU's plans (R2D2_RUNTIME=trt).
@@ -1057,6 +1138,8 @@ def enter_node(node: int, nodes: dict[int, list[int]]) -> None:
     if node in _NODE_ORT_SESSIONS:
         _ORT_SESSIONS.clear()
         _ORT_SESSIONS.update(_NODE_ORT_SESSIONS[node])
+        _ORT_SHARED.clear()
+        _ORT_SHARED.update(_NODE_ORT_SHARED.get(node, {}))
 
 
 def warm_imports() -> None:
@@ -1991,6 +2074,48 @@ def self_check_checkpoint_series() -> None:
     print("r2d2 checkpoint series self-check passed")
 
 
+def self_check_threaded_session() -> None:
+    """A multi-thread session over shared weights matches a file-loaded one bit for bit."""
+    try:
+        import numpy as np
+        import onnx
+        import onnxruntime as ort
+        from onnx import helper, numpy_helper
+    except ImportError:  # r2d2.sif without the run script's onnxruntime
+        print("threaded_session: skipped, no onnxruntime")
+        return
+    import tempfile
+
+    rng = np.random.default_rng(0)
+    weight = numpy_helper.from_array(rng.standard_normal((8, 2, 3, 3)).astype(np.float32), "w")
+    graph = helper.make_graph([helper.make_node("Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1])], "g",
+                              [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 2, 32, 32])],
+                              [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, None)], [weight])
+    x = rng.standard_normal((1, 2, 32, 32)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "N1.onnx"
+        onnx.save(helper.make_model(graph, ir_version=8, opset_imports=[helper.make_opsetid("", 17)]), str(path))
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = options.inter_op_num_threads = 1
+        # As patch_onnx_network loads its saved optimised graphs.
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        expected = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+        _ORT_SHARED.clear()
+        _ORT_THREADED.clear()
+        try:
+            assert threaded_session(1, 2) is None
+            _ORT_SHARED[1] = ort_shared_parts(path)
+            for threads in (2, 3, 4):
+                session = threaded_session(1, threads)
+                assert threaded_session(1, threads) is session
+                assert np.array_equal(session.run(None, {"x": x})[0], expected)
+            assert list(_ORT_THREADED) == [(1, 2), (1, 4)]  # 3 runs on 2
+        finally:
+            _ORT_SHARED.clear()
+            _ORT_THREADED.clear()
+    print("threaded_session: ok")
+
+
 def self_check_net_reuse() -> None:
     calls = []
     optimiser = types.ModuleType("optimiser.R2D2")
@@ -2209,6 +2334,7 @@ if __name__ == "__main__":
         self_check_lazy_utils()
         self_check_checkpoint_cache()
         self_check_checkpoint_series()
+        self_check_threaded_session()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
