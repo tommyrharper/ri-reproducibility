@@ -12307,3 +12307,58 @@ passes, and `bash scripts/lib/progress-bar.sh` (its self-check, a CI step)
 passes. Behaviour is byte-for-byte the same, so no WSClean guard is needed.
 To lint as CI does from a compute node:
 `uvx --from shellcheck-py==0.9.0.6 shellcheck -x scripts/*.sh scripts/lib/*.sh`.
+
+## Round 252 (validation): the two-socket default in the production search, +15%
+
+**Question.** Round 250 made sized R2D2 CPU submissions default to two
+sockets, from short searches on an exclusive node whose other socket was
+idle. Does the gain hold in the production search on a shared icelake node,
+submitted the way a user's `./ri search` submits it, and does log(Z) still
+agree?
+
+**Method.** Round 239's command (seed 190182240, nlive 150, 15 repeats,
+async, to convergence) on `8cac391`, with `--mpi-procs 38`, submitted through
+`ns_submit_run` from this job with `SLURM_JOB_ID` unset (`.probe/r252/submit.sh`).
+The default asked for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task 19`
+on icelake. Job 39555976 started at once on cpu-q-112, a node shared with
+other jobs. The baseline is round 239: the same command on one socket (this
+gnhf job's 38 CPUs, all on NUMA node 0), 39 ranks, node load 120-145. The two
+runs were not raced, so node load differs between them.
+
+| | round 239 (one socket, `d41efab`) | round 252 (two sockets, `8cac391`) |
+| --- | ---: | ---: |
+| ranks (workers) | 39 (38) | 38 (37) |
+| evaluations | 70,202 | 82,504 |
+| search span | 1,372.1 s | 1,410.0 s |
+| steady evals/s | 51.2 | **58.8** |
+| ms per evaluation | 739 | **630** |
+| startup | 0.0 s | 7.8 s |
+| idle fraction | 0.0 | 0.0001 |
+| peak memory | 7.2 GB | 13.0 GB |
+| post-run phases (pack) | 21.6 s (14.0 s) | ~15 s (4.3 s) |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.0172910867005174 +/- 0.000406752036020735 |
+| ndead, nlike | 1,488, 68,540 | 1,461, 80,834 |
+
+**Results.**
+- Steady evals/s is **+15%** (58.8 against 51.2) with one fewer worker, so
+  +18% per worker. ms per evaluation is 630, close to round 250's exclusive
+  split arms (601-604) and well below its one-socket arms (734-756) and
+  round 239's 739. A shared node gave back some of the exclusive +26%, as
+  round 250 expected, and different node loads blur the exact figure.
+- log(Z) agrees with round 239 within 0.20 sigma and with round 233
+  (0.0172880612106121 +/- 0.000403960591240749) within 0.005 sigma.
+- No stalls, 0 failures, 0 meqserver wedges, busy share ~1.0. Peak memory
+  13.0 GB is the expected two per-socket copies, well inside the job's
+  58 GB `--mem`.
+- The job started at once on the shared queue, so the two-socket shape cost
+  no queue time here either.
+- Side note: `./ri health` run from this node with the squeue shim on PATH
+  reported the live job as "STOPPED", because the shim says no jobs are
+  queued and the ranks are on another node. That is an artefact of the shim:
+  real `squeue` sees the job. Don't read liveness from health under the shim
+  for a run on another node.
+
+The default stays. Rows: bench `r252-split` and stage
+`r252-split-validation` (full-precision log(Z) for both runs). `.probe/r252/`
+keeps the submit script, `summary.json`, `.stats`, and gzipped job output and
+run log. The run directory is deleted.
