@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 315; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 316; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -46,7 +46,11 @@ the Hetzner host.
     chains cost 9% more each under adoption, which the toy's never did,
     even with plateaus, two modes or 9x-varying evaluation time. Opt-in
     only; whether to default it is the user's call
-    ([round 315](#round-315-the-contour-patch-saves-4-of-r2d2-evaluations-over-3-raced-seeds-not-the-toys-14)).
+    ([round 315](#round-315-the-contour-patch-saves-4-of-r2d2-evaluations-over-3-raced-seeds-not-the-toys-14)). The extra cost is R2D2's:
+    its calls per slice step rise ~3x as the contour climbs (the toy's are
+    flat), so a chain on an adopted, higher contour pays more per step; no
+    slice-width fix can recover it
+    ([round 316](#round-316-diagnostic-adopted-r2d2-chains-cost-more-because-r2d2s-cost-per-slice-step-rises-with-the-contour)).
     `./ri bench` prints this as `converging evals/s`; judge rank and layout
     A/Bs on it at the production nlive
     ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
@@ -15220,3 +15224,75 @@ Bench rows `r313-a{0,1}-s{seed}` and stage row `r315-adopt-3seed` in
 `benchmarks.jsonl`. `.probe/r313/` keeps the per-task stats, rows,
 summaries and dead-birth files (console logs gzipped); `../frozen-r313` is
 removed. GPU job 39654485 (round 303) still has no output.
+
+## Round 316 (diagnostic): adopted R2D2 chains cost more because R2D2's cost per slice step rises with the contour
+
+**Question.** Round 315 found that under `NS_ADOPT_CONTOUR=1` each R2D2
+chain costs 9% more likelihood calls, which no toy reproduced. Is that
+a flaw in the patch (e.g. a slice width set at the chain's start that is
+too wide after adoption), or a property of R2D2's likelihood?
+
+**Method.** A probe-only PolyChord build (`.probe/r316/chain-log.diff` on
+top of `docker/polychord/patches/0001`, built in a fakeroot sandbox and
+layered over `polychord.sif` as in round 313; not shipped) writes one line
+per chain when `PC_CHAIN_LOG` is set: start and final contour, seed and
+final logL, the step it first adopted, and calls before and after
+adoption. Two R2D2 searches ran one after the other in the gnhf job on
+cpu-q-190 (seed 190182240, nlive 150, 15 repeats, 39 ranks,
+`--max-ndead 600`, which stops at 750 dead): `NS_ADOPT_CONTOUR` 0 then 1.
+Round 315's 6-d toy (seed 101, converged) ran with both settings for
+reference. `.probe/r316/ana*.py` reads the logs; the raw logs are in
+`.probe/r316/chain-logs.tgz`. The last chain of each rank is cut off by
+the stop signal and is dropped.
+
+| | chains | nlike / chain | calls / slice step |
+| --- | ---: | ---: | --- |
+| R2D2 stock | 525 | 51.7 | 3.45 |
+| R2D2 adopt | 527 | 54.0 | 2.60 before adopting, **3.71** after |
+| toy stock | 2,783 | 67.5 | 4.50 |
+| toy adopt | 2,392 | 67.2 | 4.03 before adopting, **4.51** after |
+
+Every chain in both adopt runs adopts, on average at step 2.2 (toy) or 2.6
+(R2D2). Calls per step against the chain's start contour, binned in
+sextiles of the stock run's contours:
+
+| contour sextile | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| R2D2 stock | 1.55 | 2.34 | 3.68 | 4.23 | 4.64 | 4.25 |
+| R2D2 adopt | 1.64 | 2.49 | 3.95 | 4.51 | 4.63 | 4.66 |
+| toy stock | 2.77 | 4.58 | 4.92 | 4.90 | 4.89 | 4.93 |
+| toy adopt | 2.78 | 4.63 | 4.91 | 4.91 | 4.90 | 4.88 |
+
+**Results.**
+- R2D2's cost per slice step climbs ~3x over the first 750 dead points
+  (1.55 -> ~4.6 calls), steadily through the run. The toy's climbs only in
+  its first sixth (the phase where the prior box, not the likelihood,
+  bounds the slice; points outside the box cost no call) and is then flat
+  at 4.9. R2D2's likelihood is nearly flat (log(Z) = 0.017), so the box
+  stays the binding edge in many directions for far longer.
+- Adopting moves a chain to a newer, higher contour. Where cost per step
+  rises with the contour, that costs more per step: +5-10% within the same
+  sextile in R2D2 (roughly the slope over the ~36 dead points a chain's
+  ~27 s spans), against 0-1% in the toy's flat phase. That is round 315's
+  +9% per chain. A stock chain also costs this much once the contour
+  reaches that height; adoption brings the cost forward.
+- So it is not a flaw in the patch, and rescaling the slice width on
+  adoption, round 315's candidate, cannot recover it: the chain's region
+  shrinks by ~exp(-36/150) in volume, a ~2-3% change in linear width in
+  R2D2's dimensions, while the extra calls come from the binding edge
+  changing from the prior box to the likelihood.
+- At 750 dead the adopt run spent +4.0% nlike (28,425 vs 27,321) for the
+  same dead points (with fewer of them wasted, so more useful ones); the
+  partial log(Z)s agree (0.0168735 +/- 0.00048 vs 0.0170246 +/- 0.00043).
+  These short runs are probes, not an A/B of wall time (arms ran in
+  sequence on a node at load 30-68).
+
+**Decision.** No change: round 315's -4.0% is what contour adoption buys
+on R2D2 at 38 workers, and it stays opt-in for the user to decide. At 76
+workers (two nodes) both the waste the patch removes and the contour
+advance per chain double, so this does not predict a bigger relative
+saving there; only a 2-node raced A/B would say.
+
+Stage row `r316-chain-cost` in `benchmarks.jsonl`; bench rows `r316-a0`
+and `r316-a1`. The run directories, the sandbox and `/dev/shm/r316` are
+deleted.
