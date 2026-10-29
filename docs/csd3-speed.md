@@ -11656,3 +11656,67 @@ Rows: `r224-A1`, `r224-A2`, `r224-B2`, `r224-C1` (bench) and stage row
 `r238-trt-gathered-ab` in `benchmarks.jsonl`. `.probe/r224/` keeps the
 job script, its output and the four `summary-*.json`. The run directories
 are deleted.
+
+## Round 239 (validation): rounds 234-236 in the production search, post-run drain 60 s -> 0.3 s
+
+**Question.** Rounds 234-236 cancel unstarted record writes and held
+publishes at the end of a run, and strip pruned extremes' dirs. They were
+guarded on WSClean only. What do they do in the production R2D2 search,
+and does log(Z) still agree?
+
+**Method.** Round 233's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs),
+on `d41efab` (`.probe/r239/run.sh`). The node was busy with other jobs:
+load 23 at the start and 120-145 for most of the run.
+
+| | round 233 (`5c7b03c`) | round 239 (`d41efab`) |
+| --- | ---: | ---: |
+| evaluations | 77,526 | 70,202 |
+| search span | 1,595.6 s | 1,372.1 s |
+| evals/s (= steady) | 48.6 | **51.2** |
+| request (`r2d2 container`) | 743 ms | 712 ms |
+| busy share of 38 workers | 0.995 | 0.995 |
+| worker-s lost below 38 in flight | 327 | 257 |
+| windows > 5 s below 34 in flight | 0 | 0 |
+| post-run drain (rank 0 / slowest rank) | 60.0 s / - | **0.3 s / 0.4 s** |
+| pack | 43.9 s | 14.0 s |
+| all post-run phases | 112.4 s | 21.6 s |
+| wrapper wall | 1,716 s | **1,427 s** |
+| files left in the run dir | 9,537 | **711** |
+| log(Z) | 0.0172880612106121 +/- 0.000403960591240749 | 0.0174042104464403 +/- 0.000408942281146939 |
+| ndead, nlike | 1,471, 75,436 | 1,488, 68,540 |
+
+**Results.**
+- The drain is gone: 0.3 s on rank 0 and 0.4 s on the slowest rank,
+  against 60.0 s. All post-run phases together take 21.6 s against 112.4 s,
+  and the pack takes 14.0 s against 43.9 s, because it no longer reads and
+  unlinks tens of thousands of flat records. That is 91 s saved per run
+  (5.3% of round 233's wrapper wall).
+- What the end of the run cancelled: 33,144 record writes (47% of the
+  run's 70,202 records) and 1,924 held publishes. Queued at the end were
+  1,068 jobs on the busiest rank. The writers spent 49,159 s on records
+  across 39 ranks (~1,260 s per rank in a 1,372 s span), so on this
+  Lustre the record writers are saturated for the whole run.
+- The run dir keeps 711 files against 9,537 (-93%), which is round 236's
+  strip on R2D2 (`r2d2/` dirs) plus no flat records left behind.
+- Busy share and the search itself are unchanged: 0.995, no window below
+  34 in flight. evals/s is 51.2 against 48.6 because the request was 712
+  ms against 743 ms, which is node load, not these rounds.
+- log(Z) agrees with round 233 within 0.20 sigma (difference 0.000116,
+  combined error 0.000575), and with round 230 within 0.36 sigma.
+
+**Cost found.** Because the writers stay saturated, about half of a
+run's records (33,144 of 70,202 here, ~11 minutes of search) exist only
+in rank memory until the final pack. If a run is killed mid-search, those
+records are missing from its archive. PolyChord's own checkpoints are
+unaffected, and this round did not test what `./ri resume` does with the
+gap. This was already true before round 234: the backlog builds up during
+the search, and round 234 only cancels it at the end. So it is not a
+regression. A cheaper record store (one append file per rank instead of
+one create+rename per record) would fix it, but would touch eight readers
+(round 237). That is the next lever here, on durability rather than speed.
+
+Rows: `r239-bigrun` (bench) and stage row `r239-validation` (full
+precision log(Z)) in `benchmarks.jsonl`. `.probe/r239/` keeps the
+script, the profile, `.stats`, and gzipped `summary.json` and log. The run
+directory is deleted.
