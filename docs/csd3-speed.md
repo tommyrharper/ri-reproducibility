@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 313; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 315; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -40,8 +40,13 @@ the Hetzner host.
     ([round 312](#round-312-a-polychord-patch-that-adopts-the-newest-contour-mid-chain-cuts-async-evaluations-14-38-workers-and-22-76-with-unbiased-logz)).
     In the converged production R2D2 search it agrees on log(Z) (+0.15
     sigma) with 11% fewer dead points but only ~6% fewer evaluations, one
-    run; a 3-seed raced array is queued
-    ([round 313](#round-313-the-contour-patch-in-a-converged-r2d2-search-logz-agrees-dead-points--11-evaluations--6-one-run)).
+    run ([round 313](#round-313-the-contour-patch-in-a-converged-r2d2-search-logz-agrees-dead-points--11-evaluations--6-one-run)).
+    Three raced seeds settle it at **-4.0% evaluations** (-7.2/-0.4/-4.4%),
+    dead points -11.9%, log(Z) agreeing (-0.09/-0.24/-0.41 sigma): R2D2's
+    chains cost 9% more each under adoption, which the toy's never did,
+    even with plateaus, two modes or 9x-varying evaluation time. Opt-in
+    only; whether to default it is the user's call
+    ([round 315](#round-315-the-contour-patch-saves-4-of-r2d2-evaluations-over-3-raced-seeds-not-the-toys-14)).
     `./ri bench` prints this as `converging evals/s`; judge rank and layout
     A/Bs on it at the production nlive
     ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
@@ -15138,3 +15143,80 @@ Bench row `r313-adopt` and stage row `r313-adopt-r2d2` in `benchmarks.jsonl`;
 `.probe/r313/` keeps the gzipped `summary.json`, `run.log`, console log,
 dead-birth file, `.stats` and profile. The run directory is deleted.
 GPU job 39654485 (round 303) still had no output at ~21:45 on 29 Oct.
+
+## Round 315: the contour patch saves 4% of R2D2 evaluations over 3 raced seeds, not the toy's 14%
+
+**Method.** Round 313's array job 39660948 (`.probe/r313/array.sh`): six
+1-node icelake tasks, each a converged production R2D2 search (nlive 150,
+15 repeats, async, 39 ranks) on the patched polychord.sif, from the frozen
+worktree `../frozen-r313` (`08a4c91` plus the plumbing). Arms
+`NS_ADOPT_CONTOUR` 0 and 1, seeds 190182240, 7311 and 4242, all six started
+together at 21:36:56 on 29 Oct and exited 0 in 18-23 min.
+`.probe/r313/ana.py` pairs them; wasted chains are `waste.py`'s rule.
+Round 314 was cut off by the job limit before reading them.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall | node |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 190182240 | stock | 0.0173486835510407 +/- 0.00040752730532764 | 1,458 | 255 | 65,392 | 66,925 | 56.4 | 1,218 s | cpu-q-540 |
+| 190182240 | adopt | 0.0172950046702071 +/- 0.000402782692260155 | 1,288 | 81 | 60,472 | 62,132 | 52.2 | 1,225 s | cpu-q-608 |
+| 7311 | stock | 0.0174151767019566 +/- 0.000366463462114217 | 1,466 | 264 | 65,596 | 67,107 | 48.9 | 1,403 s | cpu-q-556 |
+| 7311 | adopt | 0.017291398985864 +/- 0.00036032300132719 | 1,300 | 84 | 65,495 | 66,851 | 65.0 | 1,061 s | cpu-q-557 |
+| 4242 | stock | 0.0182077471400141 +/- 0.000389309774867251 | 1,479 | 275 | 66,969 | 68,255 | 52.6 | 1,329 s | cpu-q-589 |
+| 4242 | adopt | 0.0179824722502375 +/- 0.000378356218975823 | 1,290 | 75 | 63,998 | 65,272 | 52.2 | 1,282 s | cpu-q-590 |
+
+| pooled (3 seeds) | stock | adopt | change |
+| --- | ---: | ---: | ---: |
+| evaluations | 202,287 | 194,255 | **-3.97%** (per seed -7.2 / -0.4 / -4.4%) |
+| nlike | 197,957 | 189,965 | -4.04% |
+| dead points | 4,403 | 3,878 | -11.92% |
+| wasted chains (share of dead) | 794 (18.0%) | 240 (6.2%) | -70% |
+| useful dead points (ndead - wasted) | 3,609 | 3,638 | +0.8% |
+| nlike per dead point | 44.96 | 48.99 | **+9.0%** |
+| nlike per useful dead point | 54.85 | 52.22 | -4.8% |
+
+**Results.**
+- log(Z) agrees seed by seed: -0.09, -0.24 and -0.41 sigma (adopt minus
+  stock), mean -0.25 sigma. No sign of the v1 bias.
+- The patch removes the waste exactly as in the toy: stock wastes 18.0% of
+  dead points (the toy's async 18% at 38 workers), adopt 6.2% (toy 5.3%),
+  and useful dead points stay the same (+0.8%).
+- But each chain costs 9% more: nlike per dead point rises 44.96 -> 48.99,
+  in every seed (44.8/44.7/45.3 stock, 46.9/50.4/49.6 adopt). In the toy it
+  was flat (62.4 stock, 61.5 v2). The saving left is -4.0% of evaluations,
+  not the -14% the waste alone predicts.
+- Wall time is not an A/B here: each arm ran on its own node and steady
+  evals/s span 48.9-65.0 across the six nodes, so the -9.7% mean wall
+  change is node noise; the evaluation counts are the measure.
+
+**Which R2D2 feature makes adopted chains cost more? Not three obvious
+ones.** `.probe/r315/toy.py` is round 312's 6-d toy (39 ranks, async, nlive
+150, converged, the patched SIF for both arms) with one R2D2-like feature
+added at a time. nlike per dead point, stock -> adopt:
+
+| toy variant | seeds | nlike change | nlike / dead stock | nlike / dead adopt | wasted stock -> adopt |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 3 dims snapped to 8 levels (integer plateaus, like `channel_count`) | 1 | -17.1% | 62.4 | 61.3 | 18.0% -> 4.5% |
+| two unequal modes (clustering; R2D2's posterior has 5 clusters) | 2 | -14.7% | 63.2 | 62.3 | 17.1% -> 4.2% |
+| evaluation time 0-8x by position (R2D2's cost varies with channels x minutes) | 2 | -15.5% | 62.4 | 61.3 | 17.3% -> 4.7% |
+
+All three keep the toy's flat per-chain cost and full saving, with log(Z)
+pairs within 0.9 sigma. So the extra cost comes from something else in
+R2D2's likelihood. Candidates left: its near-flat likelihood (log(Z) =
+0.017, so the contour rises through a region where logL barely changes,
+and the slice width set from the live points at a chain's start may be far
+too wide after adoption), and its ~3 calls per slice step against the
+toy's ~4. A per-chain nlike count from inside the patch, split by whether
+the chain adopted, would tell them apart.
+
+**Decision.** `NS_ADOPT_CONTOUR` stays opt-in (default 0), as the
+sampler-change guard requires. Defaulting it is the user's call: it saves
+~4% of evaluations at 38 workers with log(Z) agreeing over 3 seeds and the
+toy's 40-seed bias check, and should save more at 76 workers (two nodes),
+where the toy's waste is 29%. Shipping it also needs the patched
+polychord.sif built on a Docker host or layered at search start (like
+`ns_use_patched_wsclean_sif`).
+
+Bench rows `r313-a{0,1}-s{seed}` and stage row `r315-adopt-3seed` in
+`benchmarks.jsonl`. `.probe/r313/` keeps the per-task stats, rows,
+summaries and dead-birth files (console logs gzipped); `../frozen-r313` is
+removed. GPU job 39654485 (round 303) still has no output.
