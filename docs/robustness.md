@@ -250,7 +250,10 @@ A run writes records on a background thread per rank (`write_records_in_backgrou
 record or two on a quiet RDS, but the flat writer falls behind as metadata load
 rises (161 of 4,933 records lost at a moderately loaded kill, ~5,000 behind
 under heavy load), where `NS_RECORD_APPEND=1` lost none (docs/csd3-speed.md,
-rounds 244-245). That costs the archive, not the search: an async run (the
+rounds 244-245). So the writer now takes its whole backlog at once and appends
+it to `records.jsonl` in one write, keeping it ~15 records behind where flat
+files fell 120-170 behind on the same Lustre (round 247; `NS_RECORD_COALESCE=0`
+for the old writer). That costs the archive, not the search: an async run (the
 default) resumed from its checkpoint draws new points, so every evaluation
 scored after the checkpoint is imaged again whether or not its record landed,
 and none is adopted (rounds 242 and 246). A failed write re-raises on the rank's

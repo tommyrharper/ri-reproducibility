@@ -12122,3 +12122,72 @@ Stage row `r246-resume-reuse` is in `benchmarks.jsonl`. The run directories
 are deleted. The script and gzipped logs are in `.probe/r246/`. The round 243
 GPU race (job 39544674) had still not started at ~04:00 (no
 `.probe/r243/ab-39544674.out`).
+
+## Round 247: the record writer coalesces its backlog into one append
+
+**Question.** Rounds 244-245 found the flat record writer (one create and
+rename per record) falling behind as RDS metadata load rises, so a kill
+loses records from the archive. `NS_RECORD_APPEND=1` loses none but costs
+~2% evals/s (rounds 240-241). Can the default writer get append's
+durability without paying for it on every record?
+
+**Change** (`common.py`, `_write_pending_records`, default on;
+`NS_RECORD_COALESCE=0` restores the old writer). Each record goes on a
+per-rank pending list, and each writer job takes everything pending when it
+runs. A lone record is a flat file, exactly as before, so a writer that keeps
+up behaves as it did. A backlog is one `O_APPEND` write of all its lines to
+`records.jsonl` (NS_RECORD_APPEND's path, under the same shared lock), so the
+queue cannot grow. At the end of a run the cancelled jobs' pending records are
+dropped, because their texts are already in `_WRITTEN_RECORDS` (round 234).
+The post-run line counts how many records were coalesced. There is a new
+self-check block in `self_check_resume_adoption`.
+
+**A/B** (`.probe/r247/race.sh`: async R2D2, seed 242, `--nlive 48
+--num-repeats 5 --max-ndead 600 --mpi-procs 20`, both arms raced on the two
+CPU halves, swapped between pairs, round 244's on-disk sampler every 10 s).
+RDS was quiet to moderate, with the slowest `evaluations/` listing taking 2.5 s.
+
+| pair | arm | CPUs | evals | steady evals/s | most behind mid-run | writer record-s, all ranks | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| 1 | coalesce | 0-36 | 9,007 | 22.43 | **15** | 2,278 (1,216 coalesced) | 0.0166506289522126 +/- 0.000727208089544788 |
+| 1 | flat | 38-74 | 9,428 | 23.64 | 122 | 3,825 | 0.0167147137702 +/- 0.000736117939533334 |
+| 2 | coalesce | 38-74 | 8,188 | 26.77 | **16** | 1,937 (1,280 coalesced) | 0.0167761927869447 +/- 0.000747062460707704 |
+| 2 | flat | 0-36 | 10,574 | 25.55 | 172 | 4,504 | 0.0161574824357351 +/- 0.000708179747602443 |
+
+WSClean guard (`.probe/r247/ws.sh`, seed 229, `--nlive 100 --num-repeats 2
+--max-ndead 4000 --mpi-procs 19 --synchronous`, raced, halves swapped):
+coalesce 35.85 and 34.95 against flat 35.58 and 34.94 steady evals/s
+(+0.8%, +0.1%). Chains are byte-identical, and log(Z) is 0.0967023094179472
++/- 0.000520957293962581 in all four arms. An earlier async WSClean pair
+(the same command without `--num-repeats 2 --mpi-procs 19 --synchronous`)
+ran only ~35 s an arm and spread 103-176 evals/s, which is noise. Its log(Z)
+values are in the stage row.
+
+**Results.**
+- On the same Lustre the coalescing writer stays at most 15-16 records
+  behind, against 122-172 for the flat writer. That bounds what a kill can
+  lose to about one batch a rank. Writer time drops by 40-57%, because 13-16%
+  of records went out as batch appends instead of creates.
+- Speed is unchanged. Each pair favours the arm on CPUs 38-74, by -5.1% and
+  +4.8% (round 241's half effect), so the swapped geometric mean is -0.3%,
+  inside the noise. log(Z) agrees within 0.06 and 0.6 sigma. The arms are
+  async, so their draws differ.
+- Every arm's archive is complete after a normal finish: unique names in
+  `records.jsonl` equal the summary's evaluations (8,188-10,574 R2D2, 4,071
+  WSClean), and no flat files are left.
+- The coalescing arms scored fewer evaluations in all four async pairs
+  (R2D2 nlike 8,630/8,021 against 9,000/10,155). This is not explained.
+  Synchronous runs are identical, and the record path returns before
+  PolyChord sees anything, so it is most likely async scheduling noise (a
+  1-in-16 sign run). A converged production pair would settle it.
+
+**Decision.** Coalescing is the default. It closes most of the durability gap
+that rounds 244-245 left to `NS_RECORD_APPEND=1`, at no measured speed cost.
+This round was not a kill test under heavy load. The bound comes from the
+mid-run sampler, not from a kill.
+
+Stage row `r247-record-coalesce` (full-precision log(Z) for every arm) and
+bench rows `r247-coal1/2`, `r247-flat1/2`, `r247-scoal3/4`, `r247-sflat3/4`,
+`r247-wcoal1/2`, `r247-wflat1/2` are in `benchmarks.jsonl`. Run directories
+are deleted. Scripts, samples and gzipped logs are in `.probe/r247/`. The
+round 243 GPU race (job 39544674) still had no output at ~04:25.

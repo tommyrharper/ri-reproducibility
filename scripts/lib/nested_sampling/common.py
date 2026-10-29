@@ -1705,6 +1705,7 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     _PUBLISHING.clear()
     _RECORD_WRITES[:] = [future for future in _RECORD_WRITES if not future.cancelled()]
     drain_record_writes(flush_held=False)
+    _PENDING_RECORDS.clear()  # their texts are in _WRITTEN_RECORDS too
     backlog = (queued, time.monotonic() - started, dict(_WRITER_SECONDS))
     try:
         from mpi4py import MPI
@@ -2011,6 +2012,26 @@ def self_check_resume_adoption() -> None:
         assert not flat_record_path(queued).exists(), "a queued record was written"
         assert pack_finished_run(evaluations_dir) == 1
         assert load_evaluations_from_dir(evaluations_dir) == records
+        # A writer that fell behind appends its backlog to the pack in one
+        # write; one that keeps up writes a flat file (round 247).
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        backlog = [evaluations_dir / f"eval-002{i}-bkl" for i in range(3)]
+        for i, eval_dir in enumerate(backlog):
+            write_evaluation_record(eval_dir, {"eval_id": 20 + i, "params": {"a": 20 + i}, "objective": 0.5})
+        gate.set()
+        drain_record_writes()
+        assert not any(flat_record_path(eval_dir).exists() for eval_dir in backlog), "a backlog went flat"
+        assert [json.loads(packed_record_texts(evaluations_dir)[d.name])["eval_id"] for d in backlog] == [20, 21, 22]
+        write_records_in_background()
+        lone = evaluations_dir / "eval-0023-bkl"
+        write_evaluation_record(lone, {"eval_id": 23, "params": {"a": 23}, "objective": 0.5})
+        drain_record_writes()
+        assert flat_record_path(lone).exists(), "a lone record was not written flat"
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 20, 21, 22, 23]
+        assert pack_finished_run(evaluations_dir) == 1  # the flat one; the appended are packed
         # A run's writer appends its records to the pack, never a flat file,
         # and the finish then has nothing to add (round 240). A torn last
         # line - a rank killed mid-append - is cut by the next pack writer,
@@ -2024,7 +2045,7 @@ def self_check_resume_adoption() -> None:
         assert not flat_record_path(appended).exists(), "an appended record was written flat"
         assert json.loads(packed_record_texts(evaluations_dir)[appended.name])["eval_id"] == 10
         records = finished_run_records(evaluations_dir)
-        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 10]
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 10, 20, 21, 22, 23]
         assert pack_finished_run(evaluations_dir) == 0, "the finish re-appended an appended record"
         with open(evaluations_dir / RECORD_PACK, "a") as pack:
             pack.write('eval-0011-bcd\t{"eval_id": 11, "par')
@@ -2034,7 +2055,7 @@ def self_check_resume_adoption() -> None:
                                 {"eval_id": 12, "params": {"a": 12}, "objective": 0.6})
         drain_record_writes()
         os.environ.pop("NS_RECORD_APPEND")
-        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)][-1] == 12
+        assert 12 in [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)]
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -2697,9 +2718,36 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     elif os.environ.get("NS_RECORD_APPEND", "0") == "1":
         line = f"{eval_dir.name}\t{json.dumps(record)}\n".encode()
         _submit_record_job(lambda: _append_record(eval_dir.parent, line))
-    else:
+    elif os.environ.get("NS_RECORD_COALESCE", "1") == "0":
         _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
+    else:
+        with _PENDING_LOCK:
+            _PENDING_RECORDS.append((eval_dir, text, record))
+        _submit_record_job(_write_pending_records)
     return record
+
+
+# A flat writer that falls behind - a create in evaluations/ costs 2ms on a
+# quiet RDS and up to 1.2s on a loaded one - held 58-67% of a run's records
+# only in memory (round 244), and a kill lost them from the archive (161 of
+# 4,933, round 245). So the writer takes every record queued when it gets to
+# one: a lone record is a flat file, as before; a backlog is one append to
+# the pack, NS_RECORD_APPEND's single write, so it never grows (round 247).
+_PENDING_RECORDS: list[tuple[Path, str, dict[str, Any]]] = []
+_PENDING_LOCK = threading.Lock()
+
+
+def _write_pending_records() -> None:
+    with _PENDING_LOCK:
+        pending = _PENDING_RECORDS[:]
+        _PENDING_RECORDS.clear()
+    if len(pending) == 1:
+        eval_dir, text, _ = pending[0]
+        _write_record(flat_record_path(eval_dir), text)
+    elif pending:
+        _append_record(pending[0][0].parent, b"".join(
+            f"{eval_dir.name}\t{json.dumps(record)}\n".encode() for eval_dir, _, record in pending))
+        _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(pending)
 
 
 def _submit_record_job(job: Any, kind: str = "record") -> Any:
