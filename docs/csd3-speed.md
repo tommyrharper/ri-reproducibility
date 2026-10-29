@@ -11806,3 +11806,56 @@ Rows: stage row `r240-record-append`. Bench rows `r240-c1`, `r240-wflat`,
 `r240-wapp` (async, earlier draft), `r240-sflat`, `r240-sapp`,
 `r240-rflat`, `r240-rapp`, `r240-rflat2` and `r240-rapp2`. All run directories
 are deleted. Logs (gzipped) and scripts are in `.probe/r240/`.
+
+## Round 241 (negative, async): append records cost 1-3% and gain no speed in async R2D2 searches
+
+**Question.** Round 240's R2D2 pairs were synchronous. In an async search
+(the `./ri search` default), does `NS_RECORD_APPEND=1` still come out
+slower, and how many records stay in memory only at the end?
+
+**Method.** `.probe/r241/ab.sh`, the round 240 harness with the same tree
+(`435dcee`) and only `NS_RECORD_APPEND` changed. Two arms raced at once,
+one per 19-CPU half of the job (`taskset`), then a second pair with the
+halves swapped. Each arm ran `--seed 240 --nlive 48 --num-repeats 5
+--max-ndead 400 --mpi-procs 20`, async, on CPU ONNX.
+
+| | pair 1 flat (CPUs 0-36) | pair 1 append (38-74) | pair 2 flat (38-74) | pair 2 append (0-36) |
+| --- | ---: | ---: | ---: | ---: |
+| evals/s (steady) | 24.14 | 24.59 | **24.85** | **23.30** |
+| request (image_container) | 731 ms | 717 ms | 725 ms | 770 ms |
+| evaluations | 8,073 | 7,920 | 7,129 | 6,926 |
+| records still queued at the end | 3,303 | 22 | 580 | 0 |
+| record / publish writer-s, all ranks | 6,394 / 60 | 2,271 / 515 | 4,218 / 37 | 568 / 232 |
+| log(Z) | 0.017008532752603 +/- 0.00058693969702136 | 0.0174257756769625 +/- 0.000587839574347744 | 0.0176327304660833 +/- 0.000604709227169273 | 0.0179201110318572 +/- 0.00062115221930883 |
+| files left | 586 | 605 | 586 | 605 |
+
+All four arms reached ndead 448 (nlike 7,795, 7,676, 6,819, 6,625).
+
+**Results.**
+- On the same CPUs, append is slower on both halves: -3.5% on CPUs 0-36
+  (23.30 against 24.14) and -1.1% on 38-74 (24.59 against 24.85). The mean
+  is -2.3%. That matches round 240's synchronous -3.1% and -1.0%. Each
+  result is inside the ~5% control span, but now four of four comparisons
+  have the same sign. Within a pair, the arm on CPUs 38-74 was faster both
+  times, so the raw pair-by-pair figures (+1.9%, -6.3%) mostly measure
+  the two halves.
+- Async flat runs end with many more records held only in memory than
+  sync ones: 3,303 of 8,073 (41%) in pair 1. Append leaves 0-22.
+- Publish writer-s again rises 4-9x under append, with the same work. As
+  round 240 found, writer-seconds measure the thread waiting for a CPU or
+  the GIL. The cost probably comes from the writer thread competing for
+  CPU with the rank once it is no longer parked in Lustre creates.
+  Correction to round 240: in those short runs the 600 s flush never
+  fired, so the publishes are kept `NS_KEEP_DETAIL_EVERY` evaluations
+  (kind "publish"), not held extremes. The suggested fix of deferring
+  held publishes would not touch them.
+- log(Z) agrees across the four arms (spread 0.00091, about 1.5 sigma of
+  one arm, which is ordinary for async runs that differ in their chains).
+
+**Decision.** `NS_RECORD_APPEND` stays opt-in and default off. It is a
+durability setting with a small speed cost (~2%), not a speed lever. The
+record path is closed for speed.
+
+Rows: stage row `r241-record-append-async`, and bench rows `r241-aflat`,
+`r241-aapp`, `r241-aflat2` and `r241-aapp2`. Run directories are deleted.
+Gzipped logs and scripts are in `.probe/r241/`.
