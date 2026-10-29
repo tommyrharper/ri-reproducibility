@@ -19,6 +19,16 @@ case "${R2D2_DEVICE:=cpu}" in
   *) echo "FATAL: R2D2_DEVICE must be cpu or cuda, got '${R2D2_DEVICE}'" >&2; exit 1 ;;
 esac
 export R2D2_DEVICE
+# NS_NODES=N (`./ri search r2d2 --nodes N`) spreads one search over N whole
+# nodes: one node is DRAM-bandwidth bound (docs/csd3-speed.md, round 205), so
+# more nodes is the way past it. Each node runs its own pools, scratch and
+# --mpi-procs ranks (per node); srun starts the ranks (round 287). CPU only.
+NS_NODES="${NS_NODES:-1}"
+if [ "${NS_NODES}" -gt 1 ] && [ "${R2D2_DEVICE}" != cpu ]; then
+  echo "FATAL: --nodes ${NS_NODES} is CPU only; a GPU search runs on one node" >&2
+  exit 1
+fi
+export NS_NODES
 # A CPU forward runs through ONNX Runtime unless R2D2_RUNTIME=torch: 33-44%
 # more evals/s, log(Z) within 0.25 sigma of torch's at convergence
 # (docs/csd3-speed.md, rounds 140-145). A GPU forward runs through TensorRT,
@@ -47,7 +57,11 @@ HOST_CPUS="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)"
 ns_refuse_missing_checkpoints "${CHECKPOINTS_DIR}" "${R2D2_CKPT_NAME}"
 # Claim the default only after guards, so refused runs leave no empty result;
 # named directories may exist, but not while a job is still in them.
-if [ -n "${OUTPUT_DIR:-}" ]; then
+# NS_NODE_ROLE=pools is this script started again on another node of a
+# multi-node search, by its launcher, to run that node's pools only.
+if [ "${NS_NODE_ROLE:-}" = pools ]; then
+  :
+elif [ -n "${OUTPUT_DIR:-}" ]; then
   ns_refuse_live_run "${OUTPUT_DIR}"
   mkdir -p "${OUTPUT_DIR}"
   # Normalize once so containment and recorded paths are consistent.
@@ -56,7 +70,7 @@ if [ -n "${OUTPUT_DIR:-}" ]; then
 else
   OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" r2d2-vlaa-)"
 fi
-ns_warn_file_quota "${OUTPUT_DIR}" "${NS_NLIVE}" "${NS_NUM_REPEATS}" "${NS_MAX_NDEAD}"
+[ "${NS_NODE_ROLE:-}" = pools ] || ns_warn_file_quota "${OUTPUT_DIR}" "${NS_NLIVE}" "${NS_NUM_REPEATS}" "${NS_MAX_NDEAD}"
 # On a cluster login node the search leaves here: the claimed directory and the
 # whole environment go to a Slurm job that runs this script again inside the
 # allocation, where the cores and memory below are the job's (docs/cluster.md).
@@ -166,6 +180,14 @@ else
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2
 fi
+# A multi-node search needs the nodes it asked for; the ranks above are per node.
+if [ "${NS_NODES}" -gt 1 ] && [ "${NS_NODE_ROLE:-}" != pools ]; then
+  if [ "${SLURM_JOB_NUM_NODES:-1}" -lt "${NS_NODES}" ]; then
+    echo "FATAL: --nodes ${NS_NODES} needs a Slurm allocation of ${NS_NODES} nodes; this one has ${SLURM_JOB_NUM_NODES:-1}" >&2
+    exit 1
+  fi
+  ns_node_hosts="$(ns_expand_hostlist "${SLURM_JOB_NODELIST}" | head -n "${NS_NODES}")"
+fi
 # mpirun counts one slot per CPU and refuses -np past it.
 if [ "${NS_MPI_PROCS}" -gt "${HOST_CPUS}" ]; then
   NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-1}"
@@ -191,18 +213,64 @@ fi
 
 # Written before anything can go wrong, so that a run which stops - out of
 # memory, Ctrl-C, reboot - still says how to start it again exactly.
-write_run_config "${OUTPUT_DIR}" r2d2
+[ "${NS_NODE_ROLE:-}" = pools ] || write_run_config "${OUTPUT_DIR}" r2d2
 # The workers are reached over FIFOs, so these have to sit on the bind mount the
 # ranks and the pools both see - REPO_ROOT, which OUTPUT_DIR is always under,
 # because ns_refuse_unmounted_run above is what makes that true.
 SIMULATE_FIFO_DIR="${OUTPUT_DIR}/.simulate-workers"
 R2D2_FIFO_DIR="${OUTPUT_DIR}/.r2d2-workers"
-rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
-mkdir -p "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
-for ((rank = 0; rank < NS_MPI_PROCS; rank++)); do
-  mkfifo "${SIMULATE_FIFO_DIR}/${rank}.in" "${SIMULATE_FIFO_DIR}/${rank}.out"
-  mkfifo "${R2D2_FIFO_DIR}/${rank}.in" "${R2D2_FIFO_DIR}/${rank}.out"
-done
+if [ "${NS_NODES}" = 1 ]; then
+  rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+  mkdir -p "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+  for ((rank = 0; rank < NS_MPI_PROCS; rank++)); do
+    mkfifo "${SIMULATE_FIFO_DIR}/${rank}.in" "${SIMULATE_FIFO_DIR}/${rank}.out"
+    mkfifo "${R2D2_FIFO_DIR}/${rank}.in" "${R2D2_FIFO_DIR}/${rank}.out"
+  done
+else
+  # A FIFO on Lustre is a pipe on each node by itself (round 287), so every
+  # node gets a directory of its own ranks' FIFOs, named after the host: srun
+  # deals the ranks out in blocks of NS_MPI_PROCS in nodelist order, and each
+  # rank's wrapper below points it at its host's directory. The launcher makes
+  # them all before anything starts; a node's pools serve only its own. The
+  # scratch tmpfs has one name on every node, so one bind fits all ranks.
+  if [ "${NS_NODE_ROLE:-}" != pools ]; then
+    rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+    node=0
+    for host in ${ns_node_hosts}; do
+      mkdir -p "${SIMULATE_FIFO_DIR}/${host}" "${R2D2_FIFO_DIR}/${host}" "${OUTPUT_DIR}/.node-${host}"
+      for ((rank = node * NS_MPI_PROCS; rank < (node + 1) * NS_MPI_PROCS; rank++)); do
+        mkfifo "${SIMULATE_FIFO_DIR}/${host}/${rank}.in" "${SIMULATE_FIFO_DIR}/${host}/${rank}.out"
+        mkfifo "${R2D2_FIFO_DIR}/${host}/${rank}.in" "${R2D2_FIFO_DIR}/${host}/${rank}.out"
+      done
+      node=$((node + 1))
+    done
+  fi
+  NS_FIFO_ROOTS=("${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}")
+  ns_host="$(hostname -s)"
+  SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}/${ns_host}"
+  R2D2_FIFO_DIR="${R2D2_FIFO_DIR}/${ns_host}"
+  [ -d "${R2D2_FIFO_DIR}" ] || { echo "FATAL: ${ns_host} is not one of this search's nodes (${ns_node_hosts:-})" >&2; exit 1; }
+  NS_SCRATCH_DIR="/dev/shm/ri-ns-scratch-${SLURM_JOB_ID}-${OUTPUT_DIR##*/}"
+  mkdir -p "${NS_SCRATCH_DIR}"
+  # Every other node starts this script again as its pools, now, so their
+  # warm-up overlaps this node's. Their logs and .launcher.pid go in
+  # .node-<host>, so no node's reaper reads another's pid.
+  if [ "${NS_NODE_ROLE:-}" != pools ]; then
+    others="$(printf '%s\n' "${ns_node_hosts}" | grep -vx "${ns_host}" | paste -sd,)"
+    # A step's CPUs are what it asks for, so the pools ask for the node's
+    # share of the job; the job's own -c is dropped, as srun refuses two.
+    env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
+      srun --overlap --export=ALL --nodes "$((NS_NODES - 1))" --ntasks-per-node 1 \
+      --cpus-per-task "${SLURM_JOB_CPUS_PER_NODE%%[(,]*}" --mem 0 --cpu-bind none --nodelist "${others}" \
+      env NS_NODE_ROLE=pools NS_MPI_PROCS="${NS_MPI_PROCS}" NS_R2D2_ROOT_RANK_EXTRA=0 \
+      R2D2_OMP_THREADS="${R2D2_OMP_THREADS}" R2D2_MAX_THREADS="${R2D2_MAX_THREADS}" \
+      /bin/bash "${REPO_ROOT}/scripts/run-nested-sampling-r2d2.sh" \
+      >>"${OUTPUT_DIR}/nodes.log" 2>&1 &
+    ns_pools_srun=$!
+  fi
+  OUTPUT_DIR_RUN="${OUTPUT_DIR}"
+  OUTPUT_DIR="${OUTPUT_DIR}/.node-${ns_host}"
+fi
 
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
 # Each evaluation uses MeqTrees for simulate and MS-to-`.mat`, and R2D2 for
@@ -339,6 +407,18 @@ sidecar_launch "${R2D2_SIF}" \
   --env R2D2_CUDA_BLOCKING_SYNC="${R2D2_CUDA_BLOCKING_SYNC:-1}" \
   --env OMP_WAIT_POLICY=PASSIVE \
   -- python3 "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py" --fifo-dir "${R2D2_FIFO_DIR}"
+if [ "${NS_NODES}" -gt 1 ]; then
+  OUTPUT_DIR="${OUTPUT_DIR_RUN}"
+  if [ "${NS_NODE_ROLE:-}" = pools ]; then
+    # Held until the launcher's srun ends this step; the trap removes the pools.
+    sleep infinity &
+    wait $!
+    exit 0
+  fi
+  trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null || true' EXIT
+  trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null; exit 130' INT
+  trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null; exit 143' TERM
+fi
 
 sidecar_binds
 RUN_COMMAND=(
@@ -347,7 +427,7 @@ RUN_COMMAND=(
   MEQTREES_IMAGE="${MEQTREES_SIF}"
   R2D2_IMAGE="${R2D2_SIF}"
   CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
-  NS_MPI_PROCS="${NS_MPI_PROCS}"
+  NS_MPI_PROCS="$((NS_MPI_PROCS * NS_NODES))"
   NS_IMAGE_DIM="${NS_IMAGE_DIM}"
   NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-}"
   NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
@@ -379,15 +459,43 @@ RUN_COMMAND=(
   R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
   R2D2_MAX_THREADS="${R2D2_MAX_THREADS}"
   R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-1}"
+)
+RUN_CONTAINER=(
   "${APPTAINER}" exec --pwd "${REPO_ROOT}"
   "${SIDECAR_BINDS[@]}"
   --bind "${REPO_ROOT}/scripts/lib/nested_sampling:/opt/ri-nested-sampling"
   "${POLYCHORD_SIF}"
-  mpirun
-  # Match Open MPI's slot units to `nproc`'s hardware-thread rank count.
-  --use-hwthread-cpus
-  ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
-  -np "${NS_MPI_PROCS}"
+)
+if [ "${NS_NODES}" = 1 ]; then
+  RUN_COMMAND+=(
+    "${RUN_CONTAINER[@]}"
+    mpirun
+    # Match Open MPI's slot units to `nproc`'s hardware-thread rank count.
+    --use-hwthread-cpus
+    ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
+    -np "${NS_MPI_PROCS}"
+  )
+else
+  # Across nodes the ranks are a Slurm step, wired up by PMIx: the image's
+  # Open MPI cannot start ranks on another node itself (round 287). Each one
+  # makes its node's scratch and finds its node's FIFOs (above) by host name.
+  # shellcheck disable=SC2016  # for the rank's own sh
+  RUN_COMMAND+=(
+    # Each rank is its own container, so Open MPI's single-copy (CMA) cannot
+    # cross between them, and the image's PMIx locks its shared store in a
+    # way the host's Slurm PMIx refuses; both are switched to what works.
+    env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK
+    OMPI_MCA_btl_vader_single_copy_mechanism=none PMIX_MCA_gds=hash
+    srun --overlap --export=ALL --mpi=pmix --kill-on-bad-exit=1
+    --nodelist "$(printf '%s\n' "${ns_node_hosts}" | paste -sd,)" --nodes "${NS_NODES}"
+    --ntasks-per-node "${NS_MPI_PROCS}" --overcommit --mem 0 --cpu-bind none
+    /bin/sh -c 'h="$(hostname -s)"; mkdir -p "$NS_SCRATCH_DIR"
+      export NS_SIMULATE_FIFO_DIR="$1/$h" NS_R2D2_FIFO_DIR="$2/$h"; shift 2; exec "$@"' sh
+    "${NS_FIFO_ROOTS[@]}"
+    "${RUN_CONTAINER[@]}"
+  )
+fi
+RUN_COMMAND+=(
   python3 /opt/ri-nested-sampling/polychord_r2d2.py
   --output-dir "${OUTPUT_DIR}"
   --repo-root "${REPO_ROOT}"
@@ -421,5 +529,9 @@ uv run scripts/bench.py record "${OUTPUT_DIR}" || true
 # of the FIFOs, and that worker writes its pid file into the directory being
 # removed. The EXIT trap would kill them too, but only after this rm.
 _sidecar_remove
+if [ "${NS_NODES}" -gt 1 ]; then
+  kill "${ns_pools_srun}" 2>/dev/null || true
+  rm -rf "${NS_FIFO_ROOTS[@]}"
+fi
 rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
 echo "OK: nested-sampling R2D2 output in ${OUTPUT_DIR}"

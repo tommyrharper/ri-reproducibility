@@ -41,6 +41,7 @@ SEARCH_ENV = (
     ("seed", "NS_SEED"),
     ("metric", "NS_METRIC"),
     ("mpi_procs", "NS_MPI_PROCS"),
+    ("nodes", "NS_NODES"),
     ("mgain", "NS_WSCLEAN_MGAIN"),
     ("niter", "NS_WSCLEAN_NITER"),
     ("synchronous", "NS_SYNCHRONOUS"),
@@ -484,7 +485,10 @@ def build_parser():
                              "over them. A leading minus needs the = form, "
                              "--metric=-snr, to search the worst corner [NS_METRIC]")
     search.add_argument("--mpi-procs", type=int,
-                        help="MPI ranks; 1 is serial, for debugging [NS_MPI_PROCS]")
+                        help="MPI ranks (per node with --nodes); 1 is serial, for debugging [NS_MPI_PROCS]")
+    search.add_argument("--nodes", type=int,
+                        help="R2D2 on CPUs only: spread the search over this many whole "
+                             "nodes, each with its own pools (docs/cluster.md) [NS_NODES]")
     search.add_argument("--niter", type=int,
                         help="WSClean minor-iteration budget per major cycle. "
                              "At the old default of 100, ~80%% of evaluations "

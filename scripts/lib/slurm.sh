@@ -58,7 +58,10 @@ ns_submit_run() {
   . "$(dirname "${BASH_SOURCE[0]}")/job-env.sh"
   ns_write_job_settings "${settings}" || return
   printf -v cmd '%q ' /bin/bash "${repo}/scripts/lib/job-env.sh" "${settings}" "$@"
-  if [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
+  if [ "${NS_NODES:-1}" -gt 1 ]; then
+    # A multi-node search takes whole nodes; its ranks are per node.
+    size=(--ntasks-per-node 1 --exclusive)
+  elif [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
     size=(--ntasks 1 --gres "gpu:${NS_SLURM_GPUS}" --cpus-per-task "$((32 * NS_SLURM_GPUS))")
     export SBATCH_PARTITION="${SBATCH_PARTITION:-ampere}"
   elif [ -n "${NS_MPI_PROCS:-}" ]; then
@@ -90,7 +93,7 @@ ns_submit_run() {
     --job-name "${run_dir##*/}" \
     --chdir "${repo}" \
     --output "${run_dir}/slurm-%j.out" \
-    --nodes 1 "${size[@]}" \
+    --nodes "${NS_NODES:-1}" "${size[@]}" \
     --wrap "exec ${cmd}" || return
   # The readers' shared squeue cache (scripts/slurm_queue.py) predates this job;
   # dropped so `./ri runs` lists it as queued straight away.
@@ -117,6 +120,28 @@ ns_enter_job_env() {
   echo "Inside Slurm job ${SLURM_JOB_ID}: carrying on in the job's own environment (scripts/lib/job-env.sh; NS_JOB_ENV=0 to skip)."
   cd "${repo}" || return
   exec /bin/bash "${repo}/scripts/lib/job-env.sh" "${run_dir}/.job-settings.env" "$@"
+}
+
+# ns_expand_hostlist <list>: one host per line from a Slurm hostlist such as
+# SLURM_JOB_NODELIST (cpu-q-[83-84,90],gpu-q-1), keeping zero padding -
+# without `scontrol show hostnames`, which this repo does not call from a job.
+ns_expand_hostlist() {
+  local item prefix body range lo hi n
+  # Commas inside brackets become ';' so the top-level ones split items.
+  for item in $(printf '%s\n' "$1" | sed -E ':a;s/(\[[^],]*),/\1;/;ta' | tr ',' ' '); do
+    case "${item}" in
+      *\[*\]) ;;
+      *) printf '%s\n' "${item}"; continue ;;
+    esac
+    prefix="${item%%\[*}" body="${item#*\[}"
+    body="${body%\]}"
+    for range in ${body//;/ }; do
+      lo="${range%-*}" hi="${range#*-}"
+      for ((n = 10#${lo}; n <= 10#${hi}; n++)); do
+        printf '%s%0*d\n' "${prefix}" "${#lo}" "${n}"
+      done
+    done
+  done
 }
 
 # `bash scripts/lib/slurm.sh --self-check`: when a run submits, and what it
@@ -239,6 +264,19 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   SBATCH_ACCOUNT=PROJ-CPU NS_SLURM_GPUS=1 ns_submit_run "${_run}" 3500 x >/dev/null 2>&1 \
     && { echo "FAIL: a GPU run on a -CPU project must be refused"; exit 1; }
   [ -e "${_dir}/args" ] && { echo "FAIL: a refused GPU run must not reach sbatch"; exit 1; }
+
+  # A multi-node search takes whole nodes, one task each.
+  NS_NODES=2 NS_MPI_PROCS=39 ns_submit_run "${_run}" 3500 x >/dev/null
+  _args="$(tr '\n' ' ' <"${_dir}/args")"
+  case "${_args}" in
+    *"--nodes 2 --ntasks-per-node 1 --exclusive --wrap"*) ;;
+    *) echo "FAIL: NS_NODES=2 must ask for two whole nodes, got: ${_args}"; exit 1 ;;
+  esac
+  _hosts="$(ns_expand_hostlist 'cpu-q-[83-84,090],cpu-p-7,gpu-q-[1,3-4]' | paste -sd' ')"
+  [ "${_hosts}" = "cpu-q-83 cpu-q-84 cpu-q-090 cpu-p-7 gpu-q-1 gpu-q-3 gpu-q-4" ] \
+    || { echo "FAIL: ns_expand_hostlist, got: ${_hosts}"; exit 1; }
+  [ "$(ns_expand_hostlist 'n[008-010]' | paste -sd' ')" = "n008 n009 n010" ] \
+    || { echo "FAIL: ns_expand_hostlist must keep zero padding"; exit 1; }
 
   echo "slurm self-check passed"
 fi

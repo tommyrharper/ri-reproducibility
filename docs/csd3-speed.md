@@ -13821,3 +13821,83 @@ sampler could collide with, so it costs only the warning.
 Test-only change (no search code, so no WSClean A/B). Stage row
 `r280-kill-resume` is in `benchmarks.jsonl`. The run dir is deleted; script
 and gzipped logs are in `.probe/r280/`.
+
+## Round 287 (feature, first step): `./ri search r2d2 --nodes N` runs one search over several nodes
+
+One node is DRAM-bandwidth bound (round 205), so the next lever is more nodes.
+Until now every search was `--nodes 1`. This round makes a CPU R2D2 search
+able to span N nodes and checks that it finishes correctly. It does not yet
+measure a speedup.
+
+**What the launch can use.** One 2-node probe job (`.probe/r287/probe.sh`,
+2 x 2 tasks on icelake) tested three things:
+
+| question | answer |
+| --- | --- |
+| `srun --mpi=pmix apptainer exec polychord.sif python3` (direct launch, host Slurm PMIx v3) | works: 4 ranks on 2 hosts, 45 us one-way 64-byte ping-pong |
+| the image's own `mpirun` (Open MPI 4.1.4), rsh/ssh to the second node | fails: the remote `orted` never connects back |
+| one Lustre FIFO path opened by a writer on node A and a reader on node B | no connection (writer times out): a FIFO is a pipe on each node by itself |
+
+**Design** (`scripts/run-nested-sampling-r2d2.sh`, opt-in through `NS_NODES`,
+so a single-node search runs exactly the code it ran before):
+
+- `slurm.sh` submits `--nodes N --ntasks-per-node 1 --exclusive`. `ns_expand_hostlist`
+  expands `SLURM_JOB_NODELIST` in bash, because this repo does not call
+  `scontrol` from a job.
+- `--mpi-procs` (or the default sizing) counts ranks per node, and srun
+  deals them out in blocks in nodelist order. The launcher creates every
+  host's FIFOs under `.r2d2-workers/<host>/` and `.simulate-workers/<host>/`.
+  A wrapper on each rank points it at its own host's directory and creates
+  that node's scratch tmpfs, which has the same name on every node
+  (`/dev/shm/ri-ns-scratch-<job>-<run>`).
+- The other nodes' pools are one `srun --overlap` step that runs the same
+  script as `NS_NODE_ROLE=pools`. That run skips the run-dir guards and the
+  run config, starts both pools on its own FIFOs, and holds them until the
+  launcher kills the step at the end. Its logs and `.launcher.pid` go to
+  `.node-<host>/`, so one node's reaper never reads another node's pid.
+- The ranks are `srun --mpi=pmix --kill-on-bad-exit=1`, with
+  `PMIX_MCA_gds=hash`: the image's PMIx printed a `gds_ds12_lock` error
+  against the host's PMIx on every rank. They also set
+  `btl_vader_single_copy_mechanism=none`, because each rank is its own
+  container and CMA cannot cross user namespaces. srun refuses to start if
+  the job's `SLURM_CPUS_PER_TASK` and `SLURM_TRES_PER_TASK` disagree, which
+  happened when Slurm raised `-c 8` to 13 to cover `--mem`, so both are
+  unset for the steps. The pools step takes the node's `SLURM_JOB_CPUS_PER_NODE`.
+
+**Bug found and fixed.** In the first 2-node search, PolyChord finished, and
+then all 8 ranks on the second node died with `FileNotFoundError:
+/dev/shm/ri-chains-<tag>/r2d2_vlaa.stats`. After the Fortran run,
+pypolychord's `run_polychord` reads `<root>.stats` on every rank, but the
+chains tmpfs (round 227) exists only on rank 0's node. srun then cancelled
+the step (exit 143), and the retry hung in the same place. Now
+`polychord_r2d2.py` catches that error only on a non-root rank whose base
+directory has no `.stats` file, and sets `output = None` (only rank 0 uses
+it).
+
+**Check** (2 icelake nodes x 13 CPUs; `--nlive 32 --max-ndead 60 --seed 287`;
+job `.probe/r287/twob.sh`), compared with a single-node search using the same
+settings on this node:
+
+| | 1 node, 16 ranks | 2 nodes, 2 x 14 ranks |
+| --- | ---: | ---: |
+| finished | yes, 20.7 s | yes, 21.6 s, no retry; the pools step is torn down after |
+| evaluations | 218 | 191 (340 lines in records.jsonl, both nodes' ranks) |
+| log(Z) | 0.00555735700481639 +/- 0.0109073752851461 | 0.00290183247440473 +/- 0.0137174585939859 |
+
+log(Z) agrees (0.15 sigma). Both runs are seconds long and their layouts
+differ (13-CPU slices, 14 ranks per node), so the bench rows `r287-1nodeb`
+and `r287-2nodeb` (18.0 against 15.1 evals/s) say nothing about speed.
+
+**Not done yet, next rounds:** a 1 vs 2 whole-node icelake search
+(wall-time speedup, evals/s per node, log(Z)); kill -9 + `./ri resume` on 2
+nodes. Retries need two fixes: `sidecar_reset_workers` globs only
+`.*-workers/*.pid`, so it misses the per-host directories, and the stall
+watchdog's `pkill` reaches only the launcher node's ranks (srun's
+`--kill-on-bad-exit` should take the rest). Also to check: `./ri health`
+and `./ri runs` on a multi-node run.
+
+The single-node path was smoke-tested at this change (`--mpi-procs 8
+--max-ndead 30`, 43 s, finished). Its only code change is that
+`RUN_COMMAND` is now built in three pieces. The other changes are WSClean-inert
+(`NS_NODES` unset): slurm.sh's `--nodes "${NS_NODES:-1}"` and an R2D2-only
+except clause. The slurm self-check, test_cli.py and shellcheck 0.9.0.6 pass.

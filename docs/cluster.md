@@ -166,6 +166,18 @@ else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
 place. A failed submission (a bad account, say) removes the claimed directory
 again.
 
+`./ri search r2d2 --nodes N` (CPU only, `NS_NODES`) spreads one search over N
+whole nodes (`--nodes N --exclusive`), each with `--mpi-procs` ranks of its own
+(sized per node as above). The launcher's node starts the others' pools with
+an `srun` step that runs the same script as `NS_NODE_ROLE=pools`, and the ranks
+are a second `srun --mpi=pmix` step rather than the image's `mpirun`, which
+cannot reach another node. A FIFO on Lustre is a pipe on each node by itself,
+so each host's ranks and pools meet in `.r2d2-workers/<host>/` and
+`.simulate-workers/<host>/`; pool logs are in `.node-<host>/`. Only rank 0's node
+holds the chains tmpfs and its Lustre mirror. Not yet covered: a retry resets
+only the launcher node's workers, and no speedup is measured yet
+(docs/csd3-speed.md, round 287).
+
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit
 defaults to `01:00:00` under it - enough for a smoke-sized search or to try a

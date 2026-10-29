@@ -603,7 +603,15 @@ def main() -> None:
     packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
     mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
     finish = PolyChordFinish()
-    output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    try:
+        output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    except FileNotFoundError:
+        # pypolychord reads <root>.stats on every rank once the run is over, and
+        # across nodes (NS_NODES) a rank off the root's node has no copy of its
+        # tmpfs chains; only rank 0 uses the output (docs/csd3-speed.md, round 287).
+        if mpi_rank() == 0 or (Path(settings.base_dir) / f"{settings.file_root}.stats").exists():
+            raise
+        output = None
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
     if mirror is not None:
