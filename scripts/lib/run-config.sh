@@ -35,6 +35,10 @@ write_run_config() {
     printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
     printf 'NS_SYNCHRONOUS=%q\n' "${NS_SYNCHRONOUS}"
     printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
+    # Opt-in contour adoption (round 312); a resume keeps the same sampler.
+    if [ -n "${NS_ADOPT_CONTOUR:-}" ]; then
+      printf 'NS_ADOPT_CONTOUR=%q\n' "${NS_ADOPT_CONTOUR}"
+    fi
     printf 'NS_IMAGER_IMAGE_ID=%q\n' "${imager_image_id}"
     printf 'NS_MEQTREES_IMAGE_ID=%q\n' "${meqtrees_image_id}"
     printf 'NS_POLYCHORD_IMAGE_ID=%q\n' "${polychord_image_id}"

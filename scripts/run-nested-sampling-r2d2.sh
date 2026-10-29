@@ -472,6 +472,9 @@ RUN_COMMAND=(
   NS_ENABLE_PARAMS="${NS_ENABLE_PARAMS:-}"
   NS_DISABLE_PARAMS="${NS_DISABLE_PARAMS:-}"
   NS_SYNCHRONOUS="${NS_SYNCHRONOUS}"
+  # Async workers adopt the newest live contour mid-chain; needs a polychord.sif
+  # with docker/polychord/patches (round 312), and is ignored by one without.
+  PC_ADOPT_CONTOUR="${NS_ADOPT_CONTOUR:-0}"
   NS_CHAINS_TMPFS="${NS_CHAINS_TMPFS:-1}"
   NS_KEEP_MEASUREMENT_SETS="${NS_KEEP_MEASUREMENT_SETS}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per

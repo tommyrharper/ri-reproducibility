@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 312; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 313; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -36,9 +36,12 @@ the Hetzner host.
     its toy was synchronous, and async waste is ~2x larger). A PolyChord
     patch where workers adopt the newest contour mid-chain cuts a toy's
     evaluations 14% at 38 workers and 22% at 76 with unbiased log(Z). It is
-    opt-in (`PC_ADOPT_CONTOUR=1`) until polychord.sif is rebuilt and a
-    converged R2D2 search agrees
+    opt-in (`NS_ADOPT_CONTOUR=1`, on a polychord.sif with the patch)
     ([round 312](#round-312-a-polychord-patch-that-adopts-the-newest-contour-mid-chain-cuts-async-evaluations-14-38-workers-and-22-76-with-unbiased-logz)).
+    In the converged production R2D2 search it agrees on log(Z) (+0.15
+    sigma) with 11% fewer dead points but only ~6% fewer evaluations, one
+    run; a 3-seed raced array is queued
+    ([round 313](#round-313-the-contour-patch-in-a-converged-r2d2-search-logz-agrees-dead-points--11-evaluations--6-one-run)).
     `./ri bench` prints this as `converging evals/s`; judge rank and layout
     A/Bs on it at the production nlive
     ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
@@ -15066,3 +15069,72 @@ ranks, four runs at a time on this node (~13 min for 160 runs).
 Stage row `r312-adopt-contour` in `benchmarks.jsonl`; toy, sweep scripts and
 per-seed results in `.probe/r312/`. GPU job 39654485 (round 303) still had no
 output at ~21:05 on 29 Oct.
+
+## Round 313: the contour patch in a converged R2D2 search: log(Z) agrees, dead points -11%, evaluations -6% (one run)
+
+**Change.** `scripts/run-nested-sampling-r2d2.sh` passes `NS_ADOPT_CONTOUR`
+(default 0) to every rank as `PC_ADOPT_CONTOUR`, the switch round 312's
+patch reads. The `PC_` name could not be the setting itself: `job-env.sh`
+carries only `NS_*`/`R2D2_*`/... names into a Slurm job. `run.env` records
+it when set, so `./ri resume` keeps the same sampler, and `./ri bench` files
+it as a workload key, so `./ri bench run r2d2 --interleave NS_ADOPT_CONTOUR 0 1`
+works. Unset, `run.env` and every other path are unchanged. A polychord.sif
+without the patch ignores the variable.
+
+**A patched polychord.sif without Docker in 7 s.** `.probe/r313/adopt.def`
+is a `Bootstrap: localimage` over `images/polychord.sif` that copies round
+312's pypolychord build (`.probe/r312/pp2`: `pypolychord/`, whose
+`lib/libchord.so` carries the patch, and `_pypolychord*.so`) over
+`/opt/venv/lib/python3.11/site-packages/`. `apptainer build --fakeroot` on
+the gnhf node took 7 s. A copy is in `$RI_WORK_DIR/.cache/ri/polychord-adopt.sif`.
+Because `POLYCHORD_SIF` is always `$SIF_DIR/polychord.sif`, a run picks it up
+through a `SIF_DIR` of symlinks.
+
+**Method.** Round 302's command (seed 190182240, nlive 150, 15 repeats,
+async, converged, 39 ranks) with `NS_ADOPT_CONTOUR=1`, run in the gnhf job
+on cpu-q-140 (node load 48-66 from another job) at `08a4c91` plus the
+plumbing (`.probe/r313/run.sh`).
+
+| | round 239 | round 278 | round 302 | round 313 (adopt) |
+| --- | ---: | ---: | ---: | ---: |
+| ndead | 1,488 | 1,457 | 1,438 | **1,277** |
+| nlike | 68,540 | 73,707 | 70,887 | 66,738 |
+| evaluations | 70,202 | 75,278 | 72,286 | 68,426 |
+| nlike / ndead | 46.1 | 50.6 | 49.3 | 52.3 |
+| wasted dead points (`waste.py`) | - | - | (~237 inferred) | 76 (6.0%) |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.0172503990041623 +/- 0.000401752587890735 | 0.0172602493141394 +/- 0.000402502115363966 | 0.0173483242870011 +/- 0.000407794943306949 |
+| evals/s (steady) | 51.2 | 47.5 | 60.2 (62.8) | 47.7 (49.1) |
+| wrapper wall | 1,427 s | 1,610 s | 1,260 s | 1,461 s |
+
+**Results.**
+- log(Z) agrees: +0.15 sigma from round 302, -0.10 sigma from round 239.
+  The run had no stalls and exited cleanly.
+- The patch works in production: 6.0% of dead points are wasted chains,
+  the toy's v2 figure at 38 workers (5.3%), against the toy's stock 18%.
+  If useful dead points are the same as in round 302 (1,201), stock wasted
+  ~237 (16.5%), close to the toy's 18%.
+- Dead points fell 11.2% (12.6% against the three-run mean), but nlike
+  only 5.9% (6.1%) and evaluations 5.3% (5.7%). The toy saved evaluations
+  in proportion to dead points (nlike per dead point 62.4 stock, 61.5 v2).
+  Here nlike per dead point is 52.3 against 46.1-50.6 stock, but that
+  stock spread is itself +/-5% and this is one run, so the toy's ~14% is
+  not ruled out, and neither is a real cost per chain (a chain that adopts
+  a higher contour keeps its old slice width, so it may shrink more per
+  step). The three stock runs' evaluation counts span 70.2k-75.3k, so the
+  -6% is about 1.5x that spread.
+- evals/s is not comparable: this ran in the gnhf job on a shared, loaded
+  node, round 302 on its own quiet node.
+
+**Pending.** Array job 39660948 (`.probe/r313/array.sh`, six 1-node icelake
+tasks, 55 min each) runs the same command at `NS_ADOPT_CONTOUR` 0 and 1 for
+seeds 190182240, 7311 and 4242, both arms on the patched SIF, from the
+frozen worktree `../frozen-r313` (`08a4c91` plus the plumbing). Each task
+leaves `row-`, `stats-`, `sum-` and `dead-birth-` files in `.probe/r313/`
+and deletes its run directory. Read them in a later round: paired by seed,
+they give the evaluation saving per seed and the log(Z) differences, then
+append the rows to `benchmarks.jsonl` and remove `../frozen-r313`.
+
+Bench row `r313-adopt` and stage row `r313-adopt-r2d2` in `benchmarks.jsonl`;
+`.probe/r313/` keeps the gzipped `summary.json`, `run.log`, console log,
+dead-birth file, `.stats` and profile. The run directory is deleted.
+GPU job 39654485 (round 303) still had no output at ~21:45 on 29 Oct.
