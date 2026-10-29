@@ -510,8 +510,10 @@ else
     srun --overlap --export=ALL --mpi=pmix --kill-on-bad-exit=1
     --nodelist "$(printf '%s\n' "${ns_node_hosts}" | paste -sd,)" --nodes "${NS_NODES}"
     --ntasks-per-node "${NS_MPI_PROCS}" --overcommit --mem 0 --cpu-bind none
+    # And appends its records to its node's own pack (round 290).
     /bin/sh -c 'h="$(hostname -s)"; mkdir -p "$NS_SCRATCH_DIR"
-      export NS_SIMULATE_FIFO_DIR="$1/$h" NS_R2D2_FIFO_DIR="$2/$h"; shift 2; exec "$@"' sh
+      export NS_SIMULATE_FIFO_DIR="$1/$h" NS_R2D2_FIFO_DIR="$2/$h" NS_RECORD_PACK="records.$h.jsonl"
+      shift 2; exec "$@"' sh
     "${NS_FIFO_ROOTS[@]}"
     "${RUN_CONTAINER[@]}"
   )

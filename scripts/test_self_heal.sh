@@ -57,7 +57,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 completed_evals() {
   { find "${1}/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
       sed 's#/metrics\.json$##; s#\.json$##; s#.*/##'
-    [ ! -f "${1}/evaluations/records.jsonl" ] || cut -f1 "${1}/evaluations/records.jsonl"
+    for pack in "${1}"/evaluations/records.jsonl "${1}"/evaluations/records.*.jsonl; do
+      [ ! -f "${pack}" ] || cut -f1 "${pack}"
+    done
   } | sort -u | wc -l | tr -d ' '
 }
 

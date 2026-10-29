@@ -14049,3 +14049,71 @@ Pending, not read here: round 243's GPU A/B (39544674, batched TRT lanes) has
 finally started on gpu-q-10, at `1b7b9a9` plus this round's diff. Its rows
 `r243-*` (W1, A1-3, B1-3, C1-2) land in `benchmarks.jsonl` and
 `.probe/r243/ab-39544674.out`, for the next round to read.
+
+## Round 290 (fix): one record pack per node on multi-node runs; round 243's GPU A/B read
+
+**Why.** Round 289 showed that on 2 nodes, every rank `O_APPEND`ing one Lustre
+`evaluations/records.jsonl` cost ~37x one node's writer time, and a kill -9
+lost 20% of the printed records.
+
+**Change.** The multi-node launcher (`run-nested-sampling-r2d2.sh`, the
+srun wrapper that already picks each node's FIFOs) now sets
+`NS_RECORD_PACK=records.<host>.jsonl`, so each node's ranks append to their
+own pack (`_append_record` in `common.py`). Every reader takes the node packs
+first and then `records.jsonl`, which wins: `_read_record_pack`, `./ri health`
+(`packed_records`), `./ri runs`, the progress bar and `test_self_heal.sh`. The
+finish (`pack_finished_run`) and a resume (`adopt_completed_evaluations`)
+fold the node packs into `records.jsonl` under its lock, fsync, and then
+unlink them. No rank appends at either point. The run's own 15 s packer
+passes `fold_nodes=False`, because unlinking a pack another node is still
+appending to would lose its records. A single-node run never sets
+`NS_RECORD_PACK` and writes exactly as before. The `common.py` resume
+self-check covers the node-pack write, the read, the packer leaving it
+alone, a torn line, the fold on resume and on finish, and the run pack
+winning over a stale node line. The progress-bar fixture now splits its
+packed names across both kinds of pack.
+
+**Result** (job 39615438, 2 x 38 icelake, round 289's scenarios and seed:
+`--nodes 2 --nlive 150 --num-repeats 15 --seed 289 --max-ndead 450`):
+
+| | round 289 (one shared pack) | round 290 (node packs) |
+| --- | ---: | ---: |
+| unkilled: writer record seconds, all 78 ranks | 3,743-4,043 | 1,204 |
+| unkilled: most queued on one rank | 42-48 | 1 |
+| unkilled: evals/s | 102.0 / 91.9 (round 288) | 102.8 (steady 103.5) |
+| kill -9 of everything at 100 s: printed / on disk | 10,059 / 8,152 | 8,946 / 8,254 |
+| records lost | 2,007 (20%, ~19 s) | 692 (7.7%, ~6 s) |
+
+After the kill, `./ri resume` came back on 2 nodes, read 8,254 records from
+the two node packs, folded them into `records.jsonl` (none were left
+afterwards), and finished in 77 s. Full-precision evidence: unkilled
+0.0165143033200384 +/- 0.00113325543911799 (ndead 600, nlike 11398); killed
+and resumed 0.016176300802068 +/- 0.00150869829396101 (ndead 600, nlike 7402).
+These agree (0.18 sigma), and both agree with round 289's A/B.
+
+The loss is now ~3x smaller, but it is not yet one node's 0. Writer time is
+still ~12x one node's (~100 s for 39 ranks), even though no file is shared
+across nodes any more. So the remaining cost is not file-lock ping-pong.
+Candidates are the cluster-wide `flock` (each `LOCK_SH`/`LOCK_UN` is an MDS
+round trip on Lustre with `-o flock`) and the two clients sharing the
+evaluations directory. The next step is to time one append on each node.
+
+**WSClean guard** (`.probe/r290/ws.sh`, HEAD `b3ec3d9` in a `/dev/shm`
+worktree raced against this tree on swapped CPU halves): steady evals/s
+40.58 / 41.23 at HEAD against 41.14 / 40.53 (-0.15%, noise). Chains are
+md5-identical, and log(Z) is 0.0967023094179472 in all four arms.
+
+**Round 243 read** (job 39544674, one A100 on gpu-q-10, shared TensorRT,
+`--nlive 48 --num-repeats 5 --max-ndead 600 --seed 4242`; rows `r243-*`):
+
+| arm | steady evals/s | evals/s | startup s | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| A, 19 x 2 (default), x3 | 91.0 / 90.2 / 96.9 | 79.2 / 77.8 / 79.2 | 9.3-9.9 | 0.01860-0.01904 |
+| B, 33 x 1, x3 | 86.2 / 94.1 / 89.2 | 72.5 / 80.6 / (B3 wall unreadable, 0.07 s) | 9.0-9.2 | 0.01864-0.01905 |
+| C, 33 x 1, gathered batches of 8 on 4 lanes, x2 | 139.6 / 110.4 | 101.8 / 88.6 | 27.7-33.9 | 0.01864-0.01915 |
+
+Gathered batching (C) is +35% steady and +20% end to end over the default,
+with 0 s of stalls against ~8.5 s. Its startup is ~20 s longer (the
+batch-profile TensorRT plan). All log(Z)s agree within their ~0.0006 errors.
+Two arms are too few to change the GPU default. The next GPU step is a
+longer, converged C-against-A pair.

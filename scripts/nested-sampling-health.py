@@ -361,18 +361,20 @@ ENDED_EPOCH_PATTERN = re.compile(r'"ended_epoch":\s*([0-9.eE+-]+)')
 
 def packed_records(evaluations: Path) -> dict[str, tuple[float, str]]:
     """{name: (when it ended, record text)} from evaluations/records.jsonl,
-    without its torn last line if a killed packer left one."""
-    try:
-        data = (evaluations / "records.jsonl").read_bytes()
-        fallback = (evaluations / "records.jsonl").stat().st_mtime
-    except OSError:
-        return {}
+    and before it a multi-node run's records.<host>.jsonl (round 290),
+    without a torn last line if a killed writer left one."""
     packed = {}
-    for line in data[:data.rfind(b"\n") + 1].decode(errors="replace").splitlines():
-        name, tab, text = line.partition("\t")
-        if tab:
-            ended = ENDED_EPOCH_PATTERN.search(text)
-            packed[name] = (float(ended.group(1)) if ended else fallback, text)
+    for path in [*sorted(evaluations.glob("records.*.jsonl")), evaluations / "records.jsonl"]:
+        try:
+            data = path.read_bytes()
+            fallback = path.stat().st_mtime
+        except OSError:
+            continue
+        for line in data[:data.rfind(b"\n") + 1].decode(errors="replace").splitlines():
+            name, tab, text = line.partition("\t")
+            if tab:
+                ended = ENDED_EPOCH_PATTERN.search(text)
+                packed[name] = (float(ended.group(1)) if ended else fallback, text)
     return packed
 
 

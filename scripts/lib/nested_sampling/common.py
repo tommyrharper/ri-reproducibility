@@ -1239,21 +1239,46 @@ def evaluation_record_paths(evaluations_dir: Path) -> dict[str, Path]:
 # a flat record beside a packed one wins. A line without its newline is a torn
 # append, and is ignored.
 RECORD_PACK = "records.jsonl"
+# Across nodes each node's ranks append to a pack of their own,
+# records.<host>.jsonl (NS_RECORD_PACK, set by the multi-node launcher): on
+# one shared file 2 nodes spent ~37x one node's writer-seconds and a kill lost
+# ~20% of the printed records (round 289). Readers take the node packs and
+# then the run's pack, which wins; a finish or a resume folds them into it.
+NODE_PACK_GLOB = "records.*.jsonl"
 
 
-def _read_record_pack(evaluations_dir: Path) -> tuple[dict[str, str], int]:
-    """({name: record json} from the pack, the length of its whole lines)."""
+def node_packs(evaluations_dir: Path) -> list[Path]:
     try:
-        data = (evaluations_dir / RECORD_PACK).read_bytes()
+        return sorted(evaluations_dir.glob(NODE_PACK_GLOB))
+    except OSError:
+        return []
+
+
+def _read_pack_file(path: Path, texts: dict[str, str]) -> int:
+    """Add {name: record json} from one pack to `texts`; its whole lines' length."""
+    try:
+        data = path.read_bytes()
     except (FileNotFoundError, NotADirectoryError):
-        return {}, 0
+        return 0
     whole = data.rfind(b"\n") + 1
-    texts: dict[str, str] = {}
     for line in data[:whole].decode(errors="replace").splitlines():
         name, tab, text = line.partition("\t")
         if tab:
             texts[name] = text
-    return texts, whole
+    return whole
+
+
+def _read_record_pack(evaluations_dir: Path, nodes: bool = True) -> tuple[dict[str, str], int, set[str]]:
+    """({name: record json} from the packs, the length of the run pack's
+    whole lines, the names only a node pack holds)."""
+    texts: dict[str, str] = {}
+    for path in node_packs(evaluations_dir) if nodes else []:
+        _read_pack_file(path, texts)
+    on_nodes = set(texts)
+    own: dict[str, str] = {}
+    whole = _read_pack_file(evaluations_dir / RECORD_PACK, own)
+    texts.update(own)
+    return texts, whole, on_nodes - own.keys()
 
 
 def packed_record_texts(evaluations_dir: Path) -> dict[str, str]:
@@ -1298,12 +1323,15 @@ def _read_records(names: list[str], read: Any, files: dict[str, Path]) -> list[d
     return [records[name] for name in names]
 
 
-def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]]) -> int:
+def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]],
+                            fold_nodes: bool = True) -> int:
     """Move the records named in `known` ({name: record}) into the pack and
     unlink their files - a flat record, or a pre-round-92 metrics.json and
     then its dir if that held nothing else - and append again any packed one
     `known` has edited since; how many lines it appended. Writers of the pack
-    (a resume, the run's packer, the finish) take its lock in turn."""
+    (a resume, the run's packer, the finish) take its lock in turn.
+    `fold_nodes` also moves the node packs in, which only a caller no rank
+    is appending beside may do: the run's own packer passes False."""
     import fcntl
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1319,28 +1347,32 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
         lap("lock")
         paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
         lap("list")
-        texts, whole = _read_record_pack(evaluations_dir)
+        texts, whole, on_nodes = _read_record_pack(evaluations_dir, fold_nodes)
+        folding = node_packs(evaluations_dir) if fold_nodes else []
         lap("read")
-        lines: dict[str, str] = {}
+        lines: dict[str, str] = {name: texts[name] for name in sorted(on_nodes)}
         moving = []
         for name in sorted(known):
             if name in paths and (paths[name].parent == evaluations_dir or name not in texts):
                 moving.append(name)  # a packed name's dir has no record file: only a flat one is newer
             text = json.dumps(known[name])
             # Not on disk at all: a record write the finish cancelled.
-            if name in moving or text != texts.get(name):
+            if name in moving or name in on_nodes or text != texts.get(name):
                 lines[name] = text  # the last line of a name is its record
         lap("encode")
         # A torn last line from a killed packer, or a killed rank's append,
         # which the next append would otherwise run on into.
         if whole < os.fstat(pack.fileno()).st_size:
             pack.truncate(whole)
+        if lines:
+            pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
+            pack.flush()
+            os.fsync(pack.fileno())
+        for path in folding:  # every line of them is in the run's pack now
+            path.unlink(missing_ok=True)
+        lap("write")
         if not lines:
             return 0
-        pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
-        pack.flush()
-        os.fsync(pack.fileno())
-        lap("write")
 
     def unlink(name: str) -> None:
         paths[name].unlink(missing_ok=True)
@@ -1388,7 +1420,8 @@ def pack_flat_records(evaluations_dir: Path) -> int:
         records = dict(zip((path.name.removesuffix(RECORD_SUFFIX) for path in flat),
                            pool.map(read_evaluation_record, flat)))
     return pack_evaluation_records(
-        evaluations_dir, {name: record for name, record in records.items() if record is not None})
+        evaluations_dir, {name: record for name, record in records.items() if record is not None},
+        fold_nodes=False)
 
 
 def start_record_packer(evaluations_dir: Path) -> subprocess.Popen | None:
@@ -1862,7 +1895,7 @@ def adopt_completed_evaluations(
     # Collective, and before the pack: no rank reads a flat record after it.
     if comm is not None:
         comm.bcast((adopted, keys), root=0)
-    if good:
+    if good or node_packs(evaluations_dir):
         started = time.monotonic()
         packed = pack_evaluation_records(evaluations_dir, good)
         if packed:
@@ -2103,6 +2136,34 @@ def self_check_resume_adoption() -> None:
         drain_record_writes()
         os.environ.pop("NS_RECORD_APPEND")
         assert 12 in [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)]
+        # Across nodes a rank appends to its node's pack (round 290), which
+        # every reader takes too; the run's packer leaves it alone, and a
+        # finish or a resume folds it into the run's pack, which wins.
+        os.environ["NS_RECORD_PACK"] = "records.node-b.jsonl"
+        write_records_in_background()
+        remote = evaluations_dir / "eval-0013-hij"
+        write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        drain_record_writes()
+        os.environ.pop("NS_RECORD_PACK")
+        node_pack = evaluations_dir / "records.node-b.jsonl"
+        assert node_pack.read_text().startswith("eval-0013-hij\t"), "a node's record missed its pack"
+        assert json.loads(packed_record_texts(evaluations_dir)[remote.name])["eval_id"] == 13
+        write_evaluation_record(evaluations_dir / "eval-0014-klm",
+                                {"eval_id": 14, "params": {"a": 14}, "objective": 0.6})  # flat
+        assert pack_flat_records(evaluations_dir) == 1 and node_pack.exists()
+        with open(node_pack, "a") as pack:
+            pack.write('eval-0015-nop\t{"eval_id": 15, "par')  # a rank killed mid-append
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 15
+        assert not node_pack.exists(), "a resume left a node pack unfolded"
+        texts = packed_record_texts(evaluations_dir)
+        assert json.loads(texts[remote.name])["eval_id"] == 13 and "eval-0015-nop" not in texts
+        node_pack.write_text('eval-0013-hij\t{"eval_id": 13, "params": {"a": 13}, "objective": 9}\n'
+                             'eval-0016-qrs\t{"eval_id": 16, "params": {"a": 16}, "objective": 0.1}\n')
+        _WRITTEN_RECORDS.clear()
+        records = finished_run_records(evaluations_dir)
+        assert {r["eval_id"]: r["objective"] for r in records}[13] == 0.6, "a node pack beat the run's"
+        assert pack_finished_run(evaluations_dir) == 1 and not node_pack.exists()
+        assert load_evaluations_from_dir(evaluations_dir) == records
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -2846,15 +2907,16 @@ _PACK_FDS: dict[str, int] = {}
 def _append_record(evaluations_dir: Path, line: bytes) -> None:
     import fcntl
 
-    fd = _PACK_FDS.get(str(evaluations_dir))
+    path = evaluations_dir / os.environ.get("NS_RECORD_PACK", RECORD_PACK)
+    fd = _PACK_FDS.get(str(path))
     if fd is None:
-        fd = os.open(evaluations_dir / RECORD_PACK, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        _PACK_FDS[str(evaluations_dir)] = fd
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        _PACK_FDS[str(path)] = fd
     fcntl.flock(fd, fcntl.LOCK_SH)
     try:
         written = os.write(fd, line)
         if written != len(line):
-            raise OSError(f"short append to {evaluations_dir / RECORD_PACK}: {written} of {len(line)} bytes")
+            raise OSError(f"short append to {path}: {written} of {len(line)} bytes")
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
 

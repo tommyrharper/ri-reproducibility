@@ -215,10 +215,14 @@ _ns_completed_evals() {
   } | sort -u | wc -l | tr -d ' '
 }
 
-# The names in a run's record pack, one a line: `name<TAB>record` lines.
+# The names in a run's record packs, one a line: `name<TAB>record` lines, in
+# records.jsonl and a multi-node run's records.<host>.jsonl (round 290).
 _ns_packed_names() {
-  [ -f "$1/records.jsonl" ] || return 0
-  cut -f1 "$1/records.jsonl"
+  local pack
+  for pack in "$1"/records.jsonl "$1"/records.*.jsonl; do
+    [ -f "${pack}" ] && cut -f1 "${pack}"
+  done
+  return 0
 }
 
 # Return run.log size so retry output can be isolated from earlier attempts.
@@ -745,7 +749,9 @@ self_check() {
   }
   # Packed records (round 93) count once by name, before the checkpoint: one
   # still a file too (eval-0004-d), one packed only (eval-0006-f).
-  printf 'eval-0004-d\t{}\neval-0006-f\t{}\n' >"${tmp}/evaluations/records.jsonl"
+  # And a multi-node run's node pack (round 290) as one with them.
+  printf 'eval-0004-d\t{}\n' >"${tmp}/evaluations/records.jsonl"
+  printf 'eval-0006-f\t{}\n' >"${tmp}/evaluations/records.node-b.jsonl"
   [ "$(_ns_count_evals "${tmp}/evaluations" "${dead_file}")" = "5 2" ] || {
     echo "FAIL: packed records: $(_ns_count_evals "${tmp}/evaluations" "${dead_file}")"; exit 1
   }
@@ -755,7 +761,7 @@ self_check() {
   [ "$(_ns_completed_evals "${tmp}")" = "3" ] || {
     echo "FAIL: completed with packed records: $(_ns_completed_evals "${tmp}")"; exit 1
   }
-  rm "${tmp}/evaluations/records.jsonl"
+  rm "${tmp}/evaluations/records.jsonl" "${tmp}/evaluations/records.node-b.jsonl"
 
   # The redraw backs off with the cost of the draw, so the bar cannot grow
   # into a share of the machine on a long run. A shell that cannot time itself
