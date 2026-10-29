@@ -14401,3 +14401,68 @@ against `NS_RECORD_BATCH=1` (v2) at nlive ≥ 4 × workers, reading both
 steady evals/s and the backlog, plus a kill -9 under load. If it holds
 evals/s, make it the default. Full-precision log(Z) is in the `r295-nlive`
 and `r296-batch` rows of `benchmarks.jsonl`.
+
+## Round 297 (measurement): batched record appends cost no evals/s in longer arms
+
+Round 296's open question was whether `NS_RECORD_BATCH=1` (now one job per
+batch) costs steady evals/s. Job 39641599 (cpu-q-210/211) ran the longer A/B:
+`--nodes 2 --nlive 320 --num-repeats 15 --seed 297 --max-ndead 1000` (the
+search ran to ndead 1,320, ~7 min of sampling per arm, ~40,000 evaluations),
+ABBA. nlive 320 is above 4 × 75 workers (round 293).
+
+| arm | steady evals/s | records queued at finish (max on one rank) | post-run drain s | log(Z) |
+| --- | --- | --- | --- | --- |
+| a1, HEAD path | 104.0 | 2,711 (62) | 2.8 | 0.016938 ± 0.000390 |
+| b1, batched | 103.3 | 339 (11) | 0.0 | 0.016914 ± 0.000379 |
+| b2, batched | 101.2 | 2,167 (77) | 0.6 | 0.017030 ± 0.000392 |
+| a2, HEAD path | 100.1 | 31,601 (529) | 184.9 | 0.016984 ± 0.000389 |
+
+- Steady evals/s means are A 102.0 and B 102.3. Round 296's -10% for
+  batching came from ~60 s arms running the job-per-record version and does
+  not reappear here. Batching costs nothing measurable.
+- Within each pair the batched arm had the smaller backlog at the finish:
+  8x smaller in the first pair and 15x in the second. a2 ran while Lustre
+  was loaded: 31,601 of its 42,466 records (74%) were still queued at the
+  finish and its drain took 185 s, the round 296 failure again but larger.
+  b2 was also loaded (2,167 lines), so batching does not remove the backlog
+  under load. It does shrink it by an order of magnitude.
+- log(Z) agrees across all four arms within 0.3σ. nlike was 38,313,
+  37,978, 37,194 and 39,259.
+- The arms took 7-8 min each, ndead 1,320 for `--max-ndead 1000`. A first
+  submission at `--max-ndead 1600` (job 39639944) ran ~15 min per arm and
+  was cancelled before a1 finished, because it would have overrun the 1 h
+  limit.
+
+**Kill -9 + resume found a multi-node bug.** The same job then started a
+batched search, killed every process on both nodes at 150 s and ran
+`./ri resume`. The search was still generating live points (357 records
+printed, none on disk; the writer was behind on a Lustre loaded enough to
+leave a2 with 31,601 queued). The resume died at its first evaluation with
+`OSError: [Errno 39] Directory not empty` renaming
+`/dev/shm/ri-ns-scratch-39641599-r297-k/eval-0001-…` into `.held/`. On
+multi-node runs the scratch is named after the job and run, not the launch
+(`run-nested-sampling-r2d2.sh`), and only the EXIT trap removes it. A
+kill -9 skips the trap, so a resume in the same job with the same seed
+finds the killed attempt's held directories under the same evaluation
+names. In production the next job has a new id, but `run_with_retries` and
+`./ri self-check self-heal` relaunch inside the job. Round 294's resume
+passed only because nothing had been held yet.
+
+Fix: the launch on every node removes the named scratch before creating
+it. No other search can own that directory, because `ns_refuse_live_run`
+refuses a live `OUTPUT_DIR`. shellcheck and `test_cli.py` pass. A re-run
+(job 39648108, `--max-ndead 400`, fresh nodes cpu-q-186/187) did not
+exercise the collision: start-up passed 150 s, so the kill came before any
+evaluation was scored. Its `./ri resume` in the same job finished (exit 0,
+log(Z) 0.015956 ± 0.00134, ndead 720, 7,858 records). The single-node
+scratch is per launch (`start-sidecars.sh`, `$$`), so single-node and
+WSClean runs never reach this line.
+
+Open: 357 printed against 0 on disk at the kill is a durability failure,
+but this round cannot tell whether it is batch-specific or the loaded-Lustre
+backlog that a2 shows on the default path. Next: a 2-node A/B kill -9 at a
+fixed number of scored evaluations (wait for N lines, not a fixed time), for
+both writers, then `NS_RECORD_BATCH=1` as the default if batch loses no more
+than the default does (WSClean guard needed, since `common.py` is shared).
+Full-precision log(Z) for every arm is in the `r297-batch` row of
+`benchmarks.jsonl`.

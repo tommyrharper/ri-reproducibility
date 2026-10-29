@@ -259,7 +259,12 @@ else
   SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}/${ns_host}"
   R2D2_FIFO_DIR="${R2D2_FIFO_DIR}/${ns_host}"
   [ -d "${R2D2_FIFO_DIR}" ] || { echo "FATAL: ${ns_host} is not one of this search's nodes (${ns_node_hosts:-})" >&2; exit 1; }
+  # Named, not per-launch like start-sidecars.sh's, so a kill -9 (no trap)
+  # leaves it for the next launch in this job: its .held/ collided with
+  # ./ri resume's identical eval names, ENOTEMPTY (round 297). No other
+  # search can own it - ns_refuse_live_run guards OUTPUT_DIR.
   NS_SCRATCH_DIR="/dev/shm/ri-ns-scratch-${SLURM_JOB_ID}-${OUTPUT_DIR##*/}"
+  rm -rf "${NS_SCRATCH_DIR}"
   mkdir -p "${NS_SCRATCH_DIR}"
   # Every other node starts this script again as its pools, now, so their
   # warm-up overlaps this node's. Their logs and .launcher.pid go in
