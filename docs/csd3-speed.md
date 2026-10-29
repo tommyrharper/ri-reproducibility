@@ -12567,3 +12567,74 @@ files)`. `scripts/test_self_checks.py` passes 30 of 30 host checks. The
 only exception was a run alongside the race, where `self_check_cpu_pinning`
 found every CPU claimed (`[None, None]`). That check cannot pass while a
 search holds the node's CPU claims. Run it on an idle allocation.
+
+
+## Round 257: the CPU pool loads weights-only checkpoints, half the bytes of a cold start
+
+**Question.** Round 255's whole-sapphire search reported `startup_s` 27.4 s
+against 7.8 s on 38 icelake CPUs. What is it?
+
+**Finding.** It is every rank's first evaluation. In round 255's
+`summary.json`, all 112 workers started an evaluation in the first instant
+and none finished for 27.4 s: those first evaluations took 27.4-29.2 s
+(U-Net request 24.9 s, simulate 4.1 s) against 0.79 s warm. The request
+waits for the R2D2 pool's warm-up, and on a node that has never read the
+weights that warm-up reads 8.7 GB off Lustre: 5.8 GB of torch checkpoints
+and 2.9 GB of optimised ONNX graphs (round 228). On a whole node it costs
+27 s x 112 CPUs once per job, ~4% of an 11-minute search and of every
+restart's first minute.
+
+Each Lightning checkpoint is 248 MB, but only its `state_dict` is used, and
+that is 124 MB. The rest is optimiser state, loops and callbacks.
+
+**Change.** On the CPU onnx path (the CPU default), `load_checkpoint_series`
+keeps each checkpoint's `state_dict` alone in
+`$RI_WORK_DIR/.cache/ri/r2d2-onnx/weights/<key>/` (25 files, 3.1 GB, keyed
+like the exported models by the checkpoints' names, sizes and mtimes). The
+first pool writes them once, and later pools and `prefetch_weights` read
+those instead. A cold pool now reads 5.6 GB rather than 8.7 GB. The torch
+and CUDA paths are unchanged. The image self-check `checkpoint_series`
+covers write-once and read-back.
+
+| load of the 25 checkpoints, `r2d2.sif`, page cache warm | seconds |
+| --- | ---: |
+| original checkpoints (as before) | 0.87 |
+| first load, writing the weights-only copies | 1.04 |
+| weights-only copies | 0.26-0.42 |
+
+The loaded dicts match the originals in key order, `_metadata`, dtype,
+stride and value for all 775,608,025 weights (`.probe/r257/load.py`).
+
+Interleaved tiny searches against HEAD from a `/dev/shm` worktree (seed
+196, nlive 100, 20 dead, 39 ranks, `.probe/r257/ab.sh`). The new arm's
+first run (pair 0) wrote the cache:
+
+| pair | 0 | 1 | 2 | 3 | 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| first request, HEAD | 4.53 | 4.42 | 4.55 | 4.52 | 4.43 s |
+| first request, new | 5.52 | 4.32 | 4.14 | 4.24 | 4.30 s |
+| search wall, HEAD | 9.53 | 9.16 | 9.32 | 9.48 | 9.38 s |
+| search wall, new | 10.35 | 9.37 | 9.01 | 9.14 | 9.20 s |
+
+Warm, the first request is 0.23 s faster (4 of 4 pairs) and search wall 0.16 s
+faster (3 of 4). log(Z) is 0.0101886951976723 in all 10 runs, bit-identical
+to rounds 198-204. The command-to-first-evaluation time is ~0.8 s longer in
+the new arm. That is the tree's location (RDS against `/dev/shm`), not the
+change, because the gap was already there in pair 0 before any search
+started. The cold gain cannot be measured on this node, whose page cache
+always holds the weights. At round 228's cold rate (5.8 GB in 8.9 s) it
+should be ~4.5 s of a fresh node's first request.
+The change is in `r2d2_serve.py` only, so WSClean is not touched.
+
+**Pending.** Exclusive sapphire job 39563276 (`.probe/r257/job.sh`) runs
+interleaved 113 x 1 against 57 x 2 rank x thread arms (nlive 200, 5
+repeats, 1,000 dead), to test round 255's suggestion that fewer ORT
+sessions per socket might beat 787 ms per evaluation. It runs this
+worktree, so its first arm (W0) is a fresh node's cold first request with
+the weights-only copies, to compare with round 255's 24.9 s. Read
+`.probe/r257/job-39563276.out` and the `r257-*` run dirs. Then record
+steady evals/s, `startup_s` and log(Z) at full precision, and delete the
+run dirs.
+
+Rows: `r257-weights-cache` stage row and the new arm's `r257-abb` rows in
+`benchmarks.jsonl`. Run dirs deleted.

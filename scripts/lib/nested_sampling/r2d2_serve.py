@@ -94,11 +94,47 @@ def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
             raise ValueError(f'Checkpoint conflict for N{i+1}')
         paths.append(dnn[0])
 
+    weights = checkpoint_weights_dir(ckpt_path)
+
     def load(path):
-        return torch.load(path, map_location=torch.device('cpu'), weights_only=False)['state_dict']
+        cached = weights / os.path.basename(path) if weights else None
+        if cached is not None and cached.exists():
+            return torch.load(cached, map_location=torch.device('cpu'), weights_only=True)
+        state_dict = torch.load(path, map_location=torch.device('cpu'), weights_only=False)['state_dict']
+        if cached is not None:
+            partial = cached.with_suffix(f'.{os.getpid()}.tmp')
+            try:
+                torch.save(state_dict, partial)
+                partial.replace(cached)
+            except OSError:
+                partial.unlink(missing_ok=True)  # a full quota: the next pool tries again
+        return state_dict
 
     with ThreadPoolExecutor(max(1, min(4, len(paths)))) as pool:
         return {f'N{i+1}': state_dict for i, state_dict in enumerate(pool.map(load, paths))}
+
+
+def checkpoint_weights_dir(ckpt_path) -> Path | None:
+    """Where a CPU onnx pool keeps each checkpoint's state_dict alone, or None.
+
+    A Lightning checkpoint is half optimiser state (248 MB, 124 MB of it
+    weights), and a cold pool on a new node reads all 6.2 GB off Lustre
+    before its first request (docs/csd3-speed.md, round 257). Keyed like the
+    exported models, by the checkpoints' names, sizes and mtimes.
+    """
+    if r2d2_device() != "cpu" or r2d2_runtime() != "onnx" or not ONNX_DIR.is_dir():
+        return None
+    import hashlib
+
+    ckpt_path = Path(ckpt_path)
+    stats = sorted((p.name, p.stat().st_size, int(p.stat().st_mtime)) for p in ckpt_path.glob("*.ckpt"))
+    key = hashlib.sha1(repr((str(ckpt_path), stats)).encode()).hexdigest()[:16]
+    weights = ONNX_DIR / "weights" / key
+    try:
+        weights.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return weights
 
 
 def patch_checkpoint_loading() -> None:
@@ -314,6 +350,9 @@ def prefetch_weights() -> int:
         import concurrent.futures
 
         files = sorted(Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1")).glob("*.ckpt"))
+        weights = checkpoint_weights_dir(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
+        if weights is not None:
+            files = [weights / path.name if (weights / path.name).exists() else path for path in files]
         if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
             files += sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
 
@@ -1924,6 +1963,22 @@ def self_check_checkpoint_series() -> None:
         assert list(loaded) == [f"N{i}" for i in range(1, 7)], list(loaded)
         for i in range(1, 7):
             assert torch.equal(loaded[f"N{i}"]["unet.w"], torch.full((3,), float(i)))
+        # A CPU onnx pool writes each state_dict alone once, then reads that (round 257).
+        global ONNX_DIR
+        onnx_dir, runtime = ONNX_DIR, os.environ.get("R2D2_RUNTIME")
+        with tempfile.TemporaryDirectory() as cache:
+            ONNX_DIR, os.environ["R2D2_RUNTIME"] = Path(cache), "onnx"
+            try:
+                assert all(torch.equal(load_checkpoint_series(6, tmp)[name]["unet.w"], loaded[name]["unet.w"])
+                           for _ in range(2) for name in loaded)
+                written = sorted(p.name for p in checkpoint_weights_dir(tmp).iterdir())
+                assert written == [f"R2D2_UNet_N{i}.ckpt" for i in range(1, 7)], written
+            finally:
+                ONNX_DIR = onnx_dir
+                if runtime is None:
+                    os.environ.pop("R2D2_RUNTIME")
+                else:
+                    os.environ["R2D2_RUNTIME"] = runtime
         for num_iter, message in ((7, "Checkpoint for N7 not found"), (6, "Checkpoint conflict for N2")):
             if num_iter == 6:
                 torch.save({"state_dict": {}}, Path(tmp) / "copy_N2.ckpt")
