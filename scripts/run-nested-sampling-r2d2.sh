@@ -186,7 +186,7 @@ if [ "${NS_NODES}" -gt 1 ] && [ "${NS_NODE_ROLE:-}" != pools ]; then
     echo "FATAL: --nodes ${NS_NODES} needs a Slurm allocation of ${NS_NODES} nodes; this one has ${SLURM_JOB_NUM_NODES:-1}" >&2
     exit 1
   fi
-  ns_node_hosts="$(ns_expand_hostlist "${SLURM_JOB_NODELIST}" | head -n "${NS_NODES}")"
+  ns_node_hosts="$(ns_expand_hostlist "${SLURM_JOB_NODELIST}" "${NS_NODES}")"
 fi
 # mpirun counts one slot per CPU and refuses -np past it.
 if [ "${NS_MPI_PROCS}" -gt "${HOST_CPUS}" ]; then

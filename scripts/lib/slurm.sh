@@ -122,22 +122,25 @@ ns_enter_job_env() {
   exec /bin/bash "${repo}/scripts/lib/job-env.sh" "${run_dir}/.job-settings.env" "$@"
 }
 
-# ns_expand_hostlist <list>: one host per line from a Slurm hostlist such as
-# SLURM_JOB_NODELIST (cpu-q-[83-84,90],gpu-q-1), keeping zero padding -
+# ns_expand_hostlist <list> [<count>]: one host per line from a Slurm hostlist
+# such as SLURM_JOB_NODELIST (cpu-q-[83-84,90],gpu-q-1), keeping zero padding -
 # without `scontrol show hostnames`, which this repo does not call from a job.
+# <count> stops after that many: `| head -n` SIGPIPEd it under pipefail, so
+# --nodes 2 in a 4-node allocation died at once with 141 (round 292).
 ns_expand_hostlist() {
-  local item prefix body range lo hi n
+  local item prefix body range lo hi n left="${2:--1}"
   # Commas inside brackets become ';' so the top-level ones split items.
   for item in $(printf '%s\n' "$1" | sed -E ':a;s/(\[[^],]*),/\1;/;ta' | tr ',' ' '); do
     case "${item}" in
       *\[*\]) ;;
-      *) printf '%s\n' "${item}"; continue ;;
+      *) [ "${left}" -eq 0 ] && return; left=$((left - 1)); printf '%s\n' "${item}"; continue ;;
     esac
     prefix="${item%%\[*}" body="${item#*\[}"
     body="${body%\]}"
     for range in ${body//;/ }; do
       lo="${range%-*}" hi="${range#*-}"
       for ((n = 10#${lo}; n <= 10#${hi}; n++)); do
+        [ "${left}" -eq 0 ] && return; left=$((left - 1))
         printf '%s%0*d\n' "${prefix}" "${#lo}" "${n}"
       done
     done
@@ -277,6 +280,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     || { echo "FAIL: ns_expand_hostlist, got: ${_hosts}"; exit 1; }
   [ "$(ns_expand_hostlist 'n[008-010]' | paste -sd' ')" = "n008 n009 n010" ] \
     || { echo "FAIL: ns_expand_hostlist must keep zero padding"; exit 1; }
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    _hosts="$(ns_expand_hostlist 'cpu-q-[1-4000],cpu-p-7' 2 | paste -sd' ')"
+  done
+  [ "${_hosts}" = "cpu-q-1 cpu-q-2" ] || { echo "FAIL: ns_expand_hostlist <list> 2, got: ${_hosts}"; exit 1; }
+  [ "$(ns_expand_hostlist 'cpu-p-7,cpu-q-[1-4]' 3 | paste -sd' ')" = "cpu-p-7 cpu-q-1 cpu-q-2" ] \
+    || { echo "FAIL: ns_expand_hostlist must count single hosts"; exit 1; }
 
   echo "slurm self-check passed"
 fi

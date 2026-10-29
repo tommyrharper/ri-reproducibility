@@ -2139,13 +2139,26 @@ def self_check_resume_adoption() -> None:
         # Across nodes a rank appends to its node's pack (round 290), which
         # every reader takes too; the run's packer leaves it alone, and a
         # finish or a resume folds it into the run's pack, which wins.
+        # NS_RECORD_INLINE=1 appends inline (round 292): the line is on disk
+        # when the call returns - unless a job is queued, which it waits behind.
         os.environ["NS_RECORD_PACK"] = "records.node-b.jsonl"
+        os.environ["NS_RECORD_INLINE"] = "1"
+        node_pack = evaluations_dir / "records.node-b.jsonl"
         write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
         remote = evaluations_dir / "eval-0013-hij"
         write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        assert not node_pack.exists(), "an inline record overtook a queued job"
+        gate.set()
+        drain_record_writes()
+        write_records_in_background()
+        write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        assert not _RECORD_WRITES and node_pack.read_text().count("eval-0013-hij") == 2, \
+            "an inline record was queued"
         drain_record_writes()
         os.environ.pop("NS_RECORD_PACK")
-        node_pack = evaluations_dir / "records.node-b.jsonl"
+        os.environ.pop("NS_RECORD_INLINE")
         assert node_pack.read_text().startswith("eval-0013-hij\t"), "a node's record missed its pack"
         assert json.loads(packed_record_texts(evaluations_dir)[remote.name])["eval_id"] == 13
         write_evaluation_record(evaluations_dir / "eval-0014-klm",
@@ -2837,7 +2850,18 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         _write_record(flat_record_path(eval_dir), text)
     elif os.environ.get("NS_RECORD_APPEND", "1") == "1":
         line = f"{eval_dir.name}\t{json.dumps(record)}\n".encode()
-        _submit_record_job(lambda: _append_record(eval_dir.parent, line))
+        # _pypolychord holds the GIL through PolyChord's MPI waits, so the
+        # writer thread runs only while a callback blocks: on 2 nodes an
+        # append cost ~86ms of GIL waits, the writer fell hundreds of records
+        # behind and a kill lost 692 records. NS_RECORD_INLINE=1 appends on
+        # the rank's thread: no loss, but 18-28ms a record there and ~4% fewer
+        # evals/s on 2 nodes, so it is opt-in (round 292). A queued publish
+        # keeps the thread, so a record never lands before its detail.
+        if os.environ.get("NS_RECORD_INLINE") == "1" and all(
+                future.done() for future in _RECORD_WRITES):
+            _timed_record_job(lambda: _append_record(eval_dir.parent, line), "record")
+        else:
+            _submit_record_job(lambda: _append_record(eval_dir.parent, line))
     elif os.environ.get("NS_RECORD_COALESCE", "1") == "0":
         _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
     else:

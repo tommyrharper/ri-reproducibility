@@ -14177,3 +14177,79 @@ arms of 1, 2, 4, 4, 2 and 1 nodes, `--nlive 300 --num-repeats 15 --max-ndead
 after 25 minutes in the queue. It runs whatever scripts are in the tree when
 it starts, so no script it executes may be edited while it is running. Read
 `.probe/r291/scale-39616258.out` next round.
+
+## Round 292 (negative, opt-in): appending records inline stops the kill loss but costs ~4%; `--nodes N` below the allocation fixed
+
+Round 291 proposed that each rank append its record on its own thread at the
+end of the callback, because `_pypolychord` holds the GIL and starves the
+writer thread. `NS_RECORD_INLINE=1` does that in `write_evaluation_record`.
+If a publish job is still queued, the record waits behind it on the thread as
+before, so a record never lands before its detail. The `common.py` self-check
+covers both paths. This round measured it on 2 icelake nodes (job 39618487,
+`.probe/r292/inline.sh`, `--nodes 2 --nlive 150 --num-repeats 15 --seed 289
+--max-ndead 450`, ABBA):
+
+| arm | records | evals/s | steady evals/s | record writer-seconds | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| a1 thread | 14,191 | 81.5 (cold start) | 106.36 | 2,455 | 0.0164705 ± 0.00113 |
+| b1 inline | 13,512 | 99.06 | 99.43 | 243 | 0.0165418 ± 0.00115 |
+| b2 inline | 14,042 | 100.65 | 101.70 | 388 | 0.0165872 ± 0.00110 |
+| a2 thread | 14,016 | 103.87 | 104.15 | 2,420 | 0.0165838 ± 0.00116 |
+
+- **Kill loss is gone.** Inline, with kill -9 of everything at 100 s, the log
+  had printed 7,827 records and 7,906 were on disk, so none were lost (the
+  log lags the packs). Round 290 lost 692. `./ri resume` folded both node
+  packs and finished, with log(Z) 0.0162592 ± 0.00145.
+- **But inline appends block the rank.** For inline arms, "writer-seconds" is
+  time on the rank's own thread: 243-388 s over 78 ranks and ~125 s, which is
+  18-28 ms a record and 2.5-4% of rank time. Round 291's microbenchmark
+  predicted 0.1-0.4 ms. Steady evals/s is 4.5% lower on the mean (pairs:
+  -6.5%, -2.3%). That is near the ~5% noise floor, but it agrees with the
+  blocked time, so it is probably real. So `NS_RECORD_INLINE` is opt-in
+  (default off). The 2-node default stays round 290's per-node pack on the
+  writer thread, which loses ~6 s of records on a kill.
+- **Next:** find out where the 18-28 ms goes. The three blocking calls
+  (`flock`, `write`, `flock`) each give up the GIL, and getting it back from
+  another Python thread costs up to the 5 ms switch interval. The likely
+  holders are the publish thread and the progress and watchdog threads, or
+  else Lustre itself under load. Nothing truncates a node pack while ranks
+  append (only the finish and a resume fold it), so dropping the `flock` on
+  node packs would leave one call instead of three. Retry inline after that
+  change.
+
+WSClean guard (common.py changed): HEAD raced against this tree on this
+node, with halves swapped. Steady evals/s was 40.31/41.22 at HEAD against
+41.15/40.63 with the change. Chains are md5-identical, and log(Z) is
+0.0967023094179472 in all four arms.
+
+**Bug fixed: `--nodes 2` inside a larger allocation died at once.**
+Round 291's 4-node job ran its `--nodes 2` arms in a 4-node allocation, and
+both exited with status 141 within 0.4 s.
+`ns_expand_hostlist "$SLURM_JOB_NODELIST" | head -n "$NS_NODES"` let `head`
+exit early, which sent SIGPIPE to the expansion, and pipefail made that the
+script's exit status. It reproduces in a plain shell: 200 loops of a
+400-host list through `head -n 2` exit with 141. `ns_expand_hostlist` now
+takes an optional count and stops itself, and the `slurm.sh` self-check
+covers it with a 4,000-host list.
+
+**4-node scaling, partial (job 39616258, `--nlive 300 --num-repeats 15
+--max-ndead 600 --seed 291`):**
+
+| arm | nodes | evals/s | steady evals/s | evaluations | nlike | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| n1a | 1 | 53.01 | 54.98 | 21,510 | 20,298 | 0.0168612 ± 0.00067 |
+| n4a | 4 | 169.44 | 196.88 | 11,131 | 8,124 | 0.0160311 ± 0.00104 |
+| n4b | 4 | 189.04 | 195.39 | 11,148 | 8,218 | 0.0160980 ± 0.00110 |
+
+At 4 nodes, steady evals/s is 3.57x one node (89% per-node efficiency). The
+2-node arms hit the bug above. The 4-node runs needed 40% of the likelihood
+calls and half the evaluations that one node needed for the same `ndead`.
+log(Z) agrees within 0.6σ, but the halved call count is not understood yet;
+check it next round before quoting wall-time speedups. n1b was still running
+when this was written. Read the end of `.probe/r291/scale-39616258.out`.
+
+One more sharp edge, from this round: `./ri resume` in the inline job exited
+with status 2 after it had written `summary.json`. The cause was this round
+editing `run-nested-sampling-r2d2.sh` while that job was still executing it,
+and bash reads a script as it runs ("unexpected EOF" at line 566). The
+search itself was intact. Never edit a script that a running job executes.
