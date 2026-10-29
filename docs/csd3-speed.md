@@ -5,7 +5,44 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 215; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 266; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+
+- **Rounds 216-265 in brief.** The CPU R2D2 forward is at the hardware
+  wall: a half-icelake search draws ~90-96% of its socket's measured
+  DRAM read bandwidth for U-Net weights alone, so ~53 evals/s is the
+  one-socket ceiling ([round 205](#round-205-diagnostic-the-r2d2-cpu-search-is-at-the-sockets-dram-bandwidth)).
+  The weights cannot shrink without changing results ([round 206](#round-206-diagnostic-the-u-net-weights-cannot-be-shrunk-losslessly)),
+  and batching through ORT loses at a fixed CPU count ([round 265](#round-265-diagnostic-batched-onnx-runtime-forwards-are-bit-identical-but-lose-at-a-fixed-cpu-count)).
+  What still paid came from layout and from the filesystem:
+  - Sized CPU jobs split their CPUs over two sockets, which doubles the
+    bandwidth: **+26%** on an exclusive node ([round 250](#round-250-sized-r2d2-cpu-jobs-default-to-two-sockets)),
+    and **+15%** (58.8 steady evals/s) in the converged production search
+    ([round 252](#round-252-validation-the-two-socket-default-in-the-production-search-15)).
+    They also get the extra root rank, +3.1% ([round 253](#round-253-sized-cpu-r2d2-jobs-get-round-186s-extra-root-rank)).
+  - Whole-search stalls of 20-45 s turned out to be PolyChord's root
+    creating its `.resume` on Lustre. `chains/` now lives on tmpfs, with a
+    Lustre mirror ([rounds 225-229](#round-227-polychord-writes-chains-on-node-tmpfs-mirrored-to-lustre-by-a-child-process)).
+    The stalls on the ranks' own threads moved onto the record writer, and
+    busy share went from 0.92 to 0.995 ([round 232](#round-232-diagnosis--fix-the-root-blocks-are-lustre-stalls-on-the-ranks-own-threads)).
+    The post-run drain fell from 60 s to 0.3 s, and the files a run leaves
+    fell 93% ([round 239](#round-239-validation-rounds-234-236-in-the-production-search-post-run-drain-60-s---03-s)).
+  - Cold start: the pool prefetches its weights in parallel ([round 228](#round-228-the-gap-after-the-first-wave-is-a-cold-r2d2-pool-it-now-prefetches-its-weights))
+    and loads weights-only checkpoints ([round 257](#round-257-the-cpu-pool-loads-weights-only-checkpoints-half-the-bytes-of-a-cold-start)).
+    The first request on a whole sapphire node went from 27 s to ~6 s.
+  - A whole sapphire node runs the default search at **147.5 steady
+    evals/s** and converges in 11 minutes ([round 255](#round-255-validation-todays-defaults-on-a-whole-sapphire-node-1475-evalss)).
+    113 x 1 beats 57 x 2 ORT threads by 40% ([round 259](#round-259-negative-diagnostic-57-x-2-loses-40-to-113-x-1-on-a-whole-sapphire-node-the-cold-first-request-is-now-6-s)).
+  - Records are appended to one file by default. That was chosen for
+    durability (a kill loses 0 records) over ~2% evals/s
+    ([round 264](#round-264-ns_record_append1-is-the-default)).
+  - Validated on today's tree: the production search agrees on log(Z)
+    within 0.53 sigma ([round 263](#round-263-validation-rounds-240-262-in-the-production-search-logz-agrees-no-code-regression)).
+    Simulate (MeqTrees) is now 4.6% of worker time, and the R2D2 request
+    is 94.8%.
+  - GPU: batching TensorRT forwards across ranks gave no search speed
+    ([round 238](#round-238-negative-the-gathering-tensorrt-server-gives-no-search-speed-and-its-first-arm-hung)).
+    Round 243's ranks-per-card race is still queued; ampere is booked to
+    31 Oct.
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -13096,3 +13133,14 @@ B requests in flight per CPU (36 x 1, B swept; not a fixed-CPU layout):
   worth building, so CPU batching stays closed, now for ORT too.
 - No search was run, so there is no run dir to delete. The stage row is
   `r265-ort-batch`; scripts are in `.probe/r265/`.
+
+## Round 266 (docs only): "Where it stands" brought up to round 265
+
+The status block at the top of this file still described round 215. It now
+opens with a short summary of rounds 216-265: the DRAM-bandwidth wall, and
+the levers that still paid (two-socket layout, Lustre stalls moved off the
+critical path, cold-start prefetch, the whole-sapphire figure, the append
+writer and the round 263 validation). Every anchor it links to was checked
+against this file's headings. No code changed, no search ran, and there
+is no `benchmarks.jsonl` row. Round 243's ampere race (job 39544674) still
+has no output file in `.probe/r243/`.
