@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 308; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 310; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -30,6 +30,9 @@ the Hetzner host.
     [round 307](#round-307-analysis-guidance-fix-the-async-overhead-is-a-fixed-04-x-workers-live-points-so-a-bigger-nlive-never-buys-speed)).
     The extra dead points buy no measured precision either
     ([round 308](#round-308-measurement-the-async-overheads-extra-dead-points-buy-no-measured-precision)).
+    `./ri bench` prints this as `converging evals/s`; judge rank and layout
+    A/Bs on it at the production nlive
+    ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
     A resumed multi-node search used to deadlock (fixed, round 289).
     Node packs (round 290) and batched appends, the default since
     [round 298](#round-298-default-batched-record-appends-the-scratch-fix-proven-end-to-end),
@@ -14921,3 +14924,21 @@ arms each):
 
 Row: stage `r309-converging-rate` in `benchmarks.jsonl`. GPU job 39654485
 (round 303's pair) still had no output at ~20:50 on 29 Oct.
+
+## Round 310 (docs only): agent guidance no longer says `--nlive` is free
+
+`AGENTS.md`, which every agent session loads, still said "raise `--nlive`
+freely" and that R2D2 throughput follows the rank x thread product (the old
+20-CPU Docker host's 15 x 2 beating 20 x 1). Both now contradict CSD3
+measurements: round 307 showed a converged search needs evaluations in
+proportion to nlive + 0.41 x workers, round 308 that the extra ones buy no
+precision, and rounds 276 and 309 that 39 x 1 beats 20 x 2 here, by +6.4% at
+the production nlive once judged on converging evals/s. The entry now says
+`--nlive` is a precision choice that costs time, and that rank or layout
+A/Bs are judged on `converging evals/s` at nlive 150.
+`docs/nested-sampling.md`'s "`NS_NLIVE` is free" bullet became "costs no
+memory", with the same time caveat. "Where it stands" now points at
+round 309's table line.
+
+No search ran and no code changed. GPU job 39654485 (round 303's pair, frozen
+worktree `../frozen-r303`) still had no output at ~20:40 on 29 Oct.
