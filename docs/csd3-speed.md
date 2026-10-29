@@ -12845,3 +12845,56 @@ depends on job 39567902's whole-node A/B, still pending.
 Stage row `r261-kill-coalesce` (full-precision log(Z) for both arms) is in
 `benchmarks.jsonl`. Run dirs are deleted. Script, sampler output and
 gzipped logs are in `.probe/r261/`.
+
+## Round 262 (negative probe, diagnostic): the pack's encode has no cheaper exact form; whole-sapphire load above 112 is blocked record writers
+
+**Question.** Sapphire job 39567902 (round 260) had not started, so this
+round took two things this node could answer. (1) Round 256 left a fix
+for the final pack: `encode` (a `json.dumps` of every known record to
+compare with its packed line) was ~60% of its CPU. Is there a cheaper exact
+comparison? (2) Round 259's 113-rank arms ran at load average 173-226 on
+112 CPUs, against ~90 for 57 x 2. Is that CPU oversubscription?
+
+**Method.** (1) `.probe/r262/enc.py` in `polychord.sif`'s Python on round
+159's 43,115-record pack (this icelake half, load ~50 from neighbours),
+three repeats of each comparison. (2) The `writer seconds` post-run lines
+in round 259's arm logs (`.probe/r257/*.log.gz`), set against the job's
+`uptime` after each arm. Each arm's search spans ~88 s.
+
+| comparison over 43,115 records | seconds | differing |
+| --- | ---: | ---: |
+| `json.dumps(record) != text` (today) | 1.10-1.11 | 0 |
+| `JSONEncoder(check_circular=False)` | 1.06-1.07 | 0 |
+| `json.loads(text) != record` | 0.82 | 0 |
+
+| arm (round 259) | record writer-seconds | / ~88 s | 1-min load after |
+| --- | ---: | ---: | ---: |
+| W0 113 x 1 | 8,774 | ~100 | 173 |
+| A1 113 x 1 | 9,978 | ~113 | 197 |
+| A2 113 x 1 | 11,205 | ~127 | 195 |
+| A3 113 x 1 | 11,635 | ~132 | 226 |
+| B1-B3 57 x 2 | 534-542 | ~6 | 90-94 |
+
+**Results.**
+- (1) Nothing worth shipping. `check_circular=False` saves 4%. Comparing
+  parsed records saves 25% but is not exact: `1` against `1.0` or a
+  reordered key would compare equal, and NaN would never compare equal.
+  On round 259's 1,000-dead runs `encode` is 0.7 s, after `summary.json`
+  is written. Skipping it needs the caller to say which records prune
+  edited, which `pack_evaluation_records`' callers do not track. That
+  is worth doing only if a production-length whole-node pack shows
+  `encode` as the slow step (round 256's open question).
+- (2) It is not oversubscription. The load above 112 tracks the record
+  writers blocked in Lustre creates (D state counts toward load): 113
+  workers plus ~100-132 blocked writers is ~213-245, and the 1-minute
+  average, lagging a 2-minute arm, reads 173-226 in the same order. At
+  57 ranks the writers are ~6 deep, so doubling the ranks costs ~20x the
+  writer-seconds. That is a single-directory create convoy on the MDS,
+  which `NS_RECORD_APPEND=1` (one fd, no creates) avoids. Job 39567902
+  tests whether it costs evals/s.
+- RDS is quiet today (2.5 kB create + rename on hpc-work: 10 ms median,
+  21 ms max over 40), so round 261's open case, a kill under MDS load,
+  could not be reproduced on demand.
+
+No code change, no search, no `benchmarks.jsonl` row. The probe is in
+`.probe/r262/`.
