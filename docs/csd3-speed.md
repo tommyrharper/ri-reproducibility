@@ -13042,3 +13042,57 @@ self-check.
 - The run dirs are deleted, and the gzipped logs are in `.probe/r264/`. The
   bench rows are `r264-w{flat,app}{1,2}` and the stage row is
   `r264-ws-guard`.
+
+## Round 265 (diagnostic): batched ONNX Runtime forwards are bit-identical, but lose at a fixed CPU count
+
+**Question.** Rounds 136-139 closed CPU batching with torch, where a batched
+forward is ~1e-6 of the peak off batch 1. ORT has been the CPU runtime since
+round 145 and was never batched. Is ORT's batch-B output bit-identical per
+sample, and does batching pay at one rank per CPU?
+
+**Why it could.** Shape inference on `N10.onnx` (`.probe/r265/shapes.py`):
+four average pools take the 32x32 input to 2x2, and the two 1024-channel
+convolutions at 2x2 hold 56.6 of the net's 124 MB of weights. Each weight is
+used 16 times or fewer per image, so a forward streams weights, and a loaded
+socket is memory-bound (round 137). Batching reads them once per batch.
+
+**Run.** The source graph with its batch dimension made symbolic, 1 thread,
+no arena, as in production (`.probe/r265/bt.py`). Throughput: P forked
+processes pinned to the job's CPUs, each running T-thread batch-B forwards for
+20 s, two mirrored passes, on cpu-q-124 at load 53-73 (the other half busy).
+`eq.py` compares the batch-4 graph with the production optimised graph run
+one sample at a time.
+
+- Accuracy: batch 2, 4, 8 and 16 are **bit-identical** per sample to batch 1,
+  and batch 4 is bit-identical to production's fixed-shape session. Unlike
+  torch, batching ORT needs no accuracy sign-off.
+
+| P procs x T threads, batch B | pass 1 img/s | pass 2 img/s | vs 36 x 1 x 1 |
+| --- | ---: | ---: | ---: |
+| 36 x 1, B 1 (production) | 1,276 / 1,281 | 1,263 / 1,302 | - |
+| 9 x 4, B 4 | 1,130 | 1,127 | **-12%** |
+| 4 x 8, B 8 | 929 | 918 | -28% |
+| 2 x 16, B 16 | 728 | 750 | -42% |
+
+B requests in flight per CPU (36 x 1, B swept; not a fixed-CPU layout):
+
+| B | 1 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| img/s, two passes | 1,278, 1,261 (1,270, 1,271 at the end) | 1,577, 1,552 | 1,614, 1,483 | 1,473, 1,397 |
+
+**Learned.**
+- ORT's MLAS U-Net is twice torch's rate at batch 1 (1,270 against round 136's
+  650-700 img/s on 36 icelake CPUs), and it gains far less from batching:
+  +22-26% at B 4-8 with B requests in flight per CPU (torch: +27% at B 4,
+  +95% at B 9). ORT already streams the weights well at batch 1.
+- At a fixed CPU count, the only layout a search has, batching with threads
+  loses: -12% at 9 x 4 and -42% at 2 x 16 (torch gained +14% and +64%).
+  So a lockstep worker (round 137) or a T-thread forward server (round 139)
+  cannot win on ORT even before prune thins the batch.
+- The one shape that gains, 1-thread batches of 4 with 4 requests per CPU,
+  needs 4 ranks per CPU feeding a per-CPU gatherer. Its ceiling is ~+24% of
+  the forward, ~75% of a loaded request, so ~+18% before prune thinning (a
+  batch of 4 averages 3.0, round 137) and 4x the rank memory. That is not
+  worth building, so CPU batching stays closed, now for ORT too.
+- No search was run, so there is no run dir to delete. The stage row is
+  `r265-ort-batch`; scripts are in `.probe/r265/`.
