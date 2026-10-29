@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 311; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 312; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -31,9 +31,14 @@ the Hetzner host.
     The extra dead points buy no measured precision either
     ([round 308](#round-308-measurement-the-async-overheads-extra-dead-points-buy-no-measured-precision)).
     82-88% of the overhead is chains that come back below the contour the
-    other workers have since raised. A PolyChord patch letting workers
-    adopt the newest contour mid-chain is the open lever
-    ([round 311](#round-311-diagnostic-most-of-async-polychords-overhead-is-chains-that-return-below-the-contour)).
+    other workers have since raised
+    ([round 311](#round-311-diagnostic-most-of-async-polychords-overhead-is-chains-that-return-below-the-contour);
+    its toy was synchronous, and async waste is ~2x larger). A PolyChord
+    patch where workers adopt the newest contour mid-chain cuts a toy's
+    evaluations 14% at 38 workers and 22% at 76 with unbiased log(Z). It is
+    opt-in (`PC_ADOPT_CONTOUR=1`) until polychord.sif is rebuilt and a
+    converged R2D2 search agrees
+    ([round 312](#round-312-a-polychord-patch-that-adopts-the-newest-contour-mid-chain-cuts-async-evaluations-14-38-workers-and-22-76-with-unbiased-logz)).
     `./ri bench` prints this as `converging evals/s`; judge rank and layout
     A/Bs on it at the production nlive
     ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
@@ -15000,3 +15005,64 @@ bound: a point between that maximum and the live minimum is missed.
 No code change. Stage row `r311-async-waste` in `benchmarks.jsonl`. Scripts
 and results are in `.probe/r311/`. GPU job 39654485 (round 303's pair) still
 had no output at ~20:45 on 29 Oct.
+
+## Round 312: a PolyChord patch that adopts the newest contour mid-chain cuts async evaluations 14% (38 workers) and 22% (76) with unbiased log(Z)
+
+**Correction to round 311 first.** Rounds 308 and 311 ran the toy with
+pypolychord's default `synchronous=True`, while every search here is async
+(`NS_SYNCHRONOUS=0`). Re-run async (`.probe/r312/toy.py` sets it from
+`TOY_SYNC`, default async), the waste is about twice as large: chains
+returning below the contour are 4.4% of dead points at 8 workers, 18% at 38
+and 29% at 76 (seeds 1-3, nlive 150). Async nlike is 160k / 184k / 211k against
+round 311's synchronous 153k / 169k / 184k. Round 308's precision result was
+measured in synchronous mode too.
+
+**Change.** `docker/polychord/patches/0001-adopt-newest-contour-mid-chain.patch`,
+applied by `docker/polychord/Dockerfile` to PolyChordLite `370f6af` and hashed
+into the image's build inputs. It is opt-in: `PC_ADOPT_CONTOUR=1` and async MPI
+only. After each replacement the administrator `MPI_Isend`s every worker its
+cluster's current contour (a worker whose previous send is still in flight is
+skipped). Between slice steps, `SliceSampling` drains those messages with
+`MPI_Iprobe` and raises its slice contour to the newest one when its current
+point is already above it. `catch_seed` skips contour messages queued ahead of
+a seed or stop signal, and the administrator `MPI_Waitall`s them after the
+stop signals go out. Unset, nothing is sent and serial (np 1) output is
+bit-identical to stock: log(Z) -8.15870627279788, nlike 50987 for both.
+
+**Method.** 6-d Gaussian toy (analytic log(Z) -8.3019), async, nlive 150,
+num_repeats 15, sleep 3 ms, converged. Seeds 101-140 per arm at 39 and 77
+ranks, four runs at a time on this node (~13 min for 160 runs).
+
+| arm | ranks | log(Z) - truth | rms | ndead | wasted | nlike | nlike vs stock |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| stock | 39 | +0.019 +/- 0.030 | 0.187 | 2,960.5 | 528.8 | 184,704 | - |
+| v1 (adopt on entry) | 39 | **-0.081 +/- 0.033** | 0.222 | 2,577.7 | 131.3 | 158,409 | -14.2% |
+| v2 (shipped) | 39 | -0.013 +/- 0.026 | 0.165 | 2,573.4 | 137.7 | 158,204 | **-14.3%** |
+| stock | 77 | +0.024 +/- 0.033 | 0.209 | 3,419.0 | 977.9 | 211,751 | - |
+| v1 (adopt on entry) | 77 | **-0.088 +/- 0.026** | 0.185 | 2,724.2 | 268.0 | 162,472 | -23.3% |
+| v2 (shipped) | 77 | -0.010 +/- 0.026 | 0.160 | 2,741.4 | 296.1 | 164,645 | **-22.2%** |
+
+**Learned.**
+- v1 remembered a contour the point was below and adopted it once the chain
+  climbed into it. That is a hitting-time rule: the point enters the new
+  region at its boundary and has too few steps left to mix away from it, so
+  new live points sit too low and log(Z) came out ~0.1 low (~3.5 sigma over
+  both arms, half a run's reported error). v2 adopts a contour only when it
+  arrives and the point is already inside it. Then the point is a draw from
+  the old region conditioned on the new one, which is uniform on the new one.
+  Its bias is -0.01 +/- 0.026 in both arms, and its rms is no worse than stock.
+  40 seeds rule out a v2 bias above ~0.05 (2 sigma).
+- The saving is the waste removed: useful dead points (ndead - wasted) are
+  ~2,435 in every arm, and wasted chains fall from 18% to 5% (38 workers)
+  and from 29% to 11% (76). Every evaluation of a dead chain is time on a
+  real search, so for production R2D2 (38 workers, async) v2 should cut a
+  converged search's evaluations by ~14% on one node and ~22% on two.
+- Not shipped as a default. It needs a polychord.sif rebuild (Docker host,
+  then `./ri images export`/`import`), `PC_ADOPT_CONTOUR` passed into the rank
+  environment, and a converged R2D2 search with log(Z) agreeing against
+  round 302 before it becomes the default. Results agree within error, not
+  bit for bit, because the chains change.
+
+Stage row `r312-adopt-contour` in `benchmarks.jsonl`; toy, sweep scripts and
+per-seed results in `.probe/r312/`. GPU job 39654485 (round 303) still had no
+output at ~21:05 on 29 Oct.
