@@ -1750,7 +1750,11 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     started = time.monotonic()
     # This rank's own backlog and drain, apart from the barrier's wait for
     # the slowest: round 233's 60s drain was one of the two (round 234).
-    queued = [future.kind for future in _RECORD_WRITES if not future.done()]
+    queued = [future.kind for future in _RECORD_WRITES if not future.done() and future.kind != "record"]
+    with _PENDING_LOCK:
+        lines = len(_PENDING_LINES)
+    queued += ["record"] * (lines or sum(future.kind == "record" for future in _RECORD_WRITES
+                                         if not future.done()))
     # A record still queued has its text in _WRITTEN_RECORDS, which rank 0
     # gathers and pack_finished_run() writes into the pack: writing the file
     # first only for the pack to unlink it was most of a backlog of up to
@@ -1768,6 +1772,7 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     _RECORD_WRITES[:] = [future for future in _RECORD_WRITES if not future.cancelled()]
     drain_record_writes(flush_held=False)
     _PENDING_RECORDS.clear()  # their texts are in _WRITTEN_RECORDS too
+    _PENDING_LINES.clear()
     backlog = (queued, time.monotonic() - started, dict(_WRITER_SECONDS))
     try:
         from mpi4py import MPI
@@ -2134,6 +2139,37 @@ def self_check_resume_adoption() -> None:
         write_evaluation_record(evaluations_dir / "eval-0012-efg",
                                 {"eval_id": 12, "params": {"a": 12}, "objective": 0.6})
         drain_record_writes()
+        # An appending writer that fell behind writes its backlog in one
+        # append, in order, but never a line ahead of a queued publish of its
+        # evaluation's detail (round 296).
+        os.environ["NS_RECORD_BATCH"] = "1"
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        appends = []
+        real_append = _append_record
+        globals()["_append_record"] = lambda d, line: (appends.append(line), real_append(d, line))
+        published = threading.Event()
+        try:
+            for i in range(3):
+                write_evaluation_record(evaluations_dir / f"eval-003{i}-bat",
+                                        {"eval_id": 30 + i, "params": {"a": 30 + i}, "objective": 0.5})
+            assert sum(f.kind == "record" for f in _RECORD_WRITES) == 1, "a covered line got a job"
+            _submit_record_job(published.wait, "publish")
+            _PENDING_LINES.append((evaluations_dir, b'eval-0033-bat\t{"eval_id": 33, "params": {"a": 33}, "objective": 0.5}\n', _RECORD_WRITES[-1]))
+            _submit_record_job(_append_pending_lines)
+            gate.set()
+            time.sleep(0.2)
+            assert [line.count(b"\n") for line in appends] == [3], appends
+            published.set()
+            drain_record_writes()
+        finally:
+            gate.set()
+            published.set()  # so a failed assertion cannot hang the drain at exit
+            globals()["_append_record"] = real_append
+            os.environ.pop("NS_RECORD_BATCH")
+        assert [line.count(b"\n") for line in appends] == [3, 1], appends
+        assert appends[0].startswith(b"eval-0030-bat\t") and b"eval-0032-bat\t" in appends[0]
         os.environ.pop("NS_RECORD_APPEND")
         assert 12 in [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)]
         # Across nodes a rank appends to its node's pack (round 290), which
@@ -2166,7 +2202,7 @@ def self_check_resume_adoption() -> None:
         assert pack_flat_records(evaluations_dir) == 1 and node_pack.exists()
         with open(node_pack, "a") as pack:
             pack.write('eval-0015-nop\t{"eval_id": 15, "par')  # a rank killed mid-append
-        assert adopt_completed_evaluations(evaluations_dir, {}) == 15
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 19
         assert not node_pack.exists(), "a resume left a node pack unfolded"
         texts = packed_record_texts(evaluations_dir)
         assert json.loads(texts[remote.name])["eval_id"] == 13 and "eval-0015-nop" not in texts
@@ -2833,6 +2869,7 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         if marker is not None:
             marker.unlink(missing_ok=True)
     keeping = prune_evaluation_artefacts(eval_dir, record)
+    published: list[Any] = []
     kept = retain_evaluation_detail(eval_dir, record) or keeping
     if kept and not keeping and not _always_retained(eval_dir, record):
         hold_evaluation_scratch(eval_dir, record)
@@ -2841,7 +2878,7 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         # ~0.2s, and the rank sat idle through it: ~2% of a 36-rank search
         # (docs/csd3-speed.md, round 95).
         publish_evaluation_scratch(eval_dir, record, kept, defer=(
-            (lambda job: _submit_record_job(job, "publish"))
+            (lambda job: published.append(_submit_record_job(job, "publish")))
             if _RECORD_WRITER is not None else None))
     flush_held_evaluations()
     text = _json_text(record)
@@ -2860,8 +2897,16 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         if os.environ.get("NS_RECORD_INLINE") == "1" and all(
                 future.done() for future in _RECORD_WRITES):
             _timed_record_job(lambda: _append_record(eval_dir.parent, line), "record")
-        else:
+        elif os.environ.get("NS_RECORD_BATCH", "0") != "1":
             _submit_record_job(lambda: _append_record(eval_dir.parent, line))
+        else:
+            publish = published[0] if published else None
+            with _PENDING_LOCK:
+                # A job queued for an earlier line takes this one too.
+                covered = bool(_PENDING_LINES) and publish is None
+                _PENDING_LINES.append((eval_dir.parent, line, publish))
+            if not covered:
+                _submit_record_job(_append_pending_lines)
     elif os.environ.get("NS_RECORD_COALESCE", "1") == "0":
         _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
     else:
@@ -2892,6 +2937,32 @@ def _write_pending_records() -> None:
         _append_record(pending[0][0].parent, b"".join(
             f"{eval_dir.name}\t{json.dumps(record)}\n".encode() for eval_dir, _, record in pending))
         _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(pending)
+
+
+# The appending writer fell behind the same way under a loaded Lustre: a
+# 2-node search ended with 11,085 of its 23,279 records still queued, 1,078
+# on one node (round 296). NS_RECORD_BATCH=1 has a record job append every
+# line queued when it runs, in one write - up to the first whose detail is
+# still to publish, which its own job, queued behind that publish, appends.
+# On 2 nodes it cut the backlog at the finish 1,350-1,871 -> 105-131, but
+# steady evals/s read 83.5/87.9 against 90.0/100.2, so it is opt-in until a
+# longer A/B settles that (round 296).
+_PENDING_LINES: list[tuple[Path, bytes, Any]] = []
+
+
+def _append_pending_lines() -> None:
+    with _PENDING_LOCK:
+        ready = 0
+        for _, _, publish in _PENDING_LINES:
+            if publish is not None and not publish.done():
+                break
+            ready += 1
+        batch = _PENDING_LINES[:ready]
+        del _PENDING_LINES[:ready]
+    if batch:
+        _append_record(batch[0][0], b"".join(line for _, line, _ in batch))
+        if len(batch) > 1:
+            _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(batch)
 
 
 def _submit_record_job(job: Any, kind: str = "record") -> Any:

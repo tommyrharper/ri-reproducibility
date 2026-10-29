@@ -14344,3 +14344,60 @@ extra branch. Full-precision log(Z) is in the `r294-flock` row of
 `benchmarks.jsonl`. Next for multi-node: compare evals/s per node at a
 production-shaped nlive (≥ 4 × workers, round 293) rather than keep shaving
 the record path, which is now below the 2-node noise floor.
+
+## Round 296 (measurement, opt-in): per-node evals/s at production nlive; batched record appends
+
+**Evals/s per node at production-shaped nlive** (job 39625275, submitted in
+gnhf 295 and read here; icelake cpu-q-[210-211], `--num-repeats 15 --seed
+295 --max-ndead 600`, ABCCBA):
+
+| arm | nodes | nlive (workers/nlive) | steady evals/s | per node | log(Z) |
+| --- | --- | --- | --- | --- | --- |
+| A | 2 | 150 (0.51) | 95.0, 110.6 | 47.5-55.3 | 0.016875 ± 0.00062, 0.016833 ± 0.00060 |
+| B | 2 | 640 (0.12) | 98.9, 99.8 | 49.4-49.9 | 0.016421 ± 0.00076, 0.016485 ± 0.00078 |
+| C | 1 | 640 (0.06) | 52.5, 51.6 | 51.6-52.5 | 0.016740 ± 0.00070, 0.016667 ± 0.00071 |
+
+- At nlive 640 two nodes give 95% of one node's evals/s per node. Round
+  292's 3.57x on 4 nodes is consistent with that.
+- These runs stop at a fixed `--max-ndead`, so per round 293 their nlike and
+  wall times are biased between rank counts. Only evals/s is compared here.
+- Under a loaded Lustre the default record writer fell far behind. At the
+  finish there were still 11,085 of a2's 23,279 records queued across ranks
+  (5,348 in b2, 1,078 in single-node c2), and a2's post-run took 390 s
+  (drain 146, flush 180, summary 64). A kill -9 at that point would lose
+  every queued record, so on a loaded Lustre the default misses the
+  durability bar on both 1 and 2 nodes.
+
+**Batched appends** (`NS_RECORD_BATCH=1`, `common.py`). A record job now
+appends every line queued when it runs, in one write, as round 247 did for
+the flat writer. It stops at the first line whose detail is still queued for
+publishing; that line's own job runs after the publish and appends it. A
+line already covered by a queued job gets no job of its own. The A/B (job
+39634194, same nodes, `--nodes 2 --nlive 320 --max-ndead 300 --seed 296`,
+ABBA) ran the first version, which still queued one job per record:
+
+| arm | steady evals/s | record jobs queued at finish (max on one rank) | log(Z) |
+| --- | --- | --- | --- |
+| A, HEAD path | 90.0, 100.2 | 1,350 (44), 1,871 (53) | 0.015827 ± 0.00171, 0.015861 ± 0.00172 |
+| B, batched | 83.5, 87.9 | 131 (4), 105 (4) | 0.015810 ± 0.00173, 0.015802 ± 0.00170 |
+
+- The backlog at the finish fell 10-18x, and the queued counts for B are an
+  upper bound: they count jobs, and many of those were no-ops whose lines an
+  earlier batch had already written. 3,876 and 3,759 of B's ~4,900 lines
+  went out in batches.
+- B's steady evals/s was lower in both pairs (mean -10%). The 2-node spread
+  is ~5% (round 294) and the arms were short (~60 s of sampling), so this is
+  not settled, but the batching cannot ship as the default against it.
+- WSClean guard (cpu-q-140, HEAD in a /dev/shm worktree raced against this
+  tree on swapped halves): 29.6/36.8 against 35.9/36.9 evals/s, log(Z)
+  0.09670 ± 0.00052 in all four. The HEAD arm writes its records to tmpfs,
+  so writer seconds are not comparable between the two arms.
+
+What ships: the batched path as opt-in, in its second version (one job per
+batch, not per record). In that path the post-run line counts queued lines.
+The default path is HEAD's, and the self-check covers the batch order, the
+publish barrier and the job count. Next: a longer 2-node ABBA of HEAD
+against `NS_RECORD_BATCH=1` (v2) at nlive ≥ 4 × workers, reading both
+steady evals/s and the backlog, plus a kill -9 under load. If it holds
+evals/s, make it the default. Full-precision log(Z) is in the `r295-nlive`
+and `r296-batch` rows of `benchmarks.jsonl`.
