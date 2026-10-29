@@ -12634,7 +12634,7 @@ worktree, so its first arm (W0) is a fresh node's cold first request with
 the weights-only copies, to compare with round 255's 24.9 s. Read
 `.probe/r257/job-39563276.out` and the `r257-*` run dirs. Then record
 steady evals/s, `startup_s` and log(Z) at full precision, and delete the
-run dirs.
+run dirs. (Read in [round 259](#round-259-negative-diagnostic-57-x-2-loses-40-to-113-x-1-on-a-whole-sapphire-node-the-cold-first-request-is-now-6-s).)
 
 Rows: `r257-weights-cache` stage row and the new arm's `r257-abb` rows in
 `benchmarks.jsonl`. Run dirs deleted.
@@ -12712,3 +12712,59 @@ was meant to be. Read it as in round 257.
 
 Rows: `r258-ab{a,b}` and `r258-def{a,b}` bench rows and the
 `r258-threaded-ort` stage row in `benchmarks.jsonl`. Run dirs deleted.
+
+## Round 259 (negative, diagnostic): 57 x 2 loses 40% to 113 x 1 on a whole sapphire node; the cold first request is now ~6 s
+
+**Question.** Round 255 put a whole-sapphire evaluation at 787 ms against
+630 on split icelake, and suggested that fewer ORT sessions per socket might
+help. Round 258 made 2-thread requests run ORT instead of torch. So does
+57 ranks x 2 threads beat the default 113 x 1 on a whole sapphire node? And
+does round 257's weights-only cache shorten a fresh node's first request
+(round 255: 27.4 s)?
+
+**Method.** Exclusive sapphire job 39563276 (`.probe/r257/job.sh`, cpu-r-92),
+interleaved W0 A1 B1 B2 A2 A3 B3: `./ri search r2d2 --nlive 200
+--num-repeats 5 --max-ndead 1000 --seed 4242` (async). Arm A is the default
+(113 ranks, `R2D2_OMP_THREADS=1`); arm B is `NS_MPI_PROCS=57`, which derives
+`R2D2_OMP_THREADS=2`. W0 ran round 257's tree plus round 258's uncommitted
+change; A1 the same; B1 onwards ran `dad9dff` (round 258) clean. The A arms
+use the 1-thread path, which round 258 did not change.
+
+| arm | evals/s | steady evals/s | ms per eval | image_container ms | simulate ms | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| W0 (113 x 1) | 146.97 | 147.02 | 745.0 | 679.1 | 64.8 | 0.0176877867975606 +/- 0.000359539845140757 |
+| A1 (113 x 1) | 150.72 | 150.76 | 727.0 | 673.9 | 51.9 | 0.0175364754653707 +/- 0.000397843469083318 |
+| B1 (57 x 2) | 88.80 | 92.66 | 622.7 | 590.2 | 31.5 | 0.0181245677039065 +/- 0.000339626694415866 |
+| B2 (57 x 2) | 88.86 | 92.45 | 623.7 | 590.9 | 31.7 | 0.0180341232346788 +/- 0.000335677992076756 |
+| A2 (113 x 1) | 146.32 | 146.36 | 742.6 | 692.5 | 49.0 | 0.0176073253679468 +/- 0.000399276316153648 |
+| A3 (113 x 1) | 149.65 | 149.69 | 730.0 | 682.4 | 46.5 | 0.0170137811517355 +/- 0.000482718536058283 |
+| B3 (57 x 2) | 89.41 | 93.47 | 617.4 | 585.7 | 30.7 | 0.0179679913807668 +/- 0.000334514642347057 |
+
+**Results.**
+- **113 x 1 wins every pair by ~40%**: A1-A3 average 148.9 evals/s and B
+  89.0 (-40%). Steady evals/s, which leaves out B's 7.5-7.9 s of per-worker
+  session builds, gives -38%. The default stays.
+- Two threads per request cut the request only from ~680 to ~590 ms
+  (1.15x) under full-node load, against 1.8x for a solo forward (round
+  258: 16.5 -> 9.0 ms). B's load average sat at ~90 on 112 CPUs. The
+  second thread mostly waits on memory, the same limit as round 255's
+  shared L3/memory bandwidth. Halving the sessions per socket does not
+  relieve it: each forward still streams the same weights.
+- log(Z) agrees across all seven arms (0.0170-0.0181; the widest gap, A3
+  against B1, is 1.9 sigma). B's values sit ~1 sigma above A's. Async searches with
+  different worker counts take different paths, as in round 255.
+- **Cold first request.** `startup_s` reads 0.0 in A and W0 because
+  `bench.py` counts gaps between evaluation *starts*, and all 112 first
+  evaluations start together. Measured from the records instead, W0's
+  first requests take 5.0/6.0/7.7 s (min/median/max) and A1's (page cache
+  warm) 5.2/6.6/8.5 s, against 27.4-29.2 s in round 255 on a fresh node.
+  So W0 shows no cold-read penalty left, though this node may have had
+  some files cached from an earlier job. What is left is 112 workers' first
+  requests contending, not I/O. Round 257's weights-only cache is consistent
+  with that, but this does not prove it alone: cpu-r-92 is not round 255's
+  node.
+
+No code change. Rows: stage row `r259-spr-layout` (arm means, the first
+request timings and full-precision log(Z)) in `benchmarks.jsonl`, plus the
+job's own `r257-*` bench rows. Run dirs deleted. The job script, output and
+arm logs are in `.probe/r257/`.
