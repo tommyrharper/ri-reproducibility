@@ -2342,7 +2342,12 @@ def evaluation_key(record: dict[str, Any]) -> str:
     name carries the parameter hash and is unique.
     """
     eval_dir = (record.get("paths") or {}).get("eval_dir")
-    return Path(eval_dir).name if eval_dir else f"eval_id:{record.get('eval_id')}"
+    if not eval_dir:
+        return f"eval_id:{record.get('eval_id')}"
+    # Path().name, without building a Path: ~4 a record at the end of a run
+    # (round 269). Only a trailing "/" or "." needs Path's normalising.
+    name = eval_dir.rpartition("/")[2] if isinstance(eval_dir, str) else ""
+    return name if name not in ("", ".") else Path(eval_dir).name
 
 
 def evaluations_keeping_images(
@@ -2488,6 +2493,9 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
 
     slow, removed = [], 0
     for record in records:
+        paths = record.get("paths") or {}
+        if not any(paths.get(key) for key in RETAINED_IMAGE_KEYS):
+            continue  # prune() of a record naming no image does nothing: ~90% of them (round 269)
         if touches_lustre(record):
             slow.append(record)
         else:
@@ -2630,6 +2638,10 @@ def self_check_image_retention() -> None:
     assert evaluations_keeping_images(shared, ends=1, stride=100) == {
         "eval-0007-aaa", "eval-0007-bbb"}
     assert len({evaluation_key(r) for r in shared}) == 2
+    # Path().name, whatever the spelling (round 269 skips building the Path).
+    for spelled in ("/run/evaluations/eval-0007-aaa", "eval-0007-aaa", "/run//eval-1/", "/run/eval-1/.",
+                    "/run/..", "/", "a/./b", Path("/run/evaluations/eval-0007-aaa")):
+        assert evaluation_key({"paths": {"eval_dir": spelled}}) == Path(spelled).name, spelled
 
     with tempfile.TemporaryDirectory() as tmp:
         evaluations = Path(tmp) / "evaluations"

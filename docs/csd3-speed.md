@@ -13270,3 +13270,63 @@ flush writer-seconds come from where they ran (the RDS worktree against
 - Rows: bench `r268-w{old,new}{1,2}` and stage `r268-record-read`. Run dirs,
   packs and the HEAD worktree are deleted. Scripts and timings are in
   `.probe/r268/`.
+
+## Round 269: the finish's keep decision and prune skip what they do not need
+
+Ampere job 39544674 (round 243) still had no output file, so this round
+looked at rank 0's end-of-run work, which leaves every other rank of the
+node idle and grows with the evaluation count. At 67k records (round 263)
+the timed post-run phases total ~12 s, and the wrapper spends ~21 s
+outside `run_polychord`. A synthetic probe (`.probe/r269/p.py`, records
+copied from r263-bigrun's `summary.json`, single process in
+`polychord.sif`) timed the in-memory parts at HEAD:
+
+| step at HEAD (in memory) | 67k records | 400k records |
+| --- | ---: | ---: |
+| `evaluations_keeping_images` (runs twice: flush and prune) | 0.29 s | 1.98 s |
+| `prune_run_artefacts`, before any Lustre call | 0.93 s | 5.95 s |
+| `summarize_profiling` | 0.15 s | 0.90 s |
+| `_json_text` of the summary | 1.88 s | 11.10 s |
+
+Two of those did work with no effect:
+- `prune()` of a record naming no image changes nothing and touches no
+  file, but it still ran for every record, building ~4 `Path`s each. About
+  90% of records are like this (9-13% ever enter a rank's held extremes).
+  The loop now skips them.
+- `evaluation_key` built a `Path` only to take `.name`. It now takes the
+  text after the last `/`, and falls back to `Path` for a trailing `/` or
+  `.`. The pruning self-check asserts it equals `Path().name` for eight
+  spellings.
+
+Same probe, with 11% of records naming images, best of 3, evaluations dir
+absent (so in-memory cost only):
+
+| | HEAD 67k | change 67k | HEAD 400k | change 400k |
+| --- | ---: | ---: | ---: | ---: |
+| keep | 0.290 s | 0.086 s | 1.981 s | 0.702 s |
+| prune | 0.926 s | 0.111 s | 5.953 s | 0.906 s |
+
+The pruned records and the keep set hash the same at both sizes. Counting
+keep twice, the finish saves ~1.2 s at 67k and ~7.6 s at 400k. That is
+~0.1% and ~0.3% of those runs' wall clock, too small to see end to end, so
+it is measured by stage only.
+
+**WSClean guard** (shared code): `.probe/r269/ws.sh`, round 268's script
+raced against a HEAD (e619391) worktree on `/dev/shm`:
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 37.62 | 37.63 (+0.0%) |
+| 2 | 37.63 | 37.80 (+0.5%) |
+
+Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms.
+
+**Learned.**
+- The largest remaining end-of-run step is `summary.json`'s JSON encode,
+  11 s at 400k records. Round 197 already moved it to the C encoder. A
+  cheaper form would need to reuse the ranks' record texts, which prune
+  edits for ~10% of records.
+- Rows: bench `r269-w{old,new}{1,2}`, stage `r269-post-run-keep-prune`.
+  Run dirs and the HEAD worktree are deleted. Scripts are in
+  `.probe/r269/`.
