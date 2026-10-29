@@ -12801,3 +12801,47 @@ default writer, B is `NS_RECORD_APPEND=1`. Read `.probe/r260/job-39567902.out`
 and the `r260-*` dirs in a later round, record the evals/s, steady evals/s,
 `first_request_s` and full-precision log(Z), then delete the dirs.
 
+
+## Round 261 (durability check): a kill -9 and resume with the coalescing writer
+
+**Why.** The durability rule from round 244 is that a mid-search kill must
+not lose more than a few seconds of records, verified by a kill -9 and a
+`./ri resume`. Round 247 made the coalescing writer the default but did not
+kill a search. Round 260's sapphire job 39567902 had not started, so this
+check ran on this node.
+
+**Method.** Round 245's kill (`.probe/r261/kill.sh`: async R2D2, seed 242,
+`--nlive 48 --num-repeats 5 --max-ndead 600 --mpi-procs 20`, tree
+`e91eb36`). The default (coalescing) writer raced `NS_RECORD_APPEND=1`, one
+arm on each 19-CPU half of this job. Round 244's sampler ran every 10 s. At
+210 s, one `kill -9` hit the launcher's group and every process naming the
+run dir (0 left). Each arm then ran `./ri resume` to the end. RDS was quiet:
+no `evaluations/` listing took over 0.1 s.
+
+| arm | scored at kill | on disk | lost | most behind mid-run | resumed at (ndead) | resume wall | final evaluations = records | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| coalesce (default) | 5,078 (5,080 after) | 5,058 | **20-22** | 2 | 284 | 235 s | 10,074 | 0.0164934813192454 +/- 0.000719897271085676 |
+| append | 4,907 (4,910 after) | 4,909 | **0-1** | 1 | 280 | 247 s | 9,858 | 0.0165801785722601 +/- 0.00072200227030288 |
+
+**Results.**
+- The coalescing writer loses about one record per rank at a kill: the
+  in-flight writer job of each of 20 ranks. At ~24 evals/s that is ~0.8 s
+  of evaluations, inside the "few seconds" bar. Round 245's flat writer lost
+  27 on quiet RDS and 161 under load. Append lost nothing, as in round 245.
+- Both resumes restarted from the last `.resume` checkpoint, ran to the
+  end (rc 0), and left complete archives (unique records = the summary's
+  `evaluation_count`, no flat files). log(Z) agrees within 0.09 sigma.
+- Even on quiet RDS the coalescing writer spends 17x the writer-seconds of
+  append (1,146 against 68, all ranks), because a lone record is still a
+  Lustre create. That is the cost round 260's sapphire job weighs at 113
+  ranks.
+- Not covered: a kill under heavy MDS load. Rounds 247-248 bound the lag
+  there at 15-18 records behind, from the mid-run sampler.
+
+**Decision.** No code change. The coalescing default meets the durability
+rule on quiet RDS. Whether `NS_RECORD_APPEND=1` becomes the default
+depends on job 39567902's whole-node A/B, still pending.
+
+Stage row `r261-kill-coalesce` (full-precision log(Z) for both arms) is in
+`benchmarks.jsonl`. Run dirs are deleted. Script, sampler output and
+gzipped logs are in `.probe/r261/`.
