@@ -13556,3 +13556,65 @@ worktree), the instrumented first-wave runs `r273-a`, `r273-prof`,
 `benchmarks.jsonl`. The run dirs and the HEAD worktree are deleted. Probes
 are in `.probe/r273/`. Change is R2D2-only (`run-nested-sampling-r2d2.sh`),
 so no WSClean guard is needed.
+
+## Round 274 (shipped): the pool's 1-thread sessions come from the shared arrays, which wins back round 273's ~3 s
+
+**Question.** Round 273 made an async pool really build `ort_shared_parts`'
+~2.9 GB of aligned weight arrays, and that put ~3 s on the first request
+(5.3 -> 8.3 s). Round 272's unshipped diff
+(`.probe/r272/sessions-from-parts.diff`) builds the 25 1-thread sessions over
+those same arrays (`add_initializer`) instead of loading every graph file a
+second time, and copies the arrays on 8 threads. Standalone it took
+`patch_onnx_network` from 5.1 to 2.35 s. Does that show in a search now that
+`threaded` is True?
+
+**Change.** `patch_onnx_network`'s `build()` returns both dicts. When
+`threaded`, it builds `ort_shared_parts` on a fresh 8-thread pool (per NUMA
+set, so its threads take the caller's memory policy) and makes the 1-thread
+sessions with the new `parts_session(parts, 1)`, which `threaded_session` now
+uses too. It still loads the file sessions first if any optimised graph is
+missing, since that is what writes them. A run that is not threaded is
+unchanged. `self_check_threaded_session` now also checks that a
+`parts_session(…, 1)` output equals the file session's bit for bit. It passes
+in `r2d2.sif` with the cached onnxruntime, and `./ri self-check r2d2-serve`
+passes.
+
+**A/B** (interleaved against HEAD in a `/dev/shm` worktree, default async
+39 x 1 layout, 38 CPUs, nlive 48, 5 repeats, 150 dead, seed 274; order n1 h1
+h2 n2 n3 h3):
+
+| arm | evals/s | steady | first request s | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| n1 (new) | 41.92 | 41.96 | 5.66 | 8154 | 0.0136331980863233 +/- 0.00412448 |
+| h1 (HEAD) | 41.26 | 52.49 | 8.44 | 9751 | 0.0138136681317998 +/- 0.00388216 |
+| h2 (HEAD) | 39.71 | 50.07 | 8.46 | 9693 | 0.0137530707275181 +/- 0.00388182 |
+| n2 (new) | 42.96 | 42.98 | 5.70 | 8228 | 0.0137982726772110 +/- 0.00388189 |
+| n3 (new) | 41.83 | 41.86 | 5.70 | 8145 | 0.0137093469472998 +/- 0.00396099 |
+| h3 (HEAD) | 39.75 | 50.38 | 8.62 | 9889 | 0.0135728138091944 +/- 0.00404133 |
+
+**Learned.**
+- The first request is back to 5.7 s (8.4-8.6 at HEAD) in all three pairs,
+  just above round 273's pre-fix 5.3-5.4 s. End to end, these 35 s arms gain
+  +4.4% (42.2 against 40.2 mean). That is the ~2.8 s start-up, about 0.2% of
+  a 25-minute run, and paid again at every pool restart.
+- Peak memory drops ~1.6 GB (8.1-8.2 against 9.7-9.9 GB): the pool now holds
+  one copy of the weights, not a file session's copy plus the shared arrays.
+  On a node where `rank-budget.sh` clamps ranks by free memory, that is room
+  for ~4 more ranks at ~0.4 GB each.
+- HEAD's "steady" (50-52) is again bench's start-up cut opening a gap for
+  the longer start (round 273), not a faster steady state. The new arms
+  start fast enough that bench cuts no start-up (`startup_s` 0), so they
+  report steady = end to end. Compare `evals_per_s` and the median request
+  here, not `steady_evals_per_s`.
+- Round 272's two slow first waves (8.9 and 11.5 s) did not recur in three
+  new arms. Round 272 ran when the pool built no shared arrays, so its "new"
+  arms were a different code path from this one.
+- log(Z) agrees (0.01363-0.01380 against 0.01357-0.01381, sigma ~0.004).
+  The sessions are bit-identical to file-loaded ones, so a request's output
+  does not change.
+
+Rows: bench `r274-{n,h}{1,2,3}` (the HEAD rows copied back from the
+`/dev/shm` worktree) and stage `r274-pool-parts-sessions` in
+`benchmarks.jsonl`. The run dirs and the worktree are deleted. Arm logs are
+in `.probe/r274/`. The change is R2D2-only (`r2d2_serve.py`), so no WSClean
+guard is needed.

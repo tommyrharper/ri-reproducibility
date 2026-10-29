@@ -393,6 +393,8 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     worker over the parent's weights (threaded_session, round 258); R3D3
     (layers > 1) keeps torch.
     """
+    import concurrent.futures
+
     import torch
 
     models = export_onnx(checkpoint_path)
@@ -435,16 +437,26 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
             pass
         return built
 
-    def build() -> dict[int, object]:
-        return {cur_iter: session(cur_iter) for cur_iter in range(1, num_iter + 1)}
-
+    iters = range(1, num_iter + 1)
     # Only a run whose requests can take more than one thread (async, or
     # R2D2_OMP_THREADS > 1) pays the arrays' memory, ~2.9GB per set.
     threaded = max(int(os.environ.get(name) or 1) for name in ("R2D2_OMP_THREADS", "R2D2_MAX_THREADS")) > 1
 
-    def build_shared() -> dict[int, tuple]:
-        return {cur_iter: ort_shared_parts(optimised / f"N{cur_iter}.onnx")
-                for cur_iter in range(1, num_iter + 1)} if threaded else {}
+    def build() -> tuple[dict[int, object], dict[int, tuple]]:
+        sessions = {}
+        if not threaded or not all((optimised / f"N{cur_iter}.onnx").exists() for cur_iter in iters):
+            sessions = {cur_iter: session(cur_iter) for cur_iter in iters}  # saves the optimised graphs
+        if not threaded:
+            return sessions, {}
+        # A fresh pool per set: its threads take the caller's NUMA policy as
+        # they start. The weights' copy and alignment release the GIL, so 8
+        # threads take 1.4s against 2.5s (round 272).
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            shared = dict(zip(iters, pool.map(lambda cur_iter: ort_shared_parts(optimised / f"N{cur_iter}.onnx"), iters)))
+        # The 1-thread sessions over those arrays too: bit-identical, as fast,
+        # 0.3s against 1.9s for 25 file loads and one copy of the weights, not
+        # two: first request 8.5 -> 5.7s in a search (rounds 272, 274).
+        return sessions or {cur_iter: parts_session(shared[cur_iter], 1) for cur_iter in iters}, shared
 
     # Where the torch checkpoints went, the sessions' weights go too: a set
     # per NUMA node when load_checkpoints made one (enter_node swaps it in),
@@ -453,8 +465,7 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
         for node in _NODE_CHECKPOINTS:
             bound = set_mempolicy(2, [node])  # MPOL_BIND
             try:
-                _NODE_ORT_SESSIONS[node] = build()
-                _NODE_ORT_SHARED[node] = build_shared()
+                _NODE_ORT_SESSIONS[node], _NODE_ORT_SHARED[node] = build()
             finally:
                 if bound:
                     set_mempolicy(0, [])
@@ -463,8 +474,9 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
         _ORT_SHARED.update(_NODE_ORT_SHARED[node])
     else:
         with interleaved_pages():
-            _ORT_SESSIONS.update(build())
-            _ORT_SHARED.update(build_shared())
+            sessions, shared = build()
+            _ORT_SESSIONS.update(sessions)
+            _ORT_SHARED.update(shared)
 
     optimiser = sys.modules["optimiser.R2D2"]
     upstream_load_net = optimiser.load_net
@@ -526,20 +538,24 @@ def threaded_session(cur_iter: int, threads: int):
     threads = 1 << (threads.bit_length() - 1)
     session = _ORT_THREADED.get((cur_iter, threads))
     if session is None:
-        import onnxruntime as ort
-
-        graph, names, values = parts
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = threads
-        options.inter_op_num_threads = 1
-        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        options.enable_cpu_mem_arena = False
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        for name, value in zip(names, values):
-            options.add_initializer(name, value)
-        session = _ORT_THREADED[(cur_iter, threads)] = ort.InferenceSession(
-            graph, options, providers=["CPUExecutionProvider"])
+        session = _ORT_THREADED[(cur_iter, threads)] = parts_session(parts, threads)
     return session
+
+
+def parts_session(parts: tuple, threads: int):
+    """A `threads`-thread session over `ort_shared_parts`' arrays, used in place."""
+    import onnxruntime as ort
+
+    graph, names, values = parts
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = threads
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.enable_cpu_mem_arena = False
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    for name, value in zip(names, values):
+        options.add_initializer(name, value)
+    return ort.InferenceSession(graph, options, providers=["CPUExecutionProvider"])
 
 
 # Where the run script binds tensorrt-cu13 and the GPU's plans (R2D2_RUNTIME=trt).
@@ -2105,6 +2121,8 @@ def self_check_threaded_session() -> None:
         try:
             assert threaded_session(1, 2) is None
             _ORT_SHARED[1] = ort_shared_parts(path)
+            # The pool's own 1-thread sessions are built this way in async runs.
+            assert np.array_equal(parts_session(_ORT_SHARED[1], 1).run(None, {"x": x})[0], expected)
             for threads in (2, 3, 4):
                 session = threaded_session(1, threads)
                 assert threaded_session(1, threads) is session
