@@ -494,6 +494,62 @@ def self_check_failure_record_persistence() -> None:
         globals()["simulate_measurement_set"] = original_simulate
 
 
+def share_resume(chains: Path, base_dir: Path, file_root: str, read_resume: bool) -> bool:
+    """Every rank, before run_polychord: make sure this rank sees <root>.resume.
+
+    PolyChord tests `base_dir/<root>.resume` on every rank (resume_file_exists
+    in nested_sampling.F90), and a rank that finds none runs GenerateLivePoints
+    while the root resumes, so the search deadlocks. base_dir is node tmpfs,
+    which only rank 0's ChainsMirror seeds, so with NS_NODES > 1 every resumed
+    attempt hung on the other nodes (round 289). Each rank copies under its own
+    name and renames, so ranks sharing a node never see half a file. The
+    barrier also keeps rank 0's own node from testing before it has seeded.
+    Returns whether base_dir is a copy on another node, to remove at the end."""
+    try:
+        import socket
+
+        from mpi4py import MPI
+    except ImportError:
+        return False
+    comm = MPI.COMM_WORLD
+    off_root = comm.bcast(socket.gethostname(), root=0) != socket.gethostname()
+    if off_root and read_resume and base_dir != chains:
+        seed_resume(chains, base_dir, file_root, comm.Get_rank())
+    comm.Barrier()
+    return off_root and base_dir != chains
+
+
+def seed_resume(chains: Path, base_dir: Path, file_root: str, rank: int) -> None:
+    import shutil
+
+    target = base_dir / f"{file_root}.resume"
+    if not target.exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
+        partial = base_dir / f".{target.name}.{rank}"
+        shutil.copyfile(chains / target.name, partial)
+        partial.replace(target)
+
+
+def self_check_share_resume() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        chains, shm = Path(tmp) / "chains", Path(tmp) / "shm"
+        chains.mkdir()
+        (chains / "r.resume").write_text("checkpoint")
+        # One rank, no other node: nothing to copy and nothing to remove.
+        assert share_resume(chains, shm, "r", True) is False
+        assert not shm.exists()
+        # Another node: a whole copy under the final name, no partial left.
+        seed_resume(chains, shm, "r", 7)
+        assert (shm / "r.resume").read_text() == "checkpoint"
+        assert [p.name for p in shm.iterdir()] == ["r.resume"]
+        # A rank on the same node that comes second keeps the first copy.
+        (chains / "r.resume").write_text("newer")
+        seed_resume(chains, shm, "r", 8)
+        assert (shm / "r.resume").read_text() == "checkpoint"
+
+
 def main() -> None:
     args = parse_args()
     args.repo_root = str(Path(args.repo_root).resolve())
@@ -602,6 +658,7 @@ def main() -> None:
     write_records_in_background()
     packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
     mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
+    node_copy = share_resume(output_dir / "chains", Path(settings.base_dir), settings.file_root, settings.read_resume)
     finish = PolyChordFinish()
     try:
         output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
@@ -614,6 +671,10 @@ def main() -> None:
         output = None
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
+    if node_copy:
+        import shutil
+
+        shutil.rmtree(settings.base_dir, ignore_errors=True)
     if mirror is not None:
         mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
     stop_record_packer(packer)
@@ -698,6 +759,7 @@ if __name__ == "__main__":
         self_check_worker_timeout()
         self_check_worker_pool_connect()
         self_check_follow_worker_node()
+        self_check_share_resume()
         print("metric resolution self-check passed")
     else:
         main()

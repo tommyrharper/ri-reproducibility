@@ -13974,3 +13974,78 @@ retry, or writes `NS_NODES` only when it is above 1.
 Still open: kill -9 plus `./ri resume` on 2 nodes, which would also exercise
 the remote reset; the stall watchdog's `pkill`, which still reaches only the
 launcher node; and `./ri health` / `./ri runs` on a multi-node run.
+
+## Round 289 (fix): a resumed multi-node search deadlocked; kill -9 and resume on 2 nodes
+
+**Why.** Round 288 left kill -9 and `./ri resume` on 2 nodes untested.
+`.probe/r289/kill.sh` runs two scenarios in one 2 x 38-CPU icelake job:
+`--nodes 2 --nlive 150 --num-repeats 15 --seed 289`. In A, one rank on the
+second node is killed mid-search, so `run_with_retries` and the remote worker
+reset run for real. In B, everything on both nodes is killed, and then
+`./ri resume` runs.
+
+**Bug.** The first job (39607545, at `1b7b9a9`) hung in A. The retry worked:
+`sidecar_reset_workers` killed 78 workers on node 1, and node 2 reset its own
+78 from its `.node-<host>/reset` file (`nodes.log`). But after the resume,
+completions ran at 53/s, which is one node's rate. At the finish, only
+workers 1-38 printed PolyChord's closing line, while node 2's 39 ranks sat
+at ~100% CPU in an MPI busy-wait. The cause is that PolyChord tests
+`<base_dir>/<root>.resume` on **every** rank (`resume_file_exists` in
+`nested_sampling.F90`). A rank that finds none runs `GenerateLivePoints`
+while the root resumes. Since round 227, `base_dir` is node tmpfs, and only
+rank 0's `ChainsMirror` seeds it from `<run>/chains`. So every multi-node
+retry and every multi-node `./ri resume` deadlocked. On one node, only a
+rank that tested before rank 0 had finished seeding could hit this.
+
+**Fix** (`polychord_r2d2.py`, `share_resume`). Before `run_polychord`, rank 0
+broadcasts its hostname. When the run resumes, every rank on another node
+whose tmpfs has no `.resume` copies it from `<run>/chains` under its own temp
+name and renames it, so ranks that share a node never read half a file. A
+barrier follows, which also closes the single-node window. Off-root ranks
+remove their tmpfs copy after the run. The self-check covers the copy, and
+the case where a second rank on the same node keeps the first copy.
+
+**After the fix** (job 39611623, `--max-ndead 450`):
+
+| scenario | result |
+| --- | --- |
+| A: kill -9 one node-2 rank at 75 s | retry, both nodes reset 78 workers, rate back to ~210/s, all 77 workers finish, done 78 s after the kill; log(Z) 0.0161040708362379 +/- 0.00148904501854405 (ndead 600, nlike 7304) |
+| B: kill -9 everything on both nodes at 100 s | 0 processes left on either node; `run.env` has `NS_NODES=2`; `./ri resume` comes back on 2 nodes, all 78 ranks resume from 8,152 records, finishes in 70 s; log(Z) 0.0160260937654155 +/- 0.00151697719929362 (ndead 600, nlike 7305) |
+| one node, 20 ranks, nlive 48, kill at 60 s, then resume | 2,104 printed, 2,104 adopted, **0 lost**; log(Z) 0.0170770776413862 +/- 0.000728404530376024 |
+
+A and B agree (0.04 sigma). The single-node smoke search also completes
+(log(Z) 0.0150440460113585 +/- 0.00272563567152167, nlive 48 to 150 dead).
+
+**Found, not fixed: on 2 nodes a kill loses ~10 s of records.** In B,
+10,059 records had been printed at the kill, but only 8,152 were on disk:
+2,007 were lost, or 20%. All ranks `O_APPEND` to one
+`evaluations/records.jsonl` on Lustre, so its locks ping-pong between the two
+Lustre clients. Record-writer seconds over all ranks show it:
+
+| run | ranks | writer record seconds | most queued on one rank |
+| --- | ---: | ---: | ---: |
+| r288 s1/s2 (one node) | 39 | 103 / 101 | 1 / 0 |
+| r288 d1/d2 (2 nodes) | 78 | 3,721 / 3,846 | 46 / 48 |
+| r288 conv (2 nodes, 790 s) | 78 | 59,804 (97% of rank-time) | 574 |
+| r289 A / B resume | 78 | 4,043 / 3,743 | 42 / 46 |
+
+The writer runs off the rank's thread, so this does not cost throughput
+(round 288's 94% per node). It does break the durability bar (a kill must
+lose only a few seconds), and in a long search the backlog could grow
+without bound. The next round should give each node its own pack
+(`records.<host>.jsonl`, with every reader globbing `records*.jsonl`). That
+touches `common.py`, so it needs the WSClean guard.
+
+Also in this round: the `rank-budget.sh` self-check now asserts that a pool
+serving `.<pool>-workers/<host>` is never read as reapable. The run's
+`.launcher.pid` is a pid on the first node, so if the reaper matched such a
+pool on any other node, it would kill a live one.
+
+No shared runtime code changed (`polychord_r2d2.py`, plus a self-check line
+in `rank-budget.sh`), so there is no WSClean A/B. Stage row `r289-kill` is in
+`benchmarks.jsonl`, and the run dirs are deleted.
+
+Pending, not read here: round 243's GPU A/B (39544674, batched TRT lanes) has
+finally started on gpu-q-10, at `1b7b9a9` plus this round's diff. Its rows
+`r243-*` (W1, A1-3, B1-3, C1-2) land in `benchmarks.jsonl` and
+`.probe/r243/ab-39544674.out`, for the next round to read.

@@ -361,6 +361,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     || { echo "FAIL: a worker that has just exec'd was read as a pool"; exit 1; }
   [ -z "$(_ns_pool_row 4242 'python3 /opt/s.py --serve --fifo /r/run-1/.simulate-workers/3')" ] \
     || { echo "FAIL: a worker's FIFO path was read as a pool"; exit 1; }
+  # A multi-node pool serves `.<pool>-workers/<host>`, and its run's
+  # .launcher.pid is a pid on the first node, so on any other node it would
+  # read as dead and the live pool would be reaped (round 289).
+  [ -z "$(_ns_pool_row 4242 'sh -c loop sh /r/run-1/.r2d2-workers/cpu-q-126')" ] \
+    || { echo "FAIL: a multi-node pool was read as a reapable pool"; exit 1; }
 
   # The orphaned run: launcher pid gone, run directory that still has ranks.
   # Reaping these is what would kill the search - so a live run wins over the

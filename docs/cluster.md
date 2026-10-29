@@ -178,7 +178,11 @@ holds the chains tmpfs and its Lustre mirror. Before a retry each other node
 resets its own workers when the launcher drops a `.node-<host>/reset` file, and
 `run.env` keeps `NS_NODES`, so `./ri resume` comes back on as many nodes. Two
 icelake half-nodes ran a converged search in half the wall time of one, at 94%
-of the single-node rate per node (docs/csd3-speed.md, rounds 287-288).
+of the single-node rate per node (docs/csd3-speed.md, rounds 287-288). PolyChord
+looks for its `.resume` on every rank, so a resumed attempt copies it into each
+other node's chains tmpfs first (round 289: without that, every multi-node
+retry and resume deadlocked). A kill on 2 nodes still loses ~10 s of records,
+because both nodes append to one `records.jsonl`.
 
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit
