@@ -11714,7 +11714,7 @@ gap. This was already true before round 234: the backlog builds up during
 the search, and round 234 only cancels it at the end. So it is not a
 regression. A cheaper record store (one append file per rank instead of
 one create+rename per record) would fix it, but would touch eight readers
-(round 237). That is the next lever here, on durability rather than speed. (Corrected in round 242: a mid-search kill loses at most a couple of records; the end-of-run backlog does not exist mid-run.)
+(round 237). That is the next lever here, on durability rather than speed. (Corrected in round 242: a mid-search kill loses at most a couple of records; the end-of-run backlog does not exist mid-run.) (Round 244 reverses that correction: on a loaded RDS, 58-67% of records stayed off disk all the way through a search.)
 
 Rows: `r239-bigrun` (bench) and stage row `r239-validation` (full
 precision log(Z)) in `benchmarks.jsonl`. `.probe/r239/` keeps the
@@ -11918,7 +11918,7 @@ line per scored evaluation, so "scored" below is exact; "on disk" is what
 
 **Decision.** No code change. `NS_RECORD_APPEND` stays opt-in, now
 without a durability argument: the default flat writer is already
-durable to within a couple of records at a kill.
+durable to within a couple of records at a kill. (Corrected in round 244: on a loaded RDS, the flat writer trails by ~60% of records through the whole search, so a kill there loses thousands.)
 
 Stage row `r242-kill-records` is in `benchmarks.jsonl`. The run
 directories are deleted. Scripts and outputs are in `.probe/r242/`.
@@ -11957,3 +11957,61 @@ the arm that could.
 pass (python3.12, Slurm off PATH). The edit sits inside the
 `R2D2_DEVICE=cuda` branch of the R2D2 launcher, which neither a CPU R2D2
 nor a WSClean search reaches, so no WSClean guard was needed.
+
+## Round 244 (diagnostic, correction): on loaded RDS the record backlog is the mid-run state; round 242 was wrong
+
+**Question.** Round 242 found a kill -9 mid-search lost only 2 of 5,779
+records. From that it concluded that the end-of-run "records queued" figure
+does not describe a running search. Is that true in general?
+
+**Method.** Round 242's flat async shape again (seed 242, `--nlive 48
+--num-repeats 5 --max-ndead 600 --mpi-procs 20`, CPUs 0-36, `7486d55`), not
+killed. `.probe/r244/samp.py` sampled the run every 10 s. Each sample read
+the scored lines (`^{"eval_id"`, printed once `evaluate()` has queued the
+record), then the unique record names on disk (flat `*.json` plus the pack's
+names), then the scored lines again. "Behind" is at least
+`scored_before - on_disk`. RDS was heavily loaded: one listing of
+`evaluations/` took up to 52 s.
+
+| t (s) | scored | on disk | not on disk |
+| ---: | ---: | ---: | ---: |
+| 69 | 1,748 | 579 | 1,169 (67%) |
+| 138 | 4,070 | 1,479 | 2,591 (64%) |
+| 209 | 6,340 | 2,672 | 3,668 (58%) |
+| 293 | 8,802 | 3,740 | 5,062 (58%) |
+| end | 9,674 | 9,674 (after the pack) | 5,947 queued at the end |
+
+A first run (`lag1`, cruder `ls` count) showed the same: at least 2,330 of
+9,724 were not on disk at 344 s, and 2,895 were queued at the end.
+
+**Results.**
+- With RDS this loaded, the per-rank record writers fall behind from the
+  first minute and stay ~60% behind for the whole search, ~300 records per
+  rank. A kill at any point would lose that many records from the archive.
+  So round 239's reading (half a run's records exist only in memory) was
+  right on a loaded Lustre. Round 242's 2-of-5,779 must have come from a
+  quieter Lustre during its kill window (its finish still reported 1,587
+  queued). That is not proven: the 242 kill was not repeated under load.
+- Speed and results are not affected. The writers are off the rank's
+  thread, and the pack writes every queued record from memory at the end,
+  so the archive is complete (9,674 unique names = 9,674 scored).
+  Writer-seconds were 6,088 across 20 ranks in a 324 s span, ~94% busy.
+  log(Z) 0.0168909217090111 +/- 0.000751602394995056 (`lag1` 0.01683 +/-
+  0.00075).
+- What a kill loses is archive records only. PolyChord resumes from its
+  `.resume`, and round 242 found that a resumed async run adopts none of
+  the post-checkpoint evaluations anyway. But this repo's output is that
+  archive (failure modes), so on loaded RDS the durability case for
+  `NS_RECORD_APPEND=1` (2-11x fewer records held in memory, round 240, at
+  a 1-3% cost, round 241) is open again. It was not re-measured here.
+
+**Next.** Repeat round 242's kill under load with both writers, to settle
+whether append's ~2% is worth paying for durability. Alternatively, make
+the flat writer cheaper on a loaded MDS. One listing of the 20-rank
+`evaluations/` dir took 34-52 s, so contention in that one directory is
+the likely cost.
+
+Stage row `r244-record-lag` (full-precision log(Z)) is in
+`benchmarks.jsonl`. The bench rows `r244-lag1` and `r244-lag2` were written
+by the runs. Run dirs are deleted. Script, sampler, outputs and gzipped
+logs are in `.probe/r244/`.
