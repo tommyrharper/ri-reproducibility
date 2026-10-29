@@ -2364,17 +2364,18 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
         eval_dir = Path(paths.get("eval_dir") or "")
         if not eval_dir.name:
             return removed
+        # Stripped like an evaluation evicted as it was scored: its logs,
+        # simulation.json and the emptied wsclean/ and r2d2/ go, and so does
+        # the dir. Left behind they were ~3 inodes for each extreme a flush
+        # published and the run did not keep, ~1,000 per 4,000-evaluation
+        # WSClean run against the file quota (round 236).
         local = evaluations_dir / eval_dir.name
-        # One readdir, not a stat per log name: most dirs hold only metrics.json.
         try:
-            present = set(os.listdir(local)) & set(PRUNED_EVALUATION_LOGS)
+            entries = os.listdir(local)
         except (FileNotFoundError, NotADirectoryError):
             return removed
-        for name in present:
-            log = local / name
-            if log.is_file():
-                log.unlink()
-                removed += 1
+        removed += sum(name in PRUNED_EVALUATION_LOGS for name in entries)
+        _strip_to_record(local)
         return removed
 
     # Only a record naming an image in a dir still listed touches Lustre: ~1%
@@ -2542,7 +2543,7 @@ def self_check_image_retention() -> None:
                               ("residual", "recon-residual.fits")):
                 (eval_dir / "wsclean" / name).write_text(name)
                 paths[key] = str(eval_dir / "wsclean" / name)
-            for name in PRUNED_EVALUATION_LOGS:
+            for name in PRUNED_EVALUATION_LOGS + ("simulation.json",):
                 (eval_dir / name).write_text(name)
             made.append({"eval_id": i, "objective": i / 60, "paths": paths})
         # A failure keeps every artefact whatever its rank.
@@ -2576,10 +2577,12 @@ def self_check_image_retention() -> None:
                 # A summary must never name a file this deleted.
                 assert (key in rec["paths"]) == kept, (rec["eval_id"], key)
 
-        # Logs go with the images, and a failure keeps all of them.
+        # Logs go with the images, and a failure keeps all of them. A dropped
+        # one is stripped dir and all, as if evicted when it was scored.
         for rec in made:
             eval_dir = Path(rec["paths"]["eval_dir"])
             kept = evaluation_key(rec) in keep or "error" in rec
+            assert eval_dir.is_dir() == kept, (rec["eval_id"], "dir")
             for name in PRUNED_EVALUATION_LOGS:
                 assert (eval_dir / name).is_file() == kept, (rec["eval_id"], name)
 

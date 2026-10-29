@@ -11533,3 +11533,58 @@ Rows: `r235-a` (bench), `r235-sbase`, `r235-snew` (guard), the mis-pinned
 `r235-base`, `r235-new`, and stage row `r235-held-cancel` in
 `benchmarks.jsonl`. Run directories are deleted; `.probe/r235/` keeps the
 scripts and logs.
+
+## Round 236 (fix): a pruned extreme's dir goes with its images
+
+**Question.** Round 235 found that most evaluation dirs left after a
+WSClean run hold only `simulation.json` and an empty `wsclean/`. They
+cost about 3 inodes each against the ~1M-file project quota. Which path
+leaves them?
+
+**Cause.** `prune_run_artefacts`. A held extreme that a periodic flush
+published, and that the run then did not keep, has its images unlinked
+and its `PRUNED_EVALUATION_LOGS` removed. Everything else stays:
+`simulation.json`, the emptied `wsclean/` (or `r2d2/`) and the dir.
+`_strip_to_record` was never involved, because an evaluation it strips
+loses its dir.
+
+**Fix.** For those records the prune now finishes by calling
+`_strip_to_record`, so a pruned extreme ends up exactly like an extreme
+evicted when it was scored. Only its flat record survives, beside the
+dir. Kept evaluations and failures are not touched. No reader opens a
+per-evaluation `simulation.json` after a run, and the 98% of evaluations
+stripped at scoring time never had one. `self_check_image_retention` now
+writes a `simulation.json` into each fixture dir and asserts that a
+dropped evaluation's dir is gone. That assertion fails on `c974995`
+(`AssertionError: (21, 'dir')`). All 30 host self-checks pass.
+
+**WSClean guard** (raced, synchronous, `NS_RETAIN_FLUSH_SECONDS=20`, seed
+229, nlive 100, 4,000 dead, 19 even CPUs per arm, base `c974995` from a
+`/dev/shm` worktree):
+
+| | base | new |
+| --- | ---: | ---: |
+| evals/s (steady) | 39.78 (39.83) | 39.48 (39.53) |
+| evaluation dirs left | 573 | 46 |
+| of which `simulation.json`-only | 527 | 0 |
+| files in the run dir | 2,078 | 497 |
+| prune | 0.3 s | 0.9 s |
+
+All 11 chain files and `clusters/` are bit-identical. log(Z) is
+0.0967023094179472 +/- 0.000520957293962581 in both arms, as in rounds
+234-235. Both summaries hold 4,071 distinct evaluations, and the same 46
+of them keep images. All 92 image paths in the new summary exist. The
+-0.75% in evals/s is inside the ~5% three-repeat span. The new arm's
+prune, 0.6 s longer, runs on Lustre, while the base arm's results were
+on tmpfs, so the two are not comparable (round 234). In any case 0.6 s
+is a one-off at the end of a run, and it deletes ~1,600 inodes.
+
+**Effect.** 76% fewer files per WSClean benchmark run at this flush
+interval. In production (600 s flush) fewer extremes reach Lustre, so
+the saving is smaller per run, but it grows with run length and with
+the number of ranks. An R2D2 run leaves the same shape of dir (with
+`r2d2/` in place of `wsclean/`), so it gets the same fix.
+
+Rows: `r236-sbase`, `r236-snew` (bench) and stage row `r236-prune-strip`
+in `benchmarks.jsonl`. Run directories are deleted; `.probe/r236/` keeps
+the script and logs.
