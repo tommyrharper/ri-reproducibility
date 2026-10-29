@@ -11922,3 +11922,38 @@ durable to within a couple of records at a kill.
 
 Stage row `r242-kill-records` is in `benchmarks.jsonl`. The run
 directories are deleted. Scripts and outputs are in `.probe/r242/`.
+
+## Round 243 (fix, GPU race pending): a shared TensorRT search may ask for more ranks than eager's card budget
+
+**Why.** With `R2D2_TRT_SHARED=1`, the GPU default since round 215, the
+25 engines live once in the forward server (~5.7 GB, round 207), and the
+workers hold nothing on the card. `run-nested-sampling-r2d2.sh` still
+divided the card's memory by eager's 4,096 MB a rank. On an 80 GB A100
+that refused any explicit `NS_MPI_PROCS` over 19 with a "need ~...MB of
+GPU memory" FATAL, so the layout round 225 pointed at (32 x 1 is +20%
+over 19 x 2 in the forward-free stub, 198 against 168 steady evals/s)
+could not be run at all. On a 40 GB card the same check would also have
+cut the shared default from 19 to 9 ranks.
+
+**Change.** The GPU-memory sizing and the FATAL now apply only when the
+workers hold engines or weights themselves (eager, or `trt` without the
+shared server). The default rank count is unchanged: still
+`NS_R2D2_CUDA_MAX_RANKS=19`, so a default search runs exactly as before,
+and only an explicit `--mpi-procs` (or `NS_MPI_PROCS`) can now go past it,
+bounded by CPUs and host memory like a CPU search.
+
+**Race (pending).** 1-GPU job 39544674 (`.probe/r243/ab.sh`) alternates the
+default 19 x 2 (A), 33 ranks x 1 thread, i.e. 32 workers (B), and B with
+the gathering server at batch 8 on 4 lanes (C; more workers should mean
+more same-net requests to gather, round 238). Each arm is the round 224
+shape: seed 4242, `--nlive 48 --num-repeats 5 --max-ndead 600`, compared
+on `steady_evals_per_s` and log(Z). It had not started 30 minutes after
+submission; a later round reads `.probe/r243/ab-39544674.out`. Raising
+`NS_R2D2_CUDA_MAX_RANKS` waits on it. Round 222 found the card saturated at
+~2,400 batch-1 forwards/s (~95 evals/s), so B may well gain nothing; C is
+the arm that could.
+
+**Checks.** `bash -n`; `scripts/test_self_checks.py` 30 host self-checks
+pass (python3.12, Slurm off PATH). The edit sits inside the
+`R2D2_DEVICE=cuda` branch of the R2D2 launcher, which neither a CPU R2D2
+nor a WSClean search reaches, so no WSClean guard was needed.

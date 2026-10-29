@@ -112,8 +112,10 @@ sys.exit(0 if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0 an
   # Each worker holds all 25 checkpoints on the GPU. Past what the card holds,
   # workers die with CUDA OOM and their evaluations score as failures - a
   # silent fake worst case - so an explicit rank count over it is refused.
+  # A shared server's workers hold nothing on the card, so only the CPUs
+  # bound an explicit rank count there.
   gpu_mb="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
-  if [ -n "${gpu_mb}" ]; then
+  if [ -n "${gpu_mb}" ] && { [ "${R2D2_RUNTIME}" != trt ] || [ "${R2D2_TRT_SHARED:-0}" != 1 ]; }; then
     gpu_ranks="$((gpu_mb * 95 / 100 / NS_R2D2_CUDA_MB_PER_RANK))"
     if [ -n "${NS_MPI_PROCS:-}" ] && [ "${NS_MPI_PROCS}" -gt "${gpu_ranks}" ]; then
       echo "FATAL: ${NS_MPI_PROCS} R2D2 workers need ~$((NS_MPI_PROCS * NS_R2D2_CUDA_MB_PER_RANK))MB of GPU memory; this GPU has ${gpu_mb}MB, enough for ${gpu_ranks} (NS_R2D2_CUDA_MB_PER_RANK)" >&2
