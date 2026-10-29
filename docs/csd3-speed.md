@@ -13359,3 +13359,42 @@ and grows linearly; only smaller records (e.g. not storing each one's
 
 No code change, no search; stage row `r270-summary-encode`. Probe in
 `.probe/r270/`.
+
+## Round 271 (negative probe): a lane-parallel PCG64 does not speed up the noise draw
+
+**Question.** Simulate is ~4.6% of an R2D2 evaluation (round 263), and
+round 187 put its noise draw at ~6 ms of a 17 ms call. `fastnoise.c`
+steps PCG64 one word at a time, so each draw waits on the 128-bit
+multiply of the one before. Four chains that each jump 4 positions
+(multiplier `M^4`, increment `inc (1 + M + M^2 + M^3)`) give the same
+word stream with no serial dependency. Is that faster?
+
+**Method.** `.probe/r271/lanes.c` adds `add_normal_f32_lanes()`: fill a
+1,024-word buffer from the four chains, run numpy's ziggurat over it
+(rejection paths read from the buffer too), and at the end jump the
+state forward by the words used. It is checked against today's
+`add_normal_f32()` on the R2D2 path's shape: 500k complex64
+visibilities, `every=4`, real then imaginary half. `gcc -O2
+-ffp-contract=off` as `start-sidecars.sh` builds it, pinned to one
+CPU, best of 20, on three CPUs. `.probe/r271/gen.c` times word
+generation alone.
+
+| step, 4M draws | today | four lanes |
+| --- | ---: | ---: |
+| whole fill (`every=4`, both halves) | 15.57-15.64 ms | 14.87-14.93 ms |
+| word generation only | 8.07-8.08 ms | 4.95-4.96 ms |
+
+The output bytes and the final generator state were identical in every run.
+
+**Result.** Negative, nothing shipped. The lanes cut word generation by
+3.1 ms, but reading from a buffer costs the ziggurat about as much
+again, so the fill is only 4.5% faster: ~0.35 ms of a ~840 ms
+evaluation, about 0.04%. Shipping it would also need a rebuilt
+`meqtrees.sif` (the library is baked in at `/opt/ri-lib`, and
+`start-sidecars.sh` builds a host copy only for images that have none)
+and a WSClean guard. The draw is now bound by the ziggurat's table
+lookup and compare (~1.9 ns a draw), not by the generator. Simulate has
+no bit-identical lever worth a rebuild left.
+
+No code change, no search; stage row `r271-noise-lanes`. Probe in
+`.probe/r271/`.
