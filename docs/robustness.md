@@ -250,8 +250,10 @@ A run writes records on a background thread per rank (`write_records_in_backgrou
 record or two on a quiet RDS, but the flat writer falls behind as metadata load
 rises (161 of 4,933 records lost at a moderately loaded kill, ~5,000 behind
 under heavy load), where `NS_RECORD_APPEND=1` lost none (docs/csd3-speed.md,
-rounds 244-245). Those evaluations have no `metrics.json`, so the next
-attempt re-runs them with the same seed. A failed write re-raises on the rank's
+rounds 244-245). That costs the archive, not the search: an async run (the
+default) resumed from its checkpoint draws new points, so every evaluation
+scored after the checkpoint is imaged again whether or not its record landed,
+and none is adopted (rounds 242 and 246). A failed write re-raises on the rank's
 own thread at its next record, and `abort_run` waits up to 30s for the queue.
 
 ### Half a `summary.json` is not a finished run
@@ -377,7 +379,11 @@ creates with `exist_ok=False`. One rank died on `FileExistsError` and left
 every other one waiting forever in a collective - a 16-core restart that burned
 every core, landed nothing, and never exited for `run_with_retries` to give up
 on. Re-sampling from scratch costs nothing: the same seed redraws the same
-points and the adopted cache answers them without imaging.
+prior points and the adopted cache answers them without imaging. In an async
+run that holds only for the prior phase - the slice steps after it diverge -
+but PolyChord's first checkpoint lands within a few dozen evaluations of the
+prior phase ending (seconds), so that is the whole window (docs/csd3-speed.md,
+round 246).
 
 The same hang is closed at its source too: the likelihood aborts the whole job
 (`MPI_Abort`) on **any** unexpected exception, not only `WorkerDied`.

@@ -12061,3 +12061,64 @@ Stage row `r245-kill-under-load` is in `benchmarks.jsonl`. Run dirs are
 deleted. Script, sampler outputs and gzipped logs are in `.probe/r245/`.
 The round 243 GPU race (job 39544674) had still not started at 03:45
 (no `.probe/r243/ab-39544674.out`).
+
+## Round 246 (diagnostic, docs fix): what a restart reuses from the cache in an async search
+
+**Why.** Round 245 left `docs/robustness.md` saying that evaluations whose
+record a kill lost are re-run "with the same seed", and that re-sampling from
+scratch "costs nothing" because the same seed redraws the same points. Round
+242 had already found that an async resume from a checkpoint draws different
+points. Neither claim had been measured for the case before a checkpoint.
+
+**Method.** `.probe/r246/fresh.sh`: an async R2D2 search (seed 242, nlive 48,
+num-repeats 5, max-ndead 300, 20 ranks) killed with `kill -9` 10 s after its
+first scored evaluation, then `./ri resume`. Arm a kept the checkpoint. Arm b
+deleted `chains/*.resume` before resuming, which forces the
+"no checkpoint to resume from, re-sampling from the cache" path. Attempt-1
+points were matched against attempt 2's chains (`_prior.txt`,
+`_dead-birth.txt`, `_phys_live-birth.txt`) on their non-integer parameter
+values. Arm c sampled when the first `.resume` appeared.
+
+| arm | attempt 1 scored / on disk | resume scored | final records = unique params | attempt 2 prior rows that are attempt-1 points | later attempt-1 points in the chains | log(Z) |
+|---|---|---|---|---|---|---|
+| a, checkpoint kept | 248 / 247 | 5,547 | 5,794 | 66 of 66 (from the checkpoint) | 0 | 0.0164425867494481 +/- 0.000764956166256197 |
+| b, checkpoint deleted | 233 / 232 | 4,844 | 5,076 | 66 of 66 (cache hits) | 0 | 0.0162938787497314 +/- 0.000739930262333626 |
+
+- With no checkpoint, the same seed redraws the whole prior phase: all 66
+  prior points come out identical, and the cache answers them. The slice steps
+  after the prior phase diverge (async dispatch order), so none of the other
+  166 attempt-1 evaluations recurs. The one attempt-1 point that b scored again
+  (eval 233) is the record the kill lost, so a lost record can be redrawn.
+- The no-checkpoint window is only the prior phase plus a few seconds. In arm
+  c the first `.resume` appeared in tmpfs at 74-96 scored evaluations (3-4 s
+  after the first score) and in `<run>/chains` at ~4.9 s (the 2 s mirror).
+  Re-sampling from scratch therefore does cost almost nothing, as
+  `robustness.md` says, but only because that window is that short.
+- After a checkpoint, records lost at a kill cost the archive and not the
+  search. The resumed async sampler re-images every evaluation scored after the
+  checkpoint whether or not its record landed (round 242), so the flat
+  writer's lag (rounds 244-245) adds no imaging to a resume.
+- Both resumed runs converged with rc 0, and their log(Z)s are 0.14 sigma apart.
+- Side finding: a killed run leaves its tmpfs `chains/` copy
+  (`/dev/shm/ri-chains-<hash>`, 0.1-1.2 MB here). A run that finishes removes
+  its copy, and a resume of the same run reuses the same path. Seven had built
+  up on this node from rounds 244-246's kills and were removed. They are small,
+  so this is noted but not fixed.
+- Kill hygiene: `setsid cmd &` in a script forks, so `$!` is not a process
+  group leader and `kill -- -$!` fails. Arm c's ranks died, but the retry loop
+  restarted the search until its launcher was killed by name.
+
+- Tooling fix: `./ri bench` (the ledger table) died on `KeyError: 'preset'`
+  at HEAD. `load_rows()` dropped hand-logged stage rows only when they had no
+  `imager`, and round 245's stage row carries one. It now drops every
+  `"kind": "stage"` row, and `bench.py --self-check` has a fixture row with an
+  `imager` to cover it.
+
+**Decision.** No search code change. `docs/robustness.md` now says that records lost
+at a kill cost the archive and not the search, and that same-seed reuse covers
+the prior phase, which is the whole window before the first checkpoint.
+
+Stage row `r246-resume-reuse` is in `benchmarks.jsonl`. The run directories
+are deleted. The script and gzipped logs are in `.probe/r246/`. The round 243
+GPU race (job 39544674) had still not started at ~04:00 (no
+`.probe/r243/ab-39544674.out`).

@@ -400,8 +400,9 @@ def load_rows() -> list[dict[str, Any]]:
                 # A row half written by a killed run costs that row, not the file.
                 print(f"benchmark: skipping unreadable line in {LEDGER.name}",
                       file=sys.stderr)
-    # Hand-logged stage timings ("kind": "stage", rounds 201-203) are not runs.
-    return [row for row in rows if "imager" in row]
+    # Hand-logged stage timings ("kind": "stage", rounds 201-203) are not runs,
+    # and since round 245 some carry an "imager" too.
+    return [row for row in rows if "imager" in row and row.get("kind") != "stage"]
 
 
 def commit_order() -> dict[str, int]:
@@ -680,7 +681,8 @@ def self_check() -> None:
                 "peak_memory_mb": 256.0,
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
                 "busy_wall_s": 0.9, "idle_fraction": 0.1,
-            }) + "\nnot json\n" + json.dumps({"kind": "stage", "stage": "s"}) + "\n")
+            }) + "\nnot json\n" + json.dumps({"kind": "stage", "stage": "s"}) + "\n"
+                + json.dumps({"kind": "stage", "imager": "r2d2", "run": "s"}) + "\n")
             rows = load_rows()
             assert len(rows) == 1, rows
             do_table()
