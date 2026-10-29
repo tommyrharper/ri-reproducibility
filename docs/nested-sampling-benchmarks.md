@@ -106,6 +106,11 @@ rank starts at once and the cold first requests are under that bound (an async
 whole node: 5-8s against 0.7s warm). `first_request_s`, the median duration of
 the evaluations started within 1s of the first, is the start-up figure there
 ([CSD3 speed](csd3-speed.md), rounds 259-260).
+`converging evals/s` is not stored. The table derives it as the steady rate
+x nlive / (nlive + 0.41 x workers), where workers is
+`NS_MPI_PROCS` x `NS_NODES` - 1. A converged async search needs that many extra evaluations
+([CSD3 speed](csd3-speed.md), round 307), so raw evals/s flatters more ranks.
+Compare rank or node layouts on this line, not on the raw rate (round 309).
 
 Rows are grouped by **machine, imager and settings**, and only rows in one
 group are ever compared. The machine id is derived from `/etc/machine-id` (the

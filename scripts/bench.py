@@ -498,6 +498,27 @@ def series(rows: list[dict[str, Any]], path: tuple[str, ...]) -> list[float]:
     return values
 
 
+# A converged async search needs ~0.41 x workers live points' worth of extra
+# evaluations whatever nlive is (docs/csd3-speed.md, round 307), so raw evals/s
+# flatters more ranks. Scaled by nlive/(nlive + 0.41 x workers) it is the rate
+# a converged search makes progress at, and that compares across rank counts
+# and nodes. Workers leave out PolyChord's root; synchronous runs get no line.
+ASYNC_OVERHEAD_PER_WORKER = 0.41
+
+
+def useful_evals_per_s(row: dict[str, Any]) -> float | None:
+    settings = row.get("settings") or {}
+    rate = row.get("steady_evals_per_s") or row.get("evals_per_s")
+    try:
+        nlive = int(settings["NS_NLIVE"])
+        workers = int(settings["NS_MPI_PROCS"]) * int(settings.get("NS_NODES", "1")) - 1
+    except (KeyError, ValueError):
+        return None
+    if settings.get("NS_SYNCHRONOUS", "0") != "0" or not rate or nlive <= 0 or workers < 1:
+        return None
+    return round(rate * nlive / (nlive + ASYNC_OVERHEAD_PER_WORKER * workers), 4)
+
+
 def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                 columns: int, order: dict[str, int]) -> None:
     imager, preset, machine, settings_json = key
@@ -542,6 +563,10 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                             series(by_commit[old], ("evals_per_s",)))
                        for new, old in zip(labels, labels[1:])])
     row_for_path("steady evals/s", ("steady_evals_per_s",))
+    useful = [cell([v for v in map(useful_evals_per_s, by_commit[c]) if v is not None])
+              for c in labels]
+    if any(useful):
+        line("converging evals/s", useful)
     row_for_path("stall s", ("stall_s",))
     row_for_path("first request s", ("first_request_s",))
     row_for_path("ms/eval", ("ms_per_eval",))
@@ -648,6 +673,16 @@ def self_check() -> None:
                 for env in ({"NS_MPI_PROCS": "39"}, {"NS_MPI_PROCS": "39", "NS_NODES": "2"}))
     assert group_key({"imager": "r2d2", "preset": "custom", "machine": "m", "settings": one}) \
         != group_key({"imager": "r2d2", "preset": "custom", "machine": "m", "settings": two})
+
+    # Round 288: 2 x 39 ranks at nlive 300, 99.1 evals/s, is 77 workers.
+    two_nodes = {"steady_evals_per_s": 99.1, "settings": {
+        "NS_NLIVE": "300", "NS_MPI_PROCS": "39", "NS_NODES": "2", "NS_SYNCHRONOUS": "0"}}
+    assert useful_evals_per_s(two_nodes) == round(99.1 * 300 / (300 + 0.41 * 77), 4)
+    one_node = {"evals_per_s": 50.0, "settings": {"NS_NLIVE": "300", "NS_MPI_PROCS": "39"}}
+    assert useful_evals_per_s(one_node) == round(50.0 * 300 / (300 + 0.41 * 38), 4)
+    assert useful_evals_per_s({**one_node, "settings": {**one_node["settings"],
+                                                        "NS_SYNCHRONOUS": "1"}}) is None
+    assert useful_evals_per_s({"evals_per_s": 1.0, "settings": {}}) is None
 
     timeout = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                                start_new_session=True)

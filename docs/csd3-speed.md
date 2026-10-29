@@ -14880,3 +14880,44 @@ multi-node runs to compensate is not supported by evidence. The stale
 Row: stage `r308-async-precision` in `benchmarks.jsonl`, with every arm's
 log(Z), error, ndead and nlike.
 
+
+## Round 309 (tooling, re-reading): `./ri bench` prints the rate a converged search progresses at
+
+**Question.** Round 307 found that a converged async search needs
+nlive + 0.41 x workers live points' worth of evaluations. So raw evals/s
+favours more ranks, and the ledger had no column that compares rank counts
+or node counts fairly. Round 293 had already warned that short fixed
+`--max-ndead` arms are biased this way.
+
+**Change.** `scripts/bench.py` now prints a `converging evals/s` line under
+`steady evals/s`. It is the steady rate (the raw rate for rows that have no
+steady rate) times nlive / (nlive + 0.41 x workers), where workers =
+`NS_MPI_PROCS` x `NS_NODES` - 1, since PolyChord's root does not evaluate.
+It is computed when the table is read, so every existing async row gets it.
+Synchronous rows and rows without `NS_NLIVE` or `NS_MPI_PROCS` get none. The
+self-check pins the formula on round 288's 2-node row and on the synchronous
+case. This is a table-only change: no search, run script or shared code
+changed, so no WSClean guard was needed.
+
+**What it says about earlier decisions** (steady evals/s, means of three
+arms each):
+
+| layout | raw (nlive 48 arms) | converging at nlive 48 | at 150 | at 300 |
+| --- | ---: | ---: | ---: | ---: |
+| 39 x 1 thread (round 276) | 48.06 | 36.28 | 43.54 | 45.69 |
+| 20 x 2 threads | 43.04 | 37.03 | 40.92 | 41.95 |
+| 19 x 2 threads | 41.80 | 36.23 | 39.84 | 40.79 |
+
+- Round 276's 39 x 1 default still wins at the production nlive of 150, but
+  by +6.4% over 20 x 2, not the +11.7% the raw rates give. At the nlive 48
+  the bench arms used, the layouts tie. The default stands. The lesson is
+  that rank-layout A/Bs at bench nlive overstate the gain from more ranks.
+- Round 288's 2-node search: steady 99.17 gives 81.93 converging, against
+  47.7-48.3 for its 1-node arms, so 1.71x per converged search at
+  nlive 150. Round 307's table predicted ~1.85x before the per-node rate
+  loss. The 1,586 s to 790 s (2.0x) in round 288 compares against round
+  278's slower 1-node run (47.5 evals/s on a busier node), not against
+  r288-s1/s2.
+
+Row: stage `r309-converging-rate` in `benchmarks.jsonl`. GPU job 39654485
+(round 303's pair) still had no output at ~20:50 on 29 Oct.
