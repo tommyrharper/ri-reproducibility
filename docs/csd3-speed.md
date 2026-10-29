@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 304; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 308; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -23,9 +23,13 @@ the Hetzner host.
     round 278's search in 790 s against 1,586 s (99.1 evals/s, 94% per
     node), with log(Z) agreeing
     ([round 288](#round-288-measurement-two-nodes-run-a-converged-r2d2-search-in-half-the-time)).
-    PolyChord needs ~0.4 x workers/nlive more evaluations to converge, so
-    raise `--nlive` with `--nodes` (a launch warns below 4 x workers)
-    ([round 293](#round-293-measurement-more-ranks-per-live-point-cost-polychord-evaluations-4-node-scaling-corrected)).
+    PolyChord needs ~0.41 x workers live points' worth more evaluations to
+    converge, whatever nlive is, so time to converge goes as
+    nlive/workers + 0.41 and a bigger `--nlive` never buys speed
+    ([round 293](#round-293-measurement-more-ranks-per-live-point-cost-polychord-evaluations-4-node-scaling-corrected),
+    [round 307](#round-307-analysis-guidance-fix-the-async-overhead-is-a-fixed-04-x-workers-live-points-so-a-bigger-nlive-never-buys-speed)).
+    The extra dead points buy no measured precision either
+    ([round 308](#round-308-measurement-the-async-overheads-extra-dead-points-buy-no-measured-precision)).
     A resumed multi-node search used to deadlock (fixed, round 289).
     Node packs (round 290) and batched appends, the default since
     [round 298](#round-298-default-batched-record-appends-the-scratch-fix-proven-end-to-end),
@@ -14831,3 +14835,48 @@ table above instead of "at least 4x the total ranks". The message text is all
 that changed. Single-node launches never reach it, so no WSClean guard was
 needed. shellcheck 0.9.0.6 is clean. Row: stage `r307-async-overhead-fit` in
 `benchmarks.jsonl`.
+
+## Round 308 (measurement): the async overhead's extra dead points buy no measured precision
+
+**Question.** Round 307 left one thing open: a converged search with many
+workers runs ~0.41 x workers more live points' worth of evaluations. Is that
+pure cost, or does it buy precision like a larger nlive? If it bought
+precision, a multi-node search could lower `--nlive` and keep the same
+precision, and multi-node scaling at equal precision would be close to linear.
+
+**Method.** No R2D2 search ran. Round 293's toy (`polychord.sif`'s
+pypolychord, 6-d Gaussian with σ 0.1 in the unit cube, analytic log(Z)
+-8.3018, `num_repeats` 15, 3 ms sleep, run to convergence) was run 80 times
+per arm (seeds 101-180) under oversubscribed `mpirun` on this allocation,
+three runs at a time (`.probe/r308/run.sh`, `ana.py`). nlive 30 makes
+workers/nlive large (2.5 for B), so any effect is big. The error is the
+empirical rms of log(Z) about the analytic value, not PolyChord's estimate.
+
+| arm | ranks | nlive | ndead | nlike | rms of log(Z) - truth | bias | reported error |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| A | 8 | 30 | 530 | 33,542 | 0.353 ± 0.028 | +0.051 | 0.411 |
+| B | 77 | 30 | 934 | 56,673 | 0.405 ± 0.032 | -0.004 | 0.395 |
+| C | 8 | 50 | 852 | 53,943 | 0.363 ± 0.029 | -0.019 | 0.324 |
+
+- B runs 76% more dead points than A (round 307's fit predicts 1021 x
+  (30 + 0.41 x 76) = 62k evaluations; it measured 57k at this extreme
+  ratio). If they counted like live points, B's rms would be about
+  0.353 x sqrt(530/934) = 0.27. It measured 0.405, 1.2σ *above* A and 4σ
+  above that prediction. The extra dead points buy no measured precision.
+- PolyChord's own error estimate credits B a little (0.395 against 0.411),
+  as it did round 255's 112-worker R2D2 search (~9%). That estimate is not
+  borne out here.
+- Caveat: C (nlive 50) is not measurably more precise than A either
+  (0.363 against 0.353, where sqrt(H/nlive) with H = 5.3 predicts 0.33
+  against 0.42). At nlive 30-50 this toy's scatter does not follow the
+  textbook scaling, so 80 seeds cannot show a precision gain of either kind.
+  What the data do rule out is B being better than A.
+
+**Decision.** No change. Round 307's reading stands: the async overhead is
+a cost, and multi-node speedups at equal precision are the round 307 table
+(e.g. 1.85x for 2 nodes at nlive 150), not linear. Lowering `--nlive` on
+multi-node runs to compensate is not supported by evidence. The stale
+"raise `--nlive` with `--nodes`" advice in "Where it stands" is corrected.
+Row: stage `r308-async-precision` in `benchmarks.jsonl`, with every arm's
+log(Z), error, ndead and nlike.
+
