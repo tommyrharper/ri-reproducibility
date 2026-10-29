@@ -13330,3 +13330,32 @@ Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
 - Rows: bench `r269-w{old,new}{1,2}`, stage `r269-post-run-keep-prune`.
   Run dirs and the HEAD worktree are deleted. Scripts are in
   `.probe/r269/`.
+
+## Round 270 (negative probe): `summary.json`'s encode has no cheaper exact form
+
+**Question.** Round 269 left `_json_text` as the largest end-of-run step
+(1.88 s at 67k records, 11.1 s at 400k). Is there a faster way to get the
+same bytes, and how much of it is the Lustre write?
+
+**Method.** `.probe/r270/enc.py`, host `python3.12`, on r263-bigrun's
+`summary.json` (67,058 records, 169 MB, ~2.5 kB a record), two passes each.
+
+| step at 67k records | seconds |
+| --- | ---: |
+| `",\n    ".join(map(json.dumps, records))` (today's body) | 1.56-1.59 |
+| one reused `c_make_encoder`, same separators (identical bytes) | 1.41 |
+| `json.dumps(records)` in one C call (wrong layout, the floor) | 1.35 |
+| `_json_text(summary)`, whole | 1.70 |
+| `_write_text_atomic` of the 169 MB to hpc-work | 0.16 |
+
+**Result.** Negative, nothing shipped. Per-call Python overhead is ~10% of
+the encode; the rest is the C encoder formatting ~30 floats and the path
+strings of each record. Even the wrong-layout single call saves only
+0.2 s, and the write is 0.16 s. A reused encoder would save ~0.15 s a
+67k-record run (~0.01% of its 1,493 s) through a private `json.encoder`
+API. The end of an R2D2 run is now ~2 s of rank-0 work at 67k records
+and grows linearly; only smaller records (e.g. not storing each one's
+`commands`) would shrink it, which changes the summary's content.
+
+No code change, no search; stage row `r270-summary-encode`. Probe in
+`.probe/r270/`.
