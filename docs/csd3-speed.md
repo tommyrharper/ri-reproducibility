@@ -14301,3 +14301,46 @@ so no WSClean guard was needed. `docs/cluster.md` states the rule.
 Benchmarks that stop at a fixed `--max-ndead` and compare different rank
 counts are biased by this effect. Compare them in evals/s, or run them to
 convergence.
+
+## Round 294 (negative): dropping the flock on node packs makes inline appends cheaper but no search faster
+
+Round 292 left a lever: each multi-node record append took a shared `flock`
+on its node pack, and `flock`, `write` and unlock each release and retake
+the GIL, which `_pypolychord` holds through PolyChord's MPI waits (round 291).
+Nothing truncates a node pack while ranks append to it (only a finish or a
+resume folds it), so the lock guards nothing there. This round skipped it for
+node packs and raced the change on 2 icelake nodes (job 39622959,
+cpu-q-243/244, `--nodes 2 --nlive 150 --num-repeats 15 --seed 289
+--max-ndead 450`, arms in ABCCBA order so that linear drift cancels):
+
+| arm | path | flock | steady evals/s | record seconds, all ranks | log(Z) |
+| --- | --- | --- | --- | --- | --- |
+| A | writer thread | yes (HEAD) | 114.7, 115.3 | 1,904, 1,928 | 0.016509 ± 0.00115, 0.016632 ± 0.00111 |
+| B | writer thread | no | 108.5, 113.6 | 1,859, 867 | 0.016556 ± 0.00113, 0.016509 ± 0.00115 |
+| C | inline (`NS_RECORD_INLINE=1`) | no | 106.9, 108.5 | 186, 51 | 0.016622 ± 0.00107, 0.016538 ± 0.00106 |
+
+(a1's 86.7 overall evals/s carries a 39 s start-up; its steady rate is the
+comparable one.)
+
+- Inline appends got cheaper. Without the lock a record costs the rank
+  3.7-12.7 ms of its own thread, against round 292's 18-28 ms with it.
+- No arm got faster. The writer thread without the lock (B) is 3.5% below
+  A, inside its own 5% spread, and inline (C) is still 3-6% below the writer
+  arms. Inline's 51-186 record-seconds are 0.5-1.9% of the ~9,700
+  rank-seconds in an arm, so append time alone does not explain inline's
+  loss. Something else on that path costs it (e.g. the rank waiting on its
+  queued publishes before an inline append, or noise between arms on 2
+  nodes).
+- Kill -9 of everything at 100 s with C: 10,380 records printed and 10,629
+  on disk (0 lost). `./ri resume` finished in 83 s with log(Z)
+  0.0161405 ± 0.00156, which agrees.
+- WSClean guard (single node, so the change did not touch its path; HEAD
+  raced against the working tree, halves swapped): 41.2/40.4 against
+  40.6/41.2 evals/s, log(Z) 0.09670 ± 0.00052 in all four.
+
+The code change was reverted. Inline stays opt-in and node packs keep the
+lock. Removing the lock gave no verified speed gain, so it is not worth the
+extra branch. Full-precision log(Z) is in the `r294-flock` row of
+`benchmarks.jsonl`. Next for multi-node: compare evals/s per node at a
+production-shaped nlive (≥ 4 × workers, round 293) rather than keep shaving
+the record path, which is now below the 2-node noise floor.
