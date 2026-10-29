@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 310; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 311; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -30,6 +30,10 @@ the Hetzner host.
     [round 307](#round-307-analysis-guidance-fix-the-async-overhead-is-a-fixed-04-x-workers-live-points-so-a-bigger-nlive-never-buys-speed)).
     The extra dead points buy no measured precision either
     ([round 308](#round-308-measurement-the-async-overheads-extra-dead-points-buy-no-measured-precision)).
+    82-88% of the overhead is chains that come back below the contour the
+    other workers have since raised. A PolyChord patch letting workers
+    adopt the newest contour mid-chain is the open lever
+    ([round 311](#round-311-diagnostic-most-of-async-polychords-overhead-is-chains-that-return-below-the-contour)).
     `./ri bench` prints this as `converging evals/s`; judge rank and layout
     A/Bs on it at the production nlive
     ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
@@ -14942,3 +14946,57 @@ round 309's table line.
 
 No search ran and no code changed. GPU job 39654485 (round 303's pair, frozen
 worktree `../frozen-r303`) still had no output at ~20:40 on 29 Oct.
+
+## Round 311 (diagnostic): most of async PolyChord's overhead is chains that return below the contour
+
+**Question.** Rounds 293 and 307 measured that a converged async search needs
+~0.41 x workers live points' worth of extra evaluations, but not where they
+go. The epochs in `nested_sampling.F90` change only when clusters change, so
+it is not chains discarded by epoch. In PolyChordLite `370f6af`,
+`replace_point` (`run_time_info.f90`) puts a returned chain's final point
+into the live set only if it is above the *current* minimum live logL.
+Otherwise the point is filed as a dead point with `logzero` weight, and the
+whole chain is wasted. A worker's chain was seeded at the contour of its
+dispatch, and the other workers have raised that contour by the time it
+returns. Is this where the overhead goes?
+
+**Method.** Round 308's 6-d Gaussian toy (`.probe/r311/toy.py`, num_repeats
+15, 3 ms sleep, nlive 150, converged, seeds 1-3) at 9, 39 and 77 ranks
+(8, 38 and 76 workers), on this node in ~2 minutes. `t_dead-birth.txt` is
+in `RTI%dead` order, so a wasted point is one whose logL is below the running
+maximum of the dead points before it (`.probe/r311/waste.py`). This is a lower
+bound: a point between that maximum and the live minimum is missed.
+
+| workers | ndead | wasted (below contour) | wasted share | ndead - wasted | nlike | nlike vs 8 workers | round 307 predicts |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 2,424.7 | 41.7 | 1.7% | 2,383.0 | 153,410 | - | - |
+| 38 | 2,676.0 | 247.0 | 9.2% | 2,429.0 | 168,925 | +10.1% | +10.4% |
+| 76 | 2,928.3 | 487.3 | 16.6% | 2,441.0 | 184,352 | +20.2% | +20.8% |
+
+**Learned.**
+- 82% (38 workers) and 88% (76 workers) of the extra dead points over 8
+  workers are chains whose final point came back below the contour. The
+  useful dead points barely move (2,383 -> 2,441). Round 307's
+  0.41 x workers overhead is almost all of this one mechanism, and the
+  remainder is within the lower-bound undercount.
+- On the production R2D2 search (38 workers, nlive 150, ~49 evaluations per
+  chain at ~0.6 s each) that is ~9% of all evaluations. On two nodes it is
+  ~17%, and on four nodes ~29%.
+- The lever is in PolyChord, not this repo: a worker that adopts the newest
+  contour between slice steps, whenever its current point is above it,
+  wastes only the contour's movement during its last step. Every step is
+  still a valid slice step for the constrained prior it uses, so the
+  estimator keeps PolyChord's usual chain approximation. The cost is a
+  PolyChord patch: the administrator sends its minimum logL to the workers
+  after each replacement, and the workers check for it with `MPI_Iprobe`
+  in `slice_sampling`. The changed chains mean log(Z) can only agree within
+  error, not bit for bit, so the patch has to be validated against the
+  toy's analytic log(Z) over many seeds (round 308's method) and then on
+  R2D2. That is the next round's work. The alternative, using a returned
+  chain's last intermediate point that is still above the contour, is not
+  pursued: those points are correlated with the seed, which biases the
+  evidence.
+
+No code change. Stage row `r311-async-waste` in `benchmarks.jsonl`. Scripts
+and results are in `.probe/r311/`. GPU job 39654485 (round 303's pair) still
+had no output at ~20:45 on 29 Oct.
