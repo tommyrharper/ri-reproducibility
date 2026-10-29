@@ -246,8 +246,11 @@ startup in every restart and every `./ri resume`. Records are now written
 runs and the tolerance covers the runs already on disk.
 
 A run writes records on a background thread per rank (`write_records_in_background`,
-~50ms a record on CSD3's Lustre). A kill can therefore lose the last record or
-two a rank had queued. Those evaluations have no `metrics.json`, so the next
+~50ms a record on CSD3's Lustre). A kill loses what the ranks had queued: a
+record or two on a quiet RDS, but the flat writer falls behind as metadata load
+rises (161 of 4,933 records lost at a moderately loaded kill, ~5,000 behind
+under heavy load), where `NS_RECORD_APPEND=1` lost none (docs/csd3-speed.md,
+rounds 244-245). Those evaluations have no `metrics.json`, so the next
 attempt re-runs them with the same seed. A failed write re-raises on the rank's
 own thread at its next record, and `abort_run` waits up to 30s for the queue.
 

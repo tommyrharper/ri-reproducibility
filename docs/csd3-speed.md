@@ -12015,3 +12015,49 @@ Stage row `r244-record-lag` (full-precision log(Z)) is in
 `benchmarks.jsonl`. The bench rows `r244-lag1` and `r244-lag2` were written
 by the runs. Run dirs are deleted. Script, sampler, outputs and gzipped
 logs are in `.probe/r244/`.
+
+## Round 245 (diagnostic): under load a kill costs flat records, never append ones
+
+**Question.** Round 244 found the flat record writer ~60% behind for a
+whole search on a loaded RDS, against round 242's 2 records lost at a
+kill. Round 244's next step: repeat the kill under load with both writers.
+
+**Method.** Round 242's shape and kill (`.probe/r245/kill.sh`: async
+R2D2, seed 242, `--nlive 48 --num-repeats 5 --max-ndead 600 --mpi-procs
+20`, `ca86dd0`). Flat (default) raced against `NS_RECORD_APPEND=1` on the
+other CPU half, two pairs with the halves swapped. Round 244's sampler
+ran every 10 s. One `kill -9` took the launcher's group and every process
+naming the run dir (0 left alive). "Scored" is the log's `^{"eval_id"`
+count just before the kill; "on disk" is `.probe/r242/count.py`.
+
+| pair | kill | RDS (slowest `evaluations/` listing) | arm | scored | on disk | lost | most behind mid-run |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | 210 s | loaded (33 s) | flat, CPUs 0-36 | 4,933 | 4,772 | **161** | 654 |
+| 1 | 210 s | loaded | append, 38-74 | 4,709 | 4,709 | **0** | 204 (t=40 only), then <=11 |
+| 2 | 150 s | quiet (1.2 s) | flat, 38-74 | 3,163 | 3,136 | **27** | 50 |
+| 2 | 150 s | quiet | append, 0-36 | 3,514 | 3,515 | **0** | 2 |
+
+**Results.**
+- Rounds 242, 244 and 245 now agree: the flat writer's lag, and so what
+  a kill loses from the archive, tracks the MDS load on `evaluations/`.
+  2 (242), 27 (quiet), 161 (moderate) and up to ~5,000 (244, listings
+  of 34-52 s). Append lost nothing in either pair and stayed within a
+  couple of records of the scored count all run, loaded or not.
+- What it costs. A lost record is an imaged evaluation that is missing
+  from the failure-mode archive for good. `./ri resume` draws new points
+  and never re-scores it (round 242). It is not a speed or log(Z) issue:
+  PolyChord resumes from its `.resume` either way.
+- Append's price is still 1-3.5% evals/s (rounds 240-241, same sign in
+  all four pairs, inside the noise span). No new speed figures here, since
+  killed arms write no bench row.
+
+**Decision.** No code change, and the default stays flat, because this
+loop's objective is speed. For a long production search on a busy RDS,
+where a timeout or node failure is likely and the archive is the
+product, `NS_RECORD_APPEND=1` is the durable choice at ~2%. The
+background writer's records were never at risk in a run that finishes.
+
+Stage row `r245-kill-under-load` is in `benchmarks.jsonl`. Run dirs are
+deleted. Script, sampler outputs and gzipped logs are in `.probe/r245/`.
+The round 243 GPU race (job 39544674) had still not started at 03:45
+(no `.probe/r243/ab-39544674.out`).
