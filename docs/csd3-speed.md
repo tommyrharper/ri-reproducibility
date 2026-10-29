@@ -14538,3 +14538,66 @@ at `--nlive 128` (≥ 4 x workers, round 293) in ACCAAC order. It had not starte
 by the end of this iteration. The next round reads
 `.probe/r299/ab-39651057.out`. Full-precision log(Z) for the CPU arms is in
 the `r299-cpu-batch` row of `benchmarks.jsonl`.
+
+## Round 302 (validation): rounds 287-299 in the production search; log(Z) agrees, 60.2 evals/s
+
+**Question.** Since round 278's validation, multi-node support, the
+`/dev/shm` scratch fix (round 297) and batched record appends (round 298
+default) changed shared code. Does the single-node production search still
+converge to the same log(Z), and at what speed?
+
+**Method.** Round 239's command unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on 38 icelake CPUs) on `3cc4f25`.
+Rounds 300 and 301 started it inside the gnhf job and were cut off before it
+finished, so this round ran it as its own 1-node icelake job (39652782,
+`.probe/r300/run.sh`, node cpu-q-577). Node load was 7.7 at the start and
+57-68 at the end.
+
+| | round 239 (`d41efab`) | round 278 (`101346b`) | round 302 (`3cc4f25`) |
+| --- | ---: | ---: | ---: |
+| evaluations | 70,202 | 75,278 | 72,286 |
+| evals/s | 51.2 | 47.5 | 60.2 |
+| steady evals/s | - | 47.5 | 62.8 |
+| request (`r2d2 container`) | 712 ms | 763 ms | 598 ms |
+| simulate | 26.6 ms | 33.3 ms | 29.2 ms |
+| idle | 0.0% | 0.4% | 0.5% |
+| first request | - | 5.81 s | 50.5 s |
+| peak memory (bench row) | - | 8,342 MB | 14,735 MB |
+| post-run phases (pack) | 21.6 s (14.0 s) | 11.6 s (2.6 s) | 12.9 s (2.4 s) |
+| wrapper wall | 1,427 s | 1,610 s | 1,260 s |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.0172503990041623 +/- 0.000401752587890735 | 0.0172602493141394 +/- 0.000402502115363966 |
+| ndead, nlike | 1,488, 68,540 | 1,457, 73,707 | 1,438, 70,887 |
+
+**Results.**
+- log(Z) agrees: -0.25 sigma from round 239 and +0.02 sigma from round 278.
+  `run.log` has no stalls or meqserver wedges. Rounds 287-299 are validated
+  for results on one node.
+- 60.2 evals/s (62.8 steady) is 27% above round 278 and above round 205's
+  ~53 evals/s "DRAM ceiling". The request time fell from 763 to 598 ms with
+  no code change to the U-Net path since round 278, so this is the node,
+  not the tree: the job started on a nearly idle node (load 7.7, against
+  19-75 for round 278 and 95-145 for rounds 239/263). Round 205's ~53 is a
+  weights-only bandwidth estimate (165 GB/s) taken on a busy node, so it is
+  not a hard ceiling on a quiet one. Absolute evals/s across nodes says
+  nothing about a change; only raced A/Bs do.
+- Cold-node start-up: every rank's first request took ~48 s (38
+  evaluations over 10 s, all in the first wave), against 5.8 s in round 278,
+  which ran on the gnhf node where the SIFs and checkpoints were already in
+  page cache. On a fresh node this costs ~45 s of the whole search once
+  (start-up 50.2 s in the bench row), ~4% of a 20-minute search and nothing
+  in a long one.
+- Peak memory reads 14.5-15.5 GB in every evaluation (median 14.9 GB),
+  against 8.3 GB in round 278. It is flat from the first evaluation to the
+  last, so it is a different baseline on this node or job, not growth
+  during the search. The cause was not investigated; it is within the
+  job's allocation.
+- Batched records: every rank's queue was at most 2 at the finish and the
+  pack took 2.4 s.
+
+No code change. Rows: bench `r300-bigrun` and stage `r302-validation` in
+`benchmarks.jsonl`. `.probe/r300/` keeps the script, the gzipped
+`summary.json`, `run.log` and console log, `.stats` and the profile. The
+run directory is deleted.
+
+GPU job 39651057 (`.probe/r299/ab.sh`) had still not started by the end of
+this round; the next round reads `.probe/r299/ab-39651057.out`.
