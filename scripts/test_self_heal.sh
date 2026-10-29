@@ -236,9 +236,22 @@ SEARCH_PID=""
 # That one file used to end a search for good: json.loads raised at startup in
 # the resume and in every restart, all before scoring anything, so nothing
 # retried. The resume below has to skip it and finish anyway.
+# Since round 264 a run appends its records to evaluations/records.jsonl
+# rather than writing eval-*.json, so there the damage is one record's line
+# garbled and a torn last line, a killed rank's half-finished append
+# (NS_RECORD_APPEND=0 still writes flat files: those are zeroed instead).
+pack="${RESUME_OUT}/evaluations/records.jsonl"
 corrupt_record="$(find "${RESUME_OUT}/evaluations" -maxdepth 1 -name 'eval-*.json' | sort | head -1)"
-[ -n "${corrupt_record}" ] || fail "the killed run scored nothing to corrupt"
-: >"${corrupt_record}"
+if [ -n "${corrupt_record}" ]; then
+  : >"${corrupt_record}"
+  unreadable="${corrupt_record}"
+else
+  [ -s "${pack}" ] || fail "the killed run scored nothing to corrupt"
+  corrupt_name="$(head -1 "${pack}" | cut -f1)"
+  sed -i "1s/\t.*/\t{\"eval_id\": 1, \"par/" "${pack}"
+  printf 'eval-9999-0123456789abcdef\t{"eval_id": 9999, "pa' >>"${pack}"
+  unreadable="${corrupt_name} in ${pack}"
+fi
 
 # The report is how anyone finds out, so it is asserted before the resume: a
 # stopped run has to headline STOPPED and name the command that continues it.
@@ -274,12 +287,19 @@ SEARCH_PID=""
 [ "${resumed_status}" -eq 0 ] \
   || fail "./ri resume did not finish the run (exit ${resumed_status}); see ${RESUME_OUT}.log"
 [ -f "${RESUME_OUT}/summary.json" ] || fail "the resumed run finished with no summary.json"
-grep -qF "WARNING: ignoring unreadable ${corrupt_record}" "${RESUME_OUT}.log" \
-  || fail "the resume did not say it had skipped the half-written ${corrupt_record}; see ${RESUME_OUT}.log"
-[ -e "${corrupt_record%.json}" ] \
-  && fail "the half-written record's directory survived the resume, so the sampler collides with it when it proposes that point again"
-[ -e "${corrupt_record}" ] \
-  && fail "the half-written record survived the resume, so every later resume warns about it"
+grep -qF "WARNING: ignoring unreadable ${unreadable}" "${RESUME_OUT}.log" \
+  || fail "the resume did not say it had skipped the half-written ${unreadable}; see ${RESUME_OUT}.log"
+if [ -n "${corrupt_record}" ]; then
+  [ -e "${corrupt_record%.json}" ] \
+    && fail "the half-written record's directory survived the resume, so the sampler collides with it when it proposes that point again"
+  [ -e "${corrupt_record}" ] \
+    && fail "the half-written record survived the resume, so every later resume warns about it"
+else
+  grep -q '^eval-9999-' "${pack}" \
+    && fail "the torn last line survived the resume, so the next append ran on into it"
+  tail -c1 "${pack}" | od -An -c | grep -q '\\n' \
+    || fail "the resumed run's pack does not end in a whole line"
+fi
 
 # Continued, not restarted. The count the resume script prints is the scored
 # evaluations - the same records `completed_evals` counts -

@@ -13772,3 +13772,52 @@ start and 50-75 for most of the run (round 263: 95-120).
 No code change. Rows: bench `r278-bigrun` and stage `r278-validation` in
 `benchmarks.jsonl`. `.probe/r278/` keeps the script, `summary.json`,
 `.stats`, the profile and the gzipped log. The run directory is deleted.
+
+## Round 280 (check, test fix): self-heal and an R2D2 kill -9 + resume at HEAD
+
+**Why.** `./ri self-check self-heal` last ran in round 227. Since then the
+record writer became append by default (round 264), resume and finish
+changed (rounds 267-269) and the R2D2 pool builds its sessions differently
+(rounds 273-274). Round 245's kill covered append records at `ca86dd0`, but
+not `./ri resume` on today's code.
+
+**Self-heal.** At `c425390` it failed in scenario three: "the killed run
+scored nothing to corrupt". The scenario zeroes one `eval-*.json` to show
+that a half-written record cannot end a resume, but with append records a
+run writes `evaluations/records.jsonl` and no flat files. The check was
+stale; the code was fine. `scripts/test_self_heal.sh` now damages the
+pack the way a kill or a full disk does: one record's line is garbled and a
+torn `eval-9999-...` line with no newline is appended. The resume must warn
+`ignoring unreadable <name> in .../records.jsonl`, finish, and leave a pack
+that ends in a whole line with the torn line gone. With
+`NS_RECORD_APPEND=0` it still zeroes a flat record as before. All seven
+scenarios passed in 176 s (WSClean, with the squeue shim).
+
+**R2D2 kill -9 + `./ri resume`.** Round 245's shape (`.probe/r280/kill.sh`:
+async R2D2, seed 242, `--nlive 48 --num-repeats 5 --max-ndead 600
+--mpi-procs 20`). At 120 s, one `kill -9` took the launcher's group and
+every process naming the run dir.
+
+| | |
+| --- | ---: |
+| scored at the kill (log) | 4,800 (4,802 just after) |
+| on disk | 4,802, **0 lost**, 0 processes left |
+| `./ri resume` adopted | 4,802 ("4802 evaluations already done") |
+| resume wall | 114 s (`summary.json`: 104.3 s) |
+| records at the end | 9,081, no duplicate parameters |
+| ndead, nlike | 529, 8,431 |
+| log(Z) | 0.0167740326060257 +/- 0.000738664281660799 |
+
+log(Z) is 0.57 sigma from round 278's production 0.0172503990041623 +/-
+0.000401752587890735 (different nlive, same likelihood). So today's defaults
+meet the durability bar: a mid-search kill loses no records, and the resume
+picks up every one of them.
+
+**Seen, not changed.** A garbled packed line stays in `records.jsonl` after
+the resume (the repack rewrites only names it could read), so later readers
+warn about it again. Unlike a zeroed flat file, it holds no directory the
+sampler could collide with, so it costs only the warning.
+
+Test-only change (no search code, so no WSClean A/B). Stage row
+`r280-kill-resume` is in `benchmarks.jsonl`. The run dir is deleted; script
+and gzipped logs are in `.probe/r280/`.

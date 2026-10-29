@@ -550,7 +550,7 @@ in the six ways that recover through different machinery:
 |---|---|
 | `SIGKILL` after 8 evaluations (fewer than `--nlive`, so before any checkpoint) | Restarts itself, records the kill, keeps the evaluations, writes `summary.json`, and `./ri health` says nothing on its headline |
 | `SIGSTOP` on one rank | Only the stall watchdog can notice; run with `--stall-timeout 20` and a 2s poll so it costs a minute rather than two hours |
-| `SIGKILL` on a search started with `--retries 0` | Does *not* recover on its own: `./ri health` must headline it `STOPPED` and name `./ri resume <run>`, and that command - taken from the report and typed verbatim - must continue the search rather than begin one |
+| `SIGKILL` on a search started with `--retries 0` | Does *not* recover on its own: `./ri health` must headline it `STOPPED` and name `./ri resume <run>`, and that command - taken from the report and typed verbatim - must continue the search rather than begin one, skipping a garbled `records.jsonl` line and truncating a torn last one first |
 | `SIGKILL` on every worker in the pool | Costs nothing: absorbed inside the evaluation, so `restarts.log` is never written |
 | `SIGKILL` on the pool's whole process group | Costs a restart: the run dies and `sidecar_restore` is what lets the retry fix it |
 | A truncated `chains/*.resume`, then a truncated `summary.json`, on the finished run | `./ri resume` finishes both, keeps the torn checkpoint as `*.resume.unreadable`, and leaves the evaluation count unchanged - nothing imaged twice |
