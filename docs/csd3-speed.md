@@ -14718,3 +14718,24 @@ Every anchor in the block was checked against this file's headings. No code
 changed, no search ran, and there is no `benchmarks.jsonl` row. The GPU
 pair (job 39654485, `.probe/r303/ab.sh`) still has no output file at 19:45
 on 29 Oct.
+
+## Round 305 (check, test fix): every CI "Checks" step at HEAD; job-env's base-OS case is emptied
+
+With the GPU pair still queued (job 39654485, no output file at 19:48 on
+29 Oct), this round ran every step of `ci.yml`'s "Checks" job on this node
+with Slurm off `PATH`, through `uv run --no-project python3` as CI does (the
+system `python3` here is 3.6 and fails every script at `from __future__ import
+annotations`). `resume-nested-sampling-run.sh --self-check` was skipped, as
+the run rules ask. Every step passed except one:
+`scripts/lib/job-env.sh --self-check` failed with "the base OS alone must
+pass the check", because the shell that ran it exported
+`LOCALE_ARCHIVE_2_27=/nix/store/...` (a nix-portable login). That case ran
+`env -u NS_SCRATCH_DIR`, so it inherited every other variable from the
+caller. A real job never does that, because `job-env.sh` empties its
+environment with `env -i`. The case now runs under `env -i`, with only
+`PATH=/usr/bin:/bin` and the self-check's own `RI_JOB_*` settings. It passes
+from the Nix login shell and from `env -i`, and shellcheck 0.9.0.6 is clean.
+The negative cases above it, including the Nix-store binary, still fail the
+check as they should. No search ran, the run scripts' behaviour is
+unchanged (only a self-check changed), and there is no `benchmarks.jsonl`
+row.
