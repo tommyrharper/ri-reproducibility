@@ -155,7 +155,9 @@ does. `bash scripts/lib/job-env.sh --self-check` tests the check itself.
 
 Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive`;
 CSD3 refuses `--mem 0`) and the run script sizes the ranks from the allocation; with it the
-job asks for that many cores and the matching memory. `--partition` defaults
+job asks for that many cores and the matching memory. A CPU R2D2 job then
+runs one rank more than its cores, for PolyChord's root, which never
+evaluates (round 253; `NS_R2D2_ROOT_RANK_EXTRA=0` runs exactly `--mpi-procs`). `--partition` defaults
 to `icelake` and `--time` to `12:00:00`, the SL3 cap, which every service
 level accepts; SL1/SL2 accounts can pass `--time 36:00:00`, their own cap,
 and a limit above your level is refused by sbatch. Both, and anything

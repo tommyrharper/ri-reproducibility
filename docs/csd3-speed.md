@@ -12362,3 +12362,57 @@ The default stays. Rows: bench `r252-split` and stage
 `r252-split-validation` (full-precision log(Z) for both runs). `.probe/r252/`
 keeps the submit script, `summary.json`, `.stats`, and gzipped job output and
 run log. The run directory is deleted.
+
+## Round 253: sized CPU R2D2 jobs get round 186's extra root rank
+
+**Gap.** Round 186 gives a default CPU run one rank more than its CPUs,
+because PolyChord's root never evaluates (+3.7%). That rule only fires when
+`NS_MPI_PROCS` is unset. A login-node `./ri search r2d2 --mpi-procs N` sizes
+the job to N CPUs *and* carries `NS_MPI_PROCS=N` into it, so every sized
+submission (rounds 250 and 252's default two-socket shape included) ran N
+ranks on N CPUs, with the root's CPU idle: round 252's production search ran
+37 workers on 38 CPUs.
+
+**Change.** The submit branch of `scripts/run-nested-sampling-r2d2.sh`
+exports `NS_R2D2_ROOT_RANK_EXTRA=1` for sized CPU jobs. It reaches the job
+through `.job-settings.env`, and inside the job an explicit `NS_MPI_PROCS`
+equal to the job's CPUs becomes CPUs + 1. The Slurm request is unchanged:
+with a fake `sbatch`, `--mpi-procs 38` still asks for `--ntasks 2
+--ntasks-per-socket 1 --cpus-per-task 19 --mem 58096`, and the extra rank's
+~1 GB fits in the 4,096 MB headroom (peak 7.0 GB here, 13 GB two-socket).
+`NS_R2D2_ROOT_RANK_EXTRA=0` runs exactly `--mpi-procs` ranks. GPU jobs, runs
+in place with an explicit `NS_MPI_PROCS`, and WSClean are unchanged.
+
+**A/B.** In-job on this gnhf node (half icelake, 38 CPUs on one socket, node
+load ~88), `NS_MPI_PROCS=38` (A, the old sized job: 38 ranks) against the
+same plus `NS_R2D2_ROOT_RANK_EXTRA=1` (B: 39 ranks, confirmed in the run's
+`mpi_procs`). The runs were async, with nlive 100, 5 repeats, 400 dead and
+seed 4242 (round 186's shape), in the order W0 A1 B1 B2 A2 B3 A3 A4 B4.
+Rows `r253-*`, stage row `r253-root-rank-extra`, script `.probe/r253/ab.sh`.
+
+| run | ranks | evals | steady evals/s | ms per eval | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| W0 (discarded) | 38 | 5,993 | 47.4 | 761 | 7,039 | 0.017394184523864 +/- 0.000795940269377829 |
+| A1 | 38 | 7,777 | 50.6 | 721 | 7,008 | 0.0161690704705988 +/- 0.00131276215943309 |
+| B1 | 39 | 6,320 | 49.5 | 756 | 6,814 | 0.0170905622646202 +/- 0.00089889065878906 |
+| B2 | 39 | 6,105 | 49.3 | 758 | 6,966 | 0.017428562173038 +/- 0.000757722363946419 |
+| A2 | 38 | 6,001 | 46.4 | 784 | 6,964 | 0.0174025233553157 +/- 0.000773688689440642 |
+| B3 | 39 | 6,586 | 48.3 | 776 | 6,988 | 0.016956188436949 +/- 0.000967224570316897 |
+| A3 | 38 | 5,809 | 45.5 | 788 | 7,162 | 0.017568627327135 +/- 0.000737492027114256 |
+| A4 | 38 | 6,006 | 48.1 | 757 | 7,049 | 0.0174323700337516 +/- 0.000785041317612504 |
+| B4 | 39 | 6,786 | 49.2 | 758 | 7,043 | 0.0169215860477515 +/- 0.000917906021654815 |
+
+**Learned.**
+- Steady geomean 49.1 (B) against 47.6 (A), **+3.1%**. B won 3 of 4 pairs
+  (-2.2%, +6.2%, +6.1%, +2.3%), in line with round 186's +3.7% (5 of 5).
+  The node load (~88 on 76 CPUs) makes single pairs noisy, and A1 was the
+  outlier.
+- B's ms per evaluation (756-776) sits inside A's range (721-788), so the
+  root's 39th rank costs the workers nothing measurable. The gain is the
+  extra worker.
+- All nine log(Z)s agree within their errors (0.0162-0.0176, sigma
+  0.0007-0.0013).
+- Only the R2D2 run script's submit and explicit-ranks branches changed, so
+  no WSClean guard was needed. CI's shellcheck 0.9.0 is clean,
+  `scripts/test_self_checks.py` passes 30 of 30 host checks, and
+  `slurm.sh --self-check` passes. The `r253-*` run dirs are deleted.

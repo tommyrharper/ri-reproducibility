@@ -71,6 +71,10 @@ if ns_should_submit; then
     # copies switch on: +37% on sapphire (round 111), +26% on icelake (round 250).
     export NS_SLURM_SOCKETS="${NS_SLURM_SOCKETS:-2}"
   fi
+  # The job gets --mpi-procs CPUs; the root's rank goes on top, as below.
+  if [ "${R2D2_DEVICE}" = cpu ] && [ -n "${NS_MPI_PROCS:-}" ]; then
+    export NS_R2D2_ROOT_RANK_EXTRA="${NS_R2D2_ROOT_RANK_EXTRA:-1}"
+  fi
   NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
   exit 0
@@ -152,6 +156,12 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   fi
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2)"
 else
+  # A job a login node sized with --mpi-procs N has N CPUs, so N ranks would
+  # leave the root's CPU idle (round 186); NS_R2D2_ROOT_RANK_EXTRA=0 keeps N.
+  if [ "${NS_R2D2_ROOT_RANK_EXTRA:-0}" = 1 ] && [ "${R2D2_DEVICE}" = cpu ] \
+    && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
+    NS_MPI_PROCS="$((HOST_CPUS + 1))"
+  fi
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2
