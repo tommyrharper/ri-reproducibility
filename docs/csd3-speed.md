@@ -12898,3 +12898,107 @@ in round 259's arm logs (`.probe/r257/*.log.gz`), set against the job's
 
 No code change, no search, no `benchmarks.jsonl` row. The probe is in
 `.probe/r262/`.
+
+## Round 263 (validation): rounds 240-262 in the production search; log(Z) agrees, no code regression
+
+**Question.** Sapphire job 39567902 (round 260) had still not started. Rounds
+240-262 changed the record writer (coalescing, round 247), the CPU pool's
+checkpoints (round 257) and the multi-thread runtime (round 258), and were
+never run together in the production search. Do they still converge to the
+same log(Z), and at round 239's speed?
+
+**Method.** Round 239's command unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs,
+`.probe/r263/run.sh`) on `8afee6e`, node cpu-q-124. Node load was 41 at the
+start and 95-120 for most of the run (round 239: 120-145 on cpu-q-566).
+
+| | round 239 (`d41efab`) | round 263 (`8afee6e`) |
+| --- | ---: | ---: |
+| evaluations | 70,202 | 67,058 |
+| evals/s (= steady) | 51.2 | 44.9 |
+| request (`r2d2 container`) | 712 ms | 802 ms |
+| simulate | 26.6 ms | 38.7 ms |
+| idle | 0.0% | 0.5% |
+| first request | - | 5.61 s |
+| post-run phases (pack) | 21.6 s (14.0 s) | 13.8 s (2.5 s) |
+| wrapper wall | 1,427 s | 1,514 s |
+| files left in the run dir | 711 | 749 |
+| writer-s, record / coalesced | 49,159 / - | 24,782 / 15,052 records |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.01710037195271 +/- 0.000395823425917893 |
+| ndead, nlike | 1,488, 68,540 | 1,459, 65,526 |
+
+The run was 12% slower, and both the request (+13%) and simulate (+46%) were
+slower with it. Simulate runs no R2D2 code, so the drop is more likely node
+load than code. To check, HEAD and `d41efab` (a `/dev/shm` worktree) were
+raced on the job's two 19-CPU halves, then swapped (`.probe/r263/ab.sh`,
+20 ranks, seed 240, nlive 48, 5 repeats, 400 dead):
+
+| | CPUs 0-36 | CPUs 38-74 |
+| --- | ---: | ---: |
+| pair 1 | HEAD 22.2 (811 ms) | `d41efab` 23.6 (751 ms) |
+| pair 2 | `d41efab` 23.7 (763 ms) | HEAD 24.4 (741 ms) |
+| HEAD against `d41efab`, same CPUs | -6.3% | +3.4% |
+
+log(Z) in the four arms: 0.0174284751036090 +/- 0.000663 (HEAD 1),
+0.0174873101886092 +/- 0.000587 (old 1), 0.0176241094368738 +/- 0.000593
+(old 2), 0.0175677369685795 +/- 0.000618 (HEAD 2). All four reached ndead
+448.
+
+**Results.**
+- log(Z) agrees: within 0.53 sigma of round 239, 0.34 sigma of round 252
+  (0.0172910867005174) and 0.33 sigma of round 233. No failures, no stalls
+  and no meqserver wedges. Rounds 240-262 are validated for results.
+- No code regression is visible. On the same CPUs, the raced pairs split in
+  sign (-6.3%, +3.4%, mean -1.5%), inside the ~5% control span. So the
+  production run's -12% is the node: on a shared icelake node, simulate's
+  +46% says other jobs took memory bandwidth.
+- The record writer coalesced 15,052 records, and writer-seconds on flat
+  records halved (24,782 against 49,159). Every rank's queue held at most 2
+  at the end, against 1,068 in round 239. So round 247's writer keeps up in
+  the production search on loaded RDS. The pack took 2.5 s against 14.0 s.
+- The 22 Sep production search now converges in ~25 min on half an icelake
+  node even under load 95-120.
+
+Rows: bench `r263-bigrun`, `r263-new1/2`, `r263-old1/2`, and stage
+`r263-validation` (full-precision log(Z) for every arm). `.probe/r263/`
+keeps the scripts, `summary.json`, `.stats`, the profile and gzipped logs.
+The run directories are deleted.
+
+**Sapphire job 39567902 (round 260) ran during this round** on cpu-r-81,
+exclusive, at `8afee6e`: 113 ranks x 1 thread, async, nlive 200, 5 repeats,
+1,000 dead, seed 4242, arms interleaved W0 A1 B1 B2 A2 A3 B3. A is the
+default coalescing writer, B is `NS_RECORD_APPEND=1`.
+
+| arm | writer | steady evals/s | evals/s | first request | request | record writer-s (coalesced records) | load at end | pack | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W0 | default | 160.0 | 117.4 | 34.3 s | 707 ms | 8,370 (10,264) | 179 | 1.6 s | 0.0178004666207206 +/- 0.000386899732106165 |
+| A1 | default | 162.7 | 145.1 | 12.6 s | 650 ms | 9,639 (11,958) | 203 | 1.9 s | 0.0174979779748526 +/- 0.000434314316289035 |
+| B1 | append | 160.6 | 134.3 | 19.8 s | 659 ms | 217 | 112 | 0.6 s | 0.0172514684619337 +/- 0.000436751081455162 |
+| B2 | append | 157.9 | 134.3 | 16.3 s | 666 ms | 197 | 103 | 0.5 s | 0.0176887445407745 +/- 0.000368475652415278 |
+| A2 | default | 165.7 | 142.0 | 15.5 s | 637 ms | 8,630 (10,838) | 175 | 1.5 s | 0.0177547510533588 +/- 0.000374513635091155 |
+| A3 | default | 161.5 | 136.1 | 16.8 s | 652 ms | 8,396 (10,221) | 191 | 1.4 s | 0.0177822301619086 +/- 0.000367188647221824 |
+| B3 | append | 162.2 | 145.1 | 13.8 s | 653 ms | 245 | 119 | 0.7 s | 0.0171662451388133 +/- 0.000469591700363310 |
+
+- Steady evals/s: default 163.3 mean, append 160.2, **-1.9%**. The
+  adjacent pairs give -1.3%, -4.7% and +0.4%, so 2 of 3 are lower and all
+  are inside the ~5% control span. That is the same ~2% cost as rounds
+  240-241 on half icelake. The whole node's 113 writers did not make append
+  faster.
+- Append cuts the record writers' time ~40x (197-245 writer-s against
+  8,396-9,639), and the default coalesced 10-12k records an arm, so its
+  writers were behind for the whole search. The 1-minute load at the end of
+  each arm is 103-119 with append and 175-203 with the default. That
+  confirms round 262: the load above 112 is writers blocked in Lustre
+  creates, and append removes them. The pack is 0.5-0.7 s against 1.4-1.9 s.
+- log(Z) agrees across all seven arms. The widest A-B gap is A3 against B3,
+  1.04 sigma, for async paths at different speeds.
+- First requests took 12.6-34.3 s (W0 is the cold one), against round 259's
+  ~6 s on cpu-r-92. Each arm here started at node load ~100-200 left by the
+  previous arm's end, so this is not a cold-cache regression on its own.
+- **Decision.** This is the measurement the user's durability rule asked
+  for: append costs ~2% and takes the writers off Lustre's create path.
+  Round 245 (under load) and round 261 (quiet) show append loses 0 records
+  at a kill -9, and `./ri resume` finishes from it. So the next round should
+  make `NS_RECORD_APPEND=1` the default, with the WSClean guard that a
+  `common.py` change needs. The run dirs are deleted, and the arm logs are
+  gzipped in `.probe/r260/`. Stage row `r260-spr-append`.
