@@ -11392,3 +11392,75 @@ Rows: `r233-bigrun` (bench) and `r233-validation` (stage, with full-precision
 log(Z)) in `benchmarks.jsonl`. `summary.json`, `.stats`, the profile and the
 sampler output are kept in `.probe/r233/`. The run directory (9,537 files) is
 deleted.
+
+## Round 234 (fix): the post-run drain is a record-writer backlog
+
+**Question.** Round 233's post-run drain took 60 s. What is still queued
+on the ranks' record writers when a run ends?
+
+**Method.** `finished_run_records` now reports, on the `post-run seconds`
+line, each kind of writer job still queued when the run ended (summed over
+ranks), the most queued on one rank, the slowest rank's own drain (the
+`drain` phase is rank 0's, barrier included), and the seconds every writer
+spent on each kind. Three short R2D2 searches on `c72f740` (nlive 150, 15
+repeats, 400 dead, seed 190182240, 39 ranks, `NS_RETAIN_FLUSH_SECONDS=60`
+to exercise the periodic flush). Other users' jobs put the node load at
+50-90.
+
+| run | drain (rank 0) | slowest rank | queued: record / held / strip / publish | most on one rank |
+| --- | ---: | ---: | --- | ---: |
+| a | 3.3 s | 25.4 s | 6,457 in total (kinds not split yet) | 243 |
+| b | **49.6 s** | 49.6 s | 7,905 / 1,345 / 1,010 / 84 | 361 |
+| c | 5.9 s | 6.2 s | 9,251 / 1,705 / 1,205 / 113 | 407 |
+
+In run c, the writers spent 7,823 s on records, 2,104 s on held-extreme
+publishes, 749 s on strips and 30 s on publishes. That is 282 s of each
+rank's ~300 s search, so the writers were saturated. Of 14,567 records,
+9,251 (64%) were still unwritten when the run ended.
+
+**Finding.** The writer is not a little behind at the end. On a loaded
+Lustre it falls 200-400 jobs behind (minutes of records) during the
+search, at ~0.5 s per record create+rename. How long the drain takes then
+depends on Lustre at that moment: 6-50 s here, 60 s in round 233. Two
+thirds of the backlog is record writes, and those are wasted at the end:
+rank 0 already has every record's text (`_WRITTEN_RECORDS`, gathered) and
+`pack_finished_run` packs them into `records.jsonl`, then unlinks each
+flat file the writers just created.
+
+**Fix.** At the start of `finished_run_records`, each rank cancels its
+record writes that have not started. `pack_evaluation_records` now appends
+a known record that has no file and is not yet in the pack (before this it
+skipped such a record, which could only happen if the file had vanished).
+Held publishes, strips and publishes still drain: a strip left undone
+would leave an evaluation's images on Lustre, and the final flush already
+sends only the extremes the run keeps. The trade-off: if a run is killed
+between the cancel and the pack, those records are lost, and a resume
+re-evaluates those points. That window is a few seconds at the end of a
+run. The self-check (`self_check_resume_adoption`) parks the writer,
+queues a record, finishes the run and asserts that no flat file was
+written and that the pack holds the record. It fails without the cancel.
+
+**WSClean guard.** Raced synchronous WSClean (seed 229, nlive 100, 4,000
+dead, 19 CPUs per arm, CPU sets swapped from a first async pair). Base
+`c72f740` against this change: 4,071 evaluations each, all 7 chain text
+files bit-identical, log(Z) 0.0967023094179472 +/- 0.000520957293962581
+in both, 37.64 vs 37.45 evals/s (-0.5%, noise). The new arm cancelled
+2,618 record writes. `records.jsonl` holds all 4,071 distinct records and
+no flat record is left. The base arm ran from a `/dev/shm` worktree, so
+its post-run phases are not comparable: its records went to tmpfs, and its
+wrapper wall was ~10 s shorter for that reason.
+
+**Not measured yet.** The drain gain in a production R2D2 search. The
+drain varies 6-50 s run to run at the same settings, so one pair would
+not show it. Next: read the new `post-run seconds` line of the next
+production run (the cancelled records are its `record` count). A second
+lever is the held publishes still queued at the end (1,345-1,705). Each
+is an extreme the periodic flush copied to Lustre. Most of them are
+evicted again, and the end-of-run prune drops them. They could go back to
+`_HELD` when cancelled, so that the keep-filtered final flush drops them
+in tmpfs.
+
+Rows: `r234-a`, `r234-b`, `r234-c` (bench), `r234-base`, `r234-new`,
+`r234-sbase`, `r234-snew` (guard), and stage row `r234-writer-backlog` in
+`benchmarks.jsonl`. Run directories are deleted; `.probe/r234/` keeps the
+scripts.

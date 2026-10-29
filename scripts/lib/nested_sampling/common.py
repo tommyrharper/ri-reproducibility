@@ -1301,10 +1301,9 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
         for name in sorted(known):
             if name in paths and (paths[name].parent == evaluations_dir or name not in texts):
                 moving.append(name)  # a packed name's dir has no record file: only a flat one is newer
-            elif name not in texts:
-                continue
             text = json.dumps(known[name])
-            if name in moving or text != texts[name]:
+            # Not on disk at all: a record write the finish cancelled.
+            if name in moving or text != texts.get(name):
                 lines[name] = text  # the last line of a name is its record
         if not lines:
             return 0
@@ -1678,8 +1677,21 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     makes - and the ranks publish only that and drop the rest in tmpfs.
     """
     POST_RUN_SECONDS.clear()
+    POST_RUN_BACKLOG.clear()
     started = time.monotonic()
+    # This rank's own backlog and drain, apart from the barrier's wait for
+    # the slowest: round 233's 60s drain was one of the two (round 234).
+    queued = [future.kind for future in _RECORD_WRITES if not future.done()]
+    # A record still queued has its text in _WRITTEN_RECORDS, which rank 0
+    # gathers and pack_finished_run() writes into the pack: writing the file
+    # first only for the pack to unlink it was most of a backlog of up to
+    # 400 jobs a rank behind a Lustre slower than ~0.5s a create (round 234).
+    for future in _RECORD_WRITES:
+        if future.kind == "record":
+            future.cancel()
+    _RECORD_WRITES[:] = [future for future in _RECORD_WRITES if not future.cancelled()]
     drain_record_writes(flush_held=False)
+    backlog = (queued, time.monotonic() - started, dict(_WRITER_SECONDS))
     try:
         from mpi4py import MPI
 
@@ -1689,6 +1701,15 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     if comm is not None:
         comm.Barrier()  # apart from the gather, so post_run_line() tells the two apart
     started = post_run_phase("drain", started)
+    backlogs = comm.gather(backlog, root=0) if comm is not None else [backlog]
+    if backlogs:
+        kinds = [kind for queued, _, _ in backlogs for kind in queued]
+        POST_RUN_BACKLOG.update({kind: kinds.count(kind) for kind in sorted(set(kinds))},
+                                queued_max=max(len(q) for q, _, _ in backlogs),
+                                writer_max_s=max(s for _, s, _ in backlogs))
+        busy = [spent for _, _, spent in backlogs]
+        POST_RUN_BACKLOG.update({f"{kind}_s": sum(b.get(kind, 0.0) for b in busy)
+                                 for kind in sorted({k for b in busy for k in b})})
     # Each rank parses its own records, in parallel, and hands them to rank 0,
     # which reads from Lustre only what an earlier segment of a resumed run
     # wrote: re-reading 43k metrics.json files took it 7.5s (round 52). The
@@ -1717,6 +1738,8 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
 # which `./ri bench` never sees (its wall is the evaluation span) and which
 # grows with the evaluation count: 13.5% of a production run in round 51.
 POST_RUN_SECONDS: dict[str, float] = {}
+# Rank 0's view of every rank's record-writer backlog when the run ended.
+POST_RUN_BACKLOG: dict[str, float] = {}
 
 
 def post_run_phase(name: str, started: float) -> float:
@@ -1726,7 +1749,16 @@ def post_run_phase(name: str, started: float) -> float:
 
 
 def post_run_line() -> str:
-    return "post-run seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in POST_RUN_SECONDS.items())
+    line = "post-run seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in POST_RUN_SECONDS.items())
+    if POST_RUN_BACKLOG:
+        backlog = dict(POST_RUN_BACKLOG)
+        line += "; slowest rank's drain {:.1f}, most queued on one rank {:.0f}".format(
+            backlog.pop("writer_max_s"), backlog.pop("queued_max"))
+        line += "".join(f", {kind} {count:.0f}" for kind, count in backlog.items()
+                        if not kind.endswith("_s"))
+        line += "; writer seconds, all ranks: " + ", ".join(
+            f"{kind[:-2]} {spent:.0f}" for kind, spent in backlog.items() if kind.endswith("_s"))
+    return line
 
 
 def adopt_completed_evaluations(
@@ -1946,6 +1978,22 @@ def self_check_resume_adoption() -> None:
         assert sorted(p.name for p in evaluations_dir.iterdir()) == [
             "eval-0001-abc", "eval-0006-pqr", RECORD_PACK]
         assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6, 7]
+        # A record still queued when the run ends goes into the pack, never
+        # to its own file (round 234).
+        import threading
+
+        _WRITTEN_RECORDS.clear()
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        queued = evaluations_dir / "eval-0008-vwx"
+        write_evaluation_record(queued, {"eval_id": 8, "params": {"a": 8}, "objective": 0.3})
+        threading.Timer(0.5, gate.set).start()
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8]
+        assert not flat_record_path(queued).exists(), "a queued record was written"
+        assert pack_finished_run(evaluations_dir) == 1
+        assert load_evaluations_from_dir(evaluations_dir) == records
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -2595,7 +2643,8 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         # ~0.2s, and the rank sat idle through it: ~2% of a 36-rank search
         # (docs/csd3-speed.md, round 95).
         publish_evaluation_scratch(eval_dir, record, kept, defer=(
-            _submit_record_job if _RECORD_WRITER is not None else None))
+            (lambda job: _submit_record_job(job, "publish"))
+            if _RECORD_WRITER is not None else None))
     flush_held_evaluations()
     text = _json_text(record)
     _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
@@ -2606,11 +2655,21 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     return record
 
 
-def _submit_record_job(job: Any) -> None:
+def _submit_record_job(job: Any, kind: str = "record") -> None:
     for done in [future for future in _RECORD_WRITES if future.done()]:
         _RECORD_WRITES.remove(done)
         done.result()  # a failed write raises here, on the rank's own thread
-    _RECORD_WRITES.append(_RECORD_WRITER.submit(job))
+    future = _RECORD_WRITER.submit(_timed_record_job, job, kind)
+    future.kind = kind
+    _RECORD_WRITES.append(future)
+
+
+def _timed_record_job(job: Any, kind: str) -> None:
+    started = time.monotonic()
+    try:
+        job()
+    finally:
+        _WRITER_SECONDS[kind] = _WRITER_SECONDS.get(kind, 0.0) + time.monotonic() - started
 
 
 def _write_record(path: Path, text: str) -> None:
@@ -2624,6 +2683,8 @@ _RECORD_WRITER: Any = None
 _RECORD_WRITES: list[Any] = []
 # Every record this process wrote, by eval dir, for finished_run_records().
 _WRITTEN_RECORDS: dict[str, str] = {}
+# Seconds this rank's writer spent on each kind of job, for post_run_line().
+_WRITER_SECONDS: dict[str, float] = {}
 
 
 # The writer must not share the rank's pinned CPU. Every mkdir in evaluations/
@@ -2739,7 +2800,7 @@ def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
             # record writer, after its own move there. On the rank's thread a
             # Lustre metadata stall froze every rank at once for 15-48s,
             # ~19% of a 1,500-dead search (docs/csd3-speed.md, round 232).
-            _defer_lustre(lambda path=eval_dir.parent / name: _strip_to_record(path))
+            _defer_lustre(lambda path=eval_dir.parent / name: _strip_to_record(path), "strip")
     if key in evicted:
         for image_key in RETAINED_IMAGE_KEYS:
             (record.get("paths") or {}).pop(image_key, None)
@@ -2794,8 +2855,8 @@ def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) ->
             continue
         # The periodic flush is the record writer's (round 232); a forced
         # one is the end of a run, whose readers need the files there.
-        (_defer_lustre if not force else (lambda job: job()))(
-            lambda held=held, eval_dir=eval_dir: _publish_held(held, eval_dir))
+        (_defer_lustre if not force else (lambda job, kind: job()))(
+            lambda held=held, eval_dir=eval_dir: _publish_held(held, eval_dir), "held")
     _HELD.clear()
     _HELD_SINCE = None
 
@@ -2809,12 +2870,12 @@ def _publish_held(held: Path, eval_dir: Path) -> None:
     held.rmdir()
 
 
-def _defer_lustre(job: Any) -> None:
+def _defer_lustre(job: Any, kind: str) -> None:
     """Run a Lustre job on the record writer if there is one, else now."""
     if _RECORD_WRITER is None:
         job()
     else:
-        _submit_record_job(job)
+        _submit_record_job(job, kind)
 
 
 def self_check_streaming_retention() -> None:
