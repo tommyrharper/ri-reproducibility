@@ -15296,3 +15296,31 @@ saving there; only a 2-node raced A/B would say.
 Stage row `r316-chain-cost` in `benchmarks.jsonl`; bench rows `r316-a0`
 and `r316-a1`. The run directories, the sandbox and `/dev/shm/r316` are
 deleted.
+
+## Round 317 (diagnostic + tooling): R2D2's early stop, not the node, slows a search mid-run
+
+Four converged production searches (rounds 239, 278, 300, 313; per-eval
+timings in their `.probe/*/summary.json.gz`) all lose 10-20% of evals/s
+part-way through. The R2D2 request goes from ~685 to ~780 ms around the
+fifth tenth of the run (objective 0.020 -> 0.024). Round 300's quiet
+own-job node does it too, so it is not neighbour load. The parameters
+explain little of the request time (R^2 0.08, `.probe/r317/cause.py`), but
+image content does: the lowest-peak quintile runs in ~300 ms against
+600-740 ms. The cause is upstream R2D2's `prune: True` stop criterion: a
+request runs 1-25 U-Net iterations depending on its residual.
+
+Each evaluation record now carries `timing.r2d2_iterations` (a count of
+the `RDR:` lines upstream prints, read from the tmpfs stdout log), and
+`./ri bench` rows carry its mean as `r2d2_iterations`. A 550-dead probe
+(bench row `r317-iters`, 44.9 evals/s on a load-30 node) fits request ms =
+168.9 + 33.3 x iterations (R^2 0.60), with a mean of 18.4 iterations and
+37% at the 25 cap. Its mean stays at ~18.5 over its 330 s, which ends
+before the mid-run step. Partial log(Z) 0.0164430991567243 +/-
+0.000958443752992411 (ndead 550, nlike 13508).
+
+What follows from this: the cost per request is set by the results, so it
+is not a speed lever. Short bench arms sit in the cheap early phase and
+overstate a converged search's evals/s by ~10-15%, and arms at different
+phases should be compared per iteration. A converged run to confirm that
+the mid-run step is the iteration count was started and then stopped at the
+iteration limit. That is next round's job.

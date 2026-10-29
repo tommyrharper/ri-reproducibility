@@ -216,6 +216,16 @@ def first_request(records: Any) -> float | None:
     return statistics.median(end - start for start, end in starts if start - first < 1.0)
 
 
+def mean_r2d2_iterations(records: Any) -> float | None:
+    """Mean U-Net forwards per R2D2 request. R2D2 stops its series early on
+    the residual, so a request's cost goes as ~170 + 33 ms per iteration and
+    the mean rises ~10-20% as a search climbs (round 317): arms at different
+    phases differ in this, not in speed."""
+    counts = [record["timing"]["r2d2_iterations"] for record in records or ()
+              if isinstance(record, dict) and (record.get("timing") or {}).get("r2d2_iterations")]
+    return sum(counts) / len(counts) if counts else None
+
+
 def row_for(run_dir: Path) -> dict[str, Any] | None:
     """One ledger row for a finished run, or None with a reason on stderr.
 
@@ -261,6 +271,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     gaps = start_gaps(summary.get("evaluations", []))
     steady = gaps and gaps[2] - gaps[0] - gaps[1]
     first = first_request(summary.get("evaluations", []))
+    iterations = mean_r2d2_iterations(summary.get("evaluations", []))
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -285,6 +296,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "first_request_s": round(first, 2) if first is not None else None,
         "steady_evals_per_s": round(evals / steady, 4) if steady and steady > 0 else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
+        "r2d2_iterations": round(iterations, 3) if iterations else None,
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -573,6 +585,7 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
     row_for_path("busy wall s", ("busy_wall_s",))
     row_for_path("idle fraction", ("idle_fraction",))
     row_for_path("peak memory MB", ("peak_memory_mb",))
+    row_for_path("R2D2 iterations", ("r2d2_iterations",))
     stages: list[str] = []
     for row in rows:
         stages += [key for key in row.get("stages_ms", {}) if key not in stages]
@@ -646,6 +659,9 @@ def self_check() -> None:
 
     assert series([{"stages_ms": {"simulate": 3.0}}], ("stages_ms", "simulate")) == [3.0]
     assert series([{"stages_ms": {}}], ("stages_ms", "simulate")) == []
+    assert mean_r2d2_iterations([{"timing": {"r2d2_iterations": 25}}, {"timing": {"r2d2_iterations": 9}},
+                                 {"timing": {}}, {"objective": 0.0}]) == 17.0
+    assert mean_r2d2_iterations([]) is None
     assert series([{"ms_per_eval": None}], ("ms_per_eval",)) == []
 
     defined = presets()

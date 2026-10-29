@@ -102,6 +102,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def r2d2_iterations(stdout_path: Path) -> int | None:
+    """U-Net forwards this request ran: upstream prints one `RDR:` line per
+    iteration, and `prune: True` stops the series early on the residual, so the
+    count (1-25) follows the image and drifts with the search (round 317)."""
+    try:
+        text = stdout_path.read_text(errors="replace")
+    except OSError:
+        return None
+    return sum(line.startswith("RDR:") for line in text.splitlines()) or None
+
+
 def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> int:
     threads = r2d2_thread_count()
     lines = [
@@ -290,9 +301,21 @@ def evaluate(
             "simulate_seconds": simulate_seconds,
             "image_container_seconds": run_result.wall_seconds,
             "metrics_seconds": metrics_seconds,
+            "r2d2_iterations": r2d2_iterations(r2d2_stdout),
         },
     }
     return write_evaluation_record(eval_dir, record)
+
+
+def self_check_r2d2_iterations() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "r2d2.stdout.log"
+        assert r2d2_iterations(out) is None, "a missing log has no count"
+        out.write_text("RDR: 1.0e-01\nRDR rel. diff: 2.0e-01\nRDR: 8.0e-02\nRDR rel. diff: 2.0e-05\n"
+                       "Imaging finished in 2/25 iterations in 0.5 sec, \n")
+        assert r2d2_iterations(out) == 2, r2d2_iterations(out)
 
 
 def self_check_r2d2_config_thread_cap() -> None:
@@ -750,6 +773,7 @@ if __name__ == "__main__":
         self_check_spectral_window()
         self_check_lazy_numpy()
         self_check_r2d2_config_thread_cap()
+        self_check_r2d2_iterations()
         self_check_source_offset()
         self_check_profiling()
         self_check_evidence_record()
