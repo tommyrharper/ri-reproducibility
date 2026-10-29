@@ -11720,3 +11720,89 @@ Rows: `r239-bigrun` (bench) and stage row `r239-validation` (full
 precision log(Z)) in `benchmarks.jsonl`. `.probe/r239/` keeps the
 script, the profile, `.stats`, and gzipped `summary.json` and log. The run
 directory is deleted.
+
+## Round 240 (opt-in, no speed gain): records appended to the pack, not one flat file each
+
+**Question.** Round 239 found the per-rank record writers saturated for a
+whole production run on loaded RDS (create + write + rename per record),
+leaving ~half a run's records only in rank memory until the final pack.
+Does appending each record line to `evaluations/records.jsonl` instead
+close that gap, and what does it do to speed?
+
+**Also seen first.** In a cold-start probe (`.probe/r240/arm.sh`, the
+round 228 worker-side cold first request, which did not reproduce: first
+request 5.7 s) a 32 s, 39-rank R2D2 search spent 26.7 s in the post-run
+drain. Its writers spent 749 s on 888 records, so on a loaded Lustre the
+drain still waits on whichever write is running. The bench wall does not see
+this.
+
+**Change** (`common.py`, `NS_RECORD_APPEND=1`, default off): the run's
+background writer appends `name<TAB>json` to the pack through one O_APPEND
+descriptor per rank under a shared `flock`. Pack writers keep the exclusive
+lock, and now truncate only when there is a torn tail, so a killed rank's
+half line is cut by the next pack (resume) rather than run on into.
+`pack_flat_records` returns before taking the lock when there are no flat
+records. Without that, the 15 s packer held the exclusive lock every pass
+while it listed the dir and read the whole pack, and every append waited.
+The async WSClean arms below ran that draft. Readers needed no change: the
+pack was already read everywhere, last line per name wins, a torn tail is
+ignored, and `sort -u` dedupes names. New self-check block in
+`self_check_resume_adoption`.
+
+**Microbenchmark** (`.probe/r240/mb.py`, 38 processes x 100 records of 4 KB
+on RDS, 20 ms apart):
+
+| | median | p99 | worst |
+| --- | ---: | ---: | ---: |
+| flat create + write + rename | 1.5-2.1 ms | 12.6-1,176 ms | 0.04-1.19 s |
+| append under shared flock | 0.14-0.24 ms | 0.5-1.8 ms | <0.01 s |
+| append, no lock | 0.04 ms | 0.3-0.9 ms | <0.01 s |
+
+All 3,800 lines came out whole each time.
+
+**A/B** (raced, same tree, `NS_RECORD_APPEND` toggled, `.probe/r240/ab.sh`):
+
+| | WSClean sync (seed 229, nlive 100, 19 CPUs) | R2D2 sync pair 1 (seed 240, nlive 48, 20 ranks / 19 CPUs) | R2D2 pair 2, CPU halves swapped |
+| --- | ---: | ---: | ---: |
+| evals/s, flat / append | 27.48 / 27.53 (steady 37.44 / 37.55) | 13.47 / **13.06** | 13.42 / **13.29** |
+| request, flat / append | 100.4 / 100.3 ms | 615 / 615 ms | 630 / 631 ms |
+| records queued at the end, flat / append | 2,448 / 769 | 1,533 / 136 | 850 / 445 |
+| record writer-s, all ranks | 2,523 / 1,631 | 9,530 / 1,816 | 8,778 / 2,585 |
+| publish writer-s, all ranks | 62 / 205 | 223 / 861 | 160 / 479 |
+| chains | bit-identical | bit-identical | bit-identical (and = pair 1) |
+| log(Z) | 0.0967023094179472 +/- 0.000520957293962581 both | 0.0178076426814691 +/- 0.000612615118847292 all four | |
+| files left | 497 / 497 | 630 / 630 | 630 / 630 |
+
+**Results.**
+- It does what it was for: records still in memory at the end fall 3x in
+  WSClean and 2-11x in R2D2, and record writer time falls 3-5x.
+- It gains no speed. R2D2 was slower in both pairs (-3.1%, -1.0%) with
+  identical request times, inside the ~5% control span but the same sign
+  twice. A likely cause, not proven: a writer no longer stuck on creates
+  reaches publishes of held extremes that round 235 would have cancelled
+  once they were evicted. Publish writer-s rose 2-4x, which means Lustre
+  copies and CPU on the ranks' own CPUs.
+- The pack carries more lines (6,516 against 5,483 for 4,071 records in
+  WSClean). None is an identical repeat: they are later edits of a record
+  (paths), which the flat layout overwrote in place. This costs bytes, not
+  inodes.
+- Even an append job takes ~0.4 s of writer wall in-run against 0.2 ms
+  solo, so the writer thread's latency is waiting for a CPU or the GIL on
+  a busy rank, not Lustre. Writer-seconds overstate Lustre cost in every
+  round that quotes them.
+- The default path (flat, `NS_RECORD_APPEND=0`) differs from `9432fd5`
+  only by the packer's early return and the conditional truncate. The sync
+  WSClean flat arm reproduced round 236's log(Z) exactly.
+
+**Decision.** Opt-in (`NS_RECORD_APPEND=1`), for runs where a mid-search
+kill losing ~half the records matters more than 1-3%. The next test is
+an async production-shaped search with it on, which would show both the
+real in-memory gap and whether the publish effect holds when it is not
+synchronous. A version that stops publishing held extremes until the end
+(as round 235 already does for the evicted ones) would take away the
+suspected cost.
+
+Rows: stage row `r240-record-append`. Bench rows `r240-c1`, `r240-wflat`,
+`r240-wapp` (async, earlier draft), `r240-sflat`, `r240-sapp`,
+`r240-rflat`, `r240-rapp`, `r240-rflat2` and `r240-rapp2`. All run directories
+are deleted. Logs (gzipped) and scripts are in `.probe/r240/`.

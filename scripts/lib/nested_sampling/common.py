@@ -1305,9 +1305,12 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
             # Not on disk at all: a record write the finish cancelled.
             if name in moving or text != texts.get(name):
                 lines[name] = text  # the last line of a name is its record
+        # A torn last line from a killed packer, or a killed rank's append,
+        # which the next append would otherwise run on into.
+        if whole < os.fstat(pack.fileno()).st_size:
+            pack.truncate(whole)
         if not lines:
             return 0
-        pack.truncate(whole)  # a torn last line from a killed packer
         pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
         pack.flush()
         os.fsync(pack.fileno())
@@ -1342,6 +1345,10 @@ def pack_flat_records(evaluations_dir: Path) -> int:
 
     flat = [path for path in evaluation_record_paths(evaluations_dir).values()
             if path.parent == evaluations_dir]
+    if not flat:
+        # A run appending its records (round 240): no pass may hold the pack's
+        # lock, which every rank's next append then waits on, for nothing.
+        return 0
     with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
         records = dict(zip((path.name.removesuffix(RECORD_SUFFIX) for path in flat),
                            pool.map(read_evaluation_record, flat)))
@@ -2004,6 +2011,30 @@ def self_check_resume_adoption() -> None:
         assert not flat_record_path(queued).exists(), "a queued record was written"
         assert pack_finished_run(evaluations_dir) == 1
         assert load_evaluations_from_dir(evaluations_dir) == records
+        # A run's writer appends its records to the pack, never a flat file,
+        # and the finish then has nothing to add (round 240). A torn last
+        # line - a rank killed mid-append - is cut by the next pack writer,
+        # so the next append does not run on into it.
+        _WRITTEN_RECORDS.clear()
+        os.environ["NS_RECORD_APPEND"] = "1"
+        write_records_in_background()
+        appended = evaluations_dir / "eval-0010-yza"
+        write_evaluation_record(appended, {"eval_id": 10, "params": {"a": 10}, "objective": 0.4})
+        drain_record_writes()
+        assert not flat_record_path(appended).exists(), "an appended record was written flat"
+        assert json.loads(packed_record_texts(evaluations_dir)[appended.name])["eval_id"] == 10
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 10]
+        assert pack_finished_run(evaluations_dir) == 0, "the finish re-appended an appended record"
+        with open(evaluations_dir / RECORD_PACK, "a") as pack:
+            pack.write('eval-0011-bcd\t{"eval_id": 11, "par')
+        assert pack_evaluation_records(evaluations_dir, {}) == 0
+        write_records_in_background()
+        write_evaluation_record(evaluations_dir / "eval-0012-efg",
+                                {"eval_id": 12, "params": {"a": 12}, "objective": 0.6})
+        drain_record_writes()
+        os.environ.pop("NS_RECORD_APPEND")
+        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)][-1] == 12
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -2663,6 +2694,9 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
     _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
     if _RECORD_WRITER is None:
         _write_record(flat_record_path(eval_dir), text)
+    elif os.environ.get("NS_RECORD_APPEND", "0") == "1":
+        line = f"{eval_dir.name}\t{json.dumps(record)}\n".encode()
+        _submit_record_job(lambda: _append_record(eval_dir.parent, line))
     else:
         _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
     return record
@@ -2688,6 +2722,34 @@ def _timed_record_job(job: Any, kind: str) -> None:
 
 def _write_record(path: Path, text: str) -> None:
     _write_text_atomic(path, text)
+
+
+# NS_RECORD_APPEND=1: a run's writer appends each record to the pack instead
+# of creating a flat file - one write on a descriptor held open, against a
+# create and a rename in the evaluations dir (on RDS, 38 processes: 0.15-0.24
+# against 1.9-2.1 ms, worst 0.01 against 1.2 s). It cuts the records a run
+# holds only in memory 3-11x (round 239's durability gap) at no speed gain:
+# R2D2 -3.1% and -1.0% in two swapped pairs, WSClean +0.2% (round 240), so it
+# is opt-in. O_APPEND keeps concurrent lines whole; the shared lock keeps them
+# out of a pack writer's truncate of a torn last line, which takes it
+# exclusively.
+_PACK_FDS: dict[str, int] = {}
+
+
+def _append_record(evaluations_dir: Path, line: bytes) -> None:
+    import fcntl
+
+    fd = _PACK_FDS.get(str(evaluations_dir))
+    if fd is None:
+        fd = os.open(evaluations_dir / RECORD_PACK, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        _PACK_FDS[str(evaluations_dir)] = fd
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        written = os.write(fd, line)
+        if written != len(line):
+            raise OSError(f"short append to {evaluations_dir / RECORD_PACK}: {written} of {len(line)} bytes")
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 # A record write (create, write, rename) costs ~50ms on CSD3's Lustre, a fifth
@@ -3009,7 +3071,7 @@ def self_check_streaming_retention() -> None:
                     else:
                         # Stripped to its record, which is beside the dir: no dir.
                         assert not (evaluations / key).exists(), key
-                    written = json.loads(flat_record_path(evaluations / key).read_text())
+                    written = _record_reader(evaluations)[1](key)  # flat or appended
                     assert written["objective"] == objectives[key], (key, written)
 
                 if scratch_root:
@@ -3082,8 +3144,9 @@ def self_check_streaming_retention() -> None:
                 if background:
                     # A write that fails in the background still fails the run.
                     write_records_in_background()
-                    blocked = evaluations / "eval-blocked"
+                    blocked = evaluations / "blocked" / "eval-blocked"
                     flat_record_path(blocked).with_name(blocked.name + ".json.partial").mkdir(parents=True)
+                    (blocked.parent / RECORD_PACK).mkdir()  # and the append's
                     write_evaluation_record(blocked, {"objective": 1.0})
                     try:
                         drain_record_writes()
