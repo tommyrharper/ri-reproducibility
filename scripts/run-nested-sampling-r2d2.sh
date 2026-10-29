@@ -316,6 +316,10 @@ case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
     ;;
   *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;
 esac
+# R2D2_OMP_THREADS and R2D2_MAX_THREADS are set above, not exported: without
+# them the pool builds no shared weights (patch_onnx_network), so a request on
+# more than one thread ran torch, not ONNX Runtime - 19 x 2 at 25 against
+# 40-43 steady evals/s (docs/csd3-speed.md, round 273).
 sidecar_launch "${R2D2_SIF}" \
   ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
   --env R2D2_DEVICE="${R2D2_DEVICE}" \
@@ -325,6 +329,8 @@ sidecar_launch "${R2D2_SIF}" \
   --env MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
   --env OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
   --env R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}" \
+  --env R2D2_OMP_THREADS="${R2D2_OMP_THREADS}" \
+  --env R2D2_MAX_THREADS="${R2D2_MAX_THREADS}" \
   --env R2D2_INTERLEAVE_WEIGHTS="${R2D2_INTERLEAVE_WEIGHTS:-1}" \
   --env R2D2_NUMPY_WEIGHTS="${R2D2_NUMPY_WEIGHTS:-1}" \
   --env R2D2_FAST_IO="${R2D2_FAST_IO:-1}" \

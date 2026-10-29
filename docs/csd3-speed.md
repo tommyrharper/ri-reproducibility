@@ -13468,3 +13468,91 @@ Rows: bench `r272-a`, `r272-{old,new}{1,2,3}`, `r272-{cold,cnew}{1,2}` and
 stage `r272-pool-warmup` in `benchmarks.jsonl`. The run dirs and the HEAD
 worktree are deleted. Scripts and gzipped logs are in `.probe/r272/`. Round
 243's ampere job 39544674 still has no output file in `.probe/r243/`.
+
+## Round 273 (fix): the R2D2 pool never saw its thread settings, so multi-thread requests ran torch
+
+**Question.** Round 272 left the worker's ~4-5 s first request (against
+0.35-0.8 s steady) as the next start-up lever. Where does it go?
+
+**First request, split** (one 38-rank search at HEAD, nlive 48, 5 repeats,
+60 dead, seed 273; a temporary cProfile and timestamps in `r2d2_serve.py`,
+reverted). Times are from the first evaluation's start:
+
+| event | s |
+| --- | ---: |
+| run script start (`./ri search`) | -4.1 |
+| R2D2 pool launched / pool's `serve_pool` starts | -2.13 / -1.75 |
+| mpirun starts | -1.77 |
+| first simulate done (median) | 0.97 |
+| pool warm-up done | 4.09-4.38 |
+| workers open their FIFOs (median) | 4.35-4.67 |
+| first wave done (median) | 5.3-5.6 |
+
+The pool's warm-up (imports 3.05 s, `load_checkpoints` 0.60 s,
+`patch_onnx_network` 2.15 s) is on the critical path: every rank finishes its
+first simulate at ~1 s and then waits ~3.3 s for its worker. That corrects
+round 272, which read the first wave as bound by the workers' own requests.
+Inside the worker, the imager's first request takes 0.97 s (median of 39)
+against 0.71 s and 0.63 s for the second and third, of which 0.30 s is
+`create_net_imaging` building the torch U-Net once.
+
+**Two shorter warm-ups that do not work.**
+- Building the ORT sessions on a thread while the main thread imports
+  (`.probe/r273/overlap.py`): the session builds hold the GIL, so the imports
+  go from 2.5 to 5.4 s. Total warm-up 8.7-9.1 s -> 7.7-7.9 s in a probe, only ~1 s.
+- Round 272's `sessions-from-parts.diff` does not change
+  `patch_onnx_network` in a search (2.11-2.15 s against 2.08-2.12 s, 3 + 2
+  arms). That is what led to the bug below.
+
+**The bug.** The pool's environment had `R2D2_OMP_THREADS=None` and
+`R2D2_MAX_THREADS=None`. The run script sets both but does not export them,
+and passes them to the ranks (`RUN_COMMAND`) but not to the pool's
+`sidecar_launch`. So `patch_onnx_network`'s `threaded` was always False:
+no `ort_shared_parts`, `threaded_session` returned None, and every request on
+more than one thread fell back to torch. Round 258's A/B passed
+`R2D2_OMP_THREADS=2` on the command line, which the pool did inherit; a layout
+that the script works out itself (`--mpi-procs 19` on 38 CPUs gives 2 threads)
+or an async tail (`R2D2_MAX_THREADS` 16) never did. Fix: `--env` both into
+the pool.
+
+**A/B** (interleaved against HEAD in a `/dev/shm` worktree, 38 CPUs, nlive 48,
+5 repeats, 150 dead, seed 273):
+
+| arm | layout | evals/s | steady | first request s | median request s | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| h1 (HEAD) | 19 x 2 | 25.51 | 25.51 | 5.74 | 0.635 | 0.0153575051337603 +/- 0.00255244 |
+| n1 (fix) | 19 x 2 | 34.35 | 40.33 | 8.63 | 0.420 | 0.0152459644779766 +/- 0.00245233 |
+| n2 (fix) | 19 x 2 | 37.19 | 43.04 | 8.48 | 0.384 | 0.0152855813971252 +/- 0.00255202 |
+| h2 (HEAD) | 19 x 2 | 25.19 | 25.20 | 5.79 | 0.651 | 0.0153079992492334 +/- 0.00226731 |
+| dn1 (fix) | 39 x 1 | 38.80 | 48.72 | 8.43 | 0.698 | 0.0140892842851275 +/- 0.00365477 |
+| dh1 (HEAD) | 39 x 1 | 42.23 | 42.26 | 5.42 | 0.666 | 0.0136061405528414 +/- 0.00388110 |
+| dh2 (HEAD) | 39 x 1 | 42.06 | 42.12 | 5.25 | 0.696 | 0.0133676241604217 +/- 0.00420792 |
+| dn2 (fix) | 39 x 1 | 39.42 | 49.59 | 8.08 | 0.666 | 0.0138439591513837 +/- 0.00380437 |
+
+**Learned.**
+- 19 x 2 gains +65% in steady evals/s (+42% end to end in these 1-minute
+  arms). Its 2-thread requests now run ONNX Runtime, so their outputs move
+  from torch's to ORT's (within round 144's 1.5e-5 of the peak). log(Z)
+  agrees (0.01525-0.01529 against 0.01531-0.01536, sigma ~0.0025).
+- The default 39 x 1 async layout runs the same per request (median
+  0.67-0.70 s in both arms). Its first request is ~3 s longer (8.1-8.4 s
+  against 5.3-5.4 s) because the pool now builds the ~2.9 GB of shared arrays.
+  That is -7% on these 35 s arms and ~0.2% of a 25-minute run. In exchange,
+  the async tail's multi-thread requests run ORT, not torch, so a request's
+  output no longer depends on how many threads it was given. Its steady
+  figure here (48.7/49.6 against 42.1/42.3) is bench's start-up cut opening
+  a gap for the longer start, not a gain.
+- The next lever is getting that ~3 s back. Round 272's diff (1-thread
+  sessions over the shared arrays, arrays on 8 threads) now applies, since
+  `threaded` is True in a search: standalone it took `patch_onnx_network`
+  from 5.1 to 2.35 s. It needs a search A/B now that the pool really builds
+  the arrays.
+- 19 x 2 at 40-43 steady is still below 39 x 1's ~42-45 in the same
+  allocation, so the default layout stays.
+
+Rows: bench `r273-{h,n,dh,dn}{1,2}` (HEAD rows copied back from the `/dev/shm`
+worktree), the instrumented first-wave runs `r273-a`, `r273-prof`,
+`r273-t{1..4}` and `r273-tl-*`, and stage `r273-pool-thread-env`, all in
+`benchmarks.jsonl`. The run dirs and the HEAD worktree are deleted. Probes
+are in `.probe/r273/`. Change is R2D2-only (`run-nested-sampling-r2d2.sh`),
+so no WSClean guard is needed.
