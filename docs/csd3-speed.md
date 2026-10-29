@@ -14466,3 +14466,39 @@ both writers, then `NS_RECORD_BATCH=1` as the default if batch loses no more
 than the default does (WSClean guard needed, since `common.py` is shared).
 Full-precision log(Z) for every arm is in the `r297-batch` row of
 `benchmarks.jsonl`.
+
+## Round 298 (default): batched record appends; the scratch fix proven end to end
+
+Round 297 left two things open: a kill test at a fixed evaluation count for
+both record writers, and an end-to-end check of the stale-scratch fix. Job
+39649817 (cpu-q-589/590, `--nodes 2 --nlive 320 --num-repeats 15 --seed 298
+--max-ndead 400`) started each search, waited until the log had printed at
+least 3,000 scored evaluations, killed every process on both nodes with
+kill -9, then ran `./ri resume` in the same job.
+
+| arm | killed at | printed at kill | on disk | stale `.held/` dirs (node 1 / 2) | resume | log(Z) |
+| --- | --- | --- | --- | --- | --- | --- |
+| k0, `NS_RECORD_BATCH=0` | 128 s | 3,006 | 3,011 | 1,381 / 1,505 | exit 0, 130 s | 0.016014 ± 0.00136 |
+| k1, `NS_RECORD_BATCH=1` | 53 s | 3,061 | 3,079 | 1,422 / 1,493 | exit 0, 136 s | 0.016065 ± 0.00131 |
+
+- Neither writer lost a record. The packs held more lines than the log had
+  printed, because the log lags. Lustre was quiet in this job, so the kill
+  did not test round 297's loaded case. There, batching left 8-15x fewer
+  records queued.
+- Both resumes ran over thousands of the killed attempt's held scratch
+  directories on each node and finished. That is the collision that killed
+  round 297's resume, so the fix in `run-nested-sampling-r2d2.sh` is now
+  proven end to end. The two log(Z) values agree within 0.03σ.
+- The kill times differ (128 s against 53 s) because the first search
+  warmed each node's caches. That is why the kill waits for a count and not
+  a time.
+- WSClean guard (cpu-q-140, the same tree with `NS_RECORD_BATCH` 0 against
+  1, raced on swapped halves): 26.7/34.7 evals/s against 26.8/34.7, and
+  log(Z) 0.0967023 ± 0.00052 with nlike 4,004 in all four arms.
+
+What ships: `NS_RECORD_BATCH=1` is the default (`common.py`), and
+`NS_RECORD_BATCH=0` brings back one record job per record. The evidence is
+round 297 (no evals/s cost, an order of magnitude smaller backlog under
+load) plus this round (no extra kill loss, a flat WSClean guard). The
+host-runnable self-checks and `test_watchdogs.py` pass. Full-precision log(Z)
+is in the `r298-kill` row of `benchmarks.jsonl`.

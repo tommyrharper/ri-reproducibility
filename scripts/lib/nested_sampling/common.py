@@ -2897,7 +2897,7 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         if os.environ.get("NS_RECORD_INLINE") == "1" and all(
                 future.done() for future in _RECORD_WRITES):
             _timed_record_job(lambda: _append_record(eval_dir.parent, line), "record")
-        elif os.environ.get("NS_RECORD_BATCH", "0") != "1":
+        elif os.environ.get("NS_RECORD_BATCH", "1") == "0":
             _submit_record_job(lambda: _append_record(eval_dir.parent, line))
         else:
             publish = published[0] if published else None
@@ -2944,9 +2944,10 @@ def _write_pending_records() -> None:
 # on one node (round 296). NS_RECORD_BATCH=1 has a record job append every
 # line queued when it runs, in one write - up to the first whose detail is
 # still to publish, which its own job, queued behind that publish, appends.
-# On 2 nodes it cut the backlog at the finish 1,350-1,871 -> 105-131, but
-# steady evals/s read 83.5/87.9 against 90.0/100.2, so it is opt-in until a
-# longer A/B settles that (round 296).
+# It costs no steady evals/s on 2 nodes (102.3 vs 102.0, ~7 min ABBA arms)
+# and leaves 8-15x fewer records queued at the finish (round 297), and a
+# kill -9 loses no more than the old writer (round 298), so it is the
+# default; NS_RECORD_BATCH=0 queues one job per record.
 _PENDING_LINES: list[tuple[Path, bytes, Any]] = []
 
 
