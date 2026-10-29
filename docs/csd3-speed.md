@@ -16,6 +16,9 @@ the Hetzner host.
   On half an icelake node (39 ranks) today's default converges in **23
   minutes** at 48.1 evals/s, log(Z) 0.01733 +/- 0.00041, within 0.9 sigma of
   22 Sep and round 115 ([round 195](#round-195-validation-the-22-sep-production-search-on-half-an-icelake-node-23-minutes)).
+  On a whole exclusive sapphire node, a default `./ri search` (113 ranks)
+  converges in **11 minutes of search** at 147.5 steady evals/s, log(Z)
+  within 0.74 sigma of round 239 ([round 255](#round-255-validation-todays-defaults-on-a-whole-sapphire-node-1475-evalss)).
   Simulate (MeqTrees) went from 39% of worker time to 3.8%, idle from
   11.5% to 0.05%. A whole sapphire node (112 ranks x 1, one checkpoint
   copy per socket, rounds 105-106) runs 103.5 evals/s. The request is now
@@ -12442,8 +12445,60 @@ root-block fixes of rounds 186, 227 and 232) and round 252's 58.8 steady
 evals/s on 38 split icelake CPUs. A later round reads the job's
 `summary.json` and bench row, copies log(Z) at full precision, and deletes
 the run dir.
+Read in [round 255](#round-255-validation-todays-defaults-on-a-whole-sapphire-node-1475-evalss): 147.5 steady evals/s, log(Z) agrees.
 
 **Slurm hygiene.** The `--test-only` probes and the submission were three
 calls in ~3 minutes. The last came 22 s after the one before it, which breaks
 the two-minute rule: leave the full gap even for `--test-only`. Two jobs of
 this account are pending (39544674 and 39560906), the limit.
+
+## Round 255 (validation): today's defaults on a whole sapphire node, 147.5 evals/s
+
+**Question.** Rounds 150-253 were measured on half or whole icelake nodes,
+or in short sapphire searches. What does a user's default whole-node
+submission do on sapphire, the production partition, in the production
+search, and does log(Z) agree?
+
+**Method.** Round 254 queued round 239's production command (seed 190182240,
+nlive 150, 15 repeats, async, to convergence) on `0b81364` through
+`ns_submit_run` with no `--mpi-procs` (`.probe/r254/submit.sh`). Job 39560906
+got an exclusive sapphire node (cpu-r-94) and ran 113 ranks x 1 thread
+(112 CPUs + round 186's root rank) with per-socket ORT sessions. It started
+~2h after submission and ran 06:03:40-06:15:21.
+
+| | round 115 (24 x 1 sapphire) | round 252 (38 icelake CPUs, split) | round 255 (whole sapphire) |
+| --- | ---: | ---: | ---: |
+| ranks | 24 | 38 | 113 |
+| evaluations | 65,420 | 82,504 | 92,553 |
+| search span | 2,459 s (wall) | 1,410.0 s | **654.8 s** |
+| steady evals/s | 26.6 (whole run) | 58.8 | **147.5** |
+| steady evals/s per CPU | 1.11 | 1.55 | 1.32 |
+| ms per evaluation | 858 | 630 | 787 |
+| startup | - | 7.8 s | 27.4 s |
+| post-run phases (pack) | - | ~15 s (4.3 s) | 31.0 s (18.2 s) |
+| peak memory | - | 13.0 GB | 16.1 GB |
+| log(Z) | 0.01683 +/- 0.00041 | 0.0172910867005174 +/- 0.000406752036020735 | 0.017813855940541 +/- 0.000371068139993459 |
+| ndead, nlike | 1,368, - | 1,461, 80,834 | 1,918, 87,360 |
+
+**Results.**
+- The production search converges in **11 minutes of search** (~11.7 min of
+  job) on one sapphire node, against round 115's 41 minutes on 24 sapphire
+  CPUs and the original 22 Sep run's 6h20m. Steady 147.5 evals/s is +26% on
+  round 150's 117 (a shorter nlive 200 / 5 repeats / 1000 dead shape before
+  rounds 186, 227 and 232's root rank, chains-on-tmpfs and root-block fixes).
+- log(Z) agrees with round 239 within 0.74 sigma and with round 252 within
+  0.95 sigma. ndead is higher (1,918 against ~1,470) because 112 async
+  workers return more points per iteration; the evidence is unaffected.
+- No stalls, 0 failures, 0 retries, 0 meqserver wedges, idle fraction 0.0001.
+- An evaluation costs 787 ms here against 630 on split icelake: per CPU a
+  full sapphire node is ~15% less productive than 19 + 19 icelake CPUs. The
+  U-Net request is 751 of the 787 ms, so this is the shared L3/memory
+  bandwidth of 56 single-thread sessions per socket, not the harness.
+- Fixed overhead is ~58 s of the ~700 s job (27.4 s start-up, 31 s post-run,
+  18.2 s of it `pack`), ~8%. In a longer, larger-nlive search it shrinks in
+  proportion; in short sapphire validations it is worth subtracting.
+
+No default changes. Rows: bench `r254-sapphire` (written by the job) and
+stage `r254-sapphire-validation` (full-precision log(Z) for rounds 239, 252
+and 255). `.probe/r254/` keeps the submit script, `run.env`, `.stats`,
+gzipped `summary.json`, job output and run log. The run directory is deleted.
