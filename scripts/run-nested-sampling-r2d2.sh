@@ -21,10 +21,16 @@ esac
 export R2D2_DEVICE
 # A CPU forward runs through ONNX Runtime unless R2D2_RUNTIME=torch: 33-44%
 # more evals/s, log(Z) within 0.25 sigma of torch's at convergence
-# (docs/csd3-speed.md, rounds 140-145). GPU runs keep torch. Set before
-# rank-budget.sh, which budgets onnx ranks larger.
-: "${R2D2_RUNTIME:=$([ "${R2D2_DEVICE}" = cpu ] && echo onnx || echo torch)}"
+# (docs/csd3-speed.md, rounds 140-145). A GPU forward runs through TensorRT,
+# all workers' engines in one server (R2D2_TRT_SHARED=1): the converged 22 Sep
+# search took 785 s against eager torch's 1,165 (90.8 against 64.2 evals/s),
+# log(Z) 0.06 sigma apart (round 215). Set before rank-budget.sh, which budgets
+# onnx ranks larger.
+: "${R2D2_RUNTIME:=$([ "${R2D2_DEVICE}" = cpu ] && echo onnx || echo trt)}"
 export R2D2_RUNTIME
+if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}" = cuda:trt ]; then
+  export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-1}"
+fi
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
@@ -60,6 +66,10 @@ if ns_should_submit; then
   export OUTPUT_DIR
   if [ "${R2D2_DEVICE}" = cuda ]; then
     NS_SLURM_GPUS=1
+  elif [ "${NS_MPI_PROCS:-0}" -ge 4 ]; then
+    # A sized CPU job spreads over both sockets, so the pool's per-socket
+    # copies switch on: +37% on sapphire (round 111), +26% on icelake (round 250).
+    export NS_SLURM_SOCKETS="${NS_SLURM_SOCKETS:-2}"
   fi
   NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
@@ -69,22 +79,47 @@ fi
 # job's own environment rather than the login node's (slurm.sh).
 export OUTPUT_DIR
 ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling-r2d2.sh
+# Every exec reads the image through squashfuse, and a cold node pages it in
+# off Lustre one fault at a time: a cold `import torch` took 46 s against 23 s
+# after this read, 64MB pieces 16 at a time (~1.8GB/s against one reader's
+# ~0.45GB/s), which costs ~3 s cold and ~1 s warm and overlaps the setup
+# below (csd3-speed.md, rounds 216 and 218).
+(sif_bytes="$(stat -c %s "${R2D2_SIF}")" && seq 0 $(((sif_bytes - 1) >> 26)) \
+  | xargs -P 16 -I{} dd if="${R2D2_SIF}" of=/dev/null bs=64M skip={} count=1 status=none) &
 # On a node without a GPU every worker would fail its first request, and a
 # failed evaluation is scored rather than fatal - so it is checked here, once,
 # before anything starts.
 if [ "${R2D2_DEVICE}" = cuda ]; then
-  if ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c \
+  # Asked of the driver, not torch: a torch import through squashfuse is
+  # 14-20 s even warm (round 218). The driver must run the image's CUDA major;
+  # anything this check cannot answer falls back to torch's own.
+  if ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c '
+import ctypes, glob, re, sys
+need = re.search(r"cuda: .*= .(\d+)\.", open(glob.glob("/opt/venv/lib/python3*/site-packages/torch/version.py")[0]).read())
+cu, n, v = ctypes.CDLL("libcuda.so.1"), ctypes.c_int(), ctypes.c_int()
+sys.exit(0 if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0
+         and cu.cuDriverGetVersion(ctypes.byref(v)) == 0 and v.value >= 1000 * int(need[1]) else 1)' 2>/dev/null \
+    && ! "${APPTAINER}" exec --nv "${R2D2_SIF}" python3 -c \
       'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
     echo "FATAL: R2D2_DEVICE=cuda but no GPU is visible here - submit from a login node (it asks for one), or sintr -p ampere --gres=gpu:1" >&2
     rmdir "${OUTPUT_DIR}" 2>/dev/null || true
     exit 1
   fi
   NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
+  # A TensorRT worker's 25 engines hold ~5.1GB on the card against eager's
+  # ~3.1GB of weights, so an 80GB A100 fits 12, not 19 (csd3-speed.md, round 170).
+  # R2D2_TRT_SHARED=1 holds them once, in one forward server, and its workers
+  # stay off the card, so eager's sizing is an over-estimate (round 208).
+  if [ "${R2D2_RUNTIME}" = trt ] && [ "${R2D2_TRT_SHARED:-0}" != 1 ]; then
+    NS_R2D2_CUDA_MB_PER_RANK="${NS_R2D2_CUDA_TRT_MB_PER_RANK}"
+  fi
   # Each worker holds all 25 checkpoints on the GPU. Past what the card holds,
   # workers die with CUDA OOM and their evaluations score as failures - a
   # silent fake worst case - so an explicit rank count over it is refused.
+  # A shared server's workers hold nothing on the card, so only the CPUs
+  # bound an explicit rank count there.
   gpu_mb="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
-  if [ -n "${gpu_mb}" ]; then
+  if [ -n "${gpu_mb}" ] && { [ "${R2D2_RUNTIME}" != trt ] || [ "${R2D2_TRT_SHARED:-0}" != 1 ]; }; then
     gpu_ranks="$((gpu_mb * 95 / 100 / NS_R2D2_CUDA_MB_PER_RANK))"
     if [ -n "${NS_MPI_PROCS:-}" ] && [ "${NS_MPI_PROCS}" -gt "${gpu_ranks}" ]; then
       echo "FATAL: ${NS_MPI_PROCS} R2D2 workers need ~$((NS_MPI_PROCS * NS_R2D2_CUDA_MB_PER_RANK))MB of GPU memory; this GPU has ${gpu_mb}MB, enough for ${gpu_ranks} (NS_R2D2_CUDA_MB_PER_RANK)" >&2
@@ -108,11 +143,22 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_MPI_PROCS}" -gt "${NS_R2D2_MAX_RANKS}" ]; then
     NS_MPI_PROCS="${NS_R2D2_MAX_RANKS}"
   fi
+  # PolyChord's root rank only hands out points: it never evaluates, so a
+  # rank per CPU leaves one CPU without an R2D2 worker. One more rank fills it:
+  # 38 -> 39 ranks on 38 icelake CPUs won 5 of 5 pairs, +3.7% evals/s, with
+  # the same time per evaluation (csd3-speed.md, round 186).
+  if [ "${R2D2_DEVICE}" = cpu ] && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
+    NS_MPI_PROCS="$((HOST_CPUS + 1))"
+  fi
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2)"
 else
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2
+fi
+# mpirun counts one slot per CPU and refuses -np past it.
+if [ "${NS_MPI_PROCS}" -gt "${HOST_CPUS}" ]; then
+  NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-1}"
 fi
 
 if [ -z "${R2D2_OMP_THREADS:-}" ]; then
@@ -155,10 +201,10 @@ done
 #
 # The simulate workers are each kept alive by their own loop: a worker that
 # dies - or exits when its rank's end of the FIFO closes - is started again
-# and reopens the same pair, and the rank reconnects (common.py). The pid
-# file is how a rank kills a worker that has wedged (FifoWorker.kill). The
-# working tree is bound over the baked copy so the run executes the code in
-# this checkout; there is no `docker build` here to keep them in step.
+# and reopens the same pair; the rank reconnects (common.py). The pid
+# file is how a rank kills a wedged worker (FifoWorker.kill); a mid-run
+# "exited 137" in workers-meqtrees.log is that (round 214).
+# The tree overlays the SIF.
 #
 # The single quotes are deliberate: $1, ${fifo} and ${base} are for the
 # container's own sh, which gets its arguments below, not for this one.
@@ -172,6 +218,7 @@ sidecar_launch "${MEQTREES_SIF}" \
     ( while :; do
         python3 /opt/ri-nested-sampling/simulate_point_source_ms.py \
           --serve --fifo "${base}" & echo $! >"${base}.pid"; wait $!
+        echo "$(date +%s) simulate worker ${base##*/} exited $?"
       done ) &
   done
   wait
@@ -195,7 +242,10 @@ R2D2_POOL_FLAGS=()
 if [ "${R2D2_DEVICE}" = cuda ]; then
   R2D2_POOL_FLAGS=(--nv)
   # NS_CUDA_MPS=0 leaves the workers time-slicing the card, for an A/B.
-  if [ "${NS_CUDA_MPS}" != 0 ]; then
+  # R2D2_TRT_SHARED=1 never starts MPS: its one server is the only process on
+  # the card, and through an MPS daemon it ran 32% slower (steady 61.9 against
+  # 90.9 evals/s, 3 of 3 interleaved pairs; docs/csd3-speed.md, round 211).
+  if [ "${NS_CUDA_MPS}" != 0 ] && [ "${R2D2_TRT_SHARED:-0}" != 1 ]; then
     sidecar_cuda_mps_flags
     R2D2_POOL_FLAGS+=(${CUDA_MPS_FLAGS[@]+"${CUDA_MPS_FLAGS[@]}"})
   fi
@@ -207,28 +257,54 @@ fi
 # its exported checkpoints are cached beside it. numpy is dropped from the
 # install so the image's own is the one imported. A failed install (no PyPI)
 # runs the pool on torch rather than ending the search.
-case "${R2D2_RUNTIME}" in
-  torch) ;;
-  onnx)
+# r2d2_pip_install DIR MODULE PKG...: pip-install PKG... once into DIR/py,
+# which must then hold MODULE; numpy is dropped so the image's own is imported,
+# and TensorRT's Windows builder resources (2GB) with it.
+r2d2_pip_install() {
+  local dir="$1" module="$2"
+  shift 2
+  [ -d "${dir}/py/${module}" ] && return 0
+  mkdir -p "${dir}"
+  rm -rf "${dir}/py.$$"
+  if "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
+    --target "${dir}/py.$$" "$@"; then
+    rm -rf "${dir}/py.$$"/numpy "${dir}/py.$$"/numpy-* "${dir}/py.$$"/numpy.libs \
+      "${dir}/py.$$"/tensorrt_libs/libnvinfer_builder_resource_win_*
+    mv -T "${dir}/py.$$" "${dir}/py" 2>/dev/null || rm -rf "${dir}/py.$$"
+  else
+    rm -rf "${dir}/py.$$"
+    return 1
+  fi
+}
+case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
+  *:torch) ;;
+  cpu:onnx | cuda:trt)
     R2D2_ONNX_DIR="${_ri_cache}/r2d2-onnx"
-    if [ ! -d "${R2D2_ONNX_DIR}/py/onnxruntime" ]; then
-      mkdir -p "${R2D2_ONNX_DIR}"
-      rm -rf "${R2D2_ONNX_DIR}/py.$$"
-      if "${APPTAINER}" exec "${R2D2_SIF}" python3 -m pip install --quiet --disable-pip-version-check \
-        --target "${R2D2_ONNX_DIR}/py.$$" onnxruntime==1.23.2 onnx==1.23.2; then
-        rm -rf "${R2D2_ONNX_DIR}/py.$$"/numpy "${R2D2_ONNX_DIR}/py.$$"/numpy-* "${R2D2_ONNX_DIR}/py.$$"/numpy.libs
-        mv -T "${R2D2_ONNX_DIR}/py.$$" "${R2D2_ONNX_DIR}/py" 2>/dev/null || rm -rf "${R2D2_ONNX_DIR}/py.$$"
-      else
-        rm -rf "${R2D2_ONNX_DIR}/py.$$"
-        echo "WARNING: could not pip-install onnxruntime; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
-        R2D2_RUNTIME=torch
-      fi
+    if ! r2d2_pip_install "${R2D2_ONNX_DIR}" onnxruntime onnxruntime==1.23.2 onnx==1.23.2; then
+      echo "WARNING: could not pip-install onnxruntime; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
+      R2D2_RUNTIME=torch
     fi
-    if [ "${R2D2_RUNTIME}" = onnx ]; then
+    # R2D2_RUNTIME=trt (GPU only) builds each exported checkpoint into a
+    # TensorRT fp32 engine: ~+84% forwards through an A100 at 12 workers
+    # against eager's best (patch_trt_network, csd3-speed.md rounds 168-171).
+    # tensorrt-cu13 matches the CUDA 13 torch in r2d2-cuda.sif; its builds are
+    # cached beside it, per GPU model and image size.
+    R2D2_TRT_DIR="${_ri_cache}/r2d2-trt"
+    if [ "${R2D2_RUNTIME}" = trt ] && ! r2d2_pip_install "${R2D2_TRT_DIR}" tensorrt --no-deps \
+      tensorrt-cu13==11.4.0.106 tensorrt-cu13-bindings==11.4.0.106 tensorrt-cu13-libs==11.4.0.106; then
+      echo "WARNING: could not pip-install tensorrt; this run's U-Net runs on torch (R2D2_RUNTIME=torch)" >&2
+      R2D2_RUNTIME=torch
+    fi
+    if [ "${R2D2_RUNTIME}" != torch ]; then
       R2D2_POOL_FLAGS+=(--bind "${R2D2_ONNX_DIR}:/opt/r2d2-onnx")
     fi
+    if [ "${R2D2_RUNTIME}" = trt ]; then
+      R2D2_POOL_FLAGS+=(--bind "${R2D2_TRT_DIR}:/opt/r2d2-trt" --env R2D2_TRT_STATUS="${OUTPUT_DIR}/r2d2-engine.txt"
+        --env NS_IMAGE_DIM="${NS_IMAGE_DIM}" --env R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}"
+        --env R2D2_TRT_BATCH="${R2D2_TRT_BATCH:-1}" --env R2D2_TRT_LANES="${R2D2_TRT_LANES:-2}")
+    fi
     ;;
-  *) echo "FATAL: R2D2_RUNTIME must be torch or onnx, got '${R2D2_RUNTIME}'" >&2; exit 1 ;;
+  *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;
 esac
 sidecar_launch "${R2D2_SIF}" \
   ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
@@ -264,6 +340,7 @@ RUN_COMMAND=(
   NS_ENABLE_PARAMS="${NS_ENABLE_PARAMS:-}"
   NS_DISABLE_PARAMS="${NS_DISABLE_PARAMS:-}"
   NS_SYNCHRONOUS="${NS_SYNCHRONOUS}"
+  NS_CHAINS_TMPFS="${NS_CHAINS_TMPFS:-1}"
   NS_KEEP_MEASUREMENT_SETS="${NS_KEEP_MEASUREMENT_SETS}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
   # host CPU, in every rank. Nothing here has a BLAS call big enough to want

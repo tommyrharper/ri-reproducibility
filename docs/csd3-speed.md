@@ -5,19 +5,24 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 160; R2D2 speed work stopped, see [the final status](#round-160-final-status-stop-condition-met)).**
+**Where it stands (round 215; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
-  sapphire CPUs with the same images and seed, converges in **41 minutes
+  sapphire CPUs with the same images and seed, converged in **41 minutes
   instead of 6h20m (7.0x)**: 26.6 evals/s against 4.12, log(Z) in
   agreement ([round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree)).
+  Rerun again on round 183's tree it takes **29 minutes (9.9x)**: 39.7
+  evals/s and a 546 ms request against 825 ([round 184](#round-184-validation-the-22-sep-production-search-on-round-183s-tree-29-minutes)).
+  On half an icelake node (39 ranks) today's default converges in **23
+  minutes** at 48.1 evals/s, log(Z) 0.01733 +/- 0.00041, within 0.9 sigma of
+  22 Sep and round 115 ([round 195](#round-195-validation-the-22-sep-production-search-on-half-an-icelake-node-23-minutes)).
   Simulate (MeqTrees) went from 39% of worker time to 3.8%, idle from
   11.5% to 0.05%. A whole sapphire node (112 ranks x 1, one checkpoint
   copy per socket, rounds 105-106) runs 103.5 evals/s. The request is now
   the evaluation (96%), and two thirds of it is the U-Net's convolutions,
   which are memory-bound under load (one request costs 55% more CPU with
   36 neighbours than solo). Closed with numbers: bit-identical forward
-  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), 2-3 ORT threads per rank (157), per-NUMA
+  changes (round 86), MKL packing (100), bfloat16/AMX (134), OpenVINO (155), huge pages for ORT's weights (156), a quarter of the weights on the other socket (210), 2-3 ORT threads per rank (157), fixed input shapes and flush-to-zero in ORT (162), ORT 1.31.1 over 1.23.2 (180), lower ORT graph optimisation levels (190), malloc tuning and the ORT arena (164), per-NUMA
   copies with pinning (98), one net per checkpoint (97), and batching
   forwards inside a worker, in a pool (109, 136) or with real requests in
   lockstep (137, -24 to -45%), and a cross-rank forward server (139,
@@ -43,13 +48,80 @@ the Hetzner host.
   before it, onnx ran a whole node at torch's rate. A whole sapphire node
   now runs **117 evals/s**, +40% over the pre-149 onnx default and +22%
   over torch ([round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40)).
+  A default CPU run takes one rank more than its CPUs, because PolyChord's
+  root never evaluates: 39 ranks on 38 CPUs won 5 of 5 pairs, **+3.7%**
+  ([round 186](#round-186-one-more-r2d2-rank-than-cpus-37)); a second and third extra rank add nothing (round 194).
 - **R2D2 on GPU.** CUDA MPS ([round 119](#round-119-cuda-mps-in-gpu-searches-265x-on-one-a100))
   and 19 ranks per card (round 124) give one A100 ~44 evals/s, ~40% of a
   whole sapphire node. Rejected: a
   shared weight copy (120), CUDA graphs (122, 130), TF32, `cudnn.benchmark`
-  and channels_last (125), more CPU threads per rank (126) and batching
-  across requests (127). A 2-GPU A/B (round 130's job 39303263) had not
-  run when this was written.
+  and channels_last (125), `torch.compile` (166, -40%), ONNX Runtime's CUDA EP (167, -2%), more CPU threads per rank (126) and batching
+  across requests (127). Rounds 148-153's CPU cuts change nothing on the
+  card: today's tree runs 43.1 evals/s against round 146's 43.4, so a
+  1-GPU search is bound by the card, not its 32 cores ([round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146)).
+  2-GPU jobs never start on SL3 (round 163): scale out with 1-GPU searches.
+  The job's 32 cores are not idle: racing a 16-rank CPU onnx search beside
+  a 16-core GPU search gives 47.3 evals/s against 54.9 for the GPU search
+  alone, -14% ([round 183](#round-183-negative-cpu-onnx-ranks-beside-a-1-gpu-search--14)).
+  Open: TensorRT's fp32 engine puts **+62% forwards/s** through the card
+  at 19 MPS copies, 1e-5 off the CPU path, so a 1-GPU search should gain
+  ~30%; it is not wired into the pool yet ([round 168](#round-168-positive-probe-tensorrt-for-the-gpu-u-net-62-forwards-on-one-a100-under-mps)).
+  The route is clear: TensorRT 11.4's own CUDA 13 wheels run in the same
+  process as the image's torch, on torch's buffers, at +64% ([round 169](#round-169-positive-probe-tensorrt-cu13-beside-torch-in-one-process-64)).
+  With 25 engines a worker holds 5.1 GB, so an A100 fits 12 TensorRT workers,
+  and those 12 still give +84% forwards over eager's best 16, so a GPU search
+  should gain ~20% ([round 170](#round-170-positive-probe-25-tensorrt-engines-per-worker-fit-12-copies-on-an-a100-84-forwards)).
+  Wired in as opt-in `R2D2_RUNTIME=trt` it gave +4% (round 171), inside
+  the +/-10% run noise; 13-14 ranks or 1-2 threads a rank add nothing,
+  since 12 TensorRT workers already saturate the card ([round 172](#round-172-negative-more-tensorrt-ranks-per-a100-or-fewer-cpu-threads-each-gain-nothing)).
+  Run 4x longer (600 dead points) it gives +7% evals/s and -48% request
+  time, still inside the noise over 6 pairs (TensorRT ahead in 4), so the GPU
+  default stays torch ([round 173](#round-173-null-tensorrt-against-eager-at-600-dead-points-and-onnx-against-torch-on-cpu-rechecked)).
+  One refittable engine per worker would fit ~19 workers (3.2 GB), but a
+  refit costs 34 ms of host CPU against a 1.6 ms forward, -90% forwards at
+  12 copies ([round 181](#round-181-negative-one-refittable-tensorrt-engine-per-worker)).
+  fp16 engines would double forwards per card (+108% at 12 copies, 19
+  fit in 37 GB), but each net lands 0.6-5.6% of the peak off float32,
+  1000x round 140's gap, so they are rejected ([round 175](#round-175-negative-fp16-tensorrt-engines-2x-forwards-but-1e-2-off-float32)).
+  Open: one process holding the 25 engines once, with a context per
+  client, serves 12-32 pipe clients at 2,450 forwards/s (90% of 12 MPS
+  workers) on 5.7 GB instead of 66, bit-identical, so a shared TensorRT
+  forward server lifts the 12-worker cap ([round 207](#round-207-positive-probe-one-process-sharing-25-tensorrt-engines-feeds-the-a100-from-57-gb)).
+  Wired in as opt-in `R2D2_TRT_SHARED=1`, bit-identical to per-worker
+  TensorRT at 19 concurrent workers ([round 208](#round-208-wired-in-race-pending-opt-in-r2d2_trt_shared1-one-tensorrt-forward-server-for-the-pool)).
+  Raced in a search it agrees on log(Z) but runs 55.5 evals/s against
+  60.6 for per-worker `trt` and 61.1 for eager (3/2/3 arms), because a
+  forward through the server takes 10.9 ms against 2.7; whether MPS or
+  the server's Python is to blame is pending ([round 209](#round-209-negative-so-far-the-shared-tensorrt-server-loses-9-at-19-ranks-because-its-forwards-take-4x-longer)).
+  It was MPS: without it, shared mode runs **90.9 steady evals/s against
+  61.9** (+47%, 3 of 3 pairs, log(Z) agreeing), so shared mode no longer
+  starts MPS. Short GPU arms are compared on `steady_evals_per_s`, because
+  start-up and meqserver wedges move a 3-minute arm by up to 50%
+  ([round 211](#round-211-positive-opt-in-mode-shared-tensorrt-without-mps-47-steady-and-short-gpu-arms-were-measuring-start-up-and-meqserver-wedges)).
+  Raced steady against both on one A100 (600 dead points, 3 arms each):
+  shared 82.2 evals/s, per-worker `trt` 74.3, eager 66.4, log(Z) agreeing,
+  but shared won only 2 of 3 pairs against either. Run to convergence on
+  the 22 Sep production search it takes 13.5 minutes at **80.5 evals/s
+  against 69.6** for per-worker (+16%; steady 89.6 against 71.7), log(Z)
+  0.01708 and 0.01735 +/- 0.00042, with no meqserver wedge in either. The
+  converged race against eager 19 x 2 settles it: **785 s against 1,165 s**
+  (90.8 against 64.2 evals/s, 100.1 against 66.4 steady), log(Z) 0.06
+  sigma apart, so shared TensorRT is the GPU default since
+  [round 215](#round-215-gpu-default-shared-tensorrt-converges-the-production-search-in-785-s-against-eagers-1165).
+- **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
+  core-hours, and the GPU and CPU allowances are separate budgets, so
+  using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
+  give ~15% more evaluations per core-hour than whole nodes, and whole
+  nodes finish one search sooner ([round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu)).
+  On one whole icelake node, two socket-bound 38-rank searches run +9%
+  more in total than one 76-rank search (request -8%), so a single
+  search loses ~8% to spanning both sockets ([round 176](#round-176-diagnostic-two-socket-bound-searches-on-a-whole-icelake-node-give-9-total-but-each-one-takes-twice-as-long)).
+  After round 177 the gap is still ~8% (85.2/86.2 against 92.8). It is
+  spread over both sockets' request time, with weights correctly placed and
+  idle ~0, and one icelake socket can run 13% slower than the other even when
+  fully bound ([round 178](#round-178-diagnostic-the-whole-node-penalty-by-socket-weights-are-placed-right-and-socket-1-is-slower-anyway)).
+  Round 177's fix holds on a whole sapphire node too, at +2.9%: 135.7 evals/s
+  against 131.8, up from round 150's 117 ([round 179](#round-179-validation-round-177-on-a-whole-sapphire-node-29)).
 - **WSClean.** A production-shaped 36-rank search on a patched
   (0001-0017) SIF runs ~250 evals/s on half an icelake node
   ([round 89](#round-89-diagnostic-rounds-72-88-together-in-a-production-shaped-search)),
@@ -7486,6 +7558,7 @@ Where R2D2 ends up on CSD3:
 | shape | evals/s | against | source |
 | --- | ---: | --- | --- |
 | 22 Sep production search, 24 sapphire CPUs | 26.6 (torch, round 115) | 4.12 before (7.0x) | [round 115](#round-115-diagnostic-the-22-sep-production-search-rerun-on-todays-tree) |
+| 22 Sep production search, 24 sapphire CPUs, round 183's tree | 39.7 (onnx, round 184) | 26.6 in round 115, 4.12 on 22 Sep (9.9x in wall time) | [round 184](#round-184-validation-the-22-sep-production-search-on-round-183s-tree-29-minutes) |
 | half icelake node, default onnx, 38 x 1 | 46.4 | 44.8 in round 146 | [round 158](#round-158-diagnostic-an-r2d2-workers-cpu-after-rounds-148-153) |
 | whole icelake node, onnx, sessions per NUMA node | 80.5 | 59.2 before round 149 | [round 149](#round-149-onnx-runtime-sessions-per-numa-node-on-whole-nodes-36) |
 | whole sapphire node, onnx, sessions per NUMA node | 117 | 83.2 pre-149 onnx, 96-104 torch | [round 150](#round-150-validation-round-149-on-a-whole-sapphire-node-40) |
@@ -7506,9 +7579,4731 @@ change the results or are outside this scope:
   Round 130's 2-GPU A/B (job 39303263) never reported back; re-run it
   before sizing a GPU production run.
 - **Job shape.** Whole nodes with sessions per NUMA node (rounds 149-150)
-  give the best per-core rate. Prefer them to half nodes for long
-  searches.
+  give the best wall-clock rate per search. (Corrected in
+  [round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu):
+  half nodes give ~15% more evaluations per core-hour.)
 
 WSClean speed work closed earlier (rounds 83, 135, and the 2026-10-27
 scope decision). The one non-code lever left for it is still shipping a
 SIF with all of `docker/wsclean/patches/` (round 94).
+
+## Round 161 (pending): the 2-GPU R2D2 A/B, resubmitted
+
+**Why.** The 2026-10-27 scope has no stop condition, so after round 160
+closed the CPU side, the next R2D2 lever is more GPUs per search. Round
+128's multi-GPU change (`R2D2_CUDA_GPUS`, which deals pool workers
+round-robin over the job's cards with `torch.cuda.set_device` after the
+fork, and scales the GPU rank cap and `NS_SLURM_GPUS`) was never measured:
+round 130's job 39303263 left no output file at all, so it never started.
+
+**What was done.** The diff (`agent-node/iteration-129-multi-gpu.diff`)
+was ported onto this round's tree in a separate copy,
+`agent-node/r161-mgpu` (`BASE` holds the commit). All hunks apply except
+`bench.py`'s `WORKLOAD_KEYS` line, which `R2D2_RUNTIME` had moved, and
+which was re-added by hand. Job 39368806 (ampere, 2 x A100, 64 CPUs, 1h,
+`.probe/r161/job.sh` in that copy) runs warmG2, G1a, G2a, G1b, G2b: `./ri
+search r2d2 --device cuda --nlive 96 --num-repeats 5 --max-ndead 150
+--seed 4242`, MPS and blocking sync, 2 threads, with 19 ranks on one card
+against the default 38 over two. It was still queued 40 minutes after
+submission, so there is no result yet. Output goes to
+`agent-node/r161-mgpu/.probe/r161/job-39368806.out`, and to `row-*.json`
+and `smi-*.log` beside it.
+
+**To finish.** Read the job output. If G2 gives about 2x G1 with log(Z)
+in agreement, apply the same diff to the tree, add
+`R2D2_CUDA_GPUS` to `docs/cluster.md`'s GPU section, and copy the rows
+into `benchmarks.jsonl`. Then delete `agent-node/r161-mgpu`, whose
+`results/` count against the file quota.
+
+
+## Round 162 (negative): fixed input shapes and flush-to-zero in ONNX Runtime
+
+**Question.** The shipped sessions (round 141) are exported with dynamic
+height and width and run with ORT's defaults for shapes and denormals. Two
+session options are left untried. `add_free_dimension_override_by_name`
+pins `h` and `w` to `NS_IMAGE_DIM` (32), which lets the optimiser fold
+shape arithmetic and plan memory statically. `session.set_denormal_as_zero`
+sets FTZ/DAZ on the thread, which pays if the U-Net's activations underflow
+into denormals, since x86 handles those slowly.
+
+**Method.** `.probe/r162/opts.py` runs inside `r2d2.sif` with the cached
+onnxruntime 1.23.2 and the cached 25 `.onnx` checkpoints. It builds four
+session sets in one parent: dyn (as shipped: 1 thread, no spinning, no
+arena), static, ftz and both. It then forks 36 children, one per CPU, each
+walking N1..N25 staggered (round 157's production-like shape), with 150
+timed forwards each on a sky-like 2x32x32 input (two Gaussians plus 1%
+noise). The four arms alternate, three repeats, on this loop's icelake
+half-node.
+
+| arm | ms a forward (rep 0, 1, 2) |
+| --- | ---: |
+| dyn (shipped) | 26.81, 26.91, 26.98 |
+| static 32x32 | 27.48, 27.57, 27.74 |
+| ftz | 26.97, 26.98, 26.68 |
+| static + ftz | 27.60, 27.69, 27.83 |
+
+**Result.** Every arm's output is bit-identical to dyn's on all 25
+checkpoints. Fixed shapes are slower in every repeat (+2.5%), so the
+dynamic-shape kernels ORT picks are already the better ones. FTZ is noise:
+the forward makes no denormals worth flushing. Nothing ships, and the R2D2
+CPU forward stays where round 160 left it. Round 161's 2-GPU job
+(39368806) was still queued when this round ended, with no output file.
+No search was run, so there is no `benchmarks.jsonl` row.
+
+## Round 163: the GPU search on today's tree, and why 2-GPU jobs never run
+
+The job ran in iteration 165; its result is [round 165](#round-165-null-the-gpu-search-on-todays-tree-against-round-146).
+
+**Why 2-GPU jobs never report.** Every 1-GPU ampere job this loop sent
+(rounds 119-130, `--gres=gpu:1 --cpus-per-task=32`, most with
+`--qos=intr`) started within 9-17 minutes of submission. Every 2-GPU job
+(rounds 128 and 129, round 130's 39303263, round 161's 39368806, all
+`--gres=gpu:2 --cpus-per-task=64` without `--qos=intr`) has left no
+output file at all, after hours in the queue. On `WBARKER-SL3-GPU` a
+2-GPU request is not a practical way to measure, or to run, a search.
+Treat more cards as more independent 1-GPU searches whose runs are
+merged, not as one search over two cards, unless a 2-GPU job is ever
+seen to start.
+
+**Question.** Rounds 148, 151 and 153 cut ~28 ms of CPU work per request
+(Briggs weights, FITS writes, FINUFFT bin sort). The GPU path runs all of
+that on the CPU too (`patch_cuda_network` moves only the U-Net). Round 127
+says a 1-GPU search is bound by its 32 cores, and round 130 says it is
+bound by the card under MPS. If 127 is right, these rounds should lift
+the GPU rate. No GPU search has run on the tree since round 146, so this
+is also the regression check for the GPU path.
+
+**Run.** Job 39371931 (ampere, 1 x A100, 32 CPUs, `--qos=intr`,
+`agent-node/r163/job.sh`) runs the round-146 tree (`git archive 5872bb4`,
+in `agent-node/r163/base`) against HEAD (`agent-node/r163/new`). The arms
+are warmN B1 N1 B2 N2 B3 N3, each `./ri search r2d2 --device cuda --nlive 48
+--num-repeats 5 --max-ndead 150 --seed 4242`, with the default 19 ranks, MPS
+and blocking sync. It was still queued when this round ended.
+
+**To finish.** Read `agent-node/r163/job-39371931.out` and the `row-*.json`
+and `smi-*.log` files beside it. Compare evals/s and the R2D2 request in
+ms for B against N, check that log(Z) agrees within 1 sigma, and copy the
+rows into `benchmarks.jsonl` with `run` set to `r163-<arm>`. Then delete
+`agent-node/r163`, whose `results/` count against the file quota.
+
+## Round 164 (negative): page faults and malloc in ORT's arena-less sessions
+
+**Question.** Since round 143 the ORT sessions run without a CPU arena, so
+every activation of a forward is a glibc `malloc`/`free`. A 64-channel
+32x32 float32 tensor is 256 KB, above glibc's initial mmap threshold, so
+each forward could map, fault in and unmap fresh pages, and zeroing
+pages costs the memory bandwidth the U-Net is bound by under load (round
+146). Round 143 timed the arena solo, not under 36-way load.
+
+**Run.** `.probe/r164/malloc.py` in `r2d2.sif`: round 162's shape (25
+sessions built in the parent, 36 forked children pinned one per CPU, each
+walking N1..N25 staggered, 150 forwards, sky-like input), three arms
+alternating, three passes. `getrusage` in each child counts minor faults
+and system time over the timed forwards.
+
+| arm | ms a forward | minor faults a forward | system ms a forward |
+| --- | --- | ---: | ---: |
+| shipped (no arena) | 27.21, 27.03, 26.96 | 6.5 | 0.03 |
+| CPU arena on | 27.09, 27.18, 27.17 | 68.0 | 0.22 |
+| no arena, child `mallopt` mmap and trim thresholds at 1 GB | 26.99, 26.82, 26.79 | 6.5 | 0.03 |
+
+All outputs are bit-identical to the shipped arm.
+
+**Learned.** glibc's dynamic mmap threshold already keeps activations on
+the heap after the first free, so the shipped sessions take 6.5 faults
+and 0.03 ms of system time per forward: there is nothing to save there.
+The arena faults ten times more (its growth chunks are fresh mmaps) and is
+no faster. The `mallopt` arm is 0.7% faster on average, inside the spread
+of three passes and far below the ~5% an end-to-end A/B can see, so it is
+not shipped. Allocation is closed as an R2D2 CPU lever. Not a search, so
+no `benchmarks.jsonl` rows.
+
+## Round 165 (null): the GPU search on today's tree against round 146
+
+**Question.** Round 163's job 39371931: does a 1-GPU search speed up with
+rounds 148-153's CPU cuts (~28 ms a request), as it would if round 127 is
+right that it is bound by its 32 cores? And has the GPU path regressed
+since round 146, the last time it ran?
+
+**Run.** As round 163 set it up: gpu-q-23, 1 x A100-SXM4-80GB, 32 CPUs.
+`./ri search r2d2 --device cuda --nlive 48 --num-repeats 5 --max-ndead 150
+--seed 4242`, 19 ranks, MPS, `R2D2_RUNTIME=torch` (the GPU default), the
+round-146 tree (`5872bb4`, B) against `d5f3326` (N, the tree as of round
+162; 163-164 changed no code), alternating.
+
+| arm | evals/s | R2D2 request, ms | simulate, ms | wall, s | CPU (user), s | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| warmN (first on the node) | 23.7 | 666 | 71 | 141.7 | 139 | 0.01655 +/- 0.00244 |
+| B1 | 44.7 | 341 | 43 | 66.6 | 107 | 0.01639 +/- 0.00259 |
+| N1 | 45.3 | 339 | 40 | 62.5 | 110 | 0.01488 +/- 0.00315 |
+| B2 | 43.3 | 351 | 43 | 63.6 | 107 | 0.01674 +/- 0.00235 |
+| N2 | 41.7 | 362 | 49 | 62.1 | 101 | 0.01681 +/- 0.00222 |
+| B3 | 42.2 | 360 | 43 | 61.7 | 112 | 0.01658 +/- 0.00240 |
+| N3 | 42.3 | 360 | 45 | 63.0 | 135 | 0.01682 +/- 0.00226 |
+
+Means: B 43.4, N 43.1 evals/s (-0.7%, inside the 42.2-45.3 spread of
+either arm). The card peaks at 99-100% utilisation in every arm (1 s
+samples every 10 s; 67.9 GB used), while the 32 CPUs do 101-135 CPU-s of
+user time in ~63 s of wall, about 2 of 32 cores. Every log(Z) agrees
+within 0.6 sigma. GPU searches are not bit-reproducible run to run on
+one tree either (B1-B3 differ), as for every GPU arm since round 119.
+
+**Learned.**
+- No regression on the GPU path since round 146, and no gain: a 1-GPU
+  search is bound by the card. Round 130 was right and round 127 wrong.
+  CPU-side request work is not a GPU lever; the U-Net on the card is.
+- The first search on a fresh GPU node runs at half rate (23.7 evals/s,
+  666 ms a request): cold caches (SIF, checkpoints, CUDA/cuDNN set-up)
+  across its whole 80 s. A short GPU benchmark needs a warm-up arm, and a
+  production GPU run pays this once.
+- 1 x A100 at ~43 evals/s is ~37% of a whole sapphire node on CPU (117,
+  round 150).
+
+Rows: `r163-warmN`, `r163-B1`..`r163-N3` in `benchmarks.jsonl` (commit set
+to the archived tree's). `agent-node/r163` and the never-run round-161
+2-GPU tree deleted.
+
+## Round 166 (negative): `torch.compile` for the GPU U-Net, -40% under MPS
+
+**Question.** Round 165 left the U-Net on the card as the only GPU lever.
+Rounds 122 and 125 tried graphs and cuDNN settings, but not kernel fusion.
+Would TorchInductor (Triton kernels that fuse each instance norm and
+activation) cut the kernels a forward launches and raise the MPS plateau?
+
+**Probe.** `r2d2-cuda.sif` (torch 2.13, Triton 3.7.1) has no C compiler,
+and Triton needs one to build its launcher. `pip install --target ziglang`
+plus a two-line `CC` wrapper (`python3 -m ziglang cc -target
+x86_64-linux-gnu.2.36`) works as one, with no image change. It is carried
+to the GPU node as one tar file (`agent-node/zig-py.tar`, because the
+unpacked copy is 20k files). `scripts/probe_unet_forward.py` gained
+`COMPILE=<mode>` (`torch.compile(dynamic=False)`) and `KERN=1`, which counts
+one forward's CUDA kernels with `torch.profiler`. One ampere job
+(`.probe/r166/job.sh`, job 39373826, gpu-q-27, A100-SXM4-80GB, MPS on,
+TF32 off as in `r2d2_serve.py`, batch 1, 32x32) ran first solo, then 19
+copies (the production rank count) in E C M M C E order twice, with the
+Inductor and Triton caches shared and warmed by the solo arms:
+
+| arm | solo ms a forward | kernels a forward | kernel time, us | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs eager |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| E eager (production) | 3.29 | 142 | 2,507 | 1,769 / 1,774 / 1,772 / 1,771 | - | 0 |
+| C `compile`, default | 3.09 | 183 | 2,955 | 1,072 / 1,067 / 1,068 / 1,064 | -40% | 6.7e-6 |
+| M `max-autotune-no-cudagraphs` | 3.11 | 182 | 2,954 | 1,055 / 1,061 / 1,056 / 1,056 | -40% | 7.0e-6 |
+
+**Learned.**
+- Rejected, both modes. Inductor makes the forward *more* kernels (183
+  against 142) and more GPU time (2.95 against 2.51 ms). Its Triton
+  reductions for the instance norms cost more than ATen's, and the convs
+  stay cuDNN calls, so nothing is fused away. Solo it is 6% faster, because
+  its Python launch path is shorter. Under MPS, where card time is what
+  counts, it loses 40% in all eight runs. Its output also moves by ~7e-6,
+  so it would not be bit-identical either. max-autotune changes nothing.
+- A solo eager forward is 2.5 ms of kernels in 3.3 ms of wall: 142 kernels
+  at ~18 us each. These are low-occupancy kernels (batch 1 at 32x32 with
+  124 MB of weights), not launch gaps. Concurrency is what fills the card
+  (MPS, round 119), and with that, kernel *count* is not the bound.
+- With graphs (122, 130), TF32, `cudnn.benchmark` and channels_last (125),
+  and now Inductor, the framework-level settings for the GPU forward are
+  exhausted. Only cross-request batching raises the ceiling (round 127,
+  1.33x at B=19, bit-identical), and so far the CPU-side gather has cost
+  more than it gives. A different engine (TensorRT, ORT's CUDA EP) would
+  need a CUDA-12 stack beside the image's CUDA 13 torch.
+- A zig `CC` makes Triton (and so `torch.compile`) usable in any SIF with
+  no rebuild. No search ran, so there are no `benchmarks.jsonl` rows; the
+  job output is `.probe/r166/job-39373826.out`.
+
+## Round 167 (negative): ONNX Runtime's CUDA EP for the GPU U-Net, -2% under MPS
+
+**Question.** Round 166 left a different engine as the last single-forward
+GPU lever. ORT is already the CPU default (round 145) and has its own CUDA EP
+with cuDNN algorithm search and CUDA graphs. Does it put more forwards
+through one A100 under MPS than torch's eager forward?
+
+**Probe.** `r2d2-cuda.sif` has CUDA 13 torch, while `onnxruntime-gpu` 1.23.2
+is a CUDA 12 build. `uv pip install --target` with the CUDA 12 runtime,
+cuBLAS, cuDNN 9, cuFFT, cuRAND and NVRTC wheels gives a 3.1 GB, 602-file
+directory. `ort.preload_dlls()` loads it in the SIF on the 595 driver with
+no rebuild. It is carried as one tar (`agent-node/ortgpu-py.tar`).
+`scripts/probe_ort_cuda.py` runs the exported net (`N1.onnx`, the same file
+the CPU sessions use) through the CUDA EP with I/O bound on the card. It
+does not import torch, because both stacks ship a `libcudnn.so.9`. It
+compares the output against the CPU session's output for the same seeded
+input (`DEV=cpu` writes that reference). One ampere job (`.probe/r167/job.sh`,
+job 39376600, gpu-q-27, A100-SXM4-80GB, MPS on, TF32 off in both engines,
+batch 1, 32x32) ran each arm solo, then 19 copies in E O G H H G O E order
+twice:
+
+| arm | solo ms a forward | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs CPU ORT |
+| --- | ---: | --- | ---: | ---: |
+| E torch eager (production) | 2.82 | 1,777 / 1,769 / 1,775 / 1,774 | - | (torch) |
+| O ORT CUDA EP, `EXHAUSTIVE` conv search | 2.41 | 1,745 / 1,740 / 1,740 / 1,739 | -2.0% | 7.2e-6 |
+| G as O, plus `enable_cuda_graph` | - | - / - / 1,724 / 1,722 | -2.9% | 7.2e-6 |
+| H ORT CUDA EP, `HEURISTIC` conv search | 2.50 | 1,715 / 1,718 / 1,724 / 1,721 | -3.1% | 6.8e-6 |
+
+(G's first pass crashed in the probe's post-loop check, which ran the graph
+session unbound. That was fixed between passes, so G has no solo time.)
+
+**Learned.**
+- Rejected. ORT's CUDA EP is 15% faster solo, because it has less per-forward
+  host work: 2.41 ms of wall and CPU against torch's 2.82. Under 19 MPS
+  copies, where the card is the bound (round 165), it is 2-3% slower in all
+  eight runs. The convolutions are cuDNN in both engines, so the card does
+  the same work, and ORT's choices (exhaustive search, its graph) do not
+  beat ATen's. Like `torch.compile`, it moves the output (~7e-6 from the CPU
+  path), so it would not be bit-identical either.
+- A shorter host path is not worth anything on a saturated card. That is
+  the same conclusion as rounds 122/130 (graphs) and 166 (Inductor's
+  shorter launch path). A GPU lever has to cut the card's kernel time, and
+  single-forward engines all end up on the same cuDNN kernels.
+- That leaves TensorRT (its own fp32 tactics, but a further ~3 GB of
+  libraries and results that move) and cross-request batching (round 127,
+  1.33x ceiling) as the only GPU options.
+- No search ran, so there are no `benchmarks.jsonl` rows. The job output is
+  `.probe/r167/job-39376600.out`.
+
+## Round 168 (positive probe): TensorRT for the GPU U-Net, +62% forwards on one A100 under MPS
+
+**Question.** Round 167 left TensorRT as the last single-forward engine. A GPU
+search is bound by the card (round 165), so only a lever that cuts the
+card's kernel time counts. Does TensorRT's fp32 engine put more forwards
+through one A100 under 19 MPS copies than torch eager does?
+
+**Probe.** `onnxruntime-gpu` 1.23.2's TensorRT EP needs `libnvinfer.so.10`
+and `libnvonnxparser.so.10`. `tensorrt-cu12-libs` 10.13.3 supplies both
+(2.8 GB without the Windows builder resource; carried as one file,
+`agent-node/trt-py.tar`, beside round 167's `ortgpu-py.tar`).
+`scripts/probe_ort_cuda.py` gained `EP=trt`. It preloads the TensorRT
+libraries from `TRT_LIBS`, puts the TensorRT EP in front of the CUDA EP with
+fp16 off and an engine cache, and asserts that the session really got the
+EP, because ORT otherwise falls back to the CPU without raising.
+`NVIDIA_TF32_OVERRIDE=0` keeps the builder off TF32 (TensorRT logs
+"Disabling TF32"). The engine is built once solo, in about 10 s, and the 19
+copies load it from the cache. One ampere job (`.probe/r168/job.sh`, job
+39379761, gpu-q-1, A100-SXM4-80GB, MPS on, batch 1, 32x32, the same
+`N1.onnx` and seeded input as round 167) ran each arm solo, then 19 copies
+in E T3 T5 T3G T3G T5 T3 E order, twice:
+
+| arm | solo ms a forward | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs CPU ORT |
+| --- | ---: | --- | ---: | ---: |
+| E torch eager (production) | 2.69 | 1,768 / 1,764 / 1,770 / 1,766 | - | (torch) |
+| T3 TensorRT EP, builder optimisation level 3 | 1.57 | 2,860 / 2,850 / 2,844 / 2,836 | **+61%** | 1.0e-5 |
+| T5 as T3, optimisation level 5 | 1.57 | 2,857 / 2,852 / 2,875 / 2,842 | +62% | 8.9e-6 |
+| T3G as T3, plus the EP's CUDA graph | 1.46 | 2,867 / 2,866 / 2,858 / 2,850 | +62% | 1.0e-5 |
+
+**Learned.**
+- TensorRT is the first GPU lever since MPS (round 119) that moves the card
+  bound: +61-62% forwards/s at 19 copies in every run. It is 42% faster
+  solo too. Unlike ORT's CUDA EP and Inductor, it does not end on the same
+  cuDNN kernels. It fuses the U-Net's conv, norm and activation layers and
+  picks its own fp32 tactics, so the card does less work per forward.
+- The builder's optimisation level (3 against 5) and the EP's CUDA graph
+  make no difference under load. Level 3, the default, with no graph is
+  enough.
+- Accuracy: with TF32 off, the output is 1e-5 (relative to the peak) from
+  the CPU ORT path. That is the same order as round 140's ORT-against-torch
+  gap (1.5e-5), which round 144 showed leaves log(Z) and the posterior
+  unchanged. GPU searches are already not bit-reproducible (round 165), so
+  an end-to-end check must judge log(Z) within sigma.
+- **Not yet shipped. Expect about +30% end to end, not +62%.** A request
+  walks N1..N25, so round 165's 43.4 evals/s is ~1,085 forwards/s. That
+  is ~61% of the card's 1,774 eager forwards/s; the rest of the card's
+  time is the request's data prep. Cutting the forward by 1.62x gives
+  1/(0.39 + 0.61/1.62), ~1.3x evals/s for a 1-GPU search. Integration has
+  one obstacle. The pool process imports CUDA 13 torch for data prep, and
+  `onnxruntime-gpu` is a CUDA 12 build, and both load a `libcudnn.so.9`.
+  The cleaner route is TensorRT's own Python API from `tensorrt-cu13`,
+  which matches the image's CUDA and runs the engine on torch's device
+  buffers. Its engine can be built from the same `N1.onnx` with TensorRT's
+  ONNX parser and installed into `$RI_WORK_DIR/.cache/ri` the way
+  `R2D2_RUNTIME=onnx` installs onnxruntime, with no SIF rebuild. Then a
+  raced 1-GPU search A/B (warm-up arm first, log(Z) within sigma) decides
+  it.
+- No search ran, so there are no `benchmarks.jsonl` rows. The job output is
+  `.probe/r168/job-39379761.out`.
+
+## Round 169 (positive probe): tensorrt-cu13 beside torch in one process, +64%
+
+**Question.** Round 168 measured TensorRT through `onnxruntime-gpu`, a CUDA
+12 stack that cannot share the pool process with the image's CUDA 13 torch
+(both load a `libcudnn.so.9`). Does TensorRT's own Python API, from CUDA 13
+wheels, run in a torch process on torch's device buffers with the same
+gain? That is the shape the pool needs.
+
+**Probe.** `tensorrt-cu13` 11.4.0.106 (`uv pip install --python-version
+3.10 --target`, no deps; 4.4 GB as shipped, 1.2 GB after dropping the
+Windows and non-sm80 builder resources, carried as one file,
+`agent-node/trt13-py.tar`) on `PYTHONPATH` inside `r2d2-cuda.sif`, no
+rebuild. `scripts/probe_trt.py` imports torch first, builds an engine from
+round 168's `N1.onnx` with TensorRT's ONNX parser (TF32 flag cleared,
+one 1x2x32x32 profile), binds torch tensors' `data_ptr()` as input and
+output, and runs `execute_async_v3` on torch's stream. Every timed forward
+then waits on a blocking CUDA event, as `patch_cuda_network` does.
+`EAGER=1` times torch eager in the same process instead, so both arms carry
+the TensorRT engine and compare outputs. One ampere job (`.probe/r169/job.sh`,
+job 39382083, gpu-q-77, A100-SXM4-80GB, driver 595.112, MPS on) ran each arm
+solo and then 19 copies in E T T E order, twice:
+
+| arm | solo ms a forward | 19 copies, forwards/s (4 runs) | vs eager | maxrel vs CPU ORT |
+| --- | ---: | --- | ---: | ---: |
+| E torch eager (production) | 3.12 | 1,748 / 1,743 / 1,750 / 1,673 | - | (torch; TensorRT vs eager 1.2e-5) |
+| T tensorrt-cu13 11.4, fp32, in the torch process | 1.57 | 2,872 / 2,859 / 2,859 / 2,858 | **+64%** | 8.9e-6 |
+
+**Learned.**
+- The integration route works. TensorRT's CUDA 13 wheels load beside torch
+  2.13+cu130 with no library clash, build the engine in 11 s (213 MB) and
+  run it on torch's buffers. The gain matches round 168's ORT-hosted
+  engine (+61-62%), so the EP added nothing and costs nothing.
+- Host time a forward falls from 2.85-3.07 to 0.38 CPU-ms solo, which
+  leaves CPU for data prep, though round 165 says the card, not the CPU,
+  is the bound.
+- Accuracy: TensorRT is 8.9e-6 from the CPU ORT path and 1.2e-5 from
+  torch eager on the card, the same order as round 140's ORT-vs-torch gap.
+- TensorRT warns "Using default stream in enqueueV3()" and adds a
+  `cudaStreamSynchronize` when given torch's default stream. It cost
+  nothing measurable here, but the pool should run the engine on its own
+  `torch.cuda.Stream`.
+- Memory is the open question before wiring it in. Each worker
+  deserialises its own engines, and a plan is 213 MB against the 124 MB of
+  fp32 weights it carries, so 25 checkpoints in 19 workers would be ~100 GB
+  if the plan size is what stays resident. Eager's per-worker weight cache
+  is already 25 x 124 MB, ~59 GB across 19 workers, so this needs a
+  measured device footprint. If it does not fit, the options are engines
+  built lazily per iteration, or one refittable engine (`REFIT`,
+  `STRIP_PLAN`) with each iteration's weights swapped in.
+- No search ran, so there are no `benchmarks.jsonl` rows. The job output is
+  `.probe/r169/job-39382083.out`.
+
+## Round 170 (positive probe): 25 TensorRT engines per worker fit 12 copies on an A100, +84% forwards
+
+**Question.** Round 169 left device memory open. A GPU worker holds all 25
+iterations' nets, and a TensorRT plan is 213 MB against 124 MB of fp32
+weights. How much does a worker with 25 engines actually hold, how many
+workers fit on an 80 GB A100, and does TensorRT still win at that count
+when each forward steps through N1..N25 the way a request does?
+
+**Probe.** `scripts/probe_trt_memory.py` (tensorrt-cu13 11.4 inside
+`r2d2-cuda.sif` as in round 169, no rebuild). It builds N1..N25.onnx into
+fp32 plans (TF32 off, 1x2x32x32, 258 s for all 25, 5.3 GB, cached in
+`$RI_WORK_DIR/.cache/ri/trt-probe/a100-fp32`), then loads one worker's
+worth and reads `cudaMemGetInfo` after each step. The engine arm (T) holds
+25 engines; with `SHARED=1` all 25 contexts share one user-managed
+activation buffer. The eager arm (E) holds 25 checkpoints' weights on the
+card, as `_CUDA_WEIGHTS` does, and calls `load_state_dict(assign=True)` before
+each forward. Both arms time forwards cycling N1..N25, and each forward
+waits on a blocking event, as `patch_cuda_network` does. Jobs
+`.probe/r170/job.sh` (39383558, gpu-q-22) and `job2.sh` (39387935,
+gpu-q-44), A100-SXM4-80GB, MPS restarted for each arm in job 2.
+
+| arm | copies | forwards/s (2 runs) | vs best eager | ms a forward | peak GPU memory |
+| --- | ---: | --- | ---: | ---: | ---: |
+| E eager, solo | 1 | 240 | | 4.16 | 3.9 GB (3,142 MB of weights, 126 MB a net) |
+| T TensorRT, solo | 1 | 629 | | 1.59 | 5.6 GB (5,140 MB of engines, 206 MB a net) |
+| T, shared activations, solo | 1 | 629 | | 1.59 | 5.6 GB (5,112 MB) |
+| E | 12 | 1,335 / 1,344 | -9% | 8.9-9.0 | 46.2 GB |
+| E | 16 | 1,481 / 1,466 | - | 10.8-10.9 | 61.5 GB |
+| E | 19 | crashed (`unspecified launch failure`) | | | 73.1 GB |
+| **T, shared activations** | **12** | **2,688 / 2,728** | **+84%** | 4.4-4.5 | 66.4 GB |
+
+**Learned.**
+- A deserialised engine holds about 206 MB of device memory, close to its
+  213 MB plan, so 25 of them take 5.1 GB a worker against eager's 3.1 GB.
+  Activations are only 1.5 MB an engine at 32x32, so a shared
+  user-managed buffer saves just 28 MB. Each process's CUDA context adds
+  about 0.45 GB. So an 80 GB A100 holds 12 TensorRT workers (66 GB), not
+  the 19 eager ones that production runs (67.9 GB, round 124).
+- TensorRT still wins at that count. 12 TensorRT copies push 2,688-2,728
+  forwards/s, against eager's best of 1,466-1,481 at 16 copies (+84%) and
+  1,335-1,344 at 12 copies (+102%). Cycling through 25 nets costs eager more
+  than one net does: 4.16 ms solo against round 169's 3.12 ms, because
+  `load_state_dict` runs before every forward. TensorRT's 25 contexts cost
+  nothing over its one (1.59 ms either way).
+- The end-to-end gain is smaller than the forward gain, because a GPU
+  search's ranks are its workers. Round 124's 19-rank request was ~350 ms,
+  of which ~25 x 11 ms was forwards. At 12 ranks with 25 x 4.4 ms of
+  forwards, a request would be ~190 ms, about 12/0.23 s ~ 52 evals/s with
+  simulate added, against 43.4: roughly +20%, to be measured. Integration
+  must therefore size GPU ranks from a TensorRT per-worker memory figure
+  (~5.6 GB) rather than eager's ~3.6 GB.
+- An eager arm at 19 copies here reached 73 GB (the probe's process also
+  carries tensorrt and a spare net) and died with `cudaErrorLaunchFailure`.
+  That took down the MPS server, every later arm in the job, and the next
+  job on the same node (gpu-q-22: error 805, `nvidia-cuda-mps-control quit`
+  hung until scancel). The fix is to exclude a node after an MPS fault,
+  and to start and quit MPS for each arm.
+- The `intr` QOS allows one job per user at a time, including one still
+  completing, so a replacement job cannot be submitted until the old one
+  is cancelled.
+- No search ran, so there are no `benchmarks.jsonl` rows.
+
+## Round 171 (shipped opt-in): `R2D2_RUNTIME=trt` in the GPU pool, +4% end to end
+
+**Question.** Rounds 168-170 measured TensorRT at +84% forwards through
+an A100 at the 12 workers that fit. Wired into the pool, what does a 1-GPU
+search gain?
+
+**Change.** `R2D2_RUNTIME=trt` with `--device cuda` (GPU only; the GPU
+default stays torch). The run script pip-installs `tensorrt-cu13==11.4.0.106`
+(`--no-deps`, 2m38s once, 2.6 GB after it drops the Windows builder
+resources) into `$RI_WORK_DIR/.cache/ri/r2d2-trt`, beside the onnxruntime
+cache that the export needs. `patch_trt_network` (`r2d2_serve.py`) exports
+the checkpoints (`export_onnx`, split out of `patch_onnx_network`) and builds
+missing fp32 plans (TF32 off, fixed 1x2xDIMxDIM) in a child process, because
+the pool parent must not make a CUDA context. The plans are cached per
+checkpoint set, TensorRT version, GPU model and image size (25 plans in
+~5 minutes, the first time only). Each worker deserialises its engines on
+first use. A forward of another shape or dtype runs eager. GPU ranks are
+sized from `NS_R2D2_CUDA_TRT_MB_PER_RANK = 6144` (12 on an 80 GB card).
+`<run>/r2d2-engine.txt` records which engine ran, since warm-up output
+goes to /dev/null.
+
+**Run.** Job 39390703, gpu-q-20, 1 x A100-SXM4-80GB, 32 CPUs, MPS.
+`./ri search r2d2 --device cuda --nlive 48 --num-repeats 5 --max-ndead 150
+--seed 4242` as in round 165, alternating E (`R2D2_RUNTIME=torch`, 19 ranks)
+and T (`trt`, 12 ranks), after a warm-up arm.
+
+| arm | ranks | evals/s | R2D2 request, ms | simulate, ms | GPU peak | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| E1 | 19 | 43.3 | 345 | 56 | 67.9 GB | 0.01376 +/- 0.00360 |
+| T1 | 12 | 47.7 | 178 | 38 | 64.7 GB | 0.01385 +/- 0.00332 |
+| E2 | 19 | 45.6 | 332 | 41 | 67.9 GB | 0.01637 +/- 0.00259 |
+| T2 | 12 | 47.5 | 182 | 34 | 64.7 GB | 0.01562 +/- 0.00254 |
+| E3 | 19 | 44.8 | 341 | 41 | 67.9 GB | 0.01665 +/- 0.00254 |
+| T3 | 12 | 44.3 | 197 | 33 | 64.7 GB | 0.01741 +/- 0.00189 |
+
+Means: E 44.6, T 46.5 evals/s (+4%), and the arms' ranges overlap
+(43.3-45.6 against 44.3-47.7). Every log(Z) agrees within about 1 sigma.
+
+**Learned.**
+- TensorRT cuts a GPU request by 45% (mean 339 to 186 ms), but the search
+  gains only ~4%, because memory holds it to 12 ranks against eager's 19.
+  The card now runs at 58% utilisation, so it is no longer the bound; the
+  rank count is. 12 workers peaked at 64.7 GB, ~5.4 GB each, so 14 would
+  fit in 95% of the card (75.6 GB). The next step is to measure 13-14 ranks
+  (`NS_R2D2_CUDA_TRT_MB_PER_RANK=5500`). Cutting an engine's footprint
+  (weight-stripped or refittable plans sharing one weight copy) would allow
+  more.
+- **Bug found and fixed:** the first export ran `torch.onnx.export`, a CPU
+  forward, in the pool parent on its 3 OpenMP threads (32 CPUs over 12
+  ranks). libgomp's thread pool does not survive `fork`, so every forked
+  worker deadlocked in a futex on its first torch op. The 0.0-CPU workers
+  never touched the GPU, and the search sat at "generating live points"
+  until it was killed (the warm-up arm, rc 143). This reproduces on CPU
+  (fork after a 3-thread export: the child hangs; after a 1-thread export
+  it exits 0). `export_onnx` now exports on one thread. A CPU run with
+  `R2D2_OMP_THREADS > 1` and no cached export had the same latent hang.
+- CPU default unchanged: a base/new pair of 38 x 1 `--max-ndead 100`
+  searches on cpu-q-119 gave 18.4/17.2 against 18.3/17.8 evals/s with the
+  same request times. That node was slow throughout (simulate at
+  ~155 ms against 43-49 on cpu-q-228), so these rows are a check of the
+  code path, not of speed. One open point: the first 38 x 1 smoke run
+  hit an ordering bug, since fixed before commit (`patch_onnx_network`
+  imported onnxruntime before `export_onnx` put it on `sys.path`, so
+  warm-up fell back to torch). It measured 1,369 ms a request against
+  ONNX's 1,628-1,687 on the same node. That is a single sample on a
+  loaded node, but it is worth a torch-vs-onnx recheck on whatever node
+  the next CPU job lands on.
+- No WSClean A/B: no WSClean code path changed (`defaults.toml` only gained
+  a key).
+
+Rows: `r171-E1`..`r171-T3`, `r171-cpu-*` in `benchmarks.jsonl`. Run
+directories deleted. Plans are cached in
+`$RI_WORK_DIR/.cache/ri/r2d2-trt/plans` (5.3 GB).
+
+
+## Round 172 (negative): more TensorRT ranks per A100, or fewer CPU threads each, gain nothing
+
+**Question.** Round 171 left the TensorRT GPU search at 12 ranks, with the
+card at ~58% utilisation and 15 GB unused. Do 13 or 14 ranks
+(`NS_R2D2_CUDA_TRT_MB_PER_RANK=5900` or `5500`), or 1-2 CPU threads a rank
+instead of the default 3, run faster?
+
+**Run.** Two ampere jobs, 1 x A100-SXM4-80GB, 32 CPUs, MPS.
+`R2D2_RUNTIME=trt ./ri search r2d2 --device cuda --nlive 48 --num-repeats 5
+--max-ndead 150 --seed 4242`, arms rotated, 3 passes after a warm-up arm.
+14 workers peaked at 75.8 GB (13 at 71.6, 12 at 64.7) and no evaluation
+failed.
+
+| node | arm (ranks x threads) | evals/s (3 passes) | mean | request, ms | simulate, ms |
+| --- | --- | --- | ---: | ---: | ---: |
+| gpu-q-4 | 12 x 3 (default) | 51.3, 55.3, 45.3 | 50.6 | 161-192 | 27-35 |
+| gpu-q-4 | 13 x 3 | 45.0, 46.5, 42.0 | 44.5 | 201-219 | 40-44 |
+| gpu-q-4 | 14 x 3 | 42.9, 46.7, 47.5 | 45.7 | 221-239 | 36-43 |
+| gpu-q-17 | 12 x 3 (default) | 40.8, 39.5, 39.8 | 40.0 | 214-219 | 38-44 |
+| gpu-q-17 | 12 x 2 | 42.0, 43.3, 44.1 | 43.1 | 198-208 | 34-37 |
+| gpu-q-17 | 14 x 2 | 43.4, 43.6, 48.9 | 45.3 | 212-240 | 38-41 |
+| gpu-q-17 | 14 x 1 | 44.0, 42.7, 42.0 | 42.9 | 241-248 | 36-44 |
+
+Every log(Z) is 0.013-0.018 (+/- 0.002-0.004), in agreement.
+
+**Learned.**
+- No lever. Pooled over both nodes, the default 12 x 3 averages 45.3
+  evals/s and every 13- or 14-rank arm 43-46. The ranking flips between
+  nodes: 12 x 3 was best on gpu-q-4 by 10% and worst on gpu-q-17 by 7-12%.
+  Defaults are unchanged.
+- The request time grows with the rank count about as fast as the ranks
+  do (12 -> 14 ranks: request +17-35%), so the card or the MPS server is
+  already the bound at 12 TensorRT workers. nvidia-smi's sampled ~55-60%
+  "utilisation" does not show it, so it is not a sign of headroom. Spare
+  card memory buys nothing until a single forward gets cheaper.
+- Fewer CPU threads a rank does not hurt (12 x 2 >= 12 x 3 on gpu-q-17),
+  so the GPU request is not CPU-bound at 32 cores either.
+- A 150-dead-point GPU search (~60 s) varies by +/-10% between repeats of
+  one arm on one node (45.3-55.3), and its evaluation count by 25%
+  (2,311-2,910 at the same seed, since asynchronous ranks change the
+  stream). Only differences above ~15% show at this length, and between
+  nodes only interleaved arms are comparable. Round 171's +4% was inside
+  this noise.
+- The first arm of a job on a fresh node runs at 18-26 evals/s (cold plan
+  and SIF reads), so a warm-up arm is required.
+
+Rows: `r172-*` in `benchmarks.jsonl`. Run directories deleted.
+
+## Round 173 (null): TensorRT against eager at 600 dead points, and onnx against torch on CPU, rechecked
+
+**Question.** Rounds 171-172 put TensorRT's end-to-end gain (+4%) inside
+the +/-10% noise of a 150-dead-point GPU search. Does a 4x longer search
+settle it? And round 171 left a single CPU sample (cpu-q-119) in which torch
+ran a request faster than onnx. Does that hold up?
+
+**GPU run.** Job 39398852, gpu-q-25, 1 x A100-SXM4-80GB, 32 CPUs, MPS.
+`./ri search r2d2 --device cuda --nlive 48 --num-repeats 5 --max-ndead 600
+--seed 4242`, with E (`R2D2_RUNTIME=torch`, 19 ranks) and T (`trt`, 12 ranks)
+in ABBA order (T E E T T E), after a TensorRT warm-up arm (46.8 evals/s).
+No evaluation failed.
+
+| arm | evals | sampling wall, s | evals/s | request, ms | simulate, ms | GPU peak | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| T1 | 8,044 | 131 | 61.3 | 143 | 29 | 64.7 GB | 0.01889 +/- 0.00064 |
+| E1 | 11,051 | 189 | 58.6 | 272 | 29 | 67.9 GB | 0.01869 +/- 0.00058 |
+| E2 | 9,385 | 150 | 62.7 | 248 | 31 | 67.9 GB | 0.01911 +/- 0.00063 |
+| T2 | 9,911 | 170 | 58.2 | 150 | 32 | 64.7 GB | 0.01894 +/- 0.00064 |
+| T3 | 9,412 | 146 | 64.3 | 135 | 29 | 64.7 GB | 0.01790 +/- 0.00102 |
+| E3 | 9,175 | 181 | 50.8 | 299 | 47 | 67.9 GB | 0.01902 +/- 0.00061 |
+
+Means: T 61.3, E 57.4 evals/s (+7%). Sampling wall to 600 dead points:
+T 149 s, E 173 s (-14%). A request: T 143 ms, E 273 ms (-48%). The
+evals/s ranges overlap (58.2-64.3 against 50.8-62.7), and the evaluation
+count at one seed varies by 37% (8,044-11,051). Every log(Z) agrees within
+about 1 sigma.
+
+**CPU run.** On this job's 38 icelake CPUs (cpu-q-119), two 19 x 1 searches
+were raced on disjoint halves of the allocation (`taskset`), onnx against
+torch, and the halves swapped for the second pass.
+`--nlive 48 --num-repeats 5 --max-ndead 100 --seed 4242`.
+
+| pass | onnx evals/s | torch evals/s | onnx request, ms | torch request, ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 19.1 | 15.8 | 855 | 1,060 |
+| 2 | 19.7 | 15.9 | 832 | 1,046 |
+
+onnx is +22% evals/s and -20% a request, and log(Z) agrees
+(0.0132-0.0142 +/- 0.005). Round 171's torch sample was a fluke, and
+the CPU default stays onnx.
+
+**Learned.**
+- TensorRT is ahead in 4 of 6 interleaved pairs over rounds 171 and 173
+  (+4% and +7% evals/s). Its request time is halved, but the search gains
+  single digits because only 12 ranks fit against eager's 19. At this run
+  length the gain still cannot be told apart from noise, so `trt` stays
+  opt-in. Its first-use cost (a 2.6 GB pip install and ~5 minutes of plan
+  builds) is also not worth making a default for a gain this small.
+- At 600 dead points a GPU search runs ~60 evals/s against round 172's
+  ~45 at 150, on both engines. The short runs were dominated by ramp-up
+  (or gpu-q-25 is a faster node), so short GPU rows understate the rate
+  a long search reaches, and they are comparable only within one job.
+- Evaluations per dead point vary by over a third at one seed (8.0k-11.1k
+  for 600 dead points), since asynchronous ranks change the stream. That
+  noise is larger than the engine effect, so a search's evals/s, not its
+  wall time, is the metric to compare. A wall-time comparison needs many
+  more pairs.
+- cpu-q-119 ran at normal speed this time (simulate 49-52 ms, against
+  round 171's ~155 ms there), so round 171's slowness was transient load,
+  not the node.
+- Sharp edge: two concurrent probes that both used `r173-T1`-style names
+  under `results/nested-sampling` collided, because the GPU job and this
+  node share the RDS working tree, and the GPU arm's `rm -rf` deleted the
+  CPU run's directory. The benchmark rows had already been written. Give
+  each concurrent job a distinct run-name prefix.
+- No code changed, so no WSClean A/B.
+
+Rows: `r173-warm`, `r173-T1`..`r173-E3` (GPU), `r173-cpu-onnx-*` and
+`r173-cpu-torch-*` (CPU) in `benchmarks.jsonl`. Run directories deleted.
+
+## Round 174 (diagnostic): R2D2 evaluations per SL3 charging unit, CPU against GPU
+
+**Question.** Rounds 117 and 160 left one question open: what does an R2D2
+evaluation cost in what CSD3 actually charges? Is a GPU search worth its
+GPU hours, and which CPU job shape gets the most evaluations per core-hour?
+No search was run. Every figure below comes from rows already in
+`benchmarks.jsonl`, measured on the shipped defaults.
+
+**Charging.** CSD3's [policies page](https://docs.hpc.cam.ac.uk/hpc/user-guide/policies.html)
+charges 1 credit for 1 CPU core for 1 hour, and 1 credit for 1 GPU for 1
+hour. The 32 cores that come with each A100 are not charged separately
+(`docs/cluster.md`). A PI's free SL3 allowance is **200,000 core-hours and
+3,000 GPU hours per quarter**, as two separate budgets. Paid prices are
+behind Raven (`csd3.cam.ac.uk/charges`), so they are not compared here.
+
+| shape (defaults) | rows | evals/s | request, ms | charged per hour | evals per charged hour |
+| --- | --- | ---: | ---: | ---: | ---: |
+| half icelake, 38 x 1, onnx | r151-*, r153-*, r158-perf (12 runs, nlive 100, 400 dead) | 45.9 | 732 | 38 core-h | **4,350 per core-h** |
+| whole icelake, 76 x 1, sessions per NUMA node | r149-new-a/b (nlive 200, 1000 dead) | 80.5 | 857 | 76 core-h | 3,810 per core-h |
+| whole sapphire, 112 x 1, sessions per NUMA node | r150-new-a/b (nlive 200, 1000 dead) | 116.9 | 845 | 112 core-h | 3,760 per core-h |
+| one A100, MPS, 19 ranks, torch | r173-E1..E3 (nlive 48, 600 dead) | 57.4 | 273 | 1 GPU-h | **206,000 per GPU-h** |
+| one A100, MPS, 12 ranks, `R2D2_RUNTIME=trt` | r173-T1..T3 | 61.3 | 143 | 1 GPU-h | 221,000 per GPU-h |
+
+**Learned.**
+- **One A100 hour does the work of 47-55 CPU core-hours** (47-59 with
+  `trt`). The two SL3 budgets are separate, so a project that uses only
+  CPUs leaves the GPU allowance unspent. At these rates, 200,000 core-hours
+  buy 750-870M evaluations a quarter, and 3,000 GPU hours another ~620M.
+  Using both raises a quarter's R2D2 evaluations by **~70-80%**, so GPU
+  searches belong in production alongside CPU ones, not instead of them.
+  With paid hours, the GPU pays only if a GPU hour costs less than ~50
+  core-hours.
+- **Half nodes give ~15% more evaluations per core-hour than whole nodes.**
+  That corrects round 160's job-shape advice, which said whole nodes gave
+  the best per-core rate. A request takes 732 ms on a half icelake node
+  against 845-857 ms on whole icelake or sapphire nodes. The likely cause
+  is memory bandwidth: the forward is bandwidth-bound under load (round
+  160), and a half node shares the bandwidth with whatever its neighbour
+  runs. The half-node rows also come from a slightly newer tree
+  (rounds 151-153, ~1.5% of a request), but the gap is ten times that.
+  Whole nodes are still the faster *wall clock* (117 against 46 evals/s for
+  one search). So choose by the binding constraint. When core-hours bind,
+  run several half-node searches. When time to one answer binds, run a
+  whole sapphire node.
+- Time to one answer: the 22 Sep production search (~65k evaluations,
+  round 115) takes about 9 minutes on a whole sapphire node, 14 on a whole
+  icelake node, 19 on one A100 and 24 on a half icelake node.
+- Caveats. The GPU rows use nlive 48 and a shorter search than the CPU
+  rows. Round 173 showed that short GPU searches understate their
+  long-run rate, so the GPU figure is a floor. The half-node rows' neighbour
+  load is unknown. Production neighbours that are themselves
+  bandwidth-heavy would shrink the half-node advantage. A raced pair (two
+  38-rank halves of one whole node against one 76-rank search, same tree)
+  would settle that figure.
+- No code changed, so no WSClean A/B, and no new `benchmarks.jsonl` rows.
+
+## Round 175 (negative): fp16 TensorRT engines, 2x forwards but 1e-2 off float32
+
+**Question.** Rounds 172-173 left the A100 itself as the bound at 12
+TensorRT fp32 workers, so only a cheaper forward helps. TF32 was rejected
+in round 125. Do half-precision engines cut the card's time per forward,
+and how far do they land from float32?
+
+**Probe.** TensorRT 11.4 has no `BuilderFlag.FP16`, only strongly typed
+networks. So `scripts/probe_trt_memory.py` gained `PREC=fp16`: each
+checkpoint is exported again as `net.half()` wrapped in float32 casts
+(input and output stay float32) and built with `STRONGLY_TYPED`. The
+image's torch has no `onnx` module, so the export borrows the
+`r2d2-onnx/py` install that `R2D2_RUNTIME=onnx` already caches. `ACC=1`
+compares each engine with torch eager float32 on the card (TF32 off) on
+seeded inputs at scales 1e-3, 1 and 1e3, and reports the max abs
+difference over the eager output's peak. One ampere job
+(`.probe/r175/job.sh`, 39401129, gpu-q-17, A100-SXM4-80GB, MPS restarted
+per arm, batch 1, 32x32, 25 engines a worker walking N1..N25, shared
+activation buffer as in round 170). The first job (39400761) died on the
+missing `onnx` module, but its fp32 accuracy pass finished and is quoted
+below.
+
+| arm | copies | forwards/s (2 runs) | vs fp32 x 12 | ms a forward | peak GPU memory | worst maxrel vs eager fp32 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| fp32, solo | 1 | 633 | | 1.58 | 5.6 GB (204 MB a net) | 9.9e-6 (all 25 nets 0.9-9.9e-6) |
+| fp16, solo | 1 | 1,111 | | 0.90 | 2.0 GB (62 MB a net) | 5.6e-2 (N1); N2-N25 6e-3 to 2.7e-2 |
+| fp32 (production `trt`) | 12 | 2,689 / 2,707 | - | 4.4-4.5 | 66.4 GB | |
+| fp16 | 12 | 5,573 / 5,645 | **+108%** | 2.1-2.2 | 23.6 GB | |
+| fp16 | 19 | 6,050 / 6,137 | +126% | 3.2-3.3 | 37.3 GB | |
+
+**Learned.**
+- fp16 halves the card's time per forward and cuts an engine to 62 MB,
+  so 19 workers fit in 37 GB where fp32 fits 12 in 66 GB. By round 168's
+  model (forwards ~61% of a GPU request's card time) that is ~1.4x evals/s
+  for a 1-GPU search, more if 19 ranks also cover simulate time.
+- **Rejected on accuracy.** Each fp16 net is 0.6-1.5% of the peak off
+  float32 (N1 5.6%), the same at every input scale, against 1e-5 for the
+  fp32 engine and round 140's 1.5e-5 that round 144 showed leaves log(Z)
+  alone. A request chains 25 nets, so the error compounds. This is 1000x
+  outside anything validated, and the rule is to trade no result for
+  speed, so no search was run with it.
+- The error is spread over every net, not one bad layer. A mixed-precision
+  engine (InstanceNorm and the first and last convolutions in float32) is
+  the only fp16 route left. It needs a per-layer accuracy sweep before any
+  speed number means anything.
+- Building 25 strongly typed fp16 plans took 330 s (1.57 GB on disk).
+  They were deleted after the job.
+- No search ran and no code outside the probe changed, so there are no
+  `benchmarks.jsonl` rows and no WSClean A/B.
+
+## Round 176 (diagnostic): two socket-bound searches on a whole icelake node give +9% total, but each one takes twice as long
+
+**Question.** Round 174 found that a request takes 732 ms on this loop's
+half icelake node against 845-857 ms on whole nodes. Is that because a
+whole-node search has some inefficiency, or because a half node's
+neighbour was idle?
+
+**Run.** One exclusive whole icelake node (cpu-q-60, job 39403468). The
+tree was `git archive 21c7330` in `/dev/shm`, with the onnx defaults,
+nlive 200, 5 repeats, 1000 dead points, seed 4242 and async. Each **W**
+arm was one 76-rank search (one session set per socket, round 149). Each
+**H** arm was two 38-rank searches run at the same time, each under
+`numactl --cpunodebind=N --membind=N`, so each took the single-socket
+path. The order was a 300-dead warm-up, then W1, H1, H2, W2
+(`.probe/r176/`).
+
+| arm | ranks | evals | wall s | evals/s | request ms | simulate ms | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W1 | 76 | 17,234 | 204 | 84.6 | 820 | 51 | 13,753 | 0.01776 ± 0.00043 |
+| H1 socket 0 | 38 | 17,824 | 405 | 44.0 | 782 | 50 | 7,305 | 0.01755 ± 0.00047 |
+| H1 socket 1 | 38 | 19,898 | 430 | 46.2 | 747 | 46 | 7,263 | 0.01739 ± 0.00049 |
+| H2 socket 0 | 38 | 18,132 | 400 | 45.3 | 762 | 47 | 7,354 | 0.01799 ± 0.00035 |
+| H2 socket 1 | 38 | 16,844 | 344 | 49.0 | 711 | 36 | 7,499 | 0.01809 ± 0.00036 |
+| W2 | 76 | 17,656 | 209 | 84.6 | 819 | 51 | 13,513 | 0.01761 ± 0.00052 |
+
+**Result.** The two halves together run **90.2 and 94.3 evals/s, against
+84.6 and 84.6** for one whole-node search (+9%). The request takes 751 ms
+against 820 ms (-8%). That matches the half-node allocation's per-core
+rate (round 174: 4,350 evals per core-hour, which is 1.21 evals/s per
+core; the halves here give 1.19-1.24). All log(Z)s agree within their
+errors.
+
+So most of round 174's 15% is real and specific to running one search
+across two sockets, not to an idle neighbour. Whole nodes still finish a
+single search about twice as fast (204-209 s against 344-430 s for the
+same 1000 dead points), so the job-shape advice stands: run one
+whole-node search when one answer is wanted soon, and pack socket-bound
+searches when many are queued.
+
+**Learned.**
+- A 76-rank search loses ~8% per request to something that two
+  independent socket-bound searches avoid. The workers are already
+  pinned and read their own socket's weights (round 149), so the
+  candidates are the unpinned processes: the PolyChord ranks and MPI
+  (`--bind-to none`), the pool parent, and the simulate/MeqTrees
+  sidecars, which float across sockets and touch remote memory.
+  Socket 0 also runs about 4% slower than socket 1 in both H arms
+  (44.0/45.3 against 46.2/49.0), which suggests that the shared or OS
+  work lands there. Next check: pin each PolyChord rank and its
+  simulate sidecar to the socket of the worker it feeds, then rerun W.
+- Two concurrent searches in one tree on one node (round 154's case)
+  ran cleanly with distinct `--output-dir`s; neither reaped the other.
+- Rows `r176-*` were built from `git archive` and so logged commit
+  `unknown`; they were rewritten to `21c7330`. Run directories were in
+  `/dev/shm` and are gone. No code changed, so there was no WSClean A/B.
+
+## Round 177: an R2D2 rank and its simulate worker follow their R2D2 worker's socket, +3.5% on a whole node
+
+**Question.** Round 176 found that a 76-rank search loses ~8% a request
+against two socket-bound halves, and named the processes nobody pins as
+the suspects. Where does each one actually run?
+
+**Cause.** The R2D2 `mpirun` (unlike WSClean's) has no `--bind-to none`,
+so Open MPI binds every rank to a socket by its own rule. The pool puts
+worker *i* on a node by its place in the string-sorted FIFO list
+(`r2d2_serve.worker_nodes`). The two rules disagree for about half the
+ranks: sampled 2 minutes into each HEAD arm, **36 of 76 ranks ran on the
+other socket from their R2D2 worker**. The simulate worker was not
+pinned at all. The rank, its simulate worker and its R2D2 worker hand
+each other the MS and the visibilities through files in `/dev/shm`, so
+for those 36 the pages were on the far socket.
+
+**Change.** `follow_r2d2_worker_node` (`common.py`) reads the R2D2
+worker's affinity from its `.pid` and moves every thread of the rank and
+of its simulate worker's process tree there. `polychord_r2d2.py` calls it
+once, after the rank's first evaluation and not at connect: the pool
+parent holds both FIFO ends, so a rank connects before its worker has
+forked onto its node, and the `.pid` is not there yet. That is why the
+first attempt, called right after `warm()`, moved nothing (an A/A pair
+gave 86.0 against 87.6 evals/s). It does nothing when the worker may run
+anywhere the rank may: a single-socket job, a shared checkpoint copy, the
+GPU pool, or `NS_PIN_CPUS=0`. New `self_check_follow_worker_node` (host
+runnable, in `test_self_checks.py` and `./ri self-check r2d2`).
+
+**Run.** One exclusive whole icelake node (cpu-q-170, job 39408338).
+Trees were `git archive 4e8156d` (A) and the same plus this diff (B) in
+`/dev/shm`. Onnx defaults, 76 ranks, nlive 200, 5 repeats, 1000 dead
+points, seed 4242, async, with a 300-dead warm-up and then A B B A
+(`.probe/r177/`).
+
+| arm | ranks on worker's CPUs | evals | wall s | evals/s | request ms | simulate ms | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | 40/76 | 14,880 | 184 | 81.1 | 851 | 53 | 13,753 | 0.01807 ± 0.00035 |
+| B1 | 76/76 | 15,424 | 181 | 85.1 | 819 | 47 | 13,469 | 0.01806 ± 0.00035 |
+| B2 | 76/76 | 15,278 | 179 | 85.2 | 819 | 47 | 13,615 | 0.01799 ± 0.00035 |
+| A2 | 40/76 | 15,654 | 187 | 83.6 | 824 | 58 | 13,583 | 0.01803 ± 0.00035 |
+
+**Result.** **85.1/85.2 against 81.1/83.6 evals/s (+3.5%)**, with both B
+arms above both A arms. Simulate drops from 53-58 to 47 ms and the
+request from 824-851 to 819 ms. All four log(Z)s agree. That is under the
+~5% three-repeat noise floor end to end, but the stage times move the way
+the cause predicts and the B arms are tight. It closes about 4 points of
+round 176's 8-9%.
+
+**WSClean guard.** `common.py` gained only functions that the WSClean
+path never calls. Even so, two raced pairs of 18-rank WSClean searches
+on this half node (A = 4e8156d, B = this diff; synchronous, nlive 100,
+400 dead, seed 4242) gave 27.9/28.4 (A) against 28.0/28.3 (B) evals/s,
+with **byte-identical chains** in all four arms (`.probe/r177w/`).
+
+**Learned.**
+- R2D2 ranks are socket-bound by Open MPI's default binding; WSClean's
+  are not (`--bind-to none`, one pinned CPU each). Any per-socket
+  placement in the R2D2 pool has to be matched to the rank, not assumed.
+- A pooled worker's `.pid` appears only when its forked child starts
+  answering, after the rank has connected. Anything that needs the
+  worker's placement must wait for its first reply.
+- What is left of round 176's gap (~4-5%) is something else: the pool
+  parent, MPI's shared-memory segments, or remote page-cache pages of
+  the run's files. Next check: the same A/B with the rank's evaluation
+  directory and MS on the worker's node (first touch by the rank, now
+  local) against round 176's halves.
+- Rows `r177-*` and `r177w-*` were built from `git archive`; their commit
+  was rewritten to 4e8156d, with `dirty: true` on the B arms. Run
+  directories were in `/dev/shm` and are gone.
+
+## Round 178 (diagnostic): the whole-node penalty by socket; weights are placed right, and socket 1 is slower anyway
+
+**Question.** Round 177 left ~4-5% of round 176's whole-node penalty
+unexplained and suspected the pool parent, MPI, or remote pages. Which
+socket's ranks pay it, and do any worker pages sit on the wrong node?
+
+**Method.** One exclusive whole icelake node (cpu-q-170, job 39410328),
+`git archive a32315a` in `/dev/shm`, onnx defaults, nlive 200, 5 repeats,
+1000 dead points, seed 4242, async. The only change is a probe print
+(`.probe/r178/probe.py`): each rank's per-evaluation stdout line also gets
+its pid, its CPU (so its socket) and the request and simulate seconds.
+Arms: a 300-dead warm-up, W1 (76 ranks), H1 (two concurrent 38-rank searches
+under `numactl --cpunodebind=N --membind=N`), and W2. Two minutes into each W
+arm, `sample.sh` copied every pool process's `/proc/<pid>/numa_maps`.
+
+| arm | evals | wall s | evals/s | request ms (socket 0 / 1) | simulate ms (0 / 1) | log(Z) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| W1 | 16,789 | 197 | 85.2 | 751 / 892 | 44 / 56 | 0.01786 ± 0.00036 |
+| H1-n0 | 16,438 | 334 | 49.2 | 706 / - | 36 / - | 0.01801 ± 0.00035 |
+| H1-n1 | 16,807 | 386 | 43.6 | - / 798 | - / 43 | 0.01761 ± 0.00034 |
+| W2 | 17,315 | 201 | 86.2 | 749 / 883 | 39 / 47 | 0.01754 ± 0.00041 |
+
+**Result.** The halves total 92.8 evals/s against 85.2/86.2 for one search
+(+8%), the same gap as round 176 had before round 177's fix. It splits as
+follows:
+- **Socket 1 on this node is 13% slower per request, even fully bound**
+  (H1: 798 against 706 ms, simulate 43 against 36). Round 176 found socket 0
+  4% slower on cpu-q-60, so this is per machine, not per socket number.
+- **In one 76-rank search both sockets lose time** against their bound
+  halves: socket 0 +6% (749-751 against 706 ms), socket 1 +11% (883-892
+  against 798). Idle stays at 0.04-0.05%, so ranks are not starved by the
+  PolyChord master or MPI. The loss is inside the evaluation.
+- **Worker pages are where round 149 put them.** Every pooled worker maps
+  ~6.3 GB on node 0 and ~6.4 GB on node 1, which is both per-node weight
+  copies in its heap. Only ~0.4 GB of the parent's own data leans to node 0.
+  So glibc reusing freed node-0 heap for the node-1 sessions (MPOL_BIND only
+  governs new faults) is not happening at any size that matters. Rank and
+  simulate pages follow their socket after round 177. The workers' mapped
+  library text is mostly on node 1, yet socket 0 is the faster one, so that
+  is not the cause either. Node 0 holds 13.4 GB of page cache to node 1's
+  5.2 GB, but none of it is mapped by the pool.
+- All four log(Z)s agree within their errors.
+
+**Learned.**
+- What is left of the whole-node penalty is contention a single search
+  cannot place away: both sockets slow when one search spans them, and
+  the per-node weight copies, rank, and simulate placement are already
+  right. No page in the pool sits on the wrong node.
+- Socket speed differs per machine by 4-13% under identical bound loads,
+  so a per-socket A/B must compare the same socket, and a whole-node search
+  runs at the mean of its two sockets. Async PolyChord loses nothing to the
+  imbalance: the faster socket simply does more evaluations (9.0-9.3k
+  against 7.8-8.1k here).
+- The only remaining lever this points to is running a whole node as two
+  socket-bound searches (+8-9% total, rounds 176 and 178) and combining them
+  afterwards. That is a workflow change (two seeds, merged posteriors), not a
+  speed change to one search, so it is left for a decision.
+- A probe print on the rank's per-evaluation stdout line (pid, CPU, request
+  seconds) is enough to split a search's stage times by socket. No change
+  to the records is needed.
+
+Rows: `r178-warm`, `r178-W1`, `r178-W2`, `r178-H1-n0`, `r178-H1-n1` in
+`benchmarks.jsonl`. Their commit is rewritten to a32315a with `dirty: true`
+(probe print only). The run directories were in `/dev/shm` and are gone, and
+the numa_maps dumps were deleted.
+
+## Round 179 (validation): round 177 on a whole sapphire node, +2.9%
+
+**Question.** Round 177 was measured on a whole icelake node (76 ranks).
+Production R2D2 runs whole sapphire nodes (112 ranks). Does the same
+rank/socket mismatch happen there, and does the fix pay?
+
+**Method.** One exclusive sapphire node (cpu-r-67, job 39411746; 2 x 56
+cores, 2 NUMA nodes, CPUs numbered alternately by socket like icelake).
+A is `git archive 4e8156d` (before round 177) and B is `a32315a` (round 177),
+both in `/dev/shm`. Every arm runs the defaults (112 x 1 async, onnx) with
+nlive 200, 5 repeats, 1000 dead and seed 4242, in the order B warm-up
+(300 dead), A, B, B, A. Two minutes into each arm, `.probe/r179/job.sh`
+compares each rank's affinity with its R2D2 worker's. The job was requeued
+once (its first node dropped it before A1), so all rows are from cpu-r-67.
+
+| arm | ranks on their worker's socket | evals | evals/s | ms per eval | simulate ms | request ms | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | 56 of 112 | 15,234 | 132.2 | 819 | 66.7 | 751 | 0.01780 ± 0.00038 |
+| B1 | 112 of 112 | 17,663 | 135.9 | 802 | 56.4 | 745 | 0.01792 ± 0.00039 |
+| B2 | 112 of 112 | 16,307 | 135.5 | 803 | 59.7 | 742 | 0.01762 ± 0.00037 |
+| A2 | 58 of 112 | 16,680 | 131.5 | 821 | 62.6 | 757 | 0.01766 ± 0.00039 |
+
+**Result.** **+2.9% evals/s** (135.7 against 131.8). The two arms of each
+tree are within 0.6% of each other, so the ranges do not overlap. Most of the
+gain is simulate, 64.6 to 58.0 ms (-10%); the request drops ~1%. All four
+log(Z)s agree within their errors.
+
+**Learned.**
+- Sapphire has the same mismatch as icelake: before round 177, half of a
+  whole node's ranks (54-56 of 112) ran on the other socket from their
+  R2D2 worker. After it, none do.
+- The gain is a little smaller than icelake's +3.5%, and as there, most of
+  it is simulate (-10% here, -10 to -19% on icelake). The request itself
+  barely moves, because round 149's per-node weight copies already kept
+  each worker's U-Net local.
+- Today's tree runs a whole sapphire node at **135.7 evals/s**, up from
+  round 150's 117 (+16%). Rounds 151-153 and 177 account for that, though
+  the two rounds ran on different nodes.
+- An exclusive sapphire job started after ~15 minutes, at 02:00 GMT.
+  Slurm requeued it onto a second node with no message in the job output
+  other than a fresh header, which overwrote the first node's partial
+  output. Write a per-arm log beside the job output, as `search.sh` does.
+
+Rows: `r179-Bwarm`, `r179-A1`, `r179-B1`, `r179-B2`, `r179-A2` in
+`benchmarks.jsonl`. Their commit is rewritten to the archived tree (4e8156d
+for A, a32315a for B). The run directories were in `/dev/shm` and are gone.
+
+## Round 180 (null): ONNX Runtime 1.31.1 against the shipped 1.23.2
+
+**Question.** The CPU default pins `onnxruntime==1.23.2` (round 141), and
+PyPI is now at 1.31.1. Do eight releases of MLAS make the U-Net forward faster?
+
+**Method.** ORT 1.24 and later need Python 3.11 or newer, and `r2d2.sif`
+runs 3.10, so pip inside the image offers nothing past 1.23.2. To isolate the
+version, two uv venvs on the host's Python 3.12 in `/dev/shm` hold
+onnxruntime 1.23.2 and 1.31.1 (numpy 2.2). `.probe/r180/ver.py` uses round
+162's shape: the shipped session options (1 thread, no spinning, no arena),
+the 25 cached `.onnx` checkpoints, 36 forked children, one per CPU, each
+walking N1..N25 staggered, and 150 timed forwards on the sky-like 2x32x32
+input. The versions alternate (ABABAB) on this loop's icelake half-node at
+load ~4.
+
+| ORT | ms a forward (rep 0, 1, 2) |
+| --- | ---: |
+| 1.23.2 (shipped) | 25.88, 25.90, 25.70 |
+| 1.31.1 | 25.95, 25.69, 25.70 |
+
+**Result.** The two versions run at the same speed (25.83 against 25.78 ms,
+-0.2%, inside the rep spread), and all 25 nets' outputs are byte-identical
+between them. So MLAS's float32 conv path for this network has not changed
+since 1.23. Shipping 1.31 would also need Python 3.11 or newer in `r2d2.sif`,
+or a ctypes binding to the C API. Neither is worth doing. The pin stays.
+No search was run, so there is no `benchmarks.jsonl` row. The venvs in
+`/dev/shm/r180` were deleted.
+
+
+## Round 181 (negative): one refittable TensorRT engine per worker
+
+**Question.** Rounds 170-173 found the TensorRT GPU path capped by memory:
+25 fp32 engines hold 5.1 GB a worker, so an A100 fits 12 TensorRT workers
+against eager's 19, and those 12 put only ~1,070 forwards/s through the card
+in a search. Can one `REFIT` engine per worker, refitted from the 25 nets'
+weights held on the card (`TensorLocation.DEVICE`) before each forward, keep
+TensorRT's forward speed at eager's memory?
+
+**Method.** `scripts/probe_trt_refit.py` (MODE=build/acc/time) on one A100
+(job 39415157, gpu-q-39, MPS). It builds one fp32 REFIT engine from N1.onnx
+(TF32 off, 1x2x32x32, 12 s, 213 MB) and checks it, refitted to each of N1..N25,
+against round 170's per-net plans on three input scales. Then timed arms:
+1000 or 2500 forwards walking N1..N25, with and without a refit before each,
+solo and at 12 MPS copies beside round 170's 12 x 25-engine baseline
+(`probe_trt_memory.py KIND=T SHARED=1`).
+
+| Arm | ms a forward | refit call ms | CPU ms a forward | forwards/s (card) | MB a worker |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| solo, no refit | 1.56 | - | 0.37 | 640 | 3,236 |
+| solo, refit each forward | 35.98 | 34.38 | 34.60 | 28 | 3,236 |
+| 12 x 25 engines (round 170 baseline) | 4.40-4.44 | - | 0.5-0.6 | **2,710** | ~5,000 |
+| 12 x refit | 43.9-51.5 | 41.8-42.0 | 42.2 | 262 | 3,236 |
+
+**Result.** Accuracy is fine: the refitted engine is within 5.0e-6 of each
+per-net plan's peak (4 of 25 nets bit-identical), and a worker holds 3.2 GB
+(228 MB engine plus 25 weight sets) against 5.1 GB, so ~19 would fit a card.
+But a refit of the 68 weights costs **34 ms of host CPU** even with the
+weights already on the device, against a 1.6 ms forward: the call's CPU time equals
+its wall time, so the refit's work runs on the host, not the card. At 12 copies the card does 262
+forwards/s against the baseline's 2,710 (-90%), so no rank count recovers it,
+and the job was cancelled before the 19-copy and second-pass arms. The
+baseline reproduced round 170 (2,710 forwards/s at 4.4 ms). The lever is
+closed: TensorRT engine memory per worker cannot be cut by refitting. No
+search was run, so there is no `benchmarks.jsonl` row.
+
+## Round 183 (negative): CPU onnx ranks beside a 1-GPU search, -14%
+
+**Question.** Round 165 measured ~2 of a 1-GPU job's 32 cores of user time
+and concluded the search is bound by the card. If ~30 cores sit idle, CPU
+(`R2D2_RUNTIME=onnx`) ranks on them would add evaluations for free: a GPU
+job is charged per GPU, not per core. Is that worth building as a hybrid pool?
+
+**Method.** Before writing any pool code, two searches were raced in one
+1-GPU job (39416385, gpu-q-18, A100-SXM4-80GB, 32 Milan cores split across
+two NUMA nodes: 48-63 = LO, 96-111 = HI). `.probe/r183/job.sh` ran each search
+under `taskset` with `nlive 48`, `5 repeats` and seed 4242: the GPU search
+(torch, MPS, 300 dead) and the CPU search (onnx, 150 dead). The order was
+two warm-ups, then two passes of G32, G16, R and C16. The tree was `20c1fbf`.
+
+| arm | CPUs | ranks x threads | evals/s (pass 1, 2) | request ms | simulate ms |
+| --- | --- | --- | ---: | ---: | ---: |
+| G32: GPU search alone | all 32 | 19 x 2 | 56.6, 53.1 | 277, 291 | 33, 38 |
+| G16: GPU search alone | LO | 16 x 1 | 40.4, 37.0 | 311, 337 | 45, 53 |
+| R, GPU half (RG) | LO | 16 x 1 | 32.4, 37.8 | 381, 336 | 63, 47 |
+| R, CPU half (RC) | HI | 16 x 1 | 12.1, 12.3 | 1165, 1152 | 54, 53 |
+| C16: CPU search alone | HI | 16 x 1 | 10.5, 12.2 | 1122, 1157 | 45, 58 |
+
+**Result.** The raced pair totals **47.3 evals/s** (35.1 + 12.2), against
+**54.9** for the GPU search alone on all 32 cores (**-14%**). The cores
+are not idle. Giving the GPU search 16 cores instead of 32 costs it 30%
+(38.7 against 54.9), partly because the rank count follows the cores (16
+instead of 19), so fewer requests share the card. With a CPU search on the other 16 it loses another 9%
+(35.1), with request and simulate both slower, although the two halves
+share no core. One CPU onnx rank on a Milan core does 0.71-0.77 evals/s,
+against 1.2 on sapphire (round 179), so it cannot make up for the GPU
+ranks it displaces. The GPU arms' log(Z)s agree within their errors
+(0.0174-0.0187 ± 0.0006-0.0010). The CPU arms stop at 150 dead with
+0.0135-0.0152 ± 0.003. The hybrid pool was not built.
+
+**Learned.**
+- Round 165's "2 of 32 cores" was a measurement artefact: `/usr/bin/time`
+  counts only the processes it waits for, not the apptainer sidecar pools,
+  so it misses the workers' CPU. A 1-GPU search needs its cores: 19 x 2 on
+  32 CPUs beats 16 x 1 on 16 by 42%. Ranks and cores were not varied
+  separately here, so this does not contradict round 165's finding that
+  cheaper CPU work per request does not speed the card.
+- An ampere job's 32 cores span two NUMA nodes of a 128-core, 8-node
+  Milan host. Load on one node slows a GPU search pinned to the other by
+  ~9%.
+- At 300 dead and nlive 48, a warm 1-GPU search runs 53-57 evals/s, more
+  than round 165's 43 at 150 dead, because start-up is a smaller share of
+  the run.
+- The first CPU search on a fresh GPU node runs at 4 evals/s (3.4 s a
+  request): cold caches, as for round 165's first GPU arm.
+
+Rows: `r183-warm`, `r183-cwarm`, `r183-G32-1`..`r183-C16-2` in
+`benchmarks.jsonl` (commit 20c1fbf, gpu-q-18). The run directories (~9.3k
+files) were deleted.
+
+## Round 184 (validation): the 22 Sep production search on round 183's tree, 29 minutes
+
+**Question.** Round 115 reran the 22 Sep production R2D2 search (job
+36031480, 6h20m) on the tree of that day: 41 minutes. Since then the CPU
+default moved to ONNX Runtime (rounds 141-145), the data prep got cheaper
+(148-153), and ranks follow their worker's socket (177). What does the same
+search take on today's tree?
+
+**Run.** Same command as round 115 on `7e5caf9` with today's defaults
+(`R2D2_RUNTIME=onnx`), the same SIFs (same three image ids), seed
+190182240, nlive 150, 15 repeats, 24 ranks x 1 thread, async, to
+convergence. It was a sized 24-CPU sapphire job, as before (39418598 on
+cpu-r-75, started at once, `.probe/r184/job.sh`). The node was shared:
+load 56 when the job started. Row `r184-bigrun`.
+
+| | 22 Sep (`cb59233`) | round 115 (`5ced3d0`) | round 184 (`7e5caf9`) |
+| --- | ---: | ---: | ---: |
+| search wall to convergence | 17,331 s (6h 19m) | 2,459 s (41 min) | **1,749 s (29 min)** |
+| against 22 Sep | 1x | 7.0x | **9.9x** |
+| evaluations | 71,395 | 65,420 | 69,478 |
+| evals/s | 4.12 | 26.6 | **39.7 (+49% on round 115)** |
+| R2D2 request per evaluation | 2,868 ms | 825 ms | **546 ms (-34%)** |
+| simulate (MeqTrees) per evaluation | 1,936 ms (39.2%) | 32 ms (3.8%) | 29 ms (5.0%) |
+| idle fraction | 11.5% | 0.05% | 0.6% (end-of-run tail) |
+| post-run phase | ~88 min | 34.5 s | 19 s |
+| files left | ~225k | 6,647 | 6,675 |
+
+**Result.** The production search now converges in 29 minutes on the same
+24 CPUs and images: 9.9x faster than 22 Sep and 1.41x faster than round
+115. The whole gain since round 115 is in the request (825 to 546 ms),
+which matches what the onnx default (+33-44%, rounds 141 and 144) and
+rounds 148-153 predicted. Simulate is 5% of worker time and the user's
+30-50% MeqTrees share stays gone. log(Z) is not resolved here: the run
+directory lived in the job's `/dev/shm` and was deleted with the chains,
+and the last status print (1,063 dead, before the end) reads log(Z) =
+0.01 +/- 0.00, consistent with round 115's 0.0168 +/- 0.0004. Round 144
+already checked onnx against torch to convergence on two seeds (0.25
+sigma), so this run is a speed figure only.
+
+**Learned.**
+- The rate fell during the run, from ~50 evals/s in its first ten minutes
+  to ~35 later, on a node other jobs were also loading. A sized job on a
+  shared sapphire node has that much noise. Exclusive whole nodes (round
+  179) are steadier.
+- The ~110 s outside the search wall was mostly the fresh tree's uv
+  `.venv` (70 s), which a production checkout pays once.
+- A validation job that extracts a tree into `/dev/shm` must copy the
+  run's `chains/*.stats` (or the packed archive) out before it cleans up,
+  or log(Z) is lost. `summary.json` did not carry it until round 185.
+
+Rows: `r184-bigrun` in `benchmarks.jsonl` (commit 7e5caf9). The run
+directory was in the job's `/dev/shm` and is gone; the job log and
+profile are in `.probe/r184/`.
+
+## Round 185: `summary.json` records log(Z)
+
+**Why.** Round 184's validation could only quote log(Z) to two decimals,
+from a status print before the end, because its chains went with the
+job's `/dev/shm`. Every speed change here has to keep log(Z), so the
+summary should carry it.
+
+**Change.** `run_polychord()` already returns a `PolyChordOutput` that has
+parsed `chains/<root>.stats` on every rank; it was thrown away. Both
+drivers now keep it, and `summary.json` gains an `evidence` block
+(`common.py` `evidence_record`: `log_z`, `log_z_err`, `ndead`, `nlike`
+as PolyChord writes them; `None` if the output lacks them). No new IO.
+Self-check `self_check_evidence_record` (host-runnable).
+
+**WSClean guard.** Two raced pairs of 18-rank WSClean searches on this
+half icelake node (A = 7b14e19, B = this diff; synchronous, nlive 100,
+400 dead, seed 4242):
+
+| arm | pass 1 evals/s | pass 2 evals/s | chains |
+|---|---|---|---|
+| A | 27.91 | 28.36 | byte-identical |
+| B | 27.92 | 28.32 | byte-identical |
+
+B's summaries record log(Z) = 0.0961695969470598 +/- 0.00072 (500 dead).
+A tiny R2D2 search (8 ranks, default 12 dead) wrote its block too.
+
+**Learned.**
+- `.stats` gives log(Z) to full double precision; `run.log`'s status
+  line does not. Compare validation runs on `summary.json`'s
+  `evidence.log_z` from now on.
+- `nlike` is PolyChord's own count (4,123 here against 4,255 evaluations
+  in the benchmark row), not the run's evaluation count.
+
+Rows: `r185w-*` in `benchmarks.jsonl` (built from `git archive`, so
+`commit` reads `unknown`). Script and logs in `.probe/r185w/`.
+
+## Round 186: one more R2D2 rank than CPUs, +3.7%
+
+**Why.** A per-process CPU sample of today's default search (38 x 1, onnx,
+half icelake node, row `r186-base`, 47.3 evals/s) still splits as round 146
+did: R2D2 workers 91.4%, simulate servers 5.0%, PolyChord ranks 3.3%. perf
+on the 38 ranks put 63% of the ranks' samples in one process, the root,
+inside Open MPI's shared-memory progress loop (`mca_btl_vader`,
+`libopen-pal`). PolyChord's root only hands out points and never calls the
+likelihood, so 38 ranks run 37 R2D2 workers and the 38th CPU only hosts the
+root's spin.
+
+**Change.** A default CPU R2D2 run whose rank count reaches the job's CPUs
+now takes one rank more (`run-nested-sampling-r2d2.sh`; after the
+`NS_R2D2_MAX_RANKS` cap and before the memory clamp), so every CPU has a
+worker. An `NS_MPI_PROCS` above `nproc` now sets `--oversubscribe` itself,
+which mpirun needs past one rank per slot. GPU runs are unchanged.
+
+**A/B.** Half icelake node (cpu-q-164), nlive 100, 5 repeats, 400 dead,
+seed 4242, onnx, async, run back to back. A = 38 ranks (the old default),
+B = 39 ranks with the root at `nice 19` (a probe knob, not kept), C = 39
+ranks (the change):
+
+| pass | A evals/s | B evals/s | C evals/s |
+| --- | ---: | ---: | ---: |
+| 1 (A B C) | 46.46 | 46.72 | 46.65 |
+| 2 (A B C) | 47.09 | 47.59 | 49.31 |
+| 3 (C A) | 44.04 | | 47.20 |
+| 4 (C A) | 46.49 | | 47.06 |
+| 5 (C A) | 47.82 | | 50.14 |
+| mean | 46.38 | 47.15 | 48.07 (+3.7%) |
+
+C beat A in all five pairs, in both orders. Time per evaluation did not
+move (A 761-781 ms, C 734-796 ms), so the gain is the 38th worker:
+38/37 = +2.7% is the expectation, and +3.7% is that within noise. `nice 19`
+on the root added nothing over C: the root's spin was not taking CPU from
+a worker, because the job had ~0.85 CPU idle (37.15 of 38 busy). log(Z) x1e-3
+over all 13 searches: 17.0-17.7, errors 0.74-0.91, so every arm agrees.
+
+**Not measured.** Whole nodes get the same +1 rank (113 on a sapphire node,
+77 on icelake), where the expectation is +0.9-1.3%, below what an A/B can
+see; the mechanism is the same.
+
+Rows: `r186-*` in `benchmarks.jsonl` (`dirty`: the probe knob and the
+change were uncommitted). Scripts in `.probe/r186/`. Run directories deleted.
+
+## Round 187: R2D2's `.mat` without `savemat`, -9% of simulate
+
+**Profile.** Round 186 left simulate (the MeqTrees server's `--mat-only`
+request) at 5-6% of an R2D2 worker's time, 45 ms an evaluation in a
+default search (row `r187-base`, 39 x 1, 46.4 evals/s). A cProfile of that
+request alone, in `meqtrees.sif` on one pinned CPU with the host-built
+`fastnoise.so`, over 96 real draws from that search (`.probe/r187/prof.py`):
+17.1 ms a call, of which the noise draw is 6.2 ms, scipy's `savemat` of the
+`.mat` 3.9 ms, `write_r2d2_mat()` around it 1.5 ms and the phase ramp 1.8 ms.
+`savemat` copies every element with `tobytes(order='F')`, the complex
+column's halves through strided `.real`/`.imag` views of a complex128
+temporary, and a typical `.mat` here is ~13 MB.
+
+**Change.** `write_r2d2_mat()` now writes the MAT-v5 file itself
+(`write_mat_columns()` in `ms_to_r2d2_mat.py`): the same 128-byte header,
+then per column the matrix tag, array flags, dims, name and miDOUBLE
+data, straight from float64 arrays through `memoryview`s. The complex
+column's halves are converted from complex64 once each. The file is byte
+for byte what `savemat(do_compression=False)` wrote; only the header's
+creation time differs, as it did between any two runs.
+`self_check_write_mat_columns()` compares the bytes with `savemat` on one
+mocked clock, for complex64 and complex128 input, and is part of
+`./ri self-check simulate`. The noise draw stays: it must reproduce the
+4-correlation stream, and round 65 already skips what it can.
+
+**Stage A/B.** `.probe/r187/stage.sh`: N `meqtrees.sif` processes, one
+per CPU, half on HEAD's `ms_to_r2d2_mat.py` (A) and half on this one (B),
+all at once, each warming then timing 2 x 96 real draws from a shared
+start file. Passes alternate which CPUs get which arm.
+
+| load | A ms a call (wall / user / sys) | B ms a call | change |
+| --- | ---: | ---: | ---: |
+| 2 copies | 17.79 / 14.27 / 3.44 | 15.68 / 12.35 / 3.27 | -2.1 ms |
+| 36 copies, pass 1 | 29.41 / 22.07 / 7.13 | 26.73 / 19.11 / 7.41 | -2.7 ms |
+| 36 copies, pass 2 (swapped) | 29.19 / 21.86 / 7.11 | 26.56 / 19.03 / 7.34 | -2.6 ms |
+| 36 copies, pass 3 | 29.39 / 22.04 / 7.14 | 26.84 / 19.11 / 7.52 | -2.6 ms |
+| 36 copies, pass 4 (swapped) | 29.44 / 22.05 / 7.18 | 26.77 / 19.12 / 7.45 | -2.7 ms |
+
+B is faster in every pass by 2.6-2.7 ms under load (-9% of the
+stage), all of it user time. The 96 `.mat` files of the two arms are
+identical outside the header clock.
+
+**End to end.** One default search on the change (`r187-new`, same
+settings as `r187-base`: nlive 100, 5 repeats, 400 dead, seed 4242) ran,
+scored and converged: log(Z) 0.01687 +/- 0.00084 against 0.01753 +/- 0.00077,
+inside round 186's spread of async runs. Its rate (39.1 evals/s, request
+921 against 753 ms) says the node was busier than in `r187-base`, so
+the pair is not an A/B. ~2.7 ms of a ~770 ms evaluation is ~0.35%, well
+under the ~5% an end-to-end A/B resolves, which is why the stage was
+timed directly. WSClean never writes a `.mat`, so its path is unchanged.
+
+**Also found.** PolyChord's final `nlike` (5,111 in `r187-base`, now in
+`summary.json`'s evidence) is ~10% below the run's evaluations (5,675).
+The likely cause is the stop: the 38 workers' part-run chains (up to ~22
+evaluations each at 5 repeats, ~840 at most) are dropped uncounted. That
+was not traced further. If so it is a fixed cost of workers x part of a
+chain, under ~1.2% of round 184's 69k-evaluation production search, so
+not a lever, but short runs overstate it.
+
+Rows: `r187-base`, `r187-new` in `benchmarks.jsonl`. Scripts in
+`.probe/r187/`. Run directories deleted.
+
+## Round 188 (null): two PolyChord-side costs that are not there
+
+**Root spin.** Round 186 left PolyChord's root rank busy-polling Open MPI
+on a CPU it now shares with a worker (39 ranks on 38 CPUs). Open MPI 4.1.4
+in `polychord.sif` documents `mpi_yield_when_idle` as on by default when
+oversubscribed. `.probe/r188/spin.py` (rank 0 waits 5 s in `recv`) shows
+it is: at `-np 4` the wait is 5.01 s user, 0.01 s system; at
+`--oversubscribe -np 39` (and 50) it is 0.84 s user, 4.36 s system, the
+`sched_yield` loop, the same as `-np 4` with
+`OMPI_MCA_mpi_yield_when_idle=1`. Round 186's default already yields its
+root's CPU to a worker when one is runnable, so there is no MPI knob left
+there.
+
+**Stale async chains.** In an async run the root accepts a returned
+chain's point only if it is above the *current* contour
+(`replace_point`, `run_time_info.f90` at 370f6af), and every other worker's
+chain that lands meanwhile moves that contour. If returned points were
+uniform inside their seed contour, the rejected fraction would be
+~1 - exp(-(ranks-1)/nlive): ~40% at 112 ranks and nlive 200, so more
+ranks would buy fewer dead points per evaluation. `benchmarks.jsonl`
+says otherwise. At nlive 200, 5 repeats, 1000 dead (rounds 104-179, all
+async):
+
+| ranks | rows | mean evaluations |
+| ---: | ---: | ---: |
+| 38 | 6 | 17,657 |
+| 56 | 4 | 17,455 |
+| 76 | 18 | 16,096 |
+| 112 | 15 | 15,931 |
+
+Evaluations per dead point do not grow with ranks. A 5-repeat chain ends
+close to its seed, a live point usually well inside the contour, so few
+chains go stale. (Clustering changes also discard in-flight chains through
+`administrator_epoch`, but round 184's production search clustered once in
+1,063 dead points.) Whole-node rank counts cost no extra sampling, and
+async PolyChord is not a lever.
+
+Docs only. No searches were run. Script in `.probe/r188/`.
+
+## Round 189 (check): self-heal after rounds 154-188, and an R2D2 rank killed at 39 on 38 CPUs
+
+**Why.** `./ri self-check self-heal` last ran in round 101. Since then,
+round 154 changed the startup reaper and round 186 made default R2D2
+CPU runs take one rank more than the job's CPUs, with `--oversubscribe`.
+Both of those are in the retry path. The self-heal check only starts
+WSClean searches, so it does not cover the second one.
+
+**Self-heal.** Run on this loop's half icelake node with the `squeue`
+shim, `NS_SBATCH=0` and `OMP_NUM_THREADS` unset, on 1ac668c. It
+**passes** all scenarios in about 2.5 minutes, including the 26 host
+self-checks it runs first:
+
+| scenario | broken at | finished at |
+| --- | ---: | ---: |
+| sampler killed before any checkpoint | 8 evals | 54 |
+| a rank frozen (SIGSTOP) | 9 evals | 51 |
+| killed with no retries left, then `./ri resume` | 9 evals | 51 |
+| every WSClean worker killed | 8 evals | 54 |
+| the WSClean pool killed | 9 evals | 54 |
+| torn `.resume` | 54 evals | 82 |
+| torn `summary.json` | 82 evals | rewritten |
+
+It left no run directories and no worker loops behind.
+
+**R2D2 kill at 39 ranks.** `.probe/r189/r2d2kill.sh` ran a default
+search: `./ri search r2d2 --nlive 100 --num-repeats 5 --max-ndead 400
+--seed 4242 --retries 2`, which picks 39 ranks on 38 CPUs. Once the run
+had 336 evaluation entries, the script sent `kill -9` to one of its own
+`polychord_r2d2.py` ranks, matched on that run's `--output-dir`. mpirun
+reported rank 38 killed. `sidecar_reset_workers` then killed the 78 pool
+workers (39 R2D2 and 39 simulate), and `run_with_retries` resumed from
+PolyChord's checkpoint at 385 evaluations (retry 1 of 2) on the same
+oversubscribed 39-rank command. The run finished 2 minutes after the
+kill, with 6,077 evaluations and 500 dead points. Its log(Z) is
+0.01759 ± 0.00079, inside round 186's 13-search range of 0.0170-0.0177.
+
+No speed change and no `benchmarks.jsonl` row: the run was killed and
+retried on purpose, so its rate does not count. The run directory was
+deleted, and its `summary.json` is kept in `.probe/r189/`.
+
+## Round 190 (null): ONNX Runtime's graph optimisation level
+
+**Why.** Round 146's ORT profile put NCHWc reorders at 2.4% of a forward.
+The pool's sessions run at ORT's default level, `ORT_ENABLE_ALL`, which
+includes the NCHWc layout transformer. The question was whether, on a
+32x32 U-Net that is weight-bandwidth bound, the blocked layout pays for
+its reorders. It had not been measured.
+
+**Probe.** `.probe/r190/fork.py` is round 146's `fork.py` with a level
+per mode. It builds one N1 session per level in a parent with the pool's
+options (1 thread, no spinning, no arena), then forks P children pinned
+one per CPU. Each child times 100 forwards of 1x2x32x32, two passes:
+
+| level | P=4 (ms a forward) | P=38 (ms a forward) | max diff / peak |
+| --- | ---: | ---: | ---: |
+| `ORT_ENABLE_ALL` (shipped) | 17.60 / 17.67 | 24.49-24.53 (4 runs) | 0 |
+| `ORT_ENABLE_EXTENDED` | 19.01 / 19.01 | 26.54-26.76 (4 runs) | 6.6e-6 |
+| `ORT_ENABLE_BASIC` | 18.96 / 18.97 | - | 6.6e-6 |
+
+The default is **8% faster** than the levels without NCHWc at 38-way,
+and 7% faster at 4-way. The runs do not overlap. The reorders cost less
+than the blocked AVX-512 convolutions save. No change.
+
+Probe only. No searches were run, so there is no `benchmarks.jsonl`
+row. Scripts are in `.probe/r190/`.
+
+## Round 194 (null): two extra R2D2 ranks past the CPU count, and round 191 cancelled
+
+**Round 191 cancelled.** The two cclake jobs that were to measure R2D2
+evaluations per core-hour on Cascade Lake (39426905, whole node exclusive;
+39426997, one 28-core socket) were still pending after about two hours, over
+iterations 191-193. Both were cancelled, so cclake is still unmeasured.
+
+**Why.** Round 186 gave a 38-CPU job 39 ranks so the root's CPU got a worker,
+and noted ~0.85 CPU idle beforehand. The question was whether workers still
+wait on I/O or the rank round trip, which would let a 40th and 41st worker use
+time the CPUs do not fill.
+
+**A/B.** Half icelake node (cpu-q-197), nlive 100, 5 repeats, 400 dead, seed
+4242, onnx, async, commit 0f5751c, run back to back with alternating order.
+A = default (39 ranks), B = `NS_MPI_PROCS=41`:
+
+| pass | A evals/s | B evals/s | A ms/eval | B ms/eval |
+| --- | ---: | ---: | ---: | ---: |
+| 1 (A B) | 37.34 (cold) | 47.59 | 1005 | 821 |
+| 2 (B A) | 48.32 | 50.96 | 774 | 770 |
+| 3 (A B) | 50.50 | 49.35 | 739 | 796 |
+| 4 (B A) | 48.56 | 47.26 | 761 | 829 |
+| mean, passes 2-4 | 49.13 | 49.19 | 758 | 798 |
+
+A1 was the node's first search of the session (cold page cache); it is the
+only outlier, so the means leave pass 1 out. With 40 workers on 38 CPUs the
+time per evaluation rises by ~5%, matching 40/38, and cancels the extra
+worker. The job is CPU-bound at 39 ranks (idle fraction 0.03-0.08% in both
+arms), so round 186's +1 is the right count. No change.
+
+log(Z) x1e-3 (full values in `.probe/r194/*.summary.json`): A 16.89, 17.59,
+17.18, 17.36 (errors 0.75-0.94); B 17.47, 16.79, 17.01, 16.37 (errors
+0.78-1.09). All agree with each other and with round 186's 17.0-17.7.
+
+Rows: `r194-*` in `benchmarks.jsonl`. Script in `.probe/r194/ab.sh`. Run
+directories deleted.
+
+## Round 195 (validation): the 22 Sep production search on half an icelake node, 23 minutes
+
+**Question.** Round 184 reran the 22 Sep production search on round 183's
+tree, but lost its log(Z) with the job's `/dev/shm`. Since then a default
+run takes one rank more than its CPUs (186) and R2D2's `.mat` skips
+`savemat` (187). Does today's default still converge to the same log(Z),
+with full precision this time, and what does it take on the half icelake
+node this loop runs on?
+
+**Run.** Same command as rounds 115 and 184 (seed 190182240, nlive 150,
+15 repeats, async, to convergence) on `5723db6` with today's defaults:
+39 ranks x 1 thread on this job's 38 icelake CPUs (cpu-q-197), `onnx`,
+the same three SIF image ids. The other half of the node was loaded by
+other users' jobs (load 15-56). Row `r195-bigrun`. Script
+`.probe/r195/run.sh`.
+
+| | 22 Sep (24 sapphire) | round 115 (24 sapphire) | round 184 (24 sapphire) | round 195 (38 icelake) |
+| --- | ---: | ---: | ---: | ---: |
+| search wall to convergence | 17,331 s | 2,459 s | 1,749 s | **1,393 s (23 min)** |
+| evaluations | 71,395 | 65,420 | 69,478 | 66,973 |
+| evals/s | 4.12 | 26.6 | 39.7 | **48.1** |
+| evaluations per core-hour | 618 | 3,990 | 5,960 | 4,560 |
+| R2D2 request per evaluation | 2,868 ms | 825 ms | 546 ms | 744 ms |
+| simulate (MeqTrees) per evaluation | 1,936 ms (39.2%) | 32 ms (3.8%) | 29 ms (5.0%) | 35 ms (4.4%) |
+| idle fraction | 11.5% | 0.05% | 0.6% | 1.0% (end-of-run tail) |
+| dead points | 1,373 | 1,368 | (lost) | 1,472 |
+| log(Z) | 0.01722 ± 0.00042 | 0.01683 ± 0.00041 | ~0.01 (status line) | **0.017334457686004 ± 0.000411387** |
+
+**Result.** Today's default converges in 23 minutes on half an icelake
+node, at 48.1 evals/s. That matches the short-run rate of round 194
+(49.1 at nlive 100, 400 dead), so nothing in a long run costs more than
+the short A/Bs measure. log(Z) agrees with 22 Sep (0.19 sigma) and with
+round 115 (0.87 sigma). Async runs draw different points, so the
+log(Z)s are not expected to be identical. MeqTrees is 4.4% of worker
+time, against the 39% of the 22 Sep run. An icelake core does ~24% less
+per hour than a sapphire core (744 against 546 ms a request).
+
+**Learned.**
+- The half-node rate held for the whole run (36.7k evaluations in the
+  first 12.5 minutes, 67k in 23), unlike round 184's shared sapphire
+  job, which fell from ~50 to ~35 evals/s.
+- A whole run to convergence fits one iteration on this node (~24 min
+  plus ~40 s outside the search), so validating today's defaults
+  production-shaped needs no Slurm job.
+- `chains/r2d2_vlaa.stats` and `summary.json` are kept in `.probe/r195/`.
+  The run directory (9,596 files) was deleted.
+
+Rows: `r195-bigrun` in `benchmarks.jsonl` (commit 5723db6).
+
+## Round 196: a piped search no longer waits up to 60 s on the stall watchdog's sleep
+
+**Question.** Round 195's search took 1,393 s but its command took 1,436 s.
+Where do the other ~43 s go, and are they a cost per run or per evaluation?
+
+**Probe.** A tiny default R2D2 search (nlive 100, 20 dead, seed 196, 176
+evaluations) run four ways on `bb326f4`, with `bash -x` and a timestamped
+`PS4` for the traced runs. Script `.probe/r196/startup.sh`.
+
+| run | output | command wall | search wall |
+| --- | --- | ---: | ---: |
+| `./ri search ... \| grep \| python3` (s1, s2) | pipe | 62.5 s, 62.6 s | 13.3 s, 13.5 s |
+| `./ri search ... > file` (s5) | file | 21 s | ~13 s |
+| traced, with and without `job-env.sh` (s3, s4) | file | 19 s | ~13 s |
+| `./ri search ... \| cat`, this round's fix (s6) | pipe | **19 s** | 13.4 s |
+| WSClean, `./ri search ... \| cat`, fix (w1) | pipe | 10 s | 3.2 s |
+
+**Two costs, both outside the search.**
+- **Rank 0's post-run work** is most of round 195's 43 s: `post-run seconds:
+  drain 0.1, records 1.9, flush 1.0, prune 8.3, summary 5.1, pack 17.8` (34 s).
+  `pack` unlinks ~57k flat record files on Lustre with 32 threads, ~0.3 ms
+  each, so it grows with the evaluation count (~1.3% of the
+  evaluating wall at 67k evaluations, about the same share at any size).
+  It is bound by Lustre's per-directory lock (round 93), and
+  `RECORD_READ_THREADS` is already 32, so there is no cheap way left to
+  speed it up. Avoiding it means the record writer appends to a pack during
+  the run instead of creating one file per evaluation. That is a
+  larger change to every reader (health, live report, resume) and is left
+  open.
+- **The stall watchdog's orphaned `sleep`.** `_ns_stop_watchdog` kills the
+  watchdog subshell, but its `sleep 60` lives on and keeps the run's
+  stdout and stderr open. A file does not mind, but a pipe stays open
+  until the sleep ends. So `./ri search ... | tee` (or any harness that
+  reads the output to EOF) waited up to a whole poll after `OK:`: 43 s here.
+  The sleep now runs with its fds on `/dev/null`. The piped run takes 62.5 s
+  without the fix and 19 s with it, the same as writing to a file.
+
+**Results unchanged.** The sleep's file descriptors are all that changed.
+The piped R2D2 run gives log(Z) 0.0101886951976723 +/- 0.00726107899040951
+(137 dead), the same as s1 and s2's status lines (0.01019 +/- 0.00726, 137
+dead). The WSClean run gives 0.0895384119210856 +/- 0.00732350343931438
+(136 dead) at 55 evals/s. No A/B was needed, because nothing an evaluation
+runs has changed.
+
+**Learned.**
+- Timestamping a run's output through a pipe measures the pipe, not the
+  run. Python's `for line in sys.stdin` reads ahead, and `grep` block-buffers
+  into a pipe. File mtimes (`run.env`, `summary.json`) and a `PS4` with
+  `$(date +%s.%N)` are reliable (bash 4.4 here has no `EPOCHREALTIME`).
+- `job-env.sh` costs ~0.5 s a run (module purge and load, the checks). It is
+  not a startup cost worth chasing.
+- `progress-bar.sh`'s self-check now runs a piped `sleep 2` search with the
+  watchdog on. It fails on the old code and passes on the new.
+
+Rows: `r196-s1`, `r196-s2` (HEAD, piped) and `r196-w1` in `benchmarks.jsonl`.
+
+## Round 197: summary.json writes its evaluations one compact line each
+
+**Question.** Round 196 put `summary` at 5.1 s of round 195's 34 s of
+post-run work. What is it?
+
+**Probe.** Round 195's kept 218 MB `summary.json` (66,973 evaluations),
+re-encoded inside `polychord.sif`, three times each. Script
+`.probe/r197/encode.py`; the searches are `.probe/r197/run.sh`.
+
+| encoder | bytes | encode | encode + Lustre write |
+| --- | ---: | ---: | ---: |
+| `json.dumps(indent=2)` (HEAD) | 218,355,737 | 4.36 s | 5.2 s |
+| head indented, evaluations one compact line each (this round) | 168,526,337 | **1.81 s** | **2.0 s** |
+
+**Cause.** With `indent` set, Python's `json` uses its pure-Python
+encoder. The C encoder only runs with `indent=None`. `_json_text` now
+indents the run-level head as before and splices in each evaluation as
+one `json.dumps` line. That is the same JSON values (`json.loads` of both
+files compares equal) in a file 23% smaller. Flat per-evaluation records
+and every other `write_json_atomic` payload have no `evaluations` list and
+are written exactly as before.
+
+**Readers.** `./ri runs` (`summary_evaluation_count`) and
+`read_summary_head` both find the head in the new layout. `./ri profile`
+reads the new file.
+
+**Results unchanged.** On this tree, a tiny R2D2 and a tiny WSClean search
+(nlive 100, 20 dead, seed 196) give bit-identical log(Z) to round 196:
+R2D2 0.0101886951976723 +/- 0.00726107899040951 (137 dead, 176
+evaluations), WSClean 0.0895384119210856 +/- 0.00732350343931438 (136
+dead, 174 evaluations). Only the summary's bytes changed, and an
+evaluation never runs this code, so no raced A/B was needed.
+
+**Worth.** About 3.2 s off rank 0's post-run work on a 67k-evaluation
+production run (0.2% of its 23 minutes), growing with the evaluation
+count. The live summary (`summary.live.json`) goes through the same
+writer and gains the same factor. `pack` (17.8 s, Lustre unlinks) and
+`prune` (8.3 s) are still the open post-run costs.
+
+Rows: `r197-r2d2`, `r197-wsclean` in `benchmarks.jsonl` (two of each: the
+searches were run before and after the self-check's collision fix, which moved
+the splice from a NUL marker to the top-level `\n  "evaluations": []`; both
+pairs give the log(Z) above). `self_check_summary_json` covers the writer.
+
+## Round 198: prune skips the images of dirs that are already gone
+
+**Question.** Round 196 put `prune` at 8.3 s of round 195's post-run
+work. Where does it go?
+
+**Probe.** Timers inside `prune_run_artefacts` (taken out again), on an
+R2D2 search of 12,313 evaluations (seed 190182240, nlive 150, 1,500 dead,
+39 ranks onnx, this half icelake node). Script `.probe/r198/run.sh`.
+
+| part of prune (summed over its 32 threads) | thread-seconds |
+| --- | ---: |
+| `_recorded_image_path` (20,856 calls) | 94.5 |
+| `os.listdir` of 6,846 eval dirs | 3.2 |
+| log unlinks | 0.5 |
+| image unlinks | 0.2 |
+
+Prune took 3.1 s wall. 6,846 of the 12,313 records (56%) still named
+images. **Cause.** A rank keeps its 20 lowest and highest objectives so
+far. An evaluation that enters that set and is evicted later already has
+its record written with image paths, and `_strip_to_record` removes its
+dir. At the end, prune resolved each such path on Lustre: a `realpath` of
+the run root plus two failed `is_file` stats, about 4.5 ms of thread time
+per path and three paths per record.
+
+**Change.** One `os.listdir(evaluations_dir)` before the pool. A record
+whose eval dir is not listed has its image paths dropped with no stat,
+and its logs are not listed either. Records whose dir exists go through
+the old path. `self_check_image_retention` now includes an evicted
+extreme whose dir is gone.
+
+| run (same seed, ~12k evaluations) | prune | post-run total |
+| --- | ---: | ---: |
+| HEAD 6bb8143 (r198-a, 12,313 evaluations) | 3.2 s | 8.0 s |
+| this round (r198-b, 11,564 evaluations) | **0.7 s** | 4.8 s |
+
+Prune drops 4.6x. On round 195's 67k evaluations that should be about
+8.3 s down to about 2 s (0.4% of its 23 minutes). The remaining
+0.7 s is mostly the listing itself and the few hundred records that are
+really kept.
+
+**Results unchanged.** r198-b's summary names 174 images, and all 174
+exist. With seed 196, nlive 100 and 20 dead, R2D2 gives
+0.0101886951976723 +/- 0.00726107899040951 (176 evaluations) and WSClean
+gives 0.0895384119210856 +/- 0.00732350343931438 (174 evaluations). Both
+are bit-identical to round 197. The two 1,500-dead async searches agree
+within their errors: r198-a 0.0172213159642348 +/- 0.00039861149356316
+(1,465 dead) and r198-b 0.0176188970741032 +/- 0.000420757942729182
+(1,451 dead), 0.7 sigma apart. At that length the async schedule is not
+reproducible, which is the same on HEAD. Prune runs after the sampler
+finishes, so search speed is unchanged: 47.0 against 45.4 evals/s,
+sequential arms, within this host's spread.
+
+**Open.** `pack` (2.8-3.0 s here, 17.8 s at 67k: Lustre unlinks of the
+flat records) is now the only large post-run cost.
+
+Rows: `r198-a`, `r198-b`, `r198-tiny`, `r198-wsclean` in
+`benchmarks.jsonl`. All four run dirs were deleted.
+
+## Round 199: rank 0 packs records while the run goes, not after it
+
+Round 198 left `pack` as the only large post-run cost: 2.8 s at 12k
+evaluations, 17.8 s at 67k (round 196). It is Lustre unlinks of the flat
+`eval-*.json` records, and threads do not help. Timing 8,000 unlinks in
+one directory on hpc-work:
+
+| unlink threads | 8 | 32 | 64 | 128 | 32, `dir_fd` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ms per file | 0.132 | 0.126 | 0.126 | 0.126 | 0.124 |
+
+The directory's lock serialises them, so the only fix is to do them
+earlier. **Change:** rank 0 starts a child process
+(`start_record_packer` in `common.py`). Every 15 s it packs the flat
+records already on disk into `records.jsonl` and unlinks them
+(`pack_flat_records`). It has to be a process, not a thread:
+pypolychord's root sits in Fortran holding the GIL and never releases
+it, so a thread would never run. Rank 0 kills it once the sampler
+finishes, before reading the records back. Supporting changes:
+
+- `pack_evaluation_records` takes an `flock` on the pack, so a resume's
+  pack, the packer's and the finish's cannot interleave. Lustre here is
+  mounted with `flock`.
+- The finish appends again any packed record that prune has edited since
+  (the last line of a name wins). Before, it only packed records that
+  still had a file.
+- A reader falls back to the pack when a flat record vanishes between
+  the listing and the read.
+
+A kill at any point leaves only whole lines plus files still on disk,
+which the next pack handles. The packer exits once rank 0 is gone, and
+`NS_PACK_DURING_RUN=0` turns it off. Records are written once each, so
+nothing is lost by packing one early. Every reader (health, progress
+bar, live report, resume) already read the pack (round 93).
+
+| R2D2, seed 190182240, nlive 150, 1,500 dead | evaluations | pack | evals/s |
+| --- | ---: | ---: | ---: |
+| HEAD 1741ccd (round 198, r198-b) | 11,564 | 2.8 s | 45.4 |
+| packer every 60 s (r199-b) | 13,434 | 2.0 s | 45.9 |
+| packer every 15 s (r199-c, shipped) | 11,403 | **1.0 s** | 45.6 |
+
+On r199-b, a pack with nothing left to do (listing, pack read, a
+`json.dumps` and compare per record) costs 0.4 s. At 67k evaluations
+that part should be about 2 s, plus a 15 s tail of about 700 unlinks,
+so about 3 s in place of 17.8 s (about 1% of round 195's 23 minutes).
+Midway through r199-b the packer had packed 2,554 records and was using
+4% of one CPU. The evaluations dir also stays small all run, which makes
+every listing of it cheaper.
+
+**Results unchanged.** r199-b's packed records match its `summary.json`
+exactly (13,434 records), and no flat record was left behind. Tiny runs
+(seed 196, nlive 100, 20 dead) are bit-identical to round 198: R2D2
+0.0101886951976723 +/- 0.00726107899040951 (176 evaluations) and WSClean
+0.0895384119210856 +/- 0.00732350343931438 (174). The longer async runs
+agree within their errors, since at that length the schedule is not
+reproducible (round 198): r199-b 0.0173614393642752 +/-
+0.000453561067864136 (1,424 dead) and r199-c 0.0172358992631756 +/-
+0.000404025511300453 (1,491 dead).
+
+**WSClean guard.** Raced arms at 19 ranks each, seed 196, nlive 100,
+packer off (a) and on (b). At 300 dead they ran too briefly for the
+packer to make a pass: 94.0 against 107.2 evals/s, log(Z)
+0.0963770839100248 +/- 0.00102518803495449 against 0.0962595297249822
++/- 0.00103354886806531. At 3,000 dead (converged at about 910 dead) the
+packer arm ran at 146.0 evals/s against 138.8, with pack 0.8 s against
+1.3 s. log(Z) 0.0964384128004458 +/- 0.000567244216178665 (b) against
+0.0968260213400991 +/- 0.000556456159211854 (a), 0.5 sigma apart.
+
+Rows: `r199-tiny`, `r199-wsclean`, `r199-b`, `r199-c`, `r199-wsa` and
+`r199-wsb` (twice each, 300 and 3,000 dead) in `benchmarks.jsonl`. All
+run dirs were deleted.
+
+## Round 200 (validation): rounds 197-199 in the 22 Sep production search
+
+**Question.** Rounds 197-199 cut rank 0's post-run work on 12k-evaluation
+runs and predicted roughly 34 s down to about 7 s at round 195's 67k.
+Does that hold in the full production search, and does round 199's
+in-run packer cost any throughput?
+
+**Method.** Round 195's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs),
+on `d96a8e0`. Script `.probe/r200/run.sh`. As in round 195, other users'
+jobs shared the node (load 20 to 85) on their own CPUs.
+
+| | round 195 (`5723db6`) | round 200 (`d96a8e0`) |
+| --- | ---: | ---: |
+| evaluations | 66,973 | 77,570 |
+| search wall | 1,392.8 s | 1,597.1 s |
+| evals/s | 48.1 | **48.6** |
+| request (`image_container`) | 744 ms | 737 ms |
+| simulate (MeqTrees) | 35 ms, 4.4% | 32 ms, 4.0% |
+| idle | 1.0% | 1.5% |
+| post-run: records, flush | 1.9, 1.0 s | 2.3, 0.6 s |
+| post-run: prune | 8.3 s | 5.6 s |
+| post-run: summary | 5.1 s | 2.6 s |
+| post-run: pack | 17.8 s | **2.9 s** |
+| post-run total | 34.3 s | **14.1 s** |
+| command wall minus search wall | 43.1 s | **24.8 s** |
+| log(Z) | 0.0173344576860040 +/- 0.000411387 | 0.0174329374131255 +/- 0.000408558 |
+| ndead, nlike | 1,472, 65,470 | 1,455, 75,995 |
+
+**Results.**
+- Post-run work fell from 34.3 s to 14.1 s, on a run with 16% more
+  evaluations, and the time outside the search fell from 43 s to 25 s.
+  Pack (2.9 s) and summary (2.6 s) land where rounds 197 and 199 predicted.
+- Prune takes 5.6 s, not the ~2 s that round 198 extrapolated from 12k
+  evaluations. It is now the largest post-run part and the next one to look at.
+- The packer costs no visible throughput: 48.6 evals/s against 48.1, at
+  the same request time.
+- log(Z) agrees with round 195 within 0.17 sigma. The async schedule is
+  not reproducible at this length (round 198), and this run needed 16%
+  more evaluations to converge. Its wall is longer for that reason, not
+  because it ran slower.
+
+**Learned.**
+- Between async runs of the same seed, the number of evaluations to
+  convergence moves by ~15% at a fixed rate. Compare production runs by
+  evals/s and request time, not by wall.
+
+Rows: `r200-bigrun` in `benchmarks.jsonl` (commit d96a8e0). `summary.json`
+and `chains/r2d2_vlaa.stats` are kept in `.probe/r200/`. The run directory
+(9,472 files) was deleted.
+
+## Round 201: prune runs the records that touch no Lustre inline
+
+Round 200 left prune as the largest post-run part: 5.6 s at 78k
+evaluations. Only ~1% of records touch Lustre at the end (the 1 in 100
+kept whole, `_keeps_detail`). The rest either name no image or name
+images whose dir round 198's listing already shows gone. But every record
+still went through `ThreadPoolExecutor.map`, and a future each costs
+~1.0-1.2 s at 78k records with a no-op body on this node. **Change:**
+`prune_run_artefacts` runs records that touch no Lustre inline, and the
+pool gets only the ones naming an image in a listed dir.
+
+Fixture (`.probe/r201/prune_bench.py`): 77,570 records shaped like round
+200's run, with 56% naming images in gone dirs and 776 dirs on hpc-work
+holding 3 images and 4 logs each. Interleaved pairs against HEAD's
+`common.py`:
+
+| pair | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD `af9b5e3` | 2.75 s | 3.00 s | 3.07 s | 2.92 s | 2.94 s |
+| inline | 1.64 s | 1.65 s | 1.64 s | 1.62 s | **1.64 s** |
+
+Both arms remove 5,348 files and leave records with the same sha256
+(`4b59358aa70a`). Ruled out on the same fixture: caching
+`evaluations_dir.resolve()` (no change) and 128 threads instead of 32
+(no change, before or after). What is left (~1.6 s) is the 776 dirs'
+Lustre unlinks, stats and listings.
+
+Guards: tiny seed-196 runs are bit-identical (R2D2 log(Z)
+0.0101886951976723, WSClean 0.0895384119210856). In a raced WSClean pair
+(19 ranks each, nlive 100, seed 196, HEAD from a detached worktree), the
+new arm ran 143.3 evals/s against 120.7 and HEAD's `image_binary` was 114
+against 94 ms. That gap is the binary and which CPUs each arm landed on,
+not prune. log(Z) 0.0968399 +/- 0.00056 against 0.0972371 +/- 0.00058
+(async, 0.5 sigma); prune took 0.2 s in both.
+
+Expected in production: prune 5.6 s -> ~4.5 s at 78k evaluations. The
+fixture's 3.0 s is below the real 5.6 s, so part of the real prune is
+something the fixture lacks. The next production run's `post-run seconds`
+line will show it.
+
+Rows: `r201-prune-fixture`, `r201-tiny`, `r201-wsclean`, `r201-wsa`,
+`r201-wsb` in `benchmarks.jsonl`. All run dirs were deleted.
+
+## Round 202: the R2D2 pool loads pre-optimised ONNX graphs, -3 s of startup
+
+Round 200 left ~11 s of startup outside a production search. In a tiny
+R2D2 search (seed 196, nlive 100, 20 dead, 39 ranks) the first 38
+requests each took ~8.4 s against ~0.8 s warm: they wait for the pool's
+warm-up. Its parts, timed in the SIF (`.probe/r202/warm_probe.py`, two runs):
+
+| warm-up part | seconds |
+| --- | ---: |
+| imager imports (`runpy` of `imager.py`) | 2.5 |
+| torch checkpoints (`load_checkpoints`) | 1.9 |
+| 25 ORT sessions (`patch_onnx_network`) | 4.8-5.0 |
+| total | 9.1-9.4 |
+
+Session builds hold the GIL: 25 sessions take 4.7 s on 1, 4, 8 or 25
+threads (`sess_probe.py`). With graph optimisation off they take 1.7 s,
+so ~3 s of the build is ORT's graph optimiser, which does the same work
+for the same models in every pool. **Change:** the first pool on a CPU
+saves each optimised graph (`optimized_model_filepath`) beside the
+exported models, in `opt-<cpu hash>/`, keyed by the CPU's model name and
+flags because the graph may hold CPU-specific NCHWc layouts. Later pools
+load those with `ORT_DISABLE_ALL`. 25 nets (`opt_probe.py`, `fwd_probe.py`):
+
+| | build | output sha256 (128x128 and 96x160) | forward, 128x128 |
+| --- | ---: | --- | ---: |
+| as before | 3.97-4.93 s | `8b1d13c3ee77` | 144.5 ms |
+| optimised graph, optimisation off | 1.40-1.57 s | `8b1d13c3ee77` | 144.7 ms |
+
+Interleaved pairs of tiny searches against HEAD (from a detached worktree),
+`.probe/r202/ab.sh`:
+
+| pair | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| command wall, HEAD | 20.65 | 21.73 | 20.13 | 19.19 | 20.43 s |
+| command wall, new | 16.30 | 16.43 | 16.83 | 16.46 | **16.51 s** |
+| first request, HEAD | 8.35 | 8.55 | 8.40 | 8.42 | 8.43 s |
+| first request, new | 5.59 | 5.60 | 5.45 | 5.36 | **5.50 s** |
+
+log(Z) is 0.0101886951976723 +/- 0.00726107899040951 in all 8 runs,
+bit-identical to round 198's reference. The first pool on a new CPU
+pays ~6 s once to write the 2.9 GB of optimised graphs to hpc-work
+(23.7 s command wall), then every pool after it gains ~3 s. A whole
+node builds a session set per socket (round 149), so it gains this
+twice from the second pool on. The change is in `r2d2_serve.py` only,
+so WSClean is not touched.
+
+In production this is ~3 s of ~25 s outside a 27-minute search
+(0.2%), more on short jobs, resumes and retries. It also halves a
+tiny benchmark's startup tax, which tightens the A/B loop. What is left
+of the warm-up: imager imports 2.5 s, torch checkpoints 1.9 s (kept
+because a request with more than one thread falls back to torch), and
+1.5 s of session loads.
+
+Rows: `r202-startup-ab` in `benchmarks.jsonl`, with the new arm's
+`r202-abb` rows (HEAD's landed in the removed worktree). Run dirs deleted.
+
+
+## Round 203: the R2D2 pool loads its torch checkpoints on 4 threads, -1 s of startup
+
+Round 202 left 1.9 s of the pool's warm-up in `load_checkpoints`: upstream
+`get_DNNs` runs 25 `torch.load`s of 248 MB Lightning checkpoints (6.2 GB,
+optimiser state included) one after another, before any worker forks.
+Probes in `r2d2.sif` (`.probe/r203/`, page cache warm):
+
+| load of the 25 checkpoints | seconds | weights |
+| --- | ---: | --- |
+| serial `torch.load` (as before) | 2.01-2.12 | reference |
+| `mmap=True` | 0.39-0.41 | identical |
+| `mmap=True`, `state_dict` cloned to anonymous memory | 1.80-1.85 | identical |
+| 4 threads (`ThreadPoolExecutor`) | 0.88-0.91 | identical |
+| 8 threads | 0.91 | identical |
+
+`mmap=True` is not free: its pages are Lustre-backed page cache, and every
+forked worker that touches them pays ~0.57 s of faults (0.85 s against 0.28 s
+to read all 775M weights in a child, `fork_probe.py`). That would land on
+the multi-thread torch fallback at the end of a run (9 of round 200's
+77,570 requests) and lose the NUMA placement `load_checkpoints` gives torch
+CPU runs. Threads keep the pages anonymous: `torch.load` releases the GIL
+while it reads, and pool threads inherit the caller's `set_mempolicy`, so
+per-node and interleaved placement still hold. **Change:**
+`load_checkpoint_series` in `r2d2_serve.py` is upstream `get_DNNs` (same
+glob, same errors, same dict) with the loads on 4 threads; the pool's
+`get_DNNs` cache calls it. New image self-check `checkpoint_series`.
+
+Interleaved pairs of tiny searches (seed 196, nlive 100, 20 dead, 39
+ranks) against HEAD from a detached worktree, `.probe/r203/ab.sh`:
+
+| pair | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| first request, HEAD `88014b9` | 5.41 | 5.49 | 5.57 | 5.51 | 5.50 s |
+| first request, new | 4.49 | 4.47 | 4.32 | 4.60 | **4.47 s** |
+| search wall, HEAD | 10.69 | 10.51 | 10.58 | 10.63 | 10.60 s |
+| search wall, new | 9.83 | 9.63 | 9.47 | 9.53 | **9.62 s** |
+| command wall, HEAD | 22.33 | 17.02 | 17.37 | 18.07 | 18.70 s |
+| command wall, new | 18.91 | 17.52 | 16.32 | 17.72 | 17.62 s |
+
+First request and search wall fall by ~1.0 s in 4 of 4 pairs; command wall
+is noisier (apptainer and mpirun start-up) but follows. log(Z) is
+0.0101886951976723 in all 8 runs, bit-identical to rounds 198-202. The
+change is in `r2d2_serve.py` only, so WSClean is not touched.
+
+What is left of the warm-up (~5.3 s): imager imports 2.5 s, torch
+checkpoints 0.9 s, ORT session loads 1.5 s. In production this is ~1 s of
+~22 s outside the search; it matters more to resumes, retries and the tiny
+A/B loop.
+
+Rows: `r203-startup-ab` and the new arm's `r203-abb` rows in
+`benchmarks.jsonl`. Run dirs and the temporary worktree were removed.
+
+
+## Round 204 (diagnostic): what is left of R2D2 startup, and no early stop
+
+**Question.** After rounds 202-203, where do the ~4.5 s before a tiny
+search's first live point go, and is any of it worth a round? Also: can
+the 25 R2D2 iterations end early?
+
+**Method.** One clean tiny search on `849692e` (seed 196, nlive 100, 20
+dead, 39 ranks), with timestamped output. One run under `strace -f -e
+execve` to locate gaps, read for ordering only, because strace inflates
+every fork. Each suspect timed alone without strace. Imports timed with
+`python3 -X importtime` in `r2d2.sif`, twice. Probes are in `.probe/r204/`.
+
+| startup piece (clean run unless noted) | seconds |
+| --- | ---: |
+| `./ri`, `uv`, defaults, rank budget (two `pgrep -f` at ~0.15 s each) | ~0.6 |
+| `.job-settings.env` written on Lustre (only inside an allocation the run did not submit) | 0-0.5, first write to a fresh file |
+| `job-env.sh` (rebuild and check, `uv python find` included), alone | 0.45-0.50 |
+| run script's second pass up to the R2D2 pool launch | ~1.0 |
+| of which the 78-FIFO `mkfifo` loop (one call instead: 0.06) | 0.14 |
+| of which the `apptainer exec ... test -e fastnoise.so` probe (shared `start-sidecars.sh`) | ~0.25 |
+| pool warm-up: imager imports | 2.51 |
+| of which `import torch` | 1.95 (`torch._C` own time 0.54) |
+
+The pool launches ~2.7 s after the command starts when the run is started
+inside this allocation, which re-enters job-env (this benchmark loop and
+`sintr`). A submitted production job starts in `job-env.sh`, so only the
+second pass (~1 s) sits before its pool. mpirun and apptainer start-up
+(~1.7 s) and the manifest overlap the pool's warm-up and cost nothing.
+
+**Results.**
+- What is left of startup is many 0.05-0.3 s pieces, about 1 s before the
+  pool in production and 2.5 s of mostly-GIL imports inside it. All of it
+  together is about 0.1% of a 27-minute production search. Nothing in it is
+  worth a round: merging the `mkfifo` loop saves 0.08 s at 39 ranks, and the
+  bigger pieces (`pgrep`, the fastnoise probe) are in shared code that would
+  need a raced WSClean A/B for each 0.1-0.25 s.
+- `import torch` is 1.95 s of the 2.5 s import. The 0.54 s of it in
+  `torch._C`'s own loading is the shared-library load, and the import holds
+  the GIL, so threads cannot overlap it with the GIL-bound ORT session
+  loads (round 202).
+- Upstream R2D2 has a stopping rule (`_stop_criteria`: relative residual
+  change below `sigma_res_tol`, or two rises in a row), but it applies only
+  with `prune` on. `polychord_r2d2.py` runs without it, so every request runs
+  all 25 nets. Turning it on would change the images and log(Z), so it is
+  out under the result-preservation rule.
+- The production profile (round 200) is 94.2% request, 4.0% simulate, 1.5%
+  idle and 0.2% PolyChord. Every lever outside the U-Net is now at the 1%
+  level or below.
+
+**Learned.**
+- On Lustre the first `write` to a freshly created file can take 0.4 s
+  (0.0001 s on the next run of the same probe). Small one-off settings
+  files on hpc-work cost startup time at random.
+- `strace -f` over a search inflates every fork about 3x (`uv python find`
+  showed 1.0 s under strace and ~0 s without it). Use it to order events,
+  never to time them.
+
+Rows: `r204-tiny` in `benchmarks.jsonl` (the clean run: 176 evaluations,
+log(Z) 0.0101886951976723, bit-identical to rounds 198-203). The two
+instrumented runs' rows were removed. Run dirs deleted.
+
+## Round 205 (diagnostic): the R2D2 CPU search is at the socket's DRAM bandwidth
+
+**Question.** Round 146 called the U-Net forward weight-bandwidth bound.
+How close is a production search to the hardware limit? That decides
+whether any CPU lever that keeps the network unchanged can still pay.
+
+**Method.** This loop's allocation is all 38 cores of socket 0 of an
+icelake node (Xeon 8368Q, one NUMA node, 57 MB L3). `.probe/r205/bw.c` is
+a STREAM-style OpenMP probe (`gcc -O3 -march=native`, 2 GB arrays, threads
+pinned with `OMP_PROC_BIND=spread`). Its read test sums two arrays, and its
+triad test is `c = a + 3b`. The exported networks are 25 `.onnx` files
+averaging 124.2 MB of fp32 weights. A 32x32 activation is at most 256 KB a
+layer, so it stays in L2, and DRAM traffic is the weights.
+
+| threads | read GB/s | triad GB/s |
+| ---: | ---: | ---: |
+| 1 | 12.2 | 13.6 |
+| 19 | 150.7 | 113.8 |
+| 38 | 164.2-165.3 | 152.1-152.5 |
+
+**Arithmetic.** An evaluation runs all 25 nets once (no early stop, round
+204), so it reads 25 x 124.2 = 3.10 GB of weights. A net is twice the L3,
+and the workers are staggered across nets, so almost every forward streams
+its weights from DRAM. Round 157's aligned-versus-staggered probe shows
+only ~6% L3 sharing.
+
+| run | evals/s | weight demand | share of 165 GB/s |
+| --- | ---: | ---: | ---: |
+| round 200, production, 39 ranks | 48.6 | 151 GB/s | 91% |
+| round 195, production, 39 ranks | 48.1 | 149 GB/s | 90% |
+| ceiling, weights only, nothing else | ~53 | 165 GB/s | 100% |
+
+The forward-only probe of round 157 (36 staggered children, 26.0 ms a
+forward) implies ~172 GB/s, slightly above the read peak. That fits a few
+percent of weight lines being shared through L3 by children on the same
+net.
+
+**Result.** The half-node R2D2 CPU search uses ~90% of its socket's
+measured DRAM read bandwidth for U-Net weights alone. Even if FINUFFT,
+simulate, data prep and PolyChord cost nothing, it could go no faster than
+~53 evals/s (+9%). This is why runtime, kernel, thread and layout changes
+all came out null after round 149 (rounds 155-157, 162, 180, 190): they
+change compute, and compute is not the bound. Only two things move the
+ceiling. One is fewer weight bytes per evaluation, which means quantisation,
+a different network, and is out of scope. The other is more evaluations per
+weight read, through batching or lockstep, already rejected in rounds 109,
+136, 137 and 139 because the waits cost more than the reuse saves. The
+GPU has headroom the CPU does not: at 44 evals/s, one A100 streams ~137
+GB/s of weights, under a tenth of its HBM bandwidth (rounds 119, 124).
+Weight bytes do not bound it, so GPU work (TensorRT, round 171-173) is where
+R2D2 throughput can still grow.
+
+**Learned.**
+- A half icelake job (`--ntasks 38`) here is exactly socket 0 (the even
+  CPUs), so it owns one socket's memory controllers. A neighbour job on
+  socket 1 (load ~26 during this probe) does not share them.
+- For R2D2 on CPU, evals/s x 3.10 GB against the socket's read bandwidth
+  is the quick check of how much any change could still give. Whole
+  nodes are further from it: 80.5 evals/s on icelake (round 149) is ~250
+  GB/s of 2 x 165, and the gap is the cross-socket loss rounds 176-178
+  measured.
+
+Probe only, no searches, so there is no `benchmarks.jsonl` row. The
+probe's binaries in `/dev/shm` were deleted, and its sources are in
+`.probe/r205/`.
+
+## Round 206 (diagnostic): the U-Net weights cannot be shrunk losslessly
+
+**Question.** Round 205 left two ways past the CPU's DRAM wall: fewer weight
+bytes per evaluation, or more evaluations per weight read. Reuse was already
+rejected (rounds 109, 136, 137, 139). Can the bytes shrink without changing
+a single output bit? That would work if the fp32 weights were bfloat16 or
+fp16 values stored as fp32 (low mantissa bits zero), held exact zeros, were
+shared between nets, or compressed well.
+
+**Method.** `.probe/r206/mantissa.py`, run in `r2d2.sif` on the 25
+`R2D2_A1` checkpoints. It looks at every float32 tensor: how many low
+mantissa bits are zero, how many weights are exactly zero, whether any two
+tensors are byte-identical (within a net or across nets), and how well zlib
+compresses the largest layer.
+
+| check | result | random-mantissa expectation |
+| --- | --- | --- |
+| weights over 25 nets | 3.102 GB (124.1 MB a net) | - |
+| low 16 bits zero | 1.49e-5 | 1.5e-5 (1/65536) |
+| low 12 bits zero | 2.44e-4 | 2.44e-4 (1/4096) |
+| exact zeros | 0 | - |
+| byte-identical tensors | none | - |
+| zlib-6, 1024x1024x3x3 bottleneck | 0.929 of its size | - |
+
+| layer (spatial size at 32x32) | MB a net | share of bytes |
+| --- | ---: | ---: |
+| `conv.layers.4` 1024x1024x3x3 (2x2) | 37.7 | 30.4% |
+| `conv.layers.0` 1024x512x3x3 (2x2) | 18.9 | 15.2% |
+| `up_conv.0.layers.0` 512x1024x3x3 (4x4) | 18.9 | 15.2% |
+| `down_sample_layers.3.layers.4` 512x512x3x3 (4x4) | 9.4 | 7.6% |
+| `up_conv.0.layers.4` 512x512x3x3 (4x4) | 9.4 | 7.6% |
+| `up_transpose_conv.0` 1024x512x2x2 | 8.4 | 6.8% |
+
+**Result.** None of the ways works. The mantissas are fully used: the
+zero-low-bit counts are exactly what random bits give, so no narrower float
+holds them. There are no zeros to skip and no tensors shared between nets.
+zlib saves 7%, all of it from the exponent bytes, and decompressing 3.1 GB
+an evaluation would cost far more CPU than the 7% of DRAM traffic it saves.
+Three layers at the 2x2 and 4x4 bottleneck hold 61% of the bytes, and every
+3x3 tap there is used by some output pixel even at 2x2, so a forward has to
+read all of them. With reuse already rejected, the CPU R2D2 path has no
+bit-identical lever left past round 205's ~53 evals/s ceiling. Only the GPU
+path, or a changed network (quantised or distilled, which is out of scope),
+can go faster.
+
+Probe only. No search was run, so there is no `benchmarks.jsonl` row. The
+probe source is in `.probe/r206/`.
+
+## Round 207 (positive probe): one process sharing 25 TensorRT engines feeds the A100 from 5.7 GB
+
+**Question.** TensorRT on the GPU is held to single digits end to end
+(rounds 171-173) because each worker holds its own 25 engines, 5.1 GB, so
+an A100 fits only 12 TensorRT workers. Those 12 put ~1,070 forwards/s
+through the card in a search (round 173: 61.3 evals/s x 17.6 forwards)
+against the ~2,700/s it sustains (round 170). Refitting one engine per
+worker was 20x too slow (round 181). TensorRT does share an engine's weights
+between the execution contexts of one process, and a context needs only
+1.5 MB of activations. Can one process holding the 25 engines once serve
+every rank at the card's rate, including a pipe round trip per forward?
+
+**Method.** `scripts/probe_trt_shared.py`, in `r2d2-cuda.sif` with
+TensorRT 11.4 (cu13) and round 170's fp32 plans, one A100-SXM4-80GB
+(gpu-q-25, job 39451031, `.probe/r207/`). One process loads N1..N25 once;
+each of K threads gets its own 25 user-managed contexts, scratch buffer,
+CUDA stream and input/output buffers, and walks N1..N25 for 2,500 forwards
+with a blocking sync after each, as a request does. In `pipes` mode each
+thread also serves a forked CPU-only client: the client writes the 8 KB
+input down a pipe, the thread copies it to the card, runs the net, copies
+the 4 KB output back and replies. The baseline is round 170/181's 12
+separate processes under MPS, each with its own 25 engines, in the same
+job. Two passes.
+
+| arm | forwards/s (pass 1, 2) | ms a forward | card memory (MiB) | server CPU (cores) |
+| --- | ---: | ---: | ---: | ---: |
+| 12 processes x 25 engines, MPS (baseline) | 2,719, 2,717 | 4.43 | 66,421 | - |
+| 1 process, 12 threads | 2,457, 2,438 | 4.86 | 5,729 | 1.43-1.46 |
+| 1 process, 19 threads | 2,458, 2,445 | 7.68-7.70 | 5,821 | 1.51-1.52 |
+| 1 process, 32 threads | 2,450, 2,453 | 12.95 | 5,977 | 1.60 |
+| 1 process, 12 pipe clients | 2,445, 2,449 | 4.97-4.98 | 5,729 | 1.75-1.80 |
+| 1 process, 19 pipe clients | 2,444, 2,446 | 7.87 | 5,821 | 1.87-1.88 |
+| 1 process, 32 pipe clients | 2,455, 2,448 | 13.18-13.24 | 5,977 | 1.90-1.93 |
+
+Every thread's output matched one reference context's bit for bit for all
+25 nets (0 mismatches in every arm), as it must: the contexts run the same
+plan.
+
+**Result.** One process reaches 90% of the 12-process MPS rate (2,450
+against 2,718 forwards/s) on 5.7-6.0 GB of card memory instead of 66 GB,
+and the rate does not move from 12 to 32 clients, so the card is the bound,
+not the server. The pipe round trip costs nothing measurable (2,445-2,455
+against 2,438-2,458 for bare threads) and adds ~0.3 cores of server CPU.
+Each extra client adds only ~8 MB on the card. So a GPU search no longer
+has to choose between TensorRT's speed and eager's rank count: with a
+shared forward server, every rank the 32 cores can feed gets TensorRT
+forwards, and the card has ~2.3x the forward rate that round 173's 12
+TensorRT ranks used. What limits such a search is then the CPU side
+(round 120: the 32 cores bind at ~19 ranks), which this probe does not
+measure.
+
+**Next.** Wire it in as an opt-in GPU runtime: the pool starts one
+TensorRT server process before forking workers; a worker's `trt` network
+writes its input down its own pipe pair and reads the output back instead
+of holding engines; ranks are sized like eager (no 5.1 GB per worker).
+Then race it against eager and per-worker `trt` in 1-GPU searches at
+19 ranks and 600 dead points (round 173's shape), log(Z) to agree.
+
+Probe only. No search was run, so there is no `benchmarks.jsonl` row.
+
+## Round 208 (wired in, race pending): opt-in `R2D2_TRT_SHARED=1`, one TensorRT forward server for the pool
+
+**Change.** With `R2D2_DEVICE=cuda R2D2_RUNTIME=trt R2D2_TRT_SHARED=1`
+the R2D2 pool forks one forward server (`start_trt_server`,
+`serve_trt_shared` in `r2d2_serve.py`) before its workers. The server holds
+the 25 engines once and gives each worker a lane: 25 user-managed contexts,
+a scratch buffer, a stream and pinned buffers, served by one thread.
+Workers never touch the GPU. `patch_cuda_network` is skipped, so
+everything but the U-Net runs on the CPU as on `R2D2_DEVICE=cpu`, and
+`TrtSharedNet` sends each 1x2xDxD float32 forward down the worker's own
+`SOCK_SEQPACKET` pair. A request is a (net, pid, sequence) header plus the
+input, and the reply echoes the header, so a replacement worker drops a
+reply meant for the worker it replaced. Other shapes, a net with no
+engine, or a server that has gone all fall back to the CPU torch net. The
+run script skips the 6 GB/rank TensorRT sizing in this mode, and
+`run.env` records `R2D2_TRT_SHARED` for `./ri resume`. The default is
+unchanged: off.
+
+**Bug found and fixed before shipping.** The first search (gpu-q-25, job
+39453723, cancelled) ran ~114 likelihood calls/s, but PolyChord needed 136
+calls per slice where round 173 needed ~56, and log(Z) was heading off.
+After 12 min it had 82k calls at 365 dead points, against round 173's
+8-11k for all 600. A one-lane check (job 39454736) was bit-identical to
+per-worker `TrtNet` on all 25 nets. With 19 forked workers at once (job
+39454864, `.probe/r208/check2.py`), 3,798 of 3,800 forwards were wrong,
+worst |diff| 3.4e38. `lane()` did not keep its scratch tensor, so torch's
+caching allocator gave the same block to the next lane and every context
+shared one scratch. Once the lane holds it, 19 concurrent workers x 200
+forwards are **bit-identical** to per-worker TensorRT (3,800 of 3,800,
+job 39454893). Round 207's probe kept its scratch on the lane object,
+which is why it never saw this.
+
+**Pending.** The race in round 173's shape (1 x A100, 600 dead points,
+nlive 48, seed 4242; shared at 19 ranks, per-worker `trt` at 12, eager at
+19, interleaved S T E / T E S / E S) is job 39455029, `.probe/r208/job.sh`.
+Its output goes to `.probe/r208/job-39455029.out` and its run directories
+delete themselves. Read in [round 209](#round-209-negative-so-far-the-shared-tensorrt-server-loses-9-at-19-ranks-because-its-forwards-take-4x-longer): log(Z) agrees, shared is ~9% slower. Ship as default only if log(Z)
+agrees with the other two arms. First arms, read at 11:41 (gpu-q-12):
+
+| arm | evals/s | wall (s) | log(Z) | ndead / nlike | card peak (MiB) | GPU util |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| warm, shared, 19 ranks | 45.9 | 287.9 | 0.0184173527579479 +/- 0.000819 | 492 / 11,509 | 5,779 | 74% |
+| S1, shared, 19 ranks | 52.5 | 227.7 | 0.018861009306903 +/- 0.000643 | 509 / 10,706 | 5,779 | 84% |
+
+log(Z) sits inside round 173's 0.0179-0.0190 for both runtimes, and no
+evaluation failed. At 52.5 evals/s, S1 is not yet ahead of round 173's
+58-64 for per-worker `trt` and 51-63 for eager. The same-job T and E arms
+decide it.
+
+Self-checks: `self_check_trt_shared_protocol` (round trip, stale reply,
+no-engine reply, other shape, server gone) and the full
+`r2d2_serve.py --self-check` pass in `r2d2.sif`, and
+`test_self_checks.py` passes. The only shared-code edit is in
+`run-config.sh`, inside its `r2d2` branch: a WSClean `run.env` is
+byte-identical before and after (checked with `write_run_config`), so no
+WSClean A/B was run. Slurm etiquette slip: this round made three Slurm
+calls less than 2 minutes apart (17 s, 64 s and 115 s).
+
+## Round 209 (negative, so far): the shared TensorRT server loses ~9% at 19 ranks, because its forwards take 4x longer
+
+Round 208's race (job 39455029, gpu-q-12, 1 x A100, nlive 48, 600 dead
+points, seed 4242, arms interleaved S T E / T E S / E S) finished. Its run
+directories deleted themselves; every arm has a `benchmarks.jsonl` row.
+
+| arm | ranks x threads | evals/s | log(Z) | ndead / nlike |
+| --- | --- | ---: | --- | --- |
+| S1 shared `trt` | 19 x 2 | 52.5 | 0.018861009306903 +/- 0.000643 | 509 / 10,706 |
+| T1 per-worker `trt` | 12 x 3 | 61.2 | 0.0189784187873873 +/- 0.000658 | 460 / 8,735 |
+| E1 eager | 19 x 2 | 58.0 | 0.0187401703551069 +/- 0.000614 | 518 / 10,454 |
+| T2 per-worker `trt` | 12 x 3 | 60.0 | 0.0188407201060907 +/- 0.000654 | 466 / 8,187 |
+| E2 eager | 19 x 2 | 59.0 | 0.019108752703253 +/- 0.000621 | 514 / 6,877 |
+| S2 shared `trt` | 19 x 2 | 52.9 | 0.0191202259860594 +/- 0.000617 | 506 / 7,797 |
+| E3 eager | 19 x 2 | 66.4 | 0.0191175531218563 +/- 0.000621 | 488 / 8,204 |
+| S3 shared `trt` | 19 x 2 | 61.1 | 0.0191878668615988 +/- 0.000629 | 497 / 8,012 |
+
+Means: shared 55.5, per-worker `trt` 60.6, eager 61.1 evals/s. log(Z)
+agrees across all three (0.0187-0.0192, errors ~0.0006), and no evaluation
+failed, so shared mode is correct but not faster. It stays opt-in.
+
+Why, from `./ri profile --r2d2-phases` on S1, T1 and E1 before they were
+deleted: a shared worker's "model update" (one U-Net forward plus
+R2D2's few element-wise ops) takes **10.9 ms** a call, against **2.7 ms**
+for per-worker `trt` and 8.9 ms for eager. That is 260 of a 310 ms
+request; T1's request is 143 ms. Everything else in the request is the
+same CPU code in all three. By Little's law the server held ~14 forwards
+in flight at ~1,250 forwards/s (52.5 evals/s x 24 forwards), so it was
+running at about half round 207's 2,450/s, whose 12-lane latency was
+4.9 ms. Round 207's probe ran the server alone on the card with no MPS
+daemon; in a search the pool, and so the server, run as an MPS client,
+beside 18 workers' CPU work. Either could be the difference.
+
+**Pending:** job 39455763 (`.probe/r209/job.sh`, ampere, normal QoS) races
+shared mode with MPS on against `NS_CUDA_MPS=0` at 19 ranks (3 pairs,
+alternating), plus 27 ranks without MPS (2 arms). Shared mode puts no
+worker on the card, so the 19-rank GPU cap does not apply to it; the
+probe lifts it with `NS_R2D2_CUDA_MB_PER_RANK=2000 --mpi-procs 27`.
+If MPS off brings the forward back towards round 207's latency, shared
+mode should skip MPS and size ranks by CPUs; if not, the server's
+per-forward Python (one thread a lane, under the GIL) is next.
+
+## Round 210 (negative): a quarter of the U-Net weights on the other socket's memory
+
+**Question.** Round 205 put the half-node R2D2 CPU search at ~91% of its
+socket's DRAM read bandwidth. This job's cpuset allows memory on both NUMA
+nodes (`Mems_allowed_list: 0-1`) although its CPUs are all on node 0.
+Could putting some weights on node 1 add the interconnect's bandwidth to
+the local controllers'?
+
+**Bandwidth probe** (`.probe/r210/bw2.c`: round 205's read test with 1 in
+K 2 MB blocks `mbind`ed to node 1; 38 threads on socket 0; a neighbour
+job was running on socket 1 at load ~26):
+
+| pages on node 1 | read GB/s (best of 6) |
+| --- | ---: |
+| none | 172 |
+| 1/8 | 195 |
+| 1/5 | 206 |
+| 1/4 | 216 (+25%) |
+| 1/3 | 170 |
+| 1/2 (`numactl --interleave=0,1`) | 117 |
+| all (`--membind=1`) | 57 |
+
+The local and remote paths add up when the split is about 3:1 (165 local
++ 57 remote would be ~220).
+
+**Prototype knob** (not kept): `R2D2_REMOTE_NETS=k` bound every k-th net's
+ORT session to the job's memory-only node while the pool built it. With
+k = 4, 6 of the 25 nets (24% of the weights) went to node 1, and
+`/proc/<pid>/numa_maps` showed ~720 MB of each worker's pages there,
+as intended.
+
+**Search A/B** (cpu-q-197, half icelake node, default 39 ranks, onnx,
+nlive 100, 5 repeats, 400 dead, seed 4242; A = default, B = k 4;
+order B0, A1 B1, B2 A2 A3 B3):
+
+| arm | evals/s | ms/eval | log(Z) | ndead / nlike |
+| --- | ---: | ---: | --- | --- |
+| B0 (first after the edit) | 36.9 | 1015 | 0.0174128417571236 +/- 0.000814 | 500 / 5369 |
+| A1 | 46.4 | 796 | 0.0174040483674829 +/- 0.000864 | 500 / 6060 |
+| B1 | 48.3 | 774 | 0.0170199562761951 +/- 0.001055 | 500 / 6198 |
+| B2 | 46.9 | 784 | 0.017599403113552 +/- 0.000735 | 500 / 4977 |
+| A2 | 49.8 | 751 | 0.0163660879634581 +/- 0.001172 | 500 / 7202 |
+| A3 | 45.9 | 799 | 0.0174918176415889 +/- 0.00074 | 500 / 5555 |
+| B3 | 47.8 | 773 | 0.0175286517214831 +/- 0.000774 | 500 / 4729 |
+
+Paired means: A 47.4, B 47.7 evals/s (+0.7%, inside the ~5% control
+spread); ms/eval 782 against 777. B0 was a cold first start and is left
+out. Every log(Z) agrees (0.0164-0.0176, errors 0.0007-0.0012).
+
+**Forward probe** (`.probe/r210/remote.py`: 38 forked children pinned
+one per CPU, each walking the 25 optimised ORT sessions staggered, 100
+forwards each, two reps):
+
+| nets on node 1 | ms/forward | forwards/s |
+| --- | ---: | ---: |
+| none | 28.59, 28.51 | 1,329, 1,333 |
+| 1/4 (6 nets) | 28.46, 28.27 | 1,335, 1,344 |
+| 1/8 (3 nets) | 28.64, 28.49 | 1,327, 1,334 |
+
+**Result.** Null at both levels, so the knob was reverted. 1,330
+forwards/s x 124 MB is 165 GB/s, which is round 205's local read peak.
+The forwards still do not go past it when a quarter of the weights stream
+from node 1, a split that gave STREAM +25%. What limits a forward at 38
+cores is therefore not the node-0 memory controllers alone. Per core it
+is ~4.4 GB/s of weight reads mixed with compute, which looks more like
+per-core latency or prefetch than channel bandwidth, and remote lines
+only add latency. Even a gain would have taken bandwidth from whatever
+job holds the other socket, which is another user's in production.
+
+**Learned.**
+- On CSD3 a half-node job may allocate on the other socket even though
+  its CPUs are all on one: Slurm's cpuset sets `cpuset.mems` to 0-1.
+- STREAM's read peak overstates the gain a weight-streaming workload can
+  get from more memory channels. Before wiring a placement change in,
+  check it with the forward probe (`.probe/r210/remote.py`, a couple of
+  minutes), not with bandwidth arithmetic.
+- The first search after an edit to `r2d2_serve.py` ran 21% slow (B0).
+  The A/B order needs a warm-up arm, as round 209's GPU races have.
+
+GPU: job 39455763 (round 209's MPS-off and 27-rank race) had not started
+by 12:33. No Slurm call was made this round; read its output
+(`.probe/r209/job-39455763.out`) next round.
+
+Rows: `r210-*` in `benchmarks.jsonl` (`dirty`: the knob was uncommitted).
+Probe sources and output are in `.probe/r210/`. Run directories deleted.
+
+## Round 211 (positive, opt-in mode): shared TensorRT without MPS, +47% steady; and short GPU arms were measuring start-up and meqserver wedges
+
+Three results from round 209's race (job 39455763, gpu-q-28) and a new job
+(39458000, gpu-q-40, `.probe/r211/job.sh`), all 1 x A100, nlive 48, 600 dead
+points, seed 4242, `R2D2_RUNTIME=trt R2D2_TRT_SHARED=1`.
+
+**1. The headline evals/s of a 3-minute GPU arm is mostly noise.** Each
+evaluation records its start and end epochs. Read across the whole search,
+they show two kinds of stretch in which *no rank starts anything*:
+
+- **Start-up**, before the first evaluations finish (the pool and the
+  TensorRT server warm up): 23-28 s in most arms, but 52-88 s in some.
+- **Mid-run stalls**: one evaluation's *simulate* took 81-93 s instead of
+  ~40 ms (`timing.simulate_seconds`), and the whole search waited. [Round 214:
+  not MeqTrees, which an R2D2 simulate never runs; most likely a silent
+  worker killed at the rank's reply bound.] Read at the time as
+  meqserver wedges sitting out their retry ladder: with a 1 s dump and a
+  15.5-minute observation (931 time samples) the predict bound is ~17 s, the
+  worker restarts its meqserver and retries, and the rank's reply timeout
+  sits above both (docs/robustness.md). Every other rank meanwhile waits in
+  PolyChord's collective. It hit 3 of 17 arms (N19b twice, M19b twice at
+  ~30 s, A1 once), all within the first ~100 s.
+
+So r209-N19b recorded 42.6 evals/s, yet outside its 99 s of gaps it ran at
+87.0. That is why round 208's arms spread by 15% and r211-A1 (36.2) looks
+like a regression. `scripts/bench.py` now records `startup_s`, `stall_s` and
+`steady_evals_per_s` (evaluations over the span minus both; a gap is more
+than max(2 s, 10x the median evaluation) with no evaluation starting), and
+`./ri bench` prints the steady rate under evals/s. Short arms should be
+compared on it. The headline rate is still the honest cost of a short run,
+and wedges are a real cost in production too, but they are rare per
+evaluation and land early. A long run pays its start-up once.
+
+**2. Shared mode should not run under MPS.** Round 209's race, read
+steady (`.probe/r211/stalls.py` on the summaries, rows `r209-*`):
+
+| arm | MPS | ranks | headline evals/s | start-up + stalls (s) | steady evals/s | log(Z) | ndead / nlike |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| warm | off | 19 | 56.7 | 88 | 106.7 | 0.0189927813399692 +/- 0.000626 | 479 / 10,201 |
+| M19a | on | 19 | 58.4 | 24 | 68.1 | 0.01891316616849 +/- 0.000615 | 498 / 9,426 |
+| N19a | off | 19 | 76.7 | 24 | 93.5 | 0.0170521010639902 +/- 0.001351 | 467 / 9,911 |
+| N27a | off | 27 | 69.8 | 28 | 85.9 | 0.0184899289058102 +/- 0.000642 | 502 / 11,155 |
+| N27b | off | 27 | 59.1 | 27 | 74.5 | 0.0191127010051921 +/- 0.000638 | 512 / 7,368 |
+| N19b | off | 19 | 42.6 | 24 + 75 (wedges) | 87.0 | 0.0188079202755247 +/- 0.000601 | 506 / 8,028 |
+| M19b | on | 19 | 48.9 | 23 + 22 (wedges) | 62.8 | 0.0191770161313821 +/- 0.000622 | 500 / 9,360 |
+| M19c | on | 19 | 49.5 | 23 | 54.8 | 0.0188530433043638 +/- 0.000595 | 490 / 11,399 |
+| N19c | off | 19 | 71.3 | 23 | 92.1 | 0.018943729817722 +/- 0.000607 | 500 / 7,845 |
+
+At 19 ranks MPS off wins 3 of 3 pairs: steady **90.9 against 61.9
+evals/s (+47%)**, headline 63.5 against 52.3 (+21%). 27 ranks without MPS
+are no better than 19 (80.2 steady). log(Z) agrees everywhere
+(0.0185-0.0192, errors ~0.0006; N19a's 0.0171 +/- 0.0014 is within 1.4
+sigma). The reason is plain: in shared mode only the server process touches
+the card, so an MPS daemon has nothing to share and only adds its client
+path to every launch. `run-nested-sampling-r2d2.sh` now never starts MPS when
+`R2D2_TRT_SHARED=1`; other GPU runs keep it (round 119).
+
+For scale, round 208's per-worker TensorRT and eager arms (another node,
+headline only) ran 60.6 and 61.1. A steady race of shared-without-MPS
+against both is the next GPU round, and it decides whether shared becomes
+the GPU default.
+
+**3. Round 207's probe rate is not an artefact of lanes in step.** In
+`scripts/probe_trt_shared.py` every lane ran N1..N25 from the same start,
+so concurrent forwards could share L2. With `STAGGER=1` (lane t starts at
+net t), job 39458000 part 1, no MPS, K = 19, two passes:
+
+| lanes | threads mode forwards/s | pipes mode forwards/s |
+| --- | ---: | ---: |
+| aligned | 2,460, 2,465 | 2,460, 2,459 |
+| staggered | 2,462, 2,462 | 2,457, 2,460 |
+
+No difference. Outputs were bit-identical (0 mismatches).
+
+**Threads per rank, and MPS again** (job 39458000 part 2, gpu-q-40). The
+job runs the working tree, and the MPS change above landed at 13:04:58,
+between C2's start and B2's. So warm-C2 ran with MPS and B2 and A2 without,
+which turned the end of the job into a second MPS check:
+
+| arm | MPS | ranks x threads | headline | start-up + stalls (s) | steady | log(Z) | ndead / nlike |
+| --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| warm | on | 19 x 2 | 45.1 | 66 | 66.4 | 0.0194020963996079 +/- 0.000653 | 491 / 8,935 |
+| A1 | on | 19 x 2 | 36.2 | 23 + 81 (wedge) | 55.4 | 0.0189331320186553 +/- 0.000599 | 503 / 10,526 |
+| B1 | on | 19 x 1 | 53.9 | 52 | 70.1 | 0.0187737438179926 +/- 0.000688 | 481 / 11,727 |
+| C1 | on | 27 x 1 | 48.4 | 27 | 55.9 | 0.0188803031693729 +/- 0.000615 | 558 / 9,286 |
+| C2 | on | 27 x 1 | 53.5 | 26 | 61.9 | 0.0185734460403887 +/- 0.000582 | 580 / 9,929 |
+| B2 | off | 19 x 1 | 56.9 | 23 + 38 | 99.0 | 0.0188558686390048 +/- 0.000592 | 488 / 7,792 |
+| A2 | off | 19 x 2 | 42.3 | 21 + 107 | 98.8 | 0.0192080305249269 +/- 0.000633 | 506 / 9,154 |
+
+Without MPS the steady rate is 99 at both thread counts, against 55-70 with
+it on the same node. That matches job 39455763's +47%. With MPS, 19 x 1
+looked better than 19 x 2 (70.1 against 55.4-66.4), but without it the
+difference disappears, so `R2D2_OMP_THREADS` stays as it is. A2's 107 s and
+B2's 38 s of stalls came from no slow simulate; what the search waited on
+there is not identified yet. log(Z) agrees everywhere (0.0186-0.0194).
+C2 exited 127 after its search finished, so it has no ledger row. Its bash
+was reading `run-nested-sampling-r2d2.sh` when the file was edited under it.
+Do not edit a shell script that a running job is executing.
+
+**Slurm hygiene.** The scancel of 39457795 (the first version of this job,
+before the stagger probe was added) came 80 s after its sbatch, inside the
+2-minute rule. The resubmission came 2 minutes after the scancel.
+
+**Learned.**
+- Read a short GPU arm through its evaluations' epochs before trusting
+  evals/s. One wedge, or a slow start-up, moves a 3-minute arm by up to 50%.
+- A job that runs the working tree picks up edits mid-job: arms after the
+  edit run the new code, and a shell script edited while it runs can fail.
+  Write down which arms ran which tree.
+- MeqTrees wedges reach the GPU searches too, early in a run, at large
+  time-sample counts. Each one stops every rank for its whole retry ladder.
+  Shortening that ladder for those shapes is a lever for production runs
+  (WSClean shares this code, so it needs the WSClean guard).
+
+## Round 213 (positive, opt-in): converged, shared TensorRT runs the production search 16% faster than per-worker TensorRT
+
+**Question.** Round 211 found shared TensorRT without MPS at +47% steady over
+shared *with* MPS. Does it beat the other two GPU modes, per-worker
+`trt` (12 x 3, round 172's best) and eager torch (19 x 2, the GPU default)?
+
+**Run.** Job 39460028 (gpu-q-41, 1 x A100, 32 cores, `.probe/r212/job.sh`),
+submitted by gnhf iteration 212, which was cut off before it could read
+it. Tree `b41063c`; nlive 48, 5 repeats, 600 dead points, seed 4242, a
+discarded warm-up arm, then three interleaved triples. The iteration's
+reset dropped the ledger rows its arms had written, so this round rebuilt
+them (`r212-*`) from the saved `summary.json`s through `bench.row_for`,
+with host, commit and time set to the job's. Two
+settings the ledger did not group by, `R2D2_TRT_SHARED` and
+`R2D2_DEVICE`, are now `WORKLOAD_KEYS`; until now a shared and a
+per-worker arm at the same ranks and threads landed in one cell.
+
+| arm | mode | ranks x threads | evals/s | start-up + stall s | steady evals/s | simulate ms | request ms | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| S1 | shared | 19 x 2 | 77.2 | 24 | 97.2 | 33.9 | 193 | 0.0188058162526177 +/- 0.000598 |
+| T1 | per-worker | 12 x 3 | 66.7 | 12 + 2 | 75.0 | 22.3 | 136 | 0.0190883982001229 +/- 0.000659 |
+| E1 | eager | 19 x 2 | 56.2 | 14 | 61.5 | 32.0 | 281 | 0.0189418368847199 +/- 0.000607 |
+| E2 | eager | 19 x 2 | 56.2 | 11 | 60.1 | 29.1 | 284 | 0.0190002868972952 +/- 0.000605 |
+| S2 | shared | 19 x 2 | 69.9 | 23 | 83.0 | 37.1 | 214 | 0.0189079731728229 +/- 0.000611 |
+| T2 | per-worker | 12 x 3 | 68.7 | 13 + 2 | 77.7 | 22.4 | 131 | 0.0188547315624287 +/- 0.000653 |
+| T3 | per-worker | 12 x 3 | 63.5 | 13 + 2 | 70.2 | 26.1 | 140 | 0.018743075134026 +/- 0.000662 |
+| E3 | eager | 19 x 2 | 71.1 | 11 | 77.8 | 28.3 | 218 | 0.0182637019071869 +/- 0.000751 |
+| S3 | shared | 19 x 2 | 57.0 | 23 | 66.4 | 49.8 | 258 | 0.0188935993662264 +/- 0.000608 |
+
+(The warm-up arm, shared, ran 53.7 evals/s with 90 s of start-up, 98.0
+steady.)
+
+**Result.** Mean steady rate: shared **82.2**, per-worker 74.3, eager 66.4.
+Shared beat per-worker in triples 1 and 2 and lost in 3; it beat eager in
+1 and 2 and lost in 3. Its own arms span 66-97, against 70-78 for
+per-worker: S3's simulate (49.8 ms against ~34) shows the whole node
+slowed under it, and shared's 19 ranks x 2 threads already ask 38
+threads of 32 cores, so it feels CPU contention the 12-rank per-worker
+layout does not. No mode stalled mid-run (per-worker's 2 s is the
+TensorRT engine load after the first evaluations). log(Z) agrees across all
+nine (0.0183-0.0191, errors 0.0006-0.0008). Shared's +11% over per-worker
+is inside this node's spread, so the GPU default stays eager torch. The
+decider is round 211's priority: a converged, production-shaped race
+(the 22 Sep search: seed 190182240, nlive 150, 15 repeats), shared
+19 x 2 against per-worker 12 x 3 in one 1-GPU job.
+
+**Converged race.** Job 39467111 (gpu-q-16, `.probe/r213/job.sh`), one
+arm each, shared first, on this round's tree (`b41063c` plus the
+`WORKLOAD_KEYS` edit, which no search reads). Rows `r213-S`, `r213-T`.
+
+| | shared 19 x 2 | per-worker 12 x 3 | round 195 (CPU, 38 icelake) |
+| --- | ---: | ---: | ---: |
+| search wall (job's clock) | **865 s** | 924 s | 1,393 s |
+| evaluations | 65,071 | 62,024 | 66,973 |
+| evals/s | **80.5** | 69.6 | 48.1 |
+| start-up + stall s | 77 + 4.8 | 16.7 + 9.1 | |
+| steady evals/s | **89.6** | 71.7 | |
+| request ms per evaluation | 186 | 125 | 744 |
+| simulate ms per evaluation | 31.0 | 26.5 | 35 |
+| idle fraction | 0.59% | 0.79% | 1.0% |
+| dead points / likelihood calls | 1,322 / 64,364 | 1,283 / 61,593 | 1,472 / |
+| log(Z) | 0.0170806350771138 +/- 0.000422116 | 0.0173488323913882 +/- 0.000424796 | 0.017334457686004 +/- 0.000411387 |
+
+Shared mode converges 16% faster by the headline rate and 25% by the
+steady one, and it would be more on a longer search: its start-up is 77 s
+against 17 (the server builds or loads all 25 engines before the first
+forward). The two log(Z)s are 0.45 sigma apart and both within 0.6 sigma of
+round 195's CPU run. Neither run had a single slow simulate: no
+evaluation's simulate took over 5 s, so on a production-shaped GPU search
+meqserver wedges cost nothing here. Round 211's wedges were all in short
+arms' first ~100 s, and these two runs' first 100 s had none, so the
+wedge rate is low enough that priority 1 needs many more runs (or a
+forced wedge) to measure. One converged pair is not an interleaved A/B,
+but the effect is 4x this host's ~4% sequential bias. A GPU on the
+production search now does in 14 minutes what half an icelake node does
+in 23.
+
+**Pending.** The GPU default is eager torch, which neither arm measured
+converged. Job 39470312 (`.probe/r214/job.sh`) runs eager 19 x 2 and then
+shared on the same search, to decide whether `R2D2_TRT_SHARED=1
+R2D2_RUNTIME=trt` becomes the GPU default.
+
+**Learned.**
+- When an iteration is reset, the ledger rows its job writes before the
+  reset are lost; rows written afterwards survive uncommitted. Have a job
+  save each `summary.json` itself (this one did), so rows can be rebuilt.
+- A production-shaped GPU search (65k evaluations, 14 minutes) had no
+  meqserver wedge in either of two runs, so wedges are not a steady cost
+  of GPU searches; they need a forced reproduction to study.
+- In shared mode the CPU, not the card, sets the spread: its slowest arm
+  was the one where simulate ran 47% slow. 15-16 ranks x 2 threads (no
+  oversubscription) may be the steadier shared layout.
+
+
+## Round 214 (diagnostic): round 211's "meqserver wedges" were not MeqTrees; simulate workers now log how they exit
+
+**Question.** Priority 1 is the ~80 s whole-search stalls that round 211
+called meqserver wedges. What wedges, and how can it be shortened?
+
+**Finding: no meqserver is involved.** An R2D2 search's simulate does not
+use MeqTrees. `simulate_point_source_ms.py --mat-only` fills the
+visibilities with the analytic predict (`point_source_visibilities`).
+`run_meqtrees_predict` runs only in self-checks. So round 211's reading,
+which was that the predict bound expires twice and the meqserver restarts,
+cannot be right, and shortening the predict ladder would change nothing.
+Two facts narrow down what it was:
+
+- 81-93 s brackets the *rank's* reply bound for a 931-sample observation,
+  `simulate_reply_timeout(931)` = 30 + 2 x 17.0 + 20.5 = 84.4 s, plus the
+  1 s retry delay. That is the pattern of a worker that went silent: the
+  rank waits out its bound, kills the worker (`FifoWorker.kill`), and
+  retries on the respawned worker. A legitimately slow build would have
+  no reason to land on that number.
+- They are rare and not reproducible from the seed. Round 212's ten arms
+  and round 213's two converged searches ran 221,908 evaluations with the
+  same code and seeds (4242; 190182240). In those, no simulate that started
+  after the first 5 s took longer than 1.58 s. The 37 that took over 1 s
+  are all at t = 0, where cold observation-cache builds run concurrently.
+  All of round 211's stalls were in shared-TensorRT arms within ~100 s of
+  start-up, while the server was loading its 25 engines.
+
+The summaries of the stalled arms (jobs 39455763 and 39458000) were
+deleted, and the pool's log did not record worker exits. So whether the
+worker died, hung or was killed cannot be settled after the fact.
+
+**Change.** In `run-nested-sampling-r2d2.sh`, each simulate worker's
+respawn loop now writes `<epoch> simulate worker <rank> exited <status>`
+to `workers-meqtrees.log` beside the run. A mid-run `137` at the time of a
+slow simulate means the rank killed a silent worker. Any other status
+means the worker died on its own, and its traceback is in the same log.
+No line means the worker was slow but alive. This is an R2D2-only script
+and the line runs only when a worker exits, so the evaluation path and the
+WSClean search are unchanged.
+
+**Check (cpu-q-203, 8 ranks, nlive 24, 60 dead points, seed 4242,
+`r214-probe`).** SIGKILLing rank 1's worker mid-run logged `simulate worker
+1 exited 137`. The loop respawned the worker and the search finished rc=0
+(log(Z) 0.01027 +/- 0.00858; 504 evaluations, ledger row `r214-probe`).
+At the end, every worker logged `exited 0` when its FIFO closed. The run
+directory is deleted. `bash -n` and `scripts/test_self_checks.py` pass.
+The edit was made length-neutral (18,514 bytes before and after), because
+GPU job 39470312 was executing this script from the working tree at the
+time (round 211's exit-127 trap).
+
+**Pending.** Job 39470312 (gpu-q-1, started 14:23): converged eager
+19 x 2 against shared TensorRT on the 22 Sep production search. It had
+not finished at the end of this round. Read `.probe/r214/job-39470312.out`
+and `summary-{E,S}.json` next round.
+
+**Learned.**
+- The profiler's "simulate (MeqTrees)" label (`common.py`) is historical.
+  The stage has been the analytic fill plus noise and the .mat write since
+  the analytic predict landed, so a large simulate share is never MeqTrees
+  time in these searches.
+- When the next stall happens, read `workers-meqtrees.log` before deleting
+  the run directory. A 137 there points at the worker going silent, most
+  likely CPU or memory starvation while the shared TensorRT server starts
+  up, not at the simulate code.
+
+
+## Round 215 (GPU default): shared TensorRT converges the production search in 785 s against eager's 1,165
+
+**Question.** Round 213 found shared TensorRT 16% faster than per-worker
+TensorRT on the converged 22 Sep search, but never raced it against the
+GPU default, eager torch 19 x 2 with MPS. Does it beat that too?
+
+**Run.** Job 39470312 (gpu-q-1, 1 x A100-80GB, 32 cores,
+`.probe/r214/job.sh`), submitted by round 213, read here. The 22 Sep
+search (seed 190182240, nlive 150, 15 repeats, to convergence), eager
+first, then shared, one arm each on tree `99e1bea`. Rows `r214-E`,
+`r214-S`; both `summary.json`s are kept in `.probe/r214/`.
+
+| | eager torch 19 x 2 (MPS) | shared TensorRT 19 x 2 (no MPS) |
+| --- | ---: | ---: |
+| search wall (job's clock) | 1,165 s | **785 s** |
+| evaluations | 68,476 | 68,756 |
+| evals/s | 64.2 | **90.8 (+41%)** |
+| start-up + stall s | 31.0 + 3.8 | 65.3 + 4.3 |
+| steady evals/s | 66.4 | **100.1 (+51%)** |
+| request ms per evaluation | 253 | 166 |
+| simulate ms per evaluation (max) | 21.7 (1.53 s) | 26.0 (0.86 s) |
+| idle fraction | 0.35% | 0.56% |
+| dead points / likelihood calls | 1,346 / 67,629 | 1,311 / 67,874 |
+| log(Z) | 0.0169929843910844 +/- 0.000418239 | 0.0170325527068095 +/- 0.000448107 |
+
+**Result.** Shared TensorRT finishes the production search a third
+sooner: 785 s against 1,165 s, +41% evals/s by the headline rate and +51%
+steady. The two log(Z)s are 0.06 sigma apart and within 0.6 sigma of round
+213's two runs and round 195's CPU run. With round 213 (+16% over
+per-worker TensorRT), shared TensorRT beats both other GPU modes
+converged. One converged pair is not an interleaved A/B, but the effect
+is 10x this host's ~4% sequential bias, and round 212's interleaved short
+arms ranked the modes the same way. No evaluation in either run had a
+simulate over 1.6 s, so neither run stalled.
+
+**Change.** `run-nested-sampling-r2d2.sh`: on a GPU, `R2D2_RUNTIME`
+defaults to `trt` and, with it, `R2D2_TRT_SHARED` to 1 (recorded in
+`run.env`). The default layout on a 32-core A100 job is still 19 ranks x
+2 threads (`NS_R2D2_CUDA_MAX_RANKS`, and the 4 GB-per-rank card budget
+fits 19), which is the layout raced. `R2D2_RUNTIME=torch` brings back eager
+torch with MPS, and `R2D2_TRT_SHARED=0` brings back per-worker engines.
+`resume-nested-sampling-run.sh`: a `run.env` with no `R2D2_TRT_SHARED`
+resumes with 0, so an old per-worker TensorRT run does not change mode on
+resume (eager runs record `R2D2_RUNTIME=torch` and stay eager). CPU
+searches and WSClean are untouched: the new lines run only for
+`R2D2_DEVICE=cuda`, so no WSClean race was needed. The first default GPU
+search on a node with no cached plans builds them first (~5 minutes, round
+171).
+
+**Also.** The profiler's first row is now "simulate (visibilities +
+noise)", not "simulate (MeqTrees)" (`PROFILING_VIEW_STAGES` in
+`common.py`), and `docs/nested-sampling.md` says that the search's
+simulate is analytic, with the MeqTrees predict only run in self-checks
+(round 214). That label is the likely source of the "MeqTrees takes 30-50% of the
+runtime" reading came from: the stage was 39% on 22 Sep (round 184's
+table) and is 3-5% of worker time now, none of it MeqTrees.
+
+**Default checked.** Job 39474141 (gpu-q-44, `.probe/r215/job.sh`) ran
+`./ri search r2d2 --device cuda` with no runtime, thread or rank variables
+(nlive 48, 5 repeats, 600 dead points, seed 4242), on this round's tree.
+Its `run.env` recorded `R2D2_RUNTIME=trt`, `R2D2_TRT_SHARED=1`,
+`NS_MPI_PROCS=19` and `R2D2_OMP_THREADS=2`, and it finished rc 0 in 281 s:
+46.4 evals/s with 90.9 s of start-up, 80.7 steady (round 212's shared short
+arms: 66-97), no stall. Its log(Z), 0.0187108469398579 +/- 0.000591, agrees
+with round 212's three shared arms (0.0188-0.0189). Row `r215-default`.
+A cold node's start-up runs to ~90 s, against 23-24 s in round 212.
+
+**Learned.**
+- Shared TensorRT's start-up (65-91 s, the server loading 25 engines
+  before its first forward) is the only thing it does worse than eager (31
+  s). On a 13-minute search that costs ~5%, so cutting it is the next
+  GPU lever.
+- Three converged GPU searches in a row (rounds 213-215, 202k evaluations)
+  had no simulate over 1.6 s. The ~80 s stalls are confined to round 211's
+  short arms.
+
+
+## Round 217 (start-up, GPU confirmation pending): parallel reads for the TensorRT libraries and plans
+
+**Why.** Shared TensorRT's only weakness is start-up: 65-91 s on a cold
+GPU node against 23-24 s on a warm one (rounds 212, 215). Round 216 found
+that the shared server read its 25 plans (5.3 GB) one at a time.
+
+**Where a cold start goes (this node, cpu-q-203, `r2d2-cuda.sif`).** A cold
+`apptainer exec ... python3 -c "import torch; import tensorrt"` took
+84.7 s: torch 35.0 s, and tensorrt 26.1 s. The second, warm run took 19.9 s
+(torch 14.0 s, tensorrt 0.06 s). tensorrt loads ~0.8 GB of shared libraries
+(`libnvinfer.so.11` alone is 715 MB) from `.cache/ri/r2d2-trt/py` on Lustre,
+and the mmap page faults pull them in as small reads. The plans behave the
+same way: with pages dropped by `posix_fadvise(DONTNEED)`, the 25 plans read
+one at a time in 16.3 s cold and 4.0-4.2 s afterwards, and with 8 threads in
+0.67-0.72 s (round 216: 11.6 s cold one at a time, against 3 s with 13
+threads).
+
+| step, pages dropped first (alternated) | one at a time | parallel |
+|---|---|---|
+| `import tensorrt`, alone vs after 16 x 64 MB-chunk reads of the libraries | 9.28, 9.36 s | 1.21, 0.34 s (incl. prefetch) |
+| 25 plans (5.3 GB), `read_bytes` vs 8 threads | 4.19, 3.93 s | 0.72, 0.67 s |
+
+**Change** (`r2d2_serve.py`, GPU TensorRT path only):
+- `patch_trt_network` reads the TensorRT libraries (excluding the
+  `builder_resource` ones, which only a plan build needs) in 64 MB chunks on
+  16 threads, while it exports ONNX and the `--build-trt-plans` child imports
+  torch. It joins the threads before it returns, so nothing forks while they
+  run (`read_chunk`).
+- `serve_trt_shared` reads the plans on 8 threads and deserializes each one in
+  order as it arrives, rather than reading and deserializing one at a time.
+
+Results cannot change: the same bytes reach the same engines. On this node
+(no GPU), with `export_onnx` stubbed, `patch_trt_network` still falls back to
+eager: the build child fails, the status file says `eager: TensorRT plans not
+built`, it returns in 23 s, and only the main thread is left alive.
+`scripts/test_self_checks.py` passes (27), and so does `compileall`. CPU
+searches and WSClean never call either function.
+
+**Pending.** GPU job 39475183 (`.probe/r217/job.sh`) runs round 215's
+default search (seed 4242, nlive 48, 5 repeats, 600 dead points) on this
+tree, to check that it finishes rc 0 with log(Z) identical to
+`r215-default` (0.0187108469398579 +/- 0.00059083509809515) and to compare
+`startup_s` against that run's 90.9 s. It then times the server's load, old
+against new, interleaved, along with deserialization and lane creation. It
+replaces round 216's probe job 39475003, which was cancelled before it ran.
+It had not started 35 minutes after submission. Read it in the next round.
+
+## Round 218 (start-up, GPU confirmation pending): a driver-only GPU check, and the R2D2 image read ahead
+
+**Why.** Round 217 left the torch import as the largest start-up cost: 35 s
+cold, 14 s warm. A GPU search pays it twice before its first evaluation:
+once in `run-nested-sampling-r2d2.sh`'s "is there a GPU" check (`import
+torch; torch.cuda.is_available()`) and once in the pool.
+
+**Why a warm import is still slow.** Apptainer 1.5.4 on CSD3 mounts each
+SIF through `squashfuse_ll` under `fuse-overlayfs`, one fresh mount per
+`exec`. Every exec therefore decompresses the image's libraries again
+(`torch/lib` is 946 MB and `nvidia/` is 2.7 GB in `r2d2-cuda.sif`), so the
+page cache only removes the Lustre reads. Warm on this node (cpu-q-203,
+load ~26): `apptainer exec ... true` takes 0.8 s, `python3 -c pass` takes
+1.6 s, and `import torch` takes 20.1 s (`-X importtime`: torch 14.1 s, of
+which `torch._C` is 3.7 s).
+
+**Cold image.** The image was dropped with `posix_fadvise(DONTNEED)`, which
+is only partial on Lustre (round 217), then one of two arms ran:
+`import torch` alone, or `import torch` after a 16-way 64 MB-piece read of
+the whole 3.9 GB SIF. The arms alternated, 3 pairs:
+
+| pair | import alone | read + import |
+|---|---|---|
+| 1 (the only truly cold one) | 46.3 s | 2.7 + 20.2 = 22.9 s |
+| 2 | 22.7 s | 0.8 + 19.9 = 20.7 s |
+| 3 | 22.8 s | 0.9 + 20.3 = 21.2 s |
+
+The read takes 2.7 s when the pages really are cold (1.4 GB/s) and 0.75 s
+when they are cached. In pairs 2 and 3 the eviction failed, so they only
+show the warm floor.
+
+**Change** (`run-nested-sampling-r2d2.sh` only, so WSClean is untouched):
+- Once inside the job, the script reads the R2D2 SIF in the background:
+  `dd` of 64 MB pieces, 16 at a time, finished in ~3 s cold. It overlaps the
+  GPU check and the rank budget, so the pool's import is served from the
+  page cache. The CPU path does the same with `r2d2.sif`, at ~0.1 s warm.
+- The GPU check now asks the driver directly through ctypes inside the
+  image: `cuInit`, `cuDeviceGetCount` > 0, and a `cuDriverGetVersion` major
+  of at least the image's torch CUDA major, which is read from
+  `torch/version.py` as text. It never imports torch. If this check fails or
+  errors, the old torch check runs, so it cannot reject a GPU that torch
+  would accept. On this GPU-less node the new check fails in 3.0 s, against
+  27.2 s for the torch check.
+
+Results cannot change: the read only fills the page cache, and the check
+only gates start-up. A short CPU search on this tree (9 ranks, nlive 24,
+60 dead points, seed 4242) finished rc 0: 338 evaluations, log(Z)
+0.01082 +/- 0.00832 (async, so it is not compared bit for bit), with its
+row `r218-cpu` in `benchmarks.jsonl` and its summary in
+`.probe/r218/summary-cpu.json`. `test_self_checks.py` (27) and
+`test-defaults.sh` pass. shellcheck 0.11 is clean on the changed script;
+its one finding is a pre-existing SC2217 in `progress-bar.sh`.
+
+**Expected.** On a warm GPU node, about 20 s less start-up from skipping the
+second torch import. On a cold node, a further ~20 s, because the pool's
+import no longer page-faults the image in from Lustre. That is against
+round 215's 90.9 s `startup_s`, or ~5% of a 13-minute converged search.
+
+**Pending.** GPU job 39478176 (`.probe/r218/job.sh`, 10 minutes, 1 A100)
+times the torch check and the driver check, alternated 3 times starting
+cold, to confirm that the driver check passes on a GPU node. Round 217's job
+39475183 runs `./ri search` from this working tree, so if it starts after
+this round its `startup_s` includes both rounds' changes. Neither had
+started when this round ended.
+
+## Round 219 (negative, reverted): CUDA graphs crash the shared TensorRT server; rounds 217-218 confirmed on a GPU
+
+**Why.** Shared TensorRT is now the GPU default (round 215, 100 steady
+evals/s at 19 ranks). Round 209 found that a shared worker's forward takes
+~4x its solo latency (10.9 ms against 2.7). With 19 lanes, each a Python
+thread in one server process, every forward costs three stream operations
+(copy in, the engine's own launches, copy out) issued under one GIL and one
+CUDA context. At ~2,500 forwards/s the launch path, not the A100's
+arithmetic, is the likely ceiling.
+
+**Change tried (opt-in `R2D2_TRT_GRAPHS=1`; reverted, see Result).** `serve_trt_shared()` captures
+one CUDA graph per lane and net at lane set-up: the copy from the pinned
+input buffer, `execute_async_v3`, and the copy to the pinned output.
+Requests then call `graph.replay()` on the lane's stream instead of making
+three launches. The graph runs the same kernels on the same buffers, so
+outputs should be bit-identical; the probe checks this. Each context
+flushes its deferred set-up with one ordinary enqueue before capture. A
+net whose capture fails keeps its context. The knob reaches the pool
+through `--env` in `run-nested-sampling-r2d2.sh`, and is recorded in
+`run.env` (so `./ri resume` keeps it) and in `bench.py`'s `WORKLOAD_KEYS`
+(so ledger rows with and without it are not grouped together). The default
+stays 0, so no current run changes. CPU and WSClean searches never reach
+these lines. The `run-config.sh` line prints only for `r2d2` runs, so a
+WSClean `run.env` is byte-for-byte unchanged and no WSClean race was
+needed.
+
+**Checks here (cpu-q-203, no GPU).** `compileall`, `bash -n`,
+`test_self_checks.py` (27 pass) and `./ri self-check r2d2-serve` in
+`r2d2.sif` (including the shared-protocol check) pass. shellcheck is not
+installed on this node. The two shell edits copy their neighbouring lines
+exactly.
+
+**Result: job 39479990** (gpu-q-44, `.probe/r219/job.sh`). Round 218's
+check, now confirmed on a GPU node: the driver-only check passes (rc 0) in
+1.03 s cold and 0.95 s warm, against 31.2 s cold and 5.8 s warm for the
+torch check. The two seed-4242 searches (rows `r219-G` and `r219-D`):
+
+| arm | evals | steady evals/s | headline | start-up s | request ms | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| G, graphs | 10,181 | **14.9** | 14.2 | 36.5 | 1,204 | 0.01878 +/- 0.00060 |
+| D, default | 8,850 | 100.0 | 79.8 | 22.3 | 193 | 0.01884 +/- 0.00065 |
+
+The graph arm is 6.7x *slower*. A 1.2 s request is the CPU U-Net's time
+(round 218's CPU row was 1.3 s), so in that arm the workers were almost
+certainly running on the CPU fallback. `TrtSharedNet` falls back to the
+CPU when the server's socket breaks, and log(Z) still agrees because the
+CPU path gives the same reconstructions. The probe confirms that the
+server dies. The context server answered all 25 nets, bit-identical
+between lanes, but the graph server, with lanes made and the status line
+written, closed its socket on the first forward (`recv` returned 0
+bytes). Its stderr went nowhere, so whether the replay raised or the
+process faulted is unknown. One likely cause is replaying from the lane
+threads a graph captured on the main thread with torch's global capture
+mode. **The change is reverted**: an opt-in mode that silently drops a
+search to CPU speed must not ship. To retry, capture graphs inside each
+lane's own thread, log the server's stderr, and run the probe before any
+search.
+
+Also learned: a *silent* fallback is the dangerous part. A search whose
+server dies keeps going at 15% of its rate with only a traceback in
+stderr. `./ri health` and the benchmark row do not flag it. The next
+round should make the run log a server exit loudly (the pool already
+prints "TensorRT forward server exited"), or have the `trt-shared` run
+fail fast.
+
+**Read: round 217's job 39475183** (gpu-q-26, started 16:18). It ran on
+this round's tree, so its search includes rounds 217 and 218 together;
+`R2D2_TRT_GRAPHS` was unset, i.e. 0. The default GPU search at
+r215-default's settings (19 x 2, shared TensorRT; row `r217-default`):
+
+| | r215-default (round 215) | r217-default (rounds 217+218) |
+| --- | ---: | ---: |
+| start-up s | 90.9 | **54.1** |
+| headline evals/s | 46.4 | **56.2** |
+| steady evals/s | 80.7 | 80.6 |
+| log(Z) | 0.0187108469398579 +/- 0.000591 | 0.0186358109606784 +/- 0.000613 |
+
+Start-up is 37 s shorter (-40%), the steady rate is unchanged, and log(Z)
+agrees within 0.1 sigma (async searches are not bit-reproducible, so
+"identical" was the wrong test). The headline gains 21% only because this
+search is a 3-minute one; on a converged 13-minute search the 37 s is ~5%.
+These are two runs on two nodes, not an interleaved pair. The summary is
+in `.probe/r217/summary-default.json`; the run directory is deleted. The
+probe on the same node, warm after the search, alternated 3 times:
+
+| | old (one plan at a time) | new (8 readers) |
+| --- | ---: | ---: |
+| read + deserialize 25 plans | 5.05 / 5.22 / 5.08 s | 1.59 / 0.96 / 0.94 s |
+
+**New start-up cost found.** Making the server's 19 lanes (475 execution
+contexts) takes **12.2 s** sequentially and 13.4 s on 19 threads, so
+threading does not help. That is now the largest single item in a shared
+search's start-up after the imports. Sharing one context per net across
+lanes is not possible, because a context holds its own bindings. The next
+step is to profile what `create_execution_context` spends its time on.
+
+## Round 220 (robustness, no speed change): a dead shared TensorRT server is now reported
+
+Round 219 showed that when the shared TensorRT server dies, every worker
+quietly falls back to the CPU U-Net. The search keeps going with right
+answers but at CPU speed (14.9 against 100 steady evals/s), and the only
+sign was one line in stderr. A production GPU search could lose most of
+its allocation that way without anyone noticing.
+
+**Change.** When the pool parent sees the server exit
+(`record_trt_server_exit` in `r2d2_serve.py`), it now appends
+`fallback: server exited (<wait status>) at <time>, CPU U-Net from here`
+to `<run>/r2d2-engine.txt`. `./ri health` warns on that line while the run
+is unfinished: it says the forwards are on the CPU and that stopping the
+run and running `./ri resume <run>` starts a new server. A finished run
+stays silent. The server is not restarted inside the pool because its
+socket ends are closed in the parent. A crash that came from the plans
+(as round 219's CUDA graphs did) would just crash again, so resuming is
+the honest remedy.
+
+**Checks.** `self_check_trt_shared_protocol` (in r2d2.sif) checks the
+record line. The health self-check covers three cases: unfinished with
+the fallback line (warns), the same run finished (silent), and no fallback
+line (silent). `test_self_checks.py` passes 27. Nothing in a forward or
+in scoring changed, and the new code only runs after the server has
+exited, so results and throughput cannot change. CPU and WSClean searches
+never start a server, so no A/B was run.
+
+## Round 221 (start-up, confirmed in round 222): each shared TensorRT lane serves as soon as it is made
+
+**Why.** Round 219 found that the shared server makes its 19 lanes (475
+execution contexts) in 12.2 s, and threads do not help (13.4 s on 19
+threads). Before this round, `serve_trt_shared()` started serving only
+after every lane existed. So every worker waited the full 12.2 s for its
+first forward, even though lane 0 was ready after ~0.6 s.
+
+**Change.** Each lane's thread now starts as soon as its 25 contexts are
+made. Lane *k* serves from about 0.64(*k*+1) s, so the mean wait drops
+from ~12 s to ~6 s per worker. That is roughly 6 s x 19 workers of
+evaluation time returned at the start of every GPU search. The contexts,
+buffers and engines are the same objects as before, so forwards cannot
+change. The status line `shared: one server, N lanes` is still written
+once, after the last lane starts. CPU and WSClean searches never start a
+server.
+
+**Checks here (cpu-q, no GPU).** `py_compile`, `test_self_checks.py` (27
+pass) and `self_check_trt_shared_protocol` in `r2d2.sif` pass.
+
+**Pending: job 39485592** (`.probe/r221/job.sh`, 1 x A100). It runs a
+default seed-4242 search with r219-D's settings (rc, log(Z) against
+0.01884 +/- 0.00065, `startup_s` against 22.3 s warm), then
+`.probe/r221/probe.py`, which alternates the old server
+(`r2d2_serve_old.py`, HEAD before this round) and the new one 3 times. The
+probe records when each of 19 raw-socket clients gets its first and 25th
+reply, checks that the outputs are bit-identical across versions and
+lanes, and splits one lane's context set-up into `create_execution_context`,
+`set_input_shape` and address binding, for both the `USER_MANAGED` and
+`ON_PROFILE_CHANGE` allocation strategies. The job had not started ~35
+minutes after submission. Read `.probe/r221/job-39485592.out` next round.
+The job runs `./ri search` from the live worktree, so leave
+`r2d2_serve.py` untouched until it has run.
+
+**Result (read in round 222, gpu-q-4).** Old against new, alternated 3
+times, bit-identical across versions and lanes:
+
+| | old (all lanes, then serve) | new (each lane as made) |
+|---|---:|---:|
+| first reply, earliest lane | 16.93, 14.54, 14.63 s | 3.01, 3.06, 3.01 s |
+| mean lane done (25 forwards) | 17.11, 14.73, 14.82 s | 8.91, 8.95, 8.90 s |
+| last lane done | 17.12, 14.74, 14.83 s | 14.80, 14.83, 14.79 s |
+
+The mean worker now gets its first forwards ~6 s sooner, as expected. One
+lane's 25 contexts take 0.64-0.65 s, all of it in
+`create_execution_context`; `set_input_shape` and address binding cost
+nothing measurable, and `ON_PROFILE_CHANGE` is no faster than
+`USER_MANAGED`. Lazy context creation would not help either, since every
+lane needs all 25 nets within its first request. The default search in the
+same job finished rc 0 with log(Z) 0.0169791852331699 +/- 0.00171834943813729
+(r219-D: 0.01884 +/- 0.00065, 1.0 sigma apart), `startup_s` 18.8 s against
+22.3 s and 85.0 steady evals/s against r219-D's 100.0 on gpu-q-44. That last
+gap is a single arm on a different node, and the server code that sets the
+steady rate did not change, so it is node noise (ledger row `r221-D`;
+`r221-lanes-probe` holds the probe). The search ran while round 222's
+opt-in edit was in the tree, so the row is marked dirty, but the edit only
+added a branch that the default path never takes.
+
+## Round 222 (negative): the shared TensorRT server is bound by the card, not the GIL
+
+**Why.** A default GPU search runs ~100 steady evals/s at 25 forwards a
+request, i.e. ~2,500 forwards/s, which is the shared server's ceiling from
+round 207 (2,450/s at 12-32 clients). The server answers 19 lanes from 19
+Python threads. A pure-Python echo of its protocol on a CPU node (same
+SOCK_SEQPACKET pairs, numpy copies, no GPU; `.probe/r222/echo.py`) shows
+heavy GIL convoying:
+
+| echo server, 19 clients | forwards/s |
+|---|---:|
+| 1 process x 19 threads (the server's layout) | 4,412, 4,531 |
+| 2 processes x 9-10 threads | 8,290, 8,252 |
+| 3 processes x 6-7 threads | 30,235, 30,608 |
+| 1 process, 1 thread over a selector | 93,440, 94,991 |
+
+Adding the CUDA calls could plausibly bring 4,400/s down to ~2,450/s, so
+the ceiling might have been the GIL rather than the card.
+
+**Tried.** `R2D2_TRT_SERVER=select`: one thread serves every lane over a
+selector, enqueues each forward on its lane's stream and waits on the
+oldest pending blocking event (no spin), while a second thread makes the
+lanes so round 221's early start is kept. It had a CPU self-check with
+faked CUDA. GPU job 39489396 (gpu-q-36, `.probe/r222/probe.py`) put 19
+raw-socket clients against each server variant for 20 s, 2 rounds in
+mirrored order, after each lane had answered all 25 nets:
+
+| server | forwards/s |
+|---|---:|
+| **today's: 1 process, 19 lane threads** | **2,447, 2,368** |
+| same, lanes split over 2 processes | 2,144, 2,141 |
+| same, lanes split over 3 processes | 1,898, 1,896 |
+| one selector thread, spinning on `Event.query()` | 2,011, 2,015 |
+| one selector thread, blocking on the oldest event | 1,929, 1,912 |
+| the opt-in as written (`R2D2_TRT_SERVER=select`) | 1,917, 1,973 |
+
+All six give bit-identical outputs. Every alternative loses 12-23%, so
+the server is not GIL-bound: its 19 threads keep 19 streams' kernels
+queued on the card, and one thread or several CUDA contexts (time-sliced
+without MPS) keep fewer in flight. The change is reverted, and
+`.probe/r222/selector-server.diff` keeps it.
+
+**What it means.** A default GPU search is already at the card's
+throughput with this engine set (~2,400 forwards/s at batch 1, 32x32).
+CPU-side cuts to a request, and more ranks, cannot raise a 1-GPU search's
+rate. Only cheaper forwards can: fewer or fused kernels per net, or more
+work per launch. fp16 (round 175) and TF32 are off the table for accuracy,
+and batching across requests (rounds 127, 137) depends on clients wanting
+the same net at the same time.
+
+## Round 223 (positive probe): batched TensorRT forwards put 3x more images through the A100
+
+**Why.** Round 222 showed a 1-GPU search runs at the card's batch-1
+ceiling: ~2,400 forwards/s from 19 lanes of 1x2x32x32 forwards. A 32x32
+image leaves most of an A100 idle per kernel, so more images per launch
+should cost little. Round 127 rejected gathering across requests on
+eager torch, where batch 32 gave only 1.33x over the MPS plateau, and at
+the time the search was CPU-bound anyway. Neither holds for TensorRT now:
+the card is the limit.
+
+**Probe.** One 1-GPU ampere job (39492566, gpu-q-12, A100-SXM4-80GB,
+`.probe/r223/probe.py`) rebuilt N1 and N13 from the production ONNX
+(`7794e01823b588cc`) with the input batch fixed at B (TF32 off, as in
+`build_trt_plans`), compared each row with the production B=1 plan's
+output for 19 seeded images, and timed N1 on S concurrent streams for
+4 s per arm, 2 passes:
+
+| B | S=1 | S=2 | S=4 | S=19/B |
+|---:|---:|---:|---:|---:|
+| production plan, 1 | 654, 655 | 1,218, 1,217 | 1,762, 1,760 | **2,406, 2,403** |
+| 2 | 1,193, 1,192 | 2,019, 2,020 | 2,885, 2,880 | 3,587, 3,592 (S=9) |
+| 4 | 2,072, 2,063 | 3,473, 3,491 | 4,936, 4,949 | - |
+| 8 | 3,619, 3,620 | 5,826, 5,817 | **7,345, 7,326** | - |
+| 19 | 4,959, 4,958 | 5,656, 5,616 | 6,604, 6,607 | - |
+
+(forwards/s, i.e. images/s.) Eight images on four streams put **3.05x**
+today's ceiling through the card. Accuracy: no rebuilt engine is
+bit-identical to the production plan, *including the B=1 rebuild*
+(TensorRT's tactic timing picks kernels per build). The largest difference
+from the production plan, as a fraction of the output's peak:
+
+| net | B=1 rebuild | B=2 | B=4 | B=8 | B=19 |
+|---|---:|---:|---:|---:|---:|
+| N1 | 3.6e-6 | 4.5e-6 | 5.1e-6 | 5.2e-6 | 6.7e-6 |
+| N13 | 2.5e-6 | 3.6e-6 | 6.6e-6 | 6.0e-6 | 4.9e-6 |
+
+So batching moves outputs by no more than rebuilding the same plan does,
+and both sit inside round 168's 1e-5 TensorRT-to-CPU gap that converged
+searches already accept (rounds 213, 215). Async GPU searches are not
+bit-reproducible run to run anyway (round 219), so a batched server is
+judged on log(Z) agreement, like every GPU change since round 171.
+
+**Will requests line up?** Each evaluation runs N1..N25 in order, so a
+server can only batch clients that want the same net at once.
+`.probe/r223/sim.py` is an event simulation: 19 clients, a CPU prep
+per evaluation, 1 ms between forwards, and a card that runs up to K
+batches at the measured rate for (B, K). When the card frees it serves
+the net with the most waiting clients. Clients bunch up on their own:
+mean batches of 2-9 form without any waiting window.
+
+| prep per evaluation | lanes today (B=1, 19 streams) | gather, K=1 | K=2 | K=4 |
+|---:|---:|---:|---:|---:|
+| 20 ms | 78.3 | 129.6 (+65%) | 140.8 (+80%) | 122.5 (+56%) |
+| 40 ms | 72.3 | 111.1 (+54%) | 125.9 (+74%) | 112.6 (+56%) |
+| 80 ms | 62.8 | 99.9 (+59%) | 97.7 (+56%) | 94.6 (+51%) |
+
+The model's absolute rates are below the real ~100 steady evals/s (it
+leaves out how lanes overlap with the CPU), so only the ratios are an
+estimate: **+50-80% evals/s for a 1-GPU search**, the largest GPU lever
+left.
+
+**Next.** Keep weights once: one engine per net with several
+optimisation profiles (B = 1, 2, 4, 8) rather than one plan per B, which
+would quadruple the 5.3 GB of plans. Check that a row's output does not
+depend on its position or on the other rows in the batch, then build the
+gathering server behind an opt-in (`R2D2_TRT_BATCH`) and race it against
+today's shared server for log(Z) and steady evals/s.
+
+## Round 224 (opt-in, GPU A/B pending): a gathering TensorRT server with one fixed profile per batch size
+
+**Why.** Round 223 found batches of 8 on 4 streams put 3.05x the batch-1
+ceiling through an A100, and left two questions before building a server:
+can one engine per net serve every batch size (so the weights are held
+once), and does a row's output depend on its batch-mates?
+
+**Probe.** 1-GPU ampere job 39496395 (gpu-q-12, `.probe/r224/probe.py`)
+rebuilt N1 and N13 from the production ONNX four ways and timed N1 on 4
+streams, 3 s per arm, 2 passes (images/s; a size between profiles is
+padded up and counts only its real rows):
+
+| N1 engine | plan | B1 | B2 | B3 | B4 | B6 | B8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| production (fixed 1) | 212.5 MB | 1,757 | - | - | - | - | - |
+| fixed 1 rebuild | 212.5 MB | 1,765, 1,770 | - | - | - | - | - |
+| fixed 8 | 212.6 MB | - | - | - | - | - | 6,955, 6,970 |
+| one profile, min 1 opt 8 max 8 | 136.0 MB | 1,285, 1,286 | 2,310, 2,312 | 2,953, 3,021 | 3,732, 3,767 | 4,400, 4,400 | 5,014, 4,975 |
+| one profile, min 1 opt 4 max 8 | 169.0 MB | 1,514, 1,515 | 2,467, 2,477 | 3,024, 3,025 | 3,534, 3,525 | 4,164, 4,129 | 4,666, 4,690 |
+| **four fixed profiles 1, 2, 4, 8** | 415.2 MB | **1,773, 1,764** | **2,882, 2,877** | 3,807, 3,792 | **5,083, 5,054** | 5,538, 5,523 | **7,372, 7,374** |
+
+- A dynamic batch dimension costs 27-28% at *every* size, B=1 included:
+  TensorRT picks kernels for the range, not the size. Fixed profiles in one
+  engine keep each size's fixed-shape rate (B1 1,773 as production's 1,757;
+  B8 7,372 as fixed-8's 6,955-6,970), for 2x the plan (415 MB; 25 nets
+  ~10 GB on an 80 GB card) and a 35-38 s build per net instead of 9-11 s.
+- **A row's output does not depend on its position or its batch-mates**:
+  bit-identical with the image first or last and with other mates, in every
+  engine and at every size. In a dynamic engine it is even bit-identical
+  across sizes; across fixed profiles it is not (each profile has its own
+  kernels). So the padding rows can hold anything, and a batched search's
+  outputs differ from a batch-1 one only as two TensorRT builds do.
+- Largest difference from the production plan as a fraction of the peak:
+  N1 3.6e-6 (fixed-1 rebuild), 4.8e-6 (fixed 8), 6.5e-6 / 6.7e-6 (dynamic),
+  9.1e-6 (four profiles); N13 4.4e-6, 6.3e-6, 11.5e-6 / 9.2e-6, 9.9e-6. All
+  at round 168's ~1e-5 TensorRT-to-CPU gap that converged searches accept,
+  so the test is log(Z) agreement, as for every GPU change since round 171.
+
+**Change (opt-in, default unchanged).** `R2D2_TRT_BATCH=N` (with the shared
+server, the GPU default) builds plans with a fixed profile per size in
+`trt_batch_sizes(N)` (powers of two below N, then N: 1, 2, 4, 8 for 8)
+into their own `-b1-2-4-8` directory, and forks `serve_trt_gathered`
+instead of `serve_trt_shared`. Workers and the socket protocol are
+unchanged. The server is one selector thread that queues requests by net
+and `R2D2_TRT_LANES` (default 2, the simulation's best) lane threads, each
+with its own stream, scratch, pinned buffers and a context per net and
+size (200 contexts at 2 lanes, ~5 s, against 475 today); a free lane takes
+up to N requests of whichever net has most waiting and runs them at the
+smallest size that holds them. A lane that raises takes the server down
+(`os._exit`), so workers see a closed socket and fall back to the CPU, as
+round 220 reports, rather than waiting for ever. `R2D2_TRT_BATCH=1` (the
+default) builds and serves exactly as before: same plan directory, one
+fixed 1x2x32x32 profile. Both settings are recorded in `run.env` for
+`./ri resume` and in each `benchmarks.jsonl` row's settings.
+
+**Checks.** New host-runnable `self_check_trt_gathered`: 9 threads x 15
+forwards over 5 nets through `gather_forwards` with a fake 2 ms forward;
+every reply reaches its own worker with its own output, no batch exceeds
+the cap, batches do form (mean 2.4-2.8), a net with no engine and a short
+request get the bare header, and the server returns once every socket
+closes. `scripts/test_self_checks.py` 28 pass; `bench.py`, `run-config.sh`
+self-checks, `test_cli.py`, `bash -n`, `compileall` pass. WSClean is not
+touched: the `run-config.sh` lines sit in its R2D2-only branch and print
+nothing unless the variables are set.
+
+**Pending.** 1-GPU job 39497293 (`.probe/r224/ab.sh`) builds the 25
+four-profile plans once (~15 min), then alternates default (A) and
+`R2D2_TRT_BATCH=8` (B) seed-4242 searches with round 221-D's settings
+(`--nlive 48 --num-repeats 5 --max-ndead 600`; r221-D: steady 85.0
+evals/s, log(Z) 0.0169791852331699 +/- 0.00171834943813729) as A B A B,
+then `R2D2_TRT_LANES=4`. Read `.probe/r224/ab-39497293.out` next round:
+compare `steady_evals_per_s` and log(Z), and check `r2d2-engine.txt` says
+"gathered" rather than "fallback".
+
+**Result (round 238).** No gain, and a bug in the first B arm. See
+[round 238](#round-238-negative-the-gathering-tensorrt-server-gives-no-search-speed-and-its-first-arm-hung).
+
+## Round 225 (diagnostic): the whole-search stalls are PolyChord's root blocked creating its resume file on Lustre
+
+**Why.** GPU job 39497293 (round 224's gathering-server A/B) had not
+started, so this round used the CPU node for two questions. (1) How fast
+can a 32-core GPU node go if the U-Net forward cost nothing? That caps
+what any gathering server can give. (2) Priority 1: what stalls a whole
+search for ~30-100 s (round 211's "wedges", which round 214 showed were
+not MeqTrees)?
+
+**Probe.** A throwaway worktree (`/rds/user/th773/hpc-work/r225-wt`,
+deleted) with `R2D2_PROBE_NOFWD=1`. That replaces R2D2's
+`optimiser.forward` with `output + residual` and `load_net` with a no-op,
+so every request still runs the data load, imaging weights, both NUFFTs,
+the PSF and the per-iteration residuals, but no U-Net. Searches used
+`R2D2_RUNTIME=torch`, nlive 48, 5 repeats, 600 dead points and seed 4242,
+pinned with `taskset` to 32 of this job's CPUs (an A100 node's core
+count). The stub's log(Z)s (35,529, 1,819, 74,382, 57,295, ...) are those of a
+meaningless image and say nothing about the science. Only the timings
+count. A first zero-output stub ended after 357 evaluations because every
+likelihood was equal, so the stub adds the residual.
+
+| arm | chains on | ranks x threads | evals | wall s | start-up s | stall s | idle | steady evals/s |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| S19 | Lustre | 19 x 2 | 8,899 | 119.2 | 2.8 | **61.6** | 51% | 162.7 |
+| S32 | Lustre | 32 x 1 | 8,987 | 112.3 | 39.7 | **27.2** | 24% | 197.6 |
+| P19 (perf on root) | Lustre | 19 x 2 | 9,683 | 150.9 | 36.3 | **51.7** | 34% | 154.5 |
+| G19 (gdb on ranks) | Lustre | 19 x 2 | 10,711 | 215.9 | 2.9 | **113.4** | 54% | 113.2 |
+| H19 | `/dev/shm` (symlink) | 19 x 2 | 10,724 | 104.1 | 40.2 | **0.0** | 0.2% | 168.1 |
+| H19b | `/dev/shm` (symlink) | 19 x 2 | 8,259 | 50.1 | 10.5 | **0.0** | 0.4% | 209.4 |
+
+Headline evals/s: Lustre arms 49.6-80.0, tmpfs arms 103.0 and 164.9.
+
+**(1) The CPU ceiling of a GPU node.** With free forwards, 19 x 2 on
+32 CPUs runs 168-209 steady evals/s with no stall (H19, H19b; 155-163 in
+the Lustre arms not perturbed by a debugger), and 32 x 1 runs 198. Today's
+shared TensorRT runs 85-100 (rounds 215, 221). So round 223's predicted
++50-80% from gathering (128-180) fits under the 19 x 2 node's CPU
+ceiling, but near its top. Beyond that, the CPU-side work (simulate
+26-31 ms, the rest of the request 70-140 ms at 2 threads) becomes the limit. More ranks raise the
+ceiling (32 x 1 is +20% over 19 x 2). With the shared server, workers
+hold no GPU memory, so `NS_R2D2_CUDA_MAX_RANKS=19` (sized for per-worker
+engines) is worth racing at 31 ranks once gathering lands.
+
+**(2) What stalls.** Every Lustre arm had 1-3 gaps of 24-36 s in which no
+rank started an evaluation, yet no evaluation lasted over 2.8 s. The
+workers printed "Inefficient MPI parallelisation, I spend more time
+waiting than slicing" (~65 s waiting against ~49 s slicing). perf on rank
+0 showed only Open MPI shared-memory polling (`mca_btl_vader`, ~80%), so
+the root was waiting, not computing. During a gap its
+`/proc/<pid>/syscall` was 257 (`openat`, flags `O_WRONLY|O_CREAT|O_CLOEXEC`,
+gfortran's open, not Python's, which adds `O_TRUNC`), in state `I`.
+Sampling that syscall every 0.5 s and reading its path argument from
+`/proc/<pid>/mem` gave the same file every time:
+`chains/r2d2_vlaa_temp.resume`, PolyChord's checkpoint temp file (written,
+then renamed onto `.resume`). One open blocked 25 s, the next 45.6 s, the
+next 19.6 s: 83 s of a 2-minute window. While the root waits, no worker
+gets a new seed, so the whole search stops.
+
+The filesystem does this on its own, with no search running. A Python
+loop on `/rds/user/th773/hpc-work` doing PolyChord's pattern (create a
+temp file, write 784 KB, rename it onto the target), then 0.2 s of sleep:
+
+| pattern, 162 cycles each, interleaved | median | max | cycles over 1 s | seconds lost |
+|---|---:|---:|---:|---:|
+| create temp + write + rename onto target (PolyChord's) | 3.0 ms | **31.5 s** | 2 | 46.9 |
+| rewrite the existing file in place (`O_TRUNC`, no create) | 2.2 ms | 4 ms | 0 | 0 |
+| create + write + rename on `/dev/shm` | 0.8 ms | 1 ms | 0 | 0 |
+
+An earlier 118-cycle run of the rename pattern alone had a 19.2 s worst
+case against a 0.7 ms median. So on this RDS Lustre, about one create in
+60-80 of a name that a rename has just freed blocks for 15-30 s. Rewriting in place never did.
+PolyChord's root writes its resume file every `update_files` (= nlive)
+dead points, and the root is the only rank that cannot stall without
+stopping everyone. Moving `chains/` to tmpfs (H19, H19b) removed every stall:
+idle 24-54% -> 0.2-0.4%, stall 27-113 s -> 0, in 2 of 2 arms against 4 of 4.
+
+**What this explains.** Round 211's 38-107 s GPU-arm "wedges", round
+214's finding that no worker was slow, and the 2-9 s stalls in rounds
+213-221's ledger rows. The rate scales with resume writes per second.
+Faster searches (gathering, nlive 48 short arms) write more often, so they
+hit more of them. A converged nlive 150 production search writes one
+every 150 dead points and loses less (rounds 213-215: 3.8-9.1 s per
+13-minute run, ~0.5-1%), but every faster search will lose more.
+
+**Not changed yet (next round).** The fix keeps PolyChord's base_dir on
+node-local tmpfs and mirrors `chains/` to the run directory from a
+separate process that never blocks the root: copy, then rename onto the
+Lustre target, after each `.resume` change, plus a blocking final sync
+before `summary.json`. `./ri resume` and every reader of `chains/` (merge,
+report, health, `dead_points_now`) must see the mirror, and a crash may
+lose at most the last checkpoint's mirror lag. That touches the shared run
+scripts, so it needs a raced WSClean A/B and `./ri self-check self-heal`
+(the kill-and-resume path). Also open: S32, P19 and H19 each had a 36-40 s
+gap right after the first wave of evaluations, which bench counts as
+start-up. H19 had it with chains on tmpfs, so it is something else
+(possibly another create on Lustre by the root). Sample `/proc/<root>/syscall`
+during it next time.
+
+Rows `r225-S19`, `r225-S32`, `r225-P19`, `r225-G19`, `r225-H19`, `r225-H19b`
+(plus the 357-evaluation zero-stub row) and stage row `r225-lustre-create`
+are in `benchmarks.jsonl`. All run directories and the probe worktree are
+deleted. The scripts are in `.probe/r225/`. GPU job 39497293 was still
+pending at the end of this round (`squeue`: Priority).
+
+## Round 227: PolyChord writes `chains/` on node tmpfs, mirrored to Lustre by a child process
+
+**Why.** Round 225 traced the whole-search stalls to PolyChord's root
+blocking 20-45 s in a Lustre create of `chains/<root>_temp.resume`. No
+worker gets a seed while it waits. This round ships the fix under
+the durability constraint: `./ri resume` and self-heal restart from
+`<run>/chains`, so Lustre must keep a complete copy that is replaced atomically.
+
+**Change** (`common.py`: `chains_base_dir`, `ChainsMirror`, `sync_chains`;
+used by both `polychord_r2d2.py` and `polychord_wsclean.py`):
+
+- `settings.base_dir` is `/dev/shm/ri-chains-<sha1 of the run's chains path>`.
+  mpirun forks every rank on one node, so every rank sees it. `read_resume`
+  still tests `<run>/chains/<root>.resume` on Lustre.
+- Before `run_polychord`, rank 0 clears that tmpfs dir and seeds it from
+  `<run>/chains`. Lustre is the authority, and a killed run's tmpfs
+  leftovers are thrown away. It then starts a child process that every 2 s
+  copies each changed file to `<run>/chains/.<name>.mirror` and renames it
+  into place. It skips `*_temp.*`. PolyChord renames each `.resume` into
+  place, so every copy reads a whole one. The child exits when rank 0 is gone.
+- After `run_polychord`, `stop()` kills the child, runs one blocking full
+  sync, and removes the tmpfs dir. This happens before `summary.json`, so
+  a finished run's chains are all on Lustre. It is also registered with
+  `atexit` for Python-level failures.
+- `NS_CHAINS_TMPFS=0` (passed through both run scripts) restores the old
+  layout, for A/Bs.
+- It is a process, not a thread. The first version used a thread, and it
+  never ran: pypolychord holds the GIL for the whole Fortran run, so the
+  thread mirrored only the files written before PolyChord started. This is
+  the same reason the record packer is a subprocess.
+
+**WSClean guard (raced, simultaneous, disjoint 19-CPU halves, 19 ranks,
+nlive 100, seed 227, synchronous):**
+
+| arm | chains | evals | wall s | idle | stall s | evals/s | steady evals/s | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| r227-wa | Lustre (`NS_CHAINS_TMPFS=0`) | 5,098 | 221.4 | 38.2% | 83.3 | 23.02 | 36.97 | 0.094981819312609 +/- 0.000610189158072293 |
+| r227-wb | tmpfs + mirror | 5,098 | 205.2 | 0.4% | 63.3 | 24.85 | 35.99 | 0.094981819312609 +/- 0.000610189158072293 |
+
+log(Z) is bit-identical, and so are the two `wsclean_vlaa_dead-birth.txt`
+files (`cmp`). The mirrored `chains/` holds the same file set as the
+Lustre arm's. The headline is +7.9% and idle falls from 38% to 0.4%.
+Steady rates agree within noise (-2.6%), as they should: the fix removes
+stalls and does not change the per-evaluation cost. This is one pair, so
+the +7.9% is indicative only. A synchronous WSClean arm writes a resume
+every 100 dead points, and the faster R2D2/GPU searches are where round
+225 measured the stalls (27-113 s per arm). The 63 s that bench still
+counts as stall in the tmpfs arm is not chains (none of its writes are on
+Lustre any more). It is the next thing to trace, probably the same
+"gap after the first wave" that round 225 left open.
+
+**Durability: kill -9 and `./ri resume` of a real search.** WSClean, 37
+ranks, nlive 200, async. Every process in the search's session was
+SIGKILLed at ndead 1857. The tmpfs `.resume` was from 19:58:32.9. The
+Lustre mirror's was from 19:58:08, the 491-dead checkpoint, 25 s behind.
+`./ri resume` printed `resuming from <run>/chains/wsclean_vlaa.resume,
+1842 evaluations already done`, went on from ndead 536, and finished at
+1,875 dead, 9,590 evaluations, log(Z) 0.0956259436989396 +/-
+0.000715155684803101. No evaluation was imaged twice, because the cache
+adopts them. The run used its own scratch; nothing else ran on that run dir.
+
+**The mirror's lag is the same Lustre stall, moved off the critical path.**
+The 25 s lag at the kill was the child blocked in its own create. A
+Lustre microbenchmark (250 interleaved cycles, 800 KB, row
+`r227-lustre-unique`) shows a fresh temp name per write does not help.
+Reusing the name had 5 cycles over 1 s (max 39.3 s, 85.6 s lost). A
+unique name had 3 (max 36.8 s, 50.2 s lost). Medians were 2.2 and 2.1 ms. So round 225's "name a rename has just freed" is not the
+trigger: any create and rename on this RDS can block for tens of seconds.
+A crash can therefore lose up to ~40 s of checkpoints (a checkpoint or
+two). The evaluations behind them are adopted from the cache, not imaged
+again. Before this round, the same block stopped every rank instead.
+
+**Checks.** `self_check_chains_mirror` is host-runnable and registered in
+`scripts/test_self_checks.py` and in `polychord_wsclean.py --self-check`.
+It covers seeding, mirroring while running, the final sync, `clusters/`,
+temp files staying behind, no partial left, tmpfs removed, and
+`NS_CHAINS_TMPFS=0`. `./ri self-check self-heal` ran three times. The
+first tmpfs run failed one assertion: after the SIGKILL-and-restart, `./ri
+health` warned of one 38 s gap (89% of a 43 s run). The `NS_CHAINS_TMPFS=0`
+control then passed in full, and so did a second tmpfs run, every
+scenario included: killed, hung, killed with no retries and resumed by hand,
+workers killed, pool killed, truncated `.resume`, torn `summary.json`. In
+the truncated-resume case the torn checkpoint is copied into tmpfs, PolyChord's
+`read_write.F90` error triggers the quarantine of the Lustre copy, and the
+retry seeds without it. The 38 s gap matches round 225's open 36-40 s
+gap after the first wave, which also happened with chains on tmpfs. It is
+intermittent and so far not tied to this change. It is the next stall to trace (sample
+`/proc/<root>/syscall` during it).
+
+Rows `r227-wa`, `r227-wb` (bench), `r227-lustre-unique` and
+`r227-kill-resume` (stage) are in `benchmarks.jsonl`. The run dirs are
+deleted. The scripts are in `.probe/r227/`. GPU job 39497293 (round
+224's gathering A/B) was not read this round.
+
+## Round 228: the "gap after the first wave" is a cold R2D2 pool; it now prefetches its weights
+
+**What the gap is.** Rounds 225 and 227 left open a 36-40 s gap right after
+the first wave of evaluations. A gap sampler (`.probe/r228/gap.py`: on a
+4 s pause in evaluation lines it dumps `/proc/<pid>/syscall` and the path of
+every process in the search) found no gap in the middle of a 19-rank async
+WSClean search (r228-w1, 4,013 evaluations, stall 0). In R2D2 (r228-r1, CPU
+onnx, 39 ranks), every rank's *first* evaluation took 35.9-36.7 s and every
+later one 0.3-1 s. `simulate` was 0.8 s of that and the R2D2 request was 35 s.
+It is start-up, not a stall: the pool's warm-up off a cold page cache. A
+second search straight after it (r228-r2) had no gap: warm-up 5.8 s, hidden
+behind the ranks' own start. Evicting the files (`posix_fadvise(DONTNEED)`
+on `r2d2.sif`, the checkpoints and the ONNX cache, `.probe/r228/evict.py`)
+brought the gap back (r228-r3: startup 37 s). Timed inside the pool (r228-r4,
+cold): imports 3.0 s, `load_checkpoints` 8.9 s, ONNX sessions 10.3 s. Both
+read their files (25 x 240 MB checkpoints, 25 optimised graphs, 8.7 GB
+together) one at a time off Lustre.
+
+**Change** (`r2d2_serve.py` `prefetch_weights`): first thing in
+`serve_pool`, the pool parent forks a child that reads the checkpoints and
+(onnx) this CPU's `opt-<key>/N*.onnx` with 16 threads into the page cache,
+then exits. The loads then read from memory. It is forked before any import,
+and before the FIFO ends are opened, so it holds none of them, and the
+parent's peak RSS (every worker's reported floor) never sees the reads. After
+the warm-up the parent kills it and reaps it, so the pool's `os.wait()` loop
+never mistakes it for a dead worker. It only reads files, so outputs cannot
+change. New host-runnable `self_check_prefetch_weights` (the checkpoints are
+FIFOs, so a write-open succeeds only once the prefetcher has opened each one
+to read).
+
+**A/B** (stage row `r228-prefetch-ab`; 12 arms interleaved B A A B B A A B
+B A A B, files evicted before every arm, 39 ranks, nlive 48, max-ndead 150,
+seed 228, async):
+
+| | pool warm-up s | checkpoints s | ONNX sessions s | first request s (max) | search wall s |
+|---|---|---|---|---|---|
+| A, no prefetch | 7.2, 20.9, 7.3, 30.1, 7.2, 18.0 (mean 15.1) | 1.5-7.2 | 2.7-20.1 | 6.5, 57.9, 6.7, 1.6, 40.7, 17.5 | 30.6, 83.5, 32.9, 27.0, 67.0, 43.6 (sum 284.6) |
+| B, prefetch | 7.9, 6.0, 6.1, 6.0, 6.1, 6.2 (mean 6.4) | 0.9-1.0 | 1.9-3.8 | 7.2, 5.2, 4.9, 39.6, 5.4, 5.2 | 32.2, 31.1, 30.7, 64.5, 31.4, 31.1 (sum 220.9) |
+
+Eviction does not make every arm cold: the Lustre servers keep their own
+cache, so 3 of 6 A arms came up cold (18-30 s) and 3 warm (7.2-7.3 s). B
+was 6.0-7.9 s in all 6, and about 1 s faster than A even when A was warm
+(checkpoints 1.5 -> 1.0 s, sessions 2.7 -> 1.9 s). log(Z) 0.0132-0.0138 +/-
+0.004 in all 12 arms (async, so not bit-identical between runs, and no arm
+differs beyond its error). It is worth 10-25 s per cold search start, and
+once per retry segment, which matters little to an hours-long production run.
+The GPU path gets the checkpoint half (its TensorRT plans were already read
+eight at a time, round 217).
+
+**Still open: a second cold start-up on the worker side.** c8B (prefetch,
+warm-up 6.0 s) and c10A (warm-up 7.2 s) still had a ~40 s first request,
+and c7A had a 30 s warm-up but a 1.6 s first request because its ranks
+started late. So something else read on first use (the worker's first
+R2D2 run, or the ranks' own start) also pages in cold off Lustre at times.
+Next: put the per-worker "child ready" and per-request probe times beside
+the rank's start in a cold arm to name it.
+
+**Also seen: the end-of-run chains sync can block on Lustre.** In r228-w1
+the last evaluation ended ~44 s before `summary.json`. All of it was rank 0
+in `ChainsMirror.stop()`'s blocking final sync, stuck in `openat` of
+`chains/clusters/.wsclean_vlaa_1.txt.mirror` (one of 14 creates the full sync
+makes). It costs no evaluations, but it adds to a search's wall time. A
+microbenchmark during a quiet spell (300 cycles each of create, write and
+rename timed separately, a pre-created spare opened with `O_TRUNC`, and an
+in-place rewrite) had no step over 0.52 s. The block is intermittent, and
+this round did not find which step it hits. An end sync that copies only the
+`.resume` atomically and rewrites the text files in place would make one
+create instead of 14.
+
+Bench rows `r228-w1`, `r228-r1`..`r228-r4` and `r228-c1B`..`r228-c12B` are in
+`benchmarks.jsonl` (the c-arms are dirty because the probe lines were in).
+r1-r4's and w1's log(Z) were 0.01538, 0.01370, 0.01310, 0.01359 and 0.09461
+(5 decimals; their summaries were deleted before full-precision values were
+copied). All run directories are deleted. The scripts are in
+`.probe/r228/`. GPU job 39497293 (round 224's gathering A/B) had produced
+no output file at 20:18. It was still pending, and it is not read here.
+
+## Round 229: the chains mirror rewrites text files in place; only the `.resume` is created
+
+**Question.** Round 228 saw `ChainsMirror.stop()`'s final sync block the end
+of a search for ~44 s in one of its 14 Lustre creates. A quiet-spell
+microbenchmark found nothing. Under load, does an in-place rewrite of an
+existing file block the way a create does?
+
+**Probe** (`.probe/r229/lb2.py`). Over 300 s, during and after a 19-rank
+WSClean search (`r229-load3`), each cycle did both of these, alternating
+which went first: create `.a.mirror`, write 200 KB and rename it over `a.txt`;
+and open the existing `ip.txt` with `O_TRUNC` and write 200 KB.
+
+| step | n | median | max | over 1 s | lost |
+|---|---:|---:|---:|---:|---:|
+| create + write + rename | 1,211 | 0.93 ms | **40.9 s** | 12 | 175.4 s |
+| in-place rewrite | 1,211 | 0.52 ms | 0.0 s | **0** | 0 |
+
+The block is in the metadata ops a create and a rename make. Rewriting a file
+that already exists never blocked.
+
+**Change.** `sync_chains` now rewrites every file except `*.resume` in place
+when it already exists on Lustre: it writes over the old bytes and then
+truncates, so a reader never sees an empty file. The `.resume` is what `./ri resume`
+restarts from, so it keeps the copy-and-rename that makes it atomic. A
+full sync used to make 14 creates and now makes one, apart from a file's
+first appearance. So the 2-s mirror passes and the end-of-run sync each take
+about 1/14 of the chance of a 40-s block. A kill during a rewrite can tear a
+text file, but PolyChord rewrites those files whole at every checkpoint, and a
+finished run's final sync completes before `summary.json` is written.
+
+**Bug found on the way (pre-existing since round 227).** The base arm of the
+first synchronous pair ended with an **empty** `chains/<root>.paramnames`.
+Every rank called `write_polychord_paramnames`, which truncates the file and
+rewrites it. Meanwhile rank 0's mirror seeded tmpfs with a copytree, so it
+could copy another rank's truncated file and then sync the empty file back to Lustre.
+anesthetic and `./ri plot` need the paramnames. Now only rank 0 writes it,
+before it starts the mirror, in both `polychord_wsclean.py` and
+`polychord_r2d2.py`.
+
+**WSClean guard** (raced; base is a `d5ef7a9` worktree; seed 229, nlive 100,
+max-ndead 4000, each arm on half the CPUs):
+
+| pair | base | new | log(Z) |
+|---|---:|---:|---|
+| async 1 (a1 on CPUs 0-18, b1 on 19-37) | 50.7 steady | 69.5 | async runs differ from run to run; all four agree within 1 sigma (0.0963-0.0970 +/- 0.0005) |
+| async 2 (CPUs swapped) | 73.7 | 75.6 | |
+| sync, 9 ranks each (sc, sd) | 35.81 | 35.54 (-0.8%, noise) | **0.0962001628097257 +/- 0.000453662936636545 in both, `diff -rq chains/` identical** |
+
+No end-of-run block happened in any arm, so this guard shows no wall-time
+gain. That is expected: the old code blocked on about 1% of its creates. The
+gain is the 175-s-against-0 probe above. Two side notes. A pair needs a pinned
+`--mpi-procs`, because `taskset` halves gave 10 ranks on CPUs 0-18 and 9 on
+19-37, so the first synchronous pair could not be bit-compared. And command
+wall time ran 70-85 s above search wall time in the first async pair only,
+which is a start-up cost this round did not trace.
+
+Rows `r229-*` and stage rows `r229-lustre-inplace` and `r229-guard` (log(Z) to
+full precision) are in `benchmarks.jsonl`. All run directories and the base
+worktree are deleted. Self-checks: `self_check_chains_mirror` now asserts that a
+text file keeps its inode (rewritten in place) and that the `.resume` gets a
+new one (renamed); 30 host checks pass. GPU job 39497293 (round 224's
+gathering A/B) still had no output at 20:49 and was not read.
+
+## Round 230 (validation): rounds 201-229 in the 22 Sep production search, +5%, and a new idle source
+
+**Question.** The last end-to-end check of the R2D2 CPU defaults was round
+200 (`d96a8e0`). Rounds 201-229 changed start-up (202, 203, 228), the
+post-run work (201) and where PolyChord writes `chains/` (227, 229). What do
+they add up to in the production search, and does log(Z) still agree?
+
+**Method.** Round 200's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs), on
+`69e2a2f`. Script `.probe/r230/run.sh`. Other users' jobs shared the node
+on socket 1 (load 34 at the start, 90-121 during the run, against 20-85 in
+round 200). Two short warm-up searches came first: `r230-t1` (default nlive
+8, 9 ranks) and `r230-t2` (nlive 48, 20 ranks, with timing prints in the
+post-run path that have since been removed, so its row is marked dirty).
+
+| | round 200 (`d96a8e0`) | round 230 (`69e2a2f`) |
+| --- | ---: | ---: |
+| evaluations | 77,570 | 72,429 |
+| search wall | 1,597.1 s | 1,418.8 s |
+| evals/s | 48.6 | **51.1** (+5.1%) |
+| request (`image_container`) | 737 ms | **660 ms** (-10.4%) |
+| simulate (MeqTrees) | 32 ms, 4.0% | 26 ms, 3.5% |
+| evaluating share of worker-time | 98.3% | 92.3% |
+| PolyChord (no evaluation in flight) | 0.2% | 1.4% (19.5 s of wall) |
+| idle (waiting on other workers) | 1.5% | **6.3%** |
+| post-run: records, flush, prune, summary, pack | 2.3, 0.6, 5.6, 2.6, 2.9 s | 1.9, 0.5, 3.2, **13.0**, 2.8 s |
+| command wall minus search wall | 24.8 s | 30.4 s |
+| log(Z) | 0.0174329374131255 +/- 0.000408558342628129 | 0.0171997434919644 +/- 0.000400520669269346 |
+| ndead, nlike | 1,455, 75,995 | 1,481, 71,014 |
+
+**Results.**
+- The current defaults run the production search at 51.1 evals/s against
+  round 200's 48.6. log(Z) agrees within 0.41 sigma (difference 0.000233,
+  combined error 0.000572).
+- The request itself is 10% faster (660 ms against 737). No change since
+  round 200 touched the U-Net forward, so this is most likely a quieter
+  socket 0 this time, not a lever. At 51.1 evals/s x 3.10 GB, the search
+  is drawing 158 GB/s of weights, 96% of round 205's measured read peak.
+- Idle is the new cost: 6.3% of worker-time against 1.5%. Binning the
+  evaluations' start and end times (`.probe/r230/idle.py`) shows where it
+  goes:
+  - One gap with no starts at all: 16.9 s at t=616 s, which is `stall_s`
+    (round 200 had a 3.6 s gap at t=610 s, likely the same PolyChord
+    event).
+  - Four or five drains at t~720, 870, 1020, 1320 and 1410 s. Starts per
+    10 s drop from ~550 to 160-350 for 10-30 s, while requests in those
+    bins get *faster* (0.43-0.51 s against 0.65). The workers are not slow:
+    they are waiting for seeds. The root hands them out more slowly there,
+    without stopping. Round 200's bins show none of this (only t=600 and
+    the end fall below 90% busy).
+  - Below 38 in flight, the run lost 4,145 worker-s against round 200's
+    1,017.
+- Post-run `summary` took 13.0 s against 2.6. It is `write_json_atomic` to
+  Lustre, a create plus a rename, and round 229 measured that blocking for
+  up to 41 s under load. It is a one-off per run, but it is now the biggest
+  post-run part.
+
+**Learned.**
+- With chains on tmpfs (round 227), the remaining whole-search idle in the
+  CPU production search is not blocked creates. It is the root dispatching
+  slowly for 10-30 s at a time, and it costs ~5% of worker-time. Next step:
+  sample `/proc/<root pid>/stack`, `wchan`, `syscall` and the CPU it is on,
+  every 0.5 s through a production-length run, then match the samples to
+  the drain windows. Candidates are the root's own PolyChord work (posterior
+  and cluster files, which grow with ndead), CPU contention on rank 0's CPU
+  (39 ranks on 38 CPUs, round 186, plus the mirror child and record packer
+  on the unpinned CPUs), and stdout back-pressure through the `run.log` tee
+  on Lustre.
+- Binned starts, not just the idle total, separate a stall (no starts, the
+  root blocked) from a drain (fewer starts, faster requests, the root
+  slowed). `stall_s` sees only the first.
+
+Rows: `r230-bigrun` (bench), `r230-t1`, `r230-t2` (short warm-ups) and stage
+row `r230-validation`, with log(Z) at full precision and the drain windows,
+are in `benchmarks.jsonl`. `summary.json`, `chains/r2d2_vlaa.stats`, the
+profile and the row are kept in `.probe/r230/`. The run directory (10,116
+files) is deleted. GPU job 39497293 (round 224's gathering A/B) is still
+pending: at 21:30 Slurm put its start at 07:35 on 29 Oct.
+
+## Round 231 (diagnosis): the idle is PolyChord's root computing, not dispatching slowly
+
+**Question.** Round 230 saw idle rise from 1.5% to 6.3% of worker-time and
+called it "drains": the root handing out seeds slowly. What is the root
+doing in them?
+
+**Method.** Round 230's command again (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks, `7ff6f6e`), with a 0.5 s sampler
+(`.probe/r231/sample.py`) reading the root's threads: state, syscall (and
+fd target), CPU, utime. (`wchan` reads 0 on this kernel.) After the run,
+each rank's timeline is rebuilt from `summary.json`: `eval_id` is a
+per-rank counter, so evaluation k on a rank follows evaluation k-1 on the
+same rank (`.probe/r231/` has the scripts). The same method was also run on
+round 230's summary.
+
+**Results.**
+- These are not drains. In every window, the per-rank gaps start at
+  staggered times, as each worker finishes its chain, and **all end at the
+  same instant**. Round 230: 891.6, 1038.9 and 1342.6 s. This run: 22
+  release instants from t=620 s, with waits up to 48 s. The root stops
+  dispatching completely. Seeds trickle out only because chains take
+  ~30-50 s to finish, which is why starts fell gradually instead of
+  stopping, and why round 230 read it as "slow".
+- The root is not waiting on a worker. At 761.7 s it released 38 waiting
+  ranks 17 s after the last evaluation in flight had ended (744.5 s), and
+  no evaluation took over 6 s.
+- It is not I/O or a blocked syscall. Every sample of the root's main
+  thread is state R in user space. Its user CPU stays at ~36% of a CPU
+  throughout (the rest is presumably MPI polling in system time; stime was
+  not sampled). In the 714-762 s block it stayed on cpu10 the whole time,
+  where it otherwise moves to another CPU nearly every sample. That is the
+  signature of the root computing inside PolyChord, not polling.
+- The cost grows with the run: none before t~600 s (ndead ~600), then
+  longer and more frequent blocks. This run lost 12,463 worker-s
+  (busy share 80.6%, 43.5 evals/s) against round 230's 4,145 (92.3%, 51.1).
+  log(Z) = 0.0173747444767856 +/- 0.000410586136794265, within 0.3 sigma of
+  round 230's 0.0171997434919644 +/- 0.000400520669269346.
+- The bench row's `idle_fraction` (0.023) and `stall_s` (41 s) miss almost
+  all of this: they count only time with nothing in flight.
+
+| | round 230 | round 231 |
+| --- | ---: | ---: |
+| evals/s | 51.1 | 43.5 |
+| busy share of 38 workers | 92.3% | 80.6% |
+| worker-s lost below 38 in flight | 4,145 | 12,463 |
+| release instants (>= 5 ranks freed at once) | ~6 | 22 |
+| longest wait | ~40 s | 48 s |
+
+**Learned.**
+- The open CPU lever is a CPU-bound step in PolyChord's root that grows with
+  ndead (or with phantoms or posteriors) and costs up to ~20% of
+  worker-time in a 1,500-dead search. Production runs are longer, so the
+  cost will be worse there.
+- Next: attach to the root during a block and read its Fortran stack.
+  Host `gdb`, `eu-stack` and `pstack` are installed and
+  `ptrace_scope` is 0. Trigger the dump on "the root stays on one CPU for
+  more than 3 s". Then fix the step (cache it, do it less often, or move
+  it off the dispatch path) in a patch to PolyChord.
+- To tell a root block from slow dispatch, look at the instants when
+  per-rank gaps end, not at starts per bin.
+
+Rows: `r231-bigrun` (bench) and `r231-root-blocks` (stage, with the release
+instants and full-precision log(Z)) are in `benchmarks.jsonl`. The run
+directory (9,272 files) is deleted. `summary.json`, `.stats` and the
+samples are kept in `.probe/r231/`.
+
+## Round 232 (diagnosis + fix): the "root blocks" are Lustre stalls on the ranks' own threads
+
+**Question.** Round 231 read the 15-48 s release instants as PolyChord's
+root computing. Where in PolyChord?
+
+**Method.** Round 231's command again (seed 190182240, nlive 150, 15
+repeats, async, 39 ranks, `91ac997`), stopped at ~1,100 s. Three samplers
+(`.probe/r232/`): gdb every ~2 s on the root, reading its `$pc` and 600
+stack words, symbolized offline against `libchord.so` pulled out of
+`polychord.sif` (gdb cannot open the SIF's libraries through
+`/proc/PID/root`: permission denied); every process's main-thread state
+and syscall every 0.5 s; and, for every thread of mine in D state, the
+path argument of its syscall, read from `/proc/PID/mem`.
+
+**Results.**
+- The root is not computing. All ~360 gdb samples, including the ones
+  inside the blocks (606-625, 660-683, 691-702 s: the root stays on one
+  CPU), are in `catch_babies`, i.e. `MPI_Recv` for babies, with the same
+  user CPU per sample (~35%, MPI polling) as outside them. The root is
+  waiting for the workers. Staying on one CPU is just an idle node, with
+  nothing to push it off.
+- The workers are stuck in Lustre. From 979 to 1008 s, up to 14 rank main
+  threads piled up in D state and were all released at one instant. That is
+  round 231's signature. The paths: rank **main threads** in `rmdir` and
+  `getdents64` on `evaluations/eval-*` (1,150 + 44 samples in a 90 s
+  window), and the record-writer threads in `openat` and `rename` of
+  `eval-*.json(.partial)` (~20,000 samples), which is harmless off the
+  critical path. The whole 90 s window was one long metadata stall.
+- The main-thread calls are `_strip_to_record`, which
+  `retain_evaluation_detail` runs when a rank's extreme so far is evicted.
+  Before round 232 the strip ran inline. A held extreme is in tmpfs, so
+  evicting it is free, but every `NS_RETAIN_FLUSH_SECONDS` (600 s)
+  `flush_held_evaluations` publishes the survivors to Lustre, also on the
+  main thread. From then on, each eviction of a published one walks,
+  unlinks and rmdirs on Lustre. That is why round 231 saw no blocks before
+  t~600 s and more blocks after it.
+
+**Fix.** Both Lustre jobs go to the rank's record writer, the single
+ordered thread that already writes records (`_defer_lustre`). The periodic
+flush (`_publish_held`) and an eviction's strip are queued in order, so a
+strip still follows its own publish. A forced flush, at the end of a run,
+stays inline, because `finished_run_records()` and the prune need the files
+in place. The end-of-run reader drains the writer first, as before.
+`self_check_streaming_retention` now parks the writer on an event and
+asserts that a periodic flush and an eviction leave Lustre untouched until
+it is released. It fails with the old inline behaviour ("the rank's thread
+published"). All 30 host self-checks pass.
+
+**Not yet measured.** The gain needs a production-length search with a
+Lustre stall in it. Stalls are random (round 230 lost 4,145 worker-s,
+round 231 12,463), so this round could not A/B it within one iteration.
+The bound is round 231's 19% of worker-time. The change does not touch the
+sampler, so chains and log(Z) cannot move. Next: a converged rerun of round
+230's command on this commit, comparing the busy share (`.probe/r230/idle.py`)
+and the count of D-state main threads.
+
+**WSClean guard (shared code).** A raced synchronous pair (seed 229,
+nlive 100, max-ndead 4000, 9 ranks each; base `91ac997` on CPUs 0-18, this
+change on 19-37) gave bit-identical `dead-birth.txt`, `.txt` and `.stats`,
+log(Z) = 0.0962001628097257 +/- 0.000453662936636545 in both, and 35.77
+against 35.46 evals/s (-0.9%, inside the ~5% spread and on different CPU
+halves).
+
+Rows: `r232-base`, `r232-new` (bench) and `r232-lustre-strip` (stage) in
+`benchmarks.jsonl`. The probe run directory was deleted; the samplers and
+their output are in `.probe/r232/`.
+
+**Learned.**
+- "One CPU, state R, all ranks released at one instant" is also what the root
+  looks like while it busy-polls MPI waiting on workers stalled together.
+  Before blaming the root, check the workers' D states and syscall paths
+  (`.probe/r232/paths.py` reads the path from `/proc/PID/mem`).
+- gdb on the host cannot read a SIF process's libraries. Sample `$pc` and raw
+  stack words, then symbolize against the `.so` copied out with
+  `apptainer exec <sif> cat`.
+- Any Lustre metadata call left on a rank's thread is a whole-search stall
+  risk, because a stall holds every rank at once. Grep the evaluation path
+  for mkdir, rmdir, iterdir and rename that are not handed to the writer.
+
+## Round 233 (validation): round 232's fix in the production search, busy share 0.995
+
+**Question.** Round 232 moved the Lustre strip and the periodic flush off
+the ranks' main threads. Does that remove round 230-231's whole-search
+blocks in the production search, and does log(Z) still agree?
+
+**Method.** Round 230's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs), on
+`5c7b03c`, with round 232's main-thread sampler running alongside it
+(`.probe/r233/`). Other users' jobs loaded the node heavily: load 21 at the
+start, 120-124 mid-run. Two new readers of `summary.json`: `dips.py`
+(windows longer than 5 s with fewer than 34 of 38 workers in flight, i.e.
+round 231's blocks) and `dcount.py` (D-state pile-ups in the sampler's
+output).
+
+| | round 230 (`69e2a2f`) | round 231 (`7ff6f6e`) | round 233 (`5c7b03c`) |
+| --- | ---: | ---: | ---: |
+| evaluations | 72,429 | 73,645 | 77,526 |
+| search wall | 1,418.8 s | ~1,694 s | 1,595.6 s |
+| evals/s | 51.1 | 43.5 | 48.6 |
+| request (`image_container`) | 660 ms | - | 743 ms |
+| busy share of 38 workers | 0.923 | 0.806 | **0.995** |
+| worker-s lost below 38 in flight | 4,145 | 12,463 | **327** |
+| windows > 5 s below 34 in flight | 6 (154 s) | 18 (528 s) | **0** |
+| post-run drain | 0.0 s | 5.1 s | **60.0 s** |
+| log(Z) | 0.0171997434919644 +/- 0.000400520669269346 | 0.0173747444767856 +/- 0.000410586136794265 | 0.0172880612106121 +/- 0.000403960591240749 |
+| ndead, nlike | 1,481, 71,014 | 1,464, 72,010 | 1,471, 75,436 |
+
+**Results.**
+- The blocks are gone. Busy share is 0.995. The only bin below 0.9 is the
+  last 6 s of the run. No window had fewer than 34 workers in flight for
+  more than 5 s. No rank main thread was in D state after t=4 s (start-up);
+  the D samples left are the host's progress-bar `find` and the record
+  packer, both off the critical path.
+- evals/s is 48.6, below round 230's 51.1, only because the request took
+  743 ms against 660 under the heavier node load. At round 230's request
+  time, a busy share of 0.995 against 0.923 is worth +7.8% (~55 evals/s).
+  Against round 231's run of the same command it is +23% of worker-time.
+- log(Z) agrees with round 230 within 0.15 sigma (difference 0.000088,
+  combined error 0.000569).
+- New cost: the post-run drain took 60.0 s (round 231: 5.1 s). The drain
+  is `drain_record_writes` plus a barrier. The suspect is a backlog on
+  some rank's record writer: the strips round 232 deferred, queued behind a
+  Lustre stall. The pack was also slow (43.9 s against 26.1), so Lustre
+  was slow at the end. Not proven, because the sampler does not see the
+  writer threads or futex waits. It costs once per run (3.8% of this
+  1,600 s search, less in longer ones), against ~8-23% of worker-time
+  recovered during the search.
+
+**Next.** Log the writer-queue depth and the per-rank drain time at the
+start of `finished_run_records`. If strips dominate, the end of a run can
+drop the queued strips of extremes that the run does not keep, since the
+end-of-run prune removes them anyway.
+
+Rows: `r233-bigrun` (bench) and `r233-validation` (stage, with full-precision
+log(Z)) in `benchmarks.jsonl`. `summary.json`, `.stats`, the profile and the
+sampler output are kept in `.probe/r233/`. The run directory (9,537 files) is
+deleted.
+
+## Round 234 (fix): the post-run drain is a record-writer backlog
+
+**Question.** Round 233's post-run drain took 60 s. What is still queued
+on the ranks' record writers when a run ends?
+
+**Method.** `finished_run_records` now reports, on the `post-run seconds`
+line, each kind of writer job still queued when the run ended (summed over
+ranks), the most queued on one rank, the slowest rank's own drain (the
+`drain` phase is rank 0's, barrier included), and the seconds every writer
+spent on each kind. Three short R2D2 searches on `c72f740` (nlive 150, 15
+repeats, 400 dead, seed 190182240, 39 ranks, `NS_RETAIN_FLUSH_SECONDS=60`
+to exercise the periodic flush). Other users' jobs put the node load at
+50-90.
+
+| run | drain (rank 0) | slowest rank | queued: record / held / strip / publish | most on one rank |
+| --- | ---: | ---: | --- | ---: |
+| a | 3.3 s | 25.4 s | 6,457 in total (kinds not split yet) | 243 |
+| b | **49.6 s** | 49.6 s | 7,905 / 1,345 / 1,010 / 84 | 361 |
+| c | 5.9 s | 6.2 s | 9,251 / 1,705 / 1,205 / 113 | 407 |
+
+In run c, the writers spent 7,823 s on records, 2,104 s on held-extreme
+publishes, 749 s on strips and 30 s on publishes. That is 282 s of each
+rank's ~300 s search, so the writers were saturated. Of 14,567 records,
+9,251 (64%) were still unwritten when the run ended.
+
+**Finding.** The writer is not a little behind at the end. On a loaded
+Lustre it falls 200-400 jobs behind (minutes of records) during the
+search, at ~0.5 s per record create+rename. How long the drain takes then
+depends on Lustre at that moment: 6-50 s here, 60 s in round 233. Two
+thirds of the backlog is record writes, and those are wasted at the end:
+rank 0 already has every record's text (`_WRITTEN_RECORDS`, gathered) and
+`pack_finished_run` packs them into `records.jsonl`, then unlinks each
+flat file the writers just created.
+
+**Fix.** At the start of `finished_run_records`, each rank cancels its
+record writes that have not started. `pack_evaluation_records` now appends
+a known record that has no file and is not yet in the pack (before this it
+skipped such a record, which could only happen if the file had vanished).
+Held publishes, strips and publishes still drain: a strip left undone
+would leave an evaluation's images on Lustre, and the final flush already
+sends only the extremes the run keeps. The trade-off: if a run is killed
+between the cancel and the pack, those records are lost, and a resume
+re-evaluates those points. That window is a few seconds at the end of a
+run. The self-check (`self_check_resume_adoption`) parks the writer,
+queues a record, finishes the run and asserts that no flat file was
+written and that the pack holds the record. It fails without the cancel.
+
+**WSClean guard.** Raced synchronous WSClean (seed 229, nlive 100, 4,000
+dead, 19 CPUs per arm, CPU sets swapped from a first async pair). Base
+`c72f740` against this change: 4,071 evaluations each, all 7 chain text
+files bit-identical, log(Z) 0.0967023094179472 +/- 0.000520957293962581
+in both, 37.64 vs 37.45 evals/s (-0.5%, noise). The new arm cancelled
+2,618 record writes. `records.jsonl` holds all 4,071 distinct records and
+no flat record is left. The base arm ran from a `/dev/shm` worktree, so
+its post-run phases are not comparable: its records went to tmpfs, and its
+wrapper wall was ~10 s shorter for that reason.
+
+**Not measured yet.** The drain gain in a production R2D2 search. The
+drain varies 6-50 s run to run at the same settings, so one pair would
+not show it. Next: read the new `post-run seconds` line of the next
+production run (the cancelled records are its `record` count). A second
+lever is the held publishes still queued at the end (1,345-1,705). Each
+is an extreme the periodic flush copied to Lustre. Most of them are
+evicted again, and the end-of-run prune drops them. They could go back to
+`_HELD` when cancelled, so that the keep-filtered final flush drops them
+in tmpfs.
+
+Rows: `r234-a`, `r234-b`, `r234-c` (bench), `r234-base`, `r234-new`,
+`r234-sbase`, `r234-snew` (guard), and stage row `r234-writer-backlog` in
+`benchmarks.jsonl`. Run directories are deleted; `.probe/r234/` keeps the
+scripts.
+
+## Round 235 (fix): a held extreme evicted before its publish runs is never copied
+
+**Question.** Round 234 left 1,345-1,705 periodic publishes of held
+extremes queued when a run ended, plus ~1,000 strips. Each publish copies
+an extreme from tmpfs to Lustre, and most of those extremes are evicted
+again soon after, which queues a strip to delete what the publish copied.
+On a loaded Lustre the writer runs minutes behind, so the eviction usually
+happens before the publish has even started.
+
+**Fix.** `flush_held_evaluations` keeps each queued publish's future in
+`_PUBLISHING`. When `retain_evaluation_detail` evicts an extreme whose
+publish has not started, it cancels the publish and deletes the extreme in
+tmpfs. Nothing of it reaches Lustre, so it needs no strip either. At the
+end of a run, `finished_run_records` also cancels the publishes still
+queued and returns those extremes to `_HELD`. The keep-filtered final
+flush then copies only the ones the run keeps. A publish that has already
+started is left to finish, and the strip is queued after it as before.
+The `post-run seconds` line now ends with `held publishes cancelled N`.
+`self_check_streaming_retention` has two new parked-writer tests, one for
+the eviction and one for the end of the run. Each fails when its half of
+the fix is reverted.
+
+**R2D2, one short search** (round 234's command: nlive 150, 15 repeats,
+400 dead, seed 190182240, 39 ranks, `NS_RETAIN_FLUSH_SECONDS=60`, node
+load 22-112). The cancel counter was added after this run, so it does not
+report one.
+
+| | r234-c (base) | r235-a |
+| --- | ---: | ---: |
+| evals/s | 51.2 | 53.2 |
+| held publishes queued at end | 1,705 | 723 |
+| strips queued at end | 1,205 | 340 |
+| writer seconds: held / strip / record | 2,104 / 749 / 7,823 | 1,368 / 915 / 9,751 |
+| slowest rank's drain | 6.2 s | 45.3 s |
+
+log(Z) is 0.0164202934118867 +/- 0.000954286828397633 (ndead 550, nlike
+13,203). Lustre was slower in this run: record writes took 25% more writer
+time per record. Even so, the held share of writer time fell from 19.7% to
+11.3%. The drain still varies with Lustre, as in round 234. Most of the
+queue at the end is record writes, and those were already cancelled. The
+rank-0 phases are 0.2-2.4 s each.
+
+**WSClean guard.** Raced synchronous WSClean, base `aa4fc68` from a
+`/dev/shm` worktree against this change, run as round 234 did but with
+`NS_RETAIN_FLUSH_SECONDS=20` so that the new path runs. Each arm had 19
+CPUs, base on the upper half of the job's CPUs. All 8 chain files were
+bit-identical. log(Z) was 0.0967023094179472 +/- 0.000520957293962581 in
+both, the same as round 234. Throughput was 37.53 vs 37.47 evals/s
+(-0.1%, noise). The new arm cancelled 1,330 held publishes, and its
+records.jsonl holds all 4,071 distinct records. A first async pair
+(`r235-base`, `r235-new`) was pinned with `taskset -c 0-18` / `19-37`.
+This job's CPUs are the even numbers 0-74, so each arm got only ~10 of
+them. Ignore that pair.
+
+**Found on the way (next lever).** In both arms, most evaluation dirs left
+after the prune hold only `simulation.json` and an empty `wsclean/`, and
+their records no longer name an image: 555 of 601 dirs in the base, 337 of
+383 in the new arm. They are extremes that were published and then pruned
+(or stripped) without removing the dir, at 3 inodes each. That is a file
+quota leak of roughly 1,000 inodes per 4,000-evaluation run, scaling with
+how many extremes reach Lustre. This change shrinks it but does not close
+it. Find which path leaves `simulation.json` behind (the prune, or
+`_strip_to_record` racing the publish) and remove the dir.
+
+Rows: `r235-a` (bench), `r235-sbase`, `r235-snew` (guard), the mis-pinned
+`r235-base`, `r235-new`, and stage row `r235-held-cancel` in
+`benchmarks.jsonl`. Run directories are deleted; `.probe/r235/` keeps the
+scripts and logs.
+
+## Round 236 (fix): a pruned extreme's dir goes with its images
+
+**Question.** Round 235 found that most evaluation dirs left after a
+WSClean run hold only `simulation.json` and an empty `wsclean/`. They
+cost about 3 inodes each against the ~1M-file project quota. Which path
+leaves them?
+
+**Cause.** `prune_run_artefacts`. A held extreme that a periodic flush
+published, and that the run then did not keep, has its images unlinked
+and its `PRUNED_EVALUATION_LOGS` removed. Everything else stays:
+`simulation.json`, the emptied `wsclean/` (or `r2d2/`) and the dir.
+`_strip_to_record` was never involved, because an evaluation it strips
+loses its dir.
+
+**Fix.** For those records the prune now finishes by calling
+`_strip_to_record`, so a pruned extreme ends up exactly like an extreme
+evicted when it was scored. Only its flat record survives, beside the
+dir. Kept evaluations and failures are not touched. No reader opens a
+per-evaluation `simulation.json` after a run, and the 98% of evaluations
+stripped at scoring time never had one. `self_check_image_retention` now
+writes a `simulation.json` into each fixture dir and asserts that a
+dropped evaluation's dir is gone. That assertion fails on `c974995`
+(`AssertionError: (21, 'dir')`). All 30 host self-checks pass.
+
+**WSClean guard** (raced, synchronous, `NS_RETAIN_FLUSH_SECONDS=20`, seed
+229, nlive 100, 4,000 dead, 19 even CPUs per arm, base `c974995` from a
+`/dev/shm` worktree):
+
+| | base | new |
+| --- | ---: | ---: |
+| evals/s (steady) | 39.78 (39.83) | 39.48 (39.53) |
+| evaluation dirs left | 573 | 46 |
+| of which `simulation.json`-only | 527 | 0 |
+| files in the run dir | 2,078 | 497 |
+| prune | 0.3 s | 0.9 s |
+
+All 11 chain files and `clusters/` are bit-identical. log(Z) is
+0.0967023094179472 +/- 0.000520957293962581 in both arms, as in rounds
+234-235. Both summaries hold 4,071 distinct evaluations, and the same 46
+of them keep images. All 92 image paths in the new summary exist. The
+-0.75% in evals/s is inside the ~5% three-repeat span. The new arm's
+prune, 0.6 s longer, runs on Lustre, while the base arm's results were
+on tmpfs, so the two are not comparable (round 234). In any case 0.6 s
+is a one-off at the end of a run, and it deletes ~1,600 inodes.
+
+**Effect.** 76% fewer files per WSClean benchmark run at this flush
+interval. In production (600 s flush) fewer extremes reach Lustre, so
+the saving is smaller per run, but it grows with run length and with
+the number of ranks. An R2D2 run leaves the same shape of dir (with
+`r2d2/` in place of `wsclean/`), so it gets the same fix.
+
+Rows: `r236-sbase`, `r236-snew` (bench) and stage row `r236-prune-strip`
+in `benchmarks.jsonl`. Run directories are deleted; `.probe/r236/` keeps
+the script and logs.
+
+## Round 238 (negative): the gathering TensorRT server gives no search speed, and its first arm hung
+
+**Why.** This reads round 224's A/B, 1-GPU job 39497293 (gpu-q-43,
+A100-SXM4-80GB). It ran seed-4242 searches with `--nlive 48 --num-repeats 5
+--max-ndead 600` at 19 ranks x 2 threads on 32 CPUs, alternating today's
+shared server (A) and `R2D2_TRT_BATCH=8` (B). The 25 four-profile plans
+took 1,266 s to build once. They are cached under
+`$RI_WORK_DIR/.cache/ri/r2d2-trt/plans/...-b1-2-4-8`.
+
+**Bug.** Arm B1 never scored a point: it was killed at its 900 s cap
+while still "generating live points". In `serve_trt_gathered`, the loop
+`for index, size in enumerate(sizes)` that builds each lane's contexts
+overwrote the request `size`. That left it at 8, so `gather_forwards`
+read every SEQPACKET request with `recv(8)`. The kernel truncated the
+request to 8 bytes, and the 16-byte header unpack raised in the reader
+thread. Only the lanes had the `os._exit` guard, so the server stayed up
+with no reader, and every worker waited on its socket for ever.
+`self_check_trt_gathered` missed it because it drives `gather_forwards`
+with a fake forward and never calls `serve_trt_gathered`. The fix renames
+the loop variable to `rows`. The reader now also takes the server down on
+any exception, as a lane already did, so workers see a closed socket and
+fall back to the CPU (round 220) instead of hanging. It was applied
+mid-job, after A2 had started; A2 uses `serve_trt_shared`, which the
+fix does not touch, so B2 and C1 ran the fixed server.
+
+| arm | server | evals | wall s | start-up s | stall s | steady evals/s | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---|
+| A1 | shared, 19 lanes (default) | 9,182 | 117.4 | 11.9 | 8.4 | **94.55** | 0.0193405665097373 +/- 0.000642797829427586 |
+| B1 | gathered, batch 8, 2 lanes | 0 | 900 (cap) | - | - | hung (bug above) | - |
+| A2 | shared, 19 lanes (default) | 12,001 | 157.7 | 10.2 | 8.5 | **86.40** | 0.0185146212358272 +/- 0.000604130194794121 |
+| B2 | gathered, batch 8, 2 lanes | 8,614 | 122.7 | 18.9 | 0.0 | **83.00** | 0.0186554266665952 +/- 0.000652643949993908 |
+| C1 | gathered, batch 8, 4 lanes | 8,861 | 151.3 | 56.2 | 0.0 | **93.16** | 0.0189905115905253 +/- 0.000611129824384573 |
+
+- The four log(Z)s agree (spread 0.0008, about 1.3 sigma), so the
+  batched engines are acceptable for science. Speed is the problem.
+- The default's two arms average 90.5 steady evals/s, against 83.0 for
+  B2 and 93.2 for C1. Each arm is a single run, and the A arms alone
+  differ by 9%, so neither gathered arm is distinguishable from the
+  default. That is nowhere near round 223's predicted +50-80%. Start-up
+  is worse: 200 contexts per lane took 19 s at 2 lanes and 56 s at 4,
+  against 10-12 s.
+- Why the simulation missed (not proven): it put 1 ms between a client's
+  forwards. In R2D2 each forward is followed by that iteration's NUFFT
+  residual on the CPU, so a worker spends most of its time between
+  forwards, and the 19 workers are spread over 25 nets. Few requests for
+  the same net wait at once. The forward's cost to a worker is then one
+  round trip's latency, which batching does not cut, rather than card
+  throughput, which batching raises. C1 beating B2 points the same way:
+  more lanes (concurrency) helped, not bigger batches. Logging the mean
+  batch per lane would test this, but it is not worth a GPU job.
+- Decision: `R2D2_TRT_BATCH` stays opt-in at its default of 1, now
+  fixed. The GPU batching lever is closed for 1-GPU, 19-rank searches. A
+  batch server could only pay with many more workers per card (e.g.
+  several CPU nodes feeding one GPU), which is not how this repo runs.
+
+**Checks.** `scripts/test_self_checks.py`: 30 host self-checks pass
+(python3.12, Slurm off PATH), `self_check_trt_gathered` included. The
+fix touches only `r2d2_serve.py`'s opt-in path, which WSClean never
+imports, so no WSClean guard was needed.
+
+Rows: `r224-A1`, `r224-A2`, `r224-B2`, `r224-C1` (bench) and stage row
+`r238-trt-gathered-ab` in `benchmarks.jsonl`. `.probe/r224/` keeps the
+job script, its output and the four `summary-*.json`. The run directories
+are deleted.
+
+## Round 239 (validation): rounds 234-236 in the production search, post-run drain 60 s -> 0.3 s
+
+**Question.** Rounds 234-236 cancel unstarted record writes and held
+publishes at the end of a run, and strip pruned extremes' dirs. They were
+guarded on WSClean only. What do they do in the production R2D2 search,
+and does log(Z) still agree?
+
+**Method.** Round 233's command, unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs),
+on `d41efab` (`.probe/r239/run.sh`). The node was busy with other jobs:
+load 23 at the start and 120-145 for most of the run.
+
+| | round 233 (`5c7b03c`) | round 239 (`d41efab`) |
+| --- | ---: | ---: |
+| evaluations | 77,526 | 70,202 |
+| search span | 1,595.6 s | 1,372.1 s |
+| evals/s (= steady) | 48.6 | **51.2** |
+| request (`r2d2 container`) | 743 ms | 712 ms |
+| busy share of 38 workers | 0.995 | 0.995 |
+| worker-s lost below 38 in flight | 327 | 257 |
+| windows > 5 s below 34 in flight | 0 | 0 |
+| post-run drain (rank 0 / slowest rank) | 60.0 s / - | **0.3 s / 0.4 s** |
+| pack | 43.9 s | 14.0 s |
+| all post-run phases | 112.4 s | 21.6 s |
+| wrapper wall | 1,716 s | **1,427 s** |
+| files left in the run dir | 9,537 | **711** |
+| log(Z) | 0.0172880612106121 +/- 0.000403960591240749 | 0.0174042104464403 +/- 0.000408942281146939 |
+| ndead, nlike | 1,471, 75,436 | 1,488, 68,540 |
+
+**Results.**
+- The drain is gone: 0.3 s on rank 0 and 0.4 s on the slowest rank,
+  against 60.0 s. All post-run phases together take 21.6 s against 112.4 s,
+  and the pack takes 14.0 s against 43.9 s, because it no longer reads and
+  unlinks tens of thousands of flat records. That is 91 s saved per run
+  (5.3% of round 233's wrapper wall).
+- What the end of the run cancelled: 33,144 record writes (47% of the
+  run's 70,202 records) and 1,924 held publishes. Queued at the end were
+  1,068 jobs on the busiest rank. The writers spent 49,159 s on records
+  across 39 ranks (~1,260 s per rank in a 1,372 s span), so on this
+  Lustre the record writers are saturated for the whole run.
+- The run dir keeps 711 files against 9,537 (-93%), which is round 236's
+  strip on R2D2 (`r2d2/` dirs) plus no flat records left behind.
+- Busy share and the search itself are unchanged: 0.995, no window below
+  34 in flight. evals/s is 51.2 against 48.6 because the request was 712
+  ms against 743 ms, which is node load, not these rounds.
+- log(Z) agrees with round 233 within 0.20 sigma (difference 0.000116,
+  combined error 0.000575), and with round 230 within 0.36 sigma.
+
+**Cost found.** Because the writers stay saturated, about half of a
+run's records (33,144 of 70,202 here, ~11 minutes of search) exist only
+in rank memory until the final pack. If a run is killed mid-search, those
+records are missing from its archive. PolyChord's own checkpoints are
+unaffected, and this round did not test what `./ri resume` does with the
+gap. This was already true before round 234: the backlog builds up during
+the search, and round 234 only cancels it at the end. So it is not a
+regression. A cheaper record store (one append file per rank instead of
+one create+rename per record) would fix it, but would touch eight readers
+(round 237). That is the next lever here, on durability rather than speed. (Corrected in round 242: a mid-search kill loses at most a couple of records; the end-of-run backlog does not exist mid-run.) (Round 244 reverses that correction: on a loaded RDS, 58-67% of records stayed off disk all the way through a search.)
+
+Rows: `r239-bigrun` (bench) and stage row `r239-validation` (full
+precision log(Z)) in `benchmarks.jsonl`. `.probe/r239/` keeps the
+script, the profile, `.stats`, and gzipped `summary.json` and log. The run
+directory is deleted.
+
+## Round 240 (opt-in, no speed gain): records appended to the pack, not one flat file each
+
+**Question.** Round 239 found the per-rank record writers saturated for a
+whole production run on loaded RDS (create + write + rename per record),
+leaving ~half a run's records only in rank memory until the final pack.
+Does appending each record line to `evaluations/records.jsonl` instead
+close that gap, and what does it do to speed?
+
+**Also seen first.** In a cold-start probe (`.probe/r240/arm.sh`, the
+round 228 worker-side cold first request, which did not reproduce: first
+request 5.7 s) a 32 s, 39-rank R2D2 search spent 26.7 s in the post-run
+drain. Its writers spent 749 s on 888 records, so on a loaded Lustre the
+drain still waits on whichever write is running. The bench wall does not see
+this.
+
+**Change** (`common.py`, `NS_RECORD_APPEND=1`, default off): the run's
+background writer appends `name<TAB>json` to the pack through one O_APPEND
+descriptor per rank under a shared `flock`. Pack writers keep the exclusive
+lock, and now truncate only when there is a torn tail, so a killed rank's
+half line is cut by the next pack (resume) rather than run on into.
+`pack_flat_records` returns before taking the lock when there are no flat
+records. Without that, the 15 s packer held the exclusive lock every pass
+while it listed the dir and read the whole pack, and every append waited.
+The async WSClean arms below ran that draft. Readers needed no change: the
+pack was already read everywhere, last line per name wins, a torn tail is
+ignored, and `sort -u` dedupes names. New self-check block in
+`self_check_resume_adoption`.
+
+**Microbenchmark** (`.probe/r240/mb.py`, 38 processes x 100 records of 4 KB
+on RDS, 20 ms apart):
+
+| | median | p99 | worst |
+| --- | ---: | ---: | ---: |
+| flat create + write + rename | 1.5-2.1 ms | 12.6-1,176 ms | 0.04-1.19 s |
+| append under shared flock | 0.14-0.24 ms | 0.5-1.8 ms | <0.01 s |
+| append, no lock | 0.04 ms | 0.3-0.9 ms | <0.01 s |
+
+All 3,800 lines came out whole each time.
+
+**A/B** (raced, same tree, `NS_RECORD_APPEND` toggled, `.probe/r240/ab.sh`):
+
+| | WSClean sync (seed 229, nlive 100, 19 CPUs) | R2D2 sync pair 1 (seed 240, nlive 48, 20 ranks / 19 CPUs) | R2D2 pair 2, CPU halves swapped |
+| --- | ---: | ---: | ---: |
+| evals/s, flat / append | 27.48 / 27.53 (steady 37.44 / 37.55) | 13.47 / **13.06** | 13.42 / **13.29** |
+| request, flat / append | 100.4 / 100.3 ms | 615 / 615 ms | 630 / 631 ms |
+| records queued at the end, flat / append | 2,448 / 769 | 1,533 / 136 | 850 / 445 |
+| record writer-s, all ranks | 2,523 / 1,631 | 9,530 / 1,816 | 8,778 / 2,585 |
+| publish writer-s, all ranks | 62 / 205 | 223 / 861 | 160 / 479 |
+| chains | bit-identical | bit-identical | bit-identical (and = pair 1) |
+| log(Z) | 0.0967023094179472 +/- 0.000520957293962581 both | 0.0178076426814691 +/- 0.000612615118847292 all four | |
+| files left | 497 / 497 | 630 / 630 | 630 / 630 |
+
+**Results.**
+- It does what it was for: records still in memory at the end fall 3x in
+  WSClean and 2-11x in R2D2, and record writer time falls 3-5x.
+- It gains no speed. R2D2 was slower in both pairs (-3.1%, -1.0%) with
+  identical request times, inside the ~5% control span but the same sign
+  twice. A likely cause, not proven: a writer no longer stuck on creates
+  reaches publishes of held extremes that round 235 would have cancelled
+  once they were evicted. Publish writer-s rose 2-4x, which means Lustre
+  copies and CPU on the ranks' own CPUs.
+- The pack carries more lines (6,516 against 5,483 for 4,071 records in
+  WSClean). None is an identical repeat: they are later edits of a record
+  (paths), which the flat layout overwrote in place. This costs bytes, not
+  inodes.
+- Even an append job takes ~0.4 s of writer wall in-run against 0.2 ms
+  solo, so the writer thread's latency is waiting for a CPU or the GIL on
+  a busy rank, not Lustre. Writer-seconds overstate Lustre cost in every
+  round that quotes them.
+- The default path (flat, `NS_RECORD_APPEND=0`) differs from `9432fd5`
+  only by the packer's early return and the conditional truncate. The sync
+  WSClean flat arm reproduced round 236's log(Z) exactly.
+
+**Decision.** Opt-in (`NS_RECORD_APPEND=1`), for runs where a mid-search
+kill losing ~half the records matters more than 1-3%. The next test is
+an async production-shaped search with it on, which would show both the
+real in-memory gap and whether the publish effect holds when it is not
+synchronous. A version that stops publishing held extremes until the end
+(as round 235 already does for the evicted ones) would take away the
+suspected cost.
+
+Rows: stage row `r240-record-append`. Bench rows `r240-c1`, `r240-wflat`,
+`r240-wapp` (async, earlier draft), `r240-sflat`, `r240-sapp`,
+`r240-rflat`, `r240-rapp`, `r240-rflat2` and `r240-rapp2`. All run directories
+are deleted. Logs (gzipped) and scripts are in `.probe/r240/`.
+
+## Round 241 (negative, async): append records cost 1-3% and gain no speed in async R2D2 searches
+
+**Question.** Round 240's R2D2 pairs were synchronous. In an async search
+(the `./ri search` default), does `NS_RECORD_APPEND=1` still come out
+slower, and how many records stay in memory only at the end?
+
+**Method.** `.probe/r241/ab.sh`, the round 240 harness with the same tree
+(`435dcee`) and only `NS_RECORD_APPEND` changed. Two arms raced at once,
+one per 19-CPU half of the job (`taskset`), then a second pair with the
+halves swapped. Each arm ran `--seed 240 --nlive 48 --num-repeats 5
+--max-ndead 400 --mpi-procs 20`, async, on CPU ONNX.
+
+| | pair 1 flat (CPUs 0-36) | pair 1 append (38-74) | pair 2 flat (38-74) | pair 2 append (0-36) |
+| --- | ---: | ---: | ---: | ---: |
+| evals/s (steady) | 24.14 | 24.59 | **24.85** | **23.30** |
+| request (image_container) | 731 ms | 717 ms | 725 ms | 770 ms |
+| evaluations | 8,073 | 7,920 | 7,129 | 6,926 |
+| records still queued at the end | 3,303 | 22 | 580 | 0 |
+| record / publish writer-s, all ranks | 6,394 / 60 | 2,271 / 515 | 4,218 / 37 | 568 / 232 |
+| log(Z) | 0.017008532752603 +/- 0.00058693969702136 | 0.0174257756769625 +/- 0.000587839574347744 | 0.0176327304660833 +/- 0.000604709227169273 | 0.0179201110318572 +/- 0.00062115221930883 |
+| files left | 586 | 605 | 586 | 605 |
+
+All four arms reached ndead 448 (nlike 7,795, 7,676, 6,819, 6,625).
+
+**Results.**
+- On the same CPUs, append is slower on both halves: -3.5% on CPUs 0-36
+  (23.30 against 24.14) and -1.1% on 38-74 (24.59 against 24.85). The mean
+  is -2.3%. That matches round 240's synchronous -3.1% and -1.0%. Each
+  result is inside the ~5% control span, but now four of four comparisons
+  have the same sign. Within a pair, the arm on CPUs 38-74 was faster both
+  times, so the raw pair-by-pair figures (+1.9%, -6.3%) mostly measure
+  the two halves.
+- Async flat runs end with many more records held only in memory than
+  sync ones: 3,303 of 8,073 (41%) in pair 1. Append leaves 0-22. (Round 242: only at the end; a kill -9 mid-search lost 2
+  of 5,779 records flat.)
+- Publish writer-s again rises 4-9x under append, with the same work. As
+  round 240 found, writer-seconds measure the thread waiting for a CPU or
+  the GIL. The cost probably comes from the writer thread competing for
+  CPU with the rank once it is no longer parked in Lustre creates.
+  Correction to round 240: in those short runs the 600 s flush never
+  fired, so the publishes are kept `NS_KEEP_DETAIL_EVERY` evaluations
+  (kind "publish"), not held extremes. The suggested fix of deferring
+  held publishes would not touch them.
+- log(Z) agrees across the four arms (spread 0.00091, about 1.5 sigma of
+  one arm, which is ordinary for async runs that differ in their chains).
+
+**Decision.** `NS_RECORD_APPEND` stays opt-in and default off. It is a
+durability setting with a small speed cost (~2%), not a speed lever. The
+record path is closed for speed.
+
+Rows: stage row `r241-record-append-async`, and bench rows `r241-aflat`,
+`r241-aapp`, `r241-aflat2` and `r241-aapp2`. Run directories are deleted.
+Gzipped logs and scripts are in `.probe/r241/`.
+
+## Round 242 (diagnostic): a killed search loses almost no records; rounds 239 and 241 misread the end-of-run backlog
+
+**Question.** Rounds 239 and 241 read the end-of-run "records queued"
+figure (3,303 of 8,073 in an async flat run, 33,144 of 70,202 in
+production) as records that exist only in rank memory for the whole run,
+so a mid-search kill would lose them. That was the case for making
+`NS_RECORD_APPEND=1` the default despite its ~2% cost. What does a kill
+-9 mid-search actually leave on disk, flat against append, and what does
+`./ri resume` then redo?
+
+**Method.** Round 241's async R2D2 shape (`--nlive 48 --num-repeats 5
+--mpi-procs 20`, `--max-ndead 600`, seed 242), flat (default) on CPUs
+0-36 raced against `NS_RECORD_APPEND=1` on 38-74 (`.probe/r242/arm.sh`,
+`arm2.sh`). Each search was killed -9 mid-run. The search log prints one
+line per scored evaluation, so "scored" below is exact; "on disk" is what
+`read_evaluation_records` finds (flat files plus the pack,
+`.probe/r242/count.py`).
+
+| kill | arm | scored | on disk | lost |
+| --- | --- | ---: | ---: | ---: |
+| 240 s, every process in one `kill` | flat | 5,779 | 5,777 | **2** |
+| 240 s, every process in one `kill` | append | 6,075 | 6,075 | **0** |
+| 210 s, launcher's process group only | flat | 4,875 | 4,894 | 0 |
+| 210 s, launcher's process group only | append | 5,003 | 5,022 | 0 |
+
+**Results.**
+- A mid-search kill loses at most a couple of records in either mode
+  (2 of 5,779 flat, the "last record or two" `docs/robustness.md` already
+  states). The end-of-run backlog is not the mid-run state: the same flat
+  shape, resumed to the end, again reported 1,587 records queued at its
+  finish. So the claim in rounds 239 and 241 that half a run's records
+  live only in memory is wrong, and so is `NS_RECORD_APPEND`'s durability
+  case. Why the queue builds up only at the end is not traced; one lead is
+  that the single writer thread runs `gate.wait` jobs (`common.py`), and
+  records queue behind a gated one.
+- Killing only the launcher's process group (what `kill -9` of `./ri`
+  does outside Slurm) leaves 62-64 processes of the run alive: the MPI
+  ranks and pools sit outside that group. They went on scoring for the
+  5 s until the script killed them (19 more records on disk than scored
+  lines). Slurm's cgroup kill does not have this gap.
+- What a resume redoes. After the first (group-only) kill both runs were
+  resumed with `./ri resume` (rc 0, 294-295 s each). Every evaluation
+  scored after PolyChord's last checkpoint is imaged again: the resumed
+  async sampler draws different points, so none of them is adopted (the
+  final archive has as many distinct parameter sets as records, 11,620
+  and 10,534, each the sum of both attempts). Flat was killed 2,110
+  evaluations past its checkpoint (nlike 2,765 against 4,875 scored),
+  append 265 (4,738 against 5,003). That is the kill's phase within a
+  checkpoint interval (~68 dead points here), not the record mode. A kill
+  costs up to one checkpoint interval of evaluations, half on average.
+- Both resumed runs finished: log(Z) 0.0164620242943086 +/-
+  0.000717897445059914 (flat, ndead 503, nlike 9,271) and
+  0.0165702887519633 +/- 0.000726415219078128 (append, ndead 532, nlike
+  9,911), within 0.1 sigma.
+
+**Decision.** No code change. `NS_RECORD_APPEND` stays opt-in, now
+without a durability argument: the default flat writer is already
+durable to within a couple of records at a kill. (Corrected in round 244: on a loaded RDS, the flat writer trails by ~60% of records through the whole search, so a kill there loses thousands.)
+
+Stage row `r242-kill-records` is in `benchmarks.jsonl`. The run
+directories are deleted. Scripts and outputs are in `.probe/r242/`.
+
+## Round 243 (fix, GPU race pending): a shared TensorRT search may ask for more ranks than eager's card budget
+
+**Why.** With `R2D2_TRT_SHARED=1`, the GPU default since round 215, the
+25 engines live once in the forward server (~5.7 GB, round 207), and the
+workers hold nothing on the card. `run-nested-sampling-r2d2.sh` still
+divided the card's memory by eager's 4,096 MB a rank. On an 80 GB A100
+that refused any explicit `NS_MPI_PROCS` over 19 with a "need ~...MB of
+GPU memory" FATAL, so the layout round 225 pointed at (32 x 1 is +20%
+over 19 x 2 in the forward-free stub, 198 against 168 steady evals/s)
+could not be run at all. On a 40 GB card the same check would also have
+cut the shared default from 19 to 9 ranks.
+
+**Change.** The GPU-memory sizing and the FATAL now apply only when the
+workers hold engines or weights themselves (eager, or `trt` without the
+shared server). The default rank count is unchanged: still
+`NS_R2D2_CUDA_MAX_RANKS=19`, so a default search runs exactly as before,
+and only an explicit `--mpi-procs` (or `NS_MPI_PROCS`) can now go past it,
+bounded by CPUs and host memory like a CPU search.
+
+**Race (pending).** 1-GPU job 39544674 (`.probe/r243/ab.sh`) alternates the
+default 19 x 2 (A), 33 ranks x 1 thread, i.e. 32 workers (B), and B with
+the gathering server at batch 8 on 4 lanes (C; more workers should mean
+more same-net requests to gather, round 238). Each arm is the round 224
+shape: seed 4242, `--nlive 48 --num-repeats 5 --max-ndead 600`, compared
+on `steady_evals_per_s` and log(Z). It had not started 30 minutes after
+submission; a later round reads `.probe/r243/ab-39544674.out`. Raising
+`NS_R2D2_CUDA_MAX_RANKS` waits on it. Round 222 found the card saturated at
+~2,400 batch-1 forwards/s (~95 evals/s), so B may well gain nothing; C is
+the arm that could.
+
+**Checks.** `bash -n`; `scripts/test_self_checks.py` 30 host self-checks
+pass (python3.12, Slurm off PATH). The edit sits inside the
+`R2D2_DEVICE=cuda` branch of the R2D2 launcher, which neither a CPU R2D2
+nor a WSClean search reaches, so no WSClean guard was needed.
+
+## Round 244 (diagnostic, correction): on loaded RDS the record backlog is the mid-run state; round 242 was wrong
+
+**Question.** Round 242 found a kill -9 mid-search lost only 2 of 5,779
+records. From that it concluded that the end-of-run "records queued" figure
+does not describe a running search. Is that true in general?
+
+**Method.** Round 242's flat async shape again (seed 242, `--nlive 48
+--num-repeats 5 --max-ndead 600 --mpi-procs 20`, CPUs 0-36, `7486d55`), not
+killed. `.probe/r244/samp.py` sampled the run every 10 s. Each sample read
+the scored lines (`^{"eval_id"`, printed once `evaluate()` has queued the
+record), then the unique record names on disk (flat `*.json` plus the pack's
+names), then the scored lines again. "Behind" is at least
+`scored_before - on_disk`. RDS was heavily loaded: one listing of
+`evaluations/` took up to 52 s.
+
+| t (s) | scored | on disk | not on disk |
+| ---: | ---: | ---: | ---: |
+| 69 | 1,748 | 579 | 1,169 (67%) |
+| 138 | 4,070 | 1,479 | 2,591 (64%) |
+| 209 | 6,340 | 2,672 | 3,668 (58%) |
+| 293 | 8,802 | 3,740 | 5,062 (58%) |
+| end | 9,674 | 9,674 (after the pack) | 5,947 queued at the end |
+
+A first run (`lag1`, cruder `ls` count) showed the same: at least 2,330 of
+9,724 were not on disk at 344 s, and 2,895 were queued at the end.
+
+**Results.**
+- With RDS this loaded, the per-rank record writers fall behind from the
+  first minute and stay ~60% behind for the whole search, ~300 records per
+  rank. A kill at any point would lose that many records from the archive.
+  So round 239's reading (half a run's records exist only in memory) was
+  right on a loaded Lustre. Round 242's 2-of-5,779 must have come from a
+  quieter Lustre during its kill window (its finish still reported 1,587
+  queued). That is not proven: the 242 kill was not repeated under load.
+- Speed and results are not affected. The writers are off the rank's
+  thread, and the pack writes every queued record from memory at the end,
+  so the archive is complete (9,674 unique names = 9,674 scored).
+  Writer-seconds were 6,088 across 20 ranks in a 324 s span, ~94% busy.
+  log(Z) 0.0168909217090111 +/- 0.000751602394995056 (`lag1` 0.01683 +/-
+  0.00075).
+- What a kill loses is archive records only. PolyChord resumes from its
+  `.resume`, and round 242 found that a resumed async run adopts none of
+  the post-checkpoint evaluations anyway. But this repo's output is that
+  archive (failure modes), so on loaded RDS the durability case for
+  `NS_RECORD_APPEND=1` (2-11x fewer records held in memory, round 240, at
+  a 1-3% cost, round 241) is open again. It was not re-measured here.
+
+**Next.** Repeat round 242's kill under load with both writers, to settle
+whether append's ~2% is worth paying for durability. Alternatively, make
+the flat writer cheaper on a loaded MDS. One listing of the 20-rank
+`evaluations/` dir took 34-52 s, so contention in that one directory is
+the likely cost.
+
+Stage row `r244-record-lag` (full-precision log(Z)) is in
+`benchmarks.jsonl`. The bench rows `r244-lag1` and `r244-lag2` were written
+by the runs. Run dirs are deleted. Script, sampler, outputs and gzipped
+logs are in `.probe/r244/`.
+
+## Round 245 (diagnostic): under load a kill costs flat records, never append ones
+
+**Question.** Round 244 found the flat record writer ~60% behind for a
+whole search on a loaded RDS, against round 242's 2 records lost at a
+kill. Round 244's next step: repeat the kill under load with both writers.
+
+**Method.** Round 242's shape and kill (`.probe/r245/kill.sh`: async
+R2D2, seed 242, `--nlive 48 --num-repeats 5 --max-ndead 600 --mpi-procs
+20`, `ca86dd0`). Flat (default) raced against `NS_RECORD_APPEND=1` on the
+other CPU half, two pairs with the halves swapped. Round 244's sampler
+ran every 10 s. One `kill -9` took the launcher's group and every process
+naming the run dir (0 left alive). "Scored" is the log's `^{"eval_id"`
+count just before the kill; "on disk" is `.probe/r242/count.py`.
+
+| pair | kill | RDS (slowest `evaluations/` listing) | arm | scored | on disk | lost | most behind mid-run |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | 210 s | loaded (33 s) | flat, CPUs 0-36 | 4,933 | 4,772 | **161** | 654 |
+| 1 | 210 s | loaded | append, 38-74 | 4,709 | 4,709 | **0** | 204 (t=40 only), then <=11 |
+| 2 | 150 s | quiet (1.2 s) | flat, 38-74 | 3,163 | 3,136 | **27** | 50 |
+| 2 | 150 s | quiet | append, 0-36 | 3,514 | 3,515 | **0** | 2 |
+
+**Results.**
+- Rounds 242, 244 and 245 now agree: the flat writer's lag, and so what
+  a kill loses from the archive, tracks the MDS load on `evaluations/`.
+  2 (242), 27 (quiet), 161 (moderate) and up to ~5,000 (244, listings
+  of 34-52 s). Append lost nothing in either pair and stayed within a
+  couple of records of the scored count all run, loaded or not.
+- What it costs. A lost record is an imaged evaluation that is missing
+  from the failure-mode archive for good. `./ri resume` draws new points
+  and never re-scores it (round 242). It is not a speed or log(Z) issue:
+  PolyChord resumes from its `.resume` either way.
+- Append's price is still 1-3.5% evals/s (rounds 240-241, same sign in
+  all four pairs, inside the noise span). No new speed figures here, since
+  killed arms write no bench row.
+
+**Decision.** No code change, and the default stays flat, because this
+loop's objective is speed. For a long production search on a busy RDS,
+where a timeout or node failure is likely and the archive is the
+product, `NS_RECORD_APPEND=1` is the durable choice at ~2%. The
+background writer's records were never at risk in a run that finishes.
+
+Stage row `r245-kill-under-load` is in `benchmarks.jsonl`. Run dirs are
+deleted. Script, sampler outputs and gzipped logs are in `.probe/r245/`.
+The round 243 GPU race (job 39544674) had still not started at 03:45
+(no `.probe/r243/ab-39544674.out`).
+
+## Round 246 (diagnostic, docs fix): what a restart reuses from the cache in an async search
+
+**Why.** Round 245 left `docs/robustness.md` saying that evaluations whose
+record a kill lost are re-run "with the same seed", and that re-sampling from
+scratch "costs nothing" because the same seed redraws the same points. Round
+242 had already found that an async resume from a checkpoint draws different
+points. Neither claim had been measured for the case before a checkpoint.
+
+**Method.** `.probe/r246/fresh.sh`: an async R2D2 search (seed 242, nlive 48,
+num-repeats 5, max-ndead 300, 20 ranks) killed with `kill -9` 10 s after its
+first scored evaluation, then `./ri resume`. Arm a kept the checkpoint. Arm b
+deleted `chains/*.resume` before resuming, which forces the
+"no checkpoint to resume from, re-sampling from the cache" path. Attempt-1
+points were matched against attempt 2's chains (`_prior.txt`,
+`_dead-birth.txt`, `_phys_live-birth.txt`) on their non-integer parameter
+values. Arm c sampled when the first `.resume` appeared.
+
+| arm | attempt 1 scored / on disk | resume scored | final records = unique params | attempt 2 prior rows that are attempt-1 points | later attempt-1 points in the chains | log(Z) |
+|---|---|---|---|---|---|---|
+| a, checkpoint kept | 248 / 247 | 5,547 | 5,794 | 66 of 66 (from the checkpoint) | 0 | 0.0164425867494481 +/- 0.000764956166256197 |
+| b, checkpoint deleted | 233 / 232 | 4,844 | 5,076 | 66 of 66 (cache hits) | 0 | 0.0162938787497314 +/- 0.000739930262333626 |
+
+- With no checkpoint, the same seed redraws the whole prior phase: all 66
+  prior points come out identical, and the cache answers them. The slice steps
+  after the prior phase diverge (async dispatch order), so none of the other
+  166 attempt-1 evaluations recurs. The one attempt-1 point that b scored again
+  (eval 233) is the record the kill lost, so a lost record can be redrawn.
+- The no-checkpoint window is only the prior phase plus a few seconds. In arm
+  c the first `.resume` appeared in tmpfs at 74-96 scored evaluations (3-4 s
+  after the first score) and in `<run>/chains` at ~4.9 s (the 2 s mirror).
+  Re-sampling from scratch therefore does cost almost nothing, as
+  `robustness.md` says, but only because that window is that short.
+- After a checkpoint, records lost at a kill cost the archive and not the
+  search. The resumed async sampler re-images every evaluation scored after the
+  checkpoint whether or not its record landed (round 242), so the flat
+  writer's lag (rounds 244-245) adds no imaging to a resume.
+- Both resumed runs converged with rc 0, and their log(Z)s are 0.14 sigma apart.
+- Side finding: a killed run leaves its tmpfs `chains/` copy
+  (`/dev/shm/ri-chains-<hash>`, 0.1-1.2 MB here). A run that finishes removes
+  its copy, and a resume of the same run reuses the same path. Seven had built
+  up on this node from rounds 244-246's kills and were removed. They are small,
+  so this is noted but not fixed.
+- Kill hygiene: `setsid cmd &` in a script forks, so `$!` is not a process
+  group leader and `kill -- -$!` fails. Arm c's ranks died, but the retry loop
+  restarted the search until its launcher was killed by name.
+
+- Tooling fix: `./ri bench` (the ledger table) died on `KeyError: 'preset'`
+  at HEAD. `load_rows()` dropped hand-logged stage rows only when they had no
+  `imager`, and round 245's stage row carries one. It now drops every
+  `"kind": "stage"` row, and `bench.py --self-check` has a fixture row with an
+  `imager` to cover it.
+
+**Decision.** No search code change. `docs/robustness.md` now says that records lost
+at a kill cost the archive and not the search, and that same-seed reuse covers
+the prior phase, which is the whole window before the first checkpoint.
+
+Stage row `r246-resume-reuse` is in `benchmarks.jsonl`. The run directories
+are deleted. The script and gzipped logs are in `.probe/r246/`. The round 243
+GPU race (job 39544674) had still not started at ~04:00 (no
+`.probe/r243/ab-39544674.out`).
+
+## Round 247: the record writer coalesces its backlog into one append
+
+**Question.** Rounds 244-245 found the flat record writer (one create and
+rename per record) falling behind as RDS metadata load rises, so a kill
+loses records from the archive. `NS_RECORD_APPEND=1` loses none but costs
+~2% evals/s (rounds 240-241). Can the default writer get append's
+durability without paying for it on every record?
+
+**Change** (`common.py`, `_write_pending_records`, default on;
+`NS_RECORD_COALESCE=0` restores the old writer). Each record goes on a
+per-rank pending list, and each writer job takes everything pending when it
+runs. A lone record is a flat file, exactly as before, so a writer that keeps
+up behaves as it did. A backlog is one `O_APPEND` write of all its lines to
+`records.jsonl` (NS_RECORD_APPEND's path, under the same shared lock), so the
+queue cannot grow. At the end of a run the cancelled jobs' pending records are
+dropped, because their texts are already in `_WRITTEN_RECORDS` (round 234).
+The post-run line counts how many records were coalesced. There is a new
+self-check block in `self_check_resume_adoption`.
+
+**A/B** (`.probe/r247/race.sh`: async R2D2, seed 242, `--nlive 48
+--num-repeats 5 --max-ndead 600 --mpi-procs 20`, both arms raced on the two
+CPU halves, swapped between pairs, round 244's on-disk sampler every 10 s).
+RDS was quiet to moderate, with the slowest `evaluations/` listing taking 2.5 s.
+
+| pair | arm | CPUs | evals | steady evals/s | most behind mid-run | writer record-s, all ranks | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| 1 | coalesce | 0-36 | 9,007 | 22.43 | **15** | 2,278 (1,216 coalesced) | 0.0166506289522126 +/- 0.000727208089544788 |
+| 1 | flat | 38-74 | 9,428 | 23.64 | 122 | 3,825 | 0.0167147137702 +/- 0.000736117939533334 |
+| 2 | coalesce | 38-74 | 8,188 | 26.77 | **16** | 1,937 (1,280 coalesced) | 0.0167761927869447 +/- 0.000747062460707704 |
+| 2 | flat | 0-36 | 10,574 | 25.55 | 172 | 4,504 | 0.0161574824357351 +/- 0.000708179747602443 |
+
+WSClean guard (`.probe/r247/ws.sh`, seed 229, `--nlive 100 --num-repeats 2
+--max-ndead 4000 --mpi-procs 19 --synchronous`, raced, halves swapped):
+coalesce 35.85 and 34.95 against flat 35.58 and 34.94 steady evals/s
+(+0.8%, +0.1%). Chains are byte-identical, and log(Z) is 0.0967023094179472
++/- 0.000520957293962581 in all four arms. An earlier async WSClean pair
+(the same command without `--num-repeats 2 --mpi-procs 19 --synchronous`)
+ran only ~35 s an arm and spread 103-176 evals/s, which is noise. Its log(Z)
+values are in the stage row.
+
+**Results.**
+- On the same Lustre the coalescing writer stays at most 15-16 records
+  behind, against 122-172 for the flat writer. That bounds what a kill can
+  lose to about one batch a rank. Writer time drops by 40-57%, because 13-16%
+  of records went out as batch appends instead of creates.
+- Speed is unchanged. Each pair favours the arm on CPUs 38-74, by -5.1% and
+  +4.8% (round 241's half effect), so the swapped geometric mean is -0.3%,
+  inside the noise. log(Z) agrees within 0.06 and 0.6 sigma. The arms are
+  async, so their draws differ.
+- Every arm's archive is complete after a normal finish: unique names in
+  `records.jsonl` equal the summary's evaluations (8,188-10,574 R2D2, 4,071
+  WSClean), and no flat files are left.
+- The coalescing arms scored fewer evaluations in all four async pairs
+  (R2D2 nlike 8,630/8,021 against 9,000/10,155). This is not explained.
+  Synchronous runs are identical, and the record path returns before
+  PolyChord sees anything, so it is most likely async scheduling noise (a
+  1-in-16 sign run). Round 248 settled it: two more pairs split the other
+  way, so it was noise.
+
+**Decision.** Coalescing is the default. It closes most of the durability gap
+that rounds 244-245 left to `NS_RECORD_APPEND=1`, at no measured speed cost.
+This round was not a kill test under heavy load. The bound comes from the
+mid-run sampler, not from a kill.
+
+Stage row `r247-record-coalesce` (full-precision log(Z) for every arm) and
+bench rows `r247-coal1/2`, `r247-flat1/2`, `r247-scoal3/4`, `r247-sflat3/4`,
+`r247-wcoal1/2`, `r247-wflat1/2` are in `benchmarks.jsonl`. Run directories
+are deleted. Scripts, samples and gzipped logs are in `.probe/r247/`. The
+round 243 GPU race (job 39544674) still had no output at ~04:25.
+
+## Round 248 (check): the coalescing writer's fewer evaluations were async noise
+
+**Question.** Round 247's coalescing arms scored fewer evaluations than the
+flat-writer arms in all four async pairs (R2D2 nlike 8,630/8,021 against
+9,000/10,155). Does the writer change what PolyChord does, or was it noise?
+The round 243 GPU race (job 39544674) still had not started, so this was the
+lever left on this node.
+
+**Method.** Round 247's race (`.probe/r248/race.sh`, the same script
+relabelled): async R2D2, seed 242, `--nlive 48 --num-repeats 5 --max-ndead
+600 --mpi-procs 20`, the default (coalescing) writer raced against
+`NS_RECORD_COALESCE=0` on the two CPU halves, swapped between pairs, with
+round 244's on-disk sampler every 10 s. RDS was quiet: the slowest
+`evaluations/` listing took 2.2 s. No code changed.
+
+| pair | arm | CPUs | evals | nlike | ndead | steady evals/s | most behind mid-run | writer record-s, all ranks | log(Z) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 3 | coalesce | 0-36 | 9,114 | **8,894** | 505 | 25.50 | **18** | 2,143 (1,187 coalesced) | 0.0164846043164777 +/- 0.000752693229578682 |
+| 3 | flat | 38-74 | 7,769 | 7,576 | 506 | 22.34 | 136 | 2,769 | 0.0167907852843659 +/- 0.000753398519439781 |
+| 4 | coalesce | 38-74 | 10,654 | **10,372** | 540 | 23.97 | **18** | 2,494 (1,515 coalesced) | 0.0166996149713455 +/- 0.000731411426587789 |
+| 4 | flat | 0-36 | 9,635 | 9,380 | 510 | 25.35 | 211 | 4,178 | 0.0164839594724794 +/- 0.000733945161498962 |
+
+**Results.**
+- This time the coalescing arm scored *more* evaluations in both pairs
+  (+17% and +11% nlike). Across rounds 247-248 the R2D2 pairs split 2-2, so
+  the round 247 deficit was async scheduling noise. Async nlike for this
+  shape spreads 7,576-10,574 between arms with the same seed, whatever the
+  writer.
+- The durability result holds: the coalescing writer was at most 18 records
+  behind, against 136-211 for flat files, and it spent 10-40% less writer
+  time. Both archives were complete at the end (no records behind).
+- Speed: coalesce/flat steady evals/s was 1.142 and 0.946. With round 247's
+  0.949 and 1.048, the four-pair geometric mean is **+1.8%**, inside the
+  noise. The CPU-half effect flipped this round (CPUs 0-36 won pair 3 by 14%),
+  which fits it being load from the node's other tenants and not the
+  hardware.
+- log(Z) agrees within 0.3 sigma in both pairs.
+
+**Decision.** No change. Coalescing stays the default with no open question.
+Stage row `r248-coalesce-recheck` and bench rows `r248-coal1/2`,
+`r248-flat1/2` are in `benchmarks.jsonl`. Run directories are deleted.
+Scripts, samples and gzipped logs are in `.probe/r248/`. The round 243 GPU
+race (job 39544674, output `.probe/r243/ab-39544674.out`) still had no
+output at ~04:45.
+
+## Round 250: sized R2D2 CPU jobs default to two sockets
+
+Round 249 submitted the question this node cannot answer, because all 38 of
+its CPUs are on NUMA node 0: does round 111's sapphire split (+37%) hold on
+icelake? An exclusive icelake node (job 39554885, cpu-q-127, commit ed95e23)
+ran 38-CPU R2D2 searches pinned with `taskset` either to 38 CPUs of socket 0
+(S) or to 19 + 19 across both (P). `R2D2_WEIGHTS_PER_NODE=auto` gives P one
+checkpoint copy and ONNX session set per socket and gives S one copy. The
+searches were async with 38 ranks x 1 thread, nlive 200, 5 repeats, 800 dead
+and seed 4242. The order was a discarded warm-up, then S P P S. Rows
+`r249-pin-*`; scripts in `.probe/r249/`.
+
+| run | CPUs | evals | evals/s | steady evals/s | ms per eval | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| warm-S (discarded) | 38/0 | 8,830 | 38.1 | 38.1 | 726 | 7,016 | 0.0176803896513862 +/- 0.000536954799123213 |
+| S1 | 38/0 | 8,623 | 50.6 | 50.6 | 734 | 7,018 | 0.0177660865473744 +/- 0.000548696286726532 |
+| P1 | 19/19 | 8,894 | 62.3 | 66.3 | 601 | 12,883 | 0.0178452563838658 +/- 0.000578845342925804 |
+| P2 | 19/19 | 8,719 | 56.2 | 59.6 | 604 | 13,104 | 0.0176170876679297 +/- 0.000546396226557011 |
+| S2 | 38/0 | 9,304 | 49.1 | 49.1 | 756 | 7,083 | 0.0177109331970481 +/- 0.000524522877461155 |
+
+**Learned.**
+- The split is worth **+26%** on icelake (steady 62.9 against 49.9 evals/s;
+  +31% and +21% for the two pairs), and ms per evaluation drops 18% (601-604
+  against 734-756). It is the same direction as sapphire's +37% and smaller.
+  The P arms' parent held 1.58M + 1.58M pages, one per NUMA node, and the S
+  arms' parent held 1.64M on node 0 only.
+- Peak memory nearly doubles (12.9-13.1 GB against 7.0 GB), as the two
+  copies predict.
+- All five log(Z)s agree within their errors (spread 0.0176-0.0178, sigma
+  ~0.00055).
+- Caveat, as in round 111: the other 38 CPUs were idle, so each socket had
+  spare L3 and memory bandwidth. A neighbour on a shared node will take some
+  of that back.
+- Queue cost, which held the default at one socket in round 112: `sbatch
+  --test-only` on icelake gave the same start estimate on the same node for
+  `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task 19` and `--ntasks 1
+  --cpus-per-task 38` (06:55 and 06:47 the next day). The split shape is not
+  predicted to wait longer.
+
+**Change.** `scripts/run-nested-sampling-r2d2.sh` now defaults
+`NS_SLURM_SOCKETS=2` when it submits a sized (`--mpi-procs` >= 4) CPU job.
+Whole-node, GPU and WSClean submissions are unchanged, and
+`NS_SLURM_SOCKETS=1` restores one socket. A fake `sbatch` on PATH confirmed
+the shapes: `./ri search r2d2 --mpi-procs 20` now asks for `--ntasks 2
+--ntasks-per-socket 1 --cpus-per-task 10 --mem 40096` (one extra 8000 MB
+shared budget), it asked for `--ntasks 1 --cpus-per-task 20 --mem 32096`
+with `NS_SLURM_SOCKETS=1`, and without `--mpi-procs` it still asks for
+`--exclusive`. No WSClean guard was needed, because only the R2D2 run
+script's submit branch changed. Stage row `r250-socket-split`. The
+`r249-pin-*` run directories are deleted.
+
+## Round 251: CI lint fix (shellcheck 0.9.0, SC2217)
+
+No speed change. CI's lint job installs shellcheck from apt on
+`ubuntu-latest` (24.04, shellcheck 0.9.0), and 0.9.0 flags SC2217 (warning)
+on the stall watchdog's `while sleep "${poll}" </dev/null >/dev/null 2>&1`
+in `scripts/lib/progress-bar.sh`, added in round 196. This host has no
+shellcheck, so the finding was only noticed in round 250 (via uvx). Since
+round 196 the lint step would have failed on any run of CI's workflow.
+
+The redirect stays: round 196's point is that the orphaned `sleep` must hold
+none of the run's file descriptors, and stdin counts. A
+`# shellcheck disable=SC2217` with that reason is the fix. After it,
+`shellcheck -x scripts/*.sh scripts/lib/*.sh` is clean under both
+shellcheck-py 0.9.0.6 (CI's version) and the current release, `bash -n`
+passes, and `bash scripts/lib/progress-bar.sh` (its self-check, a CI step)
+passes. Behaviour is byte-for-byte the same, so no WSClean guard is needed.
+To lint as CI does from a compute node:
+`uvx --from shellcheck-py==0.9.0.6 shellcheck -x scripts/*.sh scripts/lib/*.sh`.

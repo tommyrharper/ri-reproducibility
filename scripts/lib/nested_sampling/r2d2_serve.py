@@ -72,11 +72,38 @@ def install_lazy_utils() -> None:
     sys.modules["utils"] = package
 
 
+def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
+    """Upstream `get_DNNs`, with its torch.loads on 4 threads.
+
+    Same checks, same dict. torch.load releases the GIL while it reads, so
+    the pool's 25 checkpoints (6.2 GB) load in 0.9s instead of 2.0s
+    (docs/csd3-speed.md, round 203). Pool threads inherit the caller's NUMA
+    policy, so `load_checkpoints` still places the pages.
+    """
+    import glob
+    from concurrent.futures import ThreadPoolExecutor
+
+    import torch
+
+    paths = []
+    for i in range(num_iter):
+        dnn = glob.glob(os.path.join(ckpt_path, f'*N{i+1}.ckpt'))
+        if len(dnn) == 0:
+            raise ValueError(f'Checkpoint for N{i+1} not found')
+        elif len(dnn) > 1:
+            raise ValueError(f'Checkpoint conflict for N{i+1}')
+        paths.append(dnn[0])
+
+    def load(path):
+        return torch.load(path, map_location=torch.device('cpu'), weights_only=False)['state_dict']
+
+    with ThreadPoolExecutor(max(1, min(4, len(paths)))) as pool:
+        return {f'N{i+1}': state_dict for i, state_dict in enumerate(pool.map(load, paths))}
+
+
 def patch_checkpoint_loading() -> None:
     """Load each checkpoint series once and share it across forked workers."""
     import utils.util_model as util_model
-
-    original = util_model.get_DNNs
 
     def load_state_dict_from_state_dict(net, state_dict):
         # Keyed by identity because a state dict is not hashable. The entry
@@ -94,7 +121,7 @@ def patch_checkpoint_loading() -> None:
     def get_DNNs(num_iter: int, ckpt_path):
         key = (int(num_iter), os.path.abspath(str(ckpt_path)))
         if key not in _CHECKPOINT_CACHE:
-            _CHECKPOINT_CACHE[key] = original(num_iter, ckpt_path)
+            _CHECKPOINT_CACHE[key] = load_checkpoint_series(num_iter, ckpt_path)
         return _CHECKPOINT_CACHE[key]
 
     util_model.get_DNNs = get_DNNs
@@ -200,7 +227,7 @@ def patch_cuda_network() -> None:
 
 
 def r2d2_runtime() -> str:
-    """What runs a CPU U-Net forward: `torch` or `onnx` (R2D2_RUNTIME; the run script defaults CPU to onnx)."""
+    """What runs a U-Net forward: `torch`, `onnx` (CPU; the CPU default) or `trt` (GPU) (R2D2_RUNTIME)."""
     return os.environ.get("R2D2_RUNTIME", "torch").strip().lower() or "torch"
 
 
@@ -224,20 +251,8 @@ class OrtNet:
         return torch.from_numpy(self.session.run(None, {"x": x.numpy()})[0])
 
 
-def patch_onnx_network(checkpoint_path: Path) -> None:
-    """Run each CPU U-Net forward through ONNX Runtime instead of torch.
-
-    MLAS does this float32 network in 26ms against torch's 39.6ms with 36
-    forked workers sharing one copy (docs/csd3-speed.md, round 140); outputs
-    differ by up to 1.5e-5 of the peak over 25 chained checkpoints, so it is
-    not bit-identical to torch, but converged log(Z) agrees (round 144) and it
-    is the CPU default; R2D2_RUNTIME=torch keeps torch. Each checkpoint is
-    exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
-    and its session built here, before the fork: one intra-op thread starts no
-    pool threads, so it survives the fork and every worker shares its pages.
-    A request running more than one torch thread (the tail of an async run)
-    keeps torch, which threads; so does R3D3 (layers > 1).
-    """
+def export_onnx(checkpoint_path: Path) -> Path:
+    """Export each checkpoint once to `ONNX_DIR/models/<key>/N<i>.onnx`, height and width dynamic."""
     import hashlib
 
     import torch
@@ -252,12 +267,6 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     key = hashlib.sha1(repr((str(checkpoint_path), torch.__version__, ort.__version__, stats)).encode()).hexdigest()[:16]
     models = ONNX_DIR / "models" / key
     models.mkdir(parents=True, exist_ok=True)
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
-    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
-    # No CPU arena: bit-identical, same speed, ~8GB less PSS at 38 ranks (round 143).
-    options.enable_cpu_mem_arena = False
     net = None
     for cur_iter in range(1, num_iter + 1):
         path = models / f"N{cur_iter}.onnx"
@@ -266,16 +275,119 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
                 net = util_model.create_net_imaging().eval()
             util_model.load_state_dict_from_state_dict(net, dnn_dict[f"N{cur_iter}"])
             partial = path.with_suffix(f".{os.getpid()}.tmp")
-            with torch.no_grad():
-                torch.onnx.export(net, (torch.zeros(1, 2, 32, 32),), str(partial), dynamo=False, opset_version=17,
-                                  input_names=["x"], output_names=["y"],
-                                  dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+            # One thread: export runs a forward here in the pool parent, and an
+            # OpenMP pool started before the fork deadlocks every worker's
+            # first torch op (a GPU run's 3 threads a rank did, round 171).
+            threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                with torch.no_grad():
+                    torch.onnx.export(net, (torch.zeros(1, 2, 32, 32),), str(partial), dynamo=False, opset_version=17,
+                                      input_names=["x"], output_names=["y"],
+                                      dynamic_axes={"x": {2: "h", 3: "w"}, "y": {2: "h", 3: "w"}})
+            finally:
+                torch.set_num_threads(threads)
             partial.replace(path)
+    return models
+
+
+def onnx_cpu_key() -> str:
+    import hashlib
+
+    cpuinfo = Path("/proc/cpuinfo").read_text().split("\n\n")[0]
+    cpu = [line for line in cpuinfo.splitlines() if line.startswith(("model name", "flags"))]
+    return hashlib.sha1(repr(cpu).encode()).hexdigest()[:12]
+
+
+def prefetch_weights() -> int:
+    """Fork a child that reads the pool's weights into the page cache, 16 files at a time; return its pid.
+
+    A cold pool reads 5.8GB of checkpoints and (onnx) 2.9GB of optimised
+    graphs one file at a time off Lustre: 8.9s and 10.3s of a 22-34s warm-up,
+    against 5.8s warm (round 228). Forked before any import, so the parent's
+    peak RSS, which every worker reports as its floor, does not see the reads.
+    """
+    pid = os.fork()
+    if pid:
+        return pid
+    try:
+        import concurrent.futures
+
+        files = sorted(Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1")).glob("*.ckpt"))
+        if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
+            files += sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
+
+        def read(path: Path) -> None:
+            chunk = bytearray(1 << 22)
+            with open(path, "rb", buffering=0) as stream:
+                while stream.readinto(chunk):
+                    pass
+
+        with concurrent.futures.ThreadPoolExecutor(16) as reader:
+            list(reader.map(read, files))
+    except Exception:
+        pass  # only ever a head start: the loads read whatever this missed
+    os._exit(0)
+
+
+def patch_onnx_network(checkpoint_path: Path) -> None:
+    """Run each CPU U-Net forward through ONNX Runtime instead of torch.
+
+    MLAS does this float32 network in 26ms against torch's 39.6ms with 36
+    forked workers sharing one copy (docs/csd3-speed.md, round 140); outputs
+    differ by up to 1.5e-5 of the peak over 25 chained checkpoints, so it is
+    not bit-identical to torch, but converged log(Z) agrees (round 144) and it
+    is the CPU default; R2D2_RUNTIME=torch keeps torch. Each checkpoint is
+    exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
+    and its session built here, before the fork: one intra-op thread starts no
+    pool threads, so it survives the fork and every worker shares its pages.
+    A request running more than one torch thread (the tail of an async run)
+    keeps torch, which threads; so does R3D3 (layers > 1).
+    """
+    import torch
+
+    models = export_onnx(checkpoint_path)
+    import onnxruntime as ort
+
+    num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    # No CPU arena: bit-identical, same speed, ~8GB less PSS at 38 ranks (round 143).
+    options.enable_cpu_mem_arena = False
+
+    # Graph optimisation is ~3 of the 25 sessions' ~4.5s build, so the first
+    # build on a CPU saves each optimised graph and later pools load that with
+    # optimisation off: bit-identical outputs and forward time (round 202). It
+    # may hold CPU-specific layouts (NCHWc), so it is keyed by the CPU.
+    optimised = models / f"opt-{onnx_cpu_key()}"
+    optimised.mkdir(exist_ok=True)
+
+    def session(cur_iter: int):
+        path = optimised / f"N{cur_iter}.onnx"
+        if path.exists():
+            loaded = ort.SessionOptions()
+            for name in ("intra_op_num_threads", "inter_op_num_threads", "enable_cpu_mem_arena"):
+                setattr(loaded, name, getattr(options, name))
+            loaded.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            loaded.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            return ort.InferenceSession(str(path), loaded, providers=["CPUExecutionProvider"])
+        partial = path.with_suffix(f".{os.getpid()}.tmp")
+        options.optimized_model_filepath = str(partial)
+        try:
+            built = ort.InferenceSession(str(models / f"N{cur_iter}.onnx"), options,
+                                         providers=["CPUExecutionProvider"])
+        finally:
+            options.optimized_model_filepath = ""
+        try:
+            partial.replace(path)
+        except OSError:  # not saved (read-only cache, say): the next pool optimises again
+            pass
+        return built
 
     def build() -> dict[int, object]:
-        return {cur_iter: ort.InferenceSession(str(models / f"N{cur_iter}.onnx"), options,
-                                               providers=["CPUExecutionProvider"])
-                for cur_iter in range(1, num_iter + 1)}
+        return {cur_iter: session(cur_iter) for cur_iter in range(1, num_iter + 1)}
 
     # Where the torch checkpoints went, the sessions' weights go too: a set
     # per NUMA node when load_checkpoints made one (enter_node swaps it in),
@@ -308,6 +420,489 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
         return wrapper
 
     optimiser.load_net = load_net
+
+
+# Where the run script binds tensorrt-cu13 and the GPU's plans (R2D2_RUNTIME=trt).
+TRT_DIR = Path(os.environ.get("R2D2_TRT_DIR", "/opt/r2d2-trt"))
+# Per iteration, its serialised plan's path (set in the pool parent) and, per
+# worker, its deserialised engine and context (made on first use: CUDA does
+# not survive fork).
+_TRT_PLANS: dict[int, Path] = {}
+_TRT_CONTEXTS: dict[int, tuple] = {}
+
+
+def build_trt_plans(models: Path, dim: int, num_iter: int, batch: int = 1) -> Path:
+    """Build each missing fp32 plan for this GPU and image size; return their directory.
+
+    Runs in a child of the pool parent (`--build-trt-plans`), which must not
+    make a CUDA context. TF32 is cleared, as for eager. One fixed input shape,
+    1x2xDIMxDIM: a forward of any other shape runs eager instead. With `batch`
+    above 1 (R2D2_TRT_BATCH), for the gathering server, each plan has a fixed
+    profile per batch size in trt_batch_sizes(batch), in a directory of its
+    own: one dynamic 1..8 profile ran 27-28% slower at every size (round 224).
+    """
+    import torch
+
+    sys.path.insert(0, str(TRT_DIR / "py"))
+    import tensorrt as trt
+
+    gpu = "".join(c if c.isalnum() else "_" for c in torch.cuda.get_device_name())
+    sizes = trt_batch_sizes(batch)
+    suffix = "-b" + "-".join(map(str, sizes)) if batch > 1 else ""
+    plans = TRT_DIR / "plans" / f"{models.name}-{trt.__version__}-{gpu}-{dim}{suffix}"
+    plans.mkdir(parents=True, exist_ok=True)
+    log = trt.Logger(trt.Logger.ERROR)
+    shape = (1, 2, dim, dim)
+    for cur_iter in range(1, num_iter + 1):
+        path = plans / f"N{cur_iter}.plan"
+        if path.exists():
+            continue
+        builder = trt.Builder(log)
+        network = builder.create_network(0)
+        parser = trt.OnnxParser(network, log)
+        if not parser.parse((models / f"N{cur_iter}.onnx").read_bytes()):
+            raise RuntimeError(f"TensorRT could not parse N{cur_iter}.onnx: {parser.get_error(0)}")
+        config = builder.create_builder_config()
+        config.clear_flag(trt.BuilderFlag.TF32)
+        if batch > 1:
+            # The ONNX is exported with batch 1; this rebuild is no further
+            # from the production plan than a batch-1 rebuild (round 223).
+            network.get_input(0).shape = (-1, *shape[1:])
+        for size in sizes:
+            profile = builder.create_optimization_profile()
+            fixed = (size, *shape[1:])
+            profile.set_shape("x", fixed, fixed, fixed)
+            config.add_optimization_profile(profile)
+        plan = builder.build_serialized_network(network, config)
+        if plan is None:
+            raise RuntimeError(f"TensorRT could not build N{cur_iter}")
+        partial = path.with_suffix(f".{os.getpid()}.tmp")
+        partial.write_bytes(bytes(plan))
+        partial.replace(path)
+    return plans
+
+
+class TrtNet:
+    """Stands in for the U-Net on the GPU, as OrtNet does on the CPU; other shapes run eager."""
+
+    def __init__(self, cur_iter, eager):
+        self.cur_iter = cur_iter
+        self.eager = eager
+
+    def __call__(self, x):
+        import torch
+
+        context, shape, out_shape = trt_context(self.cur_iter)
+        if tuple(x.shape) != shape or x.dtype != torch.float32:
+            return self.eager()(x)
+        x = x.contiguous()
+        y = torch.empty(out_shape, dtype=torch.float32, device=x.device)
+        context.set_tensor_address("x", x.data_ptr())
+        context.set_tensor_address("y", y.data_ptr())
+        if not context.execute_async_v3(torch.cuda.current_stream().cuda_stream):
+            raise RuntimeError(f"TensorRT N{self.cur_iter} failed")
+        return y
+
+
+def trt_context(cur_iter: int) -> tuple:
+    entry = _TRT_CONTEXTS.get(cur_iter)
+    if entry is None:
+        import tensorrt as trt
+
+        runtime = _TRT_CONTEXTS.get(0)
+        if runtime is None:
+            runtime = _TRT_CONTEXTS[0] = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+        engine = runtime.deserialize_cuda_engine(_TRT_PLANS[cur_iter].read_bytes())
+        context = engine.create_execution_context()
+        shape = tuple(engine.get_tensor_profile_shape("x", 0)[1])
+        context.set_input_shape("x", shape)
+        entry = _TRT_CONTEXTS[cur_iter] = (context, shape, tuple(context.get_tensor_shape("y")), engine)
+    return entry[:3]
+
+
+def read_chunk(path: Path, offset: int) -> None:
+    """Read 64MB of `path` from `offset` into the page cache; a file gone or unreadable is skipped."""
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            handle.seek(offset)
+            handle.read(64 << 20)
+    except OSError:
+        pass
+
+
+def patch_trt_network(checkpoint_path: Path) -> None:
+    """Run each GPU U-Net forward through a TensorRT fp32 engine instead of torch eager.
+
+    On an A100 under MPS, 12 workers' engines put 2,700 forwards/s through the
+    card against eager's best of 1,470 at 16 (docs/csd3-speed.md, rounds
+    168-170), at ~1e-5 of the peak from the CPU path. An engine holds ~206MB
+    on the card against eager's 126MB, so the run script sizes GPU ranks from
+    NS_R2D2_CUDA_TRT_MB_PER_RANK. Plans are exported (export_onnx) and built
+    (build_trt_plans, in a child) once per checkpoint set, TensorRT version,
+    GPU model and image size, and cached under TRT_DIR/plans. A plan that
+    cannot be built leaves the run on eager; R2D2_TRT_STATUS says which ran.
+    """
+    import concurrent.futures
+    import subprocess
+
+    # The child's `import tensorrt` page-faults ~0.8GB of libraries in off
+    # Lustre, 26s on a cold node; big parallel reads first take ~1s (round 217).
+    # Joined before anything forks.
+    prefetch = concurrent.futures.ThreadPoolExecutor(16)
+    libraries = [path for path in (TRT_DIR / "py").rglob("*.so*") if "builder_resource" not in path.name]
+    prefetched = [prefetch.submit(read_chunk, path, offset)
+                  for path in libraries for offset in range(0, path.stat().st_size, 64 << 20)]
+    models = export_onnx(checkpoint_path)
+    num_iter = int(os.environ.get("R2D2_NUM_ITER", "25"))
+    dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
+    built = subprocess.run([sys.executable, __file__, "--build-trt-plans", str(models), str(dim), str(num_iter),
+                            str(trt_batch())],
+                           capture_output=True, text=True)
+    concurrent.futures.wait(prefetched)
+    prefetch.shutdown()
+    # Warm-up output goes to /dev/null, so which engine ran is recorded here.
+    status = Path(os.environ.get("R2D2_TRT_STATUS", os.devnull))
+    if built.returncode != 0:
+        status.write_text(f"eager: TensorRT plans not built\n{built.stderr[-4000:]}\n")
+        return
+    plans = Path(built.stdout.strip().splitlines()[-1])
+    status.write_text(f"trt: {plans}\n")
+    _TRT_PLANS.update({cur_iter: plans / f"N{cur_iter}.plan" for cur_iter in range(1, num_iter + 1)})
+    sys.path.insert(0, str(TRT_DIR / "py"))
+
+    optimiser = sys.modules["optimiser.R2D2"]
+    upstream_load_net = optimiser.load_net
+
+    wrap = TrtSharedNet if trt_shared() else TrtNet
+
+    def load_net(net, cur_iter, layers, dnn_dict):
+        if isinstance(net, (TrtNet, TrtSharedNet)):
+            net = net.torch_net
+        if layers != 1 or int(cur_iter) not in _TRT_PLANS:
+            return upstream_load_net(net, cur_iter, layers, dnn_dict)
+        wrapper = wrap(int(cur_iter), lambda: upstream_load_net(net, cur_iter, layers, dnn_dict))
+        wrapper.torch_net = net
+        return wrapper
+
+    optimiser.load_net = load_net
+
+
+def trt_shared() -> bool:
+    """R2D2_TRT_SHARED=1 (with R2D2_RUNTIME=trt): one process holds the engines for every worker.
+
+    A worker's 25 engines take 5.1GB, which caps an A100 at 12 TensorRT
+    workers; one process holding them once, with an execution context per
+    worker, puts 90% of 12 processes' forwards through the card on 6GB, and a
+    pipe round trip per forward costs nothing measurable (csd3-speed.md, round
+    207). Workers then stay off the GPU entirely: everything but the forward
+    runs on the CPU, as it does for R2D2_DEVICE=cpu (round 208).
+    """
+    return (r2d2_device() == "cuda" and r2d2_runtime() == "trt"
+            and os.environ.get("R2D2_TRT_SHARED", "0") == "1")
+
+
+def trt_batch() -> int:
+    """R2D2_TRT_BATCH=N (shared server only): run up to N workers' forwards of one net as one launch.
+
+    One 32x32 forward leaves most of an A100 idle: batches of 8 on 4 streams
+    put 3.05x the batch-1 ceiling through it (csd3-speed.md, round 223). The
+    gathering server (serve_trt_gathered) serves whichever net has the most
+    forwards waiting, so batches form without a waiting window.
+    """
+    return max(1, int(os.environ.get("R2D2_TRT_BATCH") or 1)) if trt_shared() else 1
+
+
+def trt_batch_sizes(batch: int) -> list[int]:
+    """The batch sizes a gathering plan has a profile for: powers of two below `batch`, then `batch`."""
+    return sorted({1 << k for k in range(batch.bit_length()) if 1 << k < batch} | {batch})
+
+
+# A forward request is (iteration, worker pid, sequence) then the input's
+# bytes; the reply echoes the header then the output's. A SOCK_SEQPACKET pair
+# keeps each one whole, and the echo lets a replacement worker drop a reply
+# meant for the worker it replaced.
+_TRT_HEADER = __import__("struct").Struct("<iiq")
+# In the pool parent, each worker base's end of its pair; in a worker, its own.
+_TRT_WORKER_SOCKETS: dict[str, object] = {}
+_TRT_SOCKET: list = [None, 0]  # [socket, last sequence number]
+
+
+def trt_shared_forward(sock, cur_iter: int, x, seq: int):
+    """Send `x` (float32, CPU) to the server for net `cur_iter`; None if it did not answer."""
+    import torch
+
+    sock.send(_TRT_HEADER.pack(cur_iter, os.getpid(), seq) + x.numpy().tobytes())
+    want = _TRT_HEADER.pack(cur_iter, os.getpid(), seq)
+    size = _TRT_HEADER.size + x.numel() // 2 * 4
+    while True:
+        reply = sock.recv(size)
+        if not reply:
+            raise ConnectionError("TensorRT forward server closed")
+        if reply[:_TRT_HEADER.size] == want:
+            break
+    if len(reply) != size:  # the server could not run this net
+        return None
+    return torch.frombuffer(bytearray(reply[_TRT_HEADER.size:]), dtype=torch.float32).view(1, 1, *x.shape[2:])
+
+
+class TrtSharedNet:
+    """Stands in for the U-Net in a worker, sending its forwards to the shared server; others run on the CPU."""
+
+    def __init__(self, cur_iter, eager):
+        self.cur_iter = cur_iter
+        self.eager = eager
+
+    def __call__(self, x):
+        import torch
+
+        sock = _TRT_SOCKET[0]
+        dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
+        if sock is not None and tuple(x.shape) == (1, 2, dim, dim) and x.dtype == torch.float32:
+            _TRT_SOCKET[1] += 1
+            try:
+                y = trt_shared_forward(sock, self.cur_iter, x.contiguous(), _TRT_SOCKET[1])
+            except OSError:
+                # Rather than fail every evaluation from here on, the worker
+                # runs the CPU U-Net, and says so in the run's stderr.
+                traceback.print_exc(file=sys.__stderr__)
+                _TRT_SOCKET[0] = None
+                y = None
+            if y is not None:
+                return y
+        return self.eager()(x)
+
+
+def serve_trt_shared(socks: list, dim: int) -> None:
+    """The forward server: load each plan once, one lane (contexts, stream, buffers) a worker, a thread a lane."""
+    import concurrent.futures
+    import threading
+
+    import numpy as np
+    import torch
+
+    import tensorrt as trt
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+    # 5.3GB of plans: read eight at a time, deserialized in order as they land.
+    # One at a time off Lustre took 11.6s cold and 4.0s warm, eight 3s and
+    # 0.7s (docs/csd3-speed.md, rounds 216-217).
+    with concurrent.futures.ThreadPoolExecutor(8) as reader:
+        blobs = reader.map(Path.read_bytes, _TRT_PLANS.values())
+        engines = {cur_iter: runtime.deserialize_cuda_engine(blob) for cur_iter, blob in zip(_TRT_PLANS, blobs)}
+    scratch = max(engine.device_memory_size_v2 for engine in engines.values())
+    device = torch.device("cuda")
+    size = _TRT_HEADER.size + 2 * dim * dim * 4
+
+    def lane(sock):
+        stream = torch.cuda.Stream()
+        x = torch.empty(1, 2, dim, dim, device=device)
+        y = torch.empty(1, 1, dim, dim, device=device)
+        hx = torch.empty(1, 2, dim, dim, pin_memory=True)
+        hy = torch.empty(1, 1, dim, dim, pin_memory=True)
+        memory = torch.empty(scratch, dtype=torch.uint8, device=device)
+        contexts = {}
+        for cur_iter, engine in engines.items():
+            context = engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+            context.set_input_shape("x", tuple(x.shape))
+            context.set_tensor_address("x", x.data_ptr())
+            context.set_tensor_address("y", y.data_ptr())
+            context.set_device_memory(memory.data_ptr(), scratch)
+            contexts[cur_iter] = context
+        hx_bytes = hx.numpy().reshape(-1).view(np.uint8)
+        # `memory` is returned only to stay alive: dropped here, torch's
+        # allocator hands the same block to the next lane, every lane's
+        # contexts then share one scratch, and concurrent forwards corrupt
+        # each other (3,798 of 3,800 wrong at 19 lanes; round 208).
+        return sock, stream, x, y, hx, hy, hx_bytes, contexts, memory
+
+    def run(sock, stream, x, y, hx, hy, hx_bytes, contexts, _memory):
+        while True:
+            request = sock.recv(size)
+            if not request:
+                return
+            header = request[:_TRT_HEADER.size]
+            context = contexts.get(_TRT_HEADER.unpack(header)[0])
+            if context is None or len(request) != size:
+                sock.send(header)
+                continue
+            hx_bytes[:] = np.frombuffer(request, np.uint8, offset=_TRT_HEADER.size)
+            with torch.cuda.stream(stream):
+                x.copy_(hx, non_blocking=True)
+                ok = context.execute_async_v3(stream.cuda_stream)
+                hy.copy_(y, non_blocking=True)
+                done = torch.cuda.Event(blocking=True)
+                done.record(stream)
+            done.synchronize()
+            sock.send(header + hy.numpy().tobytes() if ok else header)
+
+    # Each lane serves as soon as its 25 contexts exist: making all 19 took
+    # 12.2s, which every worker used to wait out (round 221).
+    threads = []
+    for sock in socks:
+        args = lane(sock)
+        torch.cuda.synchronize()
+        threads.append(threading.Thread(target=run, args=args, daemon=True))
+        threads[-1].start()
+    with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
+        status.write(f"shared: one server, {len(threads)} lanes\n")
+    for thread in threads:
+        thread.join()
+
+
+def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> None:
+    """Serve workers' forward requests in batches: one reader thread, `lanes` threads running batches.
+
+    The reader queues each request by net; a free lane takes up to `batch` of
+    the net with most waiting and calls forward(lane, cur_iter, requests),
+    which returns each request's output bytes, or None if it cannot run that
+    net (each worker is then answered with the bare header and runs it on the
+    CPU). Returns once every worker's socket has closed.
+    """
+    import selectors
+    import threading
+
+    pending: dict[int, list] = {}
+    ready = threading.Condition()
+    reading = [True]
+
+    def read():
+        try:
+            receive()
+        except Exception:
+            # As for a lane: a dead reader would leave every worker waiting.
+            traceback.print_exc()
+            os._exit(1)
+
+    def receive():
+        selector = selectors.DefaultSelector()
+        for sock in socks:
+            selector.register(sock, selectors.EVENT_READ)
+        while selector.get_map():
+            for key, _ in selector.select():
+                try:
+                    request = key.fileobj.recv(size)
+                except OSError:
+                    request = b""
+                if not request:
+                    selector.unregister(key.fileobj)
+                    continue
+                header = request[:_TRT_HEADER.size]
+                if len(request) != size:
+                    try:
+                        key.fileobj.send(header)
+                    except OSError:
+                        pass
+                    continue
+                with ready:
+                    pending.setdefault(_TRT_HEADER.unpack(header)[0], []).append((key.fileobj, request))
+                    ready.notify()
+        with ready:
+            reading[0] = False
+            ready.notify_all()
+
+    def run(lane):
+        while True:
+            with ready:
+                while not pending and reading[0]:
+                    ready.wait()
+                if not pending:
+                    return
+                cur_iter = max(pending, key=lambda net: len(pending[net]))
+                group, pending[cur_iter] = pending[cur_iter][:batch], pending[cur_iter][batch:]
+                if not pending[cur_iter]:
+                    del pending[cur_iter]
+            try:
+                outputs = forward(lane, cur_iter, [request for _, request in group])
+            except Exception:
+                # A lane gone would leave its workers waiting for ever; the
+                # whole server going shows each a closed socket instead.
+                traceback.print_exc()
+                os._exit(1)
+            for i, (sock, request) in enumerate(group):
+                try:
+                    sock.send(request[:_TRT_HEADER.size] + (b"" if outputs is None else outputs[i]))
+                except OSError:
+                    pass
+
+    threads = [threading.Thread(target=read, daemon=True)]
+    threads += [threading.Thread(target=run, args=(lane,), daemon=True) for lane in range(lanes)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
+    """The forward server for R2D2_TRT_BATCH: each plan loaded once, a few lanes running batched forwards.
+
+    A lane is a stream, buffers for `batch` images and a context per net and
+    batch size; R2D2_TRT_LANES (default 2) of them keep the card busy while
+    the others copy (round 223's simulation put 2 ahead of 1 and 4). A group
+    runs at the smallest size that holds it; the rows past it are whatever
+    the buffer held, since a row's output does not depend on the others'
+    (round 224).
+    """
+    import concurrent.futures
+
+    import numpy as np
+    import torch
+
+    import tensorrt as trt
+
+    runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+    with concurrent.futures.ThreadPoolExecutor(8) as reader:
+        blobs = reader.map(Path.read_bytes, _TRT_PLANS.values())
+        engines = {cur_iter: runtime.deserialize_cuda_engine(blob) for cur_iter, blob in zip(_TRT_PLANS, blobs)}
+    scratch = max(engine.device_memory_size_v2 for engine in engines.values())
+    device = torch.device("cuda")
+    size = _TRT_HEADER.size + 2 * dim * dim * 4
+    row = 2 * dim * dim * 4
+    sizes = trt_batch_sizes(batch)
+    lanes = []
+    for _ in range(max(1, int(os.environ.get("R2D2_TRT_LANES") or 2))):
+        x = torch.empty(batch, 2, dim, dim, device=device)
+        y = torch.empty(batch, 1, dim, dim, device=device)
+        hx = torch.empty(batch, 2, dim, dim, pin_memory=True)
+        hy = torch.empty(batch, 1, dim, dim, pin_memory=True)
+        # Each lane's own scratch, kept alive in the tuple (see serve_trt_shared).
+        memory = torch.empty(scratch, dtype=torch.uint8, device=device)
+        stream = torch.cuda.Stream()
+        contexts = {}
+        for cur_iter, engine in engines.items():
+            for index, rows in enumerate(sizes):
+                context = engine.create_execution_context(trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+                context.set_optimization_profile_async(index, stream.cuda_stream)
+                context.set_input_shape("x", (rows, 2, dim, dim))
+                context.set_tensor_address("x", x.data_ptr())
+                context.set_tensor_address("y", y.data_ptr())
+                context.set_device_memory(memory.data_ptr(), scratch)
+                contexts[cur_iter, rows] = context
+        lanes.append((stream, x, y, hx, hy, hx.numpy().reshape(-1).view(np.uint8),
+                      hy.numpy().reshape(batch, -1), contexts, memory))
+    torch.cuda.synchronize()
+
+    def forward(lane, cur_iter, requests):
+        stream, x, y, hx, hy, hx_bytes, hy_rows, contexts, _memory = lanes[lane]
+        n = len(requests)
+        padded = next(size for size in sizes if size >= n)
+        context = contexts.get((cur_iter, padded))
+        if context is None:
+            return None
+        for i, request in enumerate(requests):
+            hx_bytes[i * row:(i + 1) * row] = np.frombuffer(request, np.uint8, offset=_TRT_HEADER.size)
+        with torch.cuda.stream(stream):
+            x[:n].copy_(hx[:n], non_blocking=True)
+            ok = context.execute_async_v3(stream.cuda_stream)
+            hy[:n].copy_(y[:n], non_blocking=True)
+            done = torch.cuda.Event(blocking=True)
+            done.record(stream)
+        done.synchronize()
+        return [hy_rows[i].tobytes() for i in range(n)] if ok else None
+
+    with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
+        status.write(f"shared: one server, {len(socks)} workers gathered into batches of up to {batch} "
+                     f"on {len(lanes)} lanes\n")
+    gather_forwards(socks, size, batch, len(lanes), forward)
 
 
 def job_numa_cpus() -> dict[int, list[int]]:
@@ -449,7 +1044,7 @@ def warm_imports() -> None:
             patch_request_io()
             patch_checkpoint_loading()
             patch_net_reuse()
-            if r2d2_device() == "cuda":
+            if r2d2_device() == "cuda" and not trt_shared():
                 patch_cuda_network()
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
             if checkpoint_path.is_dir():
@@ -458,6 +1053,8 @@ def warm_imports() -> None:
                 load_checkpoints(checkpoint_path)
                 if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
                     patch_onnx_network(checkpoint_path)
+                if r2d2_device() == "cuda" and r2d2_runtime() == "trt":
+                    patch_trt_network(checkpoint_path)
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
@@ -743,9 +1340,14 @@ def serve_pool(fifo_dir: str) -> None:
     # blocks. Holding a writer on it is also what keeps the rank's reply read
     # from hitting a spurious EOF in the moment between the fork and the child
     # opening its own end.
+    prefetcher = prefetch_weights()  # first, so it holds none of the FIFO ends below
     keeper = {base: (os.open(f"{base}.in", os.O_RDONLY | os.O_NONBLOCK), os.open(f"{base}.out", os.O_RDWR))
               for base in bases}
     warm_imports()
+    # Whatever it has not read by now the loads already have. Reaped here, not
+    # by the os.wait() below, which forks a replacement for every pid it gets.
+    os.kill(prefetcher, signal.SIGKILL)
+    os.waitpid(prefetcher, 0)
     # Set before the fork, so every child reports at least what the warm-up it
     # inherited already cost.
     _PEAK_FLOOR = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
@@ -769,6 +1371,11 @@ def serve_pool(fifo_dir: str) -> None:
             for fds in keeper.values():
                 for fd in fds:
                     os.close(fd)
+            for other, sock in _TRT_WORKER_SOCKETS.items():
+                if other == base:
+                    _TRT_SOCKET[0] = sock
+                else:
+                    sock.close()
             # In the child, so the parent stays at os.wait() and lets go of a
             # dead worker's ends the moment it dies. The pause bounds the churn
             # if the replacement cannot serve either (its FIFO directory gone,
@@ -785,6 +1392,7 @@ def serve_pool(fifo_dir: str) -> None:
         # stdio buffers and must run neither.
         os._exit(status)
 
+    server = start_trt_server(bases) if trt_shared() and _TRT_PLANS else None
     for base in bases:
         fork(base)
     # Serves until killed: a worker that exits - on EOF when its rank goes, or
@@ -792,6 +1400,12 @@ def serve_pool(fifo_dir: str) -> None:
     # (or the next attempt's rank) reconnects to the same FIFOs.
     while True:
         pid, _status = os.wait()
+        if pid == server:
+            # Its workers notice (closed socket) and run the CPU U-Net: right
+            # answers at a sixth of the rate, which nothing else shows (round
+            # 219), so it is recorded where `./ri health` looks.
+            record_trt_server_exit(_status)
+            continue
         base = children.pop(pid)
         # Dropped as its worker goes, not at the end: while this process holds
         # them a rank whose worker died would write into a pipe nobody reads
@@ -801,6 +1415,49 @@ def serve_pool(fifo_dir: str) -> None:
         for fd in keeper.pop(base, ()):
             os.close(fd)
         fork(base, replacement=True)
+
+
+def record_trt_server_exit(wait_status: int) -> None:
+    print(f"r2d2 TensorRT forward server exited ({wait_status})", file=sys.stderr)
+    with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
+        status.write(f"fallback: server exited ({wait_status}) at "
+                     f"{time.strftime('%Y-%m-%dT%H:%M:%S')}, CPU U-Net from here\n")
+
+
+def start_trt_server(bases: list[str]) -> int:
+    """Fork the shared TensorRT forward server, with a socket pair per worker; return its pid.
+
+    The pool parent keeps each worker's end, so a replacement worker inherits
+    it; the server's ends are closed here, so the server going shows each
+    worker a closed socket rather than a wait for ever.
+    """
+    import socket
+
+    dim = int(os.environ.get("NS_IMAGE_DIM", "32"))
+    server_ends = []
+    for base in bases:
+        worker_end, server_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        for end in (worker_end, server_end):
+            end.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * (_TRT_HEADER.size + 8 * dim * dim))
+        _TRT_WORKER_SOCKETS[base] = worker_end
+        server_ends.append(server_end)
+    pid = os.fork()
+    if pid == 0:
+        status = 0
+        try:
+            for sock in _TRT_WORKER_SOCKETS.values():
+                sock.close()
+            if trt_batch() > 1:
+                serve_trt_gathered(server_ends, dim, trt_batch())
+            else:
+                serve_trt_shared(server_ends, dim)
+        except Exception:
+            traceback.print_exc()
+            status = 1
+        os._exit(status)
+    for sock in server_ends:
+        sock.close()
+    return pid
 
 
 def serve(fifo_base: str | None = None) -> None:
@@ -1214,6 +1871,9 @@ def self_check_checkpoint_cache() -> None:
         calls.append((num_iter, ckpt_path))
         return {"N1": object()}
 
+    global load_checkpoint_series
+    series = load_checkpoint_series
+    load_checkpoint_series = loader
     module.get_DNNs = loader
     module.load_state_dict_from_state_dict = lambda net, state_dict: net
     optimiser = types.ModuleType("optimiser.R2D2")
@@ -1242,12 +1902,38 @@ def self_check_checkpoint_cache() -> None:
         # dict's for as long as the cache holds the answer.
         assert _NORMALIZED_CHECKPOINT_CACHE[id(state_dict)][0] is state_dict
     finally:
+        load_checkpoint_series = series
         _CHECKPOINT_CACHE.clear()
         _NORMALIZED_CHECKPOINT_CACHE.clear()
         del sys.modules["utils.util_model"]
         del sys.modules["utils"]
         del sys.modules["optimiser.R2D2"]
     print("r2d2 checkpoint cache self-check passed")
+
+
+def self_check_checkpoint_series() -> None:
+    import tempfile
+
+    import torch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for i in range(1, 7):
+            torch.save({"state_dict": {"unet.w": torch.full((3,), float(i))}, "optimizer": [i]},
+                       Path(tmp) / f"R2D2_UNet_N{i}.ckpt")
+        loaded = load_checkpoint_series(6, tmp)
+        assert list(loaded) == [f"N{i}" for i in range(1, 7)], list(loaded)
+        for i in range(1, 7):
+            assert torch.equal(loaded[f"N{i}"]["unet.w"], torch.full((3,), float(i)))
+        for num_iter, message in ((7, "Checkpoint for N7 not found"), (6, "Checkpoint conflict for N2")):
+            if num_iter == 6:
+                torch.save({"state_dict": {}}, Path(tmp) / "copy_N2.ckpt")
+            try:
+                load_checkpoint_series(num_iter, tmp)
+            except ValueError as exc:
+                assert str(exc) == message, exc
+            else:
+                raise AssertionError(f"no {message!r}")
+    print("r2d2 checkpoint series self-check passed")
 
 
 def self_check_net_reuse() -> None:
@@ -1266,6 +1952,137 @@ def self_check_net_reuse() -> None:
         _NETS.clear()
         del sys.modules["optimiser.R2D2"]
     print("r2d2 net reuse self-check passed")
+
+
+def self_check_trt_fallback() -> None:
+    """A forward of a shape (or dtype) the engine was not built for runs eager."""
+    import torch
+
+    _TRT_CONTEXTS[7] = (None, (1, 2, 32, 32), (1, 1, 32, 32), None)
+    try:
+        net = TrtNet(7, lambda: (lambda x: x * 2))
+        x = torch.ones(1, 2, 64, 64)
+        assert torch.equal(net(x), x * 2)
+        assert torch.equal(net(x[:, :, :32, :32].double()), x[:, :, :32, :32].double() * 2)
+    finally:
+        _TRT_CONTEXTS.clear()
+    print("r2d2 trt fallback self-check passed")
+
+
+def self_check_trt_shared_protocol() -> None:
+    """A worker's forwards round-trip, drop stale replies, and fall back to the CPU net."""
+    import socket
+    import tempfile
+    import threading
+
+    import torch
+
+    worker_end, server_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    os.environ["NS_IMAGE_DIM"] = "4"
+    size = _TRT_HEADER.size + 2 * 4 * 4 * 4
+
+    def fake_server():
+        while request := server_end.recv(size):
+            header, x = request[:_TRT_HEADER.size], torch.frombuffer(bytearray(request[_TRT_HEADER.size:]),
+                                                                     dtype=torch.float32)
+            cur_iter, pid, seq = _TRT_HEADER.unpack(header)
+            server_end.send(_TRT_HEADER.pack(cur_iter, pid + 1, seq) + bytes(64))  # someone else's
+            if cur_iter == 9:  # a net the server has no engine for
+                server_end.send(header)
+                continue
+            server_end.send(header + (x[:16] * 3).numpy().tobytes())
+
+    thread = threading.Thread(target=fake_server, daemon=True)
+    thread.start()
+    _TRT_SOCKET[:] = [worker_end, 0]
+    try:
+        x = torch.arange(32, dtype=torch.float32).view(1, 2, 4, 4)
+        net = TrtSharedNet(3, lambda: (lambda x: x[:, :1] * 2))
+        assert torch.equal(net(x), x[:, :1] * 3), "served forward"
+        assert torch.equal(net(x), x[:, :1] * 3), "second forward skips the stale reply"
+        assert torch.equal(TrtSharedNet(9, lambda: (lambda x: x[:, :1] * 2))(x), x[:, :1] * 2), "no engine"
+        assert torch.equal(net(torch.ones(1, 2, 8, 8)), torch.ones(1, 1, 8, 8) * 2), "other shape"
+        server_end.shutdown(socket.SHUT_RDWR)  # wakes the fake server's recv; close() would not
+        thread.join()
+        server_end.close()
+        with redirect_fds(Path(os.devnull), Path(os.devnull)):
+            assert torch.equal(net(x), x[:, :1] * 2), "server gone"
+        assert _TRT_SOCKET[0] is None
+    finally:
+        _TRT_SOCKET[:] = [None, 0]
+        worker_end.close()
+        os.environ.pop("NS_IMAGE_DIM")
+    # The server's exit lands in the status file `./ri health` reads.
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = Path(tmp, "r2d2-engine.txt")
+        engine.write_text("shared: one server, 19 lanes\n")
+        os.environ["R2D2_TRT_STATUS"] = str(engine)
+        try:
+            with redirect_fds(Path(os.devnull), Path(os.devnull)):
+                record_trt_server_exit(139)
+        finally:
+            os.environ.pop("R2D2_TRT_STATUS")
+        last = engine.read_text().splitlines()[-1]
+        assert last.startswith("fallback: server exited (139) at "), last
+    print("r2d2 trt shared protocol self-check passed")
+
+
+def self_check_trt_gathered() -> None:
+    """Gathered forwards reach the right worker, in batches no larger than asked, and the server ends."""
+    import array
+    import socket
+    import threading
+
+    dim, batch, workers, nets = 2, 4, 9, 5
+    row = 2 * dim * dim * 4
+    size = _TRT_HEADER.size + row
+    pairs = [socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET) for _ in range(workers)]
+    batches = []
+    lock = threading.Lock()
+
+    def forward(lane, cur_iter, requests):
+        if cur_iter == nets:  # a net the server has no engine for
+            return None
+        time.sleep(0.002)  # long enough that others' requests queue behind this one
+        with lock:
+            batches.append(len(requests))
+        # Each output is the first half of the input times the net's number.
+        return [array.array("f", [v * cur_iter for v in array.array("f", request[_TRT_HEADER.size:])[:dim * dim]]
+                            ).tobytes() for request in requests]
+
+    server = threading.Thread(target=gather_forwards, args=([b for _, b in pairs], size, batch, 2, forward), daemon=True)
+    server.start()
+    failures = []
+
+    def worker(index, sock):
+        for seq in range(3 * nets):
+            cur_iter = seq % nets + 1
+            x = array.array("f", [index * 1000 + seq + k for k in range(2 * dim * dim)])
+            header = _TRT_HEADER.pack(cur_iter, index, seq)
+            sock.send(header + x.tobytes())
+            reply = sock.recv(size)
+            want = b"" if cur_iter == nets else array.array("f", [v * cur_iter for v in x[:dim * dim]]).tobytes()
+            if reply != header + want:
+                failures.append((index, seq))
+        sock.send(b"short")
+        if sock.recv(size) != b"short"[:_TRT_HEADER.size]:
+            failures.append((index, "short"))
+        sock.close()
+
+    clients = [threading.Thread(target=worker, args=(i, a)) for i, (a, _) in enumerate(pairs)]
+    for client in clients:
+        client.start()
+    for client in clients:
+        client.join()
+    server.join(10)
+    assert not server.is_alive(), "server did not end when every worker's socket closed"
+    for _, b in pairs:
+        b.close()
+    assert not failures, failures
+    assert sum(batches) == workers * 3 * (nets - 1), batches
+    assert max(batches) <= batch, batches
+    assert max(batches) > 1, f"nothing was gathered: {batches}"
+    print(f"r2d2 trt gathered self-check passed (mean batch {sum(batches) / len(batches):.1f})")
 
 
 def self_check_interleaved_pages() -> None:
@@ -1297,6 +2114,36 @@ def self_check_worker_nodes() -> None:
     print("r2d2 worker nodes self-check passed")
 
 
+def self_check_prefetch_weights() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # FIFOs: a write-open succeeds only once the prefetcher has opened one to read it.
+        ckpts = [Path(tmp) / f"R2D2_UNet_N{i}.ckpt" for i in (1, 2)]
+        for path in ckpts:
+            os.mkfifo(path)
+        os.environ["R2D2_CKPT_PATH"] = tmp
+        try:
+            pid = prefetch_weights()
+            deadline = time.monotonic() + 10
+            for path in ckpts:
+                while True:
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                        break
+                    except OSError:  # ENXIO: no reader yet
+                        assert time.monotonic() < deadline, f"{path.name} never read"
+                        time.sleep(0.01)
+                os.write(fd, b"weights")
+                os.close(fd)
+            assert os.waitpid(pid, 0)[1] == 0
+            os.environ["R2D2_CKPT_PATH"] = str(Path(tmp) / "missing")
+            assert os.waitpid(prefetch_weights(), 0)[1] == 0, "no checkpoints is not an error"
+        finally:
+            os.environ.pop("R2D2_CKPT_PATH")
+    print("r2d2 prefetch weights self-check passed")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check_net_reuse()
@@ -1306,11 +2153,18 @@ if __name__ == "__main__":
         self_check_request_io()
         self_check_lazy_utils()
         self_check_checkpoint_cache()
+        self_check_checkpoint_series()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()
+        self_check_prefetch_weights()
         self_check_interleaved_pages()
         self_check_worker_nodes()
+        self_check_trt_fallback()
+        self_check_trt_shared_protocol()
+        self_check_trt_gathered()
+    elif sys.argv[1:2] == ["--build-trt-plans"]:
+        print(build_trt_plans(Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])))
     elif sys.argv[1:2] == ["--fifo-dir"]:
         serve_pool(sys.argv[2])
     else:

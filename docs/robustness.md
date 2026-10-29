@@ -246,9 +246,17 @@ startup in every restart and every `./ri resume`. Records are now written
 runs and the tolerance covers the runs already on disk.
 
 A run writes records on a background thread per rank (`write_records_in_background`,
-~50ms a record on CSD3's Lustre). A kill can therefore lose the last record or
-two a rank had queued. Those evaluations have no `metrics.json`, so the next
-attempt re-runs them with the same seed. A failed write re-raises on the rank's
+~50ms a record on CSD3's Lustre). A kill loses what the ranks had queued: a
+record or two on a quiet RDS, but the flat writer falls behind as metadata load
+rises (161 of 4,933 records lost at a moderately loaded kill, ~5,000 behind
+under heavy load), where `NS_RECORD_APPEND=1` lost none (docs/csd3-speed.md,
+rounds 244-245). So the writer now takes its whole backlog at once and appends
+it to `records.jsonl` in one write, keeping it ~15 records behind where flat
+files fell 120-170 behind on the same Lustre (round 247; `NS_RECORD_COALESCE=0`
+for the old writer). That costs the archive, not the search: an async run (the
+default) resumed from its checkpoint draws new points, so every evaluation
+scored after the checkpoint is imaged again whether or not its record landed,
+and none is adopted (rounds 242 and 246). A failed write re-raises on the rank's
 own thread at its next record, and `abort_run` waits up to 30s for the queue.
 
 ### Half a `summary.json` is not a finished run
@@ -269,6 +277,10 @@ reads as a run that stopped, paired with the `./ri resume` that repairs it.
 Verified on a copy of a real finished 54-evaluation search with its 285KB
 summary cut in half: the report built again, and the resume rewrote a whole
 summary with the same 54 evaluations in 0.014s, imaging nothing.
+
+### Where the checkpoint lives
+
+PolyChord writes `chains/` on node tmpfs (`/dev/shm/ri-chains-*`), and a child of rank 0 mirrors it to `<run>/chains` every 2 s, with a blocking final sync before `summary.json` (round 227: a Lustre create can block 20-45 s, which used to stop the whole search). Only the `.resume` goes through a temp file and a rename; the text files are rewritten in place, because under load creates blocked 12 times in 1,211 and in-place rewrites never (round 229). A text file torn by a kill is rewritten at the next checkpoint, and a finished run's final sync completes before its `summary.json`. Everything that restarts or reads a run uses `<run>/chains`; a new attempt reseeds tmpfs from it. A kill loses at most the mirror's lag, normally 2 s, up to ~40 s when Lustre blocks its copy, and the evaluations in that window are adopted from the cache, not imaged again. `NS_CHAINS_TMPFS=0` writes straight to Lustre.
 
 ### One no-progress failure is retried anyway: an unreadable checkpoint
 
@@ -370,7 +382,11 @@ creates with `exist_ok=False`. One rank died on `FileExistsError` and left
 every other one waiting forever in a collective - a 16-core restart that burned
 every core, landed nothing, and never exited for `run_with_retries` to give up
 on. Re-sampling from scratch costs nothing: the same seed redraws the same
-points and the adopted cache answers them without imaging.
+prior points and the adopted cache answers them without imaging. In an async
+run that holds only for the prior phase - the slice steps after it diverge -
+but PolyChord's first checkpoint lands within a few dozen evaluations of the
+prior phase ending (seconds), so that is the whole window (docs/csd3-speed.md,
+round 246).
 
 The same hang is closed at its source too: the likelihood aborts the whole job
 (`MPI_Abort`) on **any** unexpected exception, not only `WorkerDied`.

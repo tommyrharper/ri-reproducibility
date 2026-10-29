@@ -1003,6 +1003,20 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"read this run - ./ri resume {resume_target(run_dir)} rewrites it from "
             "the evaluations already on disk"
         )
+    # The shared TensorRT server dying leaves a GPU search right but at CPU
+    # speed (14.9 against 100 evals/s in round 219), and nothing but the rate
+    # shows it. The pool parent records it in r2d2-engine.txt.
+    if status != "finished":
+        engine = run_dir / "r2d2-engine.txt"
+        fallback = next((line for line in (engine.read_text(errors="replace").splitlines()
+                                           if engine.is_file() else [])
+                         if line.startswith("fallback:")), None)
+        if fallback:
+            warnings.append(
+                f"the shared TensorRT server is gone ({fallback[len('fallback: '):]}), so "
+                "every forward runs on the CPU at a fraction of the GPU rate; stopping it "
+                f"and running ./ri resume {resume_target(run_dir)} starts a new server"
+            )
     # A run whose shell was killed keeps going and keeps looking healthy - the
     # one thing it has lost is invisible in every other number here, and only
     # shows up as the crash it never came back from.
@@ -2647,6 +2661,19 @@ def self_check() -> None:
             # ...and a whole one is still a finished run, with nothing said.
             (live / "summary.json").write_text("{}")
             assert describe(live, [], 5.0)["warnings"] == []
+            # A dead TensorRT server is said while the run is not finished,
+            # and only then.
+            (live / "r2d2-engine.txt").write_text(
+                "trt: 25 plans\nshared: one server, 19 lanes\n"
+                "fallback: server exited (139) at 2026-10-28T10:00:00, CPU U-Net from here\n")
+            assert describe(live, [], 5.0)["warnings"] == []
+            (live / "summary.json").unlink()
+            assert any("TensorRT server is gone (server exited (139)" in w and "./ri resume" in w
+                       for w in describe(live, [], 5.0)["warnings"])
+            (live / "r2d2-engine.txt").write_text("trt: 25 plans\nshared: one server, 19 lanes\n")
+            assert not any("TensorRT" in w for w in describe(live, [], 5.0)["warnings"])
+            (live / "r2d2-engine.txt").unlink()
+            (live / "summary.json").write_text("{}")
             (live / "summary.json").unlink()
             # Nothing to say about a run that has no summary at all - that is
             # every stopped run, and the half-written line must not be on it.

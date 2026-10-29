@@ -263,7 +263,11 @@ _ns_stall_watchdog() {
   local last quiet=0 now poll scanned
   poll="${floor}"
   last="$(_ns_completed_evals "${output_dir}")"
-  while sleep "${poll}"; do
+  # The sleep outlives a watchdog killed mid-poll, so it must hold none of the
+  # run's output: `./ri search | tee` waited up to a poll (60s) for it after
+  # the search had finished (round 196). Stdin included, so SC2217 is wrong here.
+  # shellcheck disable=SC2217
+  while sleep "${poll}" </dev/null >/dev/null 2>&1; do
     scanned="$(_ns_now_us)"
     now="$(_ns_completed_evals "${output_dir}")"
     if [ "${now}" != "${last}" ]; then
@@ -975,6 +979,14 @@ self_check() {
   }
   # And the pipe it went through is not left behind in the run directory.
   [ ! -e "${run_dir}/.run.log.fifo" ] || { echo "FAIL: fifo left behind"; exit 1; }
+  # A piped run ends with its command, not with the watchdog's orphaned
+  # sleep, which used to hold the pipe open for the rest of a poll (round 196).
+  local piped_start
+  piped_start="$(date +%s)"
+  NS_STALL_TIMEOUT=600 NS_STALL_POLL_SECONDS=30 \
+    run_with_progress "${run_dir}" -1 2 -- sleep 2 2>&1 | cat >/dev/null
+  [ $(($(date +%s) - piped_start)) -lt 15 ] \
+    || { echo "FAIL: a piped run waited on the stall watchdog's sleep"; exit 1; }
 
   # run_with_retries: a failure that scored evaluations gets another go, a
   # failure that scored none does not, and the exit status still travels.

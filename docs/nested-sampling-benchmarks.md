@@ -92,6 +92,14 @@ profiler measures - the same numbers `./ri profile` prints, so
 [the profiling reference](nested-sampling-profiling.md) is what each stage
 means - the commit, the machine, and the settings the run used.
 
+`evals_per_s` is evaluations over the whole wall clock. `steady_evals_per_s`
+leaves out `startup_s` (before the first evaluations finish) and `stall_s`
+(later stretches in which no rank started an evaluation for longer than
+max(2s, 10x the median evaluation), such as a meqserver wedge sitting out
+its retry ladder). On a 3-minute GPU arm those two can be 25-105s and halve
+the headline rate, so compare short arms on the steady rate
+([CSD3 speed](csd3-speed.md), round 211).
+
 Rows are grouped by **machine, imager and settings**, and only rows in one
 group are ever compared. The machine id is derived from `/etc/machine-id` (the
 `IOPlatformUUID` on macOS), so it survives a reboot, a rename and a fresh

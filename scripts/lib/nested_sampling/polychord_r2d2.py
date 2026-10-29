@@ -25,9 +25,15 @@ from common import (
     cube_like_from_theta,
     cube_to_params,
     drain_record_writes,
+    evidence_record,
     PolyChordFinish,
+    chains_base_dir,
+    start_chains_mirror,
     finished_run_records,
+    follow_r2d2_worker_node,
     pack_finished_run,
+    start_record_packer,
+    stop_record_packer,
     post_run_line,
     post_run_phase,
     gathered_window_fit_stats,
@@ -48,9 +54,11 @@ from common import (
     resolve_metric,
     run_r2d2_imaging,
     self_check_lazy_numpy,
+    self_check_follow_worker_node,
     self_check_metric_resolution,
     self_check_parameter_space,
     self_check_parameter_toggle,
+    self_check_evidence_record,
     self_check_profiling,
     self_check_resume_adoption,
     self_check_source_offset,
@@ -521,13 +529,16 @@ def main() -> None:
     # id counter the list length used to supply.
     cache: dict[str, float] = {}
     scored = 0
+    # After the first evaluation, not at connect: the pool holds both FIFO
+    # ends, so a rank connects before its worker has forked onto its node.
+    followed = False
 
     def prior(cube: np.ndarray) -> np.ndarray:
         params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
-        nonlocal scored
+        nonlocal scored, followed
         if finish.finished():
             return finish.discarded(), []
         params = cube_to_params(cube_like_from_theta(theta))
@@ -555,11 +566,14 @@ def main() -> None:
                 salvage_evaluation_logs(eval_dir)
                 abort_run(traceback.format_exc())
             cache[key] = float(record["objective"])
+            if not followed:
+                followed = True
+                follow_r2d2_worker_node(args.r2d2_image, args.meqtrees_image)
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
         return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
-    settings.base_dir = str(output_dir / "chains")
+    settings.base_dir = str(chains_base_dir(output_dir))
     settings.file_root = "r2d2_vlaa"
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
@@ -567,7 +581,7 @@ def main() -> None:
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # Checkpoint long runs so interruptions are resumable via `--output-dir`.
-    resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
+    resume_path = output_dir / "chains" / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
     # Always adopt disk evaluations: retries can die before PolyChord writes a
@@ -580,14 +594,21 @@ def main() -> None:
         print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
 
-    write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    if mpi_rank() == 0:  # one writer: rank 0's mirror seeds tmpfs from it, and another
+        # rank's truncating rewrite once seeded an empty file (round 229)
+        write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
+    packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
+    mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
     finish = PolyChordFinish()
-    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
+    if mirror is not None:
+        mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
+    stop_record_packer(packer)
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)
     window_fit_stats = gathered_window_fit_stats()
@@ -629,6 +650,7 @@ def main() -> None:
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "evidence": evidence_record(output),
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
@@ -661,11 +683,13 @@ if __name__ == "__main__":
         self_check_r2d2_config_thread_cap()
         self_check_source_offset()
         self_check_profiling()
+        self_check_evidence_record()
         self_check_failure_record_persistence()
         self_check_worker_death_is_not_scored()
         self_check_resume_adoption()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
+        self_check_follow_worker_node()
         print("metric resolution self-check passed")
     else:
         main()

@@ -15,7 +15,9 @@ os.environ.setdefault("REPO_ROOT", str(REPO_ROOT))
 HOST_RUNNABLE = {
     "common": (
         "self_check_backfilled_intervals",
+        "self_check_chains_mirror",
         "self_check_evaluation_pruning",
+        "self_check_evidence_record",
         "self_check_clean_convergence",
         "self_check_image_dim",
         "self_check_image_retention",
@@ -25,8 +27,10 @@ HOST_RUNNABLE = {
         "self_check_profiling",
         "self_check_resume_adoption",
         "self_check_streaming_retention",
+        "self_check_summary_json",
         "self_check_worker_pool_connect",
         "self_check_cpu_pinning",
+        "self_check_follow_worker_node",
         "self_check_worker_timeout",
     ),
     "r2d2_serve": (
@@ -36,9 +40,11 @@ HOST_RUNNABLE = {
         "self_check_net_reuse",
         "self_check_normal_operator",
         "self_check_nufft_plan_reuse",
+        "self_check_prefetch_weights",
         "self_check_serve_fifo",
         "self_check_serve_pool",
         "self_check_serve_reply_stream",
+        "self_check_trt_gathered",
         "self_check_worker_nodes",
     ),
 }
@@ -75,7 +81,8 @@ IMAGE_ONLY = {
         "self_check_worker_death_is_not_scored",
     ),
     "polychord_wsclean": ("self_check_failure_record_persistence",),
-    "r2d2_serve": ("self_check_imaging_weights", "self_check_request_io"),
+    "r2d2_serve": ("self_check_checkpoint_series", "self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback",
+                   "self_check_trt_shared_protocol"),
 }
 
 MODULES = sorted(set(HOST_RUNNABLE) | set(IMAGE_ONLY))

@@ -50,6 +50,16 @@ write_run_config() {
     if [ "${algorithm}" = r2d2 ]; then
       printf 'R2D2_DEVICE=%q\n' "${R2D2_DEVICE:-cpu}"
       printf 'R2D2_RUNTIME=%q\n' "${R2D2_RUNTIME:-torch}"
+      if [ -n "${R2D2_TRT_SHARED:-}" ]; then
+        printf 'R2D2_TRT_SHARED=%q\n' "${R2D2_TRT_SHARED}"
+      fi
+      # Opt-in batching (round 224); a resume keeps its plans and server.
+      if [ -n "${R2D2_TRT_BATCH:-}" ]; then
+        printf 'R2D2_TRT_BATCH=%q\n' "${R2D2_TRT_BATCH}"
+      fi
+      if [ -n "${R2D2_TRT_LANES:-}" ]; then
+        printf 'R2D2_TRT_LANES=%q\n' "${R2D2_TRT_LANES}"
+      fi
     fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"

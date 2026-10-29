@@ -10,7 +10,9 @@ TF32 (default 1, torch's own) 0 computes float32 convolutions as r2d2_serve does
 BENCH=1 sets cudnn.benchmark; CL=1 runs channels_last (round 125);
 DET=1 sets cudnn.deterministic (round 127). BF16=1 (cpu) runs the forward under
 bfloat16 autocast, AMX on sapphire (round 134), BF16=2 with the weights cast to
-bfloat16 once; maxrel_fp32 is then its error. Run P copies at once to see what a full node does:
+bfloat16 once; maxrel_fp32 is then its error. COMPILE=<mode> (cuda) runs
+torch.compile(mode=<mode>), needing a C compiler in CC for Triton; KERN=1 prints
+the CUDA kernels one forward launches (round 166). Run P copies at once to see what a full node does:
     for i in $(seq 24); do apptainer exec ... python3 probe_unet_forward.py & done; wait
 """
 import os, sys, time
@@ -42,6 +44,8 @@ with torch.no_grad():
     elif os.environ.get("BF16") == "2":  # weights cast once, not per forward
         net = module.to(torch.bfloat16)
         x = x.to(torch.bfloat16)
+    if os.environ.get("COMPILE"):
+        net = torch.compile(module, mode=os.environ["COMPILE"], dynamic=False)
     ref = torch.cat([net(x[i:i + 1]) for i in range(b)])
     y = net(x)
     for _ in range(5):
@@ -66,6 +70,13 @@ with torch.no_grad():
         y_graph = run(x).clone()
         sync()
         graph_identical = torch.equal(y_graph, y)
+    if os.environ.get("KERN") == "1":
+        from torch.profiler import profile, ProfilerActivity
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            run(x)
+            sync()
+        kern = [e for e in prof.events() if e.device_type.name == "CUDA"]
+        print(f"kernels={len(kern)} kernel_us={sum(e.device_time for e in kern):.0f}")
     time.sleep(max(0.0, float(os.environ.get("START", "0")) - time.time()))
     c = time.process_time()
     time.sleep(max(0.0, float(os.environ.get("START", "0")) - time.time()))

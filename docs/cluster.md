@@ -329,6 +329,15 @@ blocking CUDA event, not by spinning in the copy back, so its CPU goes to the
 other ranks while it waits (+6%; `R2D2_CUDA_BLOCKING_SYNC=0` spins, round 123).
 That freed CPU is why the default is 19 ranks a card, the most its memory
 holds (`NS_R2D2_CUDA_MAX_RANKS`; 43.9 against 41.1 evals/s at 16, round 124).
+`R2D2_RUNTIME=trt` runs the U-Net as TensorRT fp32 engines instead: requests
+are 45% faster, but only 12 ranks fit, so a search gains ~4% (plans are built
+on first use and cached, ~5 minutes; round 171). Since round 215 the GPU
+default is TensorRT with `R2D2_TRT_SHARED=1`: one forward server holds the 25
+engines for every worker, the workers stay on the CPU and no MPS daemon is
+started, so the 19 ranks fit again. It converged the 22 Sep search in 785 s
+against 1,165 s for eager torch (90.8 against 64.2 evals/s, log(Z) 0.06 sigma
+apart). `R2D2_RUNTIME=torch` brings back eager torch with MPS, and
+`R2D2_TRT_SHARED=0` brings back per-worker engines.
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:
@@ -385,6 +394,8 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   run scripts needs no change. `NS_R2D2_MAX_RANKS` (112) caps an R2D2 job
   at a whole sapphire node's cores: one rank per CPU beat 56 x 2 by ~20% on
   whole icelake and sapphire nodes (`docs/csd3-speed.md`, round 105).
+  A CPU run then takes one rank more than its cores, because PolyChord's
+  root rank never evaluates (+3.7% on half an icelake node, round 186).
   On such a node the R2D2 pool loads one checkpoint copy per socket and
   pins each worker to its socket (+19% on a whole sapphire node, round 106; +21% on a whole icelake
   node, round 107), and builds the ONNX Runtime sessions once per socket the
@@ -393,10 +404,11 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
   `R2D2_WEIGHTS_PER_NODE=0` keeps one shared copy. A sized (`--mpi-procs`)
   R2D2 job can land on one socket, which turns this off; on one sapphire
   node, 56 CPUs split 28/28 ran 75 evals/s against 54 on one socket (+37%,
-  round 111), so for half a node set `NS_SLURM_SOCKETS=2`: the job asks
-  for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice the
-  shared memory (it may queue longer, ~30 minutes against ~3 in round 110,
-  though round 113's started at once). It is for R2D2 only: 56-rank
+  round 111; +26% on icelake, round 250), so a sized CPU R2D2 search
+  (`--mpi-procs` >= 4) submits with `NS_SLURM_SOCKETS=2` by default: the job
+  asks for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice
+  the shared memory (`sbatch --test-only` gives it the same start estimate as
+  one socket, round 250; `NS_SLURM_SOCKETS=1` keeps one). It is for R2D2 only: 56-rank
   WSClean ran the same either way (round 114), so a WSClean job need not wait
   for it.
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the

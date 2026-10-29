@@ -393,6 +393,11 @@ run's worker pools (`scripts/lib/start-sidecars.sh`), whose ancestors are
 searched for a run script rather than checked for pid 1, because a reparented
 orphan lands on whatever subreaper the session has.
 
+**TensorRT** - a warning when a GPU search's shared TensorRT server has died.
+Its workers fall back to the CPU U-Net, so the results are still right but the
+rate drops to about a sixth (round 219). Read from the `fallback:` line the pool
+writes to `<run>/r2d2-engine.txt`. `./ri resume` starts a new server.
+
 **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
 `meqserver-wedged.log` lines. **The one a run can pass every other check and
 still fail.** PolyChord maximizes and a real `total_rms_jy` is ~0.008, so
