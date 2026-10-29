@@ -14601,3 +14601,69 @@ run directory is deleted.
 
 GPU job 39651057 (`.probe/r299/ab.sh`) had still not started by the end of
 this round; the next round reads `.probe/r299/ab-39651057.out`.
+
+## Round 303 (negative): a fresh node's slow start is not the SIFs, so reading them first does not help
+
+**Question.** Round 302's job reported a ~48 s first request on a fresh node,
+against 5.8 s on the warm gnhf node. Where does that time go, and does reading
+`polychord.sif`, `meqtrees.sif` and `r2d2.sif` into the page cache first (16
+threads, 64 MB chunks, as round 217 did for TensorRT) hide it?
+
+**Probes** (three 1-node icelake array jobs; short search: nlive 48, 5 repeats,
+150 dead, seed 4303, 39 ranks). Each node is fresh only for the first search
+it runs. A second task that lands on the same node is a warm control.
+
+| measurement, fresh node | cold | warm |
+| --- | ---: | ---: |
+| `polychord.sif`: `import numpy, mpi4py, pypolychord` | 20.55 s | 0.64 s |
+| `meqtrees.sif`: `import numpy` | 7.46 s | 0.70 s |
+| `r2d2.sif`: `import torch` | 28.02 s | 2.92 s |
+| run script setup before `mpirun` (gnhf node, `bash -x` trace) | - | ~3 s |
+
+**A/B** (job 39656343, tasks alternating `NS_PREFETCH_SIFS` 0/1. The flag
+was a background reader in `run-nested-sampling-r2d2.sh` that started right
+after `ns_require_sifs`):
+
+| node | state | prefetch | first evaluation after launch | first-wave request | log(Z) |
+| --- | --- | --- | ---: | ---: | --- |
+| cpu-q-186 | fresh | off | 14.18 s | 25.55 s | 0.0136166 ± 0.00438 |
+| cpu-q-187 | fresh | on (3 SIFs) | 15.00 s | 24.71 s | 0.0143624 ± 0.00373 |
+| cpu-q-186 | warm | off | 3.06 s | 8.40 s | 0.0140516 ± 0.00404 |
+| cpu-q-187 | warm | on | 3.18 s | 8.00 s | 0.0139358 ± 0.00404 |
+
+Earlier probes agree. With the SIFs and onnxruntime's libraries read by hand
+first (cpu-q-498), the first-wave request was 24.05 s. After cold imports
+(cpu-q-245), it was 23.36 s. On the warm gnhf node, the first evaluation
+started 3.0-4.4 s after launch and the first-wave request took 4.3-5.1 s.
+
+**Learned.**
+- A fresh node costs ~25-30 s once: ranks start ~11 s later, and the
+  first-wave request takes ~17 s longer. A second job on the same node starts
+  warm. The cache that matters is the node's own, and it outlives the job.
+- Reading the SIF files first changes neither number, although single cold
+  imports from those images take 7-28 s. The cold reads that matter are
+  somewhere other than the SIF files' page cache. The likely place for the
+  first request is the pool's 8.7 GB weight read (checkpoint weights plus
+  optimised ONNX graphs), which `prefetch_weights` already parallelises
+  (round 228). Ranks starting ~11 s late are a separate, unexplained cost.
+  The probe did not split either one further.
+- In-node eviction (`posix_fadvise DONTNEED` on `r2d2.sif`) cannot reproduce
+  a cold start. `import torch` took 2.6 s with the file evicted and with it
+  cached (`.probe/r303/siftest.py`). Only a fresh node measures this.
+- The cost is ~2% of a 20-minute search and is paid once per node per job,
+  in parallel across the nodes of a multi-node search. It is not worth more
+  rounds unless searches get much shorter.
+- log(Z) agrees across all 13 short searches (0.0135-0.0144, sigma ~0.004).
+
+The flag is reverted; no code change. Rows: bench `r303-warm*`, `r303-local-pf`,
+`r303-pft{0..3}`, `r303-c2t{0,1,2}` and `r303-cold{0,1}`, plus stage
+`r303-cold-start`, in `benchmarks.jsonl`. Scripts, console logs and outputs
+are in `.probe/r303/`. All run directories are deleted.
+
+GPU job 39651057 (round 299's TensorRT pair) had been pending for over an
+hour. It was cancelled and resubmitted as job 39654485 (`.probe/r303/ab.sh`),
+which runs on a frozen worktree of `dffbf8d`
+(`../frozen-r303`), so this tree can be edited again while the job waits.
+Its output goes to `.probe/r303/ab-39654485.out`, and its bench rows go to
+`.probe/r303/bench-rows.jsonl`. Remove the frozen worktree
+(`git worktree remove ../frozen-r303`) once that file shows DONE.
