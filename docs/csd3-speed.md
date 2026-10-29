@@ -14117,3 +14117,63 @@ with 0 s of stalls against ~8.5 s. Its startup is ~20 s longer (the
 batch-profile TensorRT plan). All log(Z)s agree within their ~0.0006 errors.
 Two arms are too few to change the GPU default. The next GPU step is a
 longer, converged C-against-A pair.
+
+## Round 291 (measurement): the record writer waits for the GIL, not for Lustre
+
+Round 290 left multi-node writer time at ~12x one node's, and named the
+cluster-wide `flock` as a suspect. This round times one append directly on
+this node (icelake, 38 CPUs, a scratch file in the repo's `results/` on RDS
+Lustre mounted `-o flock`). The probe scripts are inline in the round's
+transcript, and nothing they wrote was kept.
+
+**One append, 38 processes appending to one file, 200 each at 50 Hz:**
+
+| append | mean ms | median ms | max ms |
+| --- | ---: | ---: | ---: |
+| `flock` SH + `write` + `flock` UN (production) | 0.15-0.44 | 0.13-0.44 | 2.1 |
+| `write` only | 0.05 | 0.04 | 4.7 |
+
+The lock costs 0.1-0.4 ms. A real run's writer spends ~12 ms per record on one
+node (round 288 s1: 103 writer-seconds for 8,426 records) and ~86 ms on two
+(round 290: 1,204 s for 13,962). So neither the lock nor the syscall accounts
+for writer time.
+
+**The same append, made by a one-thread executor as in `_submit_record_job`,
+30 processes, 100 appends each:**
+
+| main thread | with `flock` | `write` only |
+| --- | ---: | ---: |
+| idle (waiting on the job) | 0.14 ms | 0.09 ms |
+| spinning pure Python (holds the GIL) | 14.88 ms | 4.90 ms |
+
+Each blocking call in the job (`flock`, `write`, `flock`) releases the GIL.
+Getting it back from a thread that holds it costs up to the 5 ms switch
+interval. Three calls make ~15 ms, which is one node's measured ~12 ms per
+record.
+
+**PolyChord never releases the GIL.** `_pypolychord.cpython-311-*.so` in
+`polychord.sif` (pypolychord 1.22.3) references no `PyEval_SaveThread`,
+`PyEval_RestoreThread` or `PyGILState_*` symbol. So while a rank is inside
+`run_polychord`'s Fortran, which is all the time it spends outside the
+likelihood callback (MPI waits for the root's next point), the GIL is held
+and the writer thread cannot run at all. It runs only when the callback
+blocks with the GIL released (the pool FIFO read). On two nodes the MPI waits
+cross the network and are longer, so the queue waits longer too. That is the
+likely cause of round 290's 692 records lost on a kill -9.
+
+**What follows (next round):** append on the rank's main thread at the end of
+the callback. That costs 0.1-0.4 ms against a ~750 ms evaluation (39 ranks at
+~52 evals/s), and leaves no queue for a kill to lose. The off-thread writer
+was built for flat-file creates (~50 ms, round 95), not for appends. Dropping
+the `flock` on node packs would also save two of the three GIL round trips.
+Nothing truncates a node pack while ranks append to it (only the finish and a
+resume fold them, and no rank writes then). Either change needs a 2-node A/B
+of writer seconds, evals/s and kill loss, plus the WSClean guard, because it
+touches `common.py`.
+
+**Pending:** a 4-node icelake scaling job (39616258, `.probe/r291/scale.sh`:
+arms of 1, 2, 4, 4, 2 and 1 nodes, `--nlive 300 --num-repeats 15 --max-ndead
+600 --seed 291`, with the root rank's CPU sampled every 10 s) had not started
+after 25 minutes in the queue. It runs whatever scripts are in the tree when
+it starts, so no script it executes may be edited while it is running. Read
+`.probe/r291/scale-39616258.out` next round.
