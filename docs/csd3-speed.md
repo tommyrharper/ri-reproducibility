@@ -14502,3 +14502,39 @@ round 297 (no evals/s cost, an order of magnitude smaller backlog under
 load) plus this round (no extra kill loss, a flat WSClean guard). The
 host-runnable self-checks and `test_watchdogs.py` pass. Full-precision log(Z)
 is in the `r298-kill` row of `benchmarks.jsonl`.
+
+## Round 299 (check): batched record appends on one node; the GPU gathered-batch pair submitted
+
+Rounds 297-298 measured `NS_RECORD_BATCH=1` on 2 nodes and on WSClean, but
+not on a single-node CPU R2D2 search, the most common production shape. This
+round raced both writers on swapped 19-CPU halves of this allocation
+(cpu-q-140; 20 ranks a side, async, `--nlive 80 --num-repeats 5 --max-ndead
+300 --seed 299`, `.probe/r299/cpu.sh`).
+
+| pair | arm | steady evals/s | evals/s | post-run flush s | log(Z) |
+| --- | --- | ---: | ---: | ---: | --- |
+| 1 | b0 (one write per record) | 24.06 | 22.27 | 0.7 | 0.01603 ± 0.00141 |
+| 1 | b1 (default, batched) | 24.44 | 22.26 | 25.6 | 0.01755 ± 0.00082 |
+| 2 | b0 | 22.88 | 21.72 | 4.1 | 0.01736 ± 0.00084 |
+| 2 | b1 | 22.86 | 22.86 | 3.7 | 0.01690 ± 0.00099 |
+
+- Steady evals/s means 23.47 (b0) against 23.65 (b1), +0.8%, well inside
+  the ~5% band. Batching costs a single node nothing, as on 2 nodes.
+- log(Z)s agree within their errors. An async search is not bit-identical
+  run to run, so agreement is the test here.
+- Pair 1's 25.6 s flush is not the writer's: flush moves the kept extreme
+  evaluations from `/dev/shm` to Lustre, and pair 2's batched arm took 3.7 s.
+  It is Lustre noise on one arm.
+- Neither arm queued more than a few records at the finish (Lustre was
+  quiet), so this says nothing new about the loaded case.
+
+`docs/cluster.md` and `docs/robustness.md` now describe the batched default
+and round 298's 2-node kill instead of round 290's ~6 s loss.
+
+GPU: job 39651057 (one A100, `.probe/r299/ab.sh`) is round 243's open
+question, the converged pair of gathered TensorRT batching (C: 33 x 1,
+`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`) against the shared default (A: 19 x 2)
+at `--nlive 128` (≥ 4 x workers, round 293) in ACCAAC order. It had not started
+by the end of this iteration. The next round reads
+`.probe/r299/ab-39651057.out`. Full-precision log(Z) for the CPU arms is in
+the `r299-cpu-batch` row of `benchmarks.jsonl`.

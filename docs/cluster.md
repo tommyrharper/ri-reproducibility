@@ -183,8 +183,10 @@ looks for its `.resume` on every rank, so a resumed attempt copies it into each
 other node's chains tmpfs first (round 289: without that, every multi-node
 retry and resume deadlocked). Each node appends its records to its own
 `evaluations/records.<host>.jsonl`, which the finish or a resume folds into
-`records.jsonl`. A kill on 2 nodes loses ~6 s of records, against ~19 s
-with one shared pack (round 290). More nodes buy evaluations/s (4 nodes:
+`records.jsonl`. Each append writes every queued line at once
+(`NS_RECORD_BATCH=1`), so a kill -9 on 2 nodes at 3,000 scored evaluations lost
+no record, and a same-job `./ri resume` clears the killed attempt's `/dev/shm`
+scratch on every node first (rounds 297-298). More nodes buy evaluations/s (4 nodes:
 3.57x one), but PolyChord spends ~0.4 x workers/nlive more of them to
 converge, so raise `--nlive` with `--nodes`: at least 4x the total ranks keeps
 the overhead under ~10%, and the launcher warns below that (round 293).

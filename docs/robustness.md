@@ -254,7 +254,11 @@ under heavy load), where appending to `records.jsonl` lost none
 record to `records.jsonl` through one descriptor and creates no file per
 record (round 264; `NS_RECORD_APPEND=0` for the flat writer, which takes its
 backlog in one append once it falls behind, round 247, and
-`NS_RECORD_COALESCE=0` on top of that for the oldest one). At 113 ranks the
+`NS_RECORD_COALESCE=0` on top of that for the oldest one). Each append takes
+every line queued so far in one write (`NS_RECORD_BATCH=1`; `=0` for one write
+per record), which leaves 8-15x fewer records queued under Lustre load at no
+evals/s cost, and a 2-node kill -9 at 3,000 evaluations lost none (rounds
+297-298). At 113 ranks the
 flat writer's creates also convoy in Lustre's metadata server, ~40x the
 writer time and a node load of ~200 on 112 CPUs, for ~2% evals/s (round 263).
 That costs the archive, not the search: an async run (the
