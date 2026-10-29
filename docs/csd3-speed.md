@@ -13618,3 +13618,53 @@ Rows: bench `r274-{n,h}{1,2,3}` (the HEAD rows copied back from the
 `benchmarks.jsonl`. The run dirs and the worktree are deleted. Arm logs are
 in `.probe/r274/`. The change is R2D2-only (`r2d2_serve.py`), so no WSClean
 guard is needed.
+
+## Round 275 (negative): the torch U-Net built before the fork does not shorten the first request
+
+**Question.** Round 273 found 0.30 s of a worker's ~0.97 s first imager
+request is `create_net_imaging` building the torch U-Net with Kaiming
+init, which `patch_net_reuse` then caches for later requests. In ONNX mode
+that net is only a wrapper (`OrtNet.torch_net`) and is never run. Does
+building it once in the pool parent, before the fork, take that off every
+worker's first request?
+
+**Change tried.** In `warm_imports`, after `patch_net_reuse`, a CPU pool
+called `create_net_imaging(layers=1, num_chans=64, architecture="unet",
+device=torch.device("cpu"))`, the kwargs `R2D2.__init__` passes (the device
+comes from `set_params` as `torch.device("cpu")`). In `r2d2.sif`
+(`.probe/r275/key.py`), the warmed `_NETS` key is exactly
+`((), [('architecture', 'unet'), ('device', device(type='cpu')),
+('layers', 1), ('num_chans', 64)])`, a second call takes 25 us, and a fresh
+build is 0.13 s solo on one CPU.
+
+**A/B** (interleaved against HEAD in a `/dev/shm` worktree, default async
+39 x 1, 38 CPUs, nlive 48, 5 repeats, 150 dead, seed 275, order n1 h1 h2
+n2 n3 h3, `.probe/r275/run.sh`; node load ~24 from the other half):
+
+| arm | evals/s | first request s | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| n1 (new) | 39.54 | 6.22 | 8292 | 0.0134843104196883 +/- 0.00403999 |
+| h1 (HEAD) | 42.30 | 5.88 | 8064 | 0.0130483735695699 +/- 0.00446937 |
+| h2 (HEAD) | 42.34 | 6.18 | 8267 | 0.0135677500605269 +/- 0.00395927 |
+| n2 (new) | 40.99 | 6.15 | 8287 | 0.0125478408807106 +/- 0.00504766 |
+| n3 (new) | 40.70 | 6.04 | 8312 | 0.0126967461270412 +/- 0.00484675 |
+| h3 (HEAD) | 41.82 | 5.86 | 8142 | 0.0135730352971486 +/- 0.00387962 |
+
+**Learned.**
+- No gain: the first request is 6.04-6.22 s against HEAD's 5.86-6.18 s,
+  and end to end the new arms are 2-7% slower in all three pairs (inside
+  the ~5% control span, but never ahead). Reverted.
+- The build does not disappear, it moves: the pool parent's warm-up is
+  on the first wave's critical path (round 273), so 0.13-0.3 s of serial
+  parent work replaces 0.3 s that 38 workers paid in parallel. Pre-fork
+  work only pays when it removes a per-child cost that is larger than its
+  serial cost, or overlaps something already on the critical path.
+- Peak memory is ~100-200 MB higher with the parent's net (8.29-8.31
+  against 8.06-8.27 GB), consistent with children's copy-on-write of the
+  net when `load_net` would touch it, plus the parent's own copy.
+- log(Z) agrees (0.01255-0.01348 against 0.01305-0.01357, sigma
+  ~0.004-0.005); the net's random init never reaches an output in ONNX mode.
+
+Rows: bench `r275-{n,h}{1,2,3}` (HEAD rows copied back from the `/dev/shm`
+worktree) and stage `r275-net-prefork` in `benchmarks.jsonl`. The run dirs
+and the worktree are deleted. `r2d2_serve.py` is unchanged.
