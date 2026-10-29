@@ -12288,3 +12288,22 @@ with `NS_SLURM_SOCKETS=1`, and without `--mpi-procs` it still asks for
 `--exclusive`. No WSClean guard was needed, because only the R2D2 run
 script's submit branch changed. Stage row `r250-socket-split`. The
 `r249-pin-*` run directories are deleted.
+
+## Round 251: CI lint fix (shellcheck 0.9.0, SC2217)
+
+No speed change. CI's lint job installs shellcheck from apt on
+`ubuntu-latest` (24.04, shellcheck 0.9.0), and 0.9.0 flags SC2217 (warning)
+on the stall watchdog's `while sleep "${poll}" </dev/null >/dev/null 2>&1`
+in `scripts/lib/progress-bar.sh`, added in round 196. This host has no
+shellcheck, so the finding was only noticed in round 250 (via uvx). Since
+round 196 the lint step would have failed on any run of CI's workflow.
+
+The redirect stays: round 196's point is that the orphaned `sleep` must hold
+none of the run's file descriptors, and stdin counts. A
+`# shellcheck disable=SC2217` with that reason is the fix. After it,
+`shellcheck -x scripts/*.sh scripts/lib/*.sh` is clean under both
+shellcheck-py 0.9.0.6 (CI's version) and the current release, `bash -n`
+passes, and `bash scripts/lib/progress-bar.sh` (its self-check, a CI step)
+passes. Behaviour is byte-for-byte the same, so no WSClean guard is needed.
+To lint as CI does from a compute node:
+`uvx --from shellcheck-py==0.9.0.6 shellcheck -x scripts/*.sh scripts/lib/*.sh`.

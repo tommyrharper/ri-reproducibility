@@ -265,7 +265,8 @@ _ns_stall_watchdog() {
   last="$(_ns_completed_evals "${output_dir}")"
   # The sleep outlives a watchdog killed mid-poll, so it must hold none of the
   # run's output: `./ri search | tee` waited up to a poll (60s) for it after
-  # the search had finished (round 196).
+  # the search had finished (round 196). Stdin included, so SC2217 is wrong here.
+  # shellcheck disable=SC2217
   while sleep "${poll}" </dev/null >/dev/null 2>&1; do
     scanned="$(_ns_now_us)"
     now="$(_ns_completed_evals "${output_dir}")"
