@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 320; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 321; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -81,6 +81,10 @@ the Hetzner host.
     +38%, log(Z) +0.55 sigma, three raced pairs). Ranks and batching
     changed together; job 39667582 splits them
     ([round 319](#round-319-gpu-measurement-33-workers-on-gathered-tensorrt-batches-converge-16-sooner-than-the-default-ranks-or-batching-pending)).
+    About 7 s of that 32 s gap is a one-off wait at PolyChord's switch from
+    prior sampling to nested sampling, which the shared server pays
+    (7.66 s every arm) and the gathered one does not (~1 s)
+    ([round 321](#round-321-diagnostic-every-search-stalls-once-at-the-prior-to-sampling-switch-766-s-on-the-shared-gpu-server)).
 - **Rounds 216-265 in brief.** The CPU R2D2 forward is at the hardware
   wall: a half-icelake search draws ~90-96% of its socket's measured
   DRAM read bandwidth for U-Net weights alone, so ~53 evals/s looked like
@@ -15483,3 +15487,63 @@ factor is 1).
 **GPU job 39667582** (round 319's ranks-vs-batching split) had not
 started when this round began; `.probe/r319/` still holds only `ab.sh`.
 It is read next round.
+
+## Round 321 (diagnostic): every search stalls once at the prior-to-sampling switch, 7.66 s on the shared GPU server
+
+**Question.** Round 319's bench rows give every 19 x 2 shared-TensorRT
+arm `stall_s` 7.7 (W1 6.7) and every gathered arm 0.0. What is the
+stall, and does a CPU search have one too? (GPU job 39667582 had still
+not started, so this round reads kept summaries only.)
+
+**Method.** `.probe/r321/transition.py` lists each finished summary's
+biggest gaps between consecutive evaluation starts, skipping the first
+0.5 s (output in `.probe/r321/transition.txt`). It ran on round 303's
+seven GPU summaries, round 318's converged CPU search and five more kept
+CPU summaries. PolyChord's `generate.F90` at the pinned commit
+(`370f6af`) was read to place the gaps.
+
+| search | ranks | gap after the prior phase | gap after `time_speeds` |
+| --- | ---: | ---: | ---: |
+| GPU A1/A2/A3, 19 x 2 shared TRT | 19 | 7.66 / 7.66 / 7.66 s | 0.34 / 0.36 / 0.35 s |
+| GPU W1, same, warm-up arm | 19 | 6.67 s | 0.36 s |
+| GPU C1/C2/C3, 33 x 1 gathered TRT | 33 | 0.51 / 0.57 / 0.56 s | 0.43 / 0.38 / 0.41 s |
+| CPU, round 318 converged, 39 ranks | 39 | 1.25 s | 1.42 s |
+| CPU, four other kept 39-rank searches | 39 | 0.95-1.90 s | 1.06-1.38 s |
+
+**Where the two gaps are.** Both sit at fixed evaluation counts: the
+first after nlive + workers - 1 starts (A: start 144 = 128 + 17; CPU:
+186), which is the prior phase ending with every worker's in-flight
+point. The second comes one start per rank later (A: 163, CPU: 225).
+That is PolyChord's `time_speeds`, which runs whenever any
+`grade_frac <= 1` (the default). It has *every* rank, the root
+included, evaluate one random point, so the root's only evaluation of a
+search lands here and everyone waits for the slowest. In A1 all 19
+`time_speeds` evaluations start together at 22.52 s after the last
+prior evaluation ended at 15.11 s. So the workers were held in the
+`sum_integers` allreduce that follows the prior loop, and the root
+reached it 7.4 s late. Between its last `catch_point` and that
+allreduce the root only sorts 145 points and writes the prior-info file
+to tmpfs chains. The 7.66 s therefore comes from the root's process on
+the shared-server arm, not from PolyChord's own work. It is the same to
+0.01 s in three arms, which is a fixed cost, not load. What it is needs
+a timed root on a GPU node.
+
+**What it costs.**
+- CPU: ~2.5 s once per search, 0.15% of a 29-minute converged search.
+  A resume from a checkpoint skips it (`nested_sampling.F90` calls
+  `GenerateLivePoints` only when there is no resume file). Not worth a
+  PolyChord patch: skipping `time_speeds` would change the random
+  stream, so results stop being bit-identical, to save ~1.4 s.
+- GPU shared: 7.66 s once per search. That is 3.8% of A's ~201 s to
+  converge, and about 7 s of round 319's 32 s A-vs-C gap. `stall_s` is
+  a fixed transition cost, not a recurring whole-search stall, and
+  `steady_evals_per_s` already subtracts it. Round 319's steady-rate
+  comparison (+38%) stands; its wall-time gain (16%) includes ~3.5
+  points from this transition.
+
+**Decision.** No code change. Next GPU round: time the root rank (e.g.
+`py-spy dump` or a timestamped print around `run_polychord`'s prior
+phase) in one shared-server arm to name the 7.4 s. If B (33 x 1,
+shared) in job 39667582 shows the same 7.66 s, the cost belongs to the
+shared server's start, not the rank count. Stage row
+`r321-prior-switch` is in `benchmarks.jsonl`.
