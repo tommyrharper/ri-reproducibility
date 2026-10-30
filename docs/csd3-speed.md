@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 318; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 319; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -76,8 +76,11 @@ the Hetzner host.
     records and broadcasts them (all-rank RSS at 67k records 42 GB down
     to 3 GB, round 267), and the packed records are parsed off the read
     pool (-27% on a production-sized adoption, round 268).
-  - **GPU.** Round 299's converged gathered-batch TensorRT pair is still
-    queued (job 39654485, on a frozen worktree).
+  - **GPU.** 33 x 1 workers on the gathering TensorRT server converge a
+    1-A100 search 16% sooner than the 19 x 2 shared default (steady
+    +38%, log(Z) +0.55 sigma, three raced pairs). Ranks and batching
+    changed together; job 39667582 splits them
+    ([round 319](#round-319-gpu-measurement-33-workers-on-gathered-tensorrt-batches-converge-16-sooner-than-the-default-ranks-or-batching-pending)).
 - **Rounds 216-265 in brief.** The CPU R2D2 forward is at the hardware
   wall: a half-icelake search draws ~90-96% of its socket's measured
   DRAM read bandwidth for U-Net weights alone, so ~53 evals/s looked like
@@ -15383,3 +15386,58 @@ posterior, not a lever; an A/B between arms that reach different phases
 should compare `r2d2_iterations`-normalised cost. Bench row `r317-conv`
 (the search's own row) and stage row `r318-conv-iters` are in
 `benchmarks.jsonl`; the run directory is deleted.
+
+## Round 319 (GPU measurement): 33 workers on gathered TensorRT batches converge 16% sooner than the default; ranks or batching pending
+
+**Why.** This reads round 303's 1-GPU job 39654485 (round 299's pair on
+the frozen `../frozen-r303` tree, gpu-q-40, A100-SXM4-80GB, 32 CPUs). It
+started at 23:41 on 29 Oct, four rounds after it was submitted. Each arm
+is a converged seed-4299 search: `--nlive 128 --num-repeats 5`, with
+`--max-ndead 4000` as a cap that no arm reached. A is the GPU default (the
+shared TensorRT server, 19 ranks x 2 threads, one lane per worker). C is
+33 x 1 with the gathering server (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`),
+the case round 238 left open: more workers per card than its 19. The
+order was ACCAAC, after a 300-dead warm-up arm (W1).
+
+| arm | ranks | evals | wall to converge s | start-up s | stall s | steady evals/s | ms/eval (R2D2) | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| A1 | 19 x 2, shared | 21,391 | 209.1 | 10.2 | 7.7 | 111.8 | 144.8 | 0.016037683911542 +/- 0.000468220942461031 |
+| C1 | 33 x 1, gathered | 20,857 | 169.8 | 35.0 | 0.0 | 154.8 | 230.7 | 0.0164877890672801 +/- 0.00044661160134725 |
+| C2 | 33 x 1, gathered | 21,377 | 178.9 | 29.0 | 0.0 | 142.6 | 236.5 | 0.0164496737825921 +/- 0.000440671365537601 |
+| A2 | 19 x 2, shared | 19,061 | 201.1 | 9.9 | 7.7 | 103.9 | 157.8 | 0.01635038438896 +/- 0.000460407590856059 |
+| A3 | 19 x 2, shared | 19,445 | 193.8 | 10.4 | 7.7 | 110.7 | 148.9 | 0.0162635838793623 +/- 0.000470167424993285 |
+| C3 | 33 x 1, gathered | 19,854 | 158.6 | 28.1 | 0.0 | 152.2 | 226.2 | 0.0164785730928507 +/- 0.000445832054425629 |
+
+**Results.**
+- **Wall time to convergence: A 201.4 s, C 169.1 s (-16.0%)**. C won
+  all three adjacent pairs. Steady evals/s rose from 108.8 to 149.9
+  (+37.8%). C needs 3.7% more evaluations (20,696 against 19,966),
+  PolyChord's price for 33 workers instead of 19 (round 307), and pays
+  ~21 s more start-up to build its four lanes' 100 batch contexts. In a
+  longer search that start-up is amortised, so the gain tends toward the
+  steady +38% less the extra evaluations.
+- **log(Z) agrees.** The mean is 0.016217 for A and 0.016472 for C, a
+  difference of 0.00026, or 0.55 sigma of one run. The batched engines
+  are not bit-identical to the batch-1 plan (9-10e-6 of the peak, round
+  224), so this agreement is the bar, as it was in round 238.
+- Per request, a C worker's R2D2 stage takes ~231 ms against A's ~150 ms,
+  yet C completes more requests per second: the card is not the
+  bottleneck at 19 workers, and 14 more single-thread workers keep it
+  busier. Round 238 found the gathering server no faster than the default
+  at 19 x 2, so the gain here most likely comes from the extra ranks, and
+  `NS_R2D2_CUDA_MAX_RANKS=19` is a cap from eager torch's card memory
+  (round 124), which a shared server's workers do not use (round 208).
+  This is not yet proven: C changed the rank count and the server
+  together.
+
+**Pending.** Job 39667582 (`.probe/r319/ab.sh`, 1 x A100, same frozen
+tree and settings) splits the two changes. It races B (33 x 1 on the
+default shared server, no batching) against C in the order BCCBBC. If B
+matches C, the change to ship is a larger GPU rank cap for the shared
+server, with no new code path. If C beats B, batching earns its place at
+33 workers. Neither becomes a default until that job is read.
+
+Rows: `r303-W1`, `r303-A1..A3` and `r303-C1..C3` (bench) and stage row
+`r319-trt-gathered-33` in `benchmarks.jsonl`. `.probe/r303/` keeps the
+job output, the logs and the six `summary-*.json`; the run directories
+were deleted by the job.
