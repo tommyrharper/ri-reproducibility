@@ -83,7 +83,17 @@ run_with_retries() {
     status=0
     started="$(date +%s)"
     run_with_progress "${args[@]}" || status=$?
-    [ "${status}" -eq 0 ] && return 0
+    if [ "${status}" -eq 0 ]; then
+      # PolyChord's nfail guard ends the search with exit 0 and a normal-looking
+      # log(Z); only this line says it never converged (round 337).
+      if _ns_attempt_output "${output_dir}" "${log_before}" | grep -q 'unable to proceed after'; then
+        _ns_retry_say "${output_dir}" \
+          "WARNING: PolyChord stopped early (\"unable to proceed after N: failed spawn" \
+          "events\"), so this search did not converge and its log(Z) is not a result." \
+          "See docs/robustness.md."
+      fi
+      return 0
+    fi
     after="$(_ns_completed_evals "${output_dir}")"
     # Let the attempt that earned the reset use it.
     if [ "$(($(date +%s) - started))" -ge "${reset_after}" ]; then
@@ -1275,6 +1285,16 @@ self_check() {
   run_with_retries 2 "${once_dir}" -1 2 -- sh -c 'echo b >>"$0"/attempts' "${once_dir}" \
     >/dev/null 2>&1 || { echo "FAIL: success returned nonzero"; exit 1; }
   [ "$(_ns_count_lines "${once_dir}/attempts")" = "2" ] || { echo "FAIL: success re-ran"; exit 1; }
+  grep -q 'stopped early' "${once_dir}/run.log" && { echo "FAIL: early-stop warning on a clean run"; exit 1; }
+  # A success that PolyChord's nfail guard cut short says so (round 337).
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${once_dir}" -1 2 -- sh -c \
+    'echo c >>"$0"/attempts; echo "Warning, unable to proceed after    151: failed spawn events"' \
+    "${once_dir}" >/dev/null 2>&1 || { echo "FAIL: early stop returned nonzero"; exit 1; }
+  [ "$(_ns_count_lines "${once_dir}/attempts")" = "3" ] || { echo "FAIL: early stop re-ran"; exit 1; }
+  grep -q 'WARNING: PolyChord stopped early' "${once_dir}/run.log" || {
+    echo "FAIL: early stop not flagged"; exit 1
+  }
 
   # The retry budget is for a crash loop, not for the run's lifetime: an
   # attempt that ran a long time before dying hands it back, so a multi-day

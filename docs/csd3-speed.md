@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 337; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 338; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -57,8 +57,9 @@ the Hetzner host.
     cheaper, not dearer. 2 nodes then converge 1.96x faster than one,
     against 1.58x stock. Still opt-in; defaulting it is the user's call
     ([round 336](#round-336-on-two-nodes-the-contour-patch-cuts-r2d2-evaluations-22-and-wall-time-19-logz-agreeing)).
-    On four nodes (155 workers, two seeds) it is -25.1% evaluations and
-    -25.1% wall, converging 3.64x faster than one node (stock 2.73x). Searches with more workers
+    On four nodes (155 workers, three seeds) it is -24.1% evaluations and
+    -23.3% wall, converging 3.55x faster than one node (stock 2.72x)
+    ([round 338](#round-338-4-node-contour-ab-complete-three-seeds--24-evaluations-a-clean-exit-0-early-stop-is-now-flagged)). Searches with more workers
     than nlive were impossible before round 337: PolyChord's `nfail` guard
     stopped them after the prior with exit 0
     ([round 337](#round-337-fix-multi-node-with-more-workers-than-nlive-polychord-stopped-after-the-prior-exit-0-meaningless-logz)).
@@ -16466,3 +16467,66 @@ with `.probe/r337/ana.py`, then removes `../frozen-r337` and
 `run-nested-sampling-r2d2.sh`. `./ri self-check r2d2` passes (30 host
 checks plus the image checks), and so does shellcheck 0.9.0.6. Rows:
 bench `r337-a*-s190182240` and `r337-a*-s7311`, and stage `r337-nfail-fix` in `benchmarks.jsonl`.
+
+## Round 338: 4-node contour A/B complete (three seeds, -24% evaluations); a clean exit-0 early stop is now flagged
+
+**Seed 4242.** Round 337's array job 39680617 finished its last pair (tasks
+4-5). Both exited 0, and neither log has an `unable to proceed` line. The
+settings are unchanged: 4 nodes x 39 ranks (155 workers), nlive 150, 15
+repeats, converged.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4242 | stock | 0.0179546256573697 +/- 0.00031421237370391 | 2,030 | 783 | 91,104 | 96,357 | 207.6 | 487 s |
+| 4242 | adopt | 0.0180001782727063 +/- 0.000315672645932437 | 1,641 | 394 | 69,319 | 75,084 | 192.7 | 391 s |
+
+Adopt minus stock: -22.1% evaluations, -19.7% wall, log(Z) +0.10 sigma.
+
+**Pooled over all three seeds (4 nodes):**
+
+| | stock | adopt | change |
+| --- | ---: | ---: | ---: |
+| evaluations | 291,676 | 221,467 | **-24.1%** |
+| summed wall | 1,452 s | 1,114 s | **-23.3%** |
+| mean wall vs round 315's 1-node stock (1,317 s) | 2.72x | **3.55x** | |
+| same, 2 nodes (round 336) | 1.58x | 1.96x | |
+
+- log(Z), adopt minus stock: +0.03, -0.12 and +0.10 sigma. Stock agrees
+  with the 2-node arms of the same seeds (round 336) at +0.3, +0.4 and -0.6
+  sigma.
+- 4 nodes converge 1.72x (stock) and 1.81x (adopt) faster than 2. Stock's
+  evaluations grow 1.13x from 2 to 4 nodes (258,700 -> 291,676; per seed
+  1.31x, 1.06x and 1.04x), less than round 307's 1.18x. So cluster.md's 4-
+  and 8-node figures hold or are slightly pessimistic. Round 337's
+  two-seed 1.18x came from one high seed.
+- The saving grows slowly with workers: -4% at 38 (round 315), -22.2% at 77,
+  -24.1% at 155. The patch stays opt-in (sampler-change guard); defaulting
+  it is the user's call.
+
+**Guard: a clean exit that never converged.** Round 337's bug ended a
+search with exit 0, a `summary.json` and a benchmark row. Only one PolyChord
+line in `run.log` showed it. `nfail = nlive + workers` fixes that case, but
+the guard still fires, just as silently, in a failure storm. Now, when an
+attempt exits 0, `run_with_retries` (`scripts/lib/progress-bar.sh`) greps
+that attempt's output for `unable to proceed after`. If the line is there,
+it writes `WARNING: PolyChord stopped early ... its log(Z) is not a result`
+to `run.log` and stderr. It does not retry, because the same guard would
+fire again. A new fixture in the `progress-bar.sh` self-check covers both
+sides: a clean success gets no warning, and a success that prints the line
+gets it. Both still run once and return 0. The self-check (CI's
+`bash scripts/lib/progress-bar.sh`) and shellcheck 0.9.0.6 pass. The new
+behaviour is described in `docs/robustness.md`.
+
+**WSClean guard.** `progress-bar.sh` is shared code, but the change only
+adds a grep of the attempt's log after a successful exit. No evaluation,
+rank or timing path changes, and a converged WSClean run never prints that
+line, so no raced A/B was run. The cost is one `tail | grep` of `run.log`
+per search.
+
+**Cleanup.** The `../frozen-r337` worktree and `$RI_WORK_DIR/.cache/ri/sifs-r337`
+were removed. The jobs had already deleted their run dirs. Logs, stats and
+dead-birth files are kept in `.probe/r337/`. GPU job 39677203 (round 332)
+still has no output (`.probe/r332/`).
+
+Rows: bench `r337-a{0,1}-s4242` and stage `r338-adopt-contour-4-nodes-3-seeds`
+in `benchmarks.jsonl`.

@@ -194,8 +194,8 @@ is (rounds 293 and 307). Time to converge therefore goes as
 times nlive: at nlive 150, 2, 4 and 8 nodes of 39 ranks converge ~1.85x,
 ~3.2x and ~4.9x faster than one, and at nlive 300 ~1.9x, ~3.5x and ~6x
 (before the ~5-10% per-node rate loss). Measured on 4 nodes at nlive 150
-(round 337, two seeds), stock converged 2.73x faster than one node and
-`NS_ADOPT_CONTOUR=1` 3.64x; searches with more workers than nlive need
+(rounds 337-338, three seeds), stock converged 2.72x faster than one node and
+`NS_ADOPT_CONTOUR=1` 3.55x; searches with more workers than nlive need
 round 337's `nfail` fix, as before it PolyChord stopped them after the prior
 with exit 0. A larger `--nlive` does not remove the
 extra evaluations: it adds more than it saves, so raise it for precision,
