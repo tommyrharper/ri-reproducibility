@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 335; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 336; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -51,6 +51,12 @@ the Hetzner host.
     flat), so a chain on an adopted, higher contour pays more per step; no
     slice-width fix can recover it
     ([round 316](#round-316-diagnostic-adopted-r2d2-chains-cost-more-because-r2d2s-cost-per-slice-step-rises-with-the-contour)).
+    On two nodes (77 workers) it pays far more: **-22.2% evaluations and
+    -19.3% wall** over three raced seeds, log(Z) -0.05/+0.10/+0.31 sigma,
+    because stock wastes 27% of dead points there and adopted chains get
+    cheaper, not dearer. 2 nodes then converge 1.96x faster than one,
+    against 1.58x stock. Still opt-in; defaulting it is the user's call
+    ([round 336](#round-336-on-two-nodes-the-contour-patch-cuts-r2d2-evaluations-22-and-wall-time-19-logz-agreeing)).
     A converged search slows ~12% mid-run because R2D2's early stop
     (`prune: True`) runs more U-Net iterations as the posterior moves to
     costlier images (18.6 -> 20.9 -> 22.8), at a flat ~37 ms an iteration;
@@ -16282,3 +16288,77 @@ time-to-converge table. No code changed, so no WSClean guard. Stage row
 **Pending (GPU).** Job 39677203 still had no output file in `.probe/r332/`
 when this round ended. The next round reads `.probe/r332/ab-39677203.out`,
 then removes `../frozen-r332`.
+
+## Round 336: on two nodes the contour patch cuts R2D2 evaluations 22% and wall time 19%, log(Z) agreeing
+
+**Why.** GPU job 39677203 (round 332's race) had still not started, so this
+round asked a multi-node question instead. Round 315 put the opt-in
+contour-adoption patch (`NS_ADOPT_CONTOUR=1`,
+[round 312](#round-312-a-polychord-patch-that-adopts-the-newest-contour-mid-chain-cuts-async-evaluations-14-38-workers-and-22-76-with-unbiased-logz))
+at only -4.0% of evaluations on one node (38 workers). The async waste it
+removes grows with workers, though: the toy's saving went from 14% at 38
+workers to 22% at 76. Multi-node is where large runs go, and the patch had
+never been run in a multi-node R2D2 search.
+
+**Run.** Array job 39679058 (`.probe/r336/array.sh`): six 2-node icelake
+tasks (2 x 38 CPUs, `--nodes 2`, 2 x 39 ranks, 77 workers), each a
+converged production search (nlive 150, 15 repeats, async,
+`--max-ndead -1`) from the frozen tree `../frozen-r336` (`52b80c8`). Both
+arms run on round 313's patched `polychord-adopt.sif`, with
+`NS_ADOPT_CONTOUR` 0 or 1, on round 315's three seeds. Every arm ran on its
+own node pair, so per-arm wall time carries node noise, and evaluation
+counts are the clean measure. All six exited 0 (five started 04:15, the
+last 04:29). `.probe/r336/ana.py` is round 313's script, and wasted chains
+use the same rule.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | ms / eval | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | stock | 0.017470005208756 +/- 0.000383036741368901 | 1,673 | 462 | 74,887 | 78,353 | 108.1 | 719 | 736 s |
+| 190182240 | adopt | 0.0175253337325731 +/- 0.000382519334213831 | 1,397 | 185 | 62,798 | 65,960 | 102.9 | 757 | 653 s |
+| 7311 | stock | 0.017537086295114 +/- 0.000349919766134516 | 1,647 | 434 | 83,963 | 87,253 | 106.3 | 732 | 835 s |
+| 7311 | adopt | 0.0176906570266012 +/- 0.000358036726606559 | 1,402 | 192 | 60,975 | 64,181 | 103.2 | 756 | 634 s |
+| 4242 | stock | 0.0182430737611569 +/- 0.000350129516796424 | 1,679 | 449 | 89,486 | 93,094 | 101.8 | 762 | 926 s |
+| 4242 | adopt | 0.0182171347449805 +/- 0.000349562929821678 | 1,384 | 162 | 67,593 | 71,032 | 100.4 | 786 | 730 s |
+
+| pooled (3 seeds) | stock | adopt | change | 1 node (round 315) |
+| --- | ---: | ---: | ---: | ---: |
+| evaluations | 258,700 | 201,173 | **-22.2%** (per seed -15.8 / -26.4 / -23.7%) | -4.0% |
+| dead points | 4,999 | 4,183 | -16.3% | -11.9% |
+| wasted chains (share of dead) | 1,345 (26.9%) | 539 (12.9%) | -60% | 18.0% -> 6.2% |
+| useful dead points | 3,654 | 3,644 | -0.3% | +0.8% |
+| nlike per dead point | 49.68 | 45.75 | **-7.9%** | +9.0% |
+| summed search wall | 2,497.6 s | 2,016.4 s | **-19.3%** (-11.3 / -24.1 / -21.2%) | node noise |
+
+**Results.**
+- log(Z) agrees seed by seed: -0.05, +0.10 and +0.31 sigma (adopt minus
+  stock). Round 315's 1-node pairs were -0.09/-0.24/-0.41, so the patch
+  shows no sign of bias across six pairs.
+- The saving grows with workers much faster in R2D2 than in the toy.
+  Stock wastes 26.9% of dead points at 77 workers (18.0% at 38), and stock
+  chains get dearer too (nlike per dead point 44.96 on one node, 49.68 on
+  two). Adoption brings both back down: 45.75 per dead point, close to the
+  1-node stock cost. On one node, by contrast, adopted chains cost 9% more
+  ([round 316](#round-316-diagnostic-adopted-r2d2-chains-cost-more-because-r2d2s-cost-per-slice-step-rises-with-the-contour)).
+- Adoption removes most of the 2-node evaluation penalty. Stock needs
+  78-93k evaluations on two nodes against 66-68k on one (round 315).
+  Adopt needs 64-71k, the 1-node stock count. Round 315's 1-node stock
+  walls were 1,218-1,403 s (mean 1,317 s, other nodes), so 2 nodes speed
+  up 1.58x stock (mean 832 s) and **1.96x adopted (mean 672 s)**.
+- In every pair the adopted arm's ms per evaluation is 3-5% higher, at
+  equal `r2d2_iterations` (19.3). Each arm ran on different nodes, so this
+  may be node noise or adopted chains landing on costlier observations;
+  this round cannot tell which. It is already inside the -19.3% wall figure.
+- Sampler-change guard: the patch changes results (fewer, different dead
+  points), so it stays **opt-in**. Whether to make it the default for
+  multi-node searches is the user's call. The evidence for it is now six
+  raced converged pairs with log(Z) agreeing, plus round 312's 40-seed toy
+  check against the analytic log(Z).
+
+**Pending (GPU).** Job 39677203 still had no output file in `.probe/r332/`
+when this round ended. The next round reads `.probe/r332/ab-39677203.out`,
+then removes `../frozen-r332`.
+
+**WSClean guard.** Not needed: no code changed. Rows: bench `r336-a*-s*`
+(six) and stage `r336-adopt-contour-2-nodes`, which holds every log(Z)
+with its error, in `benchmarks.jsonl`. The run dirs were deleted by the
+job. Logs, stats and dead-birth files are in `.probe/r336/`.
