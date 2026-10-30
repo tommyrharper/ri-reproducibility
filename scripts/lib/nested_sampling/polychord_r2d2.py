@@ -37,6 +37,7 @@ from common import (
     encode_finished_records,
     start_record_packer,
     stop_record_packer,
+    POST_RUN_SECONDS,
     post_run_line,
     post_run_phase,
     gathered_window_fit_stats,
@@ -822,6 +823,7 @@ def main() -> None:
             raise
         output = None
     total_wall_seconds = time.monotonic() - run_start
+    returned = time.monotonic()
     finish.close()
     if node_copy:
         import shutil
@@ -830,11 +832,15 @@ def main() -> None:
     if mirror is not None:
         mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
     stop_record_packer(packer)
+    stopped = time.monotonic() - returned
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)
+    started = time.monotonic()
     window_fit_stats = gathered_window_fit_stats()
+    POST_RUN_SECONDS["stop"] = stopped  # before finished_run_records(), which clears the dict
 
     if all_evaluations is not None:
+        started = post_run_phase("window_fit", started)
         best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
         mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
         summary = {
@@ -875,10 +881,10 @@ def main() -> None:
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
+        started = post_run_phase("profile", started)
         # Rank-based, so it can only run now that every evaluation is scored.
         # Mutates the records the summary embeds, so summary.json never names
         # an image this just deleted.
-        started = time.monotonic()
         prune_run_artefacts(evaluations_dir, all_evaluations)
         started = post_run_phase("prune", started)
         summary_path = output_dir / "summary.json"
