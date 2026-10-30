@@ -1,10 +1,14 @@
 # Many-seed validation of `NS_ADOPT_CONTOUR` and `NS_EARLY_STOP`
 
-Status: **design fixed, runs in progress, no result read.** The results section
+Status: **design fixed, runs in progress, no comparison made.** The results section
 is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
-39721865 (Part B, 18 tasks) were submitted on 2026-10-30. The criteria here were committed before any
-result was read and do not change afterwards. Nothing becomes a default: both
-settings stay opt-in, this report recommends, and the user decides.
+39721865 (Part B, 18 tasks) were submitted on 2026-10-30. Part A started at 18:44
+with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
+treated arms, had finished and extracted cleanly, so the pipeline works end to end.
+Those rows were opened only to check they are complete. Part B had not started. The
+criteria here were committed before any result was read and do not change afterwards.
+Nothing becomes a default: both settings stay opt-in, this report recommends, and the
+user decides.
 
 Both settings change results, not just speed. `NS_ADOPT_CONTOUR=1` lets a slice
 adopt a newer contour mid-chain (patch 0001, round 312). `NS_EARLY_STOP=1` stops
