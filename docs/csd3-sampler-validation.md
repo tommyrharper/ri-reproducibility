@@ -5,7 +5,8 @@ is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
 39721865 (Part B, 18 tasks) were submitted on 2026-10-30. Part A started at 18:44
 with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
 treated arms, had finished and extracted cleanly, so the pipeline works end to end.
-Those rows were opened only to check they are complete. Part B had not started. The
+Those rows were opened only to check they are complete. At 19:49 Part A had 23 of
+132 runs recorded, all status ok, with 10 tasks running; Part B had not started. The
 criteria here were committed before any result was read and do not change afterwards.
 Nothing becomes a default: both settings stay opt-in, this report recommends, and the
 user decides.
@@ -86,6 +87,8 @@ the posterior stays close to the prior. log(Z) and the posterior statistics are
 therefore mostly a measure of the prior mean, and may be insensitive to errors in
 the high-RMS tail, which is what this search exists to find. A pass on the rule
 above must be read with that limit; these curves are where a tail error would show.
+`analyse` reports each as a paired difference from stock with a 95% interval. That
+table, added before any comparison was made, is descriptive only and has no verdict.
 
 **Power, worked out before any result.** Condition 2 needs the t half-width plus
 |mean z| under 0.5. With 24 seeds the half-width is 0.42 x sd(z), so sd(z) = 1 would

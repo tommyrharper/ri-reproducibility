@@ -15,6 +15,7 @@ import random
 import re
 import statistics
 import sys
+from datetime import datetime
 from itertools import product
 from pathlib import Path
 from statistics import NormalDist
@@ -26,6 +27,7 @@ PARTS: dict[str, dict[str, Any]] = {
     "B": {"seeds": list(range(9201, 9207)), "arms": ["stock", "stock-repeat", "adopt+stop"],
           "shadow_seeds": [], "shadow_arms": []},
 }
+PART_CPUS = {"A": 38, "B": 304}
 ARM_ENV = {
     "stock": (0, 0), "stock-repeat": (0, 0), "adopt": (1, 0), "stop": (0, 1), "adopt+stop": (1, 1),
     "shadow": (0, 2), "adopt+shadow": (1, 2),
@@ -134,6 +136,9 @@ def record(args: argparse.Namespace) -> None:
            "end": args.end, "job": args.job, "nodes": args.nodes}
     try:
         out.update(extract(args.run_dir))
+        # A shadow run exists only for this count, and a clean exit deletes its directory.
+        if "shadow" in args.arm and not out["wrong_stop"]:
+            raise ValueError("shadow run has no early checks")
         out.update(wall_s=json.loads(args.bench.read_text())["wall_s"], status="ok" if args.exit_code == 0 else "failed")
         if args.exit_code != 0:
             out["why"] = f"exit {args.exit_code}"
@@ -252,6 +257,36 @@ def verdict(result: dict[str, Any], control_significant: int) -> str:
     return "INCONCLUSIVE"
 
 
+def tail_differences(runs: dict[str, dict[int, dict[str, Any]]], arms: list[str]) -> list[str]:
+    """Secondary: paired difference from stock at each tail point. * = interval excludes 0."""
+    points: list[tuple[str, Any]] = [("max objective", lambda r: r.get("max_log_l"))]
+    points += [(f"ln X {x}", lambda r, x=x: r.get("contour_at_log_x", {}).get(str(x))) for x in LOG_X_POINTS]
+    lines = ["| point | " + " | ".join(arms) + " |", "| --- |" + " --- |" * len(arms)]
+    for label, read in points:
+        cells = []
+        for arm in arms:
+            pairs = [(read(runs[arm][s]), read(runs["stock"][s])) for s in sorted(set(runs[arm]) & set(runs["stock"]))]
+            diffs = [a - b for a, b in pairs if a is not None and b is not None]
+            if len(diffs) < 3:
+                cells.append("-")
+                continue
+            mean, _, low, high = mean_ci(diffs)
+            cells.append(f"{mean:+.2e} ({low:+.2e} to {high:+.2e}){'*' if low > 0 or high < 0 else ''}")
+        lines.append(f"| {label} | " + " | ".join(cells) + " |")
+    return lines
+
+
+def spend(rows: list[dict[str, Any]], part: str) -> str:
+    """Core-hours of every recorded run, failed ones too, and how far each arm spread over nodes."""
+    hours = sum((datetime.fromisoformat(r["end"]) - datetime.fromisoformat(r["start"])).total_seconds() / 3600
+                * PART_CPUS[part] for r in rows if r.get("start"))
+    nodes: dict[str, set[str]] = {}
+    for r in rows:
+        nodes.setdefault(r["arm"], set()).add(r.get("nodes", "?"))
+    spread = ", ".join(f"{arm} {len(seen)}" for arm, seen in nodes.items())
+    return f"Spent {hours:,.0f} core-hours. Distinct node lists per arm: {spread}."
+
+
 def load(paths: list[Path]) -> list[dict[str, Any]]:
     records = []
     for path in paths:
@@ -316,6 +351,8 @@ def analyse(records: list[dict[str, Any]], part: str) -> str:
             have = [r["contour_at_log_x"][x] for r in values if x in r.get("contour_at_log_x", {})]
             cells.append(statistics.fmean(have) if have else float("nan"))
         lines.append(f"| {arm} | {len(values)} | " + " | ".join(f"{c:.5f}" for c in cells) + " |")
+    lines += ["", "Paired difference from stock (mean, 95% CI, * = excludes 0):", ""] + tail_differences(runs, arms)
+    lines += ["", spend(rows, part)]
     for arm in PARTS[part]["shadow_arms"]:
         counts = [r["wrong_stop"] for r in ok if r["arm"] == arm and r.get("wrong_stop")]
         if counts:
@@ -371,6 +408,10 @@ def self_check() -> None:
     assert verdicts["adopt"] == "PASS" and verdicts["stock-repeat"] == "PASS", table
     assert verdicts["stop"] == "FAIL" and verdicts["adopt+stop"] == "FAIL", table
     assert "not used: seed 9101 adopt: failed (exit 1)" in table
+    assert re.search(r"^\| ln X -4 \| [+-]\d", table, re.M) and "| ln X -1 | - |" in table, table
+    assert "Distinct node lists per arm: stock 1" in table and "Spent 0 core-hours" in table, table
+    assert spend([{"arm": "x", "nodes": "n", "start": "2026-10-30T10:00:00+00:00",
+                   "end": "2026-10-30T10:30:00+00:00"}], "A").startswith("Spent 19 core-hours")
     print("sampler_validation self-check OK")
 
 
