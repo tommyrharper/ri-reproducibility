@@ -36,6 +36,7 @@ from common import (
     start_chains_mirror,
     finished_run_records,
     pack_finished_run,
+    encode_finished_records,
     start_record_packer,
     stop_record_packer,
     post_run_line,
@@ -544,9 +545,10 @@ def main() -> None:
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
-        write_json_atomic(summary_path, summary)
+        encoded = encode_finished_records()
+        write_json_atomic(summary_path, summary, list(encoded.values()))
         started = post_run_phase("summary", started)
-        pack_finished_run(evaluations_dir)
+        pack_finished_run(evaluations_dir, encoded)
         post_run_phase("pack", started)
         print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))

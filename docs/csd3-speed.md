@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 339; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 340; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -16619,3 +16619,53 @@ dead-birth files are in `.probe/r339/`.
 dirs were deleted after their figures were recorded. `../frozen-r339` and
 `$RI_WORK_DIR/.cache/ri/sifs-r339` were removed. GPU job 39677203 (round
 332) still has no output in `.probe/r332/`.
+
+## Round 340: summary.json and the final pack share one encode per record (-2.7 s at 128k evaluations)
+
+**Question.** Round 339's 8-node jobs spent 29-51 s outside the
+evaluation span (`/usr/bin/time` wall minus bench `wall_s`): 12-14% of a
+4-6 minute search. About 20-26 s of that is rank 0's post-run work, done
+alone while 311 ranks wait: records 6.0, flush 5.8, prune 3.6, summary
+4.5 and pack 5.4 s (encode 4.0) at 128,360 evaluations. This cost grows
+with the evaluation count while the search span shrinks with nodes, so it
+is the serial part that grows with scale. What can come off it without
+changing any output?
+
+**Found.** After prune, rank 0 runs `json.dumps` on every record twice:
+once for the summary body (`_json_text`) and once more in the final pack,
+only to compare against the packed text. A fixture of 128k real records
+(r291-n1b's, made distinct) puts each pass at ~2.6 s on this node.
+
+**Change.** `encode_finished_records()` encodes each record once after
+prune. `write_json_atomic(..., encoded)` and `pack_finished_run(...,
+encoded)` both use those texts. Both drivers call it. If the lengths
+disagree, `_json_text` falls back to encoding. The resume-adoption
+self-check now packs from the encoded texts too, with an edited record,
+and the summary-json self-check compares both paths.
+
+| summary + final pack, 128,360 records, pack on hpc-work | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD 31b6322 | 7.22 s | 6.45 s | 6.67 s | 6.65 s | 6.75 s |
+| encode once | 4.05 s | 4.07 s | 4.02 s | 4.07 s | **4.05 s** |
+
+The pairs ran interleaved (ABBA). The pack phase fell 3.44 -> 0.84 s and
+the summary phase did not change. Every arm wrote byte-identical
+`summary.json` (sha256 `01480a3aa927`) and `records.jsonl`
+(`ff6ab9cb6bd1`). Expected at round 339's 8 nodes: ~3-4 s off a 220-320 s
+search (~1-1.5%), and more at higher evaluation counts.
+
+**WSClean guard.** Two raced pairs (HEAD from a `/dev/shm` worktree
+against this tree, 19 ranks each on alternate CPU halves, seed 229, nlive
+100, synchronous, 2,000 max dead): HEAD 36.9 and 37.5 evals/s, new 36.9
+and 37.4. All four give log(Z) 0.0967023094179472 +/- 0.000520957293962581
+(861 dead) with identical `dead-birth.txt`. The new arm's pack reloads
+exactly as the summary's 4,071 evaluations.
+
+**Left.** `records` (6.0 s: a 282 MB pickle gather of parsed records to
+rank 0; unpickle alone is 1.2 s at 128k) and `flush` (5.8 s) are now the
+largest post-run parts at 8 nodes. The pre-run is ~19-25 s at 8 nodes
+against ~10 s on one node, and nothing yet breaks it down by phase.
+
+Rows: `r340-w{old,new}{1,2}` and stage row `r340-encode-once` in
+`benchmarks.jsonl`. Fixture and scripts are in `.probe/r340/`. All run
+dirs, the fixture and the base worktree were deleted.

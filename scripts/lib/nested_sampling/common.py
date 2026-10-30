@@ -1324,14 +1324,16 @@ def _read_records(names: list[str], read: Any, files: dict[str, Path]) -> list[d
 
 
 def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]],
-                            fold_nodes: bool = True) -> int:
+                            fold_nodes: bool = True, encoded: dict[str, str] | None = None) -> int:
     """Move the records named in `known` ({name: record}) into the pack and
     unlink their files - a flat record, or a pre-round-92 metrics.json and
     then its dir if that held nothing else - and append again any packed one
     `known` has edited since; how many lines it appended. Writers of the pack
     (a resume, the run's packer, the finish) take its lock in turn.
     `fold_nodes` also moves the node packs in, which only a caller no rank
-    is appending beside may do: the run's own packer passes False."""
+    is appending beside may do: the run's own packer passes False.
+    `encoded` holds json.dumps() of records in `known` the caller has already
+    encoded, which this then does not encode again."""
     import fcntl
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1355,7 +1357,7 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
         for name in sorted(known):
             if name in paths and (paths[name].parent == evaluations_dir or name not in texts):
                 moving.append(name)  # a packed name's dir has no record file: only a flat one is newer
-            text = json.dumps(known[name])
+            text = encoded[name] if encoded and name in encoded else json.dumps(known[name])
             # Not on disk at all: a record write the finish cancelled.
             if name in moving or name in on_nodes or text != texts.get(name):
                 lines[name] = text  # the last line of a name is its record
@@ -1508,9 +1510,16 @@ def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[
 _FINISHED_RECORDS: dict[str, dict[str, Any]] = {}
 
 
-def pack_finished_run(evaluations_dir: Path) -> int:
+def pack_finished_run(evaluations_dir: Path, encoded: dict[str, str] | None = None) -> int:
     """Rank 0, once the summary is written: no rank writes records now."""
-    return pack_evaluation_records(evaluations_dir, _FINISHED_RECORDS)
+    return pack_evaluation_records(evaluations_dir, _FINISHED_RECORDS, encoded=encoded)
+
+
+def encode_finished_records() -> dict[str, str]:
+    """json.dumps() of each finished record, by name, once prune has edited
+    them: the summary and the final pack each encoded all of them, 2.6s a
+    time at 128k evaluations (round 340), so they share this."""
+    return {name: json.dumps(record) for name, record in _FINISHED_RECORDS.items()}
 
 
 class PolyChordFinish:
@@ -2062,7 +2071,7 @@ def self_check_resume_adoption() -> None:
         assert [r["eval_id"] for r in records] == [1, 2, 4, 7]
         assert pack_finished_run(evaluations_dir) == 0  # nothing edited
         records[3]["paths"] = {}
-        assert pack_finished_run(evaluations_dir) == 1
+        assert pack_finished_run(evaluations_dir, encode_finished_records()) == 1  # the summary's texts
         assert load_evaluations_from_dir(evaluations_dir) == records
         packer = start_record_packer(evaluations_dir)
         assert packer is not None and packer.poll() is None
@@ -2220,12 +2229,13 @@ def self_check_resume_adoption() -> None:
         assert adopt_completed_evaluations(Path(tmp), cache) == 0
 
 
-def write_json_atomic(path: Path, payload: Any) -> None:
-    """Write JSON through a same-directory temporary file, then replace `path` atomically."""
-    _write_text_atomic(path, _json_text(payload))
+def write_json_atomic(path: Path, payload: Any, encoded: list[str] | None = None) -> None:
+    """Write JSON through a same-directory temporary file, then replace `path` atomically.
+    `encoded`, if given, is json.dumps() of each of payload["evaluations"]."""
+    _write_text_atomic(path, _json_text(payload, encoded))
 
 
-def _json_text(payload: Any) -> str:
+def _json_text(payload: Any, encoded: list[str] | None = None) -> str:
     # A summary's evaluations go one compact line each: indent=2 takes the
     # pure-Python encoder, 5.1s of a 67k-evaluation summary against ~1.6s
     # this way (round 197). The same JSON values; the head stays indented.
@@ -2235,7 +2245,9 @@ def _json_text(payload: Any) -> str:
     # Two spaces and a newline: only the top-level key (a string holds no raw newline).
     slot = '\n  "evaluations": []'
     head = json.dumps({**payload, "evaluations": []}, indent=2)
-    body = ",\n    ".join(map(json.dumps, evaluations))
+    if encoded is None or len(encoded) != len(evaluations):
+        encoded = list(map(json.dumps, evaluations))
+    body = ",\n    ".join(encoded)
     return head.replace(slot, slot[:-1] + "\n    " + body + "\n  ]", 1) + "\n"
 
 
@@ -2253,6 +2265,7 @@ def self_check_summary_json() -> None:
     assert text.startswith('{\n  "evaluation_count": 2,'), text  # the head readers' layout
     assert '\n    {"eval_id": 2, "params": {}}\n  ],\n  "after"' in text, text
     assert repr(json.loads(text)) == repr(summary)
+    assert _json_text(summary, [json.dumps(e) for e in summary["evaluations"]]) == text
     for payload in ({}, {"evaluations": []}, [1], {"eval_id": 1}):
         assert _json_text(payload) == json.dumps(payload, indent=2) + "\n"
     print("OK: summary.json writer")
