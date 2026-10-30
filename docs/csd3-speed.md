@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 322; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 323; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -81,10 +81,13 @@ the Hetzner host.
     +38%, log(Z) +0.55 sigma, three raced pairs). Ranks and batching
     changed together; job 39667582 splits them
     ([round 319](#round-319-gpu-measurement-33-workers-on-gathered-tensorrt-batches-converge-16-sooner-than-the-default-ranks-or-batching-pending)).
-    About 7 s of that 32 s gap is a one-off wait at PolyChord's switch from
-    prior sampling to nested sampling, which the shared server pays
-    (7.66 s every arm) and the gathered one does not (~1 s)
-    ([round 321](#round-321-diagnostic-every-search-stalls-once-at-the-prior-to-sampling-switch-766-s-on-the-shared-gpu-server)).
+    The shared arms' constant 7.66 s `stall_s` is the shared server
+    bringing its lanes up one at a time (~0.72 s each): early ranks fill
+    the prior phase, then wait at its barrier for the last lane. The
+    gathered server builds every context first, so its ranks start
+    together, later
+    ([round 323](#round-323-diagnostic-correction-of-round-321-the-transition-gaps-are-barriers-waiting-on-the-slowest-rank-on-the-shared-gpu-server-that-is-its-last-lane-coming-up),
+    correcting round 321's "late root").
 - **Rounds 216-265 in brief.** The CPU R2D2 forward is at the hardware
   wall: a half-icelake search draws ~90-96% of its socket's measured
   DRAM read bandwidth for U-Net weights alone, so ~53 evals/s looked like
@@ -15541,6 +15544,11 @@ a timed root on a GPU node.
   comparison (+38%) stands; its wall-time gain (16%) includes ~3.5
   points from this transition.
 
+**Correction (round 323).** The root is not late: each gap ends within
+0.01 s of the last in-flight evaluation's end. The 7.66 s is one shared
+lane's *first* evaluation, which ends 22.52 s in because the server brings
+its lanes up one at a time (~0.72 s each). See round 323.
+
 **Decision.** No code change. Next GPU round: time the root rank (e.g.
 `py-spy dump` or a timestamped print around `run_polychord`'s prior
 phase) in one shared-server arm to name the 7.4 s. If B (33 x 1,
@@ -15608,3 +15616,76 @@ that: `srun` cancels the step on every node (SIGTERM, then SIGKILL). The
 fix is defensive, with no measured outcome difference. log(Z) agrees
 (0.03 sigma; arms differ after the kill because the retry's timing differs).
 Run dirs and frozen worktrees are deleted; logs are in `.probe/r322/`.
+
+## Round 323 (diagnostic, correction of round 321): the transition gaps are barriers waiting on the slowest rank; on the shared GPU server that is its last lane coming up
+
+**Question.** Round 321 said PolyChord's root reaches the allreduce after
+the prior loop late: ~1.25 s on CPU and 7.4 s on the 19 x 2 shared
+TensorRT server. What is the root doing then? py-spy cannot attach to a
+rank across Apptainer's user namespace ("Permission Denied", even with
+`ptrace_scope` 0), so the root could not be sampled. Instead,
+`.probe/r323/ends.py` asks the summaries something simpler: when did the
+*last* evaluation started before each gap end?
+
+**Method.** One fresh 39-rank CPU search on this node (`.probe/r323/root.sh`:
+round 302's command with `--max-ndead 60`, 272 evaluations, `6a92e96`),
+round 318's converged search, and round 303's GPU arms
+(`.probe/r303/summary-*.json`). `.probe/r323/slow.py` lists the
+evaluations that held each gap.
+
+| search | gap | last evaluation before it ends | next start | idle after that end |
+| --- | ---: | ---: | ---: | ---: |
+| CPU r323, gap 1 (start 186) | 1.25 s | 9.71 s | 9.72 s | 0.01 s |
+| CPU r323, gap 2 (`time_speeds`, start 225) | 1.31 s | 11.01 s | 11.03 s | 0.01 s |
+| CPU round 318, gap 1 / gap 2 | 1.25 / 1.42 s | 10.51 / 11.93 s | 10.51 / 11.94 s | 0.00 / 0.01 s |
+| GPU A1, gap 1 (start 144) | 7.66 s | 22.52 s | 22.52 s | 0.00 s |
+| GPU A2, gap 1 | 7.66 s | 22.30 s | 22.30 s | 0.00 s |
+| GPU C1, gap 1 (start 158) | 0.51 s | 36.48 s | 36.49 s | 0.01 s |
+
+**Results.**
+- **The root is never late.** Each gap ends within 0.01 s of the last
+  in-flight evaluation's end. Both gaps are barriers: the allreduce after
+  the prior loop waits for every worker's in-flight point, and
+  `time_speeds` waits for every rank's one point. On CPU each costs one
+  slow R2D2 request (~1.3 s, a 25-iteration request). Round 321's
+  "root reached it 7.4 s late" misread the last *started* prior point
+  (14.86 s) as the last to end.
+- **On the shared GPU server, gap 1 is the server's start-up.** In A1
+  the evaluation holding the barrier is one worker's *first*
+  evaluation, which started at 0 s and ended at 22.52 s. The 18 workers'
+  first evaluations end one after another, 0.72-0.73 s apart, in every
+  shared arm (A1 10.2 -> 22.5 s, A2 9.9 -> 22.3, A3 10.4 -> 22.8, W1
+  17.8 -> 30.2). `serve_trt_shared` builds its lanes (25 execution
+  contexts each) one at a time and starts serving each as soon as it
+  exists (round 221). Early lanes' ranks race through the 128 prior
+  points by ~15 s, then wait at the barrier for the last lane. The
+  gathering server (C) builds every context before it serves, so all 32
+  first evaluations end together (C1 34.96-35.20 s, C2 29.0-29.1, C3
+  28.1-28.4), and its gap 1 is only the ordinary ~0.5 s wait for one slow
+  request. Its start-up is longer, but
+  everyone pays it at once.
+- So round 303's constant `stall_s` 7.7 s on shared arms is the tail of
+  lane bring-up, not a transition cost. It is constant because the
+  bring-up is (~0.72 s per lane). It grows with the number of lanes:
+  ~0.72 x (ranks - 1) minus the time the fast lanes take to fill the
+  prior phase. Round 319's A-vs-C wall times include different start-ups
+  on both sides (A's lanes are all up ~6-12 s before C's first
+  evaluation ends), so the steady +38% is still the comparison that holds.
+
+**What it costs and what would fix it.**
+- CPU: nothing to fix. ~2.6 s once per search are two barriers, each
+  waiting for one slow request; skipping `time_speeds` would change the
+  random stream (round 321).
+- Shared GPU server: ~7.7 s of 19 ranks idle once per search (3.8% of
+  a 200 s arm, ~0.6% of a 20-minute one). The lever is to bring the
+  lanes up in parallel, building each lane's contexts in its own thread
+  (if TensorRT's Python binding releases the GIL in
+  `create_execution_context`), or to build the 475 contexts before any
+  lane serves, as the gathered server does. Both need a GPU node. Note it
+  for the next GPU round; nothing changes on CPU.
+
+**Decision.** No code change. Round 321's mechanism and "Where it
+stands" are corrected. Stage row `r323-transition-barriers` is in
+`benchmarks.jsonl` with the probe search's own bench row (`r323-root`,
+partial run, 19.8 evals/s: too short to compare). The run directory is
+deleted.
