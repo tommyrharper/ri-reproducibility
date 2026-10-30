@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 358; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 360; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Largest open lever: stopping below-contour evaluations.** `NS_EARLY_STOP=1`
   (opt-in) stops R2D2 once an iterate's RMS is well under the contour. Three
@@ -24,6 +24,10 @@ the Hetzner host.
   mode, log(Z) +0.06 sigma, 0.06% wrong stops. At 16 workers adoption added
   nothing on top of early stop, and multi-node is still unmeasured
   ([round 358](#round-358-early-stop-with-contour-adoption-wall--28-logz-agreeing-adoption-adds-nothing-at-16-workers)).
+  On two nodes (77 workers) the pair gave wall **-38%** (1.62x) over three seeds
+  with log(Z) within 0.44 sigma, and adoption added -18% there; wrong stops ran
+  0.025-0.375% by seed; on a clean node early stop alone stays ~-14%
+  ([round 360](#round-360-early-stop-across-two-nodes-wall--38-with-adoption-over-three-seeds-logz-agreeing-on-a-clean-node-it-stays--14)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -17577,3 +17581,81 @@ both stay opt-in, and any default is the user's decision. No code changed, so no
 WSClean guard ran. `benchmarks.jsonl` gained rows r358-3581-1-0/1 and
 r358-3582-1-1/2-1 from the searches. Run directories are deleted; gzipped
 summaries and posteriors are in `.probe/r358`.
+
+## Round 360: early stop across two nodes: wall -38% with adoption over three seeds, log(Z) agreeing; on a clean node it stays ~-14%
+
+Nothing was built. Round 358 left two questions: does early stop compound with
+contour adoption at 77 workers, where adoption pays, and was round 356's -16%
+depressed by the toy sweep sharing its node? Runs and files carry the `r359`
+label, because round 359 started them and logged nothing. Its local race was
+reported stopped, but `timeout` makes its own process group, so the group kill
+missed both 3591 arms. They were still running and were adopted here. Their
+settings were checked in `/proc`, and only their console logs were lost.
+
+**Two nodes (async, nlive 150, 15 repeats, converged, `--nodes 2`, 2 x 38 CPUs, 77
+workers; array 39708539, `.probe/r359/array.sh`).** `shadow` makes no stops, so it
+is the control. Every arm got its own node pair, so these are not simultaneous
+races, and each row's full-precision log(Z) is in `benchmarks.jsonl`.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | against shadow (sigma) |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | shadow + adopt | 632.6 | 66,372 | 18.84 | 104.9 | 0.0176540757742428 +/- 0.000387823083641412 | |
+| 190182240 | stop + adopt | 458.5 | 64,515 | 10.77 | 140.7 | 0.0174853333258051 +/- 0.000380176336546292 | -0.31 |
+| 190182240 | stop | 616.8 | 91,585 | 11.21 | 148.5 | 0.0176470349606619 +/- 0.000388663250747397 | -0.01 |
+| 7311 | shadow + adopt | 733.0 | 73,395 | 18.37 | 100.1 | 0.017542759710522 +/- 0.000348928841945722 | |
+| 7311 | stop + adopt | 383.6 | 64,420 | 10.77 | 167.9 | 0.0176976467563864 +/- 0.000357262939046478 | +0.31 |
+| 7311 | stop | 431.6 | 74,976 | 11.64 | 173.7 | 0.0177316628229008 +/- 0.00036172904033314 | +0.37 |
+| 4242 | shadow + adopt | 710.8 | 67,730 | 19.26 | 95.3 | 0.0183202621119982 +/- 0.000354418211264077 | |
+| 4242 | stop + adopt | 440.3 | 68,532 | 10.74 | 155.6 | 0.01810335897134 +/- 0.000342817682927003 | -0.44 |
+| 4242 | stop | 523.6 | 79,681 | 10.98 | 152.2 | 0.0183815234243697 +/- 0.0003585229102406 | +0.12 |
+| sum | shadow + adopt | 2,076.4 | 207,497 | | 99.9 | | |
+| sum | stop + adopt | 1,282.4 | 197,467 | | 154.0 | | |
+| sum | stop | 1,572.0 | 246,242 | | 156.6 | | |
+
+Stop + adopt against shadow + adopt: wall **-38.2%** (1.62x), -27.5% to -47.7% by
+seed, evaluations -4.8%. Adoption on top of early stop: wall **-18.4%**,
+evaluations -19.8%, in line with round 336's -19.3% without early stop, so the two
+do compound at 77 workers, unlike round 358's one seed at 16. The stop arm without
+adoption gained -24.3%, with 18.7% more evaluations.
+
+Posterior moments agree on all 9 columns for both arms against shadow: mean shifts
+at most 0.07 posterior sd, sd ratios 0.98-1.04, largest |z| 0.98. Log(Z) is within
+0.44 sigma on every seed, with no shared sign.
+
+**Wrong stops at 77 workers, with adoption.** 91 of 58,621 above-contour
+evaluations pooled (0.16%), but 69 of 18,403 (0.375%), 5 of 19,889 (0.025%) and 17
+of 20,329 (0.084%) by seed. Seed 190182240 is 15x seed 7311 and over twice the top
+of round 354's replay range (0.04-0.16%), with margins up to 1.115 x contour. So
+the rate is not one number: it varies by seed more than it did at 16 workers, and
+the cause is not known. No moment or log(Z) moved with it here, but three seeds
+cannot bound that.
+
+**Clean node (async, nlive 150, 5 repeats, converged, 1 node, 17 ranks each, 16
+workers x 1 thread, started ~2 s apart, nothing else on the node).** Simultaneous
+pairs, no adoption.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | stopped |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3591 | shadow | 893.3 | 20,724 | 19.49 | 23.2 | 0.0173447980427914 +/- 0.000408753726328148 | (10,267 would) |
+| 3591 | stop | 822.1 | 24,857 | 13.14 | 30.2 | 0.0173207376067225 +/- 0.000411886451789813 | 11,882 |
+| 3592 | shadow | 831.1 | 20,367 | 18.70 | 24.5 | 0.0170227716198689 +/- 0.00040246449579278 | (7,788 would) |
+| 3592 | stop | 657.9 | 20,864 | 11.82 | 31.7 | 0.0170041035712933 +/- 0.00039825737905899 | 9,725 |
+
+Wall -8.0% and -20.8%, **-14.2%** summed (1.17x), evaluations +11.3%, log(Z) -0.04
+and -0.03 sigma, mean shifts at most 0.12 posterior sd, sd ratios 0.95-1.03, largest
+|z| 1.46. Time per evaluation fell 23% in both pairs. So the toy sweep does not
+explain round 356: a clean node gives the same ~-15%, and round 358's -28% was one
+pair. The spread comes from how many evaluations a seed needs, and the rate gain
+of ~+30% is the stable part. Wrong stops were 2 of 14,617 above-contour evaluations
+(0.014%), both shadow arms together.
+
+**What this does not establish.** The two-node arms ran on different node pairs,
+some starting on busy nodes (load ~43 on one), so wall by seed carries node
+variation that the sum only partly averages. Three seeds at nlive 150 are not the
+target-size search, and early stop has never run at nlive 500. Round 356's toy
+shifted log(Z) only at ~10% wrong stops, far above 0.375%, but that toy is not this
+posterior. Both settings change the sampler, so under
+the guard they stay opt-in, and any default is the user's decision. No code changed,
+so no WSClean guard ran. `benchmarks.jsonl` gained the 13 rows above. Run
+directories, `../frozen-r359` and the `sifs-r359` links are deleted; gzipped
+summaries and posteriors are in `.probe/r359`.
