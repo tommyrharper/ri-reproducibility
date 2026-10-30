@@ -25,6 +25,7 @@ from common import (
     WORKER_DIED,
     WorkerDied,
     ZYGOTE_COMMAND,
+    abort_on_exception,
     abort_run,
     adopt_completed_evaluations,
     clean_convergence_from,
@@ -72,6 +73,7 @@ from common import (
     self_check_spectral_window,
     self_check_worker_pool_connect,
     self_check_cpu_pinning,
+    self_check_abort_on_exception,
     self_check_worker_timeout,
     sidecar_command,
     zygote_run,
@@ -571,9 +573,10 @@ if __name__ == "__main__":
         self_check_chains_mirror()
         self_check_failure_record_persistence()
         self_check_resume_adoption()
+        self_check_abort_on_exception()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
         self_check_cpu_pinning()
         print("metric resolution self-check passed")
     else:
-        main()
+        abort_on_exception(main)

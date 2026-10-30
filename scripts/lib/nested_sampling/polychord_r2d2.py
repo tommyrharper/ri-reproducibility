@@ -21,6 +21,7 @@ from common import (
     FAILURE_OBJECTIVE,
     WORKER_DIED,
     WorkerDied,
+    abort_on_exception,
     abort_run,
     adopt_completed_evaluations,
     cube_like_from_theta,
@@ -66,6 +67,7 @@ from common import (
     self_check_source_offset,
     self_check_spectral_window,
     self_check_worker_pool_connect,
+    self_check_abort_on_exception,
     self_check_worker_timeout,
     simulate_measurement_set,
     simulate_worker,
@@ -860,10 +862,11 @@ if __name__ == "__main__":
         self_check_failure_record_persistence()
         self_check_worker_death_is_not_scored()
         self_check_resume_adoption()
+        self_check_abort_on_exception()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
         self_check_follow_worker_node()
         self_check_share_resume()
         print("metric resolution self-check passed")
     else:
-        main()
+        abort_on_exception(main)

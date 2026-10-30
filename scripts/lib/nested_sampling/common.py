@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache, lru_cache
@@ -182,6 +183,21 @@ def abort_run(message: str) -> None:
         # to the hard exit, which the launcher turns into a failed run anyway.
         pass
     os._exit(1)
+
+
+def abort_on_exception(main: Any) -> None:
+    """Run a rank's main(), aborting the job if it raises. A rank that just
+    exits leaves the others in their next collective and MPI_Finalize waiting
+    for them: a failed end-of-run gather held 8 nodes until the job's timeout
+    (round 348). Only a clean exit gets past here without Abort."""
+    try:
+        main()
+    except SystemExit as error:
+        if error.code not in (None, 0):
+            abort_run(str(error.code))
+        raise
+    except BaseException:
+        abort_run(traceback.format_exc())
 
 
 # CLEAN's minor-iteration budget. At the old 100 roughly four evaluations in
@@ -1269,6 +1285,16 @@ def _read_pack_file(path: Path, texts: dict[str, str]) -> int:
     return whole
 
 
+def _pack_is_torn(evaluations_dir: Path) -> bool:
+    """Whether the run pack ends in a killed rank's half-written line."""
+    try:
+        with open(evaluations_dir / RECORD_PACK, "rb") as pack:
+            pack.seek(-1, os.SEEK_END)
+            return pack.read(1) != b"\n"
+    except OSError:  # no pack, or an empty one
+        return False
+
+
 def _read_record_pack(evaluations_dir: Path, nodes: bool = True) -> tuple[dict[str, str], int, set[str]]:
     """({name: record json} from the packs, the length of the run pack's
     whole lines, the names only a node pack holds)."""
@@ -1937,7 +1963,9 @@ def adopt_completed_evaluations(
     # Collective, and before the pack: no rank reads a flat record after it.
     if comm is not None:
         comm.bcast((adopted, keys), root=0)
-    if good or node_packs(evaluations_dir):
+    # An appending run leaves no flat records, so a torn last line alone must
+    # still reach the pack writer, or the next append runs on into it (round 348).
+    if good or node_packs(evaluations_dir) or _pack_is_torn(evaluations_dir):
         started = time.monotonic()
         packed = pack_evaluation_records(evaluations_dir, good)
         if packed:
@@ -2175,6 +2203,17 @@ def self_check_resume_adoption() -> None:
         assert pack_finished_run(evaluations_dir) == 0, "the finish re-appended an appended record"
         with open(evaluations_dir / RECORD_PACK, "a") as pack:
             pack.write('eval-0011-bcd\t{"eval_id": 11, "par')
+        # With no flat record for the resume to pack it must still cut the tail.
+        appending = evaluations_dir / "appending"
+        appending.mkdir()
+        (appending / RECORD_PACK).write_text(
+            'eval-0001-a\t{"eval_id": 1, "params": {"a": 1}, "objective": 0.5}\n'
+            'eval-0002-b\t{"eval_id": 2, "par')
+        assert _pack_is_torn(appending)
+        assert adopt_completed_evaluations(appending, {}) == 1
+        assert not _pack_is_torn(appending), "a resume left the torn line for the next append"
+        (appending / RECORD_PACK).unlink()
+        appending.rmdir()
         assert pack_evaluation_records(evaluations_dir, {}) == 0
         write_records_in_background()
         write_evaluation_record(evaluations_dir / "eval-0012-efg",
@@ -3988,6 +4027,42 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
         [params[spec["name"]] if spec["name"] in params else math.log10(params["dynamic_range"]) for spec in load_parameter_space()],
         dtype=np.float64,
     )
+
+
+def self_check_abort_on_exception() -> None:
+    """A rank that raises aborts the job; a clean exit does not (round 348)."""
+    global abort_run
+    real, aborts = abort_run, []
+    abort_run = aborts.append
+    try:
+        abort_on_exception(lambda: None)
+        assert aborts == []
+
+        def exits(code: Any) -> None:
+            raise SystemExit(code)
+
+        for code in (None, 0):
+            try:
+                abort_on_exception(lambda: exits(code))
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("a clean SystemExit was swallowed")
+        assert aborts == []
+
+        def fails() -> None:
+            raise RuntimeError("the gather failed")
+
+        abort_on_exception(fails)
+        assert len(aborts) == 1 and "the gather failed" in aborts[0], aborts
+        try:
+            abort_on_exception(lambda: exits("FATAL: bad"))
+        except SystemExit:
+            pass  # abort_run does not return; this fake one does
+        assert aborts[1:] == ["FATAL: bad"], aborts
+    finally:
+        abort_run = real
+    print("abort on exception self-check passed")
 
 
 def self_check_worker_timeout() -> None:

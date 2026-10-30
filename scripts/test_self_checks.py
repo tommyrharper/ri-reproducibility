@@ -33,6 +33,7 @@ HOST_RUNNABLE = {
         "self_check_cpu_pinning",
         "self_check_follow_worker_node",
         "self_check_worker_timeout",
+        "self_check_abort_on_exception",
     ),
     "r2d2_serve": (
         "self_check_checkpoint_cache",

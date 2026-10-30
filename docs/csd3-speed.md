@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 345; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 348; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
@@ -16992,3 +16992,89 @@ Rows: `r345-*` and `r345b-*` (bench rows) and stage row `r345-gather-limit` in
 `benchmarks.jsonl`. The bench rows have commit `unknown`, as the trees are `git
 archive` copies. `self_check_streaming_retention` now covers both functions; its
 third pass goes through the real `finished_run_records()`.
+
+## Round 348: fix: a failing rank now aborts the job, a resume cuts a torn pack tail; round 345's strip measured at 8 nodes
+
+Gnhf 346 and 347 ran out of time on their guards and shipped nothing, so this
+round covers their work. `.probe/r346` keeps that older name.
+
+**The hang.** Round 345's failed gather held 8 nodes for 16 minutes. Reproduced
+with 8 ranks in `polychord.sif` (`.probe/r346/hang.py`): rank 0 raising, or
+calling `SystemExit`, while the others wait in `bcast` never exits. `timeout 60`
+ends it with exit 124. Each rank's `main()` now runs inside
+`abort_on_exception()`, so any exception or non-zero `SystemExit` calls
+`abort_run`, and a clean exit passes.
+
+| failure injected on rank 0 before the end-of-run gather | before | after |
+| --- | ---: | ---: |
+| 8-rank fixture, raise or `SystemExit` | never exits (killed at 60 s) | exit 1 in ~0.9 s |
+| 1-node search, 19 ranks, nlive 50 | not run | exit 1, 27 s in total |
+| 2-node search (job 39687787), 78 ranks | not run | exit 1, 31 s in total |
+| 8 nodes, the real gather failure (job 39686035) | exit 124 after 960 s | not rerun |
+
+The search figures include `run_with_retries`' one retry, which scores nothing
+and stops. `chains/` survives and no `summary.json` is written.
+
+**A second bug: a resume left a torn pack tail.** `./ri self-check self-heal`
+failed on the patched tree with "the torn last line survived the resume". The
+abort patch did not cause it. `adopt_completed_evaluations()` only called the
+pack writer when flat records or node packs existed, and an appending run (the
+default since round 264) has neither. So the truncate never ran, and the next
+append ran on into the fragment: the failing run's pack had
+`eval-9999-...<fragment>eval-0012-...` on one line, so a kill mid-append cost
+one more record, the resume's first. A one-byte tail check (`_pack_is_torn`) now
+sends that case to the pack writer without reading the pack.
+
+The check found this only because it ran. It last passed in round 280, and
+leftover `.self-heal-*-1817628` directories from 28 Oct (deleted here) show a run
+that stopped without cleaning up; its cause was not checked. The first version
+of the new self-check passed with the fix removed, because its fixture had flat
+records. The final one uses an append-only directory, and fails with
+"a resume left the torn line" when the fix is mutated out.
+
+**Round 345's strip, measured.** Job 39687378, same settings and seed 345 as
+round 344's second run, 8 icelake half-nodes, with `gather_large` and
+`strip_unkept_evaluations` (tree `../frozen-r345`):
+
+| | round 344, seed 345 | round 345's tree, seed 345 |
+| --- | ---: | ---: |
+| evaluations | 425,400 | 412,638 |
+| prune | ~23 s | **2.4 s** |
+| flush | ~6 s | 3.7 s |
+| wall | 1,145 s | 986 s |
+| log(Z) | 0.0173758961596796 +/- 0.00020058887505272 | 0.0173410242589495 +/- 0.00019941208120242 |
+
+Ranks stripped 16,418 evaluations in the flush (12,283 extremes, 4,135 of the 1 in
+100), slowest rank 2.63 s. The split confirms round 345: the 1 in 100 are a real
+part, and extremes are the larger one. Post-run: drain 0.4, records 9.5, flush
+3.7, prune 2.4, summary 5.2, pack 5.0 s. The run left 1,870 files, 2,257 MB, and
+exited 0 at 412,638 records with no gather failure, though that is under round
+345's failing count, so `gather_large` was not exercised past 2 GiB at this
+size. It ran at 419 steady evals/s against ~390 in round 344; one run per arm
+does not attribute that, and the arms stopped at different evaluation counts.
+The same seed gives different chains because async order differs; the log(Z)
+gap is ~0.1 sigma.
+
+**Guards.** Raced, both trees on /dev/shm, synchronous, 19 ranks,
+`NS_RETAIN_FLUSH_SECONDS=20`. Pairs 1-2 are HEAD against the abort patch; pair 3
+is the abort patch against the abort patch plus the resume fix. A later edit
+touched only the self-check, and no pair covers the resume fix on R2D2: it only
+adds one read in shared code.
+
+| pair | imager | log(Z) | steady evals/s old / new |
+| --- | --- | --- | ---: |
+| 1 | WSClean | 0.0967023094179472 +/- 0.000520957293962581 | 37.55 / 37.52 |
+| 2 | R2D2 | 0.0147479521559665 +/- 0.00259029680327724 | 19.00 / 18.93 |
+| 3 | WSClean | same as 1 | 37.52 / 37.45 |
+
+Dead-birth chains are byte-identical in every pair (51f16314ee36, 85b5c92bed16).
+All three new arms are slightly slower (0.1-0.4%), inside the ~5% noise.
+
+**Checks.** On the final code `./ri self-check r2d2` and `wsclean`,
+`test_self_checks.py` (32 host checks), `test_watchdogs.py`, bench's self-check
+and compileall pass. `./ri self-check self-heal` passed in 145 s with both fixes,
+before the last edit, which touched only a self-check. ruff is not a CI step; it
+gained two findings here, `BLE001` (deliberate) and `B023` (in the self-check).
+
+Rows: `r346-*` (bench rows, commit `unknown`), `r345-big2`, and stage row
+`r348-abort`.

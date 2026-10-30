@@ -415,6 +415,12 @@ round 246).
 The same hang is closed at its source too: the likelihood aborts the whole job
 (`MPI_Abort`) on **any** unexpected exception, not only `WorkerDied`.
 
+Outside the likelihood, `abort_on_exception()` wraps each rank's `main()`. A rank
+that raised in an end-of-run gather used to exit alone and leave the rest in
+`MPI_Finalize` or the next collective, which held 8 nodes for 16 minutes until
+the job's timeout (docs/csd3-speed.md, round 348). Any exception, or a
+`SystemExit` with a non-zero code, now aborts the job; a clean exit passes.
+
 ## A worker that died while nobody was talking to it
 
 Each rank keeps one long-lived worker per sidecar, and each request path
