@@ -17777,3 +17777,75 @@ compare with `r344-big2`, and only then delete `../frozen-r361` and `sifs-r361`.
 percent more wall time. The wrong-stop rate has now been measured on one fresh
 seed only. Checks passed: `./ri self-check r2d2-serve` (including early stop),
 `./ri self-check r2d2`, `scripts/test_self_checks.py`.
+
+## Round 366 (negative, replay): neither the RMS trend nor retuned ratios close early stop's gap; shipped ratios queued at target size
+
+**Question.** Round 365's shipped rule saves 36-39% of U-Net iterations. If every
+below-contour evaluation stopped at the first check under its contour, it would
+save 59%. Can a better rule, replayed on the two shadow traces with `early_checks`,
+take a useful part of that gap? `r363-trace` (65,312 evaluations with a live
+contour, seed 190182240, 15 repeats) and the shadow arm of round 365's pair (20,686
+evaluations, seed 3651, 5 repeats). No search ran for this, and no code changed.
+Scripts are `.probe/r366/{a,b,c}.py`.
+
+**Where the shipped rule stops.** Share of evaluations by the check that stops them:
+
+| trace | 3 | 4 | 5 | 6 | 8 | 10 | 12 | 15 | 18 | never |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| r363-trace | 20.2 | 10.5 | 0.9 | 0.4 | 3.6 | 4.7 | 4.4 | 4.0 | 2.6 | 48.7 |
+| seed 3651 | 15.2 | 10.6 | 1.2 | 0.6 | 4.0 | 5.1 | 5.1 | 5.0 | 3.8 | 49.5 |
+
+Checks 5 and 6 do almost nothing, because their ratios sit under iteration 4's. Of
+the evaluations never stopped, 39% end below the contour (12,457 of 31,794 and
+3,999 of 10,242).
+
+**A rule using the RMS trend gains ~2 points and costs more wrong stops.** The
+ratio at check k was binned by RMS(k) / RMS(previous check), fitted on one trace
+as the lowest RMS(k) / final (or an eps quantile of it, less 1%), and tested on the
+other. Check 3 stayed at 0.82.
+
+| fit -> test | rule | iterations saved | wrong stops |
+|---|---|---:|---:|
+| r363 -> 3651 | shipped | 36.1% | 0 of 6,243 |
+| r363 -> 3651 | trend, eps 0 | 33.8% | 0 |
+| r363 -> 3651 | trend, eps 0.001 | 41.1% | 0 |
+| 3651 -> r363 | shipped | 39.0% | 1 of 19,338 |
+| 3651 -> r363 | trend, eps 0 | 41.3% | 6 |
+| 3651 -> r363 | trend, eps 0.001 | 43.5% | 8 |
+
+The trend does not explain the tail. Over round 354's 70,427 full traces, RMS(k) /
+final has a 1st percentile of 0.94 at most iterations, but its minimum falls to
+0.29 by iteration 6. Those evaluations finish far above an early iterate, and they
+are the high-RMS points this search exists to find, so the rule cannot be fitted
+around them.
+
+**Retuned fixed ratios gain ~3 points, also in-sample.** Check 3 at 0.82 and 4 at
+0.86 throughout, unless the row says otherwise:
+
+| ratios at 5, 6, 8, 10, 12, 15, 18 | r363 saved | r363 wrong | 3651 saved | 3651 wrong |
+|---|---:|---:|---:|---:|
+| shipped: .84 .82 .84 .87 .90 .93 .95 | 39.0% | 1 | 36.1% | 0 |
+| .86 .86 .86 .87 .90 .93 .95 | 39.6% | 2 | 36.8% | 0 |
+| .87 .88 .88 .89 .91 .93 .95 | 40.7% | 2 | 37.9% | 0 |
+| .88 .89 .90 .91 .92 .94 .95 | 41.8% | 3 | 39.2% | 0 |
+| .89 .90 .92 .93 .94 .95 .96 | 43.7% | 7 | 41.6% | 0 |
+
+Each extra point of iterations is worth under one point of wall, so the ratios stay
+as shipped. These traces are too small to choose between 1 and 3 wrong stops. The
+target-size shadow run below should hold ~6x as many above-contour evaluations as
+`r363-trace` (estimated from 400k evaluations at ~30% above contour).
+
+**Target-size control queued (array 39712455, `.probe/r366/array.sh`, frozen tree
+`../frozen-r366` at 17d68b8).** Seed 344, nlive 500, 25 repeats, 8 icelake
+half-nodes, adopting, `SIF_DIR` `.cache/ri/sifs-r361`. Task 0 is the shipped ratios
+and task 1 is shadow on the same code and seed, so this gives the first target-size
+wall time for the shipped ratios, a same-tree control, the wrong-stop rate at 311
+workers, and a trace in `.probe/r366/checks-r366-big-m2.jsonl.gz`. Neither task had
+output when this round closed, and neither had seed 345 of array 39710176.
+
+**Noted, not measured.** Round 365's 8-node run lost 38.6 s to a whole-search stall
+at its start, all of it the first request (`first_request_s` 38.76), which is 6.2%
+of a 620.7 s search. Round 303 called a fresh node's start ~2% of a 20-minute
+search; a faster search raises that share. The stdout records carry no timing and
+that run's `summary.json` is deleted, so this log cannot split it by node. The
+checkpoints are already striped over 32 OSTs.
