@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 330; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 331; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -16000,3 +16000,66 @@ job had not started when this iteration ended.
 
 **WSClean guard.** Not needed: both edits are R2D2-GPU-only (the gathering
 server) or bench reporting.
+
+## Round 331 (negative, reverted): pinning each R2D2 rank and its two workers to one CPU
+
+**Why.** GPU job 39673960 (round 330) had still not started, so this round
+took a CPU lever this node can answer. WSClean ranks have pinned themselves
+and their workers to one CPU each since round 16 (+10-20% there), but R2D2
+ranks have never been pinned: `pin_rank_cpu` is WSClean-only, and the R2D2
+path only follows its worker's socket (`follow_r2d2_worker_node`, round 176).
+That choice was made when R2D2 ranks ran multi-thread U-Nets. Since round
+276 they run 39 x 1, so a rank, its simulate worker and its R2D2 worker take
+turns on what could be one CPU. (Separately, a stand-in for the gathering GPU
+server, round 330's `gather_bench.py` with the server thread on its own CPU
+and 33 workers on the other 31 of 32, gave +20-23% requests/s and 3.2-3.7 ms
+round trips against 4.3-6.4 ms floating. That is a GPU-node question for a
+later round.)
+
+**Change (tried).** Opt-in `NS_R2D2_PIN_CPU=1`: after a rank's first
+evaluation, `pin_r2d2_rank_cpu` (`common.py`) claims a CPU with the same
+`/dev/shm/ri-cpu-<n>.lock` flock that `pin_rank_cpu` uses, pins the rank's
+main thread to it, and pins the R2D2 and simulate workers' process trees
+there too. The record writer keeps the whole set. The root rank never
+evaluates, so 38 workers get 38 CPUs. The affinity sampler shows 35+
+single-CPU process masks 90 s into each pinned arm and none in the default
+arms. The diff is kept at `.probe/r331/pin-r2d2-rank-cpu.diff`, with a host
+self-check.
+
+**Run.** On this half icelake node (38 CPUs), at 510cc01 plus the diff,
+async, `--nlive 48 --num-repeats 5 --max-ndead 400 --seed 331`, after a
+60-dead warm-up, in order p1 d1 d2 p2 p3 d3 (`.probe/r331/ab.sh`). The
+other half's tenant held the load average at 53-61 throughout.
+
+| arm | evals | steady evals/s | R2D2 iterations | image_container ms | ms / iteration | simulate ms | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| p1 pinned | 7034 | 43.73 | 19.94 | 811.1 | 40.67 | 42.5 | 0.0171419489667471 +/- 0.000677295834789436 |
+| d1 default | 7661 | 46.68 | 18.12 | 763.1 | 42.10 | 40.6 | 0.0172308665722291 +/- 0.000610409292634685 |
+| d2 default | 6314 | 45.43 | 18.12 | 778.5 | 42.97 | 43.5 | 0.0177644203806394 +/- 0.000597937251378693 |
+| p2 pinned | 8525 | 47.79 | 18.33 | 749.1 | 40.87 | 32.6 | 0.0168266553499682 +/- 0.000798281510098369 |
+| p3 pinned | 7822 | 44.78 | 18.89 | 793.8 | 42.02 | 39.4 | 0.0174345696366729 +/- 0.000633970957589139 |
+| d3 default | 6421 | 46.47 | 18.64 | 770.6 | 41.35 | 34.7 | 0.0176033321973591 +/- 0.000587966847088969 |
+
+**Learned.**
+- Null. Raw steady rates are 45.43 pinned against 46.19 default (-1.6%),
+  but the pinned arms happened to run more U-Net iterations per request
+  (round 317's early stop). Per iteration the pinned request is 41.19 ms
+  against 42.14 (-2.3%). The pairs go -3.4%, -4.9% and +1.6%, which is
+  inside this host's ~5% spread on a loaded node. That is not enough to
+  ship a new default under the "verified by A/B" rule, so the code is
+  reverted.
+- Pinning does not hurt: no stalls, peak memory unchanged (8.17-8.28 GB),
+  and log(Z) agrees (pinned 0.01683-0.01743, default 0.01723-0.01776, sigma
+  ~0.00065; the widest pair, p2 against d2, is 0.9 combined sigma). If it is
+  retried, it needs a quiet node and 6+ pairs, judged on ms per iteration.
+  The result fits round 205: the CPU forward is bound by DRAM bandwidth,
+  which no placement within one socket changes.
+- The GPU-side stand-in result (a dedicated server CPU, +20%) is a separate
+  and larger lever. On the GPU node, 33 ranks on 32 CPUs leaves `pin_rank_cpu`'s
+  `ranks <= cpus` guard false anyway, so nothing there is pinned today.
+
+**Pending (GPU).** Job 39673960 (round 330) started while this round ran.
+At 03:09 it had finished W, A1, B1 and C1 (walls 226, 214 and 205 s for A1, B1 and C1, one pass) and was running C2. The next round reads
+`.probe/r330/ab-39673960.out`.
+
+**WSClean guard.** Not needed: nothing shipped.
