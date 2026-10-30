@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 338; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 339; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -59,7 +59,11 @@ the Hetzner host.
     ([round 336](#round-336-on-two-nodes-the-contour-patch-cuts-r2d2-evaluations-22-and-wall-time-19-logz-agreeing)).
     On four nodes (155 workers, three seeds) it is -24.1% evaluations and
     -23.3% wall, converging 3.55x faster than one node (stock 2.72x)
-    ([round 338](#round-338-4-node-contour-ab-complete-three-seeds--24-evaluations-a-clean-exit-0-early-stop-is-now-flagged)). Searches with more workers
+    ([round 338](#round-338-4-node-contour-ab-complete-three-seeds--24-evaluations-a-clean-exit-0-early-stop-is-now-flagged)).
+    On eight nodes (311 workers, two seeds) stock converges 4.37x faster
+    than one node and the patch 5.72x (-26.0% evaluations, -23.6% wall);
+    8 nodes are only ~1.6x faster than 4 at nlive 150
+    ([round 339](#round-339-8-nodes-converge-44x-stock-and-57x-contour-patch-faster-than-one-wsclean-gets-the-nfail-fix)). Searches with more workers
     than nlive were impossible before round 337: PolyChord's `nfail` guard
     stopped them after the prior with exit 0
     ([round 337](#round-337-fix-multi-node-with-more-workers-than-nlive-polychord-stopped-after-the-prior-exit-0-meaningless-logz)).
@@ -16530,3 +16534,88 @@ still has no output (`.probe/r332/`).
 
 Rows: bench `r337-a{0,1}-s4242` and stage `r338-adopt-contour-4-nodes-3-seeds`
 in `benchmarks.jsonl`.
+
+## Round 339: 8 nodes converge 4.4x (stock) and 5.7x (contour patch) faster than one; WSClean gets the nfail fix
+
+**8-node pair.** Array job 39681494 ran round 337's converged production
+search on 8 icelake half-nodes (8 x 39 ranks, 311 workers, nlive 150, 15
+repeats) with `NS_ADOPT_CONTOUR` 0 and 1. The frozen tree was 087ed59
+(`../frozen-r339`), and both arms used the patched `polychord.sif`. Both
+arms exited 0, and neither log has an `unable to proceed` line, so round
+337's `nfail` fix holds at twice the worker count.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | stock | 0.0175623136424466 +/- 0.000272166298027298 | 2,501 | 1,156 | 119,518 | 128,360 | 412.7 | 321 s |
+| 190182240 | adopt | 0.0175995868814326 +/- 0.000274343137855641 | 2,123 | 782 | 81,298 | 93,523 | 422.7 | 239 s |
+| 7311 | stock | 0.0179831988998666 +/- 0.000252337331246243 | 2,468 | 1,130 | 109,357 | 118,488 | 426.1 | 279 s |
+| 7311 | adopt | 0.0179816396502932 +/- 0.000250780257257865 | 2,100 | 760 | 79,032 | 89,177 | 424.8 | 219 s |
+Adopt minus stock: -27.1% and -24.7% evaluations, -25.5% and -21.5% wall,
+log(Z) +0.10 and -0.00 sigma. Pooled: evaluations 246,848 -> 182,700
+(**-26.0%**), summed wall 600 -> 458 s (**-23.6%**).
+
+**Scaling, both seeds summed** (1-node walls from round 315, 4-node from
+rounds 337-338, same seeds):
+
+| nodes | stock wall | x one node | adopt wall | x one node (stock) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2,621 s | 1.00x | 2,286 s | 1.15x |
+| 4 | 966 s | 2.71x | 723 s | 3.63x |
+| 8 | 600 s | **4.37x** | 458 s | **5.72x** |
+
+- Per-node throughput holds at 8 nodes: 51.6 and 53.3 steady evals/s a
+  node stock (50.0 and 51.5 on 4), so the loss against linear is all in
+  evaluations.
+- Stock's evaluations grow 1.26x from 4 to 8 nodes (195,319 -> 246,848;
+  per seed 1.25x and 1.28x). Round 307's model predicts (150 + 0.41 x 311)
+  / (150 + 0.41 x 155) = 1.30x, so cluster.md's ~4.9x for 8 nodes before
+  rate loss was close (measured 4.37x). Stock now wastes 46% of its dead
+  points (1,156 of 2,501 and 1,130 of 2,468), against 27% on 2 nodes and
+  39% on 4.
+- 8 nodes are 1.61x (stock) and 1.58x (adopt) faster than 4: doubling the
+  nodes again buys only ~60% more speed at nlive 150.
+- The patch's saving keeps growing with workers, slowly: -4% evaluations
+  at 38 (round 315), -22% at 77 (round 336), -24% at 155 (round 338), -26%
+  at 311.
+- log(Z) across node counts: seed 190182240 gives 0.017349 (1 node),
+  0.017640 (4) and 0.017562 (8); seed 7311 gives 0.017415, 0.017720 and
+  0.017983. The largest gap is 1.3 sigma (seed 7311, 1 against 8 nodes),
+  and stock and adopt agree within 0.1 sigma on 8 nodes.
+- The patch stays opt-in under the sampler-change guard; defaulting it is
+  the user's call. On 8 nodes it is worth about a quarter of the wall time.
+
+**WSClean had round 337's `nfail` bug.** `polychord_wsclean.py` never set
+`nfail`, so a WSClean search with `--mpi-procs` above `--nlive` ended
+early with exit 0. Default WSClean searches are safe, because they clamp
+ranks to nlive. On this node, `./ri search wsclean --nlive 8 --mpi-procs 30
+--max-ndead 300 --seed 339` stopped after 8 s at 45 dead points, with
+log(Z) 0.07020 +/- 0.02706 and PolyChord's `unable to proceed after 9`.
+Round 338's warning flagged it. `polychord_nfail` moved from
+`polychord_r2d2.py` to `common.py`, and both drivers now set `settings.nfail
+= polychord_nfail(args.nlive)`. Its self-check is now host-runnable (CI's
+`scripts/test_self_checks.py`: 31 host checks pass). After the fix:
+
+| run | ranks | log(Z) | ndead | evaluations | wall |
+| --- | ---: | --- | ---: | ---: | ---: |
+| before, `--mpi-procs 30` | 30 | 0.07020 +/- 0.02706 (stopped early) | 45 | 84 | 8 s |
+| after, `--mpi-procs 30` | 30 | 0.0978118296913875 +/- 0.00138542358918950 | 157 | 1,258 | 14 s |
+| before, default ranks | 8 | 0.09883 +/- 0.00237 | 113 | 777 | 23 s |
+| after, default ranks | 8 | 0.0996512456955600 +/- 0.00254388572622455 | 109 | 608 | 12 s |
+| after, default ranks (repeat) | 8 | 0.0874366459240915 +/- 0.0137499565479228 | 100 | 788 | 13 s |
+
+**WSClean guard.** Below the line (workers < nlive), `nfail` is a limit
+that never fires, so the change cannot alter a default search. The three
+8-rank runs agree within async noise at nlive 8. The same seed does not
+repeat bit for bit asynchronously (the before/after spread matches the
+repeat's), and nothing on the evaluation path changed, so no raced timing
+A/B was needed. (The 23 s "before" wall includes a cold start; the bench
+rows' `wall_s` are 8.9 / 6.0 / 7.1 s.)
+
+Rows: bench `r339-a{0,1}-s{190182240,7311}`, `r339-ws-*`, and stage
+`r339-8-nodes-and-wsclean-nfail` in `benchmarks.jsonl`. Logs, stats and
+dead-birth files are in `.probe/r339/`.
+
+**Cleanup.** The jobs deleted their own run dirs, and the WSClean probe
+dirs were deleted after their figures were recorded. `../frozen-r339` and
+`$RI_WORK_DIR/.cache/ri/sifs-r339` were removed. GPU job 39677203 (round
+332) still has no output in `.probe/r332/`.

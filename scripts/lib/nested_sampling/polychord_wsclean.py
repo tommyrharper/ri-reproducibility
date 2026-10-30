@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from common import (
+    polychord_nfail,
     DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_MGAIN,
@@ -456,6 +457,7 @@ def main() -> None:
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
+    settings.nfail = polychord_nfail(args.nlive)
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # Checkpoint long runs; `--output-dir <interrupted run>` resumes, while a

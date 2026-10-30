@@ -4573,6 +4573,28 @@ def self_check_evidence_record() -> None:
     print("evidence record reads log(Z) from PolyChordOutput")
 
 
+def polychord_nfail(nlive: int, ranks: int | None = None) -> int:
+    """PolyChord's consecutive-failed-replacement limit, raised by the workers.
+
+    Its default is nlive, and every async chain still running when the
+    contour passes its seed comes back unplaceable, so with more workers than
+    nlive the first wave alone tripped it: PolyChord stopped after the prior
+    with exit 0 and a meaningless log(Z) (round 337: 4 nodes, 155 workers,
+    nlive 150; round 339: WSClean, nlive 8 on 30 ranks). Below that the guard never fires, so results are unchanged.
+    """
+    if ranks is None:
+        from mpi4py import MPI
+
+        ranks = MPI.COMM_WORLD.Get_size()
+    return nlive + max(ranks - 1, 0)
+
+
+def self_check_polychord_nfail() -> None:
+    assert polychord_nfail(150, 156) == 305
+    assert polychord_nfail(150, 1) == 150
+    print("OK: PolyChord's nfail covers every async worker")
+
+
 def self_check_polychord_finish() -> None:
     """PolyChordFinish's answers end a slice_sample (chordal_sampling.f90,
     PolyChordLite 370f6af) within three calls, wherever in it they start and

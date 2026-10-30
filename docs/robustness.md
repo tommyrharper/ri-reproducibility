@@ -360,8 +360,9 @@ PolyChord also ends a search when `nfail` consecutive replacements fail. It
 exits 0 and writes normal-looking chains and a `summary.json`, so the only
 trace is its `Warning, unable to proceed after N: failed spawn events` line.
 Async searches with more workers than nlive hit it after the prior until round
-337 raised `nfail` to nlive + workers (`polychord_nfail`); a failure storm can
-still hit it. `run_with_retries` now looks for that line in the attempt's
+337 raised `nfail` to nlive + workers (`polychord_nfail` in `common.py`; round
+339 gave WSClean searches the same fix, as `--mpi-procs` above `--nlive` cut
+them short too); a failure storm can still hit it. `run_with_retries` now looks for that line in the attempt's
 output and writes `WARNING: PolyChord stopped early ...` to `run.log` and
 stderr. It does not retry: the same guard would fire again.
 
