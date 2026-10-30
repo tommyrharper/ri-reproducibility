@@ -43,6 +43,7 @@ HOST_RUNNABLE = {
         "self_check_normal_operator",
         "self_check_nufft_plan_reuse",
         "self_check_prefetch_weights",
+        "self_check_run_imager",
         "self_check_serve_fifo",
         "self_check_serve_pool",
         "self_check_serve_reply_stream",
@@ -86,7 +87,7 @@ IMAGE_ONLY = {
         "self_check_worker_death_is_not_scored",
     ),
     "polychord_wsclean": ("self_check_failure_record_persistence",),
-    "r2d2_serve": ("self_check_checkpoint_series", "self_check_early_stop", "self_check_threaded_session", "self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback",
+    "r2d2_serve": ("self_check_checkpoint_series", "self_check_early_stop", "self_check_run_imager", "self_check_threaded_session", "self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback",
                    "self_check_trt_shared_protocol"),
 }
 

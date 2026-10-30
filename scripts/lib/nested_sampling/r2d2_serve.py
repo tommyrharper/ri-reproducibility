@@ -7,7 +7,6 @@ import json
 import os
 import resource
 import signal
-import runpy
 import sys
 import time
 import traceback
@@ -1194,6 +1193,17 @@ def enter_node(node: int, nodes: dict[int, list[int]]) -> None:
         _ORT_SHARED.update(_NODE_ORT_SHARED.get(node, {}))
 
 
+_imager_code: dict[Path, Any] = {}
+
+
+def run_imager(run_name: str) -> None:
+    """`runpy.run_path` without re-reading and compiling imager.py each request (round 357)."""
+    code = _imager_code.get(IMAGER)
+    if code is None:
+        code = _imager_code[IMAGER] = compile(IMAGER.read_text(), str(IMAGER), "exec")
+    exec(code, {"__name__": run_name, "__file__": str(IMAGER)})
+
+
 def warm_imports() -> None:
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
@@ -1202,7 +1212,7 @@ def warm_imports() -> None:
     # JSON reply stream.
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
-            runpy.run_path(str(IMAGER), run_name="__warmup__")
+            run_imager("__warmup__")
             import torch
 
             # On the pinned CPU build this selects a faster MKLDNN convolution
@@ -1695,7 +1705,7 @@ def answer(fifo_base: str | None) -> None:
             saved_argv = sys.argv
             try:
                 sys.argv = [str(IMAGER), *request["argv"]]
-                runpy.run_path(str(IMAGER), run_name="__main__")
+                run_imager("__main__")
             except SystemExit as exc:
                 returncode = exc.code if isinstance(exc.code, int) else 1
             except Exception:
@@ -1724,6 +1734,30 @@ def self_check_early_stop() -> None:
     assert below_contour(np.zeros((4, 4)), 2, {**rule, "flux": 0.0}) is True
     assert all(ratio < 1.0 for ratio in EARLY_STOP_RATIOS.values())
     print("r2d2 early stop self-check passed")
+
+
+def self_check_run_imager() -> None:
+    import tempfile
+
+    global IMAGER
+    saved_imager, saved_argv = IMAGER, sys.argv
+    with tempfile.TemporaryDirectory() as tmp:
+        IMAGER = Path(tmp) / "imager.py"
+        IMAGER.write_text("import sys\nassert 'seen' not in globals()\nseen = 1\nsys.exit(int(sys.argv[1]))\n")
+        sys.argv = ["imager", "3"]
+        try:
+            for _ in range(2):
+                try:
+                    run_imager("__main__")
+                except SystemExit as exc:
+                    assert exc.code == 3
+                else:
+                    raise AssertionError("the imager's exit did not reach the caller")
+                IMAGER.unlink(missing_ok=True)  # the second run must not read the file
+        finally:
+            _imager_code.pop(IMAGER, None)
+            IMAGER, sys.argv = saved_imager, saved_argv
+    print("run_imager self-check passed")
 
 
 def self_check_serve_reply_stream() -> None:
@@ -2451,6 +2485,7 @@ if __name__ == "__main__":
         self_check_checkpoint_series()
         self_check_threaded_session()
         self_check_early_stop()
+        self_check_run_imager()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()

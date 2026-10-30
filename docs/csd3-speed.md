@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 356; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 357; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Largest open lever: stopping below-contour evaluations.** `NS_EARLY_STOP=1`
   (opt-in) stops R2D2 once an iterate's RMS is well under the contour. Three
@@ -16,8 +16,10 @@ the Hetzner host.
   ([round 355](#round-355-early-stop-built-opt-in-wall--33-over-three-seeds-logz-agreeing)).
   At production nlive 150, in half-node races, it gave wall **-16%** with
   log(Z) -0.44/+0.34 sigma and 0.12% wrong stops, a rate a toy's log(Z) cannot
-  see; ~210-270 ms of each evaluation does not scale with iterations
-  ([round 356](#round-356-early-stop-at-production-nlive-wall--16-logz-agreeing-wrong-stops-measured-at-012-and-too-rare-to-move-a-toys-logz)).
+  see ([round 356](#round-356-early-stop-at-production-nlive-wall--16-logz-agreeing-wrong-stops-measured-at-012-and-too-rare-to-move-a-toys-logz)).
+  Timed directly, what does not scale with iterations is ~100 ms of a ~700 ms
+  request, not the ~210-270 ms round 356's fit implied
+  ([round 357](#round-357-a-requests-fixed-cost-timed-directly-100-ms-not-210-270-recompiling-imagerpy-was-11-ms-of-it)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -17465,3 +17467,59 @@ sized on. Multi-node and `NS_ADOPT_CONTOUR` are still unmeasured. Under the
 sampler-change guard this stays opt-in and off by default, and that decision is the
 user's. No code changed, so no WSClean guard ran. Run directories are deleted;
 gzipped summaries and posteriors are in `.probe/r356`.
+
+## Round 357: a request's fixed cost timed directly: ~100 ms, not 210-270; recompiling imager.py was 11 ms of it
+
+**Why.** Round 356 inferred ~210-270 ms per evaluation that does not scale with
+R2D2 iterations, from two points per pair. That was a fit, so this round timed it
+with temporary stamps inside the workers of live searches (`.probe/r357/stamp.diff`,
+not shipped): default layout, 39 ranks x 1 thread on 38 CPUs, nlive 150, 5
+repeats, 500 dead, ~5,000-7,500 requests per search.
+
+**Result: the fit was about twice too high.** A request of ~690 ms is ~110 ms of
+set-up, then ~31.5 ms per iteration, of which the U-Net forward is all but ~0.6 ms.
+The per-iteration cost is flat: 31-32.5 ms from net 1 to net 25, so no net is a
+cheap one to stop before. A regression of request time on iterations over the
+requests themselves gave an intercept of 109-145 ms across two searches, so the
+stamps are the better number. Why round 356's fit read high is not separated: it
+compared different mixes of points, and its control had freed CPUs at the end.
+
+| set-up phase (ms per request) | before | after |
+| --- | ---: | ---: |
+| redirect stdout/stderr | 0.17 | 0.18 |
+| **`runpy.run_path` until `parse_args`** | **11.12** | **0.37** |
+| `parse_args_imaging` | 1.66 | 1.74 |
+| `load_data_to_tensor` (`.mat` load) | 20.19 | 19.08 |
+| to `gen_imaging_weights` | 1.38 | 1.37 |
+| `gen_imaging_weights` | 15.86 | 15.73 |
+| `create_meas_op` | 3.01 | 3.05 |
+| `data["y"] * nW * nWimag` | 3.86 | 4.07 |
+| `get_psf` (normal kernel) | 29.97 | 29.88 |
+| dirty `adjoint_op` | 22.51 | 22.94 |
+| total set-up | 110.5 | 99.2 |
+
+**Change.** `runpy.run_path` re-read and compiled `imager.py` (178 lines, on
+squashfuse) for every request. `run_imager()` in `r2d2_serve.py` compiles it
+once, during warm-up in the pool parent so every forked worker inherits the code
+object, and `exec`s it in a fresh namespace per request. Upstream reads none of
+`__main__`, `__file__` or `__spec__` beyond the `__name__` guard (grep of its
+tree). New `self_check_run_imager`: fresh globals each run, the imager's exit
+reaches the caller, and a second run does not read the file.
+
+**Effect.** -10.8 ms a request, ~1.6%, seen at the stage. That is below the ~5%
+an end-to-end A/B can show, so it is claimed only at the stage. Before and after
+are separate searches, not interleaved, but every other phase held within ~1 ms.
+The HEAD vs tree race (seeded, synchronous, 2 x 19 ranks, nlive 48, 150 dead,
+simultaneous) gave **all seven `.txt` chains byte-identical**, log(Z)
+0.0164687287364301 +/- 0.0015685880842399 on both, 2,571 evaluations each, and
+wall 183.9 vs 183.5 s. `r2d2_serve.py` is not shared with WSClean, so no WSClean
+guard ran.
+
+**What is left outside the U-Net.** ~100 ms, 14% of a request: the two NUFFTs 53 ms
+(the eps 1e-6 kernel was rejected just before round 148), `.mat` load 19 ms, imaging weights 16 ms. The
+U-Net at ~84% stays the only large term, so a stopped iteration saves more of a
+request than round 356's fit implied.
+
+The stamped searches left two rows named `r357-stamp` (`dirty: true`) in
+`benchmarks.jsonl`. They carry a few ms of stamp overhead; do not compare them.
+Run directories are deleted; the gap tables are in `.probe/r357`.
