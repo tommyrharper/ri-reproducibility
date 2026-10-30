@@ -5,7 +5,7 @@ is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
 39721865 (Part B, 18 tasks) were submitted on 2026-10-30. Part A started at 18:44
 with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
 treated arms, had finished and extracted cleanly, so the pipeline works end to end.
-Those rows were opened only to check they are complete. At 19:51 Part A had 24 of
+Those rows were opened only to check they are complete. At 19:53 Part A had 25 of
 132 runs recorded, all status ok, with 33 tasks started; Part B had not started.
 Budget check at that point, from aggregate timing with no split by arm: 24 runs in 65
 minutes on 10 slots is about 27 minutes per slot per run, against the 15-22 expected
