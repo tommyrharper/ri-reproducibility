@@ -1218,7 +1218,20 @@ def run_imager(run_name: str) -> None:
     exec(code, {"__name__": run_name, "__file__": str(IMAGER)})
 
 
+# Seconds each warm-up phase took, for the line serve_pool prints to the pool's
+# workers log: a fresh node's ~38s first request is this, and a search's records
+# cannot split it (round 368).
+WARM_SECONDS: dict[str, float] = {}
+
+
+def warm_phase(name: str, started: float) -> float:
+    now = time.monotonic()
+    WARM_SECONDS[name] = now - started
+    return now
+
+
 def warm_imports() -> None:
+    started = time.monotonic()
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
     install_lazy_utils()
@@ -1227,6 +1240,7 @@ def warm_imports() -> None:
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
             run_imager("__warmup__")
+            started = warm_phase("imager", started)
             import torch
 
             # On the pinned CPU build this selects a faster MKLDNN convolution
@@ -1245,19 +1259,23 @@ def warm_imports() -> None:
             patch_net_reuse()
             if r2d2_device() == "cuda" and not trt_shared():
                 patch_cuda_network()
+            started = warm_phase("patches", started)
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
             if checkpoint_path.is_dir():
                 # Load before fork: tensor pages stay shared until a child
                 # writes them, instead of paying torch.load once per rank.
                 load_checkpoints(checkpoint_path)
+                started = warm_phase("checkpoints", started)
                 if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
                     patch_onnx_network(checkpoint_path)
                 if r2d2_device() == "cuda" and r2d2_runtime() == "trt":
                     patch_trt_network(checkpoint_path)
+                started = warm_phase("networks", started)
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
             )
+            warm_phase("operator", started)
         except Exception:
             traceback.print_exc()
 
@@ -1543,6 +1561,7 @@ def serve_pool(fifo_dir: str) -> None:
     keeper = {base: (os.open(f"{base}.in", os.O_RDONLY | os.O_NONBLOCK), os.open(f"{base}.out", os.O_RDWR))
               for base in bases}
     warm_imports()
+    print("r2d2 pool warm-up seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in WARM_SECONDS.items()), file=sys.stderr, flush=True)
     # Whatever it has not read by now the loads already have. Reaped here, not
     # by the os.wait() below, which forks a replacement for every pid it gets.
     os.kill(prefetcher, signal.SIGKILL)

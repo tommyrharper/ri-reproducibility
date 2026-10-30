@@ -211,6 +211,22 @@ def pre_run_phases(run_dir: Path, digest: dict[str, Any]) -> dict[str, float] | 
     return phases
 
 
+def pool_warm_phases(run_dir: Path) -> dict[str, float] | None:
+    """Slowest pool's seconds per warm-up phase, from the line each node's pool
+    prints to workers-r2d2.log: what a cold first request is made of (round 368)."""
+    slowest: dict[str, float] = {}
+    try:
+        lines = (run_dir / "workers-r2d2.log").read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("r2d2 pool warm-up seconds: "):
+            for phase in line.split(": ", 1)[1].split(", "):
+                name, _, seconds = phase.partition(" ")
+                slowest[name] = max(slowest.get(name, 0.0), float(seconds))
+    return slowest or None
+
+
 def trt_mean_batch(run_dir: Path) -> float | None:
     """The gathering TensorRT server's mean batch, from the r2d2-trt-batches.txt it keeps (round 330)."""
     try:
@@ -263,6 +279,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     first, iterations = digest["first_request_s"], digest["r2d2_iterations"]
     batch = trt_mean_batch(run_dir)
     pre_run = pre_run_phases(run_dir, digest)
+    pool_warm = pool_warm_phases(run_dir)
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -290,6 +307,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "r2d2_iterations": round(iterations, 3) if iterations else None,
         **({"trt_mean_batch": batch} if batch else {}),
         **({"pre_run_s": pre_run} if pre_run else {}),
+        **({"pool_warm_s": pool_warm} if pool_warm else {}),
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -777,6 +795,10 @@ def self_check() -> None:
             "sized": 1.5, "launch": 1.5, "warm": 6.0, "first_eval": 1.0, "total": 10.0, "searched": 5.0}
         assert pre_run_phases(env_dir, record_digest([])) is None
         assert pre_run_phases(Path(raw), record_digest([{"timing": {"started_epoch": 1.0}}])) is None
+        assert pool_warm_phases(Path(raw)) is None
+        (Path(raw) / "workers-r2d2.log").write_text(
+            "noise\nr2d2 pool warm-up seconds: imager 3.2, networks 2.4\nr2d2 pool warm-up seconds: imager 30.5, networks 1.0\n")
+        assert pool_warm_phases(Path(raw)) == {"imager": 30.5, "networks": 2.4}
 
         run = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         run.mkdir()

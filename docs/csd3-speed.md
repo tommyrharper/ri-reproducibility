@@ -17905,3 +17905,80 @@ nothing up front), `./ri self-check r2d2`, `scripts/test_self_checks.py` (33
 host-runnable passed) and ruff (22 findings before and after). `r2d2_serve.py` is
 not shared with WSClean, so no WSClean guard ran. Rows: `r367-old1`, `r367-old2`,
 `r367-new1`, `r367-new2`, `r367-async`. Run directories and `/dev/shm/r367` are deleted.
+
+## Round 368: the 38 s first request was one bad start, not the cost of a fresh node; second target-size seed halves wall time; pool warm-up now timed
+
+**Why.** Round 367 assumed round 365's 38.76 s first request was the pool's weight
+read. This round tested that assumption, with the array for seed 345 finishing
+during it.
+
+**Weights are not the cold cost on this node.** Short searches (39 ranks, nlive 48,
+5 repeats, 100 dead, seed 368, CPU onnx), with the ONNX cache and checkpoints evicted
+by `posix_fadvise` before the `c` arms:
+
+| arm | evicted | `imager` s | `networks` s | first request s | steady evals/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| c1 | yes | 3.2 | 2.4 | 5.05 | 31.1 |
+| w1 | no | 3.1 | 2.4 | 5.13 | 30.8 |
+| c2 | yes | 3.2 | 2.5 | 5.17 | 31.0 |
+| w2 | no | 3.1 | 2.4 | 5.03 | 30.8 |
+
+A direct read of one 118 MB graph after eviction ran at ~2.1 GB/s, against ~5 GB/s
+from cache. Eviction is only a partial stand-in for a fresh node, as round 303 found,
+but at that rate 2.9 GB of graphs is ~1.4 s of 16-thread reading at most, so the
+weight read cannot be most of a 38 s stall unless Lustre was far slower at the time.
+The `networks` phase, which holds the sessions, is 2.4 s whether evicted or not.
+
+**The stall does not repeat.** Target-size first requests on 8 icelake half-nodes:
+
+| run | tree | first request s | stall s |
+| --- | --- | ---: | ---: |
+| r344-big | stock | 9.1 | 0.0 |
+| r344-big2 | stock | 4.39 | 0.0 |
+| r362-big-s344 | stop + adopt | 38.76 | 38.6 |
+| r362-big-s345 | stop + adopt, same tree | 7.35 | 5.9 |
+
+Same tree, same checkpoint volume, same SIFs: 7.35 s against 38.76 s, so the 38 s is
+something about that start (its nodes or Lustre at that moment), not the size of the
+read. Round 367's memory saving stands; its "first request" motive for a fresh node
+does not, and its cold-node saving should be expected to be small. What the 38 s was
+is still unknown: one occurrence in four.
+
+**Second target-size seed** (array 39710176 task 1, seed 345, nlive 500, 25 repeats,
+8 half-nodes, stop + adopt on the rule before round 365's iteration-3 tightening),
+against stock `r344-big2` on the same seed:
+
+| | stock | stop + adopt | change |
+| --- | ---: | ---: | ---: |
+| search wall s | 1,068.4 | 555.7 | **-48.0% (1.92x)** |
+| job wall s | 1,145 | 607 | -47.0% |
+| evaluations | 425,400 | 385,457 | -9.4% |
+| steady evals/s | 398.6 | 702.9 | +76% |
+| log(Z) | 0.0173758961596796 +/- 0.00020058887505272 | 0.0173119266687414 +/- 0.000198078417026602 | -0.23 sigma |
+
+Two seeds now give -46.8% and -48.0%, with log(Z) +0.03 and -0.23 sigma. The same
+caveats as round 365 hold: different day and nodes, no same-run control, the rule
+before the tightening, and stock's chains are gone so moments cannot be compared.
+Task 0 and 1 of array 39712455 supply the control. Both settings stay opt-in;
+defaulting them is the user's decision.
+
+**The end of the job is now the largest fixed cost.** `searched` (last evaluation to
+the search's exit) was 37.36 s here and 39.61 s on seed 344, and the job's 51.7 s
+outside the search span is 8.5% of a 607 s job with all 8 nodes held. The post-run
+line accounts for 26.9 s (records 11.0, flush 4.0, prune 2.2, summary 4.8, pack 4.6,
+drain 0.2), which leaves ~10 s between `searched` and that line that no timer
+covers. Round 341 had that gap at ~1.5 s at 60k evaluations, so it grows with the
+run. That is the next lever.
+
+**Change (measurement only).** The pool prints `r2d2 pool warm-up seconds: imager,
+patches, checkpoints, networks, operator` to `workers-r2d2.log`, one line per node,
+and `./ri bench` stores each phase's slowest pool as `pool_warm_s` in the row, so the
+split outlives a deleted run directory. A warm pool reads imager 3.2, networks 2.4.
+`../frozen-r366` carries the same timing plus a copy to `results/warm-*.txt`, because
+that array deletes its run directories; it changes no result.
+
+Checks: `./ri self-check r2d2-serve`, `scripts/bench.py --self-check` (new
+`pool_warm_phases` cases), `scripts/test_self_checks.py` (33 host-runnable passed).
+`r2d2_serve.py` and `bench.py` are not shared evaluation code, so no WSClean guard
+ran. Rows: `r368-c1`, `r368-w1`, `r368-c2`, `r368-w2`, `r368-v1`, `r362-big-s345`.
+Run directories are deleted. Array 39712455 had no output when this round closed.
