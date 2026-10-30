@@ -17849,3 +17849,59 @@ of a 620.7 s search. Round 303 called a fresh node's start ~2% of a 20-minute
 search; a faster search raises that share. The stdout records carry no timing and
 that run's `summary.json` is deleted, so this log cannot split it by node. The
 checkpoints are already striped over 32 OSTs.
+
+## Round 367: the CPU onnx pool no longer loads torch weights it never uses: peak -43%, first request -21%, chains identical
+
+**Why.** Rounds 303 and 366 left a fresh node's start unexplained, and it is now
+6.2% of a 620 s target-size search. The likely cost is the pool's weight read, so
+what does that read contain? The two queued arrays hold this account at its limit
+of pending jobs, so this was worked on the gnhf node.
+
+**Found.** A CPU onnx pool read and kept the 25 torch state dicts (per NUMA node
+when it pins), then ran every forward through ONNX Runtime sessions built from the
+optimised graphs. The dict is touched only by `export_onnx` for a missing graph and
+by the torch fallback for a request ONNX cannot serve; `load_net` passes it along
+unread otherwise. `layers` is always 1 in this repo, so R3D3 never takes that path.
+
+**The change.** On that path `load_checkpoint_series` returns `LazyCheckpoints`,
+a dict that loads an entry when first asked for, after the same file checks.
+`prefetch_weights` reads only the graphs there. `_NODE_CHECKPOINTS` still holds one
+(empty) series per NUMA node, so worker pinning is unchanged. Torch and GPU pools
+load as before.
+
+**Race.** New tree against 17d68b8 (same `r2d2_serve.py` as HEAD), `.probe/r367/ab.sh`:
+19 ranks on their own 19 CPUs at once, synchronous, seed 367, nlive 48, 5 repeats,
+150 dead, CPU sets swapped between pairs.
+
+| arm | CPUs | evaluations | steady evals/s | first request s | peak MB |
+|---|---|---:|---:|---:|---:|
+| old | first 19 | 2,569 | 13.37 | 6.56 | 6,915 |
+| new | last 19 | 2,569 | 13.83 | 4.33 | 3,930 |
+| old | last 19 | 2,569 | 13.60 | 5.30 | 6,928 |
+| new | first 19 | 2,569 | 13.17 | 5.06 | 3,920 |
+
+- **Results identical.** All four `dead-birth` and `.stats` hashes match; log(Z)
+  0.0162567459194733 +/- 0.00152457882352641.
+- **Peak memory -43%** (6.92 to 3.93 GB), which is the pool parent's floor and so
+  every worker's reported peak. `NS_R2D2_SHARED_MB` was not lowered: the budget
+  only clamps when memory is short, and half-nodes have far more than it needs.
+- **First request** 5.93 to 4.70 s (mean, -21%) on this warm node, two pairs only.
+- **Steady rate** +0.1% (mean of pairs: 13.48 old, 13.50 new), inside the noise.
+  This is a start-up change; no per-evaluation gain is claimed.
+- **Async default** (39 ranks, 16 max threads, threaded sessions): one search, 42.1
+  steady evals/s, first request 5.2 s, peak 5,379 MB, no traceback, log(Z)
+  0.0133014836613859 +/- 0.00420051362229134.
+
+**Not measured.** The saving on a fresh node, which is the point, because only a
+new job on a new node can show it. Volume read falls from ~6 GB to round 228's
+2.9 GB of graphs, but no 8-node search has run this tree, and the queued arrays
+use frozen trees without it. Compare the next target-size run's `first_request_s`
+with round 365's 38.76 s. A request that falls back to torch now loads each
+weight file in its worker on first use, off Lustre and per worker; no search here
+has taken that path, and it was exercised only by the self-check's series test.
+
+Checks: `./ri self-check r2d2-serve` (with a new assertion that the series loads
+nothing up front), `./ri self-check r2d2`, `scripts/test_self_checks.py` (33
+host-runnable passed) and ruff (22 findings before and after). `r2d2_serve.py` is
+not shared with WSClean, so no WSClean guard ran. Rows: `r367-old1`, `r367-old2`,
+`r367-new1`, `r367-new2`, `r367-async`. Run directories and `/dev/shm/r367` are deleted.

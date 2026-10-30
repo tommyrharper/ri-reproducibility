@@ -71,6 +71,18 @@ def install_lazy_utils() -> None:
     sys.modules["utils"] = package
 
 
+class LazyCheckpoints(dict):
+    """A checkpoint series that loads an entry the first time something asks for it."""
+
+    def __init__(self, load):
+        super().__init__()
+        self.load = load
+
+    def __missing__(self, name: str):
+        state_dict = self[name] = self.load(name)
+        return state_dict
+
+
 def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
     """Upstream `get_DNNs`, with its torch.loads on 4 threads.
 
@@ -109,6 +121,11 @@ def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
                 partial.unlink(missing_ok=True)  # a full quota: the next pool tries again
         return state_dict
 
+    # A CPU onnx pool forwards through its sessions, so only an export (a new
+    # torch or checkpoint) or a request ONNX cannot serve needs these weights
+    # (round 367).
+    if weights is not None:
+        return LazyCheckpoints(lambda name: load(paths[int(name[1:]) - 1]))
     with ThreadPoolExecutor(max(1, min(4, len(paths)))) as pool:
         return {f'N{i+1}': state_dict for i, state_dict in enumerate(pool.map(load, paths))}
 
@@ -345,10 +362,10 @@ def onnx_cpu_key() -> str:
 def prefetch_weights() -> int:
     """Fork a child that reads the pool's weights into the page cache, 16 files at a time; return its pid.
 
-    A cold pool reads 5.8GB of checkpoints and (onnx) 2.9GB of optimised
-    graphs one file at a time off Lustre: 8.9s and 10.3s of a 22-34s warm-up,
-    against 5.8s warm (round 228). Forked before any import, so the parent's
-    peak RSS, which every worker reports as its floor, does not see the reads.
+    A cold pool reads 5.8GB of checkpoints or (onnx, round 367) 2.9GB of
+    optimised graphs one file at a time off Lustre: 8.9s and 10.3s of a 22-34s
+    warm-up, against 5.8s warm (round 228). Forked before any import, so the
+    parent's peak RSS, which every worker reports as its floor, does not see the reads.
     """
     pid = os.fork()
     if pid:
@@ -357,11 +374,8 @@ def prefetch_weights() -> int:
         import concurrent.futures
 
         files = sorted(Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1")).glob("*.ckpt"))
-        weights = checkpoint_weights_dir(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
-        if weights is not None:
-            files = [weights / path.name if (weights / path.name).exists() else path for path in files]
         if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
-            files += sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
+            files = sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
 
         def read(path: Path) -> None:
             chunk = bytearray(1 << 22)
@@ -2197,6 +2211,7 @@ def self_check_checkpoint_series() -> None:
         with tempfile.TemporaryDirectory() as cache:
             ONNX_DIR, os.environ["R2D2_RUNTIME"] = Path(cache), "onnx"
             try:
+                assert not load_checkpoint_series(6, tmp), "a CPU onnx series loads nothing up front"
                 assert all(torch.equal(load_checkpoint_series(6, tmp)[name]["unet.w"], loaded[name]["unet.w"])
                            for _ in range(2) for name in loaded)
                 written = sorted(p.name for p in checkpoint_weights_dir(tmp).iterdir())
