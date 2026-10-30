@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 333; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 334; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -68,7 +68,9 @@ the Hetzner host.
   - **Start-up.** The pool's 1-thread ORT sessions are built over the
     shared weight arrays (round 274). Round 273 had found that
     multi-thread requests silently ran torch; with that fixed, 39 x 1
-    still beats 20 x 2 by ~15% (round 276). A fresh node costs ~25-30 s
+    still beats 20 x 2 by ~15% (round 276). Fewer ranks do not pay either: 30 x 1 runs each U-Net
+    iteration 15% faster but converges 9.9% slower
+    ([round 334](#round-334-negative-fewer-cpu-ranks-relieve-dram-per-request-but-lose-throughput-39-x-1-stays)). A fresh node costs ~25-30 s
     once per job (cold page cache for the weights, not the SIFs), and
     reading the SIFs first does not help
     ([round 303](#round-303-negative-a-fresh-nodes-slow-start-is-not-the-sifs-so-reading-them-first-does-not-help)).
@@ -16170,3 +16172,65 @@ iteration ended; `.probe/r332/` has no output file yet. Read it next round.
 Rows: stage row `r333-cost-per-unit` in `benchmarks.jsonl`.
 
 **WSClean guard.** Not needed: docs only.
+
+## Round 334 (negative): fewer CPU ranks relieve DRAM per request but lose throughput; 39 x 1 stays
+
+**Why.** GPU job 39677203 (round 332's race) had still not started, so this
+round took a CPU question this node can answer. The CPU forward is
+DRAM-bandwidth bound ([round 205](#round-205-diagnostic-the-r2d2-cpu-search-is-at-the-sockets-dram-bandwidth)),
+and a converged async search pays ~0.41 x workers extra live points
+([round 307](#round-307-analysis-guidance-fix-the-async-overhead-is-a-fixed-04-x-workers-live-points-so-a-bigger-nlive-never-buys-speed)).
+If bandwidth were fully saturated, fewer ranks would lose almost no
+throughput and win on overhead. At nlive 150, 30 ranks (29 workers) beat
+39 (38 workers) on `converging evals/s` if their raw rate is at least 97.8%
+of the default. Round 309 had compared thread layouts at full CPU, never
+fewer ranks.
+
+**Run.** On this half icelake node (38 CPUs) at b6719f3, async,
+`--nlive 48 --num-repeats 5 --max-ndead 400 --seed 331`, after a 60-dead
+warm-up (`.probe/r334/ab.sh`, `ab2.sh`). Race 1 (d1 f1 f2 d2 d3 f3) set only
+`NS_MPI_PROCS=30`, which also raises `R2D2_OMP_THREADS` to 2 (the per-rank
+CPU share rounded up), so f is 30 x 2. Race 2 (s1 e1 e2 s2) pins 30 x 1.
+Load average 51-72 from the other half's tenant.
+
+| arm | layout | evals | steady evals/s | R2D2 iterations | ms / iteration | U-Net iterations/s | converging at nlive 150 | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| d1 | 39 x 1 | 6302 | 48.26 | 17.64 | 41.78 | 851 | 43.72 | 0.0176425155373878 +/- 0.00057758620753672 |
+| f1 | 30 x 2 | 5747 | 44.21 | 17.54 | 35.03 | 776 | 40.97 | 0.0179276333940078 +/- 0.000607454356381023 |
+| f2 | 30 x 2 | 7624 | 42.74 | 18.62 | 34.41 | 796 | 39.60 | 0.0173808812761932 +/- 0.000675675564714978 |
+| d2 | 39 x 1 | 7584 | 47.09 | 18.66 | 40.90 | 879 | 42.66 | 0.0173927466167287 +/- 0.00059691423949701 |
+| d3 | 39 x 1 | 6839 | 48.30 | 17.61 | 41.91 | 851 | 43.75 | 0.0175719957600345 +/- 0.000609537628436796 |
+| f3 | 30 x 2 | 6252 | 39.90 | 18.79 | 36.07 | 750 | 36.97 | 0.0177480060986081 +/- 0.000590349420716432 |
+| s1 | 30 x 1 | 7568 | 41.80 | 18.58 | 35.56 | 777 | 38.73 | 0.017427797864923 +/- 0.000630487591156867 |
+| e1 | 39 x 1 | 6910 | 44.78 | 18.18 | 43.48 | 814 | 40.56 | 0.0174094743444522 +/- 0.000603496236599646 |
+| e2 | 39 x 1 | 6039 | 46.45 | 18.38 | 41.79 | 854 | 42.08 | 0.017697106937523 +/- 0.000579809949408314 |
+| s2 | 30 x 1 | 6498 | 40.99 | 18.97 | 35.54 | 778 | 37.98 | 0.0175776566461186 +/- 0.000569372538338133 |
+
+ms / iteration is `image_container` ms over R2D2 iterations (round 317), and
+U-Net iterations/s is steady evals/s x iterations, the node's raw U-Net
+throughput with the early stop's per-image cost taken out.
+
+**Learned.**
+- The bandwidth relief is real but small: at 30 x 1 a U-Net iteration takes
+  35.6 ms against 40.9-43.5 ms (-15%) with 23% fewer ranks, so throughput
+  goes roughly as ranks^0.35, not flat. The node's U-Net iterations/s fall
+  8.6% (777 against a mean of 850), and the overhead saving (+2.3% at
+  nlive 150) does not make that up. `converging evals/s` is 38.4 against
+  42.6 (-9.9%; per iteration about -6.5%). 39 x 1 stays.
+- 30 x 2 is no better: its 2-thread ORT requests are no faster per
+  iteration than 30 x 1 (34.4-36.1 ms) while oversubscribing the CPUs, so
+  any R2D2 rank count below the CPU count wastes the CPUs it frees.
+  `--mpi-procs` alone changes the thread count too (`R2D2_OMP_THREADS`
+  rounds the share up), so a rank A/B must pin `R2D2_OMP_THREADS`.
+- log(Z) agrees across all ten arms (0.01738-0.01793, sigma ~0.0006; the
+  widest gap, f1 against f2, is 0.6 combined sigma).
+- Fewer ranks would only pay at a much smaller nlive, where the
+  0.41 x workers overhead dominates. That is the multi-node regime
+  (round 293), not one node at nlive 150.
+
+**Pending (GPU).** Job 39677203 (round 332: default vs 29 ranks vs 8 lanes
+on an A100) still had no output file at 03:52. The next round reads
+`.probe/r332/ab-39677203.out`, then removes `../frozen-r332`.
+
+**WSClean guard.** Not needed: nothing shipped. Rows: bench `r334-*` and
+stage `r334-fewer-cpu-ranks` in `benchmarks.jsonl`. The run dirs are deleted.
