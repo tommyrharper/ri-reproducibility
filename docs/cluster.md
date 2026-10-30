@@ -196,6 +196,9 @@ times nlive: at nlive 150, 2, 4 and 8 nodes of 39 ranks converge ~1.85x,
 (before the ~5-10% per-node rate loss). A larger `--nlive` does not remove the
 extra evaluations: it adds more than it saves, so raise it for precision,
 never for speed. The launcher warns when the extra share passes ~10%.
+Keep one rank per CPU on every node until the job's total ranks pass ~1.25 x
+nlive (8 nodes at nlive 150): below that, fewer ranks per node lose more
+U-Net throughput than they save in evaluations (rounds 334-335).
 
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit

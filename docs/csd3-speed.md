@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 334; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 335; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -70,7 +70,8 @@ the Hetzner host.
     multi-thread requests silently ran torch; with that fixed, 39 x 1
     still beats 20 x 2 by ~15% (round 276). Fewer ranks do not pay either: 30 x 1 runs each U-Net
     iteration 15% faster but converges 9.9% slower
-    ([round 334](#round-334-negative-fewer-cpu-ranks-relieve-dram-per-request-but-lose-throughput-39-x-1-stays)). A fresh node costs ~25-30 s
+    ([round 334](#round-334-negative-fewer-cpu-ranks-relieve-dram-per-request-but-lose-throughput-39-x-1-stays)); across nodes they only pay once total ranks pass ~1.25 x nlive
+    ([round 335](#round-335-analysis-docs-only-fewer-ranks-per-node-pay-only-once-total-ranks-pass-125-x-nlive)). A fresh node costs ~25-30 s
     once per job (cold page cache for the weights, not the SIFs), and
     reading the SIFs first does not help
     ([round 303](#round-303-negative-a-fresh-nodes-slow-start-is-not-the-sifs-so-reading-them-first-does-not-help)).
@@ -16234,3 +16235,50 @@ on an A100) still had no output file at 03:52. The next round reads
 
 **WSClean guard.** Not needed: nothing shipped. Rows: bench `r334-*` and
 stage `r334-fewer-cpu-ranks` in `benchmarks.jsonl`. The run dirs are deleted.
+
+## Round 335 (analysis, docs only): fewer ranks per node pay only once total ranks pass ~1.25 x nlive
+
+**Why.** GPU job 39677203 (round 332's race) had still not started, so this
+round answers the question round 334 left open with numbers already in
+hand: at what node count do fewer R2D2 ranks per node beat one per CPU?
+
+**Model** (`.probe/r335/model.py`, output `model.txt`). Round 334 measured
+the node's U-Net iterations/s at 39 x 1 (mean of five arms, 850) and 30 x 1
+(777), so node throughput goes as ranks^0.339. Round 307 measured a converged
+search's cost as `k x (nlive + 0.41 x workers)`. So time to converge on N
+nodes of r ranks goes as `(nlive + 0.41 (N r - 1)) / (N r^0.339)`, whose
+minimum is at **r\* = 1.25 x nlive / N**: one rank per CPU stays best while
+the job's total ranks are below ~1.25 x nlive.
+
+| nlive | nodes | best ranks/node | gain over 39 | 30 ranks/node |
+| ---: | ---: | ---: | ---: | ---: |
+| 150 | 1 | 39 | 0 | -6.4% |
+| 150 | 2 | 39 | 0 | -4.6% |
+| 150 | 4 | 39 | 0 | -1.7% |
+| 150 | 8 | 23 | +3.1% | +2.4% |
+| 150 | 16 | 12 | +19% | +7.1% |
+| 300 | 8 | 39 | 0 | -1.7% |
+| 300 | 16 | 23 | +3.1% | +2.4% |
+
+**Learned.**
+- Every search this repo runs today (1-4 nodes at nlive 150 or more) is
+  best at one rank per CPU, so the default stays. The one-node row matches
+  round 334's measured -6.5% per iteration, which is the fit's input, not a
+  test of it.
+- The first node count where fewer ranks could pay is 8 at nlive 150, and
+  there the gain (+3%) is inside a three-repeat control's ~5% spread, so it
+  is not worth a 16-node job to confirm. The 16-node figure extrapolates the
+  exponent to 12 ranks, far below the 30-39 it was measured over, and leaves
+  out round 288/292's 5-11% per-node rate loss; treat it as a direction,
+  not a number.
+- The rule is the same shape as round 307's: wide jobs pay for their
+  workers in PolyChord evaluations, and above ~1.25 x nlive total ranks
+  the DRAM a rank frees is worth more than the evaluations it adds.
+
+**Change.** Docs only: `docs/cluster.md` gives the rule next to the
+time-to-converge table. No code changed, so no WSClean guard. Stage row
+`r335-ranks-per-node-model` in `benchmarks.jsonl`.
+
+**Pending (GPU).** Job 39677203 still had no output file in `.probe/r332/`
+when this round ended. The next round reads `.probe/r332/ab-39677203.out`,
+then removes `../frozen-r332`.
