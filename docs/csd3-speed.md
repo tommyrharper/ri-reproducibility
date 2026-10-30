@@ -5,8 +5,14 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 352; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 354; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
+- **Largest open lever: below-contour work.** 70% of U-Net iterations go to
+  evaluations that end below the contour, and a replay of one converged search
+  stops ~40% of all iterations early with 0.04-0.16% of above-contour
+  evaluations wrongly stopped on held-out data, an estimated ~1.6x evals/s. Not
+  built. It changes the sampler, so it can only be opt-in
+  ([round 354](#round-354-diagnostic-70-of-u-net-iterations-go-to-evaluations-already-below-the-contour-stopping-them-early-could-save-40)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -17250,3 +17256,74 @@ log(Z) agrees: a 0.01803, 0.01728, 0.01753; b 0.01750, 0.01749, 0.01738, each
 at 8 nodes and nlive 500 and ~1% at nlive 150 (estimated, not measured), which
 nothing here could see, and it would add a layout to a multi-node launch that
 works. Not measured: a real multi-node job, or a host with a known load.
+
+## Round 354 (diagnostic): 70% of U-Net iterations go to evaluations already below the contour; stopping them early could save ~40%
+
+**Question.** Slice sampling only compares an evaluation with its contour, yet
+an evaluation that ends below it still runs every U-Net iteration. The metric
+(`total_rms_jy`) is the RMS of the image minus the known point source, so it can
+be read off every iterate. How much of the search is below-contour work, and how
+early does an iterate show it?
+
+**Probe.** One converged production-shaped search (1 node, default 39 x 1, nlive
+150, 15 repeats, seed 354) with a temporary trace (`.probe/r354/trace.diff`,
+reverted) that saved each iterate and logged its RMS. log(Z) 0.0169589 +/-
+0.00038 agrees with round 302, 70,427 evaluations, 48.0 evals/s (trace overhead
+included, so this is not a speed figure). The contour at each moment comes from
+`_dead-birth.txt`: a point's birth contour is the contour in force when it was
+accepted, and 1,438 of 1,476 dead points matched a trace by value.
+
+**Where the iterations go.**
+
+| | share of evaluations | mean iterations | share of U-Net iterations |
+| --- | ---: | ---: | ---: |
+| ended above the contour | 33% | 17.2 | 30% |
+| ended below it | 67% | 20.1 | 70% |
+
+Above-contour evaluations fall from 40% in the first third of the search to 25%
+in the last. RMS falls with iteration but not strictly (21% of steps rise), and
+the final value can sit ~6% above an iterate (1st percentile of RMS at iteration
+k over final is 0.94), so a below-contour iterate is strong evidence, not proof.
+
+**Rule tested, replayed offline.** Stop at the first check (iteration 2, 3, 4,
+5, 6, 8, 10, 12, 15, 18) where the iterate's RMS is under c(k) x contour, with
+c(k) set from the above-contour evaluations of a fitting set, either tight on
+their minimum (eps 0) or allowing a share eps of them through. Iterations saved
+and above-contour evaluations wrongly stopped, on data not used to fit, except
+the first row:
+
+| fit -> test | eps | iterations saved | wrongly stopped (of above) | below-contour stopped |
+| --- | ---: | ---: | ---: | ---: |
+| all -> all (in-sample) | 0 | 39.8% | 0 | 73% |
+| odd -> even evaluations | 0 | 40.3% | 0.035% | 74% |
+| first half -> second | 0 | 41.2% | 0.066% | 67% |
+| second half -> first | 0 | 43.1% | 0.157% | 85% |
+| first half -> second | 0.01 | 48.3% | 1.4% | 72% |
+
+Past eps 0 the extra saving comes with far more wrong stops, so the tight rule
+is the candidate. c(k) sits around 0.83-0.93. With the R2D2 request ~95% of an
+evaluation, ~40% of iterations would be about -37% of worker time, or roughly
+1.6x evaluations/s. That is an estimate from a replay, not a measured speed-up.
+
+**What this does not establish.**
+
+- One search, one seed, one metric, one node. c(k) may not transfer to another
+  seed or to `--nodes N`; a fit on the second half gave a different c(6) (0.93
+  against 0.83) than a fit on the first.
+- The contour is interpolated in time. A real chain holds the contour of its
+  seed, which is older than the newest, so the true margins differ slightly.
+- A wrong stop shortens a slice bracket or rejects a valid point, so this changes
+  the sampler. Under the sampler-change guard it can only ship opt-in, after
+  statistical validation of log(Z), and whether to default it is the user's call.
+- Only the end of a chain enters the live set, so the replay cannot say how many
+  wrong stops touch a point the search keeps.
+- Not implemented. PolyChord's Python likelihood is not told the contour, so
+  this needs a `docker/polychord/patches/` change exposing `logL` from
+  `slice_sample`, plus a rebuilt `polychord.sif`, plus the source flux and pixel
+  sent to the R2D2 worker, whose stop test must run inside `R2D2.run`. Records
+  of stopped evaluations would hold a partial metric, so anything reading all
+  evaluations (the failure-mode analysis itself) needs to expect that.
+
+**Next.** Build the opt-in path and race it for wall time and log(Z). The
+iterate traces, summary and dead-birth file are in `.probe/r354/`. WSClean is
+untouched: no shared code changed.
