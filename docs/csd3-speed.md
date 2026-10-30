@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 336; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 337; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -57,6 +57,11 @@ the Hetzner host.
     cheaper, not dearer. 2 nodes then converge 1.96x faster than one,
     against 1.58x stock. Still opt-in; defaulting it is the user's call
     ([round 336](#round-336-on-two-nodes-the-contour-patch-cuts-r2d2-evaluations-22-and-wall-time-19-logz-agreeing)).
+    On four nodes (155 workers, two seeds) it is -25.1% evaluations and
+    -25.1% wall, converging 3.64x faster than one node (stock 2.73x). Searches with more workers
+    than nlive were impossible before round 337: PolyChord's `nfail` guard
+    stopped them after the prior with exit 0
+    ([round 337](#round-337-fix-multi-node-with-more-workers-than-nlive-polychord-stopped-after-the-prior-exit-0-meaningless-logz)).
     A converged search slows ~12% mid-run because R2D2's early stop
     (`prune: True`) runs more U-Net iterations as the posterior moves to
     costlier images (18.6 -> 20.9 -> 22.8), at a flat ~37 ms an iteration;
@@ -16362,3 +16367,102 @@ then removes `../frozen-r332`.
 (six) and stage `r336-adopt-contour-2-nodes`, which holds every log(Z)
 with its error, in `benchmarks.jsonl`. The run dirs were deleted by the
 job. Logs, stats and dead-birth files are in `.probe/r336/`.
+
+## Round 337: fix (multi-node): with more workers than nlive PolyChord stopped after the prior, exit 0, meaningless log(Z)
+
+**Why.** Round 336 proposed a 4-node pair of the contour patch to check
+that its saving keeps growing with workers. Array job 39680026 (six 4-node
+icelake tasks, 4 x 39 ranks = 155 workers, nlive 150, converged production
+settings, frozen tree `ed98305`) ran instead into two bugs.
+
+**Bug 1: an early stop that looks like success.** Both seed-190182240 arms
+"finished" in 34-50 s, after 762 evaluations, with `nlike` 304, ndead 455
+and log(Z) 0.0144 +/- 0.0033: exit 0, a `summary.json`, a benchmark row.
+`run.log` has the cause: `Warning, unable to proceed after 151: failed
+spawn events`. PolyChord's main loop runs only while consecutive failed
+replacements stay at or below `nfail` (`nested_sampling.F90`, default
+`nlive`). In async mode every chain whose seed the contour has passed by
+the time it returns cannot be placed, so with more workers than nlive the
+first wave of stale returns alone trips the guard. Reproduced on round
+312's 6-d toy (analytic log(Z) -8.30, nlive 30, `.probe/r337/toy.py`
+with a `TOY_NFAIL` override):
+
+| ranks | nfail | ndead | log(Z) | |
+| ---: | ---: | ---: | --- | --- |
+| 20 | default (30) | 746 | -8.62 +/- 0.41 | fine: 19 workers |
+| 38 | default (30) | 97 | -6.46 +/- 0.82 | **"unable to proceed after 31"** |
+| 38 | 1000 | 934 | -8.40 +/- 0.42 | |
+| 38 | 67 (nlive + workers), seeds 1/2/3 | 862-964 | -7.93 / -8.64 / -7.52 (+/- 0.39-0.41) | |
+| 76 | 105 (nlive + workers), seeds 1/2 | 1,210-1,245 | -7.96 / -8.73 (+/- 0.39-0.40) | |
+
+**Fix.** `polychord_r2d2.py` sets `settings.nfail = nlive + workers`
+(`polychord_nfail`, with a self-check). Where the guard never fired (every
+search with fewer workers than nlive, so every 1- and 2-node production
+search so far), nothing changes. It is still a stop for a run that truly
+cannot proceed, such as the failure storm in `csd3-experiments.md` (E5),
+only `workers` returns later. Note that the cluster.md speed-ups predicted
+for 4 and 8 nodes at nlive 150 (round 307) were unreachable before this:
+such a search would have ended at the prior. WSClean (`polychord_wsclean.py`)
+has the same default and is left unchanged under the R2D2-only scope. It
+matters only below ~36 nlive on one node, e.g. the `NS_NLIVE=8` smoke form.
+The R2D2 bench presets (nlive 8, `--max-ndead 12`, 38 workers) are also
+over the line, so an R2D2 bench search can now run to its `--max-ndead`
+where before a failure run could end it first. Compare such rows only with
+rows from the same side of this commit.
+
+**Bug 2: a scratch race on the pools nodes.** The seed-7311 stock arm died
+in 6 s: three ranks on `cpu-q-272` failed `mount /dev/shm/ri-ns-scratch-...:
+destination ... doesn't exist in container`. The launcher's rank step
+starts at once, and each rank `mkdir -p`s its node's scratch. But a remote
+node's pools copy of `run-nested-sampling-r2d2.sh` runs `rm -rf` and
+`mkdir` on the same path (round 297's stale-scratch fix) whenever its own
+`srun` gets there. If that lands after a rank's mkdir, the rank's container
+mount fails, and if a rank were already running it would wipe live scratch.
+Fix: each pools node touches `.node-<host>/scratch-ready` after its
+`rm -rf`/`mkdir`, and the launcher clears those markers first and starts no
+rank until every node's marker exists (300 s limit, then a FATAL naming
+`nodes.log`). Single-node runs skip all of this.
+
+**Run with both fixes.** Array job 39680617, same six tasks on the fixed
+tree (`.probe/r337/array.sh`, `fix.diff`). The markers appeared on all
+three remote nodes, and no log has a spawn warning.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | stock | 0.0176398577755772 +/- 0.000333839152725586 | 2,046 | 791 | 96,931 | 102,919 | 200.2 | 516 s |
+| 190182240 | adopt | 0.0176556658771305 +/- 0.000333601995974698 | 1,637 | 390 | 70,860 | 75,824 | 209.6 | 363 s |
+| 7311 | stock | 0.0177196046805723 +/- 0.000308771451142401 | 1,997 | 754 | 87,456 | 92,400 | 206.2 | 450 s |
+| 7311 | adopt | 0.0176669777389513 +/- 0.000306153594462748 | 1,618 | 371 | 64,659 | 70,559 | 204.7 | 360 s |
+
+- Stock log(Z) on 4 nodes agrees with the 1-node production search
+  (0.0172602 +/- 0.00040: +0.7 and +0.9 sigma) and with round 336's 2-node
+  stock arms of the same seeds (+0.3, +0.4 sigma). Adopt minus stock is
+  +0.03 and -0.12 sigma.
+- The contour patch saves **-26.3% / -23.6% evaluations and -29.6% /
+  -19.9% wall**. Pooled over the two seeds: evaluations 195,319 -> 146,383
+  (**-25.1%**), summed wall 966 -> 723 s (**-25.1%**). Round 336 got -21.4%
+  evaluations for the same two seeds on 2 nodes, so the saving still grows
+  with workers, but slowly. Stock wastes 38% of dead points here (791 of
+  2,046 and 754 of 1,997), against ~27% on 2 nodes and 18% on 1.
+- Against round 315's 1-node stock mean of 1,317 s, 4 nodes converge
+  2.73x faster stock (mean 483 s) and **3.64x adopted** (mean 362 s). On 2
+  nodes it was 1.58x and 1.96x.
+- Stock's evaluations grow 1.18x from 2 to 4 nodes over the two seeds
+  (165,606 -> 195,319; per seed 1.31x and 1.06x). That is exactly round
+  307's nlive + 0.41 x workers prediction ((150 + 63.6) / (150 + 31.6) =
+  1.18), so cluster.md's 4- and 8-node figures stand.
+- The contour patch stays opt-in (sampler-change guard). Defaulting it is
+  the user's call.
+
+**Pending.** The seed-4242 pair was still running or queued when this
+round ended. They write into
+`.probe/r337/` and delete their own run dirs. The next round adds them
+with `.probe/r337/ana.py`, then removes `../frozen-r337` and
+`$RI_WORK_DIR/.cache/ri/sifs-r337`. The first, broken array's logs are in
+`.probe/r337/first/`. GPU job 39677203 (round 332) still has no output.
+
+**WSClean guard.** Not needed: the change touches only R2D2 code
+(`polychord_r2d2.py`) and the multi-node branch of
+`run-nested-sampling-r2d2.sh`. `./ri self-check r2d2` passes (30 host
+checks plus the image checks), and so does shellcheck 0.9.0.6. Rows:
+bench `r337-a*-s190182240` and `r337-a*-s7311`, and stage `r337-nfail-fix` in `benchmarks.jsonl`.

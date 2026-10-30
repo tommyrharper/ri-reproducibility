@@ -560,6 +560,28 @@ def self_check_failure_record_persistence() -> None:
         globals()["simulate_measurement_set"] = original_simulate
 
 
+def polychord_nfail(nlive: int, ranks: int | None = None) -> int:
+    """PolyChord's consecutive-failed-replacement limit, raised by the workers.
+
+    Its default is nlive, and every async chain still running when the
+    contour passes its seed comes back unplaceable, so with more workers than
+    nlive the first wave alone tripped it: PolyChord stopped after the prior
+    with exit 0 and a meaningless log(Z) (round 337: 4 nodes, 155 workers,
+    nlive 150). Below that the guard never fires, so results are unchanged.
+    """
+    if ranks is None:
+        from mpi4py import MPI
+
+        ranks = MPI.COMM_WORLD.Get_size()
+    return nlive + max(ranks - 1, 0)
+
+
+def self_check_polychord_nfail() -> None:
+    assert polychord_nfail(150, 156) == 305
+    assert polychord_nfail(150, 1) == 150
+    print("OK: PolyChord's nfail covers every async worker")
+
+
 def share_resume(chains: Path, base_dir: Path, file_root: str, read_resume: bool) -> bool:
     """Every rank, before run_polychord: make sure this rank sees <root>.resume.
 
@@ -703,6 +725,7 @@ def main() -> None:
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
+    settings.nfail = polychord_nfail(args.nlive)
     # Checkpoint long runs so interruptions are resumable via `--output-dir`.
     resume_path = output_dir / "chains" / f"{settings.file_root}.resume"
     settings.write_resume = True
@@ -818,6 +841,7 @@ if __name__ == "__main__":
         self_check_lazy_numpy()
         self_check_r2d2_config_thread_cap()
         self_check_r2d2_iterations()
+        self_check_polychord_nfail()
         self_check_stack_dumps()
         self_check_source_offset()
         self_check_profiling()

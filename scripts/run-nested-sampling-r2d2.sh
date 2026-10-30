@@ -264,7 +264,7 @@ else
     node=0
     for host in ${ns_node_hosts}; do
       mkdir -p "${SIMULATE_FIFO_DIR}/${host}" "${R2D2_FIFO_DIR}/${host}" "${OUTPUT_DIR}/.node-${host}"
-      rm -f "${OUTPUT_DIR}/.node-${host}/reset"
+      rm -f "${OUTPUT_DIR}/.node-${host}/reset" "${OUTPUT_DIR}/.node-${host}/scratch-ready"
       for ((rank = node * NS_MPI_PROCS; rank < (node + 1) * NS_MPI_PROCS; rank++)); do
         mkfifo "${SIMULATE_FIFO_DIR}/${host}/${rank}.in" "${SIMULATE_FIFO_DIR}/${host}/${rank}.out"
         mkfifo "${R2D2_FIFO_DIR}/${host}/${rank}.in" "${R2D2_FIFO_DIR}/${host}/${rank}.out"
@@ -284,6 +284,10 @@ else
   NS_SCRATCH_DIR="/dev/shm/ri-ns-scratch-${SLURM_JOB_ID}-${OUTPUT_DIR##*/}"
   rm -rf "${NS_SCRATCH_DIR}"
   mkdir -p "${NS_SCRATCH_DIR}"
+  # The launcher starts no rank until every node says this is done: a pools
+  # node whose rm -rf landed after its ranks' mkdir failed their container
+  # mounts, "destination ... doesn't exist in container" (round 337).
+  [ "${NS_NODE_ROLE:-}" != pools ] || : >"${OUTPUT_DIR}/.node-${ns_host}/scratch-ready"
   # Every other node starts this script again as its pools, now, so their
   # warm-up overlaps this node's. Their logs and .launcher.pid go in
   # .node-<host>, so no node's reaper reads another's pid.
@@ -583,6 +587,19 @@ scripts/record-environment.sh \
   -- "${RUN_COMMAND[@]}"
 
 mkdir -p "${OUTPUT_DIR}/evaluations"
+if [ "${NS_NODES}" -gt 1 ]; then
+  ns_waited=0
+  for host in ${others//,/ }; do
+    until [ -e "${OUTPUT_DIR}/.node-${host}/scratch-ready" ]; do
+      if [ "${ns_waited}" -ge 300 ]; then
+        echo "FATAL: ${host} did not make its scratch in 300s; see ${OUTPUT_DIR}/nodes.log" >&2
+        exit 1
+      fi
+      sleep 1
+      ns_waited=$((ns_waited + 1))
+    done
+  done
+fi
 run_with_retries "${NS_RETRIES}" "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" "${NS_NLIVE}" -- "${RUN_COMMAND[@]}"
 
 # One row in benchmarks.jsonl per finished search, so a change to this repo can
