@@ -1,0 +1,27 @@
+diff --git a/src/polychord/chordal_sampling.f90 b/src/polychord/chordal_sampling.f90
+index c70ae9c..61baeca 100644
+--- a/src/polychord/chordal_sampling.f90
++++ b/src/polychord/chordal_sampling.f90
+@@ -1,7 +1,14 @@
+ module chordal_module
++    use, intrinsic :: iso_c_binding, only: c_double
+     use utils_module, only: dp
+     implicit none
+ 
++    ! The contour of the slice step in progress, for a likelihood that can stop
++    ! early once a point is sure to fall below it (NS_EARLY_STOP, round 355).
++    ! It only ever matters in SliceSampling: live-point generation leaves the
++    ! starting value, which no likelihood can be below.
++    real(c_double), bind(C, name="polychord_contour") :: polychord_contour = -huge(1d0)
++
+     contains
+ 
+     function SliceSampling(loglikelihood,prior,settings,logL,seed_point,cholesky,nlike,num_repeats)  result(baby_points)
+@@ -94,6 +101,7 @@ module chordal_module
+             w = w * 3d0 !* exp( lgamma(0.5d0 * settings%nDims) - lgamma(1.5d0 + 0.5d0 * settings%nDims) ) * settings%nDims
+ 
+             ! Generate a new random point along the chord defined by the previous point and nhat
++            polychord_contour = logL_now
+             baby_points(:,i_babies) = slice_sample(loglikelihood,prior,logL_now, nhat, previous_point, w, settings,nlike(speeds(i_babies)))
+ 
+             baby_points(settings%b0,i_babies) = logL_now ! the contour it was born on

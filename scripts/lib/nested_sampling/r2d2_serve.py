@@ -1217,6 +1217,7 @@ def warm_imports() -> None:
             patch_imaging_weights()
             patch_request_io()
             patch_checkpoint_loading()
+            patch_early_stop()
             patch_net_reuse()
             if r2d2_device() == "cuda" and not trt_shared():
                 patch_cuda_network()
@@ -1634,12 +1635,48 @@ def start_trt_server(bases: list[str]) -> int:
     return pid
 
 
+# NS_EARLY_STOP (round 355): at iteration k a request stops once the iterate's
+# RMS is under this share of its contour. Each is ~1% under the lowest ratio any
+# above-contour evaluation of round 354's converged search reached, and below 1,
+# so a stopped evaluation always scores below its contour.
+EARLY_STOP_RATIOS = {2: 0.90, 3: 0.90, 4: 0.86, 5: 0.84, 6: 0.82, 8: 0.84, 10: 0.87, 12: 0.90, 15: 0.93, 18: 0.95}
+_early_stop: dict[str, Any] | None = None
+
+
+def below_contour(model: Any, iteration: int, rule: dict[str, Any]) -> bool:
+    """Whether iterate `model` (2-d) is far enough below `rule`'s contour to stop."""
+    ratio = EARLY_STOP_RATIOS.get(iteration)
+    if ratio is None:
+        return False
+    y, x = rule["y"], rule["x"]
+    pixel = float(model[y, x])
+    squares = float((model * model).sum()) - pixel * pixel + (pixel - rule["flux"]) ** 2
+    rms = (max(squares, 0.0) / (model.shape[0] * model.shape[1])) ** 0.5
+    if rms >= ratio * rule["contour"]:
+        return False
+    print(f"EARLY STOP: iteration {iteration} RMS {rms:.6e} contour {rule['contour']:.6e}")
+    return not rule.get("shadow")
+
+
+def patch_early_stop() -> None:
+    R2D2 = sys.modules["optimiser.R2D2"].R2D2
+    upstream = R2D2._stop_criteria
+
+    def _stop_criteria(self):
+        if upstream(self):
+            return True
+        return _early_stop is not None and below_contour(self._model.squeeze(), self._iter + 1, _early_stop)
+
+    R2D2._stop_criteria = _stop_criteria
+
+
 def serve(fifo_base: str | None = None) -> None:
     warm_imports()
     answer(fifo_base)
 
 
 def answer(fifo_base: str | None) -> None:
+    global _early_stop
     if fifo_base is None:
         requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
     else:
@@ -1652,6 +1689,7 @@ def answer(fifo_base: str | None) -> None:
         replies = open(f"{fifo_base}.out", "w")
     for line in requests:
         request = json.loads(line)
+        _early_stop = request.get("early_stop")
         returncode = 0
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             saved_argv = sys.argv
@@ -1671,6 +1709,21 @@ def answer(fifo_base: str | None) -> None:
 
 # Stub imager exits under real imager's guard, so warm-up imports only.
 _GUARDED_EXIT_IMAGER = "import sys\nif __name__ == '__main__':\n    sys.exit(int(sys.argv[1]))\n"
+
+
+def self_check_early_stop() -> None:
+    import numpy as np
+
+    rule = {"contour": 1.0, "flux": 8.0, "x": 1, "y": 2}
+    model = np.zeros((4, 4), dtype=np.float32)
+    model[2, 1] = 8.0
+    model[0, 0] = 2.0 * 0.5 * 4 * 0.9  # RMS 0.9 x contour, so 0.82-0.90 decides
+    assert below_contour(model, 7, rule) is False, "not a check iteration"
+    assert below_contour(model, 6, rule) is False
+    assert below_contour(model, 15, rule) is True
+    assert below_contour(np.zeros((4, 4)), 2, {**rule, "flux": 0.0}) is True
+    assert all(ratio < 1.0 for ratio in EARLY_STOP_RATIOS.values())
+    print("r2d2 early stop self-check passed")
 
 
 def self_check_serve_reply_stream() -> None:
@@ -2397,6 +2450,7 @@ if __name__ == "__main__":
         self_check_checkpoint_cache()
         self_check_checkpoint_series()
         self_check_threaded_session()
+        self_check_early_stop()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()

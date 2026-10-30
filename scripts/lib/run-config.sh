@@ -39,6 +39,9 @@ write_run_config() {
     if [ -n "${NS_ADOPT_CONTOUR:-}" ]; then
       printf 'NS_ADOPT_CONTOUR=%q\n' "${NS_ADOPT_CONTOUR}"
     fi
+    if [ -n "${NS_EARLY_STOP:-}" ]; then
+      printf 'NS_EARLY_STOP=%q\n' "${NS_EARLY_STOP}"
+    fi
     printf 'NS_IMAGER_IMAGE_ID=%q\n' "${imager_image_id}"
     printf 'NS_MEQTREES_IMAGE_ID=%q\n' "${meqtrees_image_id}"
     printf 'NS_POLYCHORD_IMAGE_ID=%q\n' "${polychord_image_id}"

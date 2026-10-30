@@ -5,14 +5,15 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 354; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 355; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
-- **Largest open lever: below-contour work.** 70% of U-Net iterations go to
-  evaluations that end below the contour, and a replay of one converged search
-  stops ~40% of all iterations early with 0.04-0.16% of above-contour
-  evaluations wrongly stopped on held-out data, an estimated ~1.6x evals/s. Not
-  built. It changes the sampler, so it can only be opt-in
-  ([round 354](#round-354-diagnostic-70-of-u-net-iterations-go-to-evaluations-already-below-the-contour-stopping-them-early-could-save-40)).
+- **Largest open lever: stopping below-contour evaluations.** `NS_EARLY_STOP=1`
+  (opt-in) stops R2D2 once an iterate's RMS is well under the contour. Three
+  converged bench-size seeds: wall **-33%** (1.50x), evaluations -1.8%, log(Z)
+  -0.33/+0.23/-0.04 sigma. It changes the sampler, so it stays opt-in until
+  the many-seed validation, and defaulting it is the user's call. It needs a
+  polychord.sif with patch 0002
+  ([round 355](#round-355-early-stop-built-opt-in-wall--33-over-three-seeds-logz-agreeing)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -17327,3 +17328,67 @@ evaluation, ~40% of iterations would be about -37% of worker time, or roughly
 **Next.** Build the opt-in path and race it for wall time and log(Z). The
 iterate traces, summary and dead-birth file are in `.probe/r354/`. WSClean is
 untouched: no shared code changed.
+
+## Round 355: early stop built, opt-in: wall -33% over three seeds, log(Z) agreeing
+
+**Change.** Round 354's rule, built. `docker/polychord/patches/0002` publishes
+the contour of the slice step in progress as a C symbol, `polychord_contour`;
+`contour_reader()` reads it through ctypes, and `evaluate()` sends it to the
+worker with the source's flux and pixel. `patch_early_stop()` wraps
+`R2D2._stop_criteria`, and at iterations 2, 3, 4, 5, 6, 8, 10, 12, 15 and 18
+ends the request once RMS is under `EARLY_STOP_RATIOS[k]` x contour. The ratios
+are round 354's in-sample minima, about 1% lower, and all below 1, so a stopped
+evaluation always scores under its contour. Every record of an opted-in run
+carries its `contour`, and a stopped one `early_stopped`, holding the stop line.
+Its metrics are those of the unfinished image, so failure-mode analysis must not
+read them as finished. `NS_EARLY_STOP=2` is a shadow mode that logs the stops
+without making them. A metric other than `total_rms_jy`, or a polychord.sif
+without the patch, is refused at start.
+
+**Patched SIF without Docker.** A `python:3.11-slim-bookworm` fakeroot sandbox
+with gfortran and Open MPI built pypolychord from the pinned commit with both
+patches, and a `Bootstrap: localimage` layered it over `images/polychord.sif`.
+Copy in `$RI_WORK_DIR/.cache/ri/polychord-contour.sif`. The shipped SIF does not
+have it, and neither round 313's `polychord-adopt.sif`.
+
+**Control, and exact wrong stops (seeded, synchronous, nlive 48, 5 repeats,
+max-ndead 300).** The shadow arm's `_dead-birth.txt` is byte-identical to the
+off arm's, so the patch and plumbing change nothing while no stop is made. With
+true contours, 56.7% of evaluations would stop, saving 45.6% of iterations, and
+**1 of 1,495** above-contour evaluations (0.067%) would be stopped wrongly, at
+iteration 4, its final value 2% above the contour. That rate agrees with the
+replay. The real stop arm diverged from dead point 92, and ended on log(Z)
+0.01469 +/- 0.00172 against 0.01677 +/- 0.00057, with 29% more `nlike`. That is
+one unconverged seed: a path that diverges is a different search, and round 351
+saw identical settings vary 1.7x in evaluations, so it does not show bias.
+
+**Race (async, converged, nlive 48, 5 repeats, 39 x 1, 1 node, paired by seed,
+arm order off-on, on-off, off-on; `.probe/r355/ab.sh`).**
+
+| seed | wall off (s) | wall on (s) | evaluations off | on | iterations off | on | log(Z) off | on | on-off (sigma) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3551 | 256.4 | 204.9 | 12,619 | 14,824 | 233,509 | 186,964 | 0.017495 +/- 0.00061 | 0.017214 +/- 0.00059 | -0.33 |
+| 3552 | 308.4 | 198.3 | 14,322 | 12,609 | 297,608 | 170,222 | 0.017259 +/- 0.00058 | 0.017446 +/- 0.00059 | +0.23 |
+| 3553 | 246.0 | 136.5 | 10,746 | 9,573 | 230,326 | 123,465 | 0.017263 +/- 0.00057 | 0.017228 +/- 0.00057 | -0.04 |
+| sum | 810.8 | 539.7 | 37,687 | 37,006 | 761,443 | 480,651 | | | |
+
+Wall **-33.4%** (1.50x), evaluations -1.8%, iterations -36.9% (20.2 to 13.0 per
+evaluation). 34-43% of async evaluations stopped, against 57% in the synchronous
+shadow: chains hold older contours here. Wall is the `summary.json` figure.
+Seed 3552's off arm also spent 123 s outside it, and may have been slowed, so
+without that pair wall is -32%.
+
+**What this does not establish.** Three seeds at nlive 48 on one node cannot
+show absence of a small bias: mean shift -0.05 sigma, with each sigma ~0.0008.
+The ratios were fitted to nlive 150 and seed 354 only; the production nlive and
+multi-node are unmeasured, as is how the rule interacts with `NS_ADOPT_CONTOUR`.
+Under the sampler-change guard this needs many seeds against the stock log(Z),
+with posterior moments, plus the production search. It stays opt-in, and any
+default is the user's decision. A rebuilt polychord.sif is also needed; until
+then a run points `SIF_DIR` at symlinks holding the copy above.
+
+**WSClean guard.** `common.py` and `run-config.sh` changed, so HEAD and this tree
+raced simultaneously (17 ranks each, seeded, synchronous, nlive 48, 300 dead):
+all `.txt` chain files byte-identical, log(Z) 0.0965029136823395 +/-
+0.000768628 on both, 125.5 s against 125.3 s. Off by default, R2D2 only reads
+one more environment variable and installs one no-op wrapper.

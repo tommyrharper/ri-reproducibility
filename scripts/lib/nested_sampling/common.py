@@ -3978,9 +3978,12 @@ def run_r2d2_imaging(
     argv: list[str],
     stdout_path: Path,
     stderr_path: Path,
+    early_stop: dict[str, float] | None = None,
 ) -> DockerRunResult:
     """Run one `imager.py` request, retrying worker deaths as `WORKER_DIED`."""
     request = {"argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}
+    if early_stop is not None:
+        request["early_stop"] = early_stop
     started = time.perf_counter()
     for attempt in worker_attempts():
         worker = r2d2_worker(r2d2_image, platform, checkpoints_dir)

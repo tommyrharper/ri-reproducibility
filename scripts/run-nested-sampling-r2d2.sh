@@ -517,6 +517,9 @@ RUN_COMMAND=(
   # Async workers adopt the newest live contour mid-chain; needs a polychord.sif
   # with docker/polychord/patches (round 312), and is ignored by one without.
   PC_ADOPT_CONTOUR="${NS_ADOPT_CONTOUR:-0}"
+  # Stop R2D2 once an iterate is well below the contour; needs a polychord.sif
+  # with patch 0002 and is refused by one without (round 355). Changes results.
+  NS_EARLY_STOP="${NS_EARLY_STOP:-0}"
   NS_CHAINS_TMPFS="${NS_CHAINS_TMPFS:-1}"
   # Opt-in: every N seconds each rank's Python stacks to <run>/stacks/ (round 324).
   NS_STACK_DUMP_S="${NS_STACK_DUMP_S:-}"

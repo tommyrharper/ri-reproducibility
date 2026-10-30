@@ -55,6 +55,7 @@ from common import (
     r2d2_thread_count,
     r2d2_worker,
     resolve_metric,
+    source_pixel,
     run_r2d2_imaging,
     self_check_lazy_numpy,
     self_check_follow_worker_node,
@@ -117,6 +118,27 @@ def r2d2_iterations(stdout_path: Path) -> int | None:
     return sum(line.startswith("RDR:") for line in text.splitlines()) or None
 
 
+def contour_reader(metric: str) -> Callable[[], float | None]:
+    """How a rank reads PolyChord's current slice contour, for NS_EARLY_STOP
+    (round 355); a reader of None when the search does not stop early."""
+    if os.environ.get("NS_EARLY_STOP", "0") == "0":
+        return lambda: None
+    import ctypes
+
+    import pypolychord
+
+    # The worker's stop test is this metric, and an early-stopped evaluation
+    # only reads below the contour if the score is the RMS it stopped on.
+    if metric != "total_rms_jy":
+        raise SystemExit(f"FATAL: NS_EARLY_STOP needs --metric total_rms_jy, not {metric}")
+    try:
+        library = ctypes.CDLL(str(Path(pypolychord.__file__).parent / "lib" / "libchord.so"))
+        contour = ctypes.c_double.in_dll(library, "polychord_contour")
+    except (OSError, ValueError):
+        raise SystemExit("FATAL: NS_EARLY_STOP needs a polychord.sif with docker/polychord/patches/0002") from None
+    return lambda: contour.value
+
+
 def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> int:
     threads = r2d2_thread_count()
     lines = [
@@ -163,6 +185,7 @@ def evaluate(
     eval_dir: Path,
     eval_id: int,
     objective_from_metrics: Callable[[dict[str, float]], float],
+    contour: float | None = None,
 ) -> dict[str, Any]:
     # Open interval lets profiler separate PolyChord time from idle time.
     mark_evaluation_start()
@@ -220,8 +243,20 @@ def evaluate(
         "--ckpt_path",
         R2D2_CKPT_PATH,
     ]
+    early_stop = None
+    if contour is not None:
+        size = int(os.environ["NS_IMAGE_DIM"])
+        cdelt = {"CDELT1": -scale_arcsec / 3600.0, "CDELT2": scale_arcsec / 3600.0}
+        sx, sy = source_pixel(
+            cdelt, size // 2, size // 2, params["source_l_arcsec"], params["source_m_arcsec"], size, size
+        )
+        early_stop = {"contour": contour, "flux": params["source_flux_jy"], "x": sx, "y": sy}
+        # NS_EARLY_STOP=2 logs the stops without making them: the search stays
+        # the stock one, and each record says whether its stop would be wrong.
+        if os.environ["NS_EARLY_STOP"] == "2":
+            early_stop["shadow"] = True
     run_result = run_r2d2_imaging(
-        args.r2d2_image, args.platform, args.checkpoints_dir, r2d2_cmd, r2d2_stdout, r2d2_stderr
+        args.r2d2_image, args.platform, args.checkpoints_dir, r2d2_cmd, r2d2_stdout, r2d2_stderr, early_stop
     )
     peak_memory_bytes = run_result.peak_memory_bytes
     # The OOM killer's usual victim: retried against a fresh worker already,
@@ -308,6 +343,13 @@ def evaluate(
             "r2d2_iterations": r2d2_iterations(r2d2_stdout),
         },
     }
+    # Its metrics are those of an unfinished image: all that is known of the
+    # finished one is that it was very likely below the contour.
+    if early_stop is not None:
+        record["contour"] = contour
+        stop_line = next((l for l in r2d2_stdout.read_text(errors="replace").splitlines() if l.startswith("EARLY STOP")), None)
+        if stop_line is not None:
+            record["early_stopped"] = stop_line
     return write_evaluation_record(eval_dir, record)
 
 
@@ -677,6 +719,7 @@ def main() -> None:
 
     marks["pypolychord"] = time.time()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
+    read_contour = contour_reader(args.metric)
 
     # key -> objective, not key -> record: nothing reads the record back (the
     # summary re-reads them all from disk below) and holding them is what made
@@ -705,7 +748,7 @@ def main() -> None:
             eval_id = scored
             eval_dir = evaluations_dir / f"eval-{eval_id:04d}-{key}"
             try:
-                record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics)
+                record = evaluate(params, args, eval_dir, eval_id, objective_from_metrics, read_contour())
             except WorkerDied as exc:
                 # No honest likelihood exists for an evaluation the host never
                 # ran, and any value invented here would steer the sampler.
