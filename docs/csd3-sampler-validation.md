@@ -5,11 +5,10 @@ is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
 39721865 (Part B, 18 tasks) were submitted on 2026-10-30. Part A started at 18:44
 with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
 treated arms, had finished and extracted cleanly, so the pipeline works end to end.
-Those rows were opened only to check they are complete. At 19:53 Part A had 25 of
-132 runs recorded, all status ok, with 33 tasks started; Part B had not started.
-At 19:54 none of the 33 task logs held a traceback, out-of-memory, cancellation,
-time-limit or EDQUOT line, and Part B had no log yet. At 19:54 the count was still
-25 of 132, with 527,955 files against the quota.
+Those rows were opened only to check they are complete. At 19:55 Part A had 25 of
+132 runs recorded, all status ok, with 33 tasks started and 0 task logs
+holding a traceback, out-of-memory, cancellation, time-limit or EDQUOT line; Part B
+had 0 logs.
 Budget check at that point, from aggregate timing with no split by arm: 24 runs in 65
 minutes on 10 slots is about 27 minutes per slot per run, against the 15-22 expected
 below, or ~2,260 core-hours for Part A. That estimate is rough because it ignores
