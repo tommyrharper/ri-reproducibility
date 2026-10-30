@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 319; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 320; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -15441,3 +15441,45 @@ Rows: `r303-W1`, `r303-A1..A3` and `r303-C1..C3` (bench) and stage row
 `r319-trt-gathered-33` in `benchmarks.jsonl`. `.probe/r303/` keeps the
 job output, the logs and the six `summary-*.json`; the run directories
 were deleted by the job.
+
+## Round 320 (fix): `./ri health` and live summaries counted a multi-node run's ranks per node
+
+**Why.** Round 288 left `./ri health` and `./ri runs` on a multi-node run
+untested. A multi-node `run.env` records `NS_MPI_PROCS` per node and adds
+`NS_NODES` only when it is above 1. The launcher multiplies the two for
+the ranks (`run-nested-sampling-r2d2.sh`), and `bench.py` already does the
+same, but `nested-sampling-health.py` and `live_runs.py` read
+`NS_MPI_PROCS` as the whole search's rank count.
+
+**What was wrong, on a 2 x 38 search.**
+
+- Health's occupancy divided imaging seconds by 38 ranks instead of 76, so
+  a half-busy run read as fully busy (the clamp hid the overshoot).
+- Its "ranks N% busy" figure was off in the same way, and its "X GB across
+  38 ranks" memory line gave half of what the search really holds.
+- The live summary (`summary.live.json`, which `./ri report --live` reads)
+  recorded `mpi_procs` 38, while the finished `summary.json` records 76,
+  so the profiling breakdown of a live run used half the workers.
+
+**Fix.** Health has a new `total_ranks(run_env)` helper
+(`NS_MPI_PROCS x NS_NODES`), used for the occupancy denominator, the busy
+percentage, the memory multiple and the "N ranks of M" line. That line
+now adds "on K nodes", because pgrep sees only this node's ranks. The live
+summary multiplies the two in the same way. `./ri runs` reads neither
+value: its record count already reads per-host packs (round 290), so it
+needed no change.
+
+**Verified.** There are new self-check cases in both scripts: a 4 x 2-node
+`run.env` must give the same occupancy as 8 ranks on one node, "16.0GB
+across 8 ranks" and "0 ranks of 8 on 2 nodes"; a 38 x 2 live summary must
+give `mpi_procs` 76. Both cases fail on the old code (the occupancy reads
+100% busy across 4 ranks; `mpi_procs` reads 38) and pass on the new. The
+CI host steps pass: compileall, `test_self_checks.py`, and the health,
+live-runs, runs and profile self-checks. No WSClean guard was run: the
+change is to host-side readers, which no search runs, and a single-node
+`run.env` gives the same numbers as before (`NS_NODES` is absent, so the
+factor is 1).
+
+**GPU job 39667582** (round 319's ranks-vs-batching split) had not
+started when this round began; `.probe/r319/` still holds only `ab.sh`.
+It is read next round.
