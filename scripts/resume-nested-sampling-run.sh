@@ -182,6 +182,10 @@ fi
 if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_TRT_SHARED=' "${RUN_DIR}/run.env"; then
   export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}"
 fi
+# And one from before round 327 without R2D2_TRT_BATCH sent single forwards.
+if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_TRT_BATCH=' "${RUN_DIR}/run.env"; then
+  export R2D2_TRT_BATCH="${R2D2_TRT_BATCH:-1}"
+fi
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"

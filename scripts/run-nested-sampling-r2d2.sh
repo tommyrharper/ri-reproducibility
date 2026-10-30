@@ -41,6 +41,13 @@ export R2D2_RUNTIME
 if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}" = cuda:trt ]; then
   export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-1}"
 fi
+# The shared server gathers up to 8 workers' forwards of one net into one
+# launch on 4 lanes, and with its workers off the card a rank per CPU (33 x 1)
+# fits: the production search converged 8% sooner than 19 x 2 unbatched, in
+# all five pairs, log(Z) 0.007 sigma apart (csd3-speed.md, rounds 319 and 326).
+if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}:${R2D2_TRT_SHARED:-0}" = cuda:trt:1 ]; then
+  export R2D2_TRT_BATCH="${R2D2_TRT_BATCH:-8}" R2D2_TRT_LANES="${R2D2_TRT_LANES:-4}"
+fi
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
@@ -124,6 +131,14 @@ sys.exit(0 if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0 an
     exit 1
   fi
   NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
+  # A batching server's workers hold nothing on the card and its batches keep
+  # it fed past the ~19 single-image lanes that saturate it (round 325), so
+  # the CPUs are the cap, plus the root's rank as on a CPU (round 186).
+  ns_gpu_batching=0
+  if [ "${R2D2_RUNTIME}:${R2D2_TRT_SHARED:-0}" = trt:1 ] && [ "${R2D2_TRT_BATCH:-1}" -gt 1 ]; then
+    ns_gpu_batching=1
+    NS_R2D2_MAX_RANKS="${HOST_CPUS}"
+  fi
   # A TensorRT worker's 25 engines hold ~5.1GB on the card against eager's
   # ~3.1GB of weights, so an 80GB A100 fits 12, not 19 (csd3-speed.md, round 170).
   # R2D2_TRT_SHARED=1 holds them once, in one forward server, and its workers
@@ -165,7 +180,8 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   # rank per CPU leaves one CPU without an R2D2 worker. One more rank fills it:
   # 38 -> 39 ranks on 38 icelake CPUs won 5 of 5 pairs, +3.7% evals/s, with
   # the same time per evaluation (csd3-speed.md, round 186).
-  if [ "${R2D2_DEVICE}" = cpu ] && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
+  if { [ "${R2D2_DEVICE}" = cpu ] || [ "${ns_gpu_batching:-0}" = 1 ]; } \
+    && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="$((HOST_CPUS + 1))"
   fi
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2)"
@@ -400,6 +416,13 @@ case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
     ;;
   *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;
 esac
+# Eager torch holds every worker's weights on the card, which fits
+# NS_R2D2_CUDA_MAX_RANKS, not a batching server's rank per CPU: past it the
+# workers' CUDA OOMs would score as failures.
+if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}" = cuda:torch ] && [ "${NS_MPI_PROCS}" -gt "${NS_R2D2_CUDA_MAX_RANKS}" ]; then
+  echo "FATAL: ${NS_MPI_PROCS} eager-torch workers do not fit one GPU (NS_R2D2_CUDA_MAX_RANKS=${NS_R2D2_CUDA_MAX_RANKS}); set --mpi-procs ${NS_R2D2_CUDA_MAX_RANKS}" >&2
+  exit 1
+fi
 # R2D2_OMP_THREADS and R2D2_MAX_THREADS are set above, not exported: without
 # them the pool builds no shared weights (patch_onnx_network), so a request on
 # more than one thread ran torch, not ONNX Runtime - 19 x 2 at 25 against

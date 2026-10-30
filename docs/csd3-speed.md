@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 326; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 328; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -15876,3 +15876,38 @@ Rows: bench `r326-W-t0`, `r326-A-t0`, `r326-C-t0`, `r326-W-t1`,
 `benchmarks.jsonl`. `.probe/r326/` keeps the script, the job outputs,
 gzipped logs and the six gzipped `summary-*.json`. The job deleted the run
 directories.
+
+## Round 328 (GPU default, resolution check pending): the gathering TensorRT server, 33 x 1, is the `--device cuda` default
+
+**Change.** On `--device cuda` with the shared TensorRT server (the default
+since round 215), `R2D2_TRT_BATCH` now defaults to 8 and `R2D2_TRT_LANES`
+to 4. With batching on, the rank cap is the CPUs (not
+`NS_R2D2_CUDA_MAX_RANKS=19`), plus one rank for PolyChord's root as on a CPU
+(round 186): 33 x 1 on a 32-CPU A100 job, round 326's arm C. The evidence is
+rounds 319 and 326: C converged sooner than 19 x 2 unbatched in all five
+pairs (8% at production settings), with log(Z) 0.007 sigma apart.
+`R2D2_TRT_BATCH=1` brings back 19 x 2 single forwards.
+`resume-nested-sampling-run.sh` resumes a run.env without `R2D2_TRT_BATCH`
+(from before this round) at batch 1. If TensorRT cannot be installed and
+the run falls back to eager torch, a rank count above
+`NS_R2D2_CUDA_MAX_RANKS` is now refused: eager workers hold their weights on
+the card, and CUDA OOMs past it would score as failures.
+
+**WSClean guard.** Not raced. Both edits are R2D2-only: the run-script
+change is in `run-nested-sampling-r2d2.sh`, and the resume change is gated on
+`NS_ALGORITHM = r2d2`.
+
+**Checks.** Shellcheck (CI's 0.9.0.6) on all scripts, `bash -n`, the
+self-checks of rank-budget/run-config/slurm, `test-defaults.sh`,
+`test_self_checks.py` and `test_cli.py` all pass. On this node,
+`resume-nested-sampling-run.sh --self-check` fails at its half-written
+summary case (`meqtrees.sif is missing` in its fixture). It fails the same
+way at HEAD (a2d8977), so this round did not cause it.
+
+**Pending.** Job 39673457 (`.probe/r328/check.sh`, 1 x A100, -t 00:25) runs
+a default search (D) and an `R2D2_TRT_BATCH=1` search (O) at nlive 128 with
+5 repeats, 600 dead points each. Its output, `.probe/r328/check-*.out`,
+should show D's run.env as `NS_MPI_PROCS=33 R2D2_TRT_BATCH=8
+R2D2_TRT_LANES=4 R2D2_OMP_THREADS=1`, O's as 19 x 2, and agreeing log(Z).
+It had not started when this iteration ended. Read it next round. If D does
+not resolve to C, revert this round.

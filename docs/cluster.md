@@ -369,8 +369,15 @@ default is TensorRT with `R2D2_TRT_SHARED=1`: one forward server holds the 25
 engines for every worker, the workers stay on the CPU and no MPS daemon is
 started, so the 19 ranks fit again. It converged the 22 Sep search in 785 s
 against 1,165 s for eager torch (90.8 against 64.2 evals/s, log(Z) 0.06 sigma
-apart). `R2D2_RUNTIME=torch` brings back eager torch with MPS, and
-`R2D2_TRT_SHARED=0` brings back per-worker engines.
+apart). Since round 328 that server gathers up to 8 workers' forwards of one
+net into one launch on 4 lanes (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`), and
+because its batches keep the card fed past the ~19 single-image lanes that
+saturate it, the rank cap is the CPUs plus PolyChord's root: 33 x 1 on a
+32-CPU A100 job. The production search converged 8% sooner than at 19 x 2
+unbatched, in all five pairs, log(Z) 0.007 sigma apart (rounds 319 and 326).
+`R2D2_TRT_BATCH=1` brings back 19 x 2 single forwards, `R2D2_RUNTIME=torch`
+eager torch with MPS, and `R2D2_TRT_SHARED=0` per-worker engines. A run from
+before round 328 resumes unbatched.
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:
