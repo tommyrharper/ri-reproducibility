@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 332; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 333; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -247,9 +247,12 @@ the Hetzner host.
   (90.8 against 64.2 evals/s, 100.1 against 66.4 steady), log(Z) 0.06
   sigma apart, so shared TensorRT is the GPU default since
   [round 215](#round-215-gpu-default-shared-tensorrt-converges-the-production-search-in-785-s-against-eagers-1165).
-- **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
-  core-hours, and the GPU and CPU allowances are separate budgets, so
-  using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
+- **Cost.** In SL3 charging units, one A100 hour on today's gathered
+  TensorRT default does the work of ~66-94 core-hours (round 174 said
+  47-55): a converged production search costs ~0.18 GPU-hours against
+  12-16 core-hours on half an icelake node. The GPU and CPU allowances are
+  separate budgets, so using both gives ~2.0-2.4x the R2D2 evaluations of
+  CPU alone a quarter ([round 333](#round-333-diagnostic-docs-only-r2d2-evaluations-per-sl3-unit-cpu-against-gpu-at-todays-defaults)). Half nodes
   give ~15% more evaluations per core-hour than whole nodes, and whole
   nodes finish one search sooner ([round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu)).
   On one whole icelake node, two socket-bound 38-rank searches run +9%
@@ -16115,3 +16118,55 @@ concurrency, not batch size, was what helped. It was submitted this round
 and had not started when the iteration ended.
 
 **WSClean guard.** Not needed: nothing shipped.
+
+## Round 333 (diagnostic, docs only): R2D2 evaluations per SL3 unit, CPU against GPU, at today's defaults
+
+**Why.** GPU job 39677203 (round 332's A/C/L race) had not started, so this
+round took a question this node can answer from logged rows. The cost
+figures in "Where it stands" were round 174's: one A100 at 57-61 evals/s
+(MPS, 19 or 12 ranks) against 38 x 1 CPU arms at nlive 100. Both paths have
+changed since, so the advice on where production searches should run was
+stale. No search was run.
+
+**Method.** Charging as in round 174 (CSD3 policies: 1 unit per core-hour,
+1 per GPU-hour, the A100's 32 cores not charged; SL3 allowance 200,000
+core-hours and 3,000 GPU-hours a quarter, separate budgets). Rates are the
+converged 22 Sep production search (nlive 150, 15 repeats), evaluations over
+the bench row's `wall_s` (start-up included, post-run excluded):
+
+| shape (defaults of the time) | rows | evals | wall s | evals/s | evals per charged hour |
+| --- | --- | ---: | ---: | ---: | ---: |
+| half icelake, 39 ranks on 38 cores, busy node | `r278-bigrun` | 75,278 | 1,585.6 | 47.5 | 4,500 per core-h |
+| half icelake, 39 ranks on 38 cores, quiet node | `r300-bigrun` (round 302) | 72,286 | 1,200.7 | 60.2 | 5,700 per core-h |
+| two icelake nodes, 76 cores | `r288-conv` | 78,332 | 790.4 | 99.1 | 4,690 per core-h |
+| one A100, gathered TRT 33 x 1 (today's `--device cuda`) | `r326-C-t0` | 68,385 | 585.4 | 116.8 | 421,000 per GPU-h |
+| same, second task (node shared with another task) | `r326-C-t1` | 70,160 | 675.0 | 103.9 | 374,000 per GPU-h |
+
+**Learned.**
+- **One A100 hour now does the work of ~66-94 CPU core-hours** (central
+  ~78), up from round 174's 47-55. The GPU rate roughly doubled (shared,
+  then gathered TensorRT, rounds 215 and 328) while the CPU rate rose
+  ~10-30% (two sockets, extra root rank, filesystem fixes).
+- A converged production search costs **~0.18 GPU-hours** (~10.5 minutes
+  on one card) against **12-16 core-hours** on half an icelake node (20-26
+  minutes). The GPU is also the faster wall clock, beating two whole
+  icelake nodes (790 s).
+- A quarter's SL3 allowance buys ~0.90-1.14 billion evaluations on CPU and
+  ~1.12-1.26 billion on the GPU budget, ~16,000 and ~17,000 production
+  searches. Using both now gives **~2.0-2.4x** the evaluations of CPU alone
+  (round 174 said +70-80%). If GPU hours are scarce or queue for long, the
+  CPU budget still carries about half the work, so both belong in
+  production.
+- With paid hours, the GPU pays whenever a GPU hour costs less than ~66
+  core-hours (round 174 said ~50).
+- Caveats: GPU queue time is not counted (2-GPU ampere jobs never started
+  on this account, round 163; 1-GPU jobs have waited from minutes to hours);
+  the r326 tasks shared one node's CPUs and memory bandwidth, so a lone
+  card may run faster; the CPU range spans node load (round 302).
+
+**Pending (GPU).** Job 39677203 (round 332) still had not started when this
+iteration ended; `.probe/r332/` has no output file yet. Read it next round.
+
+Rows: stage row `r333-cost-per-unit` in `benchmarks.jsonl`.
+
+**WSClean guard.** Not needed: docs only.
