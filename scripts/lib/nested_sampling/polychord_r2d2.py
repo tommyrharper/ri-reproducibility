@@ -307,6 +307,49 @@ def evaluate(
     return write_evaluation_record(eval_dir, record)
 
 
+_STACK_DUMP_FILES: list = []
+
+
+def start_stack_dumps(output_dir: Path) -> None:
+    """NS_STACK_DUMP_S=<s>: every s seconds, this rank's Python stacks, all threads, to stacks/rank-NNN.txt.
+
+    py-spy cannot attach to a rank inside Apptainer (round 323), and a Python
+    sampling thread stops whenever a C call holds the GIL. faulthandler's
+    watchdog is a C thread that needs neither. Its dumps carry no time: dump k
+    is at the header's start + k x s.
+    """
+    every = float(os.environ.get("NS_STACK_DUMP_S") or 0)
+    if every <= 0:
+        return
+    import faulthandler
+
+    stacks = output_dir / "stacks"
+    stacks.mkdir(exist_ok=True)
+    out = open(stacks / f"rank-{mpi_rank():03d}.txt", "a")
+    out.write(f"# start {time.time():.3f} every {every:g}s pid {os.getpid()}\n")
+    out.flush()
+    faulthandler.dump_traceback_later(every, repeat=True, file=out)
+    _STACK_DUMP_FILES.append(out)
+
+
+def self_check_stack_dumps() -> None:
+    import faulthandler
+    import tempfile
+
+    os.environ["NS_STACK_DUMP_S"] = "0.1"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            start_stack_dumps(Path(tmp))
+            time.sleep(0.35)
+            faulthandler.cancel_dump_traceback_later()
+            text = (Path(tmp) / "stacks" / f"rank-{mpi_rank():03d}.txt").read_text()
+            assert text.startswith("# start "), text[:80]
+            assert text.count("Thread 0x") >= 2 and "self_check_stack_dumps" in text, text[:400]
+    finally:
+        os.environ.pop("NS_STACK_DUMP_S")
+        _STACK_DUMP_FILES.pop().close()
+
+
 def self_check_r2d2_iterations() -> None:
     import tempfile
 
@@ -590,6 +633,7 @@ def main() -> None:
     # every rank ran this line, so twenty of them raced over one file.
     if mpi_rank() == 0:
         write_json_atomic(output_dir / "parameter-space.json", load_parameter_space())
+    start_stack_dumps(output_dir)
 
     # Start both workers before `import pypolychord`, then join before evaluation.
     warm = prewarm(
@@ -774,6 +818,7 @@ if __name__ == "__main__":
         self_check_lazy_numpy()
         self_check_r2d2_config_thread_cap()
         self_check_r2d2_iterations()
+        self_check_stack_dumps()
         self_check_source_offset()
         self_check_profiling()
         self_check_evidence_record()

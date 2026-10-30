@@ -80,6 +80,7 @@ IMAGE_ONLY = {
         "self_check_r2d2_config_thread_cap",
         "self_check_r2d2_iterations",
         "self_check_share_resume",
+        "self_check_stack_dumps",
         "self_check_worker_death_is_not_scored",
     ),
     "polychord_wsclean": ("self_check_failure_record_persistence",),

@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 323; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 324; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -15689,3 +15689,59 @@ stands" are corrected. Stage row `r323-transition-barriers` is in
 `benchmarks.jsonl` with the probe search's own bench row (`r323-root`,
 partial run, 19.8 evals/s: too short to compare). The run directory is
 deleted.
+
+## Round 324 (measurement + tooling): parallel TensorRT lane bring-up saves at most ~5 s once per search; per-rank stack dumps
+
+Round 323 traced the shared GPU server's constant 7.66 s `stall_s` to
+`serve_trt_shared` bringing its 19 lanes up one at a time, and named two
+levers that needed a GPU node. Round 324 measured them in one 10-minute
+1-A100 job (39669776, gpu-q-7, `.probe/r324/lanes.py`): deserialize the
+25 plans, then build 19 lanes (25 USER_MANAGED execution contexts each, the
+server's own code) serially and from thread pools, while a pure-Python
+thread spins to show whether the GIL is held. It then runs one input through
+every net of every lane and compares the outputs with the first lane's.
+
+| bring-up of 19 lanes | wall | spin thread, ticks/s |
+|---|---|---|
+| serial (today) | 17.31 s | 1.29e7 |
+| 19 threads | 13.51 s | 1.29e7 |
+| 4 threads | 13.54 s | 1.29e7 |
+| 8 threads | 12.10 s | 1.28e7 |
+
+- **The GIL is not the limit.** The spinning thread runs at the same rate
+  in every arm, so TensorRT's binding releases the GIL in
+  `create_execution_context`. Something inside TensorRT or the driver
+  serializes context creation instead. Four threads do as well as 19, and
+  the best (8) is only 1.43x serial.
+- **Outputs are unchanged:** 0 of 925 outputs (37 lanes x 25 nets) differ
+  from the first lane's, so contexts built concurrently are sound.
+- **What it is worth.** At best the last lane is ready ~5 s sooner
+  (17.3 -> 12.1 s; the job's cold plans deserialized in 21.5 s, which the
+  search's eight-reader load already overlaps). That bounds the gain at
+  ~5 s of the 7.66 s barrier, once per search: ~2.5% of a 200 s bench arm,
+  ~0.4% of a 20-minute search, and nothing on CPU. Building everything
+  before serving (the gathered server's way) would be worse: all lanes
+  would start at ~12 s, where today the first starts at ~1 s.
+- **Decision.** Not shipped. A change to the server needs its own raced GPU
+  A/B, which costs more than the lever is worth. The cheap form, if a
+  later GPU round touches `serve_trt_shared` anyway: build lanes in a
+  pool of 8 and start each lane's thread as soon as its contexts exist.
+
+**Tooling: `NS_STACK_DUMP_S`.** Round 323 found that py-spy cannot attach to
+a rank inside Apptainer. With `NS_STACK_DUMP_S=<s>`, each R2D2 search rank
+now arms `faulthandler.dump_traceback_later(s, repeat=True)` into
+`<run>/stacks/rank-NNN.txt` (`start_stack_dumps` in `polychord_r2d2.py`,
+passed through by `run-nested-sampling-r2d2.sh`; off by default, documented
+in `docs/run-health.md`). The dump comes from a C watchdog thread, so it
+also catches a rank stuck in C holding the GIL, which a Python sampling
+thread cannot do. A 39-rank `--nlive 40 --max-ndead 60` CPU search with
+`NS_STACK_DUMP_S=2` wrote 39 files, with workers in `worker_reply` (waiting
+on the R2D2 pool) and the root in `run_polychord`. Its log(Z) was
+0.00309108606104548 +/- 0.0128 (nlike 77); its bench row (`r324-stacks`,
+15.5 evals/s) is a 10 s run, too short to compare. New self-check
+`self_check_stack_dumps` (image-only, listed in `scripts/test_self_checks.py`)
+passes in polychord.sif. R2D2-only files, so there is no WSClean guard to run:
+with the variable unset the rank only reads an environment variable.
+
+Stage row `r324-trt-lane-bringup` is in `benchmarks.jsonl`. The probe run
+directory is deleted; its summary and stack dumps are kept in `.probe/r324`.

@@ -476,6 +476,8 @@ RUN_COMMAND=(
   # with docker/polychord/patches (round 312), and is ignored by one without.
   PC_ADOPT_CONTOUR="${NS_ADOPT_CONTOUR:-0}"
   NS_CHAINS_TMPFS="${NS_CHAINS_TMPFS:-1}"
+  # Opt-in: every N seconds each rank's Python stacks to <run>/stacks/ (round 324).
+  NS_STACK_DUMP_S="${NS_STACK_DUMP_S:-}"
   NS_KEEP_MEASUREMENT_SETS="${NS_KEEP_MEASUREMENT_SETS}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
   # host CPU, in every rank. Nothing here has a BLAS call big enough to want
