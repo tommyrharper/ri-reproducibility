@@ -6,7 +6,13 @@ is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
 with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
 treated arms, had finished and extracted cleanly, so the pipeline works end to end.
 Those rows were opened only to check they are complete. At 19:51 Part A had 24 of
-132 runs recorded, all status ok, with 33 tasks started; Part B had not started. The
+132 runs recorded, all status ok, with 33 tasks started; Part B had not started.
+Budget check at that point, from aggregate timing with no split by arm: 24 runs in 65
+minutes on 10 slots is about 27 minutes per slot per run, against the 15-22 expected
+below, or ~2,260 core-hours for Part A. That estimate is rough because it ignores
+in-flight work. If Part B overruns by the same third, ~2,000 core-hours, the total is
+~4,260, still under 5,000. At this rate Part A ends around 00:40. The file quota stood
+at ~552k of 1,048,576 with ~120k of that from the runs. The
 criteria here were committed before any result was read and do not change afterwards.
 Nothing becomes a default: both settings stay opt-in, this report recommends, and the
 user decides.
