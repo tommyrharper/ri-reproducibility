@@ -5,8 +5,13 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 342; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 344; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
+- **Target size reached.** Two converged searches at `docs/cluster.md`'s
+  `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
+  minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
+  0.2 sigma. Nothing broke. The one surprise is 20 s of the end of the run
+  ([round 344](#round-344-the-target-size-search-converges-in-20-minutes-on-8-nodes-prune-is-the-end-of-runs-biggest-phase)).
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
   log(Z) 0.0172602 +/- 0.00040 (within 0.25 sigma of rounds 239 and 278)
@@ -16832,3 +16837,81 @@ timing included the check's own `json.dumps`.
 
 Rows: `r342-{wnew,wold}{1,2}` and `r342-{rnew,rold}3` (bench rows) and stage
 row `r342-end-of-run` in `benchmarks.jsonl`. Run dirs were deleted.
+
+## Round 344: the target-size search converges in 20 minutes on 8 nodes; prune is the end of run's biggest phase
+
+**Why.** Every run so far stopped at 128k evaluations, but `docs/cluster.md`
+and earlier sizing work aim at `--nlive 500 --num-repeats 25`. A serial cost
+that only shows at that size would not have been seen. This is the first run
+at that size.
+
+**Method.** Converged R2D2 searches on 8 icelake half-nodes (312 ranks, 311
+workers), stock sampler, tree 0100306 frozen in `../frozen-r344`, jobs 39684651
+and 39685292 (`.probe/r344/big.sh`, `big2.sh`). The second tree differs only
+by prune timers, not committed. Rank 0's node was sampled every 30 s.
+
+| seed | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | ms/eval | job wall |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 344 | 0.0174309441303439 +/- 0.000188280573191559 | 5,820 | 1,785 | 432,376 | 450,922 | 387.4 | 796 | 1,254 s |
+| 345 | 0.0173758961596796 +/- 0.00020058887505272 | 5,926 | 1,892 | 406,776 | 425,400 | 398.6 | 774 | 1,145 s |
+
+- **Results agree.** The seeds differ by 0.2 sigma and sit within 0.4 sigma of
+  round 302's 0.0172602 +/- 0.00040 (nlive 150, one node). The error is about
+  half of round 302's.
+- **The cost model holds.** Round 307's model predicts ~465k evaluations from
+  round 339's ~123k; the two runs gave 451k and 425k. Waste falls to 31-32% of
+  dead points against 46% at nlive 150 on the same 311 workers.
+- **Per-node rate.** 48-50 steady evals/s a node against 52-53 in round 339,
+  with 19.1-19.4 R2D2 iterations. That is ~4-9% lower; two runs
+  do not say why. Simulate is 38-40 ms of ~785 ms (5%).
+- **Nothing size-related broke.** No stall (`stall_s` 0, idle 0.11-0.15%), peak RSS
+  8.5 GB (the pool parent), rank 0's node never above 40 GB used and 988 MB of
+  tmpfs. A run leaves ~2,000 files and 2.4 GB: `summary.json` 1.15 GB,
+  `run.log` 249 MB.
+- **Job start to first evaluation** is 7.7-9.4 s, unchanged from round 341.
+
+**Where the end of the run goes.** Last evaluation to search exit is 58-61 s,
+~5% of the job, with all 312 ranks held. `bench.py record` adds 10-16 s and the
+launcher ~1 s.
+
+| phase, seconds | seed 344 | seed 345 | 128k (round 339) |
+| --- | ---: | ---: | ---: |
+| drain | 0.9 | 0.5 | 0.4 |
+| records | 11.2 | 11.1 | 6.0 |
+| flush | 6.4 | 5.3 | 5.8 |
+| **prune** | **22.9** | **23.5** | 3.6 |
+| summary | 5.4 | 5.2 | 4.5 |
+| pack | 6.5 | 4.9 | 5.4 |
+
+Prune grew 6.4x on 3.5x the evaluations. The timers split seed 345's 23.5 s:
+
+| part of prune | seconds |
+| --- | ---: |
+| keep decision | 1.20 |
+| scan of 425k records | 1.09 |
+| 32-thread pool on Lustre | **20.80** |
+
+In-memory cost alone, on the real 450k records in `polychord.sif` with 12% made
+to name images, is 3.8 s under cProfile, so this is Lustre. At prune, 9,414
+directories were still listed with images, ~30 per rank, and only 205 were
+kept. The pool removed 64,463 files from the other 9,209, using 28.7 CPU-seconds
+in 20.8 s, so it never got near 32 threads' worth.
+
+These are the ranks' held extremes that were already published during the run.
+The keep-filtered flush (round 51) can only drop a held extreme still in tmpfs.
+This reading fits the numbers (9,414 / 312 is about the 20 lowest and 20 highest
+each rank holds) but no run has counted published extremes directly. It would
+explain why 128k-evaluation runs, at ~5 minutes, did not show it, and it means
+prune grows with ranks and run length, not with evaluations: a 16-node run
+would pay roughly double.
+
+**Next.** Have each rank delete its own published, unkept extremes in the flush
+phase, in parallel, so rank 0 finds almost nothing to prune. That can save ~20 s
+of ~1,200 (~1.7%) at 8 nodes. It touches `common.py`, so it needs the raced
+WSClean guard, and is left for the next round. `flush` and the Lustre load of
+312 ranks unlinking at once must be measured with it.
+
+Cost: ~100 core-hours on `WBARKER-SL3-CPU`. GPU job 39677203 (round 332) still has
+no output. Rows: `r344-big` and `r344-big2` (bench rows; the second is tagged
+`0100306+` for its timers) and stage row `r344-target-size` in
+`benchmarks.jsonl`. Run dirs were deleted, after copying full-precision log(Z).
