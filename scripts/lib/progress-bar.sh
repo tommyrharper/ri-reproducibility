@@ -284,7 +284,7 @@ _ns_stall_watchdog() {
           "no evaluation has finished in ${quiet}s (${now} scored, still counting)." \
           "A run that is alive but landing nothing is hung, not slow - killing it" \
           "so it can restart from PolyChord's checkpoint."
-        pkill -9 -f "$(ns_run_process_pattern "${output_dir}")" || true
+        ns_kill_run_ranks "${output_dir}"
         return 0
       fi
     fi

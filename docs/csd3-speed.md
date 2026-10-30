@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 321; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 322; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -15547,3 +15547,64 @@ phase) in one shared-server arm to name the 7.4 s. If B (33 x 1,
 shared) in job 39667582 shows the same 7.66 s, the cost belongs to the
 shared server's start, not the rank count. Stage row
 `r321-prior-switch` is in `benchmarks.jsonl`.
+
+## Round 322 (fix, multi-node): the stall watchdog's kill left the other nodes' ranks running
+
+**Why.** Round 320 noted that no 2-node test had run the stall watchdog.
+The watchdog kills a hung run with `pkill -9 -f` on
+`ns_run_process_pattern`, which also matches the `srun` that starts a
+multi-node search's ranks: its command line carries
+`polychord_r2d2.py --output-dir <run>`. Round 289's scenario A killed one
+remote rank while `srun` was alive, so it never tested this path.
+
+**Test** (on this job's node: two `srun --overlap --kill-on-bad-exit=1 -n2`
+steps, with `sleep` tasks named like ranks, task 1 standing in for a remote
+node):
+
+| killed with SIGKILL | task 1 afterwards |
+| --- | --- |
+| `srun` (both its processes) and task 0, as the watchdog did | still running 60 s later, orphaned; the step never ends |
+| task 0 only | srun: "task 0: Killed ... Terminating StepId ... task 1: Terminated" within 3 s |
+
+So on N nodes the watchdog killed the launcher node's ranks and `srun`,
+and every rank on the other nodes stayed alive. A hung remote rank (the
+case the watchdog exists for) stays hung, holding its node's FIFOs and
+CPU while the retry starts a new step beside it.
+
+**Fix.** `ns_kill_run_ranks` (`rank-budget.sh`) kills the pattern's
+processes on this node except those whose `comm` is `srun`. `srun` then
+sees its rank die and cancels the step on every node. The watchdog now
+calls it. On one node nothing named `srun` matches, so the kill takes
+exactly the processes it took before (ranks and `mpirun`). A new
+`rank-budget.sh` self-check case starts a fake rank and a fake `srun`
+(a `sleep` symlink) with matching command lines: the rank must die, and
+`srun` must live. It fails with the old kill.
+
+**WSClean guard.** None raced: the changed line runs only when the
+watchdog fires, so it cannot change a healthy search's speed or chains,
+and on one node it kills the same set of processes. The progress-bar
+self-check (which kills a hung fixture through the watchdog), the
+rank-budget self-check, `test_watchdogs.py`, `test_self_checks.py` and
+shellcheck all pass.
+
+**2-node check** (job 39668720, `.probe/r322/stall.sh`, 2 x 38 icelake,
+`--nodes 2 --nlive 150 --num-repeats 15 --seed 322 --max-ndead 450`,
+`NS_STALL_TIMEOUT=60`). The fix and then the old code (frozen worktrees
+of `6599d99`, one with the two changed files) ran one search each. After
+90 s the probe SIGSTOPs node 1's 39 ranks so the watchdog fires, counts
+node 2's original 39 ranks 20 s later, and lets the retry finish:
+
+| arm | watchdog after STOP | node 2 ranks alive 20 s on | how they ended | retry | log(Z) | nlike |
+| --- | ---: | ---: | --- | --- | --- | ---: |
+| fix | 112 s | 0 of 39 | srun: "Terminating StepId=39668720.1", node 2 tasks "Terminated" | resumed 5,592, exit 0, 291 s | 0.0159308761182684 +/- 0.00140720607490015 | 7,452 |
+| old | 137 s | 0 of 39 | no srun message: srun was dead, so the ranks went by themselves | resumed 9,564, exit 0, 300 s | 0.0158680530233059 +/- 0.00140666262841561 | 7,175 |
+
+So the old kill did not orphan real ranks in this scenario. Node 2's
+ranks lost their MPI peers (the root among them) and exited, and the
+retry was clean. The orphan seen with `sleep` tasks needs a remote rank
+that never touches MPI again, for example one stuck in a syscall, which is
+the hang the watchdog exists for. The fix makes the teardown not depend on
+that: `srun` cancels the step on every node (SIGTERM, then SIGKILL). The
+fix is defensive, with no measured outcome difference. log(Z) agrees
+(0.03 sigma; arms differ after the kill because the retry's timing differs).
+Run dirs and frozen worktrees are deleted; logs are in `.probe/r322/`.

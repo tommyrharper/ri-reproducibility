@@ -373,6 +373,10 @@ a multi-day search is exactly what somebody starts under `nohup`.
 The kill is by command line rather than by the pid the run script holds: that
 pid is `apptainer exec`, and the ranks are children of `mpirun`. `ns_run_process_pattern` builds the pattern, anchored on the
 run's own `--output-dir` so another search on the host is untouched.
+`ns_kill_run_ranks` spares `srun`, whose command line matches too: on a
+multi-node search it is what ends the other nodes' ranks once it sees one
+die (`--kill-on-bad-exit`), and an `srun` killed with them leaves those
+ranks running (csd3-speed.md, round 322).
 
 **The default is 7200s, deliberately far above anything legitimate.**
 `IMAGING_REPLY_TIMEOUT` already lets a single evaluation take an hour, so
