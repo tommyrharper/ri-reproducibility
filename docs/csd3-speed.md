@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 331; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 332; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -94,6 +94,11 @@ the Hetzner host.
     [round 328](#round-328-gpu-default-resolution-check-pending-the-gathering-tensorrt-server-33-x-1-is-the---device-cuda-default)
     (`R2D2_TRT_BATCH=1` opts out), checked on an A100 in
     [round 329](#round-329-check-the-cuda-default-resolves-to-33-x-1-gathered-logz-agrees-resume-self-check-fixed).
+    That default is GPU-bound, not CPU-bound: the card is 87-91% busy
+    running batches of ~2 while 15-22 of 32 CPUs work, and 29 ranks
+    converged sooner than 33 in both pairs, so the rank count and lane
+    count are being re-raced
+    ([round 332](#round-332-gpu-measurement-the-batched-default-is-gpu-bound-at-a-mean-batch-of-2-29-ranks-and-8-lanes-raced)).
     The shared arms' constant 7.66 s `stall_s` is the shared server
     bringing its lanes up one at a time (~0.72 s each): early ranks fill
     the prior phase, then wait at its barrier for the last lane. The
@@ -16061,5 +16066,52 @@ other half's tenant held the load average at 53-61 throughout.
 **Pending (GPU).** Job 39673960 (round 330) started while this round ran.
 At 03:09 it had finished W, A1, B1 and C1 (walls 226, 214 and 205 s for A1, B1 and C1, one pass) and was running C2. The next round reads
 `.probe/r330/ab-39673960.out`.
+
+**WSClean guard.** Not needed: nothing shipped.
+
+## Round 332 (GPU measurement): the batched default is GPU-bound at a mean batch of 2; 29 ranks and 8 lanes raced
+
+**Read: job 39673960 (round 330).** 1 x A100 on gpu-q-20, 32 CPUs, tree
+77e4ff7 plus round 330's batch counter, gathered TensorRT batch 8 on 4
+lanes, nlive 128, 5 repeats, converged, seed 4299, order ABCCBA after a
+300-dead warm-up. A is the default (33 ranks), B 45 ranks, C 29 ranks. "CPUs
+busy" is the job cgroup's CPU time over wall after the first 30 s; "GPU" is
+the mean `nvidia-smi` utilisation over the same span.
+
+| arm | ranks | evals | wall to converge | steady evals/s | mean TRT batch | CPUs busy (of 32) | GPU | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | 33 | 25,721 | 212.5 s | 139.6 | 2.04 | 18.6 | 87% | 0.0164320797761894 +/- 0.000455533062661695 |
+| B1 | 45 | 22,953 | 201.5 s | 131.7 | 2.43 | 22.4 | 81% | 0.0165085139887901 +/- 0.000434960864850737 |
+| C1 | 29 | 23,486 | 192.3 s | 142.8 | 2.02 | 16.0 | 91% | 0.0163268295497882 +/- 0.000437386497925277 |
+| C2 | 29 | 19,190 | 157.9 s | 147.8 | 2.06 | 15.4 | 90% | 0.0167271155037397 +/- 0.000457035689198552 |
+| B2 | 45 | 28,376 | 171.8 s | 196.5 | 3.47 | 18.2 | 88% | 0.0165352827742565 +/- 0.000442678932611848 |
+| A2 | 33 | 24,601 | 209.6 s | 135.8 | 2.16 | 18.0 | 91% | 0.0163676370876183 +/- 0.000439094867678744 |
+
+**Learned.**
+- The batched default is not CPU-bound. Only 15-22 of 32 CPUs are busy,
+  while the card is 87-91% busy. Round 331's idea of reserving a CPU for
+  the server answers a problem this node does not have, so it is dropped.
+- The card is busy with small batches: the mean is ~2 of a possible 8 at
+  29 and 33 ranks. Batches form only among workers at the same one of 25
+  nets, so with 4 lanes taking whatever is queued, most launches carry one
+  or two images. B2 is the only arm that reached a mean of 3.5, and it is
+  also the only arm far above the rest (196.5 steady); B1 at 45 ranks was
+  the slowest steady arm. That spread (B1 against B2, same settings) is
+  larger than any difference between arms, so one pass decides nothing.
+- C (29 ranks) converged sooner than A in both pairs (192.3 against 212.5 s,
+  157.9 against 209.6 s) and at a higher steady rate (+2.3%, +8.8%). Fewer
+  ranks use fewer evaluations to converge (round 309) without slowing the
+  card. Two pairs at this spread are not enough to move the default.
+- log(Z) agrees across all six arms (0.01633-0.01673, sigma ~0.00044; the
+  widest gap, C1 against C2, is 0.6 combined sigma).
+
+**Pending (GPU).** Job 39677203 (`.probe/r332/ab.sh`, 1 x A100, 32 CPUs,
+`-t 00:48`, tree `../frozen-r332` = bd967ef) races A (default 33 x 1, 4
+lanes), C (29 ranks) and L (33 ranks, `R2D2_TRT_LANES=8`) three times each,
+order A C L L C A A C L, at the same settings with seed 4332, and saves
+each run's `r2d2-trt-batches.txt` size histogram. More lanes take smaller
+groups but keep more forwards on the card at once; round 224 found
+concurrency, not batch size, was what helped. It was submitted this round
+and had not started when the iteration ended.
 
 **WSClean guard.** Not needed: nothing shipped.
