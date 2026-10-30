@@ -9,6 +9,7 @@ import os
 import re
 import select
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -896,6 +897,87 @@ def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
             "busy_wall_seconds": busy_wall, "busy_seconds_reconstructed": True}
 
 
+def start_gaps(records: Any) -> tuple[float, float, float] | None:
+    """(startup, stall, span) seconds from the evaluations' own start epochs.
+
+    A gap is a stretch in which no rank started an evaluation for longer than
+    max(2s, 10x the median evaluation). The first is start-up (the first
+    evaluations load the imager: 23-88s on a GPU node); later ones are the whole
+    search waiting, e.g. on PolyChord's root blocked 20-45s creating its resume
+    file on Lustre (round 225; tmpfs chains since 227). Both swamp a 3-minute arm, so evals over the span
+    minus the gaps is the rate a long run settles at (docs/csd3-speed.md, round 211).
+    """
+    timed = sorted((float(t["started_epoch"]), float(t["ended_epoch"]))
+                   for t in ((record.get("timing") or {}) for record in records)
+                   if t.get("started_epoch") is not None and t.get("ended_epoch") is not None)
+    if len(timed) < 2:
+        return None
+    bound = max(2.0, 10.0 * statistics.median(end - start for start, end in timed))
+    first_end = min(end for _, end in timed)
+    startup = stall = 0.0
+    for (earlier, _), (later, _) in zip(timed, timed[1:]):
+        if later - earlier > bound:
+            # Every rank starts together, so start-up opens before any ends.
+            if earlier < first_end:
+                startup += later - earlier
+            else:
+                stall += later - earlier
+    return startup, stall, max(end for _, end in timed) - timed[0][0]
+
+
+def first_request(records: Any) -> float | None:
+    """Median seconds of the evaluations started within 1s of the first.
+
+    When every rank starts together and a cold first request is shorter than
+    start_gaps()'s bound (an async whole node: 112 first requests of 5-8s
+    against 0.7s warm), no start-to-start gap opens and startup_s reads 0.0,
+    so this is the start-up figure there (docs/csd3-speed.md, round 259).
+    """
+    starts = [(float(t["started_epoch"]), float(t["ended_epoch"]))
+              for t in ((record.get("timing") or {}) for record in records)
+              if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    if not starts:
+        return None
+    first = min(start for start, _ in starts)
+    return statistics.median(end - start for start, end in starts if start - first < 1.0)
+
+
+def mean_r2d2_iterations(records: Any) -> float | None:
+    """Mean U-Net forwards per R2D2 request. R2D2 stops its series early on
+    the residual, so a request's cost goes as ~170 + 33 ms per iteration and
+    the mean rises ~10-20% as a search climbs (round 317): arms at different
+    phases differ in this, not in speed."""
+    counts = [record["timing"]["r2d2_iterations"] for record in records or ()
+              if isinstance(record, dict) and (record.get("timing") or {}).get("r2d2_iterations")]
+    return sum(counts) / len(counts) if counts else None
+
+
+def record_digest(records: Any) -> dict[str, Any]:
+    """What `./ri bench` wants from every record, kept in the summary's profiling
+    block so a finished run's ledger row does not parse them all: 7s of a 1.1 GB
+    summary, with every node of the job still held (round 349)."""
+    gaps = start_gaps(records)
+    timed = [t for t in ((record.get("timing") or {}) for record in records)
+             if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    return {
+        "startup_s": gaps[0] if gaps else None,
+        "stall_s": gaps[1] if gaps else None,
+        "span_s": gaps[2] if gaps else None,
+        "first_request_s": first_request(records),
+        "r2d2_iterations": mean_r2d2_iterations(records),
+        "peak_memory_bytes": max(
+            (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
+             or float(record.get("peak_memory_bytes", 0.0))
+             for record in records
+             if (record.get("metrics") or {}).get("peak_memory_bytes")
+             or record.get("peak_memory_bytes")),
+            default=0.0,
+        ),
+        "first_started_epoch": min((float(t["started_epoch"]) for t in timed), default=None),
+        "last_ended_epoch": max((float(t["ended_epoch"]) for t in timed), default=None),
+    }
+
+
 def summarize_profiling(
     evaluations: list[dict[str, Any]],
     total_wall_seconds: float,
@@ -940,6 +1022,7 @@ def summarize_profiling(
     ) if window_start is not None else (None, None)
 
     return {
+        "record_digest": record_digest(evaluations),
         "mpi_procs": mpi_procs,
         "total_wall_seconds": total_wall_seconds,
         "busy_worker_seconds": busy_worker,
@@ -2306,6 +2389,34 @@ def write_json_atomic(path: Path, payload: Any, encoded: list[str] | None = None
     _write_text_atomic(path, _json_text(payload, encoded))
 
 
+def read_summary_skeleton(path: Path) -> dict[str, Any] | None:
+    """A summary without its `evaluations`, or None if it needs reading whole:
+    no record_digest (older runs, merged runs) or not _json_text()'s layout.
+    Reads the two ends only; a target-size summary is over 1 GB (round 349)."""
+    marker, close = b'\n  "evaluations": [', b"\n  ],\n"
+    with open(path, "rb") as handle:
+        head = handle.read(1 << 16)
+        opened = head.find(marker)
+        if opened < 0:
+            return None
+        records_at = opened + len(marker)
+        size = handle.seek(0, os.SEEK_END)
+        handle.seek(max(records_at, size - (1 << 20)))
+        tail = handle.read()
+    # A record is one line, so the first such close is the array's. The record
+    # before it proves the read began inside the array, not past it.
+    closed = tail.find(close)
+    if closed < 0 or tail.rfind(b'\n    {"', 0, closed) < 0:
+        return None
+    try:
+        summary = json.loads(head[:records_at] + b"]" + tail[closed + len(close) - 2:])
+    except ValueError:  # caught mid-write
+        return None
+    if not (summary.get("profiling") or {}).get("record_digest"):
+        return None
+    return summary
+
+
 def _json_text(payload: Any, encoded: list[str] | None = None) -> str:
     # A summary's evaluations go one compact line each: indent=2 takes the
     # pure-Python encoder, 5.1s of a 67k-evaluation summary against ~1.6s
@@ -2339,6 +2450,24 @@ def self_check_summary_json() -> None:
     assert _json_text(summary, [json.dumps(e) for e in summary["evaluations"]]) == text
     for payload in ({}, {"evaluations": []}, [1], {"eval_id": 1}):
         assert _json_text(payload) == json.dumps(payload, indent=2) + "\n"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "summary.json"
+        digest = {"profiling": {"record_digest": {"span_s": 1.0}}}
+        records = [{"eval_id": 1, "timing": {}}, {"eval_id": 2, "seen": [1, 2]}]
+        whole = {"a": 1, "evaluations": records, "worst_evaluation": records[1], **digest, "z": [{}]}
+        path.write_text(_json_text(whole))
+        assert read_summary_skeleton(path) == {**whole, "evaluations": []}
+        path.write_text(_json_text({**whole, "profiling": {}}))
+        assert read_summary_skeleton(path) is None, "no digest, so the caller parses it whole"
+        path.write_text(json.dumps(whole, indent=2))  # merge's layout
+        assert read_summary_skeleton(path) is None
+        path.write_text(_json_text(whole)[:-20])
+        assert read_summary_skeleton(path) is None, "half a file"
+        # A tail wider than the window starts past the array's close.
+        path.write_text(_json_text({**whole, "wide": ["x" * (1 << 20)], "after": [{}]}))
+        assert read_summary_skeleton(path) is None
     print("OK: summary.json writer")
 
 

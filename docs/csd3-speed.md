@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 348; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 349; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
@@ -17078,3 +17078,69 @@ gained two findings here, `BLE001` (deliberate) and `B023` (in the self-check).
 
 Rows: `r346-*` (bench rows, commit `unknown`), `r345-big2`, and stage row
 `r348-abort`.
+
+## Round 349: a finished run's ledger row no longer parses every record (~6 s of a target-size job, all nodes held)
+
+Round 344 put the ledger row at 10-16 s of a target-size job, with every node
+still held. `./ri bench record` parsed the whole summary to read eight figures
+off its records. On a synthetic 430k-record, 1.08 GB summary in `/dev/shm`:
+
+| bench phase | seconds |
+| --- | ---: |
+| `json.loads` | 6.81 |
+| read | 0.67 |
+| start gaps | 0.46 |
+| first request + iterations | 0.35 |
+| peak memory | 0.09 |
+
+**The change.** `summarize_profiling` now stores those figures as
+`profiling.record_digest`, and `read_summary_skeleton()` reads the summary's
+two ends only. A summary with no digest (older runs, merged runs) or another
+layout returns `None`, and the caller parses it whole, as before. `./ri
+profile` uses the same reader. The record helpers moved from `bench.py` to
+`common.py`.
+
+| at 430k records | before | after |
+| --- | ---: | ---: |
+| reading the summary | ~7.5 s | 0.0011 s |
+| digest, rank 0, all ranks held | none | 1.23 s |
+
+The net is **~6 s on tmpfs**, ~0.6% of a ~1,000 s job. A larger saving on Lustre
+is expected from round 344's 10-16 s but was not measured, and no target-size
+search has run this path yet. The digest is also computed on each live summary
+(`live_runs.py`), which already decodes every record.
+
+**Results are unchanged.** On all three real summaries from the guard, the
+skeleton equals the full parse apart from `evaluations`, and the stored digest
+equals one computed fresh from the records. That covers the R2D2
+`r2d2_iterations` branch, 17.962 in both arms. The non-timing bench fields
+matched.
+
+| raced pair (19 ranks each on its own CPU set, synchronous) | evals | base steady evals/s | new | change |
+| --- | ---: | ---: | ---: | ---: |
+| WSClean, seed 229, base on even CPUs 0-36 | 4,071 | 37.51 | 37.48 | -0.1% |
+| R2D2, seed 229, base on CPUs 38-74 | 1,012 | 10.59 | 10.00 | **-5.6%** |
+| R2D2, seed 229, CPU sets swapped | 1,012 | 11.10 | 11.22 | +1.0% |
+
+All three pairs have byte-identical `dead-birth` chains and `.stats`. log(Z) is
+0.0967023094179472 +/- 0.000520957293962581 (WSClean) and
+0.0148985533905123 +/- 0.00153417185770842 (R2D2).
+
+The -5.6% is not a slowdown from this patch, because `record_digest` runs only
+after the last evaluation and its stages (simulate, imager) are the ones that
+moved. The swap does not cleanly explain it as a CPU-set effect either: the new
+arm was slower on 0-36 than the base arm on the same CPUs (10.00 against 11.10),
+and faster on 38-74 (11.22 against 10.59). Treat it as the ~5% noise of a single
+short pair, cause not established.
+
+**Checks.** `bench.py`, `profile-nested-sampling-run.py`, `test_watchdogs.py`,
+`test_self_checks.py` (32 host checks) and `./ri self-check wsclean` passed.
+`self_check_summary_json` covers the skeleton reader: no digest, merge's layout,
+half a file, and a tail wider than the read window. `./ri self-check r2d2` and
+self-heal were not run; the change touches neither records nor resume. The one
+new ruff finding, RUF007, is `start_gaps`'s existing `zip` moving into
+`common.py`, whose lint scope differs.
+
+Not done: `anesthetic-gui.py`'s title, `anesthetic_io.py`, merge and
+`prune-run-artefacts.py` still parse the whole summary. Some of those need the
+records.

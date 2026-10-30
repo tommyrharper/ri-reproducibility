@@ -29,7 +29,15 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
 
-from common import backfill_busy_seconds, profiling_breakdown  # noqa: E402
+from common import (  # noqa: E402
+    backfill_busy_seconds,
+    first_request,
+    mean_r2d2_iterations,
+    profiling_breakdown,
+    read_summary_skeleton,
+    record_digest,
+    start_gaps,
+)
 
 LEDGER = REPO_ROOT / "benchmarks.jsonl"
 NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
@@ -172,62 +180,7 @@ def resolve_run(raw: str) -> Path:
     return target.resolve()
 
 
-def start_gaps(records: Any) -> tuple[float, float, float] | None:
-    """(startup, stall, span) seconds from the evaluations' own start epochs.
-
-    A gap is a stretch in which no rank started an evaluation for longer than
-    max(2s, 10x the median evaluation). The first is start-up (the first
-    evaluations load the imager: 23-88s on a GPU node); later ones are the whole
-    search waiting, e.g. on PolyChord's root blocked 20-45s creating its resume
-    file on Lustre (round 225; tmpfs chains since 227). Both swamp a 3-minute arm, so evals over the span
-    minus the gaps is the rate a long run settles at (docs/csd3-speed.md, round 211).
-    """
-    timed = sorted((float(t["started_epoch"]), float(t["ended_epoch"]))
-                   for t in ((record.get("timing") or {}) for record in records)
-                   if t.get("started_epoch") is not None and t.get("ended_epoch") is not None)
-    if len(timed) < 2:
-        return None
-    bound = max(2.0, 10.0 * statistics.median(end - start for start, end in timed))
-    first_end = min(end for _, end in timed)
-    startup = stall = 0.0
-    for (earlier, _), (later, _) in zip(timed, timed[1:]):
-        if later - earlier > bound:
-            # Every rank starts together, so start-up opens before any ends.
-            if earlier < first_end:
-                startup += later - earlier
-            else:
-                stall += later - earlier
-    return startup, stall, max(end for _, end in timed) - timed[0][0]
-
-
-def first_request(records: Any) -> float | None:
-    """Median seconds of the evaluations started within 1s of the first.
-
-    When every rank starts together and a cold first request is shorter than
-    start_gaps()'s bound (an async whole node: 112 first requests of 5-8s
-    against 0.7s warm), no start-to-start gap opens and startup_s reads 0.0,
-    so this is the start-up figure there (docs/csd3-speed.md, round 259).
-    """
-    starts = [(float(t["started_epoch"]), float(t["ended_epoch"]))
-              for t in ((record.get("timing") or {}) for record in records)
-              if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
-    if not starts:
-        return None
-    first = min(start for start, _ in starts)
-    return statistics.median(end - start for start, end in starts if start - first < 1.0)
-
-
-def mean_r2d2_iterations(records: Any) -> float | None:
-    """Mean U-Net forwards per R2D2 request. R2D2 stops its series early on
-    the residual, so a request's cost goes as ~170 + 33 ms per iteration and
-    the mean rises ~10-20% as a search climbs (round 317): arms at different
-    phases differ in this, not in speed."""
-    counts = [record["timing"]["r2d2_iterations"] for record in records or ()
-              if isinstance(record, dict) and (record.get("timing") or {}).get("r2d2_iterations")]
-    return sum(counts) / len(counts) if counts else None
-
-
-def pre_run_phases(run_dir: Path, records: Any) -> dict[str, float] | None:
+def pre_run_phases(run_dir: Path, digest: dict[str, Any]) -> dict[str, float] | None:
     """Seconds each phase took, from the launcher's start in the job to the
     first evaluation, out of the pre-run.tsv the R2D2 launcher and its ranks
     write; a rank phase ends at its slowest rank (round 341). `searched` is
@@ -244,18 +197,17 @@ def pre_run_phases(run_dir: Path, records: Any) -> dict[str, float] | None:
                 marks.append((row[1], float(row[0])))
             except ValueError:
                 continue
-    timed = [t for t in ((record.get("timing") or {}) for record in records or ())
-             if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
-    if not marks or marks[0][0] != "job" or not timed:
+    first_started, last_ended = digest.get("first_started_epoch"), digest.get("last_ended_epoch")
+    if not marks or marks[0][0] != "job" or first_started is None:
         return None
     searched = dict(marks).get("searched")
     # After the search: its own record is written between these two.
     marks = [mark for mark in marks if mark[0] not in ("searched", "recorded", "finished")]
-    marks.append(("first_eval", min(float(t["started_epoch"]) for t in timed)))
+    marks.append(("first_eval", first_started))
     phases = {name: round(at - before, 2) for (_, before), (name, at) in zip(marks, marks[1:])}
     phases["total"] = round(marks[-1][1] - marks[0][1], 2)
     if searched is not None:
-        phases["searched"] = round(searched - max(float(t["ended_epoch"]) for t in timed), 2)
+        phases["searched"] = round(searched - last_ended, 2)
     return phases
 
 
@@ -287,7 +239,8 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         # covers all of them, so the throughput it implies is fiction.
         return skip("it restarted or was resumed")
     try:
-        summary = json.loads((run_dir / "summary.json").read_text())
+        summary = (read_summary_skeleton(run_dir / "summary.json")
+                   or json.loads((run_dir / "summary.json").read_text()))
     except (OSError, ValueError):
         return skip("no whole summary.json - it did not finish")
 
@@ -302,20 +255,14 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     run_env = read_run_env(run_dir)
     settings = {key: value for key, value in run_env.items() if key in WORKLOAD_KEYS}
     per_eval = breakdown["subtotal_per_eval_seconds"]
-    peak_memory = max(
-        (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
-         or float(record.get("peak_memory_bytes", 0.0))
-         for record in summary.get("evaluations", [])
-         if (record.get("metrics") or {}).get("peak_memory_bytes")
-         or record.get("peak_memory_bytes")),
-        default=0.0,
-    )
-    gaps = start_gaps(summary.get("evaluations", []))
-    steady = gaps and gaps[2] - gaps[0] - gaps[1]
-    first = first_request(summary.get("evaluations", []))
-    iterations = mean_r2d2_iterations(summary.get("evaluations", []))
+    digest = ((summary.get("profiling") or {}).get("record_digest")
+              or record_digest(summary.get("evaluations", [])))
+    peak_memory = digest["peak_memory_bytes"]
+    startup, stall, span = (digest[key] for key in ("startup_s", "stall_s", "span_s"))
+    steady = span and span - startup - stall
+    first, iterations = digest["first_request_s"], digest["r2d2_iterations"]
     batch = trt_mean_batch(run_dir)
-    pre_run = pre_run_phases(run_dir, summary.get("evaluations", []))
+    pre_run = pre_run_phases(run_dir, digest)
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -335,8 +282,8 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "idle_fraction": round(max(0.0, 1.0 - busy_wall / wall), 4)
         if busy_wall else None,
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
-        "startup_s": round(gaps[0], 1) if gaps else None,
-        "stall_s": round(gaps[1], 1) if gaps else None,
+        "startup_s": round(startup, 1) if span else None,
+        "stall_s": round(stall, 1) if span else None,
         "first_request_s": round(first, 2) if first is not None else None,
         "steady_evals_per_s": round(evals / steady, 4) if steady and steady > 0 else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
@@ -810,11 +757,11 @@ def self_check() -> None:
         (env_dir / "pre-run.tsv").write_text(
             "1.0\tjob\t1.0\n5.0\tlaunch\t5.0\n100.0\tjob\t100.0\n101.5\tsized\t101.5\n"
             "103.0\tlaunch\t103.0\n109.0\twarm\t106.0\n130.0\tsearched\t130.0\n133.0\tfinished\t133.0\n10")
-        assert pre_run_phases(env_dir, [{"timing": {"started_epoch": 110.0, "ended_epoch": 125.0}},
-                                        {"timing": {}}]) == {
+        assert pre_run_phases(env_dir, record_digest([
+                {"timing": {"started_epoch": 110.0, "ended_epoch": 125.0}}, {"timing": {}}])) == {
             "sized": 1.5, "launch": 1.5, "warm": 6.0, "first_eval": 1.0, "total": 10.0, "searched": 5.0}
-        assert pre_run_phases(env_dir, []) is None
-        assert pre_run_phases(Path(raw), [{"timing": {"started_epoch": 1.0}}]) is None
+        assert pre_run_phases(env_dir, record_digest([])) is None
+        assert pre_run_phases(Path(raw), record_digest([{"timing": {"started_epoch": 1.0}}])) is None
 
         run = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         run.mkdir()
