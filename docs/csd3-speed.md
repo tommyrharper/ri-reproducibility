@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 351; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 352; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
@@ -17214,3 +17214,39 @@ extended; `bench.py` only reads the ledger, so no raced guard applies.
 round. Rows: the ten `r332-*` bench rows and stage row `r351-gpu-race-and-spread`
 (full-precision log(Z)) in `benchmarks.jsonl`. The `frozen-r332` worktree is
 removed; summaries stay in `.probe/r332/`.
+
+## Round 352: one worker more than CPUs costs nothing measurable, so the multi-node layout stays
+
+**Question.** A multi-node `srun` uses a uniform `--ntasks-per-node`, so every
+non-root node of a default 39 x N job runs 39 workers on 38 CPUs. Round 186's
+extra rank is PolyChord's root, which never evaluates, and it only exists on
+the root's node. Read from the code, not measured on a real multi-node job.
+Does that one extra worker time-slice enough to pay for a non-uniform layout?
+
+**Race.** One node stands in for it: 39 ranks (38 workers) against 40 ranks
+(39 workers) on 38 CPUs. R2D2 CPU, `R2D2_OMP_THREADS=1`, nlive 48, 5 repeats,
+`--max-ndead 400`, seed 331, one warm-up, arms in order a b b a a b. Ranks were
+not pinned (no single-CPU masks). Load read 67-77 throughout, which was not
+broken down, so how much of it was this job is unknown. A converged wall time would
+be dominated by the evaluations each run happened to need, so the arms are
+judged on U-Net iterations/s (`evals_per_s` x `r2d2_iterations`).
+
+| arm | workers | U-Net iterations/s (each) | mean | evals/s (each) | evaluations | wall s |
+| --- | ---: | --- | ---: | --- | --- | --- |
+| a | 38 | 878.4, 888.2, 868.4 | 878.3 | 46.6, 49.0, 52.3 | 6,010, 6,710, 7,435 | 129.0, 136.8, 142.0 |
+| b | 39 | 901.6, 867.4, 918.4 | 895.8 | 47.8, 47.2, 48.4 | 6,752, 6,650, 7,299 | 141.3, 140.9, 150.8 |
+
+**Result.** The extra worker gives +2.0% iterations/s for +2.6% workers, so
+each worker's time per iteration moves +0.6% (43.3 to 43.5 ms). The arms
+overlap and a three-repeat control spans ~5%, so this cannot show a gain; it
+only shows no large penalty. Mean wall reads 6% longer on b, but b also ran 2%
+more evaluations, and the wall figures follow how many each run needed
+(a alone spans 129-142 s).
+
+log(Z) agrees: a 0.01803, 0.01728, 0.01753; b 0.01750, 0.01749, 0.01738, each
++/- ~0.0006 (full precision in the `r352-oversubscribed-worker` stage row).
+
+**Decision.** No change. A non-uniform layout would save ~0.5% of evaluations
+at 8 nodes and nlive 500 and ~1% at nlive 150 (estimated, not measured), which
+nothing here could see, and it would add a layout to a multi-node launch that
+works. Not measured: a real multi-node job, or a host with a known load.
