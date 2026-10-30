@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 329; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 330; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -88,8 +88,12 @@ the Hetzner host.
     ([round 325](#round-325-gpu-measurement-the-card-saturates-at-19-shared-lanes-so-round-319s-gain-is-batching-not-ranks)).
     At production settings (nlive 150, 15 repeats) C converges 8% sooner
     than A in both of two pairs, with log(Z) agreeing, so C should become
-    the GPU default; that switch is still to do
+    the GPU default
     ([round 326](#round-326-gpu-measurement-at-production-settings-the-gathering-server-converges-8-sooner-than-the-shared-default)).
+    It is the `--device cuda` default since
+    [round 328](#round-328-gpu-default-resolution-check-pending-the-gathering-tensorrt-server-33-x-1-is-the---device-cuda-default)
+    (`R2D2_TRT_BATCH=1` opts out), checked on an A100 in
+    [round 329](#round-329-check-the-cuda-default-resolves-to-33-x-1-gathered-logz-agrees-resume-self-check-fixed).
     The shared arms' constant 7.66 s `stall_s` is the shared server
     bringing its lanes up one at a time (~0.72 s each): early ranks fill
     the prior phase, then wait at its barrier for the last lane. The
@@ -15937,3 +15941,62 @@ down to this node. It was this stale count, the same one fixed on
 origin/cluster as 8152274, and this round applies that change identically.
 The self-check now passes (with the squeue shim on PATH).
 
+
+## Round 330 (tooling + GPU measurement pending): the gathering server counts its batch sizes; is the batched default CPU-bound?
+
+**Why.** The batched GPU default (round 328: 33 x 1, `R2D2_TRT_BATCH=8`, 4
+lanes) spends ~16.7 ms of rank time per R2D2 iteration (308 ms over 18.5
+iterations in round 329's arm D), against ~4.5 ms of non-U-Net CPU work an
+iteration on the CPU path (15% of a ~598 ms request over ~20 iterations,
+round 302). So a rank waits most of an iteration on the server. Two things
+could cause that: the card (or how well the server batches), or 33 ranks
+plus the server's threads competing for 32 CPUs. Nothing recorded which one.
+Batches form only among workers at the *same* iteration, one of 25 nets, so
+33 workers spread over 25 nets may rarely fill a batch of 8. The server
+also kept no count of the batch sizes it ran.
+
+**Change (tooling).** `serve_trt_gathered` counts launches by batch size and
+rewrites `r2d2-trt-batches.txt` beside `r2d2-engine.txt` every 30 s and at
+exit (`launches N forwards M mean X sizes 1:a 2:b ...`, temp file then
+rename). `./ri bench` rows carry its mean as `trt_mean_batch`, and the
+comparison prints it as "TensorRT mean batch". The count is taken under the
+lock the server already holds when it picks a group. The gathered
+self-check now asserts that the launches add up to every request, and
+`bench.py --self-check` parses the file.
+
+**Local measurement (server overhead).** A stand-in for the gathering server
+on this icelake node: the real `gather_forwards`, a forward that returns at
+once, and N worker processes that each spin 10 ms of CPU, then do one
+round trip (r2d2-cuda.sif's Python, 38 CPUs, `/dev/shm/r330/gather_bench.py`).
+
+| workers | CPU between requests | requests/s | mean round trip | mean batch |
+|---:|---:|---:|---:|---:|
+| 1 | 10 ms | 96 | 0.41 ms | 1.00 |
+| 16 | 10 ms | 1,574 | 0.09 ms | 1.02 |
+| 24 | 10 ms | 2,300 | 0.14 ms | 1.07 |
+| 30 | 10 ms | 2,646 | 1.08 ms | 1.22 |
+| 33 | 10 ms | 2,451-2,517 | 2.6-3.2 ms | 1.5-1.6 |
+| 40 | 10 ms | 2,513-2,602 | 4.9-5.3 ms | 1.6-1.7 |
+| 33 | 0 | 50,728 | 0.64 ms | 1.12 |
+
+The server's own Python is not the limit: it answers 50k requests a second
+when nothing else wants the CPUs. The round trip grows from 0.1 to 3 ms only
+once the spinning workers come within a few of the CPU count. That is
+scheduling: a reply waits for a CPU. Nicing the workers to 5 (2.59 ms
+against 2.76) and a 0.2 ms GIL switch interval (2.46 against 2.87) do not
+change it. On the GPU node, 33 ranks share 32 CPUs with the server, so the
+same effect may cost the batched default part of each iteration. Fewer
+ranks could then be as fast, while more ranks would only pay if the ranks
+spend most of their time blocked on the card.
+
+**Pending (GPU).** Job 39673960 (`.probe/r330/ab.sh`, 1 x A100, 32 CPUs,
+`-t 00:38`, tree `../frozen-r330` = 77e4ff7 plus this round's counter) races
+A (the default, 33 ranks), B (45 ranks) and C (29 ranks, 1 thread each), in
+ABCCBA order, converged at nlive 128 with 5 repeats, seed 4299, after a
+300-dead warm-up. It samples the job cgroup's CPU time and `nvidia-smi`
+utilisation every 2 s (`util-r330-*.txt`). Judge on wall to converge and
+`converging evals/s`, since more workers cost evaluations (round 309). The
+job had not started when this iteration ended.
+
+**WSClean guard.** Not needed: both edits are R2D2-GPU-only (the gathering
+server) or bench reporting.

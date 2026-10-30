@@ -885,14 +885,15 @@ def serve_trt_shared(socks: list, dim: int) -> None:
         thread.join()
 
 
-def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> None:
+def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward, launches: dict | None = None) -> None:
     """Serve workers' forward requests in batches: one reader thread, `lanes` threads running batches.
 
     The reader queues each request by net; a free lane takes up to `batch` of
     the net with most waiting and calls forward(lane, cur_iter, requests),
     which returns each request's output bytes, or None if it cannot run that
     net (each worker is then answered with the bare header and runs it on the
-    CPU). Returns once every worker's socket has closed.
+    CPU). Returns once every worker's socket has closed. `launches`, if
+    given, counts the batches run by size.
     """
     import selectors
     import threading
@@ -947,6 +948,8 @@ def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> 
                 group, pending[cur_iter] = pending[cur_iter][:batch], pending[cur_iter][batch:]
                 if not pending[cur_iter]:
                     del pending[cur_iter]
+                if launches is not None:
+                    launches[len(group)] = launches.get(len(group), 0) + 1
             try:
                 outputs = forward(lane, cur_iter, [request for _, request in group])
             except Exception:
@@ -979,6 +982,7 @@ def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
     (round 224).
     """
     import concurrent.futures
+    import threading
 
     import numpy as np
     import torch
@@ -1038,7 +1042,39 @@ def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
     with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
         status.write(f"shared: one server, {len(socks)} workers gathered into batches of up to {batch} "
                      f"on {len(lanes)} lanes\n")
-    gather_forwards(socks, size, batch, len(lanes), forward)
+    # Batches form only among workers at the same R2D2 iteration, so the size
+    # they reach is what the card's batching buys; r2d2-trt-batches.txt says
+    # (bench rows carry its mean as trt_mean_batch).
+    launches: dict[int, int] = {}
+    if os.environ.get("R2D2_TRT_STATUS"):
+        report = Path(os.environ["R2D2_TRT_STATUS"]).with_name("r2d2-trt-batches.txt")
+        threading.Thread(target=report_launches, args=(report, launches), daemon=True).start()
+    gather_forwards(socks, size, batch, len(lanes), forward, launches)
+    if os.environ.get("R2D2_TRT_STATUS"):
+        try:
+            write_launches(report, launches)
+        except OSError:
+            pass
+
+
+def write_launches(path: Path, launches: dict) -> None:
+    """One line: launches, forwards, their mean batch and the count at each size."""
+    counts = dict(launches)
+    runs = sum(counts.values())
+    forwards = sum(size * n for size, n in counts.items())
+    sizes = " ".join(f"{size}:{counts[size]}" for size in sorted(counts))
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(f"launches {runs} forwards {forwards} mean {forwards / max(runs, 1):.3f} sizes {sizes}\n")
+    os.replace(temporary, path)
+
+
+def report_launches(path: Path, launches: dict) -> None:
+    while True:
+        time.sleep(30)
+        try:
+            write_launches(path, launches)
+        except (OSError, RuntimeError):  # RuntimeError: a new size added mid-copy
+            pass
 
 
 def job_numa_cpus() -> dict[int, list[int]]:
@@ -2229,6 +2265,7 @@ def self_check_trt_gathered() -> None:
     """Gathered forwards reach the right worker, in batches no larger than asked, and the server ends."""
     import array
     import socket
+    import tempfile
     import threading
 
     dim, batch, workers, nets = 2, 4, 9, 5
@@ -2248,7 +2285,9 @@ def self_check_trt_gathered() -> None:
         return [array.array("f", [v * cur_iter for v in array.array("f", request[_TRT_HEADER.size:])[:dim * dim]]
                             ).tobytes() for request in requests]
 
-    server = threading.Thread(target=gather_forwards, args=([b for _, b in pairs], size, batch, 2, forward), daemon=True)
+    launches: dict[int, int] = {}
+    server = threading.Thread(target=gather_forwards, args=([b for _, b in pairs], size, batch, 2, forward, launches),
+                              daemon=True)
     server.start()
     failures = []
 
@@ -2280,6 +2319,11 @@ def self_check_trt_gathered() -> None:
     assert sum(batches) == workers * 3 * (nets - 1), batches
     assert max(batches) <= batch, batches
     assert max(batches) > 1, f"nothing was gathered: {batches}"
+    # Launches count every batch, the net the server cannot run included.
+    assert sum(launches.values()) >= len(batches) and sum(k * n for k, n in launches.items()) == workers * 3 * nets
+    with tempfile.TemporaryDirectory() as tmp:
+        write_launches(Path(tmp, "r2d2-trt-batches.txt"), {1: 2, 4: 1})
+        assert Path(tmp, "r2d2-trt-batches.txt").read_text() == "launches 3 forwards 6 mean 2.000 sizes 1:2 4:1\n"
     print(f"r2d2 trt gathered self-check passed (mean batch {sum(batches) / len(batches):.1f})")
 
 

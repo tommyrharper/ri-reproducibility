@@ -226,6 +226,15 @@ def mean_r2d2_iterations(records: Any) -> float | None:
     return sum(counts) / len(counts) if counts else None
 
 
+def trt_mean_batch(run_dir: Path) -> float | None:
+    """The gathering TensorRT server's mean batch, from the r2d2-trt-batches.txt it keeps (round 330)."""
+    try:
+        words = (run_dir / "r2d2-trt-batches.txt").read_text().split()
+        return float(words[words.index("mean") + 1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def row_for(run_dir: Path) -> dict[str, Any] | None:
     """One ledger row for a finished run, or None with a reason on stderr.
 
@@ -272,6 +281,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     steady = gaps and gaps[2] - gaps[0] - gaps[1]
     first = first_request(summary.get("evaluations", []))
     iterations = mean_r2d2_iterations(summary.get("evaluations", []))
+    batch = trt_mean_batch(run_dir)
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -297,6 +307,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "steady_evals_per_s": round(evals / steady, 4) if steady and steady > 0 else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "r2d2_iterations": round(iterations, 3) if iterations else None,
+        **({"trt_mean_batch": batch} if batch else {}),
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -586,6 +597,7 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
     row_for_path("idle fraction", ("idle_fraction",))
     row_for_path("peak memory MB", ("peak_memory_mb",))
     row_for_path("R2D2 iterations", ("r2d2_iterations",))
+    row_for_path("TensorRT mean batch", ("trt_mean_batch",))
     stages: list[str] = []
     for row in rows:
         stages += [key for key in row.get("stages_ms", {}) if key not in stages]
@@ -621,6 +633,8 @@ def do_table(_args: argparse.Namespace | None = None) -> int:
 
 
 def self_check() -> None:
+    import tempfile
+
     global LEDGER
 
     assert machine_id() == machine_id(), "machine id must be stable"
@@ -662,6 +676,10 @@ def self_check() -> None:
     assert mean_r2d2_iterations([{"timing": {"r2d2_iterations": 25}}, {"timing": {"r2d2_iterations": 9}},
                                  {"timing": {}}, {"objective": 0.0}]) == 17.0
     assert mean_r2d2_iterations([]) is None
+    with tempfile.TemporaryDirectory() as tmp:
+        assert trt_mean_batch(Path(tmp)) is None
+        (Path(tmp) / "r2d2-trt-batches.txt").write_text("launches 3 forwards 6 mean 2.000 sizes 1:2 4:1\n")
+        assert trt_mean_batch(Path(tmp)) == 2.0
     assert series([{"ms_per_eval": None}], ("ms_per_eval",)) == []
 
     defined = presets()
