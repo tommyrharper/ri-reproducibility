@@ -17982,3 +17982,133 @@ Checks: `./ri self-check r2d2-serve`, `scripts/bench.py --self-check` (new
 `r2d2_serve.py` and `bench.py` are not shared evaluation code, so no WSClean guard
 ran. Rows: `r368-c1`, `r368-w1`, `r368-c2`, `r368-w2`, `r368-v1`, `r362-big-s345`.
 Run directories are deleted. Array 39712455 had no output when this round closed.
+
+## Round 369: the end of a search gets timers (measurement only)
+
+**Why.** Round 368 left ~10 s between `searched` and the post-run line that no timer
+covered. `polychord_r2d2.py`'s post-run line now also reports `stop` (finish, chains
+mirror, packer), `window_fit` and `profile`.
+
+Synthetic estimates at 385k records: `summarize_profiling` ~3.0 s (mostly
+`record_digest`), left alone because a rewrite is worth ~0.25% of a 607 s job and
+touches `common.py`; interpreter exit of a process holding them ~0.8 s. The real
+8-node reading is in round 371. gnhf 370 left no commit and no log entry, so its
+number is unused here.
+
+## Round 371: the same-seed control reads -27.8%, wrong stops 1 in 98,616; a rank's exit no longer frees its heap (end of `main` to `mpirun` exit 4.4 to 0.43 s)
+
+**Why.** Array 39712455 finished: seed 344 at target size (nlive 500, 25 repeats,
+8 icelake half-nodes, adopting, the rule shipped by round 365), task 0 stopping and
+task 1 in shadow (`NS_EARLY_STOP=2`, same code, every check recorded). This is the
+control rounds 365 and 368 lacked. It is the same seed and same code but different
+nodes (6 of 8 shared), and async searches diverge, so it is two samples of one seed
+rather than a paired replay.
+
+| | stock `r344-big` | adopt only (shadow) | stop + adopt | stop against shadow |
+| --- | ---: | ---: | ---: | ---: |
+| search wall s | 1,165.7 | 817.2 | 590.0 | **-27.8% (1.38x)** |
+| job wall s | - | 869 | 643 | -26.0% |
+| evaluations | 450,922 | 351,114 | 388,809 | +10.7% |
+| dead points | - | 4,667 | 4,564 | -2.2% |
+| steady evals/s | 387.4 | 434.3 | 668.7 | +54% |
+| iterations a request | 19.36 | 18.89 | 11.65 | -38.3% |
+| log(Z) | - | 0.017454469399169 +/- 0.000188541166658583 | 0.0174615129419248 +/- 0.000188580059150255 | +0.03 sigma |
+
+Against stock on this seed, stop + adopt is -49.4% (1.98x), after -46.8% and -48.0%
+on the earlier rows, which ran the rule before the tightening.
+
+Early stop costs +10.7% evaluations here. Faster requests do not change PolyChord's
+need for points, so that is either seed noise or the price of stopped evaluations;
+one pair cannot say which. It is why the wall gain (-27.8%) is less than the
+iterations gain (-38.3%).
+
+**Wrong stops, measured live at target size.** Replaying the shipped ratios over the
+shadow's 345,681 evaluations with checks: 181,103 stopped (52.4%), 40.0% of iterations
+saved, and **1 of 98,616 above-contour evaluations stopped wrongly (0.001%)**, by
+0.39% of the contour at iteration 4. Round 365's replay predicted 0.004%. This is the
+shadow run's rate; the stopping run's own wrong stops cannot be counted, because its
+stopped evaluations never reach a final RMS.
+
+**Posterior moments** (stop against shadow, 9 dimensions): means differ by at most
+0.028 posterior sigma, 0.56 standard errors at ~820 equal-weight samples; sigmas agree
+within 1.7%. The stopping run's PolyChord split into 3 clusters and the shadow stayed
+in 1; the global log(Z) agrees regardless, and the two small clusters hold ~1.8% and
+~1.2% of the evidence. One seed; not a many-seed validation. Both
+settings stay opt-in and the default is the user's decision.
+
+**Where the end goes.** Task 1 (shadow) carried round 369's timers, 351,114
+records:
+
+| step | s |
+| --- | ---: |
+| records | 9.5 |
+| summary | 5.2 |
+| flush | 4.9 |
+| profile (was untimed) | 4.8 |
+| pack | 4.4 |
+| prune | 2.2 |
+| stop (was untimed) | 0.6 |
+| `run_polychord` return to end of `main`, sum | 31.7 |
+| end of `main` to `searched` (was untimed) | 8.2 |
+| `searched` | 39.9 |
+
+So the post-run timers are complete: the epochs give 31.68 s and the line sums to 31.7.
+The rest of round 368's ~10 s is `profile` (4.8, about 1.6x the synthetic estimate)
+plus **8.2 s after `main` returns** on this run.
+
+**What the 8.2 s was.** Job 39719836 (seed 346, stop + adopt on the current rule,
+8 half-nodes, `../frozen-r371` = c7860ed plus per-rank `flush`, an explicit
+`Barrier`/`Finalize` after `main` and an `mpirun` exit epoch; no result-affecting change)
+split it. Every one of the 312 ranks had finished `MPI_Finalize` by 0.13 s after its
+`Barrier`, and `mpirun` exited 4.40 s after the last of them. So it is not MPI: it is
+what a process does after `MPI_Finalize`, freeing its heap and exiting.
+
+A host estimate had pointed the other way, and was wrong by about 3x: Python 3.11.16 in
+`polychord.sif` holding a real 65,588-record summary exits in 0.32-0.33 s, 0.11-0.12 s
+through libc `exit`, which scales to ~1.2 s of saving at 350k. The 8-node run shows more.
+On a short single-node search the same gap is 0.27 s (39 ranks, 100 dead).
+
+**Change.** `exit_without_teardown()` in `polychord_r2d2.py`: after a clean `main`, a
+rank runs its `atexit` hooks, flushes, calls `MPI.Finalize()` and leaves through libc
+`exit`. That is `os._exit` less its loss of libgfortran's buffered output. An exception
+still goes through `abort_on_exception` as before.
+
+| run | seed | teardown | end of `main` to `mpirun` exit s | `searched` s | job wall s |
+| --- | ---: | --- | ---: | ---: | ---: |
+| r366-big-m2 | 344 | interpreter | 8.2 | 39.9 | 869 |
+| r371-big-s346 | 346 | `MPI.Finalize` first, then interpreter | 4.40 | 40.75 | 618 |
+| r371-big-x346 | 346 | libc `exit` | **0.43** | 32.49 | 612 |
+
+`searched` is smaller by less than the gap alone would say because the arms' other
+steps vary (x346: flush 7.0, records 8.4; s346: flush 6.4, records 9.5). Saving 4-8 s
+of a ~610 s job on 8 held nodes is 0.6-1.3%, with one reading each side.
+
+`flush` is the slowest rank's publish plus strip on Lustre (rank 43: 3.07 + 2.44 s of
+5.5, ranks holding ~40 kept dirs of 3,600 kept), not a fixed wait; it was 0.9 s on a
+short search and has now read 4.0-7.0 s at target size.
+
+**Third target-size seed.** Stop + adopt on the current rule, seed 346, twice:
+
+| run | search wall s | evaluations | steady evals/s | iterations | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| r371-big-s346 | 555.5 | 355,945 | 651.6 | 11.20 | 0.017258659781934 +/- 0.000193658959314901 |
+| r371-big-x346 | 563.7 | 356,363 | 641.6 | 11.11 | 0.017254793393842 +/- 0.000193575893608552 |
+
+The two differ by 0.01 sigma, and seeds 344 (0.017462) and 346 (0.017257) on this rule
+differ by 0.75 sigma, within noise. No stock run exists on seed 346.
+Both settings stay opt-in and the default is the user's decision.
+
+**Results unchanged, with one thing not explained.** Two raced short searches, HEAD
+against the tree (19 ranks, nlive 48, 100 dead, seed 371, synchronous): the second was
+byte-identical in all 7 chain files. The first was not (5 of 7 differ, from around
+line 100 of 148, `equal_weights` the same, log(Z) equal at the printed 5 digits). The
+new code runs after every chain file is closed, so it cannot be the cause, and gnhf 370's
+two races at seed 370 (one R2D2, one WSClean) were identical; a synchronous 19-rank search is apparently not
+always reproducible on a shared node, cause unknown, one occurrence in four.
+
+Checks: `./ri self-check r2d2` (new `self_check_exit_without_teardown`, classified
+image-only), `scripts/test_self_checks.py` (33 host-runnable passed). `polychord_wsclean.py`
+and shared code are untouched, so no WSClean guard ran.
+
+Rows: `r366-big-m1`, `r366-big-m2`, `r371-big-s346`, `r371-big-x346`. `../frozen-r366` and
+`../frozen-r371` are removed, diffs in `.probe/r366/` and `.probe/r371/`. Run directories are deleted.

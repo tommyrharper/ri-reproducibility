@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import ctypes
 import json
 import os
 import subprocess
+import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -901,6 +904,30 @@ def main() -> None:
         print(f"wrote {summary_path}")
 
 
+def exit_without_teardown() -> None:
+    """End a finished rank through libc, as an interpreter exit does, less its
+    freeing of every record: mpirun outlived the last MPI_Finalize by 4.4s at
+    356k evaluations, with all 8 nodes held (csd3-speed.md, round 371). libc's
+    exit, not os._exit: libgfortran flushes PolyChord's last output there."""
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    from mpi4py import MPI
+
+    MPI.Finalize()
+    ctypes.CDLL(None).exit(0)
+
+
+def self_check_exit_without_teardown() -> None:
+    code = ("import atexit, polychord_r2d2 as p; atexit.register(print, 'hook'); "
+            "print('printed'); p.exit_without_teardown(); print('after')")
+    env = {key: value for key, value in os.environ.items() if key != "POLYCHORD_R2D2_SELF_CHECK"}
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                          cwd=Path(__file__).parent, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["printed", "hook"], done.stdout
+
+
 if __name__ == "__main__":
     if os.environ.get("POLYCHORD_R2D2_SELF_CHECK") == "1":
         self_check_metric_resolution()
@@ -922,6 +949,8 @@ if __name__ == "__main__":
         self_check_worker_pool_connect()
         self_check_follow_worker_node()
         self_check_share_resume()
+        self_check_exit_without_teardown()
         print("metric resolution self-check passed")
     else:
         abort_on_exception(main)
+        exit_without_teardown()
