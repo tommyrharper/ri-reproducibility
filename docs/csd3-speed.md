@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 325; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 326; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -86,6 +86,10 @@ the Hetzner host.
     gathered batches lift the steady rate 19% at 33 ranks. Wall time tied
     in that job's two pairs, so a longer A-vs-C race decides the default
     ([round 325](#round-325-gpu-measurement-the-card-saturates-at-19-shared-lanes-so-round-319s-gain-is-batching-not-ranks)).
+    At production settings (nlive 150, 15 repeats) C converges 8% sooner
+    than A in both of two pairs, with log(Z) agreeing, so C should become
+    the GPU default; that switch is still to do
+    ([round 326](#round-326-gpu-measurement-at-production-settings-the-gathering-server-converges-8-sooner-than-the-shared-default)).
     The shared arms' constant 7.66 s `stall_s` is the shared server
     bringing its lanes up one at a time (~0.72 s each): early ranks fill
     the prior phase, then wait at its barrier for the last lane. The
@@ -15812,3 +15816,63 @@ wrote them as `r319-*`; renamed when appended) and stage row
 `r325-gpu-ranks-vs-batching` in `benchmarks.jsonl`. `.probe/r325/` keeps the
 script, job output, gzipped logs and the five `summary-*.json`; the job
 deleted the run directories.
+
+## Round 326 (GPU measurement): at production settings the gathering server converges 8% sooner than the shared default
+
+**Why.** Round 325 left one question for the GPU default: does the gathering
+TensorRT server's higher steady rate (C: 33 x 1, `R2D2_TRT_BATCH=8
+R2D2_TRT_LANES=4`) survive into wall time once its ~20 s extra start-up is
+amortised, against A (19 x 2 on the shared server, the default)? Job
+39672142 (`.probe/r326/ab.sh`, `../frozen-r303` tree as rounds 319 and 325)
+raced them at production settings: `--nlive 150 --num-repeats 15 --seed
+4299`, converged, after a 300-dead warm-up arm W. It was a 2-task array of
+1-A100, 32-CPU, `-t 00:38:00` jobs. Both tasks backfilled at once onto
+gpu-q-20 (A100-SXM4-80GB), each on its own card. Task 0 ran A then C and
+task 1 ran C then A, so each task holds one pair. The two tasks shared the
+node's CPUs and memory bandwidth, so compare arms within a task only.
+
+| arm | evals | wall to converge s | start-up s | stall s | steady evals/s | R2D2 request ms | log(Z) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A, task 0 | 67,392 | 627.5 | 10.5 | 7.5 | 110.6 | 143.2 | 0.0167323476423319 +/- 0.000429961385611248 |
+| C, task 0 | 68,385 | **585.4** | 27.8 | 0.0 | 122.6 | 238.0 | 0.0166460282472607 +/- 0.000416700827149362 |
+| C, task 1 | 70,160 | **675.0** | 32.2 | 0.0 | 109.2 | 266.6 | 0.0167838812538423 +/- 0.000420868240741699 |
+| A, task 1 | 75,576 | 741.9 | 10.0 | 7.5 | 104.3 | 150.7 | 0.0166925721621368 +/- 0.000430471402563648 |
+
+Warm-up W (19 x 2 shared, 300 dead): task 0 0.0151892460421648 +/-
+0.00115958070488613, task 1 0.0151612368285483 +/- 0.00115324194198806.
+
+**Results.**
+- **C converges sooner in both pairs**: by 6.7% (585.4 against 627.5 s)
+  and 9.0% (675.0 against 741.9 s), 8.0% on the means (630.2 against
+  684.7 s). Its steady rate is 7.9% higher (115.9 against 107.4 evals/s),
+  and here it did not need more evaluations (69,273 against 71,484 mean).
+  Round 325's ~20 s start-up penalty is ~3% of a 10-minute search, so it
+  no longer cancels the batching gain.
+- **A against C has now been raced in five pairs** (three in round 319
+  at nlive 128 with 5 repeats, two here), on two nodes. C is sooner in all
+  five: by 16% on the short searches and 8% on these. Round 325's
+  wall-time tie was C against B (33 x 1 on the shared server), not
+  against A.
+- **log(Z) agrees**: A mean 0.016712, C mean 0.016715, a difference of
+  0.007 sigma of one run.
+- Noise between tasks is large: the two A arms differ by 18% in wall time
+  (12% in evaluations, 6% in steady rate) on the same node, which is why
+  only within-task pairs are compared.
+- Iteration 326's notes compared A of task 0 with C of task 1 (627 against
+  675 s) as if they were a pair. They ran at the same time on different
+  cards, so that comparison is void.
+
+**Decision.** The evidence now favours C as the GPU default for
+production-sized searches (10+ minutes). It is slower only where start-up
+dominates (searches of ~3 minutes or less). The default is not changed in
+this round. Making it the default means raising `NS_R2D2_CUDA_MAX_RANKS` to
+33 when batching and defaulting `R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4` on
+`--device cuda`. That needs its own round: a short GPU job that checks that
+the defaults resolve to C (`run.env`, `r2d2-engine.txt`), plus the WSClean
+guard for any shared script it touches.
+
+Rows: bench `r326-W-t0`, `r326-A-t0`, `r326-C-t0`, `r326-W-t1`,
+`r326-C-t1`, `r326-A-t1` and stage row `r326-gpu-a-vs-c-production` in
+`benchmarks.jsonl`. `.probe/r326/` keeps the script, the job outputs,
+gzipped logs and the six gzipped `summary-*.json`. The job deleted the run
+directories.
