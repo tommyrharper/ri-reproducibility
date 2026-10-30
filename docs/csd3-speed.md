@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 324; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 325; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -79,8 +79,13 @@ the Hetzner host.
   - **GPU.** 33 x 1 workers on the gathering TensorRT server converge a
     1-A100 search 16% sooner than the 19 x 2 shared default (steady
     +38%, log(Z) +0.55 sigma, three raced pairs). Ranks and batching
-    changed together; job 39667582 splits them
+    changed together
     ([round 319](#round-319-gpu-measurement-33-workers-on-gathered-tensorrt-batches-converge-16-sooner-than-the-default-ranks-or-batching-pending)).
+    The gain is batching: 33 x 1 on the shared server is no faster than
+    19 x 2 because the card saturates at ~19 single-image lanes, while
+    gathered batches lift the steady rate 19% at 33 ranks. Wall time tied
+    in that job's two pairs, so a longer A-vs-C race decides the default
+    ([round 325](#round-325-gpu-measurement-the-card-saturates-at-19-shared-lanes-so-round-319s-gain-is-batching-not-ranks)).
     The shared arms' constant 7.66 s `stall_s` is the shared server
     bringing its lanes up one at a time (~0.72 s each): early ranks fill
     the prior phase, then wait at its barrier for the last lane. The
@@ -15437,7 +15442,7 @@ order was ACCAAC, after a 300-dead warm-up arm (W1).
   This is not yet proven: C changed the rank count and the server
   together.
 
-**Pending.** Job 39667582 (`.probe/r319/ab.sh`, 1 x A100, same frozen
+**Pending** (read in [round 325](#round-325-gpu-measurement-the-card-saturates-at-19-shared-lanes-so-round-319s-gain-is-batching-not-ranks), as resubmitted job 39670215). Job 39667582 (`.probe/r319/ab.sh`, 1 x A100, same frozen
 tree and settings) splits the two changes. It races B (33 x 1 on the
 default shared server, no batching) against C in the order BCCBBC. If B
 matches C, the change to ship is a larger GPU rank cap for the shared
@@ -15745,3 +15750,65 @@ with the variable unset the rank only reads an environment variable.
 
 Stage row `r324-trt-lane-bringup` is in `benchmarks.jsonl`. The probe run
 directory is deleted; its summary and stack dumps are kept in `.probe/r324`.
+
+## Round 325 (GPU measurement): the card saturates at ~19 shared lanes, so round 319's gain is batching, not ranks
+
+**Why.** Round 319 found that 33 x 1 workers on the gathering TensorRT server
+(C) converge 16% sooner than the 19 x 2 shared default (A), but C changed the
+rank count and the server together. Job 39667582, which splits them, never
+started in six rounds (32 CPUs for 55 minutes). It was cancelled and
+resubmitted as job 39670215 with `-t 00:38:00` and four arms instead of six
+(`.probe/r325/ab.sh`; otherwise round 319's script, the frozen `../frozen-r303`
+tree and the same settings: `--nlive 128 --num-repeats 5 --seed 4299`,
+converged, a 300-dead warm-up arm W1 first). It started 4 minutes after
+submission on gpu-q-63 (A100-SXM4-80GB) and finished in 18 minutes. B is
+33 x 1 on the default shared server (one lane per worker, no batching), and C
+is round 319's C (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`). The order was BCCB.
+
+| arm | ranks, server | evals | wall to converge s | start-up s | stall s | steady evals/s | R2D2 request ms | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| B1 | 33 x 1, shared | 23,390 | 235.3 | 10.1 | 16.8 | 112.3 | 284.3 | 0.0166370035199384 +/- 0.000453373783909247 |
+| C1 | 33 x 1, gathered | 29,378 | 233.4 | 31.8 | 0.0 | 145.7 | 227.6 | 0.0164066712571 +/- 0.000460445662194805 |
+| C2 | 33 x 1, gathered | 23,918 | 212.4 | 27.9 | 0.0 | 129.7 | 248.2 | 0.0164273324144557 +/- 0.000442536565345356 |
+| B2 | 33 x 1, shared | 21,723 | 210.7 | 10.3 | 16.8 | 118.3 | 268.2 | 0.0165186688093452 +/- 0.000444669272605961 |
+
+W1 (19 x 2 shared, 300 dead): log(Z) 0.0150462325838093 +/- 0.0011824641380044.
+
+**Results.**
+- **More ranks alone buy nothing on the shared server.** B's steady rate
+  (115.3 mean) is within noise of round 319's A (108.8, another node), because
+  the R2D2 request rises from ~150 ms at 19 lanes to ~276 ms at 33: 19/0.150
+  = 127 requests/s against 33/0.276 = 120. The card is saturated at ~19
+  single-image lanes, so `NS_R2D2_CUDA_MAX_RANKS=19` costs nothing on the
+  shared server and stays. The extra lanes also make the bring-up barrier
+  (round 323) longer: `stall_s` 16.8 s against 7.7 s at 19.
+- **Batching is what raises throughput.** At the same 33 ranks, C's steady
+  rate is 137.7 against B's 115.3 (+19%), with a shorter request (238 ms
+  mean against 276) because batches of up to 8 use the card better.
+- **But this job shows no wall-time gain.** B and C tie on wall to converge
+  (223.0 s against 222.9 s mean; one pair each way), because C1 needed 26%
+  more evaluations than the other three arms (29,378 against 21,723-23,918)
+  and C pays ~19 s more start-up building its batch contexts. Round 319's
+  C arms needed 3.7% more evaluations than A, so C1 looks like an async
+  outlier, but with two pairs that cannot be shown.
+- **log(Z) agrees.** B mean 0.016578, C mean 0.016417: a difference of
+  0.00016, 0.35 sigma of one run, consistent with round 319.
+
+**Decision.** No default changes. The open GPU question is narrower now:
+does the gathering server's +19-38% steady rate survive into wall time on a
+longer search, where its ~20 s extra start-up is amortised? The next GPU
+round should race A (19 x 2 shared, the default) against C at the production
+nlive (150) with `--num-repeats 15`, so a search lasts several minutes, in
+three pairs. The lever from rounds 323-324 (parallel lane bring-up) is not
+worth more at 19 lanes than round 324 found, since the shared server has no
+reason to run more than 19.
+
+**Scheduling.** A 1-A100, 32-CPU job with `-t 00:55:00` waited six rounds;
+the same job with `-t 00:38:00` started in 4 minutes. Keep GPU jobs short
+(under ~40 minutes) so the scheduler can backfill them.
+
+Rows: bench `r325-W1`, `r325-B1`, `r325-C1`, `r325-C2`, `r325-B2` (the job
+wrote them as `r319-*`; renamed when appended) and stage row
+`r325-gpu-ranks-vs-batching` in `benchmarks.jsonl`. `.probe/r325/` keeps the
+script, job output, gzipped logs and the five `summary-*.json`; the job
+deleted the run directories.
