@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 328; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 329; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -15910,4 +15910,30 @@ a default search (D) and an `R2D2_TRT_BATCH=1` search (O) at nlive 128 with
 should show D's run.env as `NS_MPI_PROCS=33 R2D2_TRT_BATCH=8
 R2D2_TRT_LANES=4 R2D2_OMP_THREADS=1`, O's as 19 x 2, and agreeing log(Z).
 It had not started when this iteration ended. Read it next round. If D does
-not resolve to C, revert this round.
+not resolve to C, revert this round. (Resolved in [round 329](#round-329-check-the-cuda-default-resolves-to-33-x-1-gathered-logz-agrees-resume-self-check-fixed): D resolves to C.)
+
+## Round 329 (check): the cuda default resolves to 33 x 1 gathered, log(Z) agrees; resume self-check fixed
+
+**Round 328's check (job 39673457, gpu-q-20, 1 x A100).** A default
+`./ri search r2d2 --device cuda` (D) and one with `R2D2_TRT_BATCH=1` (O)
+ran back to back at nlive 128, 5 repeats, 600 dead points, seed 4299.
+
+| arm | run.env | engine | wall s | evals | evals/s | steady | startup s | stall s | log(Z) |
+|---|---|---|---|---|---|---|---|---|---|
+| D (default) | `NS_MPI_PROCS=33 R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4 R2D2_OMP_THREADS=1` | plans `...-32-b1-2-4-8`, 33 workers gathered into batches of up to 8 on 4 lanes | 108.5 | 9,476 | 90.9 | 121.7 | 27.4 | 0.0 | 0.0165154851037018 +/- 0.000483519878283406 |
+| O (`R2D2_TRT_BATCH=1`) | `NS_MPI_PROCS=19 R2D2_TRT_BATCH=1 R2D2_OMP_THREADS=2` | one server, 19 lanes | 124.4 | 10,226 | 84.3 | 99.0 | 10.7 | 7.8 | 0.0162884883456009 +/- 0.00048688491664612 |
+
+The default resolves to round 326's arm C, the opt-out still gives 19 x 2,
+and log(Z) agrees (0.33 sigma), so round 328 stands. This was one
+sequential pair, a resolution check rather than an A/B. D's +23% steady
+rate is consistent with rounds 325-326, and its ~17 s extra start-up is the
+known cost of building four batched lanes. The rows are `r328-D-t0`,
+`r328-O-t0` and stage row `r328-gpu-default-check` in `benchmarks.jsonl`.
+
+**CI fix.** `resume-nested-sampling-run.sh --self-check` failed at its
+torn-summary case because line 113 still expected "2 evaluations already
+done" while the fixture has had 3 since round 92. Round 328 put the failure
+down to this node. It was this stale count, the same one fixed on
+origin/cluster as 8152274, and this round applies that change identically.
+The self-check now passes (with the squeue shim on PATH).
+
