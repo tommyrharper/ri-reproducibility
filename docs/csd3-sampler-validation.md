@@ -5,7 +5,7 @@ is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
 39721865 (Part B, 18 tasks) were submitted on 2026-10-30. Part A started at 18:44
 with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
 treated arms, had finished and extracted cleanly, so the pipeline works end to end.
-Those rows were opened only to check they are complete. At 19:49 Part A had 23 of
+Those rows were opened only to check they are complete. At 19:50 Part A had 24 of
 132 runs recorded, all status ok, with 10 tasks running; Part B had not started. The
 criteria here were committed before any result was read and do not change afterwards.
 Nothing becomes a default: both settings stay opt-in, this report recommends, and the
