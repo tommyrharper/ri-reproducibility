@@ -111,6 +111,9 @@ jobs:
       - name: Check the benchmark ledger
         run: uv run --no-project python3 scripts/bench.py --self-check
 
+      - name: Check the sampler validation analysis
+        run: uv run --no-project python3 scripts/sampler_validation.py --self-check
+
       # Only picks the runs to compare; drawing them needs the r2d2 image.
       - name: Check the likelihood-comparison run picker
         run: uv run --no-project python3 scripts/plot-merged-likelihood-compare.py --self-check
