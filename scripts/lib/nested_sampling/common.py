@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import math
 import os
@@ -1508,6 +1509,8 @@ def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[
 # The records finished_run_records() gave rank 0, by name, which
 # pack_finished_run() packs once prune_run_artefacts() has edited them.
 _FINISHED_RECORDS: dict[str, dict[str, Any]] = {}
+# json.dumps() of those a rank encoded for it and prune cannot edit.
+_FINISHED_TEXTS: dict[str, str] = {}
 
 
 def pack_finished_run(evaluations_dir: Path, encoded: dict[str, str] | None = None) -> int:
@@ -1518,8 +1521,9 @@ def pack_finished_run(evaluations_dir: Path, encoded: dict[str, str] | None = No
 def encode_finished_records() -> dict[str, str]:
     """json.dumps() of each finished record, by name, once prune has edited
     them: the summary and the final pack each encoded all of them, 2.6s a
-    time at 128k evaluations (round 340), so they share this."""
-    return {name: json.dumps(record) for name, record in _FINISHED_RECORDS.items()}
+    time at 128k evaluations (round 340), so they share this. The ranks
+    encoded nearly all of them, in parallel (round 342)."""
+    return {name: _FINISHED_TEXTS.get(name) or json.dumps(record) for name, record in _FINISHED_RECORDS.items()}
 
 
 class PolyChordFinish:
@@ -1754,6 +1758,10 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     records first, decides what the run keeps - the same decision prune
     makes - and the ranks publish only that and drop the rest in tmpfs.
     """
+    # The run's last moments, when what they allocate all stays live: a cyclic
+    # collection walks it for nothing, ~60% of unpickling 128k records here
+    # (csd3-speed.md, round 342).
+    gc.disable()
     POST_RUN_SECONDS.clear()
     POST_RUN_BACKLOG.clear()
     started = time.monotonic()
@@ -1808,10 +1816,15 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     here = os.path.abspath(evaluations_dir)
     mine = [(os.path.basename(path), json.loads(text)) for path, text in _WRITTEN_RECORDS.items()
             if os.path.dirname(path) == here]
+    # The compact text too, which rank 0 alone took ~3s to encode at 128k
+    # evaluations. Not for a record prune_run_artefacts() may edit (~22% at 128k).
+    mine = [(name, record, None if _names_image(record) else json.dumps(record)) for name, record in mine]
     gathered = comm.gather(mine, root=0) if comm is not None else [mine]
     records = None
     if mpi_rank() == 0:
-        written = {name: record for rank_records in gathered for name, record in rank_records}
+        written = {name: record for rank_records in gathered for name, record, _ in rank_records}
+        _FINISHED_TEXTS.clear()
+        _FINISHED_TEXTS.update((name, text) for rank_records in gathered for name, _, text in rank_records if text)
         records = gathered_and_earlier_records(evaluations_dir, written)
     started = post_run_phase("records", started)
     keep = (None if records is None or os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
@@ -2051,10 +2064,14 @@ def self_check_resume_adoption() -> None:
                                 {"eval_id": 2, "params": {"a": 2}, "objective": 0.75})
         assert [r["objective"] for r in load_evaluations_from_dir(evaluations_dir)] == [0.5, 0.75]
         write_evaluation_record(evaluations_dir / "eval-0004-jkl",
-                                {"eval_id": 4, "params": {"a": 4}, "objective": 0.1})
+                                {"eval_id": 4, "params": {"a": 4}, "objective": 0.1,
+                                 "paths": {"image": "x"}})
         records = finished_run_records(evaluations_dir)
         assert [r["eval_id"] for r in records] == [1, 2, 4]
+        # Rank-encoded texts: never one prune may edit (round 342).
+        assert "eval-0002-def" in _FINISHED_TEXTS and "eval-0004-jkl" not in _FINISHED_TEXTS
         records[2]["paths"] = {}  # as prune_run_artefacts() edits a record
+        assert list(encode_finished_records().values()) == [json.dumps(r) for r in records]
         assert pack_finished_run(evaluations_dir) == 2
         assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
         assert (evaluations_dir / RECORD_PACK).read_text().count("\n") == 4  # 1, 2, 2 again, 4
@@ -2538,6 +2555,11 @@ PRUNED_EVALUATION_LOGS = (
 )
 
 
+def _names_image(record: dict[str, Any]) -> bool:
+    paths = record.get("paths") or {}
+    return any(paths.get(key) for key in RETAINED_IMAGE_KEYS)
+
+
 def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) -> int:
     """Delete images and logs of evaluations the retention policy does not keep.
 
@@ -2617,7 +2639,7 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
     slow, removed = [], 0
     for record in records:
         paths = record.get("paths") or {}
-        if not any(paths.get(key) for key in RETAINED_IMAGE_KEYS):
+        if not _names_image(record):
             continue  # prune() of a record naming no image does nothing: ~90% of them (round 269)
         if touches_lustre(record):
             slow.append(record)

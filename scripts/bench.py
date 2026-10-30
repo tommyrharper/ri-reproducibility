@@ -10,6 +10,7 @@ dominate a group's result. See docs/nested-sampling-benchmarks.md.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -352,6 +353,7 @@ def do_record(args: argparse.Namespace) -> int:
     if os.environ.get("NS_BENCH_RECORD") == "0":
         print("benchmark: warm-up run, not recorded", file=sys.stderr)
         return 0
+    gc.disable()  # parsing summary.json, all of which stays live (round 342)
     row = row_for(resolve_run(args.run))
     if row is None:
         return 0

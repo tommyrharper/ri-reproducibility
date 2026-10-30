@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 341; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 342; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -16761,3 +16761,74 @@ Rows: `r341-a` (1 node), `r341-n8-cold`, `r341-n8-warm` and `r341-r{old,new}3`
 (bench rows; the new arms carry `pre_run_s`) and stage row `r341-pre-run-marks` in `benchmarks.jsonl`.
 The job script, logs and TSVs are in `.probe/r341/`. Every run dir was
 deleted.
+
+## Round 342: end-of-run records 7.1 s to 3.3 s at 128k evaluations (ranks encode, GC off)
+
+**Question.** Round 341 left rank 0's `records` gather and the encode that
+`summary.json` and the pack share as the largest steps after the last
+evaluation. Both are serial, and both scale with the evaluation count.
+
+**Change.** Two things in `finished_run_records()`, plus one line in `bench.py`.
+
+- `gc.disable()` at its start. Everything allocated from there on stays live
+  until exit and JSON records hold no cycles, so a cyclic collection walks
+  it for nothing. This costs no memory, because nothing here is a cycle.
+- Each rank also encodes the compact text of its own records, in parallel,
+  and sends it with the parsed record. `encode_finished_records()` uses that
+  text. A record naming an image gets no text, because
+  `prune_run_artefacts()` may edit it; rank 0 encodes those as before, and
+  records of an earlier resumed segment too. `_names_image()` is now the one
+  test both places use.
+- `bench.py record` also turns GC off (its whole `summary.json` stays live).
+  Measured in iteration 342 at 63k records: parse plus row helpers ~2.9 s to
+  ~2.3 s.
+
+**Measured, stage.** The real `finished_run_records()` and
+`encode_finished_records()` on 38 ranks in `polychord.sif`, on a 128,360-record
+fixture of real records in tmpfs, with a separate `json.dumps` check.
+Three interleaved pairs (`.probe/r342/post.py`):
+
+| seconds, rank 0 | HEAD | this round |
+| --- | ---: | ---: |
+| `finished_run_records()` (mean) | 3.53 | 2.43 |
+| of which the `records` phase | 3.13 | 2.0 |
+| `encode_finished_records()` (mean) | 3.61 | 0.91 |
+| **both** | **7.14** | **3.34** |
+
+That is -3.8 s (-53%), with pairs within 0.1 s. Every encoded text matched
+`json.dumps` of the pruned record (`bad 0`). Rank-encoded texts covered
+99,695 of 128,360 records (78%), not the ~90% that round 269 quotes for prune.
+
+This is a fixture, not an 8-node search, so the gather here is shared
+memory. Between nodes the texts add to what is gathered, so a real multi-node
+gain may be smaller; rank 0's GC saving does not depend on that. At 128k
+evaluations the whole saving is ~4 s of an hours-long search: it matters for
+short multi-node jobs and for tight feedback loops, not for production
+throughput.
+
+**Guards.** Raced against HEAD 264974d, with both trees on `/dev/shm`, 19 ranks each
+on alternate CPU halves, swapped between pairs, synchronous. The new tree
+also compared each text with a fresh `json.dumps` (`TEXTS-VERIFIED`).
+
+| pair | evals | evals/s HEAD / new | log(Z), both arms | dead-birth | texts bad |
+| --- | ---: | --- | --- | --- | ---: |
+| WSClean 1 (seed 229, nlive 100, 2,000 dead) | 4,071 | 37.1 / 37.1 | 0.0967023094179472 +/- 0.000520957293962581 | identical | 0 of 1,211 |
+| WSClean 2 | 4,071 | 38.0 / 38.0 | same | identical | 0 of 1,218 |
+| R2D2 (seed 190182240, nlive 150, 150 dead) | 4,324 | 19.0 / 19.1 | 0.0147479521559665 +/- 0.00259029680327724 | identical | 0 of 2,317 |
+
+In these short searches only 30-54% of records got a text, since more of them
+still name an image. On runs this size the post-run phases are ~0.1 s each,
+so the guards show no harm rather than a gain.
+
+`scripts/test_self_checks.py` (31 host-runnable checks) and `bench.py
+--self-check` pass; `self_check_resume_adoption` now asserts that a record
+naming an image gets no rank text and that the shared encode matches
+`json.dumps` after a prune edit.
+
+Iteration 342 ran out of time with its guard still running, so its edits were
+discarded unshipped. This round reapplied them from `.probe/r342/`, read that
+guard, and re-timed the stage: the `encode` figure printed in the first
+timing included the check's own `json.dumps`.
+
+Rows: `r342-{wnew,wold}{1,2}` and `r342-{rnew,rold}3` (bench rows) and stage
+row `r342-end-of-run` in `benchmarks.jsonl`. Run dirs were deleted.
