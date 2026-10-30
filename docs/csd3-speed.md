@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 357; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 358; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Largest open lever: stopping below-contour evaluations.** `NS_EARLY_STOP=1`
   (opt-in) stops R2D2 once an iterate's RMS is well under the contour. Three
@@ -20,6 +20,10 @@ the Hetzner host.
   Timed directly, what does not scale with iterations is ~100 ms of a ~700 ms
   request, not the ~210-270 ms round 356's fit implied
   ([round 357](#round-357-a-requests-fixed-cost-timed-directly-100-ms-not-210-270-recompiling-imagerpy-was-11-ms-of-it)).
+  Combined with `NS_ADOPT_CONTOUR=1`, one race gave wall **-28%** against shadow
+  mode, log(Z) +0.06 sigma, 0.06% wrong stops. At 16 workers adoption added
+  nothing on top of early stop, and multi-node is still unmeasured
+  ([round 358](#round-358-early-stop-with-contour-adoption-wall--28-logz-agreeing-adoption-adds-nothing-at-16-workers)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -17523,3 +17527,53 @@ request than round 356's fit implied.
 The stamped searches left two rows named `r357-stamp` (`dirty: true`) in
 `benchmarks.jsonl`. They carry a few ms of stamp overhead; do not compare them.
 Run directories are deleted; the gap tables are in `.probe/r357`.
+
+## Round 358: early stop with contour adoption: wall -28%, log(Z) agreeing; adoption adds nothing at 16 workers
+
+Nothing was built. Rounds 355 and 356 left `NS_EARLY_STOP` with
+`NS_ADOPT_CONTOUR` unmeasured. Both change the sampler, and adoption raises the
+contour the stop rule reads, because patch 0002 publishes `logL_now` after
+adoption. So this is the combination's first test.
+
+**Race (async, nlive 150, 5 repeats, converged, 1 node, 17 ranks each, 16 workers
+x 1 thread, started 2 s apart; `.probe/r358/race.sh`).** Unlike round 356 nothing
+else ran on the node. Early stop is `stop`, adoption is `adopt`, and the shadow
+arm makes no stops, so it also gives the true wrong-stop rate under adoption.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | stopped |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3581 | stop | 644.8 | 19,986 | 11.90 | 31.0 | 0.0169828702720885 +/- 0.000393391331263844 | 9,760 |
+| 3581 | stop + adopt | 676.4 | 23,254 | 11.98 | 34.4 | 0.0170522995627088 +/- 0.000392668833807572 | 11,332 |
+| 3582 | shadow + adopt | 912.2 | 21,072 | 20.07 | 23.1 | 0.0175126074302257 +/- 0.000408267174396098 | (10,223 would) |
+| 3582 | stop + adopt | 658.5 | 21,203 | 12.34 | 32.2 | 0.0175472431067311 +/- 0.000408296512581093 | 10,783 |
+
+**Early stop under adoption (seed 3582).** Wall **-27.8%** (1.39x), evaluations
++0.6%, iterations -38.1%, log(Z) +0.06 sigma. Posterior moments agree on all 9
+columns: mean shifts at most 0.11 posterior sd, sd ratios 0.96-1.01, largest |z|
+1.36. The stop arm finished first, so its control had freed CPUs for the last
+~250 s, which understates the gain. This is one pair, and it sits between round
+356's -16% and round 355's -33%. Round 356's pairs shared the node with a toy
+sweep, but one pair cannot show that as the cause.
+
+**Adoption on top of early stop (seed 3581).** Wall +4.9%, evaluations +16.4%,
+iterations per evaluation unchanged at ~12, log(Z) +0.13 sigma, mean shifts at
+most 0.09 posterior sd, sd ratios 0.97-1.06, largest |z| 1.07. Adoption's own
+effect at this worker count is small, and round 351 saw identical settings vary
+1.7x in evaluations, so one seed's +16% is scatter until shown otherwise. It does
+not show adoption hurting. It does show no sign that the two compound here.
+
+**Wrong stops under adoption (seed 3582, shadow).** 4 of 6,722 above-contour
+evaluations (0.06%), margins 1.005 to 1.034 x contour. That is inside the
+0.04-0.16% replay range and below round 356's 0.12% without adoption, so adopted
+contours did not make the rule less safe. The four stop-arm rows cannot give this
+number, since a stopped evaluation always scores under its contour. Stops were
+48.5-50.9% of evaluations with adoption, against 48.8% without, so adoption did
+not lift the stop rate at 16 workers.
+
+**What this does not establish.** One pair per question, at 16 workers. Adoption
+pays at 77 workers (round 336's two-node result, -19.3% wall), which is where the
+combination matters, and that remains unmeasured. Under the sampler-change guard
+both stay opt-in, and any default is the user's decision. No code changed, so no
+WSClean guard ran. `benchmarks.jsonl` gained rows r358-3581-1-0/1 and
+r358-3582-1-1/2-1 from the searches. Run directories are deleted; gzipped
+summaries and posteriors are in `.probe/r358`.
