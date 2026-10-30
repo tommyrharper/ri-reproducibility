@@ -226,6 +226,38 @@ def mean_r2d2_iterations(records: Any) -> float | None:
     return sum(counts) / len(counts) if counts else None
 
 
+def pre_run_phases(run_dir: Path, records: Any) -> dict[str, float] | None:
+    """Seconds each phase took, from the launcher's start in the job to the
+    first evaluation, out of the pre-run.tsv the R2D2 launcher and its ranks
+    write; a rank phase ends at its slowest rank (round 341). `searched` is
+    the last evaluation's end to the search's exit: rank 0's post-run."""
+    try:
+        rows = [line.split("\t") for line in (run_dir / "pre-run.tsv").read_text().splitlines()]
+    except OSError:
+        return None
+    marks = []
+    for row in rows:
+        if len(row) == 3:
+            try:
+                marks = [] if row[1] == "job" else marks
+                marks.append((row[1], float(row[0])))
+            except ValueError:
+                continue
+    timed = [t for t in ((record.get("timing") or {}) for record in records or ())
+             if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    if not marks or marks[0][0] != "job" or not timed:
+        return None
+    searched = dict(marks).get("searched")
+    # After the search: its own record is written between these two.
+    marks = [mark for mark in marks if mark[0] not in ("searched", "recorded", "finished")]
+    marks.append(("first_eval", min(float(t["started_epoch"]) for t in timed)))
+    phases = {name: round(at - before, 2) for (_, before), (name, at) in zip(marks, marks[1:])}
+    phases["total"] = round(marks[-1][1] - marks[0][1], 2)
+    if searched is not None:
+        phases["searched"] = round(searched - max(float(t["ended_epoch"]) for t in timed), 2)
+    return phases
+
+
 def trt_mean_batch(run_dir: Path) -> float | None:
     """The gathering TensorRT server's mean batch, from the r2d2-trt-batches.txt it keeps (round 330)."""
     try:
@@ -282,6 +314,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     first = first_request(summary.get("evaluations", []))
     iterations = mean_r2d2_iterations(summary.get("evaluations", []))
     batch = trt_mean_batch(run_dir)
+    pre_run = pre_run_phases(run_dir, summary.get("evaluations", []))
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -308,6 +341,7 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
         "r2d2_iterations": round(iterations, 3) if iterations else None,
         **({"trt_mean_batch": batch} if batch else {}),
+        **({"pre_run_s": pre_run} if pre_run else {}),
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -445,8 +479,10 @@ def load_rows() -> list[dict[str, Any]]:
                 print(f"benchmark: skipping unreadable line in {LEDGER.name}",
                       file=sys.stderr)
     # Hand-logged stage timings ("kind": "stage", rounds 201-203) are not runs,
-    # and since round 245 some carry an "imager" too.
-    return [row for row in rows if "imager" in row and row.get("kind") != "stage"]
+    # and since round 245 some carry an "imager" too; some are marked
+    # "preset": "stage" instead and carry no machine (round 341).
+    return [row for row in rows if "imager" in row and "machine" in row
+            and row.get("kind") != "stage" and row.get("preset") != "stage"]
 
 
 def commit_order() -> dict[str, int]:
@@ -768,6 +804,16 @@ def self_check() -> None:
         (env_dir / "run.env").write_text("NS_METRIC=total_rms_jy\\ -\\ 0.5\\ *\\ snr\n")
         assert read_run_env(env_dir)["NS_METRIC"] == "total_rms_jy - 0.5 * snr"
 
+        # The last launch's marks only (a resume appends), torn lines skipped.
+        (env_dir / "pre-run.tsv").write_text(
+            "1.0\tjob\t1.0\n5.0\tlaunch\t5.0\n100.0\tjob\t100.0\n101.5\tsized\t101.5\n"
+            "103.0\tlaunch\t103.0\n109.0\twarm\t106.0\n130.0\tsearched\t130.0\n133.0\tfinished\t133.0\n10")
+        assert pre_run_phases(env_dir, [{"timing": {"started_epoch": 110.0, "ended_epoch": 125.0}},
+                                        {"timing": {}}]) == {
+            "sized": 1.5, "launch": 1.5, "warm": 6.0, "first_eval": 1.0, "total": 10.0, "searched": 5.0}
+        assert pre_run_phases(env_dir, []) is None
+        assert pre_run_phases(Path(raw), [{"timing": {"started_epoch": 1.0}}]) is None
+
         run = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         run.mkdir()
         assert row_for(run) is None, "a run outside results/nested-sampling"
@@ -783,7 +829,8 @@ def self_check() -> None:
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
                 "busy_wall_s": 0.9, "idle_fraction": 0.1,
             }) + "\nnot json\n" + json.dumps({"kind": "stage", "stage": "s"}) + "\n"
-                + json.dumps({"kind": "stage", "imager": "r2d2", "run": "s"}) + "\n")
+                + json.dumps({"kind": "stage", "imager": "r2d2", "run": "s"}) + "\n"
+                + json.dumps({"preset": "stage", "imager": "r2d2", "run": "s"}) + "\n")
             rows = load_rows()
             assert len(rows) == 1, rows
             do_table()

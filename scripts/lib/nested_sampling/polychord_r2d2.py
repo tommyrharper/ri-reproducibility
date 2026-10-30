@@ -618,7 +618,34 @@ def self_check_share_resume() -> None:
         assert (shm / "r.resume").read_text() == "checkpoint"
 
 
+def write_pre_run_marks(marks: dict[str, float]) -> None:
+    """Append each rank phase's slowest and first rank to NS_PRE_RUN_TSV.
+
+    Collective when the launcher set it. The search starts at the slowest
+    rank, which on another node is not rank 0 (round 341).
+    """
+    path = os.environ.get("NS_PRE_RUN_TSV")
+    if not path:
+        return
+    try:
+        from mpi4py import MPI
+
+        gathered = MPI.COMM_WORLD.gather(marks, root=0)
+    except ImportError:
+        gathered = [marks]
+    if mpi_rank() != 0:
+        return
+    lines = "".join(f"{max(m[name] for m in gathered):.3f}\t{name}\t{min(m[name] for m in gathered):.3f}\n"
+                    for name in marks)
+    try:
+        with open(path, "a") as out:
+            out.write(lines)
+    except OSError:
+        pass
+
+
 def main() -> None:
+    marks = {"main": time.time()}
     args = parse_args()
     args.repo_root = str(Path(args.repo_root).resolve())
     if not args.checkpoints_dir:
@@ -646,6 +673,7 @@ def main() -> None:
     import pypolychord
     from pypolychord.settings import PolyChordSettings
 
+    marks["pypolychord"] = time.time()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
 
     # key -> objective, not key -> record: nothing reads the record back (the
@@ -719,11 +747,14 @@ def main() -> None:
                  else "no checkpoint to resume from, re-sampling from the cache")
         print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
+    marks["adopted"] = time.time()
 
     if mpi_rank() == 0:  # one writer: rank 0's mirror seeds tmpfs from it, and another
         # rank's truncating rewrite once seeded an empty file (round 229)
         write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
+    marks["warm"] = time.time()
+    write_pre_run_marks(marks)
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
     packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None

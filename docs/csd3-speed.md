@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 340; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 341; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
@@ -16669,3 +16669,95 @@ against ~10 s on one node, and nothing yet breaks it down by phase.
 Rows: `r340-w{old,new}{1,2}` and stage row `r340-encode-once` in
 `benchmarks.jsonl`. Fixture and scripts are in `.probe/r340/`. All run
 dirs, the fixture and the base worktree were deleted.
+
+## Round 341: where the time outside an 8-node search goes (instrumentation)
+
+**Question.** Round 339's 8-node jobs spent 29-51 s outside the evaluation
+span, and round 340 could break down only rank 0's post-run part. Where
+does the rest go?
+
+**Change.** The R2D2 launcher appends each phase's end to `<run>/pre-run.tsv`
+(`ns_mark`: `job`, `sized`, `fifos`, `pools`, `environment`, `launch`, then
+`searched`, `recorded` and `finished` after the search). Before
+`run_polychord()` the ranks gather their `main`, `pypolychord`, `adopted` and
+`warm` times to rank 0, which writes the slowest and first rank of each
+(`write_pre_run_marks`). `./ri bench` reads the file into a `pre_run_s` row
+field: seconds per phase up to the first evaluation's start, their `total`,
+and `searched` (last evaluation's end to the search's exit, which is rank 0's
+post-run plus MPI teardown). The gather is the only new collective, and it
+runs where the ranks already meet in PolyChord's first one. Pools nodes write
+nothing. WSClean's launcher and shared code are unchanged.
+
+**Measured.** One icelake job on 8 nodes ran two short searches back to back
+(nlive 150, 1,500 max dead, seed 190182240, async, 311 workers): the first
+on cold nodes, the second straight after. The 1-node row is a 39-rank search
+on this allocation (300 max dead).
+
+| seconds | 8 nodes cold | 8 nodes warm | 1 node |
+| --- | ---: | ---: | ---: |
+| `./ri` to the launcher's `job` mark | 2.45 | 0.57 | - |
+| `job` -> `sized` (SIF checks, rank budget) | 0.96 | 0.62 | 0.03 |
+| -> `fifos` (622 FIFOs on Lustre, pools `srun`) | 1.69 | 1.27 | 0.48 |
+| -> `pools` (sidecar launch) | 0.88 | 0.35 | 0.34 |
+| -> `environment` (`record-environment.sh`) | 0.98 | 0.47 | 0.35 |
+| -> `launch` (wait for every node's scratch) | 0.33 | 1.11 | 0.00 |
+| -> `main` (ranks' container start + imports, slowest rank) | 2.22 | 2.92 | 0.95 |
+| -> `pypolychord` | 0.81 | 0.95 | 0.13 |
+| -> `adopted` | 0.98 | 0.45 | 0.48 |
+| -> `warm` (joins the workers) | 0.82 | 0.00 | 0.00 |
+| -> first evaluation | 0.76 | 1.06 | 0.02 |
+| **job to first evaluation** | **10.43** | **9.20** | **2.78** |
+| search span (`wall_s`) | 155.42 | 147.76 | 40.40 |
+| of which first-wave start-up (`startup_s`) | 9.4 | 0.0 | 14.3 |
+| last evaluation to search exit (`searched`) | 11.22 | 10.76 | - |
+| of which rank 0's post-run line | 9.7 | 8.7 | 1.4 |
+| search exit to launcher exit (bench record, teardown) | 8.91 | 3.13 | - |
+| `/usr/bin/time` wall | 187.67 | 170.35 | 47.8 |
+
+The parts add up to the measured wall within ~1 s. Evaluations were 62,860
+and 60,214; log(Z) 0.0174810383056297 +/- 0.000300410584012915 and
+0.0174905596935261 +/- 0.000299571339559985 (1,650 dead each, 0.02 sigma
+apart).
+
+**Found.**
+
+- Job start to the first evaluation is only 9-10 s at 8 nodes, against 2.8 s
+  on one node. No single phase dominates: the ranks' start (2.2-2.9 s) and
+  the FIFOs (1.3-1.7 s) grow most with nodes.
+- The larger part is after the last evaluation: 11 s to the search's exit
+  (rank 0's post-run, about 9 s of it), then 3-9 s more in the launcher. The
+  launcher's tail is `uv run scripts/bench.py record` (it parses the whole
+  `summary.json`) and the pool teardown; it was 8.9 s on cold nodes.
+- A cold node also adds a 9.4 s first-wave start-up inside the search span.
+  The second search in the same job had none.
+
+So at 8 nodes, 21-30 s of a ~3-minute job sits outside the evaluations, and
+two thirds of it comes after the result. The next targets are rank 0's
+`records` gather (2.9-3.1 s here, 6 s at 128k evaluations) and the
+launcher's post-search tail. The launcher could write the bench row in the
+background, since it is best effort.
+
+**R2D2 guard.** HEAD a13a845 (a `/dev/shm` worktree) raced against this
+tree, 19 ranks each on alternate CPU halves, swapped between pairs (seed
+190182240, nlive 150, synchronous, 450 max dead). I sized it too long: every
+arm hit its 900 s `timeout` before it finished.
+In both pairs the two arms' `dead-birth.txt` were byte-identical at the
+kill (315 dead). The new arm started 1.1% and 3.1% fewer evaluations, but
+the arms were not alike: HEAD's tree and run dir were on `/dev/shm` and this
+tree's on Lustre. A third pair, with both trees on `/dev/shm` and 150 max
+dead, finished: 4,324 evaluations each, 19.06 against 19.10 evals/s (steady
+19.07/19.10), 717.4 against 718.2 ms per evaluation, and identical log(Z)
+0.0147479521559665 +/- 0.00259029680327724 with identical `dead-birth.txt`.
+The marks cost nothing measurable, and the first two pairs' gap was the
+run dir's filesystem. That is worth knowing for any raced guard: put both
+arms' trees on the same filesystem.
+
+**Also fixed.** On HEAD, `./ri bench` stopped with `KeyError: 'machine'`.
+Hand-logged rows marked `"preset": "stage"` (round 340's among them) carry no
+machine, and `load_rows()` skipped only `"kind": "stage"`. It now skips both
+kinds, and any row without a machine. Its self-check has a row of that shape.
+
+Rows: `r341-a` (1 node), `r341-n8-cold`, `r341-n8-warm` and `r341-r{old,new}3`
+(bench rows; the new arms carry `pre_run_s`) and stage row `r341-pre-run-marks` in `benchmarks.jsonl`.
+The job script, logs and TSVs are in `.probe/r341/`. Every run dir was
+deleted.

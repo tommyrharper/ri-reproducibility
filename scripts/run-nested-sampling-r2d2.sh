@@ -104,6 +104,17 @@ fi
 # job's own environment rather than the login node's (slurm.sh).
 export OUTPUT_DIR
 ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling-r2d2.sh
+# Each launcher phase's end, then each rank phase's slowest and first rank
+# (polychord_r2d2.py), so `./ri bench` can split the time before the first
+# evaluation, which grew from ~10 s on one node to ~20 s on eight (round 341).
+NS_PRE_RUN_TSV="${OUTPUT_DIR}/pre-run.tsv"
+ns_mark() {
+  [ "${NS_NODE_ROLE:-}" = pools ] && return 0
+  local now
+  now="$(date +%s.%N)"
+  printf '%.3f\t%s\t%.3f\n' "${now}" "$1" "${now}" >>"${NS_PRE_RUN_TSV}" 2>/dev/null || true
+}
+ns_mark job
 # Every exec reads the image through squashfuse, and a cold node pages it in
 # off Lustre one fault at a time: a cold `import torch` took 46 s against 23 s
 # after this read, 64MB pieces 16 at a time (~1.8GB/s against one reader's
@@ -239,6 +250,7 @@ fi
 
 # Written before anything can go wrong, so that a run which stops - out of
 # memory, Ctrl-C, reboot - still says how to start it again exactly.
+ns_mark sized
 [ "${NS_NODE_ROLE:-}" = pools ] || write_run_config "${OUTPUT_DIR}" r2d2
 # The workers are reached over FIFOs, so these have to sit on the bind mount the
 # ranks and the pools both see - REPO_ROOT, which OUTPUT_DIR is always under,
@@ -308,6 +320,7 @@ else
   OUTPUT_DIR="${OUTPUT_DIR}/.node-${ns_host}"
 fi
 
+ns_mark fifos
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
 # Each evaluation uses MeqTrees for simulate and MS-to-`.mat`, and R2D2 for
 # imaging. One worker per rank in each pool, started here so their ~0.5-0.9s
@@ -450,6 +463,7 @@ sidecar_launch "${R2D2_SIF}" \
   --env R2D2_CUDA_BLOCKING_SYNC="${R2D2_CUDA_BLOCKING_SYNC:-1}" \
   --env OMP_WAIT_POLICY=PASSIVE \
   -- python3 "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py" --fifo-dir "${R2D2_FIFO_DIR}"
+ns_mark pools
 if [ "${NS_NODES}" -gt 1 ]; then
   OUTPUT_DIR="${OUTPUT_DIR_RUN}"
   if [ "${NS_NODE_ROLE:-}" = pools ]; then
@@ -495,6 +509,7 @@ RUN_COMMAND=(
   NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-}"
   NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
   NS_SCRATCH_DIR="${NS_SCRATCH_DIR}"
+  NS_PRE_RUN_TSV="${NS_PRE_RUN_TSV}"
   NS_R2D2_FIFO_DIR="${R2D2_FIFO_DIR}"
   NS_ENABLE_PARAMS="${NS_ENABLE_PARAMS:-}"
   NS_DISABLE_PARAMS="${NS_DISABLE_PARAMS:-}"
@@ -585,6 +600,7 @@ scripts/record-environment.sh \
   --image "${POLYCHORD_SIF}" \
   --config docs/nested-sampling.md \
   -- "${RUN_COMMAND[@]}"
+ns_mark environment
 
 mkdir -p "${OUTPUT_DIR}/evaluations"
 if [ "${NS_NODES}" -gt 1 ]; then
@@ -600,13 +616,16 @@ if [ "${NS_NODES}" -gt 1 ]; then
     done
   done
 fi
+ns_mark launch
 run_with_retries "${NS_RETRIES}" "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" "${NS_NLIVE}" -- "${RUN_COMMAND[@]}"
+ns_mark searched
 
 # One row in benchmarks.jsonl per finished search, so a change to this repo can
 # be shown to have helped rather than argued about; see
 # docs/nested-sampling-benchmarks.md. Best effort: the run is already done, and
 # no measurement of it is worth failing it after the fact.
 uv run scripts/bench.py record "${OUTPUT_DIR}" || true
+ns_mark recorded
 
 # Pools first: their loops start a worker again the moment the ranks let go
 # of the FIFOs, and that worker writes its pid file into the directory being
@@ -617,4 +636,5 @@ if [ "${NS_NODES}" -gt 1 ]; then
   rm -rf "${NS_FIFO_ROOTS[@]}"
 fi
 rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+ns_mark finished
 echo "OK: nested-sampling R2D2 output in ${OUTPUT_DIR}"
