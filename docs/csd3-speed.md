@@ -5,13 +5,15 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 344; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 345; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
-  0.2 sigma. Nothing broke. The one surprise is 20 s of the end of the run
+  0.2 sigma. The surprise was 20 s of the end of the run
   ([round 344](#round-344-the-target-size-search-converges-in-20-minutes-on-8-nodes-prune-is-the-end-of-runs-biggest-phase)).
+  A third run lost its end of run to a 2 GiB limit in `comm.gather`, now fixed
+  ([round 345](#round-345-fix-the-records-gather-failed-past-2-gib-at-the-target-size-ranks-now-strip-what-the-run-does-not-keep)).
 - **Rounds 266-303 in brief.** The 22 Sep production search, run to
   convergence as its own 1-node icelake job on round 299's tree, gives
   log(Z) 0.0172602 +/- 0.00040 (within 0.25 sigma of rounds 239 and 278)
@@ -16915,3 +16917,78 @@ Cost: ~100 core-hours on `WBARKER-SL3-CPU`. GPU job 39677203 (round 332) still h
 no output. Rows: `r344-big` and `r344-big2` (bench rows; the second is tagged
 `0100306+` for its timers) and stage row `r344-target-size` in
 `benchmarks.jsonl`. Run dirs were deleted, after copying full-precision log(Z).
+
+## Round 345: fix: the records gather failed past 2 GiB at the target size; ranks now strip what the run does not keep
+
+**The bug.** The run meant to measure round 344's prune lever (job 39686035,
+same settings and seed 345, 8 icelake half-nodes) finished sampling at 09:02 and
+then died in `finished_run_records()`:
+
+    gathered = comm.gather(mine, root=0)
+    mpi4py.MPI.Exception: MPI_ERR_ARG: invalid argument of some other kind
+
+`comm.gather` keeps its byte counts and displacements in C ints, so it fails once
+the pickles total 2 GiB. Round 342 added each record's compact text to what is
+gathered, which roughly doubled the payload, and round 344's two runs fitted
+under the limit. This one's `run.log` holds ~506k record lines against 425-451k
+evaluations there. It has no `summary.json`, so no report and no pack.
+
+Sampling had finished: `.stats` gives log(Z) 0.0172436562853834 +/-
+0.000244710303516306, in line with round 344. **It then held all 8 nodes for 16
+more minutes**, until the script's `timeout 2200` ended it (exit 124). That hang
+is not fixed here. Why no rank aborted was not traced; mpi4py finalising at
+interpreter exit while the other ranks wait in the collective is the likely
+cause. A collective failing on one rank should abort the job, and that is the
+next item.
+
+**Reproduced and fixed.** A stage fixture in `polychord.sif` (38 ranks, distinct
+strings, `.probe/r345/gather.py`):
+
+| payload | `comm.gather` | `gather_large` |
+| --- | ---: | ---: |
+| 60.9 MB x 38 = 2.31 GB | **`MPI_ERR_ARG`** | 2.95 s |
+| 30.4 MB x 38 = 1.16 GB | 1.38, 1.39 s | 1.23, 1.24 s |
+
+`gather_large()` receives rank by rank, each message well under the limit, in the
+same order as `comm.gather`. The first attempt at this fixture proved nothing:
+strings sharing one literal were memoised by pickle and the failing case passed.
+
+**The strip.** `strip_unkept_evaluations()` runs in the flush phase: each rank
+strips what it put on Lustre and the run does not keep. Candidates are records
+still naming an image that are a current extreme or one of the 1 in
+`NS_KEEP_DETAIL_EVERY`. That second group is new against round 344's reading,
+which blamed extremes alone. 1 in 100 of ~430k is ~4,300 of the ~9,200 dirs
+pruned, so both must go. Anything in `keep` is skipped, and `keep` is the decision
+prune itself makes, so a kept evaluation cannot be stripped.
+
+**Not measured yet: the saving at 8 nodes.** Job 39686035 died before the flush
+phase, so round 344's ~20 s is still only an expected saving. Job 39687378 repeats
+the run with both changes (`.probe/r345/big2.sh`, tree `../frozen-r345`, with
+per-rank strip counts and timers in `run.log`); it had not started when this
+round closed. On tmpfs guards prune fell from 0.2-0.7 s to 0.0-0.1 s, which says
+nothing about Lustre.
+
+**Guards.** Raced against ba7d75c, both trees on /dev/shm, synchronous, 19 ranks,
+with `NS_RETAIN_FLUSH_SECONDS=20` so extremes really are published. Pairs 1-3 had
+the strip only; 4-5 had the strip and `gather_large`.
+
+| pair | imager | log(Z) | steady evals/s old / new |
+| --- | --- | --- | ---: |
+| 1 | WSClean | 0.0967023094179472 +/- 0.000520957293962581 | 37.20 / 37.25 |
+| 2 | WSClean | same | 37.51 / 37.49 |
+| 3 | R2D2 | 0.0147479521559665 +/- 0.00259029680327724 | 18.98 / 18.98 |
+| 4 | WSClean | same as 1 | 37.43 / 37.55 |
+| 5 | R2D2 | same as 3 | 19.11 / 19.05 |
+
+Dead-birth chains are byte-identical in every pair (51f16314ee36 WSClean,
+85b5c92bed16 R2D2). In all ten runs every image a record names exists and every
+dir left has a record naming its images. Both R2D2 pairs compute the same keep
+set by parameter hash. The dirs left on disk differ by up to 3 points in a pair
+(0 in WSClean pairs 1-2, 1 in pair 4), because eval ids follow the schedule and so
+decide which points hash into the 1 in 100 or stay a rank's extreme. Two of pair
+3's differences were traced to that hash. No old-vs-old R2D2 control was run.
+
+Rows: `r345-*` and `r345b-*` (bench rows) and stage row `r345-gather-limit` in
+`benchmarks.jsonl`. The bench rows have commit `unknown`, as the trees are `git
+archive` copies. `self_check_streaming_retention` now covers both functions; its
+third pass goes through the real `finished_run_records()`.

@@ -1747,6 +1747,19 @@ def evidence_record(output: Any) -> dict[str, Any] | None:
         return None
 
 
+GATHER_LARGE_TAG = 5302
+
+
+def gather_large(comm: Any, mine: Any) -> list[Any] | None:
+    """comm.gather(), rank by rank: its byte counts and displacements are C
+    ints, so past 2 GiB in all it raises MPI_ERR_ARG, ~500k records at the
+    target size, with every evaluation done (csd3-speed.md, round 345)."""
+    if comm.Get_rank() != 0:
+        comm.send(mine, dest=0, tag=GATHER_LARGE_TAG)
+        return None
+    return [mine, *(comm.recv(source=rank, tag=GATHER_LARGE_TAG) for rank in range(1, comm.Get_size()))]
+
+
 def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     """Drain every rank's records and settle its held extremes; rank 0 gets
     every record, the others None. Collective: every rank calls it.
@@ -1819,7 +1832,7 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     # The compact text too, which rank 0 alone took ~3s to encode at 128k
     # evaluations. Not for a record prune_run_artefacts() may edit (~22% at 128k).
     mine = [(name, record, None if _names_image(record) else json.dumps(record)) for name, record in mine]
-    gathered = comm.gather(mine, root=0) if comm is not None else [mine]
+    gathered = gather_large(comm, mine) if comm is not None else [mine]
     records = None
     if mpi_rank() == 0:
         written = {name: record for rank_records in gathered for name, record, _ in rank_records}
@@ -1832,6 +1845,8 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     if comm is not None:
         keep = comm.bcast(keep, root=0)
     flush_held_evaluations(force=True, keep=keep)
+    if keep is not None:
+        strip_unkept_evaluations(Path(evaluations_dir), [name for name, _, text in mine if text is None], keep)
     if comm is not None:
         comm.Barrier()  # the kept extremes are on Lustre before rank 0 prunes
     post_run_phase("flush", started)
@@ -3262,6 +3277,22 @@ def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) ->
     _HELD_SINCE = None
 
 
+def strip_unkept_evaluations(evaluations_dir: Path, named: list[str], keep: set[str]) -> int:
+    """Strip what this rank put on Lustre and the run does not keep, so rank 0
+    finds almost nothing to prune: one 32-thread pool unlinked 64k files of 9.2k
+    dirs in 21s at 430k evaluations, ~6x the 128k figure (csd3-speed.md, round 345).
+
+    `named` is this rank's records still naming an image. Most are extremes it
+    evicted long ago, whose dirs are gone; only a current extreme or one of the
+    1 in NS_KEEP_DETAIL_EVERY can still have one, so only those cost a listing.
+    """
+    extremes = {key for _, key in _LOWEST} | {key for _, key in _HIGHEST}
+    unkept = [name for name in named if name not in keep and (name in extremes or _keeps_detail(name))]
+    for name in unkept:
+        _strip_to_record(evaluations_dir / name)
+    return len(unkept)
+
+
 def _publish_held(held: Path, eval_dir: Path) -> None:
     import shutil
 
@@ -3283,6 +3314,26 @@ def self_check_streaming_retention() -> None:
     import tempfile
 
     global IMAGE_KEEP_ENDS
+    class Comm:  # rank by rank, in rank order, as comm.gather()
+        def __init__(self, rank: int) -> None:
+            self.rank, self.sent = rank, []
+
+        def Get_rank(self) -> int:
+            return self.rank
+
+        def Get_size(self) -> int:
+            return 3
+
+        def send(self, value: Any, dest: int, tag: int) -> None:
+            self.sent.append((value, dest, tag))
+
+        def recv(self, source: int, tag: int) -> str:
+            return f"from {source}"
+
+    assert gather_large(Comm(0), "mine") == ["mine", "from 1", "from 2"]
+    sender = Comm(2)
+    assert gather_large(sender, "mine") is None and sender.sent == [("mine", 0, GATHER_LARGE_TAG)]
+
     saved = IMAGE_KEEP_ENDS, os.environ.get("NS_KEEP_DETAIL_EVERY")
     IMAGE_KEEP_ENDS = 3
     os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
@@ -3364,6 +3415,8 @@ def self_check_streaming_retention() -> None:
                 assert not _HELD and not (held_root.exists() and any(held_root.iterdir()))
                 ordered = sorted(objectives, key=objectives.get)
                 must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
+                if background:  # finished_run_records() strips what the run does not keep
+                    must &= evaluations_keeping_images(records)
                 for key in objectives:
                     if key in must:
                         kept = sorted(p.name for p in (evaluations / key).iterdir())
@@ -3373,6 +3426,16 @@ def self_check_streaming_retention() -> None:
                         assert not (evaluations / key).exists(), key
                     written = _record_reader(evaluations)[1](key)  # flat or appended
                     assert written["objective"] == objectives[key], (key, written)
+
+                # What the run does not keep goes with the rank that wrote it;
+                # a name that is neither an extreme nor kept whole costs no listing.
+                bystander = evaluations / "eval-bystander"
+                bystander.mkdir()
+                assert not _keeps_detail(bystander.name)
+                assert strip_unkept_evaluations(evaluations, [*must, bystander.name], set(ordered[:3])) == len(must - set(ordered[:3]))
+                assert bystander.is_dir()
+                bystander.rmdir()
+                assert all((evaluations / key).is_dir() == (key in ordered[:3]) for key in must), must
 
                 if scratch_root:
                     # Once NS_RETAIN_FLUSH_SECONDS have passed, the next record publishes.
