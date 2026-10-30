@@ -17659,3 +17659,29 @@ the guard they stay opt-in, and any default is the user's decision. No code chan
 so no WSClean guard ran. `benchmarks.jsonl` gained the 13 rows above. Run
 directories, `../frozen-r359` and the `sifs-r359` links are deleted; gzipped
 summaries and posteriors are in `.probe/r359`.
+
+## Round 362: the `.mat` load is memory copies, not parsing, so it stays; early stop at target size queued
+
+**Why.** Round 357 left `load_data_to_tensor` at ~19 ms a request. With early stop
+near 11 iterations, set-up is a larger share of a request, and this was the
+cheapest-looking phase.
+
+**Method.** Solo, one thread, in `r2d2.sif`, on a real 404,352-visibility `.mat` on
+tmpfs (`.probe/r362/t.py`, `t2.py`, not shipped).
+
+**Result: closed, no code changed.** The whole function takes 12.8 ms here (15.2 ms
+on its first pass). A profile splits it into `scipy` element reads ~4.4 ms,
+`torch.tensor` copies ~4.3 ms and the function's own array arithmetic ~3.5 ms, with
+Python and file-open overhead too small to matter. A hand-written parser of
+`write_mat_columns`' exact layout returned identical arrays but took 4.1-5.1 ms
+against `loadmat`'s 3.6-4.4 ms, so it is no faster. A zero-copy path could save
+at most ~8 ms of ~690 ms (~1%), below what an end-to-end race can see, and is
+not worth a second loader.
+
+**Pending.** Array 39710059 (2 nodes, 6 tasks, `.probe/r361/array.sh`) tests dropping
+early stop's iteration-2 check; its edit is uncommitted in `../frozen-r361` and its
+`self_check_early_stop` passes there. Array 39710176 (8 nodes, 2 tasks,
+`.probe/r362/array.sh`) is the first `NS_EARLY_STOP=1` + `NS_ADOPT_CONTOUR=1` run at
+nlive 500, 25 repeats, on round 344's seeds, using that same candidate tree. Neither
+had produced an output file when this round closed, so neither gives a result here.
+Keep `../frozen-r361` and `sifs-r361` until both are read. Both settings stay opt-in.
