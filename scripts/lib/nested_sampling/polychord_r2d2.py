@@ -252,7 +252,8 @@ def evaluate(
         )
         early_stop = {"contour": contour, "flux": params["source_flux_jy"], "x": sx, "y": sy}
         # NS_EARLY_STOP=2 logs the stops without making them: the search stays
-        # the stock one, and each record says whether its stop would be wrong.
+        # the stock one, and each record says whether its stop would be wrong
+        # and carries every check's RMS, so any stop rule can be replayed on it.
         if os.environ["NS_EARLY_STOP"] == "2":
             early_stop["shadow"] = True
     run_result = run_r2d2_imaging(
@@ -347,9 +348,14 @@ def evaluate(
     # finished one is that it was very likely below the contour.
     if early_stop is not None:
         record["contour"] = contour
-        stop_line = next((l for l in r2d2_stdout.read_text(errors="replace").splitlines() if l.startswith("EARLY STOP")), None)
+        lines = r2d2_stdout.read_text(errors="replace").splitlines()
+        stop_line = next((l for l in lines if l.startswith("EARLY STOP")), None)
         if stop_line is not None:
             record["early_stopped"] = stop_line
+        if early_stop.get("shadow"):
+            record["early_checks"] = [
+                [int(l.split()[2]), float(l.split()[3])] for l in lines if l.startswith("EARLY CHECK")
+            ]
     return write_evaluation_record(eval_dir, record)
 
 

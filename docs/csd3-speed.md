@@ -17685,3 +17685,95 @@ early stop's iteration-2 check; its edit is uncommitted in `../frozen-r361` and 
 nlive 500, 25 repeats, on round 344's seeds, using that same candidate tree. Neither
 had produced an output file when this round closed, so neither gives a result here.
 Keep `../frozen-r361` and `sifs-r361` until both are read. Both settings stay opt-in.
+
+## Round 365: early stop's first checks tightened; 8-node target size halves wall time with log(Z) +0.03 sigma
+
+Code: `EARLY_STOP_RATIOS` loses iteration 2 and iteration 3 goes from 0.90 to 0.82,
+in `r2d2_serve.py`; `NS_EARLY_STOP=2` records now carry every check's RMS as
+`early_checks`, so any rule can be replayed on them. The new ratios only remove
+stops, so they cannot add a wrong one. `NS_EARLY_STOP` and `NS_ADOPT_CONTOUR` stay
+opt-in, and any default is the user's decision. Neither edited file is shared with
+WSClean, so no WSClean guard was needed. This logs arrays 39710059 and 39710176
+(`r361`, `r362`) from the rounds before it; gnhf 363 and 364 logged nothing.
+
+**Dropping iteration 2 alone moved the wrong stops to iteration 3 (2 nodes, 77
+workers, nlive 150, 15 repeats, adopting; array 39710059).** Same seeds as round
+360, each arm on its own node pair, not simultaneous.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | against shadow (sigma) |
+|---|---|---|---|---|---|---|---|
+| 190182240 | shadow | 617.8 | 73,863 | 18.72 | 119.6 | 0.017459441791776 +/- 0.000378090693799191 | |
+| 190182240 | stop | 381.5 | 66,281 | 11.60 | 173.8 | 0.0175366365341782 +/- 0.000382598094878383 | +0.14 |
+| 7311 | shadow | 771.5 | 65,189 | 18.60 | 84.5 | 0.0176416967649003 +/- 0.000353859698792249 | |
+| 7311 | stop | 393.4 | 64,731 | 11.09 | 164.5 | 0.0176925206617616 +/- 0.000357554573728627 | +0.10 |
+| 4242 | shadow | 671.0 | 66,315 | 18.57 | 98.8 | 0.0183781133655519 +/- 0.00035668535431306 | |
+| 4242 | stop | 452.1 | 63,481 | 11.31 | 140.4 | 0.0181966229197922 +/- 0.000347820073720918 | -0.36 |
+| sum | shadow | 2,060.3 | 205,367 | | 99.7 | | |
+| sum | stop | 1,227.0 | 194,493 | | 158.5 | | |
+
+Wall -40.4% (1.68x), against -38.2% with the iteration-2 check, which is inside
+the scatter between node pairs. Moments agree on all 9 columns: mean shifts at most
+0.08 posterior sd, sd ratios 0.95-1.04, largest |z| 1.00.
+
+Wrong stops fell only from 91 of 58,621 above-contour evaluations (0.16%) to 60 of
+59,882 (0.10%), and by seed they went 69 to 13, 5 to 46 and 17 to 1, so this was
+not the fix round 361 hoped for. 58 of the 60 first stopped at iteration 3, the
+other two at 4 and 5. All 58 had RMS at or over 0.82 x contour, which is where the
+new ratio comes from; it would have cost 25,629 of the 66,883 iteration-3 stops.
+A stop lost there mostly stops at the next check, so the cost is small.
+
+**Held-out replay (seed 190182240, 1 node, 37 workers, nlive 150, 15 repeats,
+adopting, shadow, 65,588 evaluations; run `r363-trace`, `.probe/r363/`).** Log(Z)
+0.0172349353569231 +/- 0.000401204109504618, wall 1,386 s. This is the first
+replay on the contour a chain really held. It was not used to fit the old ratios,
+but it did inform the 0.82 choice below, so only the fresh seed further down is
+fully held out. Of 26,519 above-contour evaluations:
+
+| rule | iterations saved | wrong stops | rate |
+|---|---|---|---|
+| ratios before this round | 39.3% | 27 (26 at iteration 2) | 0.102% |
+| no iteration 2 | 38.2% | 6 (5 at 3) | 0.023% |
+| no iteration 2, iteration 3 at 0.85 | 37.0% | 3 | 0.011% |
+| **no iteration 2, iteration 3 at 0.82 (shipped)** | 36.8% | 1 | 0.004% |
+| no iterations 2 or 3 | 35.8% | 1 | 0.004% |
+
+Only 5 of the 26 iteration-2 wrong stops would also stop at a later check under the
+old ratios. The rule costs ~4% more iterations than before (63.2 against 60.7 per
+100), and the worst wrong stop scores 1.016 x contour rather than 1.146.
+
+**Fresh seed with the shipped ratios (seed 3651, simultaneous pair, 1 node, 18
+workers each, nlive 150, 5 repeats, adopting; `.probe/r365/race.sh`).** No ratio
+was picked from this seed.
+
+| arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) |
+|---|---|---|---|---|---|
+| shadow | 836.3 | 21,086 | 19.78 | 25.2 | 0.0168261487794877 +/- 0.000419270046834374 |
+| stop | 679.7 | 22,034 | 12.89 | 32.4 | 0.0170519410623811 +/- 0.000434160186874423 |
+
+Wall -18.7% (1.23x), log(Z) +0.37 sigma, mean shifts at most 0.10 posterior sd, sd
+ratios 0.97-1.05, largest |z| 1.27. Wrong stops: 0 of 6,359 in the shadow arm. That
+is one seed: at the 0.10% of the old rule only ~6 were expected, so it does not
+bound the rate. It is also a small-layout figure, in line with round 358's -8% to
+-28% at 16 workers.
+
+**First stop + adopt at target size (nlive 500, 25 repeats, 8 icelake half-nodes;
+array 39710176, `.probe/r362/array.sh`).** Against round 344's stock run on the same
+seed. Stock had neither setting, so this is the two together, on different nodes
+on a different day, with no shadow control. It ran the no-iteration-2 rule with
+iteration 3 still at 0.90, not the shipped ratios, and wrong stops cannot be read
+from it.
+
+| seed 344 | search wall (s) | job (s) | evaluations | iterations per evaluation | evals/s | log(Z) |
+|---|---|---|---|---|---|---|
+| stock (round 344) | 1,165.7 | 1,254 | 450,922 | 19.36 | 386.8 | 0.0174309441303439 +/- 0.000188280573191559 |
+| stop + adopt | 620.7 | 673 | 380,252 | 11.28 | 612.7 | 0.0174394826051968 +/- 0.000188373014295059 |
+
+Search wall **-46.8% (1.88x)**, job -46.3%, evaluations -15.7%, evals/s +58%, log(Z)
++0.03 sigma. This is one seed. Moments were not compared, because round 344's chains are gone. Seed 345
+(task 1) had no output when this round closed: read `.probe/r362/big-39710176_1.out`,
+compare with `r344-big2`, and only then delete `../frozen-r361` and `sifs-r361`.
+
+**Still open.** At target size the shipped ratios are unmeasured; expect a few
+percent more wall time. The wrong-stop rate has now been measured on one fresh
+seed only. Checks passed: `./ri self-check r2d2-serve` (including early stop),
+`./ri self-check r2d2`, `scripts/test_self_checks.py`.

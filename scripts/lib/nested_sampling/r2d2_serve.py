@@ -1648,8 +1648,10 @@ def start_trt_server(bases: list[str]) -> int:
 # NS_EARLY_STOP (round 355): at iteration k a request stops once the iterate's
 # RMS is under this share of its contour. Each is ~1% under the lowest ratio any
 # above-contour evaluation of round 354's converged search reached, and below 1,
-# so a stopped evaluation always scores below its contour.
-EARLY_STOP_RATIOS = {2: 0.90, 3: 0.90, 4: 0.86, 5: 0.84, 6: 0.82, 8: 0.84, 10: 0.87, 12: 0.90, 15: 0.93, 18: 0.95}
+# so a stopped evaluation always scores below its contour. Iteration 2 has no
+# check and iteration 3 is tightened (round 365): 78 of round 360's 91 wrong stops
+# came from 2, and without it 58 of 60 came from 3, all at ratios over 0.82.
+EARLY_STOP_RATIOS = {3: 0.82, 4: 0.86, 5: 0.84, 6: 0.82, 8: 0.84, 10: 0.87, 12: 0.90, 15: 0.93, 18: 0.95}
 _early_stop: dict[str, Any] | None = None
 
 
@@ -1662,6 +1664,8 @@ def below_contour(model: Any, iteration: int, rule: dict[str, Any]) -> bool:
     pixel = float(model[y, x])
     squares = float((model * model).sum()) - pixel * pixel + (pixel - rule["flux"]) ** 2
     rms = (max(squares, 0.0) / (model.shape[0] * model.shape[1])) ** 0.5
+    if rule.get("shadow"):
+        print(f"EARLY CHECK: {iteration} {rms:.6e}")
     if rms >= ratio * rule["contour"]:
         return False
     print(f"EARLY STOP: iteration {iteration} RMS {rms:.6e} contour {rule['contour']:.6e}")
@@ -1731,7 +1735,9 @@ def self_check_early_stop() -> None:
     assert below_contour(model, 7, rule) is False, "not a check iteration"
     assert below_contour(model, 6, rule) is False
     assert below_contour(model, 15, rule) is True
-    assert below_contour(np.zeros((4, 4)), 2, {**rule, "flux": 0.0}) is True
+    assert below_contour(np.zeros((4, 4)), 2, {**rule, "flux": 0.0}) is False, "iteration 2 has no check"
+    assert below_contour(np.zeros((4, 4)), 3, {**rule, "flux": 0.0}) is True
+    assert below_contour(np.zeros((4, 4)), 3, {**rule, "flux": 0.0, "shadow": True}) is False, "shadow never stops"
     assert all(ratio < 1.0 for ratio in EARLY_STOP_RATIOS.values())
     print("r2d2 early stop self-check passed")
 
