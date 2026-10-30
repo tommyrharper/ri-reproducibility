@@ -527,6 +527,14 @@ def useful_evals_per_s(row: dict[str, Any]) -> float | None:
     return round(rate * nlive / (nlive + ASYNC_OVERHEAD_PER_WORKER * workers), 4)
 
 
+def ms_per_r2d2_iteration(row: dict[str, Any]) -> float | None:
+    """The imager's cost per solver iteration: ms/eval moves with where a run
+    lands, because R2D2 stops early except near the peak (round 351)."""
+    imager_ms = row.get("stages_ms", {}).get("image_container")
+    iterations = row.get("r2d2_iterations")
+    return round(imager_ms / iterations, 2) if imager_ms and iterations else None
+
+
 def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                 columns: int, order: dict[str, int]) -> None:
     imager, preset, machine, settings_json = key
@@ -582,6 +590,10 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
     row_for_path("idle fraction", ("idle_fraction",))
     row_for_path("peak memory MB", ("peak_memory_mb",))
     row_for_path("R2D2 iterations", ("r2d2_iterations",))
+    per_iteration = [cell([v for v in map(ms_per_r2d2_iteration, by_commit[c]) if v is not None])
+                     for c in labels]
+    if any(per_iteration):
+        line("ms/R2D2 iteration", per_iteration)
     row_for_path("TensorRT mean batch", ("trt_mean_batch",))
     stages: list[str] = []
     for row in rows:
@@ -661,6 +673,9 @@ def self_check() -> None:
     assert mean_r2d2_iterations([{"timing": {"r2d2_iterations": 25}}, {"timing": {"r2d2_iterations": 9}},
                                  {"timing": {}}, {"objective": 0.0}]) == 17.0
     assert mean_r2d2_iterations([]) is None
+    assert ms_per_r2d2_iteration({"stages_ms": {"image_container": 760.0}, "r2d2_iterations": 19.0}) == 40.0
+    assert ms_per_r2d2_iteration({"stages_ms": {"image_container": 760.0}}) is None
+    assert ms_per_r2d2_iteration({"r2d2_iterations": 19.0}) is None
     with tempfile.TemporaryDirectory() as tmp:
         assert trt_mean_batch(Path(tmp)) is None
         (Path(tmp) / "r2d2-trt-batches.txt").write_text("launches 3 forwards 6 mean 2.000 sizes 1:2 4:1\n")

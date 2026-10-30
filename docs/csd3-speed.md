@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 349; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 351; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
@@ -125,6 +125,10 @@ the Hetzner host.
     converged sooner than 33 in both pairs, so the rank count and lane
     count are being re-raced
     ([round 332](#round-332-gpu-measurement-the-batched-default-is-gpu-bound-at-a-mean-batch-of-2-29-ranks-and-8-lanes-raced)).
+    That race kept the default, and showed identical settings can need
+    1.7x more evaluations at this size, so quote evaluations beside any GPU
+    wall time
+    ([round 351](#round-351-gpu-race-read-the-default-stays-evaluations-to-converge-span-17x-multi-nodes-per-node-loss-is-not-in-the-imager)).
     The shared arms' constant 7.66 s `stall_s` is the shared server
     bringing its lanes up one at a time (~0.72 s each): early ranks fill
     the prior phase, then wait at its barrier for the last lane. The
@@ -17144,3 +17148,69 @@ new ruff finding, RUF007, is `start_gaps`'s existing `zip` moving into
 Not done: `anesthetic-gui.py`'s title, `anesthetic_io.py`, merge and
 `prune-run-artefacts.py` still parse the whole summary. Some of those need the
 records.
+
+## Round 351: GPU race read: the default stays; evaluations to converge span 1.7x; multi-node's per-node loss is not in the imager
+
+**Round 332's race (job 39677203).** Same settings throughout: 1 A100, nlive
+128, 5 repeats, seed 4332, run to convergence, arms in order ACLLCAACL. A is
+the default (33 x 1, 4 lanes), C is 29 ranks, L is 33 ranks on 8 lanes.
+
+| arm | wall s (each) | mean wall s | evaluations | steady evals/s | ms of wall per evaluation (mean) |
+| --- | --- | ---: | --- | --- | ---: |
+| A | 280.6, 172.0, 150.9 | 201.5 | 28,380, 21,146, 18,145 | 112, 148, 148 | 8.9 |
+| C | 195.6, 211.6, 233.0 | 213.4 | 20,865, 22,508, 23,991 | 124, 123, 117 | 9.5 |
+| L | 265.3, 233.4, 215.6 | 238.4 | 30,585, 24,667, 20,395 | 153, 132, 121 | 9.5 |
+
+**Decision: no default changes.** A has the lowest mean wall and wall per
+evaluation, though three runs each with this spread do not separate A from C.
+Round 332's "29 ranks converged sooner in both pairs" did not repeat. L does
+not earn its lanes: its start-up was 46-66 s against ~28 s, its mean batch fell
+to 1.4-1.8 from ~2.1, and its steady rate is not reliably higher. All nine
+log(Z) values lie in 0.01703-0.01741, each +/- ~0.0004, so they agree.
+
+**Why that race could not settle it.** Identical settings needed 18,145 to
+30,585 evaluations for the same `ndead` (1,207-1,274) and the same error, a
+1.7x range with a 1.6x range inside arm A alone. That is larger than every
+effect raced on the GPU, so a converged wall time at this size says little
+without the evaluation count beside it. The extra evaluations are late: 62-78%
+of the gap between the longest and shortest runs of A and of L is above
+objective 0.025, and the running median stays above 0.029 for ~13k evaluations
+in A1 but ~6k in A3. Looking at the last 1,500 evaluations above 0.029,
+runs end on different structures: A1 and L1 on a thin wall at `source_l_pixels`
+near -16 (the box edge) with nearly every evaluation at R2D2's 25-iteration
+cap; A3 is split across both l edges at a median of 6 iterations. A thin wall is
+the likely reason the tail costs more (it fits round 316's rising calls per
+slice step), but no chain log was taken here, so that is a reading rather than
+a measurement. It is the search's own landing point, and these tails are what
+the search is for, so nothing here is a speed lever. At the target size it
+matters less: 412,638-450,922 evaluations over three runs at nlive 500, a 1.09x
+range.
+
+**Multi-node's per-node loss is not in the imager.** Rounds 288-292 left a 5-11%
+per-node rate loss unattributed. Dividing `image_container` by R2D2 iterations
+across the ledger's 39-rank CPU rows of at least 20,000 evaluations:
+
+| nodes, nlive | runs | hosts | ms/iteration, median (range) | iterations | request ms | steady evals/s per node |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 2, 150 | 3 | 3 | 36.2 (34.5-37.6) | 19.34 | 700 | 53.1 |
+| 4, 150 | 3 | 3 | 38.4 (37.6-38.6) | 18.75 | 723 | 51.5 |
+| 8, 150 | 4 | 2 | 37.3 (36.1-38.4) | 18.51 | 685 | 52.4 |
+| 8, 500 | 3 | 2 | 38.6 (36.5-39.0) | 19.28 | 736 | 49.8 |
+
+Cost per iteration has no trend from 2 to 8 nodes at nlive 150. The last row's
+-6% per node against 2 nodes has the same iterations and a ms/iteration ~7%
+higher, but that figure matches the 4-node rows and sits on two hosts, so it
+is not separable from host differences. Against 8 nodes at nlive 150, the same
+row's -5% is +4% iterations and +3% ms/iteration. So 2 to 8 nodes adds no
+measurable per-evaluation cost and there is no scaling bug to chase here. The
+1-to-2-node step is not covered: only one 1-node row passed this filter, at
+44.5 ms/iteration, and its load was not checked.
+
+**Shipped.** `./ri bench` prints `ms/R2D2 iteration`, derived from each row like
+`converging evals/s`, because ms/eval moves with where a run lands. Self-check
+extended; `bench.py` only reads the ledger, so no raced guard applies.
+
+`bench.py --self-check` and `test_self_checks.py` passed. No search was run this
+round. Rows: the ten `r332-*` bench rows and stage row `r351-gpu-race-and-spread`
+(full-precision log(Z)) in `benchmarks.jsonl`. The `frozen-r332` worktree is
+removed; summaries stay in `.probe/r332/`.

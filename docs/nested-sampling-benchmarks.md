@@ -115,6 +115,10 @@ x nlive / (nlive + 0.41 x workers), where workers is
 `NS_MPI_PROCS` x `NS_NODES` - 1. A converged async search needs that many extra evaluations
 ([CSD3 speed](csd3-speed.md), round 307), so raw evals/s flatters more ranks.
 Compare rank or node layouts on this line, not on the raw rate (round 309).
+`ms/R2D2 iteration` is derived too: `image_container` over `r2d2_iterations`.
+ms/eval moves with where a run lands, and identical settings can need 1.7x
+the evaluations at nlive 128, so quote evaluations beside any converged wall
+time ([CSD3 speed](csd3-speed.md), round 351).
 
 Rows are grouped by **machine, imager and settings**, and only rows in one
 group are ever compared. The machine id is derived from `/etc/machine-id` (the
