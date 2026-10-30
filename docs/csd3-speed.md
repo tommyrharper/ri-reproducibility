@@ -5,7 +5,7 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 355; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 356; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
 - **Largest open lever: stopping below-contour evaluations.** `NS_EARLY_STOP=1`
   (opt-in) stops R2D2 once an iterate's RMS is well under the contour. Three
@@ -14,6 +14,10 @@ the Hetzner host.
   the many-seed validation, and defaulting it is the user's call. It needs a
   polychord.sif with patch 0002
   ([round 355](#round-355-early-stop-built-opt-in-wall--33-over-three-seeds-logz-agreeing)).
+  At production nlive 150, in half-node races, it gave wall **-16%** with
+  log(Z) -0.44/+0.34 sigma and 0.12% wrong stops, a rate a toy's log(Z) cannot
+  see; ~210-270 ms of each evaluation does not scale with iterations
+  ([round 356](#round-356-early-stop-at-production-nlive-wall--16-logz-agreeing-wrong-stops-measured-at-012-and-too-rare-to-move-a-toys-logz)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -17392,3 +17396,72 @@ raced simultaneously (17 ranks each, seeded, synchronous, nlive 48, 300 dead):
 all `.txt` chain files byte-identical, log(Z) 0.0965029136823395 +/-
 0.000768628 on both, 125.5 s against 125.3 s. Off by default, R2D2 only reads
 one more environment variable and installs one no-op wrapper.
+
+## Round 356: early stop at production nlive: wall -16%, log(Z) agreeing; wrong stops measured at 0.12% and too rare to move a toy's log(Z)
+
+Nothing was built. This round tests round 355's opt-in `NS_EARLY_STOP` where it
+had not been tested: production nlive, async, and against an analytic log(Z).
+
+**Race (async, nlive 150, 5 repeats, converged, 1 node, 17 ranks each, 16 workers
+x 1 thread, started 2 s apart; `.probe/r356/race.sh`).** The second pair's control
+is shadow mode, `NS_EARLY_STOP=2`, which makes no stops and so also gives the true
+wrong-stop rate.
+
+| seed | control | wall control (s) | wall on (s) | evaluations control | on | iterations per evaluation | steady evals/s | log(Z) control | log(Z) on | on-control (sigma) |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3561 | off | 989.9 | 842.3 | 22,976 | 25,655 | 19.96 to 12.24 | 23.2 to 30.7 | 0.0181016463848412 +/- 0.000373 | 0.0178739395353099 +/- 0.000366 | -0.44 |
+| 3562 | shadow | 1043.9 | 863.6 | 22,802 | 22,523 | 18.78 to 13.14 | 21.8 to 26.3 | 0.0169284238979196 +/- 0.000404 | 0.0171211245115164 +/- 0.000401 | +0.34 |
+| sum | | 2033.8 | 1705.9 | 45,778 | 48,178 | | | | | |
+
+Wall **-16.1%** (1.19x), evaluations +5.2%, iterations -31.2%. Posterior moments
+agree on all 9 columns of the chain: mean shifts are at most 0.13 posterior sd,
+sd ratios 0.95-1.03, largest |z| 1.56.
+
+This is half of round 355's -33%, and the cause is not separated. Two things are
+known. The stop arm finished first both times, so its control had the node's
+freed CPUs for the last ~140-180 s, which understates the gain. And a toy sweep
+held ~6 CPUs throughout. Round 355's arms ran one after another on the full node,
+where a U-Net iteration costs more. A fit of `image_container` time per evaluation
+against iterations per evaluation (two points per pair: 664 to 490 ms, 690 to
+565 ms) gives ~22 ms per iteration plus **~210-270 ms that does not scale with
+iterations**. An early stop cannot save that part. It is inferred from two
+different mixes of points, not timed directly.
+
+**True wrong stops (seed 3562, shadow, async, nlive 150).** 10,972 of 22,802
+evaluations (48%) would have stopped. **9 of 7,386** above-contour evaluations
+(0.12%) would have stopped wrongly. That is at the top of round 354's replay
+range (0.04-0.16%). The margins were larger than round 355's single 2% case: 1.002
+to 1.104 x contour, three of them over 6%.
+
+**Sensitivity against an analytic log(Z) (`.probe/r356/toy.py`).** This is a 6-d
+Gaussian, analytic log(Z) -8.3019, async, 3 ranks, nlive 48, 15 repeats, reading the
+real `polychord_contour` from the patched library. A wrong stop returns a value just
+under the contour. `iid` rejects any above-contour point; `band` rejects only points
+within 0.3 of the contour in ln(prior volume); `hole` is the same band with a fixed
+hash of the point, because a real stop is deterministic. The 0.3 is a rough scale:
+the whole search covers ~0.56 in ln(RMS) over ~8 in ln(volume), so 2% is ~0.3. Each
+arm has ~215 seeds, and PolyChord's scatter is ~0.33. Each mean is paired with the
+stock arm by seed.
+
+| arm | wrong stops (% of above-contour) | log(Z) minus stock | posterior sd (stock 0.0994; truth 0.1) |
+| --- | ---: | ---: | ---: |
+| band | 0.20 | -0.059 +/- 0.032 | 0.0994 |
+| iid | 1.00 | -0.027 +/- 0.029 | 0.0993 |
+| band | 1.99 | +0.007 +/- 0.032 | 0.0986 |
+| band | 9.88 | **+0.254 +/- 0.028** | 0.0950 |
+| hole | 9.93 | **+0.219 +/- 0.028** | 0.0953 |
+
+So the failure has the expected sign: rejecting points near the contour tightens
+it, log(Z) rises and the posterior narrows. The method can see it, at 10%. At 2%,
+16x the measured rate, no shift is visible, with a two-sigma limit of ~+0.07 (0.2 of
+one run's scatter). The 0.2% arm's -0.059 is under 2 sigma and of the wrong sign for
+this failure. The stock arm itself sits +0.046 +/- 0.023 from the analytic value.
+
+**What this does not establish.** Two more seeds at nlive 150, with round 355's
+three, are still few for the real search. The toy is a Gaussian with far fewer
+dimensions of structure than R2D2's RMS, its wrong stops are placed by a model, not
+by the rule, and real margins reach 10% of the contour, beyond the 2% the band was
+sized on. Multi-node and `NS_ADOPT_CONTOUR` are still unmeasured. Under the
+sampler-change guard this stays opt-in and off by default, and that decision is the
+user's. No code changed, so no WSClean guard ran. Run directories are deleted;
+gzipped summaries and posteriors are in `.probe/r356`.
