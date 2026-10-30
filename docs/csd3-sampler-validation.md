@@ -14,7 +14,7 @@ minutes on 10 slots is about 27 minutes per slot per run, against the 15-22 expe
 below, or ~2,260 core-hours for Part A. That estimate is rough because it ignores
 in-flight work. If Part B overruns by the same third, ~2,000 core-hours, the total is
 ~4,260, still under 5,000. At this rate Part A ends around 00:40. The file quota stood
-at ~488k of 1,048,576 at 20:00 (it reads ±20k with in-flight runs) with ~100-120k of that from the runs, and that part does not grow
+at ~490k of 1,048,576 at 20:00 (it reads ±20k with in-flight runs) with ~100-120k of that from the runs, and that part does not grow
 with finished runs: a task deletes its run directory once the record is written, and
 `keep/` held 187 files at 19:52. So it is ~12k per in-flight run, and ten slots hold
 it level; Part B's in-flight count is unmeasured, with ~500k of headroom. The
