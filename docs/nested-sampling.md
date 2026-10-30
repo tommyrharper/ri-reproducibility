@@ -273,9 +273,11 @@ host with `NS_NLIVE` held at 12 and only the rank count varied:
 That is 3.4GB per R2D2 rank, linear, against ~0.2GB per WSClean rank. Two
 consequences:
 
-- **`NS_NLIVE` is free.** It sets search quality, not memory. `--nlive 40
+- **`NS_NLIVE` costs no memory.** It sets search quality. `--nlive 40
   --mpi-procs 12` evaluates 40 live points 12 at a time and costs 12 ranks of
-  memory. Raise `--nlive` for a better search without paying for it in RAM.
+  memory. It is not free in time: a converged search needs evaluations in
+  proportion to `nlive + 0.41 x workers`, so raise it for precision, never for
+  speed (docs/csd3-speed.md, rounds 307-308).
 - **`--mpi-procs` is what has to fit.** On a 62GB host R2D2 tops out around 16
   ranks; the CPU would allow 20.
 

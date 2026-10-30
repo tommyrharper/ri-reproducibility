@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import math
 import os
 import re
 import select
 import signal
+import statistics
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache, lru_cache
@@ -181,6 +184,21 @@ def abort_run(message: str) -> None:
         # to the hard exit, which the launcher turns into a failed run anyway.
         pass
     os._exit(1)
+
+
+def abort_on_exception(main: Any) -> None:
+    """Run a rank's main(), aborting the job if it raises. A rank that just
+    exits leaves the others in their next collective and MPI_Finalize waiting
+    for them: a failed end-of-run gather held 8 nodes until the job's timeout
+    (round 348). Only a clean exit gets past here without Abort."""
+    try:
+        main()
+    except SystemExit as error:
+        if error.code not in (None, 0):
+            abort_run(str(error.code))
+        raise
+    except BaseException:
+        abort_run(traceback.format_exc())
 
 
 # CLEAN's minor-iteration budget. At the old 100 roughly four evaluations in
@@ -879,6 +897,87 @@ def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
             "busy_wall_seconds": busy_wall, "busy_seconds_reconstructed": True}
 
 
+def start_gaps(records: Any) -> tuple[float, float, float] | None:
+    """(startup, stall, span) seconds from the evaluations' own start epochs.
+
+    A gap is a stretch in which no rank started an evaluation for longer than
+    max(2s, 10x the median evaluation). The first is start-up (the first
+    evaluations load the imager: 23-88s on a GPU node); later ones are the whole
+    search waiting, e.g. on PolyChord's root blocked 20-45s creating its resume
+    file on Lustre (round 225; tmpfs chains since 227). Both swamp a 3-minute arm, so evals over the span
+    minus the gaps is the rate a long run settles at (docs/csd3-speed.md, round 211).
+    """
+    timed = sorted((float(t["started_epoch"]), float(t["ended_epoch"]))
+                   for t in ((record.get("timing") or {}) for record in records)
+                   if t.get("started_epoch") is not None and t.get("ended_epoch") is not None)
+    if len(timed) < 2:
+        return None
+    bound = max(2.0, 10.0 * statistics.median(end - start for start, end in timed))
+    first_end = min(end for _, end in timed)
+    startup = stall = 0.0
+    for (earlier, _), (later, _) in zip(timed, timed[1:]):
+        if later - earlier > bound:
+            # Every rank starts together, so start-up opens before any ends.
+            if earlier < first_end:
+                startup += later - earlier
+            else:
+                stall += later - earlier
+    return startup, stall, max(end for _, end in timed) - timed[0][0]
+
+
+def first_request(records: Any) -> float | None:
+    """Median seconds of the evaluations started within 1s of the first.
+
+    When every rank starts together and a cold first request is shorter than
+    start_gaps()'s bound (an async whole node: 112 first requests of 5-8s
+    against 0.7s warm), no start-to-start gap opens and startup_s reads 0.0,
+    so this is the start-up figure there (docs/csd3-speed.md, round 259).
+    """
+    starts = [(float(t["started_epoch"]), float(t["ended_epoch"]))
+              for t in ((record.get("timing") or {}) for record in records)
+              if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    if not starts:
+        return None
+    first = min(start for start, _ in starts)
+    return statistics.median(end - start for start, end in starts if start - first < 1.0)
+
+
+def mean_r2d2_iterations(records: Any) -> float | None:
+    """Mean U-Net forwards per R2D2 request. R2D2 stops its series early on
+    the residual, so a request's cost goes as ~170 + 33 ms per iteration and
+    the mean rises ~10-20% as a search climbs (round 317): arms at different
+    phases differ in this, not in speed."""
+    counts = [record["timing"]["r2d2_iterations"] for record in records or ()
+              if isinstance(record, dict) and (record.get("timing") or {}).get("r2d2_iterations")]
+    return sum(counts) / len(counts) if counts else None
+
+
+def record_digest(records: Any) -> dict[str, Any]:
+    """What `./ri bench` wants from every record, kept in the summary's profiling
+    block so a finished run's ledger row does not parse them all: 7s of a 1.1 GB
+    summary, with every node of the job still held (round 349)."""
+    gaps = start_gaps(records)
+    timed = [t for t in ((record.get("timing") or {}) for record in records)
+             if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    return {
+        "startup_s": gaps[0] if gaps else None,
+        "stall_s": gaps[1] if gaps else None,
+        "span_s": gaps[2] if gaps else None,
+        "first_request_s": first_request(records),
+        "r2d2_iterations": mean_r2d2_iterations(records),
+        "peak_memory_bytes": max(
+            (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
+             or float(record.get("peak_memory_bytes", 0.0))
+             for record in records
+             if (record.get("metrics") or {}).get("peak_memory_bytes")
+             or record.get("peak_memory_bytes")),
+            default=0.0,
+        ),
+        "first_started_epoch": min((float(t["started_epoch"]) for t in timed), default=None),
+        "last_ended_epoch": max((float(t["ended_epoch"]) for t in timed), default=None),
+    }
+
+
 def summarize_profiling(
     evaluations: list[dict[str, Any]],
     total_wall_seconds: float,
@@ -923,6 +1022,7 @@ def summarize_profiling(
     ) if window_start is not None else (None, None)
 
     return {
+        "record_digest": record_digest(evaluations),
         "mpi_procs": mpi_procs,
         "total_wall_seconds": total_wall_seconds,
         "busy_worker_seconds": busy_worker,
@@ -1239,29 +1339,65 @@ def evaluation_record_paths(evaluations_dir: Path) -> dict[str, Path]:
 # a flat record beside a packed one wins. A line without its newline is a torn
 # append, and is ignored.
 RECORD_PACK = "records.jsonl"
+# Across nodes each node's ranks append to a pack of their own,
+# records.<host>.jsonl (NS_RECORD_PACK, set by the multi-node launcher): on
+# one shared file 2 nodes spent ~37x one node's writer-seconds and a kill lost
+# ~20% of the printed records (round 289). Readers take the node packs and
+# then the run's pack, which wins; a finish or a resume folds them into it.
+NODE_PACK_GLOB = "records.*.jsonl"
 
 
-def _read_record_pack(evaluations_dir: Path) -> tuple[dict[str, str], int]:
-    """({name: record json} from the pack, the length of its whole lines)."""
+def node_packs(evaluations_dir: Path) -> list[Path]:
     try:
-        data = (evaluations_dir / RECORD_PACK).read_bytes()
+        return sorted(evaluations_dir.glob(NODE_PACK_GLOB))
+    except OSError:
+        return []
+
+
+def _read_pack_file(path: Path, texts: dict[str, str]) -> int:
+    """Add {name: record json} from one pack to `texts`; its whole lines' length."""
+    try:
+        data = path.read_bytes()
     except (FileNotFoundError, NotADirectoryError):
-        return {}, 0
+        return 0
     whole = data.rfind(b"\n") + 1
-    texts: dict[str, str] = {}
     for line in data[:whole].decode(errors="replace").splitlines():
         name, tab, text = line.partition("\t")
         if tab:
             texts[name] = text
-    return texts, whole
+    return whole
+
+
+def _pack_is_torn(evaluations_dir: Path) -> bool:
+    """Whether the run pack ends in a killed rank's half-written line."""
+    try:
+        with open(evaluations_dir / RECORD_PACK, "rb") as pack:
+            pack.seek(-1, os.SEEK_END)
+            return pack.read(1) != b"\n"
+    except OSError:  # no pack, or an empty one
+        return False
+
+
+def _read_record_pack(evaluations_dir: Path, nodes: bool = True) -> tuple[dict[str, str], int, set[str]]:
+    """({name: record json} from the packs, the length of the run pack's
+    whole lines, the names only a node pack holds)."""
+    texts: dict[str, str] = {}
+    for path in node_packs(evaluations_dir) if nodes else []:
+        _read_pack_file(path, texts)
+    on_nodes = set(texts)
+    own: dict[str, str] = {}
+    whole = _read_pack_file(evaluations_dir / RECORD_PACK, own)
+    texts.update(own)
+    return texts, whole, on_nodes - own.keys()
 
 
 def packed_record_texts(evaluations_dir: Path) -> dict[str, str]:
     return _read_record_pack(evaluations_dir)[0]
 
 
-def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
-    """(every evaluation name, a function reading one's record or None)."""
+def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any, dict[str, Path]]:
+    """(every evaluation name, a function reading one's record or None,
+    evaluation_record_paths())."""
     paths = evaluation_record_paths(evaluations_dir)
     packed = packed_record_texts(evaluations_dir)
 
@@ -1280,40 +1416,75 @@ def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any]:
             return None
         return read_evaluation_record(path)
 
-    return sorted(paths.keys() | packed.keys()), read
+    return sorted(paths.keys() | packed.keys()), read, paths
 
 
-def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]]) -> int:
+def _read_records(names: list[str], read: Any, files: dict[str, Path]) -> list[dict[str, Any] | None]:
+    """read() of each name. Only names with a record file go through the
+    pool: a packed one is a json.loads, which holds the GIL, so 32 threads
+    parsed the pack slower than this one does meanwhile (round 268)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    on_disk = [name for name in names if name in files]
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        pending = pool.map(read, on_disk)  # submitted now, run while this thread parses
+        records = {name: read(name) for name in names if name not in files}
+        records.update(zip(on_disk, pending))
+    return [records[name] for name in names]
+
+
+def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]],
+                            fold_nodes: bool = True, encoded: dict[str, str] | None = None) -> int:
     """Move the records named in `known` ({name: record}) into the pack and
     unlink their files - a flat record, or a pre-round-92 metrics.json and
     then its dir if that held nothing else - and append again any packed one
     `known` has edited since; how many lines it appended. Writers of the pack
-    (a resume, the run's packer, the finish) take its lock in turn."""
+    (a resume, the run's packer, the finish) take its lock in turn.
+    `fold_nodes` also moves the node packs in, which only a caller no rank
+    is appending beside may do: the run's own packer passes False.
+    `encoded` holds json.dumps() of records in `known` the caller has already
+    encoded, which this then does not encode again."""
     import fcntl
     from concurrent.futures import ThreadPoolExecutor
 
+    clock = [time.monotonic()]
+
+    def lap(phase: str) -> None:
+        clock.append(time.monotonic())
+        LAST_PACK_SECONDS[phase] = clock[-1] - clock[-2]
+
+    LAST_PACK_SECONDS.clear()
     with open(evaluations_dir / RECORD_PACK, "ab") as pack:
         fcntl.flock(pack, fcntl.LOCK_EX)
+        lap("lock")
         paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
-        texts, whole = _read_record_pack(evaluations_dir)
-        lines: dict[str, str] = {}
+        lap("list")
+        texts, whole, on_nodes = _read_record_pack(evaluations_dir, fold_nodes)
+        folding = node_packs(evaluations_dir) if fold_nodes else []
+        lap("read")
+        lines: dict[str, str] = {name: texts[name] for name in sorted(on_nodes)}
         moving = []
         for name in sorted(known):
             if name in paths and (paths[name].parent == evaluations_dir or name not in texts):
                 moving.append(name)  # a packed name's dir has no record file: only a flat one is newer
-            text = json.dumps(known[name])
+            text = encoded[name] if encoded and name in encoded else json.dumps(known[name])
             # Not on disk at all: a record write the finish cancelled.
-            if name in moving or text != texts.get(name):
+            if name in moving or name in on_nodes or text != texts.get(name):
                 lines[name] = text  # the last line of a name is its record
+        lap("encode")
         # A torn last line from a killed packer, or a killed rank's append,
         # which the next append would otherwise run on into.
         if whole < os.fstat(pack.fileno()).st_size:
             pack.truncate(whole)
+        if lines:
+            pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
+            pack.flush()
+            os.fsync(pack.fileno())
+        for path in folding:  # every line of them is in the run's pack now
+            path.unlink(missing_ok=True)
+        lap("write")
         if not lines:
             return 0
-        pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
-        pack.flush()
-        os.fsync(pack.fileno())
 
     def unlink(name: str) -> None:
         paths[name].unlink(missing_ok=True)
@@ -1328,7 +1499,15 @@ def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, An
     # cost ~6ms rather than ~0.2ms (round 93).
     with ThreadPoolExecutor(RECORD_READ_THREADS, initializer=_unpin_thread) as pool:
         list(pool.map(unlink, moving))
+    lap("unlink")
+    LAST_PACK_SECONDS["lines"], LAST_PACK_SECONDS["files"] = len(lines), len(moving)
     return len(lines)
+
+
+# Where the last pack_evaluation_records() call's time went, for the post-run
+# line: a whole sapphire node's final pack took 18.2s against 4.3s on 38
+# icelake CPUs for 12% more records, and nothing said why (round 256).
+LAST_PACK_SECONDS: dict[str, float] = {}
 
 
 # A Lustre unlink holds the evaluations dir's lock, ~0.13ms each whatever the
@@ -1353,7 +1532,8 @@ def pack_flat_records(evaluations_dir: Path) -> int:
         records = dict(zip((path.name.removesuffix(RECORD_SUFFIX) for path in flat),
                            pool.map(read_evaluation_record, flat)))
     return pack_evaluation_records(
-        evaluations_dir, {name: record for name, record in records.items() if record is not None})
+        evaluations_dir, {name: record for name, record in records.items() if record is not None},
+        fold_nodes=False)
 
 
 def start_record_packer(evaluations_dir: Path) -> subprocess.Popen | None:
@@ -1411,12 +1591,9 @@ RECORD_READ_THREADS = 32
 
 def read_evaluation_records(evaluations_dir: Path) -> list[tuple[Path, dict[str, Any] | None]]:
     """(eval dir, record or None) for every eval-* entry, in name order."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    names, read = _record_reader(evaluations_dir)
-    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        records = pool.map(read, names)
-        return [(evaluations_dir / name, record) for name, record in zip(names, records)]
+    names, read, files = _record_reader(evaluations_dir)
+    records = _read_records(names, read, files)
+    return [(evaluations_dir / name, record) for name, record in zip(names, records)]
 
 
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
@@ -1426,13 +1603,10 @@ def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
 def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """The run's records in name order, as load_evaluations_from_dir() gives
     them, reading from disk only those not already in `written`."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    listed, read_one = _record_reader(evaluations_dir)
+    listed, read_one, files = _record_reader(evaluations_dir)
     names = set(listed)
     earlier = sorted(names - written.keys())
-    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
-        read = dict(zip(earlier, pool.map(read_one, earlier)))
+    read = dict(zip(earlier, _read_records(earlier, read_one, files)))
     _FINISHED_RECORDS.clear()
     for name in sorted(names | written.keys()):
         record = written.get(name) or read.get(name)
@@ -1444,11 +1618,21 @@ def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[
 # The records finished_run_records() gave rank 0, by name, which
 # pack_finished_run() packs once prune_run_artefacts() has edited them.
 _FINISHED_RECORDS: dict[str, dict[str, Any]] = {}
+# json.dumps() of those a rank encoded for it and prune cannot edit.
+_FINISHED_TEXTS: dict[str, str] = {}
 
 
-def pack_finished_run(evaluations_dir: Path) -> int:
+def pack_finished_run(evaluations_dir: Path, encoded: dict[str, str] | None = None) -> int:
     """Rank 0, once the summary is written: no rank writes records now."""
-    return pack_evaluation_records(evaluations_dir, _FINISHED_RECORDS)
+    return pack_evaluation_records(evaluations_dir, _FINISHED_RECORDS, encoded=encoded)
+
+
+def encode_finished_records() -> dict[str, str]:
+    """json.dumps() of each finished record, by name, once prune has edited
+    them: the summary and the final pack each encoded all of them, 2.6s a
+    time at 128k evaluations (round 340), so they share this. The ranks
+    encoded nearly all of them, in parallel (round 342)."""
+    return {name: _FINISHED_TEXTS.get(name) or json.dumps(record) for name, record in _FINISHED_RECORDS.items()}
 
 
 class PolyChordFinish:
@@ -1672,6 +1856,19 @@ def evidence_record(output: Any) -> dict[str, Any] | None:
         return None
 
 
+GATHER_LARGE_TAG = 5302
+
+
+def gather_large(comm: Any, mine: Any) -> list[Any] | None:
+    """comm.gather(), rank by rank: its byte counts and displacements are C
+    ints, so past 2 GiB in all it raises MPI_ERR_ARG, ~500k records at the
+    target size, with every evaluation done (csd3-speed.md, round 345)."""
+    if comm.Get_rank() != 0:
+        comm.send(mine, dest=0, tag=GATHER_LARGE_TAG)
+        return None
+    return [mine, *(comm.recv(source=rank, tag=GATHER_LARGE_TAG) for rank in range(1, comm.Get_size()))]
+
+
 def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     """Drain every rank's records and settle its held extremes; rank 0 gets
     every record, the others None. Collective: every rank calls it.
@@ -1683,12 +1880,20 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     records first, decides what the run keeps - the same decision prune
     makes - and the ranks publish only that and drop the rest in tmpfs.
     """
+    # The run's last moments, when what they allocate all stays live: a cyclic
+    # collection walks it for nothing, ~60% of unpickling 128k records here
+    # (csd3-speed.md, round 342).
+    gc.disable()
     POST_RUN_SECONDS.clear()
     POST_RUN_BACKLOG.clear()
     started = time.monotonic()
     # This rank's own backlog and drain, apart from the barrier's wait for
     # the slowest: round 233's 60s drain was one of the two (round 234).
-    queued = [future.kind for future in _RECORD_WRITES if not future.done()]
+    queued = [future.kind for future in _RECORD_WRITES if not future.done() and future.kind != "record"]
+    with _PENDING_LOCK:
+        lines = len(_PENDING_LINES)
+    queued += ["record"] * (lines or sum(future.kind == "record" for future in _RECORD_WRITES
+                                         if not future.done()))
     # A record still queued has its text in _WRITTEN_RECORDS, which rank 0
     # gathers and pack_finished_run() writes into the pack: writing the file
     # first only for the pack to unlink it was most of a backlog of up to
@@ -1706,6 +1911,7 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     _RECORD_WRITES[:] = [future for future in _RECORD_WRITES if not future.cancelled()]
     drain_record_writes(flush_held=False)
     _PENDING_RECORDS.clear()  # their texts are in _WRITTEN_RECORDS too
+    _PENDING_LINES.clear()
     backlog = (queued, time.monotonic() - started, dict(_WRITER_SECONDS))
     try:
         from mpi4py import MPI
@@ -1732,10 +1938,15 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     here = os.path.abspath(evaluations_dir)
     mine = [(os.path.basename(path), json.loads(text)) for path, text in _WRITTEN_RECORDS.items()
             if os.path.dirname(path) == here]
-    gathered = comm.gather(mine, root=0) if comm is not None else [mine]
+    # The compact text too, which rank 0 alone took ~3s to encode at 128k
+    # evaluations. Not for a record prune_run_artefacts() may edit (~22% at 128k).
+    mine = [(name, record, None if _names_image(record) else json.dumps(record)) for name, record in mine]
+    gathered = gather_large(comm, mine) if comm is not None else [mine]
     records = None
     if mpi_rank() == 0:
-        written = {name: record for rank_records in gathered for name, record in rank_records}
+        written = {name: record for rank_records in gathered for name, record, _ in rank_records}
+        _FINISHED_TEXTS.clear()
+        _FINISHED_TEXTS.update((name, text) for rank_records in gathered for name, _, text in rank_records if text)
         records = gathered_and_earlier_records(evaluations_dir, written)
     started = post_run_phase("records", started)
     keep = (None if records is None or os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
@@ -1743,6 +1954,8 @@ def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
     if comm is not None:
         keep = comm.bcast(keep, root=0)
     flush_held_evaluations(force=True, keep=keep)
+    if keep is not None:
+        strip_unkept_evaluations(Path(evaluations_dir), [name for name, _, text in mine if text is None], keep)
     if comm is not None:
         comm.Barrier()  # the kept extremes are on Lustre before rank 0 prunes
     post_run_phase("flush", started)
@@ -1765,6 +1978,10 @@ def post_run_phase(name: str, started: float) -> float:
 
 def post_run_line() -> str:
     line = "post-run seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in POST_RUN_SECONDS.items())
+    if "pack" in POST_RUN_SECONDS and LAST_PACK_SECONDS:
+        pack = dict(LAST_PACK_SECONDS)
+        counts = f"{pack.pop('lines', 0):.0f} lines, {pack.pop('files', 0):.0f} files"
+        line += " (" + ", ".join(f"{k} {v:.1f}" for k, v in pack.items()) + f"; {counts})"
     if POST_RUN_BACKLOG:
         backlog = dict(POST_RUN_BACKLOG)
         line += "; slowest rank's drain {:.1f}, most queued on one rank {:.0f}".format(
@@ -1783,41 +2000,55 @@ def adopt_completed_evaluations(
     evaluations_dir: Path,
     cache: dict[str, float],
 ) -> int:
-    """Cache finished evaluations and remove incomplete directories."""
+    """Cache finished evaluations and remove incomplete directories.
+
+    Rank 0 alone reads the records and broadcasts {key: objective}: every
+    rank parsing every record cost 1 GB and 6 s a rank at 67k evaluations,
+    and 6.4 GB a rank at 400k, which a 113-rank resume cannot hold (round 267).
+    """
     import shutil
 
+    try:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+        if comm.Get_size() == 1:
+            comm = None
+    except Exception:
+        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    if comm is not None and comm.Get_rank() != 0:
+        adopted, keys = comm.bcast(None, root=0)
+        cache.update(keys)
+        return adopted
     adopted = 0
+    keys: dict[str, float] = {}
     good: dict[str, dict[str, Any]] = {}
     # A record a killed writer left half-written: the record it was replacing,
     # if any, is still there beside it.
     for partial in evaluations_dir.glob("eval-*" + RECORD_SUFFIX + ".partial"):
         partial.unlink(missing_ok=True)
+    # Only these can need packing: a record read from the pack is in it.
+    listed = evaluation_record_paths(evaluations_dir)
     for eval_dir, record in read_evaluation_records(evaluations_dir):
-        if record is not None:
+        if record is not None and eval_dir.name in listed:
             good[eval_dir.name] = record
         if record is None:
             # A half-written record goes too, or every resume warns about it.
             flat_record_path(eval_dir).unlink(missing_ok=True)
             if not eval_dir.is_dir():
                 continue
-            # ignore_errors because every rank runs this, and they are all
-            # removing the same directories at the same moment.
+            # ignore_errors: best effort, the next resume sweeps what is left.
             shutil.rmtree(eval_dir, ignore_errors=True)
             continue
-        cache[params_key(record["params"])] = float(record["objective"])
+        keys[params_key(record["params"])] = float(record["objective"])
         adopted += 1
-    # Collective: every rank adopts, and none may still be reading a flat
-    # record when rank 0 unlinks it - a missing record reads as a torn one,
-    # whose dir the loop above removes.
-    try:
-        from mpi4py import MPI
-
-        comm = MPI.COMM_WORLD
-    except Exception:
-        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    cache.update(keys)
+    # Collective, and before the pack: no rank reads a flat record after it.
     if comm is not None:
-        comm.Barrier()
-    if mpi_rank() == 0 and good:
+        comm.bcast((adopted, keys), root=0)
+    # An appending run leaves no flat records, so a torn last line alone must
+    # still reach the pack writer, or the next append runs on into it (round 348).
+    if good or node_packs(evaluations_dir) or _pack_is_torn(evaluations_dir):
         started = time.monotonic()
         packed = pack_evaluation_records(evaluations_dir, good)
         if packed:
@@ -1959,10 +2190,14 @@ def self_check_resume_adoption() -> None:
                                 {"eval_id": 2, "params": {"a": 2}, "objective": 0.75})
         assert [r["objective"] for r in load_evaluations_from_dir(evaluations_dir)] == [0.5, 0.75]
         write_evaluation_record(evaluations_dir / "eval-0004-jkl",
-                                {"eval_id": 4, "params": {"a": 4}, "objective": 0.1})
+                                {"eval_id": 4, "params": {"a": 4}, "objective": 0.1,
+                                 "paths": {"image": "x"}})
         records = finished_run_records(evaluations_dir)
         assert [r["eval_id"] for r in records] == [1, 2, 4]
+        # Rank-encoded texts: never one prune may edit (round 342).
+        assert "eval-0002-def" in _FINISHED_TEXTS and "eval-0004-jkl" not in _FINISHED_TEXTS
         records[2]["paths"] = {}  # as prune_run_artefacts() edits a record
+        assert list(encode_finished_records().values()) == [json.dumps(r) for r in records]
         assert pack_finished_run(evaluations_dir) == 2
         assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
         assert (evaluations_dir / RECORD_PACK).read_text().count("\n") == 4  # 1, 2, 2 again, 4
@@ -1979,7 +2214,7 @@ def self_check_resume_adoption() -> None:
         assert [r["eval_id"] for r in records] == [1, 2, 4, 7]
         assert pack_finished_run(evaluations_dir) == 0  # nothing edited
         records[3]["paths"] = {}
-        assert pack_finished_run(evaluations_dir) == 1
+        assert pack_finished_run(evaluations_dir, encode_finished_records()) == 1  # the summary's texts
         assert load_evaluations_from_dir(evaluations_dir) == records
         packer = start_record_packer(evaluations_dir)
         assert packer is not None and packer.poll() is None
@@ -1997,10 +2232,11 @@ def self_check_resume_adoption() -> None:
             "eval-0001-abc", "eval-0006-pqr", RECORD_PACK]
         assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6, 7]
         # A record still queued when the run ends goes into the pack, never
-        # to its own file (round 234).
+        # to its own file (round 234), with the flat writer too.
         import threading
 
         _WRITTEN_RECORDS.clear()
+        os.environ["NS_RECORD_APPEND"] = "0"
         write_records_in_background()
         gate = threading.Event()
         _submit_record_job(gate.wait, "held")
@@ -2032,8 +2268,9 @@ def self_check_resume_adoption() -> None:
         records = finished_run_records(evaluations_dir)
         assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 20, 21, 22, 23]
         assert pack_finished_run(evaluations_dir) == 1  # the flat one; the appended are packed
-        # A run's writer appends its records to the pack, never a flat file,
-        # and the finish then has nothing to add (round 240). A torn last
+        # A run's writer (the default since round 264) appends its records
+        # to the pack, never a flat file, and the finish then has nothing to
+        # add (round 240). A torn last
         # line - a rank killed mid-append - is cut by the next pack writer,
         # so the next append does not run on into it.
         _WRITTEN_RECORDS.clear()
@@ -2049,13 +2286,96 @@ def self_check_resume_adoption() -> None:
         assert pack_finished_run(evaluations_dir) == 0, "the finish re-appended an appended record"
         with open(evaluations_dir / RECORD_PACK, "a") as pack:
             pack.write('eval-0011-bcd\t{"eval_id": 11, "par')
+        # With no flat record for the resume to pack it must still cut the tail.
+        appending = evaluations_dir / "appending"
+        appending.mkdir()
+        (appending / RECORD_PACK).write_text(
+            'eval-0001-a\t{"eval_id": 1, "params": {"a": 1}, "objective": 0.5}\n'
+            'eval-0002-b\t{"eval_id": 2, "par')
+        assert _pack_is_torn(appending)
+        assert adopt_completed_evaluations(appending, {}) == 1
+        assert not _pack_is_torn(appending), "a resume left the torn line for the next append"
+        (appending / RECORD_PACK).unlink()
+        appending.rmdir()
         assert pack_evaluation_records(evaluations_dir, {}) == 0
         write_records_in_background()
         write_evaluation_record(evaluations_dir / "eval-0012-efg",
                                 {"eval_id": 12, "params": {"a": 12}, "objective": 0.6})
         drain_record_writes()
+        # An appending writer that fell behind writes its backlog in one
+        # append, in order, but never a line ahead of a queued publish of its
+        # evaluation's detail (round 296).
+        os.environ["NS_RECORD_BATCH"] = "1"
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        appends = []
+        real_append = _append_record
+        globals()["_append_record"] = lambda d, line: (appends.append(line), real_append(d, line))
+        published = threading.Event()
+        try:
+            for i in range(3):
+                write_evaluation_record(evaluations_dir / f"eval-003{i}-bat",
+                                        {"eval_id": 30 + i, "params": {"a": 30 + i}, "objective": 0.5})
+            assert sum(f.kind == "record" for f in _RECORD_WRITES) == 1, "a covered line got a job"
+            _submit_record_job(published.wait, "publish")
+            _PENDING_LINES.append((evaluations_dir, b'eval-0033-bat\t{"eval_id": 33, "params": {"a": 33}, "objective": 0.5}\n', _RECORD_WRITES[-1]))
+            _submit_record_job(_append_pending_lines)
+            gate.set()
+            time.sleep(0.2)
+            assert [line.count(b"\n") for line in appends] == [3], appends
+            published.set()
+            drain_record_writes()
+        finally:
+            gate.set()
+            published.set()  # so a failed assertion cannot hang the drain at exit
+            globals()["_append_record"] = real_append
+            os.environ.pop("NS_RECORD_BATCH")
+        assert [line.count(b"\n") for line in appends] == [3, 1], appends
+        assert appends[0].startswith(b"eval-0030-bat\t") and b"eval-0032-bat\t" in appends[0]
         os.environ.pop("NS_RECORD_APPEND")
         assert 12 in [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)]
+        # Across nodes a rank appends to its node's pack (round 290), which
+        # every reader takes too; the run's packer leaves it alone, and a
+        # finish or a resume folds it into the run's pack, which wins.
+        # NS_RECORD_INLINE=1 appends inline (round 292): the line is on disk
+        # when the call returns - unless a job is queued, which it waits behind.
+        os.environ["NS_RECORD_PACK"] = "records.node-b.jsonl"
+        os.environ["NS_RECORD_INLINE"] = "1"
+        node_pack = evaluations_dir / "records.node-b.jsonl"
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        remote = evaluations_dir / "eval-0013-hij"
+        write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        assert not node_pack.exists(), "an inline record overtook a queued job"
+        gate.set()
+        drain_record_writes()
+        write_records_in_background()
+        write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        assert not _RECORD_WRITES and node_pack.read_text().count("eval-0013-hij") == 2, \
+            "an inline record was queued"
+        drain_record_writes()
+        os.environ.pop("NS_RECORD_PACK")
+        os.environ.pop("NS_RECORD_INLINE")
+        assert node_pack.read_text().startswith("eval-0013-hij\t"), "a node's record missed its pack"
+        assert json.loads(packed_record_texts(evaluations_dir)[remote.name])["eval_id"] == 13
+        write_evaluation_record(evaluations_dir / "eval-0014-klm",
+                                {"eval_id": 14, "params": {"a": 14}, "objective": 0.6})  # flat
+        assert pack_flat_records(evaluations_dir) == 1 and node_pack.exists()
+        with open(node_pack, "a") as pack:
+            pack.write('eval-0015-nop\t{"eval_id": 15, "par')  # a rank killed mid-append
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 19
+        assert not node_pack.exists(), "a resume left a node pack unfolded"
+        texts = packed_record_texts(evaluations_dir)
+        assert json.loads(texts[remote.name])["eval_id"] == 13 and "eval-0015-nop" not in texts
+        node_pack.write_text('eval-0013-hij\t{"eval_id": 13, "params": {"a": 13}, "objective": 9}\n'
+                             'eval-0016-qrs\t{"eval_id": 16, "params": {"a": 16}, "objective": 0.1}\n')
+        _WRITTEN_RECORDS.clear()
+        records = finished_run_records(evaluations_dir)
+        assert {r["eval_id"]: r["objective"] for r in records}[13] == 0.6, "a node pack beat the run's"
+        assert pack_finished_run(evaluations_dir) == 1 and not node_pack.exists()
+        assert load_evaluations_from_dir(evaluations_dir) == records
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -2063,12 +2383,41 @@ def self_check_resume_adoption() -> None:
         assert adopt_completed_evaluations(Path(tmp), cache) == 0
 
 
-def write_json_atomic(path: Path, payload: Any) -> None:
-    """Write JSON through a same-directory temporary file, then replace `path` atomically."""
-    _write_text_atomic(path, _json_text(payload))
+def write_json_atomic(path: Path, payload: Any, encoded: list[str] | None = None) -> None:
+    """Write JSON through a same-directory temporary file, then replace `path` atomically.
+    `encoded`, if given, is json.dumps() of each of payload["evaluations"]."""
+    _write_text_atomic(path, _json_text(payload, encoded))
 
 
-def _json_text(payload: Any) -> str:
+def read_summary_skeleton(path: Path) -> dict[str, Any] | None:
+    """A summary without its `evaluations`, or None if it needs reading whole:
+    no record_digest (older runs, merged runs) or not _json_text()'s layout.
+    Reads the two ends only; a target-size summary is over 1 GB (round 349)."""
+    marker, close = b'\n  "evaluations": [', b"\n  ],\n"
+    with open(path, "rb") as handle:
+        head = handle.read(1 << 16)
+        opened = head.find(marker)
+        if opened < 0:
+            return None
+        records_at = opened + len(marker)
+        size = handle.seek(0, os.SEEK_END)
+        handle.seek(max(records_at, size - (1 << 20)))
+        tail = handle.read()
+    # A record is one line, so the first such close is the array's. The record
+    # before it proves the read began inside the array, not past it.
+    closed = tail.find(close)
+    if closed < 0 or tail.rfind(b'\n    {"', 0, closed) < 0:
+        return None
+    try:
+        summary = json.loads(head[:records_at] + b"]" + tail[closed + len(close) - 2:])
+    except ValueError:  # caught mid-write
+        return None
+    if not (summary.get("profiling") or {}).get("record_digest"):
+        return None
+    return summary
+
+
+def _json_text(payload: Any, encoded: list[str] | None = None) -> str:
     # A summary's evaluations go one compact line each: indent=2 takes the
     # pure-Python encoder, 5.1s of a 67k-evaluation summary against ~1.6s
     # this way (round 197). The same JSON values; the head stays indented.
@@ -2078,7 +2427,9 @@ def _json_text(payload: Any) -> str:
     # Two spaces and a newline: only the top-level key (a string holds no raw newline).
     slot = '\n  "evaluations": []'
     head = json.dumps({**payload, "evaluations": []}, indent=2)
-    body = ",\n    ".join(map(json.dumps, evaluations))
+    if encoded is None or len(encoded) != len(evaluations):
+        encoded = list(map(json.dumps, evaluations))
+    body = ",\n    ".join(encoded)
     return head.replace(slot, slot[:-1] + "\n    " + body + "\n  ]", 1) + "\n"
 
 
@@ -2096,8 +2447,27 @@ def self_check_summary_json() -> None:
     assert text.startswith('{\n  "evaluation_count": 2,'), text  # the head readers' layout
     assert '\n    {"eval_id": 2, "params": {}}\n  ],\n  "after"' in text, text
     assert repr(json.loads(text)) == repr(summary)
+    assert _json_text(summary, [json.dumps(e) for e in summary["evaluations"]]) == text
     for payload in ({}, {"evaluations": []}, [1], {"eval_id": 1}):
         assert _json_text(payload) == json.dumps(payload, indent=2) + "\n"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "summary.json"
+        digest = {"profiling": {"record_digest": {"span_s": 1.0}}}
+        records = [{"eval_id": 1, "timing": {}}, {"eval_id": 2, "seen": [1, 2]}]
+        whole = {"a": 1, "evaluations": records, "worst_evaluation": records[1], **digest, "z": [{}]}
+        path.write_text(_json_text(whole))
+        assert read_summary_skeleton(path) == {**whole, "evaluations": []}
+        path.write_text(_json_text({**whole, "profiling": {}}))
+        assert read_summary_skeleton(path) is None, "no digest, so the caller parses it whole"
+        path.write_text(json.dumps(whole, indent=2))  # merge's layout
+        assert read_summary_skeleton(path) is None
+        path.write_text(_json_text(whole)[:-20])
+        assert read_summary_skeleton(path) is None, "half a file"
+        # A tail wider than the window starts past the array's close.
+        path.write_text(_json_text({**whole, "wide": ["x" * (1 << 20)], "after": [{}]}))
+        assert read_summary_skeleton(path) is None
     print("OK: summary.json writer")
 
 
@@ -2295,7 +2665,12 @@ def evaluation_key(record: dict[str, Any]) -> str:
     name carries the parameter hash and is unique.
     """
     eval_dir = (record.get("paths") or {}).get("eval_dir")
-    return Path(eval_dir).name if eval_dir else f"eval_id:{record.get('eval_id')}"
+    if not eval_dir:
+        return f"eval_id:{record.get('eval_id')}"
+    # Path().name, without building a Path: ~4 a record at the end of a run
+    # (round 269). Only a trailing "/" or "." needs Path's normalising.
+    name = eval_dir.rpartition("/")[2] if isinstance(eval_dir, str) else ""
+    return name if name not in ("", ".") else Path(eval_dir).name
 
 
 def evaluations_keeping_images(
@@ -2361,6 +2736,11 @@ PRUNED_EVALUATION_LOGS = (
     "makems.log",
     "meqtree-pipeliner.log",
 )
+
+
+def _names_image(record: dict[str, Any]) -> bool:
+    paths = record.get("paths") or {}
+    return any(paths.get(key) for key in RETAINED_IMAGE_KEYS)
 
 
 def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) -> int:
@@ -2441,6 +2821,9 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
 
     slow, removed = [], 0
     for record in records:
+        paths = record.get("paths") or {}
+        if not _names_image(record):
+            continue  # prune() of a record naming no image does nothing: ~90% of them (round 269)
         if touches_lustre(record):
             slow.append(record)
         else:
@@ -2583,6 +2966,10 @@ def self_check_image_retention() -> None:
     assert evaluations_keeping_images(shared, ends=1, stride=100) == {
         "eval-0007-aaa", "eval-0007-bbb"}
     assert len({evaluation_key(r) for r in shared}) == 2
+    # Path().name, whatever the spelling (round 269 skips building the Path).
+    for spelled in ("/run/evaluations/eval-0007-aaa", "eval-0007-aaa", "/run//eval-1/", "/run/eval-1/.",
+                    "/run/..", "/", "a/./b", Path("/run/evaluations/eval-0007-aaa")):
+        assert evaluation_key({"paths": {"eval_dir": spelled}}) == Path(spelled).name, spelled
 
     with tempfile.TemporaryDirectory() as tmp:
         evaluations = Path(tmp) / "evaluations"
@@ -2700,6 +3087,7 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         if marker is not None:
             marker.unlink(missing_ok=True)
     keeping = prune_evaluation_artefacts(eval_dir, record)
+    published: list[Any] = []
     kept = retain_evaluation_detail(eval_dir, record) or keeping
     if kept and not keeping and not _always_retained(eval_dir, record):
         hold_evaluation_scratch(eval_dir, record)
@@ -2708,16 +3096,35 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         # ~0.2s, and the rank sat idle through it: ~2% of a 36-rank search
         # (docs/csd3-speed.md, round 95).
         publish_evaluation_scratch(eval_dir, record, kept, defer=(
-            (lambda job: _submit_record_job(job, "publish"))
+            (lambda job: published.append(_submit_record_job(job, "publish")))
             if _RECORD_WRITER is not None else None))
     flush_held_evaluations()
     text = _json_text(record)
     _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
     if _RECORD_WRITER is None:
         _write_record(flat_record_path(eval_dir), text)
-    elif os.environ.get("NS_RECORD_APPEND", "0") == "1":
+    elif os.environ.get("NS_RECORD_APPEND", "1") == "1":
         line = f"{eval_dir.name}\t{json.dumps(record)}\n".encode()
-        _submit_record_job(lambda: _append_record(eval_dir.parent, line))
+        # _pypolychord holds the GIL through PolyChord's MPI waits, so the
+        # writer thread runs only while a callback blocks: on 2 nodes an
+        # append cost ~86ms of GIL waits, the writer fell hundreds of records
+        # behind and a kill lost 692 records. NS_RECORD_INLINE=1 appends on
+        # the rank's thread: no loss, but 18-28ms a record there and ~4% fewer
+        # evals/s on 2 nodes, so it is opt-in (round 292). A queued publish
+        # keeps the thread, so a record never lands before its detail.
+        if os.environ.get("NS_RECORD_INLINE") == "1" and all(
+                future.done() for future in _RECORD_WRITES):
+            _timed_record_job(lambda: _append_record(eval_dir.parent, line), "record")
+        elif os.environ.get("NS_RECORD_BATCH", "1") == "0":
+            _submit_record_job(lambda: _append_record(eval_dir.parent, line))
+        else:
+            publish = published[0] if published else None
+            with _PENDING_LOCK:
+                # A job queued for an earlier line takes this one too.
+                covered = bool(_PENDING_LINES) and publish is None
+                _PENDING_LINES.append((eval_dir.parent, line, publish))
+            if not covered:
+                _submit_record_job(_append_pending_lines)
     elif os.environ.get("NS_RECORD_COALESCE", "1") == "0":
         _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
     else:
@@ -2750,6 +3157,33 @@ def _write_pending_records() -> None:
         _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(pending)
 
 
+# The appending writer fell behind the same way under a loaded Lustre: a
+# 2-node search ended with 11,085 of its 23,279 records still queued, 1,078
+# on one node (round 296). NS_RECORD_BATCH=1 has a record job append every
+# line queued when it runs, in one write - up to the first whose detail is
+# still to publish, which its own job, queued behind that publish, appends.
+# It costs no steady evals/s on 2 nodes (102.3 vs 102.0, ~7 min ABBA arms)
+# and leaves 8-15x fewer records queued at the finish (round 297), and a
+# kill -9 loses no more than the old writer (round 298), so it is the
+# default; NS_RECORD_BATCH=0 queues one job per record.
+_PENDING_LINES: list[tuple[Path, bytes, Any]] = []
+
+
+def _append_pending_lines() -> None:
+    with _PENDING_LOCK:
+        ready = 0
+        for _, _, publish in _PENDING_LINES:
+            if publish is not None and not publish.done():
+                break
+            ready += 1
+        batch = _PENDING_LINES[:ready]
+        del _PENDING_LINES[:ready]
+    if batch:
+        _append_record(batch[0][0], b"".join(line for _, line, _ in batch))
+        if len(batch) > 1:
+            _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(batch)
+
+
 def _submit_record_job(job: Any, kind: str = "record") -> Any:
     for done in [future for future in _RECORD_WRITES if future.done()]:
         _RECORD_WRITES.remove(done)
@@ -2772,30 +3206,31 @@ def _write_record(path: Path, text: str) -> None:
     _write_text_atomic(path, text)
 
 
-# NS_RECORD_APPEND=1: a run's writer appends each record to the pack instead
-# of creating a flat file - one write on a descriptor held open, against a
-# create and a rename in the evaluations dir (on RDS, 38 processes: 0.15-0.24
-# against 1.9-2.1 ms, worst 0.01 against 1.2 s). It cuts the records a run
-# holds only in memory 3-11x (round 239's durability gap) at no speed gain:
-# R2D2 -3.1% and -1.0% in two swapped pairs, WSClean +0.2% (round 240), so it
-# is opt-in. O_APPEND keeps concurrent lines whole; the shared lock keeps them
-# out of a pack writer's truncate of a torn last line, which takes it
-# exclusively.
+# A run's writer appends each record to the pack instead of creating a flat
+# file - one write on a descriptor held open, against a create and a rename in
+# the evaluations dir (on RDS, 38 processes: 0.15-0.24 against 1.9-2.1 ms,
+# worst 0.01 against 1.2 s). A kill loses none (rounds 245, 261), and at 113
+# ranks on whole sapphire flat creates convoyed in the MDS (~40x the
+# writer-seconds, load ~200) for +1.9% evals/s, so it is the default (round
+# 264; NS_RECORD_APPEND=0 for the coalescing flat writer). O_APPEND keeps
+# concurrent lines whole; the shared lock keeps them out of a pack writer's
+# truncate of a torn last line, which takes it exclusively.
 _PACK_FDS: dict[str, int] = {}
 
 
 def _append_record(evaluations_dir: Path, line: bytes) -> None:
     import fcntl
 
-    fd = _PACK_FDS.get(str(evaluations_dir))
+    path = evaluations_dir / os.environ.get("NS_RECORD_PACK", RECORD_PACK)
+    fd = _PACK_FDS.get(str(path))
     if fd is None:
-        fd = os.open(evaluations_dir / RECORD_PACK, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
-        _PACK_FDS[str(evaluations_dir)] = fd
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        _PACK_FDS[str(path)] = fd
     fcntl.flock(fd, fcntl.LOCK_SH)
     try:
         written = os.write(fd, line)
         if written != len(line):
-            raise OSError(f"short append to {evaluations_dir / RECORD_PACK}: {written} of {len(line)} bytes")
+            raise OSError(f"short append to {path}: {written} of {len(line)} bytes")
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
@@ -3010,6 +3445,22 @@ def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) ->
     _HELD_SINCE = None
 
 
+def strip_unkept_evaluations(evaluations_dir: Path, named: list[str], keep: set[str]) -> int:
+    """Strip what this rank put on Lustre and the run does not keep, so rank 0
+    finds almost nothing to prune: one 32-thread pool unlinked 64k files of 9.2k
+    dirs in 21s at 430k evaluations, ~6x the 128k figure (csd3-speed.md, round 345).
+
+    `named` is this rank's records still naming an image. Most are extremes it
+    evicted long ago, whose dirs are gone; only a current extreme or one of the
+    1 in NS_KEEP_DETAIL_EVERY can still have one, so only those cost a listing.
+    """
+    extremes = {key for _, key in _LOWEST} | {key for _, key in _HIGHEST}
+    unkept = [name for name in named if name not in keep and (name in extremes or _keeps_detail(name))]
+    for name in unkept:
+        _strip_to_record(evaluations_dir / name)
+    return len(unkept)
+
+
 def _publish_held(held: Path, eval_dir: Path) -> None:
     import shutil
 
@@ -3031,6 +3482,26 @@ def self_check_streaming_retention() -> None:
     import tempfile
 
     global IMAGE_KEEP_ENDS
+    class Comm:  # rank by rank, in rank order, as comm.gather()
+        def __init__(self, rank: int) -> None:
+            self.rank, self.sent = rank, []
+
+        def Get_rank(self) -> int:
+            return self.rank
+
+        def Get_size(self) -> int:
+            return 3
+
+        def send(self, value: Any, dest: int, tag: int) -> None:
+            self.sent.append((value, dest, tag))
+
+        def recv(self, source: int, tag: int) -> str:
+            return f"from {source}"
+
+    assert gather_large(Comm(0), "mine") == ["mine", "from 1", "from 2"]
+    sender = Comm(2)
+    assert gather_large(sender, "mine") is None and sender.sent == [("mine", 0, GATHER_LARGE_TAG)]
+
     saved = IMAGE_KEEP_ENDS, os.environ.get("NS_KEEP_DETAIL_EVERY")
     IMAGE_KEEP_ENDS = 3
     os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
@@ -3112,6 +3583,8 @@ def self_check_streaming_retention() -> None:
                 assert not _HELD and not (held_root.exists() and any(held_root.iterdir()))
                 ordered = sorted(objectives, key=objectives.get)
                 must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
+                if background:  # finished_run_records() strips what the run does not keep
+                    must &= evaluations_keeping_images(records)
                 for key in objectives:
                     if key in must:
                         kept = sorted(p.name for p in (evaluations / key).iterdir())
@@ -3121,6 +3594,16 @@ def self_check_streaming_retention() -> None:
                         assert not (evaluations / key).exists(), key
                     written = _record_reader(evaluations)[1](key)  # flat or appended
                     assert written["objective"] == objectives[key], (key, written)
+
+                # What the run does not keep goes with the rank that wrote it;
+                # a name that is neither an extreme nor kept whole costs no listing.
+                bystander = evaluations / "eval-bystander"
+                bystander.mkdir()
+                assert not _keeps_detail(bystander.name)
+                assert strip_unkept_evaluations(evaluations, [*must, bystander.name], set(ordered[:3])) == len(must - set(ordered[:3]))
+                assert bystander.is_dir()
+                bystander.rmdir()
+                assert all((evaluations / key).is_dir() == (key in ordered[:3]) for key in must), must
 
                 if scratch_root:
                     # Once NS_RETAIN_FLUSH_SECONDS have passed, the next record publishes.
@@ -3673,6 +4156,42 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
         [params[spec["name"]] if spec["name"] in params else math.log10(params["dynamic_range"]) for spec in load_parameter_space()],
         dtype=np.float64,
     )
+
+
+def self_check_abort_on_exception() -> None:
+    """A rank that raises aborts the job; a clean exit does not (round 348)."""
+    global abort_run
+    real, aborts = abort_run, []
+    abort_run = aborts.append
+    try:
+        abort_on_exception(lambda: None)
+        assert aborts == []
+
+        def exits(code: Any) -> None:
+            raise SystemExit(code)
+
+        for code in (None, 0):
+            try:
+                abort_on_exception(lambda: exits(code))
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("a clean SystemExit was swallowed")
+        assert aborts == []
+
+        def fails() -> None:
+            raise RuntimeError("the gather failed")
+
+        abort_on_exception(fails)
+        assert len(aborts) == 1 and "the gather failed" in aborts[0], aborts
+        try:
+            abort_on_exception(lambda: exits("FATAL: bad"))
+        except SystemExit:
+            pass  # abort_run does not return; this fake one does
+        assert aborts[1:] == ["FATAL: bad"], aborts
+    finally:
+        abort_run = real
+    print("abort on exception self-check passed")
 
 
 def self_check_worker_timeout() -> None:
@@ -4354,6 +4873,28 @@ def self_check_evidence_record() -> None:
     assert evidence_record(output) == {"log_z": -12.5, "log_z_err": 0.25, "ndead": 300, "nlike": 4567}
     assert evidence_record(None) is None
     print("evidence record reads log(Z) from PolyChordOutput")
+
+
+def polychord_nfail(nlive: int, ranks: int | None = None) -> int:
+    """PolyChord's consecutive-failed-replacement limit, raised by the workers.
+
+    Its default is nlive, and every async chain still running when the
+    contour passes its seed comes back unplaceable, so with more workers than
+    nlive the first wave alone tripped it: PolyChord stopped after the prior
+    with exit 0 and a meaningless log(Z) (round 337: 4 nodes, 155 workers,
+    nlive 150; round 339: WSClean, nlive 8 on 30 ranks). Below that the guard never fires, so results are unchanged.
+    """
+    if ranks is None:
+        from mpi4py import MPI
+
+        ranks = MPI.COMM_WORLD.Get_size()
+    return nlive + max(ranks - 1, 0)
+
+
+def self_check_polychord_nfail() -> None:
+    assert polychord_nfail(150, 156) == 305
+    assert polychord_nfail(150, 1) == 150
+    print("OK: PolyChord's nfail covers every async worker")
 
 
 def self_check_polychord_finish() -> None:

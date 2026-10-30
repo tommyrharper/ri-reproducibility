@@ -78,7 +78,7 @@ build_meqtrees() {
 
 build_polychord() {
   build_image ri-reproducibility/polychord:lite \
-    "$(inputs_hash "${PLATFORM}" docker/polychord/Dockerfile scripts/lib/nested_sampling)" \
+    "$(inputs_hash "${PLATFORM}" docker/polychord/Dockerfile docker/polychord/patches scripts/lib/nested_sampling)" \
     -f docker/polychord/Dockerfile
 }
 

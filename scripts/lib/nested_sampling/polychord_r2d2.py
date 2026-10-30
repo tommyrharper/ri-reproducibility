@@ -16,10 +16,12 @@ from typing import Any
 import numpy as np
 
 from common import (
+    polychord_nfail,
     DEFAULT_SUPER_RESOLUTION,
     FAILURE_OBJECTIVE,
     WORKER_DIED,
     WorkerDied,
+    abort_on_exception,
     abort_run,
     adopt_completed_evaluations,
     cube_like_from_theta,
@@ -32,6 +34,7 @@ from common import (
     finished_run_records,
     follow_r2d2_worker_node,
     pack_finished_run,
+    encode_finished_records,
     start_record_packer,
     stop_record_packer,
     post_run_line,
@@ -64,6 +67,7 @@ from common import (
     self_check_source_offset,
     self_check_spectral_window,
     self_check_worker_pool_connect,
+    self_check_abort_on_exception,
     self_check_worker_timeout,
     simulate_measurement_set,
     simulate_worker,
@@ -100,6 +104,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric", default="total_rms_jy", help="Objective metric: badness, a raw metric name, or an expression over metric names")
     parser.add_argument("--platform", default=os.environ.get("DOCKER_DEFAULT_PLATFORM", "linux/arm64"))
     return parser.parse_args()
+
+
+def r2d2_iterations(stdout_path: Path) -> int | None:
+    """U-Net forwards this request ran: upstream prints one `RDR:` line per
+    iteration, and `prune: True` stops the series early on the residual, so the
+    count (1-25) follows the image and drifts with the search (round 317)."""
+    try:
+        text = stdout_path.read_text(errors="replace")
+    except OSError:
+        return None
+    return sum(line.startswith("RDR:") for line in text.splitlines()) or None
 
 
 def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> int:
@@ -290,9 +305,64 @@ def evaluate(
             "simulate_seconds": simulate_seconds,
             "image_container_seconds": run_result.wall_seconds,
             "metrics_seconds": metrics_seconds,
+            "r2d2_iterations": r2d2_iterations(r2d2_stdout),
         },
     }
     return write_evaluation_record(eval_dir, record)
+
+
+_STACK_DUMP_FILES: list = []
+
+
+def start_stack_dumps(output_dir: Path) -> None:
+    """NS_STACK_DUMP_S=<s>: every s seconds, this rank's Python stacks, all threads, to stacks/rank-NNN.txt.
+
+    py-spy cannot attach to a rank inside Apptainer (round 323), and a Python
+    sampling thread stops whenever a C call holds the GIL. faulthandler's
+    watchdog is a C thread that needs neither. Its dumps carry no time: dump k
+    is at the header's start + k x s.
+    """
+    every = float(os.environ.get("NS_STACK_DUMP_S") or 0)
+    if every <= 0:
+        return
+    import faulthandler
+
+    stacks = output_dir / "stacks"
+    stacks.mkdir(exist_ok=True)
+    out = open(stacks / f"rank-{mpi_rank():03d}.txt", "a")
+    out.write(f"# start {time.time():.3f} every {every:g}s pid {os.getpid()}\n")
+    out.flush()
+    faulthandler.dump_traceback_later(every, repeat=True, file=out)
+    _STACK_DUMP_FILES.append(out)
+
+
+def self_check_stack_dumps() -> None:
+    import faulthandler
+    import tempfile
+
+    os.environ["NS_STACK_DUMP_S"] = "0.1"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            start_stack_dumps(Path(tmp))
+            time.sleep(0.35)
+            faulthandler.cancel_dump_traceback_later()
+            text = (Path(tmp) / "stacks" / f"rank-{mpi_rank():03d}.txt").read_text()
+            assert text.startswith("# start "), text[:80]
+            assert text.count("Thread 0x") >= 2 and "self_check_stack_dumps" in text, text[:400]
+    finally:
+        os.environ.pop("NS_STACK_DUMP_S")
+        _STACK_DUMP_FILES.pop().close()
+
+
+def self_check_r2d2_iterations() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "r2d2.stdout.log"
+        assert r2d2_iterations(out) is None, "a missing log has no count"
+        out.write_text("RDR: 1.0e-01\nRDR rel. diff: 2.0e-01\nRDR: 8.0e-02\nRDR rel. diff: 2.0e-05\n"
+                       "Imaging finished in 2/25 iterations in 0.5 sec, \n")
+        assert r2d2_iterations(out) == 2, r2d2_iterations(out)
 
 
 def self_check_r2d2_config_thread_cap() -> None:
@@ -494,7 +564,90 @@ def self_check_failure_record_persistence() -> None:
         globals()["simulate_measurement_set"] = original_simulate
 
 
+def share_resume(chains: Path, base_dir: Path, file_root: str, read_resume: bool) -> bool:
+    """Every rank, before run_polychord: make sure this rank sees <root>.resume.
+
+    PolyChord tests `base_dir/<root>.resume` on every rank (resume_file_exists
+    in nested_sampling.F90), and a rank that finds none runs GenerateLivePoints
+    while the root resumes, so the search deadlocks. base_dir is node tmpfs,
+    which only rank 0's ChainsMirror seeds, so with NS_NODES > 1 every resumed
+    attempt hung on the other nodes (round 289). Each rank copies under its own
+    name and renames, so ranks sharing a node never see half a file. The
+    barrier also keeps rank 0's own node from testing before it has seeded.
+    Returns whether base_dir is a copy on another node, to remove at the end."""
+    try:
+        import socket
+
+        from mpi4py import MPI
+    except ImportError:
+        return False
+    comm = MPI.COMM_WORLD
+    off_root = comm.bcast(socket.gethostname(), root=0) != socket.gethostname()
+    if off_root and read_resume and base_dir != chains:
+        seed_resume(chains, base_dir, file_root, comm.Get_rank())
+    comm.Barrier()
+    return off_root and base_dir != chains
+
+
+def seed_resume(chains: Path, base_dir: Path, file_root: str, rank: int) -> None:
+    import shutil
+
+    target = base_dir / f"{file_root}.resume"
+    if not target.exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
+        partial = base_dir / f".{target.name}.{rank}"
+        shutil.copyfile(chains / target.name, partial)
+        partial.replace(target)
+
+
+def self_check_share_resume() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        chains, shm = Path(tmp) / "chains", Path(tmp) / "shm"
+        chains.mkdir()
+        (chains / "r.resume").write_text("checkpoint")
+        # One rank, no other node: nothing to copy and nothing to remove.
+        assert share_resume(chains, shm, "r", True) is False
+        assert not shm.exists()
+        # Another node: a whole copy under the final name, no partial left.
+        seed_resume(chains, shm, "r", 7)
+        assert (shm / "r.resume").read_text() == "checkpoint"
+        assert [p.name for p in shm.iterdir()] == ["r.resume"]
+        # A rank on the same node that comes second keeps the first copy.
+        (chains / "r.resume").write_text("newer")
+        seed_resume(chains, shm, "r", 8)
+        assert (shm / "r.resume").read_text() == "checkpoint"
+
+
+def write_pre_run_marks(marks: dict[str, float]) -> None:
+    """Append each rank phase's slowest and first rank to NS_PRE_RUN_TSV.
+
+    Collective when the launcher set it. The search starts at the slowest
+    rank, which on another node is not rank 0 (round 341).
+    """
+    path = os.environ.get("NS_PRE_RUN_TSV")
+    if not path:
+        return
+    try:
+        from mpi4py import MPI
+
+        gathered = MPI.COMM_WORLD.gather(marks, root=0)
+    except ImportError:
+        gathered = [marks]
+    if mpi_rank() != 0:
+        return
+    lines = "".join(f"{max(m[name] for m in gathered):.3f}\t{name}\t{min(m[name] for m in gathered):.3f}\n"
+                    for name in marks)
+    try:
+        with open(path, "a") as out:
+            out.write(lines)
+    except OSError:
+        pass
+
+
 def main() -> None:
+    marks = {"main": time.time()}
     args = parse_args()
     args.repo_root = str(Path(args.repo_root).resolve())
     if not args.checkpoints_dir:
@@ -511,6 +664,7 @@ def main() -> None:
     # every rank ran this line, so twenty of them raced over one file.
     if mpi_rank() == 0:
         write_json_atomic(output_dir / "parameter-space.json", load_parameter_space())
+    start_stack_dumps(output_dir)
 
     # Start both workers before `import pypolychord`, then join before evaluation.
     warm = prewarm(
@@ -521,6 +675,7 @@ def main() -> None:
     import pypolychord
     from pypolychord.settings import PolyChordSettings
 
+    marks["pypolychord"] = time.time()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
 
     # key -> objective, not key -> record: nothing reads the record back (the
@@ -580,6 +735,7 @@ def main() -> None:
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
+    settings.nfail = polychord_nfail(args.nlive)
     # Checkpoint long runs so interruptions are resumable via `--output-dir`.
     resume_path = output_dir / "chains" / f"{settings.file_root}.resume"
     settings.write_resume = True
@@ -593,19 +749,35 @@ def main() -> None:
                  else "no checkpoint to resume from, re-sampling from the cache")
         print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
+    marks["adopted"] = time.time()
 
     if mpi_rank() == 0:  # one writer: rank 0's mirror seeds tmpfs from it, and another
         # rank's truncating rewrite once seeded an empty file (round 229)
         write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
+    marks["warm"] = time.time()
+    write_pre_run_marks(marks)
     run_start, run_started_epoch = time.monotonic(), time.time()
     write_records_in_background()
     packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
     mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
+    node_copy = share_resume(output_dir / "chains", Path(settings.base_dir), settings.file_root, settings.read_resume)
     finish = PolyChordFinish()
-    output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    try:
+        output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    except FileNotFoundError:
+        # pypolychord reads <root>.stats on every rank once the run is over, and
+        # across nodes (NS_NODES) a rank off the root's node has no copy of its
+        # tmpfs chains; only rank 0 uses the output (docs/csd3-speed.md, round 287).
+        if mpi_rank() == 0 or (Path(settings.base_dir) / f"{settings.file_root}.stats").exists():
+            raise
+        output = None
     total_wall_seconds = time.monotonic() - run_start
     finish.close()
+    if node_copy:
+        import shutil
+
+        shutil.rmtree(settings.base_dir, ignore_errors=True)
     if mirror is not None:
         mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
     stop_record_packer(packer)
@@ -664,9 +836,10 @@ def main() -> None:
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
-        write_json_atomic(summary_path, summary)
+        encoded = encode_finished_records()
+        write_json_atomic(summary_path, summary, list(encoded.values()))
         started = post_run_phase("summary", started)
-        pack_finished_run(evaluations_dir)
+        pack_finished_run(evaluations_dir, encoded)
         post_run_phase("pack", started)
         print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
@@ -681,15 +854,19 @@ if __name__ == "__main__":
         self_check_spectral_window()
         self_check_lazy_numpy()
         self_check_r2d2_config_thread_cap()
+        self_check_r2d2_iterations()
+        self_check_stack_dumps()
         self_check_source_offset()
         self_check_profiling()
         self_check_evidence_record()
         self_check_failure_record_persistence()
         self_check_worker_death_is_not_scored()
         self_check_resume_adoption()
+        self_check_abort_on_exception()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
         self_check_follow_worker_node()
+        self_check_share_resume()
         print("metric resolution self-check passed")
     else:
-        main()
+        abort_on_exception(main)

@@ -101,6 +101,15 @@ or `chains/` is `Not a nested-sampling run` rather than a status - every status
 above is decided by an absence, which is also what an unrelated directory looks
 like. `./ri runs` skips the same directories.
 
+## Where a rank is stuck
+
+`py-spy` cannot attach to a rank inside Apptainer ("Permission Denied"). For
+an R2D2 search, `NS_STACK_DUMP_S=<s>` makes every rank write its Python stacks
+(all threads) to `<run>/stacks/rank-NNN.txt` every `s` seconds, through
+`faulthandler`, which needs no GIL and so still dumps a rank stuck in C. Dump
+`k` is at the header's `start` + `k` x `s`. It adds one Lustre file per rank,
+so leave it off for production searches.
+
 ## Warnings
 
 The headline carries the warning count, because under `--all` it is the only

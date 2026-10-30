@@ -109,6 +109,17 @@ ns_run_process_pattern() {
   printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
 }
 
+# Kill `$1`'s processes on this node, except srun. A multi-node search's ranks
+# are one srun step started with --kill-on-bad-exit: left alive, srun sees its
+# rank die and ends the step on every node within seconds, but an srun killed
+# with its ranks never does, and the other nodes' ranks outlive it (round 322).
+ns_kill_run_ranks() {
+  local pid
+  for pid in $(pgrep -f "$(ns_run_process_pattern "$1")"); do
+    [ "$(ps -o comm= -p "${pid}" 2>/dev/null)" = srun ] || kill -9 "${pid}" 2>/dev/null || true
+  done
+}
+
 # On a cluster the ranks are on a compute node whose processes the login node
 # cannot see, so a run is also live while a Slurm job named after it (slurm.sh)
 # is queued or running - other than the job asking, which is the run itself.
@@ -361,6 +372,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     || { echo "FAIL: a worker that has just exec'd was read as a pool"; exit 1; }
   [ -z "$(_ns_pool_row 4242 'python3 /opt/s.py --serve --fifo /r/run-1/.simulate-workers/3')" ] \
     || { echo "FAIL: a worker's FIFO path was read as a pool"; exit 1; }
+  # A multi-node pool serves `.<pool>-workers/<host>`, and its run's
+  # .launcher.pid is a pid on the first node, so on any other node it would
+  # read as dead and the live pool would be reaped (round 289).
+  [ -z "$(_ns_pool_row 4242 'sh -c loop sh /r/run-1/.r2d2-workers/cpu-q-126')" ] \
+    || { echo "FAIL: a multi-node pool was read as a reapable pool"; exit 1; }
 
   # The orphaned run: launcher pid gone, run directory that still has ranks.
   # Reaping these is what would kill the search - so a live run wins over the
@@ -400,6 +416,20 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     && { echo "FAIL: another run's job must not make this one live"; exit 1; }
   PATH="${_orphan_dir}/bin:${PATH}" SLURM_JOB_ID=4242 ns_run_is_live "${_orphan_run}" \
     && { echo "FAIL: the run's own job must not count as a rival"; exit 1; }
+
+  # The kill takes the run's ranks and spares its srun, which has to live to
+  # end the step on the other nodes.
+  ln -s "$(command -v sleep)" "${_orphan_dir}/bin/srun"
+  bash -c 'exec -a "polychord_r2d2.py --output-dir $1" sleep 60' sh "${_orphan_run}" &
+  _rank_pid=$!
+  bash -c 'exec -a "srun -n 2 polychord_r2d2.py --output-dir $1" "$2" 60' sh "${_orphan_run}" "${_orphan_dir}/bin/srun" &
+  _srun_pid=$!
+  sleep 0.5
+  ns_kill_run_ranks "${_orphan_run}"
+  wait "${_rank_pid}" 2>/dev/null || true
+  kill -0 "${_rank_pid}" 2>/dev/null && { echo "FAIL: ns_kill_run_ranks left a rank"; kill "${_rank_pid}" "${_srun_pid}"; exit 1; }
+  kill -0 "${_srun_pid}" 2>/dev/null || { echo "FAIL: ns_kill_run_ranks killed srun"; exit 1; }
+  kill "${_srun_pid}"; wait "${_srun_pid}" 2>/dev/null || true
   rm -rf "${_orphan_dir}"
 
   # Shared memory is paid once: 40960 - 4096 headroom - 8000 shared = 28864,

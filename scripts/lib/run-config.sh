@@ -35,6 +35,10 @@ write_run_config() {
     printf 'NS_STALL_TIMEOUT=%q\n' "${NS_STALL_TIMEOUT}"
     printf 'NS_SYNCHRONOUS=%q\n' "${NS_SYNCHRONOUS}"
     printf 'NS_KEEP_MEASUREMENT_SETS=%q\n' "${NS_KEEP_MEASUREMENT_SETS}"
+    # Opt-in contour adoption (round 312); a resume keeps the same sampler.
+    if [ -n "${NS_ADOPT_CONTOUR:-}" ]; then
+      printf 'NS_ADOPT_CONTOUR=%q\n' "${NS_ADOPT_CONTOUR}"
+    fi
     printf 'NS_IMAGER_IMAGE_ID=%q\n' "${imager_image_id}"
     printf 'NS_MEQTREES_IMAGE_ID=%q\n' "${meqtrees_image_id}"
     printf 'NS_POLYCHORD_IMAGE_ID=%q\n' "${polychord_image_id}"
@@ -50,6 +54,10 @@ write_run_config() {
     if [ "${algorithm}" = r2d2 ]; then
       printf 'R2D2_DEVICE=%q\n' "${R2D2_DEVICE:-cpu}"
       printf 'R2D2_RUNTIME=%q\n' "${R2D2_RUNTIME:-torch}"
+      # A multi-node search (round 287) resumes on as many nodes.
+      if [ "${NS_NODES:-1}" -gt 1 ]; then
+        printf 'NS_NODES=%q\n' "${NS_NODES}"
+      fi
       if [ -n "${R2D2_TRT_SHARED:-}" ]; then
         printf 'R2D2_TRT_SHARED=%q\n' "${R2D2_TRT_SHARED}"
       fi
@@ -220,7 +228,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   _dir="$(mktemp -d)"
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=2 \
     NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 R2D2_INTEROP_THREADS=1 R2D2_MAX_THREADS=16 \
-    NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 NS_IMAGE_DIM=96 \
+    NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 NS_IMAGE_DIM=96 NS_NODES=2 \
     write_run_config "${_dir}" r2d2
   (
     set -a
@@ -234,6 +242,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${R2D2_OMP_THREADS}" = 2 ]
     [ "${R2D2_INTEROP_THREADS}" = 1 ]
     [ "${R2D2_MAX_THREADS}" = 16 ]
+    [ "${NS_NODES}" = 2 ]
     [ "${NS_STALL_TIMEOUT}" = 3600 ]
     [ "${NS_SYNCHRONOUS}" = 1 ]
     [ "${NS_KEEP_MEASUREMENT_SETS}" = 1 ]
@@ -247,6 +256,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
     NS_WSCLEAN_MGAIN=0.9 NS_WSCLEAN_NITER=250 NS_IMAGE_DIM=64 \
     write_run_config "${_dir}" wsclean
+  grep -q NS_NODES "${_dir}/run.env" && {
+    echo "FAIL: a single-node run.env names NS_NODES"; exit 1
+  }
   grep -qx 'NS_IMAGE_DIM=64' "${_dir}/run.env" || {
     echo "FAIL: NS_IMAGE_DIM not recorded in run.env"; exit 1
   }

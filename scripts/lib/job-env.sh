@@ -280,7 +280,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       PATH="${_tmp}/ok/bin:/usr/bin:/bin" ri_job_env_check >/dev/null 2>&1 \
         && { echo "FAIL: a binary carrying Nix store paths must fail the check"; exit 1; }
       rm "${_tmp}/ok/bin/gcc" "${_tmp}/ok/bin/python3"
-      env -u NS_SCRATCH_DIR PATH=/usr/bin:/bin bash -c ". '${BASH_SOURCE[0]}'; REPO_ROOT_PHYS='${_tmp}/repo' ri_job_env_check" >/dev/null \
+      # Emptied as the job's is: the caller's own exports (a Nix shell's
+      # LOCALE_ARCHIVE, say) are not the base OS.
+      env -i PATH=/usr/bin:/bin RI_JOB_FORBIDDEN="${RI_JOB_FORBIDDEN}" \
+        RI_JOB_REQUIRED_TOOLS="${RI_JOB_REQUIRED_TOOLS}" RI_JOB_CHECK_PYTHON=0 \
+        /bin/bash -c ". '${BASH_SOURCE[0]}'; REPO_ROOT_PHYS='${_tmp}/repo' ri_job_env_check" >/dev/null \
         || { echo "FAIL: the base OS alone must pass the check"; exit 1; }
 
       # Settings: only the run's knobs, directories as physical paths.

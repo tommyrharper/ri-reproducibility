@@ -61,6 +61,12 @@ check(
 )
 
 check(
+    "search --nodes reaches the run script",
+    {"NS_NODES": "2"},
+    plan("search", "r2d2", "--nodes", "2")[0],
+)
+
+check(
     "search --mgain reaches the run script",
     {"NS_WSCLEAN_MGAIN": "0.9"},
     plan("search", "wsclean", "--mgain", "0.9")[0],

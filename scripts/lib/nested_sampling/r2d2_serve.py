@@ -94,11 +94,47 @@ def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
             raise ValueError(f'Checkpoint conflict for N{i+1}')
         paths.append(dnn[0])
 
+    weights = checkpoint_weights_dir(ckpt_path)
+
     def load(path):
-        return torch.load(path, map_location=torch.device('cpu'), weights_only=False)['state_dict']
+        cached = weights / os.path.basename(path) if weights else None
+        if cached is not None and cached.exists():
+            return torch.load(cached, map_location=torch.device('cpu'), weights_only=True)
+        state_dict = torch.load(path, map_location=torch.device('cpu'), weights_only=False)['state_dict']
+        if cached is not None:
+            partial = cached.with_suffix(f'.{os.getpid()}.tmp')
+            try:
+                torch.save(state_dict, partial)
+                partial.replace(cached)
+            except OSError:
+                partial.unlink(missing_ok=True)  # a full quota: the next pool tries again
+        return state_dict
 
     with ThreadPoolExecutor(max(1, min(4, len(paths)))) as pool:
         return {f'N{i+1}': state_dict for i, state_dict in enumerate(pool.map(load, paths))}
+
+
+def checkpoint_weights_dir(ckpt_path) -> Path | None:
+    """Where a CPU onnx pool keeps each checkpoint's state_dict alone, or None.
+
+    A Lightning checkpoint is half optimiser state (248 MB, 124 MB of it
+    weights), and a cold pool on a new node reads all 6.2 GB off Lustre
+    before its first request (docs/csd3-speed.md, round 257). Keyed like the
+    exported models, by the checkpoints' names, sizes and mtimes.
+    """
+    if r2d2_device() != "cpu" or r2d2_runtime() != "onnx" or not ONNX_DIR.is_dir():
+        return None
+    import hashlib
+
+    ckpt_path = Path(ckpt_path)
+    stats = sorted((p.name, p.stat().st_size, int(p.stat().st_mtime)) for p in ckpt_path.glob("*.ckpt"))
+    key = hashlib.sha1(repr((str(ckpt_path), stats)).encode()).hexdigest()[:16]
+    weights = ONNX_DIR / "weights" / key
+    try:
+        weights.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return weights
 
 
 def patch_checkpoint_loading() -> None:
@@ -237,6 +273,14 @@ ONNX_DIR = Path(os.environ.get("R2D2_ONNX_DIR", "/opt/r2d2-onnx"))
 # with per-node checkpoints, one such set per NUMA node.
 _ORT_SESSIONS: dict[int, object] = {}
 _NODE_ORT_SESSIONS: dict[int, dict[int, object]] = {}
+# For requests on more than one thread (round 258): per iteration, the
+# optimised graph without its weights and the weights as 64-byte-aligned
+# arrays, made in the pool parent (per NUMA node, like the sessions) so a
+# worker's multi-thread sessions share them. A pool thread does not survive
+# fork, so those sessions are built in the worker and kept.
+_ORT_SHARED: dict[int, tuple] = {}
+_NODE_ORT_SHARED: dict[int, dict[int, tuple]] = {}
+_ORT_THREADED: dict[tuple[int, int], object] = {}
 
 
 class OrtNet:
@@ -314,6 +358,9 @@ def prefetch_weights() -> int:
         import concurrent.futures
 
         files = sorted(Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1")).glob("*.ckpt"))
+        weights = checkpoint_weights_dir(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
+        if weights is not None:
+            files = [weights / path.name if (weights / path.name).exists() else path for path in files]
         if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
             files += sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
 
@@ -341,9 +388,13 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     exported once to `ONNX_DIR/models/<key>/N<i>.onnx`, with height and width dynamic,
     and its session built here, before the fork: one intra-op thread starts no
     pool threads, so it survives the fork and every worker shares its pages.
-    A request running more than one torch thread (the tail of an async run)
-    keeps torch, which threads; so does R3D3 (layers > 1).
+    A request running more than one torch thread (the tail of an async run,
+    or R2D2_OMP_THREADS > 1) gets a session of that many threads built in the
+    worker over the parent's weights (threaded_session, round 258); R3D3
+    (layers > 1) keeps torch.
     """
+    import concurrent.futures
+
     import torch
 
     models = export_onnx(checkpoint_path)
@@ -386,8 +437,26 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
             pass
         return built
 
-    def build() -> dict[int, object]:
-        return {cur_iter: session(cur_iter) for cur_iter in range(1, num_iter + 1)}
+    iters = range(1, num_iter + 1)
+    # Only a run whose requests can take more than one thread (async, or
+    # R2D2_OMP_THREADS > 1) pays the arrays' memory, ~2.9GB per set.
+    threaded = max(int(os.environ.get(name) or 1) for name in ("R2D2_OMP_THREADS", "R2D2_MAX_THREADS")) > 1
+
+    def build() -> tuple[dict[int, object], dict[int, tuple]]:
+        sessions = {}
+        if not threaded or not all((optimised / f"N{cur_iter}.onnx").exists() for cur_iter in iters):
+            sessions = {cur_iter: session(cur_iter) for cur_iter in iters}  # saves the optimised graphs
+        if not threaded:
+            return sessions, {}
+        # A fresh pool per set: its threads take the caller's NUMA policy as
+        # they start. The weights' copy and alignment release the GIL, so 8
+        # threads take 1.4s against 2.5s (round 272).
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            shared = dict(zip(iters, pool.map(lambda cur_iter: ort_shared_parts(optimised / f"N{cur_iter}.onnx"), iters)))
+        # The 1-thread sessions over those arrays too: bit-identical, as fast,
+        # 0.3s against 1.9s for 25 file loads and one copy of the weights, not
+        # two: first request 8.5 -> 5.7s in a search (rounds 272, 274).
+        return sessions or {cur_iter: parts_session(shared[cur_iter], 1) for cur_iter in iters}, shared
 
     # Where the torch checkpoints went, the sessions' weights go too: a set
     # per NUMA node when load_checkpoints made one (enter_node swaps it in),
@@ -396,15 +465,18 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
         for node in _NODE_CHECKPOINTS:
             bound = set_mempolicy(2, [node])  # MPOL_BIND
             try:
-                _NODE_ORT_SESSIONS[node] = build()
+                _NODE_ORT_SESSIONS[node], _NODE_ORT_SHARED[node] = build()
             finally:
                 if bound:
                     set_mempolicy(0, [])
         # Like _CHECKPOINT_CACHE, the parent keeps the last node's set.
         _ORT_SESSIONS.update(_NODE_ORT_SESSIONS[node])
+        _ORT_SHARED.update(_NODE_ORT_SHARED[node])
     else:
         with interleaved_pages():
-            _ORT_SESSIONS.update(build())
+            sessions, shared = build()
+            _ORT_SESSIONS.update(sessions)
+            _ORT_SHARED.update(shared)
 
     optimiser = sys.modules["optimiser.R2D2"]
     upstream_load_net = optimiser.load_net
@@ -412,14 +484,78 @@ def patch_onnx_network(checkpoint_path: Path) -> None:
     def load_net(net, cur_iter, layers, dnn_dict):
         if isinstance(net, OrtNet):
             net = net.torch_net
-        session = _ORT_SESSIONS.get(int(cur_iter))
-        if layers != 1 or session is None or torch.get_num_threads() > 1:
+        threads = torch.get_num_threads()
+        session = _ORT_SESSIONS.get(int(cur_iter)) if threads == 1 else threaded_session(int(cur_iter), threads)
+        if layers != 1 or session is None:
             return upstream_load_net(net, cur_iter, layers, dnn_dict)
         wrapper = OrtNet(session)
         wrapper.torch_net = net
         return wrapper
 
     optimiser.load_net = load_net
+
+
+def ort_shared_parts(path: Path) -> tuple:
+    """`path`'s graph with its weights declared external, and the weights as aligned OrtValues."""
+    import numpy as np
+    import onnx
+    import onnxruntime as ort
+    from onnx import numpy_helper
+
+    def aligned(array):
+        # numpy's 16-byte alignment costs MLAS 15% at 1 thread; 64 matches a file-loaded session.
+        buffer = np.empty(array.nbytes + 64, np.uint8)
+        offset = -buffer.ctypes.data % 64
+        out = buffer[offset:offset + array.nbytes].view(array.dtype).reshape(array.shape)
+        out[...] = array
+        return out
+
+    model = onnx.load(str(path))
+    names, values = [], []
+    for tensor in model.graph.initializer:
+        names.append(tensor.name)
+        values.append(ort.OrtValue.ortvalue_from_numpy(aligned(numpy_helper.to_array(tensor))))
+        for field in ("raw_data", "float_data", "int32_data", "int64_data", "double_data"):
+            tensor.ClearField(field)
+        tensor.data_location = onnx.TensorProto.EXTERNAL
+        entry = tensor.external_data.add()
+        entry.key, entry.value = "location", "shared"
+    return model.SerializeToString(), names, values
+
+
+def threaded_session(cur_iter: int, threads: int):
+    """A `threads`-thread session over the parent's weights, or None (no shared parts).
+
+    ORT's output is bit-identical at 1-16 intra-op threads, and at 2 threads
+    its forward takes 9.2ms against torch's 16.5ms (round 258). add_initializer
+    uses the arrays in place: 25 sessions build in 0.34s for ~0.25GB. An
+    async tail changes the count request by request, so it is floored to a
+    power of two and every count's sessions are kept: at most four sets.
+    """
+    parts = _ORT_SHARED.get(cur_iter)
+    if parts is None:
+        return None
+    threads = 1 << (threads.bit_length() - 1)
+    session = _ORT_THREADED.get((cur_iter, threads))
+    if session is None:
+        session = _ORT_THREADED[(cur_iter, threads)] = parts_session(parts, threads)
+    return session
+
+
+def parts_session(parts: tuple, threads: int):
+    """A `threads`-thread session over `ort_shared_parts`' arrays, used in place."""
+    import onnxruntime as ort
+
+    graph, names, values = parts
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = threads
+    options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.enable_cpu_mem_arena = False
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    for name, value in zip(names, values):
+        options.add_initializer(name, value)
+    return ort.InferenceSession(graph, options, providers=["CPUExecutionProvider"])
 
 
 # Where the run script binds tensorrt-cu13 and the GPU's plans (R2D2_RUNTIME=trt).
@@ -749,14 +885,15 @@ def serve_trt_shared(socks: list, dim: int) -> None:
         thread.join()
 
 
-def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> None:
+def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward, launches: dict | None = None) -> None:
     """Serve workers' forward requests in batches: one reader thread, `lanes` threads running batches.
 
     The reader queues each request by net; a free lane takes up to `batch` of
     the net with most waiting and calls forward(lane, cur_iter, requests),
     which returns each request's output bytes, or None if it cannot run that
     net (each worker is then answered with the bare header and runs it on the
-    CPU). Returns once every worker's socket has closed.
+    CPU). Returns once every worker's socket has closed. `launches`, if
+    given, counts the batches run by size.
     """
     import selectors
     import threading
@@ -811,6 +948,8 @@ def gather_forwards(socks: list, size: int, batch: int, lanes: int, forward) -> 
                 group, pending[cur_iter] = pending[cur_iter][:batch], pending[cur_iter][batch:]
                 if not pending[cur_iter]:
                     del pending[cur_iter]
+                if launches is not None:
+                    launches[len(group)] = launches.get(len(group), 0) + 1
             try:
                 outputs = forward(lane, cur_iter, [request for _, request in group])
             except Exception:
@@ -843,6 +982,7 @@ def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
     (round 224).
     """
     import concurrent.futures
+    import threading
 
     import numpy as np
     import torch
@@ -902,7 +1042,39 @@ def serve_trt_gathered(socks: list, dim: int, batch: int) -> None:
     with open(os.environ.get("R2D2_TRT_STATUS", os.devnull), "a") as status:
         status.write(f"shared: one server, {len(socks)} workers gathered into batches of up to {batch} "
                      f"on {len(lanes)} lanes\n")
-    gather_forwards(socks, size, batch, len(lanes), forward)
+    # Batches form only among workers at the same R2D2 iteration, so the size
+    # they reach is what the card's batching buys; r2d2-trt-batches.txt says
+    # (bench rows carry its mean as trt_mean_batch).
+    launches: dict[int, int] = {}
+    if os.environ.get("R2D2_TRT_STATUS"):
+        report = Path(os.environ["R2D2_TRT_STATUS"]).with_name("r2d2-trt-batches.txt")
+        threading.Thread(target=report_launches, args=(report, launches), daemon=True).start()
+    gather_forwards(socks, size, batch, len(lanes), forward, launches)
+    if os.environ.get("R2D2_TRT_STATUS"):
+        try:
+            write_launches(report, launches)
+        except OSError:
+            pass
+
+
+def write_launches(path: Path, launches: dict) -> None:
+    """One line: launches, forwards, their mean batch and the count at each size."""
+    counts = dict(launches)
+    runs = sum(counts.values())
+    forwards = sum(size * n for size, n in counts.items())
+    sizes = " ".join(f"{size}:{counts[size]}" for size in sorted(counts))
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(f"launches {runs} forwards {forwards} mean {forwards / max(runs, 1):.3f} sizes {sizes}\n")
+    os.replace(temporary, path)
+
+
+def report_launches(path: Path, launches: dict) -> None:
+    while True:
+        time.sleep(30)
+        try:
+            write_launches(path, launches)
+        except (OSError, RuntimeError):  # RuntimeError: a new size added mid-copy
+            pass
 
 
 def job_numa_cpus() -> dict[int, list[int]]:
@@ -1018,6 +1190,8 @@ def enter_node(node: int, nodes: dict[int, list[int]]) -> None:
     if node in _NODE_ORT_SESSIONS:
         _ORT_SESSIONS.clear()
         _ORT_SESSIONS.update(_NODE_ORT_SESSIONS[node])
+        _ORT_SHARED.clear()
+        _ORT_SHARED.update(_NODE_ORT_SHARED.get(node, {}))
 
 
 def warm_imports() -> None:
@@ -1924,6 +2098,22 @@ def self_check_checkpoint_series() -> None:
         assert list(loaded) == [f"N{i}" for i in range(1, 7)], list(loaded)
         for i in range(1, 7):
             assert torch.equal(loaded[f"N{i}"]["unet.w"], torch.full((3,), float(i)))
+        # A CPU onnx pool writes each state_dict alone once, then reads that (round 257).
+        global ONNX_DIR
+        onnx_dir, runtime = ONNX_DIR, os.environ.get("R2D2_RUNTIME")
+        with tempfile.TemporaryDirectory() as cache:
+            ONNX_DIR, os.environ["R2D2_RUNTIME"] = Path(cache), "onnx"
+            try:
+                assert all(torch.equal(load_checkpoint_series(6, tmp)[name]["unet.w"], loaded[name]["unet.w"])
+                           for _ in range(2) for name in loaded)
+                written = sorted(p.name for p in checkpoint_weights_dir(tmp).iterdir())
+                assert written == [f"R2D2_UNet_N{i}.ckpt" for i in range(1, 7)], written
+            finally:
+                ONNX_DIR = onnx_dir
+                if runtime is None:
+                    os.environ.pop("R2D2_RUNTIME")
+                else:
+                    os.environ["R2D2_RUNTIME"] = runtime
         for num_iter, message in ((7, "Checkpoint for N7 not found"), (6, "Checkpoint conflict for N2")):
             if num_iter == 6:
                 torch.save({"state_dict": {}}, Path(tmp) / "copy_N2.ckpt")
@@ -1934,6 +2124,50 @@ def self_check_checkpoint_series() -> None:
             else:
                 raise AssertionError(f"no {message!r}")
     print("r2d2 checkpoint series self-check passed")
+
+
+def self_check_threaded_session() -> None:
+    """A multi-thread session over shared weights matches a file-loaded one bit for bit."""
+    try:
+        import numpy as np
+        import onnx
+        import onnxruntime as ort
+        from onnx import helper, numpy_helper
+    except ImportError:  # r2d2.sif without the run script's onnxruntime
+        print("threaded_session: skipped, no onnxruntime")
+        return
+    import tempfile
+
+    rng = np.random.default_rng(0)
+    weight = numpy_helper.from_array(rng.standard_normal((8, 2, 3, 3)).astype(np.float32), "w")
+    graph = helper.make_graph([helper.make_node("Conv", ["x", "w"], ["y"], pads=[1, 1, 1, 1])], "g",
+                              [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 2, 32, 32])],
+                              [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, None)], [weight])
+    x = rng.standard_normal((1, 2, 32, 32)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "N1.onnx"
+        onnx.save(helper.make_model(graph, ir_version=8, opset_imports=[helper.make_opsetid("", 17)]), str(path))
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = options.inter_op_num_threads = 1
+        # As patch_onnx_network loads its saved optimised graphs.
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        expected = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+        _ORT_SHARED.clear()
+        _ORT_THREADED.clear()
+        try:
+            assert threaded_session(1, 2) is None
+            _ORT_SHARED[1] = ort_shared_parts(path)
+            # The pool's own 1-thread sessions are built this way in async runs.
+            assert np.array_equal(parts_session(_ORT_SHARED[1], 1).run(None, {"x": x})[0], expected)
+            for threads in (2, 3, 4):
+                session = threaded_session(1, threads)
+                assert threaded_session(1, threads) is session
+                assert np.array_equal(session.run(None, {"x": x})[0], expected)
+            assert list(_ORT_THREADED) == [(1, 2), (1, 4)]  # 3 runs on 2
+        finally:
+            _ORT_SHARED.clear()
+            _ORT_THREADED.clear()
+    print("threaded_session: ok")
 
 
 def self_check_net_reuse() -> None:
@@ -2031,6 +2265,7 @@ def self_check_trt_gathered() -> None:
     """Gathered forwards reach the right worker, in batches no larger than asked, and the server ends."""
     import array
     import socket
+    import tempfile
     import threading
 
     dim, batch, workers, nets = 2, 4, 9, 5
@@ -2050,7 +2285,9 @@ def self_check_trt_gathered() -> None:
         return [array.array("f", [v * cur_iter for v in array.array("f", request[_TRT_HEADER.size:])[:dim * dim]]
                             ).tobytes() for request in requests]
 
-    server = threading.Thread(target=gather_forwards, args=([b for _, b in pairs], size, batch, 2, forward), daemon=True)
+    launches: dict[int, int] = {}
+    server = threading.Thread(target=gather_forwards, args=([b for _, b in pairs], size, batch, 2, forward, launches),
+                              daemon=True)
     server.start()
     failures = []
 
@@ -2082,6 +2319,11 @@ def self_check_trt_gathered() -> None:
     assert sum(batches) == workers * 3 * (nets - 1), batches
     assert max(batches) <= batch, batches
     assert max(batches) > 1, f"nothing was gathered: {batches}"
+    # Launches count every batch, the net the server cannot run included.
+    assert sum(launches.values()) >= len(batches) and sum(k * n for k, n in launches.items()) == workers * 3 * nets
+    with tempfile.TemporaryDirectory() as tmp:
+        write_launches(Path(tmp, "r2d2-trt-batches.txt"), {1: 2, 4: 1})
+        assert Path(tmp, "r2d2-trt-batches.txt").read_text() == "launches 3 forwards 6 mean 2.000 sizes 1:2 4:1\n"
     print(f"r2d2 trt gathered self-check passed (mean batch {sum(batches) / len(batches):.1f})")
 
 
@@ -2154,6 +2396,7 @@ if __name__ == "__main__":
         self_check_lazy_utils()
         self_check_checkpoint_cache()
         self_check_checkpoint_series()
+        self_check_threaded_session()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()

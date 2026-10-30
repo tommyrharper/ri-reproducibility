@@ -5,7 +5,169 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 215; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 349; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+
+- **Target size reached.** Two converged searches at `docs/cluster.md`'s
+  `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
+  minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
+  0.2 sigma. The surprise was 20 s of the end of the run
+  ([round 344](#round-344-the-target-size-search-converges-in-20-minutes-on-8-nodes-prune-is-the-end-of-runs-biggest-phase)).
+  A third run lost its end of run to a 2 GiB limit in `comm.gather`, now fixed
+  ([round 345](#round-345-fix-the-records-gather-failed-past-2-gib-at-the-target-size-ranks-now-strip-what-the-run-does-not-keep)).
+- **Rounds 266-303 in brief.** The 22 Sep production search, run to
+  convergence as its own 1-node icelake job on round 299's tree, gives
+  log(Z) 0.0172602 +/- 0.00040 (within 0.25 sigma of rounds 239 and 278)
+  at **60.2 evals/s (62.8 steady)** in 21 minutes
+  ([round 302](#round-302-validation-rounds-287-299-in-the-production-search-logz-agrees-602-evalss)).
+  That beats round 205's "~53 evals/s ceiling" with no change to the
+  U-Net path: the request fell from 763 to 598 ms because the node was
+  nearly idle. The ~53 was a busy-node estimate, not a hard limit, so
+  absolute evals/s across nodes says nothing about a change; only raced
+  A/Bs do. Simulate (MeqTrees) is 29 ms of a ~630 ms evaluation (~5%).
+  - **Multi-node** is the lever left for wall time on CPU.
+    `./ri search r2d2 --nodes N` runs one search over N nodes, with one pool
+    set, scratch and record pack per node. Two icelake nodes converge
+    round 278's search in 790 s against 1,586 s (99.1 evals/s, 94% per
+    node), with log(Z) agreeing
+    ([round 288](#round-288-measurement-two-nodes-run-a-converged-r2d2-search-in-half-the-time)).
+    PolyChord needs ~0.41 x workers live points' worth more evaluations to
+    converge, whatever nlive is, so time to converge goes as
+    nlive/workers + 0.41 and a bigger `--nlive` never buys speed
+    ([round 293](#round-293-measurement-more-ranks-per-live-point-cost-polychord-evaluations-4-node-scaling-corrected),
+    [round 307](#round-307-analysis-guidance-fix-the-async-overhead-is-a-fixed-04-x-workers-live-points-so-a-bigger-nlive-never-buys-speed)).
+    The extra dead points buy no measured precision either
+    ([round 308](#round-308-measurement-the-async-overheads-extra-dead-points-buy-no-measured-precision)).
+    82-88% of the overhead is chains that come back below the contour the
+    other workers have since raised
+    ([round 311](#round-311-diagnostic-most-of-async-polychords-overhead-is-chains-that-return-below-the-contour);
+    its toy was synchronous, and async waste is ~2x larger). A PolyChord
+    patch where workers adopt the newest contour mid-chain cuts a toy's
+    evaluations 14% at 38 workers and 22% at 76 with unbiased log(Z). It is
+    opt-in (`NS_ADOPT_CONTOUR=1`, on a polychord.sif with the patch)
+    ([round 312](#round-312-a-polychord-patch-that-adopts-the-newest-contour-mid-chain-cuts-async-evaluations-14-38-workers-and-22-76-with-unbiased-logz)).
+    In the converged production R2D2 search it agrees on log(Z) (+0.15
+    sigma) with 11% fewer dead points but only ~6% fewer evaluations, one
+    run ([round 313](#round-313-the-contour-patch-in-a-converged-r2d2-search-logz-agrees-dead-points--11-evaluations--6-one-run)).
+    Three raced seeds settle it at **-4.0% evaluations** (-7.2/-0.4/-4.4%),
+    dead points -11.9%, log(Z) agreeing (-0.09/-0.24/-0.41 sigma): R2D2's
+    chains cost 9% more each under adoption, which the toy's never did,
+    even with plateaus, two modes or 9x-varying evaluation time. Opt-in
+    only; whether to default it is the user's call
+    ([round 315](#round-315-the-contour-patch-saves-4-of-r2d2-evaluations-over-3-raced-seeds-not-the-toys-14)). The extra cost is R2D2's:
+    its calls per slice step rise ~3x as the contour climbs (the toy's are
+    flat), so a chain on an adopted, higher contour pays more per step; no
+    slice-width fix can recover it
+    ([round 316](#round-316-diagnostic-adopted-r2d2-chains-cost-more-because-r2d2s-cost-per-slice-step-rises-with-the-contour)).
+    On two nodes (77 workers) it pays far more: **-22.2% evaluations and
+    -19.3% wall** over three raced seeds, log(Z) -0.05/+0.10/+0.31 sigma,
+    because stock wastes 27% of dead points there and adopted chains get
+    cheaper, not dearer. 2 nodes then converge 1.96x faster than one,
+    against 1.58x stock. Still opt-in; defaulting it is the user's call
+    ([round 336](#round-336-on-two-nodes-the-contour-patch-cuts-r2d2-evaluations-22-and-wall-time-19-logz-agreeing)).
+    On four nodes (155 workers, three seeds) it is -24.1% evaluations and
+    -23.3% wall, converging 3.55x faster than one node (stock 2.72x)
+    ([round 338](#round-338-4-node-contour-ab-complete-three-seeds--24-evaluations-a-clean-exit-0-early-stop-is-now-flagged)).
+    On eight nodes (311 workers, two seeds) stock converges 4.37x faster
+    than one node and the patch 5.72x (-26.0% evaluations, -23.6% wall);
+    8 nodes are only ~1.6x faster than 4 at nlive 150
+    ([round 339](#round-339-8-nodes-converge-44x-stock-and-57x-contour-patch-faster-than-one-wsclean-gets-the-nfail-fix)). Searches with more workers
+    than nlive were impossible before round 337: PolyChord's `nfail` guard
+    stopped them after the prior with exit 0
+    ([round 337](#round-337-fix-multi-node-with-more-workers-than-nlive-polychord-stopped-after-the-prior-exit-0-meaningless-logz)).
+    A converged search slows ~12% mid-run because R2D2's early stop
+    (`prune: True`) runs more U-Net iterations as the posterior moves to
+    costlier images (18.6 -> 20.9 -> 22.8), at a flat ~37 ms an iteration;
+    bench rows carry `r2d2_iterations`, so compare arms per iteration
+    ([round 317](#round-317-diagnostic--tooling-r2d2s-early-stop-not-the-node-slows-a-search-mid-run),
+    [round 318](#round-318-validation-the-mid-run-slowdown-is-the-iteration-count-logz-agrees)).
+    `./ri bench` prints this as `converging evals/s`; judge rank and layout
+    A/Bs on it at the production nlive
+    ([round 309](#round-309-tooling-re-reading-ri-bench-prints-the-rate-a-converged-search-progresses-at)).
+    A resumed multi-node search used to deadlock (fixed, round 289).
+    Node packs (round 290) and batched appends, the default since
+    [round 298](#round-298-default-batched-record-appends-the-scratch-fix-proven-end-to-end),
+    mean a 2-node kill -9 loses no records, and a resume in the same job
+    survives the killed attempt's `/dev/shm` scratch.
+  - **Start-up.** The pool's 1-thread ORT sessions are built over the
+    shared weight arrays (round 274). Round 273 had found that
+    multi-thread requests silently ran torch; with that fixed, 39 x 1
+    still beats 20 x 2 by ~15% (round 276). Fewer ranks do not pay either: 30 x 1 runs each U-Net
+    iteration 15% faster but converges 9.9% slower
+    ([round 334](#round-334-negative-fewer-cpu-ranks-relieve-dram-per-request-but-lose-throughput-39-x-1-stays)); across nodes they only pay once total ranks pass ~1.25 x nlive
+    ([round 335](#round-335-analysis-docs-only-fewer-ranks-per-node-pay-only-once-total-ranks-pass-125-x-nlive)). A fresh node costs ~25-30 s
+    once per job (cold page cache for the weights, not the SIFs), and
+    reading the SIFs first does not help
+    ([round 303](#round-303-negative-a-fresh-nodes-slow-start-is-not-the-sifs-so-reading-them-first-does-not-help)).
+  - **Resume and finish** scale to large runs: rank 0 alone reads the
+    records and broadcasts them (all-rank RSS at 67k records 42 GB down
+    to 3 GB, round 267), and the packed records are parsed off the read
+    pool (-27% on a production-sized adoption, round 268).
+  - **GPU.** 33 x 1 workers on the gathering TensorRT server converge a
+    1-A100 search 16% sooner than the 19 x 2 shared default (steady
+    +38%, log(Z) +0.55 sigma, three raced pairs). Ranks and batching
+    changed together
+    ([round 319](#round-319-gpu-measurement-33-workers-on-gathered-tensorrt-batches-converge-16-sooner-than-the-default-ranks-or-batching-pending)).
+    The gain is batching: 33 x 1 on the shared server is no faster than
+    19 x 2 because the card saturates at ~19 single-image lanes, while
+    gathered batches lift the steady rate 19% at 33 ranks. Wall time tied
+    in that job's two pairs, so a longer A-vs-C race decides the default
+    ([round 325](#round-325-gpu-measurement-the-card-saturates-at-19-shared-lanes-so-round-319s-gain-is-batching-not-ranks)).
+    At production settings (nlive 150, 15 repeats) C converges 8% sooner
+    than A in both of two pairs, with log(Z) agreeing, so C should become
+    the GPU default
+    ([round 326](#round-326-gpu-measurement-at-production-settings-the-gathering-server-converges-8-sooner-than-the-shared-default)).
+    It is the `--device cuda` default since
+    [round 328](#round-328-gpu-default-resolution-check-pending-the-gathering-tensorrt-server-33-x-1-is-the---device-cuda-default)
+    (`R2D2_TRT_BATCH=1` opts out), checked on an A100 in
+    [round 329](#round-329-check-the-cuda-default-resolves-to-33-x-1-gathered-logz-agrees-resume-self-check-fixed).
+    That default is GPU-bound, not CPU-bound: the card is 87-91% busy
+    running batches of ~2 while 15-22 of 32 CPUs work, and 29 ranks
+    converged sooner than 33 in both pairs, so the rank count and lane
+    count are being re-raced
+    ([round 332](#round-332-gpu-measurement-the-batched-default-is-gpu-bound-at-a-mean-batch-of-2-29-ranks-and-8-lanes-raced)).
+    The shared arms' constant 7.66 s `stall_s` is the shared server
+    bringing its lanes up one at a time (~0.72 s each): early ranks fill
+    the prior phase, then wait at its barrier for the last lane. The
+    gathered server builds every context first, so its ranks start
+    together, later
+    ([round 323](#round-323-diagnostic-correction-of-round-321-the-transition-gaps-are-barriers-waiting-on-the-slowest-rank-on-the-shared-gpu-server-that-is-its-last-lane-coming-up),
+    correcting round 321's "late root").
+- **Rounds 216-265 in brief.** The CPU R2D2 forward is at the hardware
+  wall: a half-icelake search draws ~90-96% of its socket's measured
+  DRAM read bandwidth for U-Net weights alone, so ~53 evals/s looked like
+  the one-socket ceiling on a busy node; round 302 ran 60 on a quiet one ([round 205](#round-205-diagnostic-the-r2d2-cpu-search-is-at-the-sockets-dram-bandwidth)).
+  The weights cannot shrink without changing results ([round 206](#round-206-diagnostic-the-u-net-weights-cannot-be-shrunk-losslessly)),
+  and batching through ORT loses at a fixed CPU count ([round 265](#round-265-diagnostic-batched-onnx-runtime-forwards-are-bit-identical-but-lose-at-a-fixed-cpu-count)).
+  What still paid came from layout and from the filesystem:
+  - Sized CPU jobs split their CPUs over two sockets, which doubles the
+    bandwidth: **+26%** on an exclusive node ([round 250](#round-250-sized-r2d2-cpu-jobs-default-to-two-sockets)),
+    and **+15%** (58.8 steady evals/s) in the converged production search
+    ([round 252](#round-252-validation-the-two-socket-default-in-the-production-search-15)).
+    They also get the extra root rank, +3.1% ([round 253](#round-253-sized-cpu-r2d2-jobs-get-round-186s-extra-root-rank)).
+  - Whole-search stalls of 20-45 s turned out to be PolyChord's root
+    creating its `.resume` on Lustre. `chains/` now lives on tmpfs, with a
+    Lustre mirror ([rounds 225-229](#round-227-polychord-writes-chains-on-node-tmpfs-mirrored-to-lustre-by-a-child-process)).
+    The stalls on the ranks' own threads moved onto the record writer, and
+    busy share went from 0.92 to 0.995 ([round 232](#round-232-diagnosis--fix-the-root-blocks-are-lustre-stalls-on-the-ranks-own-threads)).
+    The post-run drain fell from 60 s to 0.3 s, and the files a run leaves
+    fell 93% ([round 239](#round-239-validation-rounds-234-236-in-the-production-search-post-run-drain-60-s---03-s)).
+  - Cold start: the pool prefetches its weights in parallel ([round 228](#round-228-the-gap-after-the-first-wave-is-a-cold-r2d2-pool-it-now-prefetches-its-weights))
+    and loads weights-only checkpoints ([round 257](#round-257-the-cpu-pool-loads-weights-only-checkpoints-half-the-bytes-of-a-cold-start)).
+    The first request on a whole sapphire node went from 27 s to ~6 s.
+  - A whole sapphire node runs the default search at **147.5 steady
+    evals/s** and converges in 11 minutes ([round 255](#round-255-validation-todays-defaults-on-a-whole-sapphire-node-1475-evalss)).
+    113 x 1 beats 57 x 2 ORT threads by 40% ([round 259](#round-259-negative-diagnostic-57-x-2-loses-40-to-113-x-1-on-a-whole-sapphire-node-the-cold-first-request-is-now-6-s)).
+  - Records are appended to one file by default. That was chosen for
+    durability (a kill loses 0 records) over ~2% evals/s
+    ([round 264](#round-264-ns_record_append1-is-the-default)).
+  - Validated on today's tree: the production search agrees on log(Z)
+    within 0.53 sigma ([round 263](#round-263-validation-rounds-240-262-in-the-production-search-logz-agrees-no-code-regression)).
+    Simulate (MeqTrees) is now 4.6% of worker time, and the R2D2 request
+    is 94.8%.
+  - GPU: batching TensorRT forwards across ranks gave no search speed
+    ([round 238](#round-238-negative-the-gathering-tensorrt-server-gives-no-search-speed-and-its-first-arm-hung)).
+    Round 243's ranks-per-card race is still queued; ampere is booked to
+    31 Oct.
 
 - **R2D2 on CPU.** The 22 Sep production search, rerun on the same 24
   sapphire CPUs with the same images and seed, converged in **41 minutes
@@ -16,6 +178,9 @@ the Hetzner host.
   On half an icelake node (39 ranks) today's default converges in **23
   minutes** at 48.1 evals/s, log(Z) 0.01733 +/- 0.00041, within 0.9 sigma of
   22 Sep and round 115 ([round 195](#round-195-validation-the-22-sep-production-search-on-half-an-icelake-node-23-minutes)).
+  On a whole exclusive sapphire node, a default `./ri search` (113 ranks)
+  converges in **11 minutes of search** at 147.5 steady evals/s, log(Z)
+  within 0.74 sigma of round 239 ([round 255](#round-255-validation-todays-defaults-on-a-whole-sapphire-node-1475-evalss)).
   Simulate (MeqTrees) went from 39% of worker time to 3.8%, idle from
   11.5% to 0.05%. A whole sapphire node (112 ranks x 1, one checkpoint
   copy per socket, rounds 105-106) runs 103.5 evals/s. The request is now
@@ -108,9 +273,12 @@ the Hetzner host.
   (90.8 against 64.2 evals/s, 100.1 against 66.4 steady), log(Z) 0.06
   sigma apart, so shared TensorRT is the GPU default since
   [round 215](#round-215-gpu-default-shared-tensorrt-converges-the-production-search-in-785-s-against-eagers-1165).
-- **Cost.** In SL3 charging units, one A100 hour does the work of 47-55
-  core-hours, and the GPU and CPU allowances are separate budgets, so
-  using both gives ~70-80% more R2D2 evaluations a quarter. Half nodes
+- **Cost.** In SL3 charging units, one A100 hour on today's gathered
+  TensorRT default does the work of ~66-94 core-hours (round 174 said
+  47-55): a converged production search costs ~0.18 GPU-hours against
+  12-16 core-hours on half an icelake node. The GPU and CPU allowances are
+  separate budgets, so using both gives ~2.0-2.4x the R2D2 evaluations of
+  CPU alone a quarter ([round 333](#round-333-diagnostic-docs-only-r2d2-evaluations-per-sl3-unit-cpu-against-gpu-at-todays-defaults)). Half nodes
   give ~15% more evaluations per core-hour than whole nodes, and whole
   nodes finish one search sooner ([round 174](#round-174-diagnostic-r2d2-evaluations-per-sl3-charging-unit-cpu-against-gpu)).
   On one whole icelake node, two socket-bound 38-rank searches run +9%
@@ -12307,3 +12475,4672 @@ passes, and `bash scripts/lib/progress-bar.sh` (its self-check, a CI step)
 passes. Behaviour is byte-for-byte the same, so no WSClean guard is needed.
 To lint as CI does from a compute node:
 `uvx --from shellcheck-py==0.9.0.6 shellcheck -x scripts/*.sh scripts/lib/*.sh`.
+
+## Round 252 (validation): the two-socket default in the production search, +15%
+
+**Question.** Round 250 made sized R2D2 CPU submissions default to two
+sockets, from short searches on an exclusive node whose other socket was
+idle. Does the gain hold in the production search on a shared icelake node,
+submitted the way a user's `./ri search` submits it, and does log(Z) still
+agree?
+
+**Method.** Round 239's command (seed 190182240, nlive 150, 15 repeats,
+async, to convergence) on `8cac391`, with `--mpi-procs 38`, submitted through
+`ns_submit_run` from this job with `SLURM_JOB_ID` unset (`.probe/r252/submit.sh`).
+The default asked for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task 19`
+on icelake. Job 39555976 started at once on cpu-q-112, a node shared with
+other jobs. The baseline is round 239: the same command on one socket (this
+gnhf job's 38 CPUs, all on NUMA node 0), 39 ranks, node load 120-145. The two
+runs were not raced, so node load differs between them.
+
+| | round 239 (one socket, `d41efab`) | round 252 (two sockets, `8cac391`) |
+| --- | ---: | ---: |
+| ranks (workers) | 39 (38) | 38 (37) |
+| evaluations | 70,202 | 82,504 |
+| search span | 1,372.1 s | 1,410.0 s |
+| steady evals/s | 51.2 | **58.8** |
+| ms per evaluation | 739 | **630** |
+| startup | 0.0 s | 7.8 s |
+| idle fraction | 0.0 | 0.0001 |
+| peak memory | 7.2 GB | 13.0 GB |
+| post-run phases (pack) | 21.6 s (14.0 s) | ~15 s (4.3 s) |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.0172910867005174 +/- 0.000406752036020735 |
+| ndead, nlike | 1,488, 68,540 | 1,461, 80,834 |
+
+**Results.**
+- Steady evals/s is **+15%** (58.8 against 51.2) with one fewer worker, so
+  +18% per worker. ms per evaluation is 630, close to round 250's exclusive
+  split arms (601-604) and well below its one-socket arms (734-756) and
+  round 239's 739. A shared node gave back some of the exclusive +26%, as
+  round 250 expected, and different node loads blur the exact figure.
+- log(Z) agrees with round 239 within 0.20 sigma and with round 233
+  (0.0172880612106121 +/- 0.000403960591240749) within 0.005 sigma.
+- No stalls, 0 failures, 0 meqserver wedges, busy share ~1.0. Peak memory
+  13.0 GB is the expected two per-socket copies, well inside the job's
+  58 GB `--mem`.
+- The job started at once on the shared queue, so the two-socket shape cost
+  no queue time here either.
+- Side note: `./ri health` run from this node with the squeue shim on PATH
+  reported the live job as "STOPPED", because the shim says no jobs are
+  queued and the ranks are on another node. That is an artefact of the shim:
+  real `squeue` sees the job. Don't read liveness from health under the shim
+  for a run on another node.
+
+The default stays. Rows: bench `r252-split` and stage
+`r252-split-validation` (full-precision log(Z) for both runs). `.probe/r252/`
+keeps the submit script, `summary.json`, `.stats`, and gzipped job output and
+run log. The run directory is deleted.
+
+## Round 253: sized CPU R2D2 jobs get round 186's extra root rank
+
+**Gap.** Round 186 gives a default CPU run one rank more than its CPUs,
+because PolyChord's root never evaluates (+3.7%). That rule only fires when
+`NS_MPI_PROCS` is unset. A login-node `./ri search r2d2 --mpi-procs N` sizes
+the job to N CPUs *and* carries `NS_MPI_PROCS=N` into it, so every sized
+submission (rounds 250 and 252's default two-socket shape included) ran N
+ranks on N CPUs, with the root's CPU idle: round 252's production search ran
+37 workers on 38 CPUs.
+
+**Change.** The submit branch of `scripts/run-nested-sampling-r2d2.sh`
+exports `NS_R2D2_ROOT_RANK_EXTRA=1` for sized CPU jobs. It reaches the job
+through `.job-settings.env`, and inside the job an explicit `NS_MPI_PROCS`
+equal to the job's CPUs becomes CPUs + 1. The Slurm request is unchanged:
+with a fake `sbatch`, `--mpi-procs 38` still asks for `--ntasks 2
+--ntasks-per-socket 1 --cpus-per-task 19 --mem 58096`, and the extra rank's
+~1 GB fits in the 4,096 MB headroom (peak 7.0 GB here, 13 GB two-socket).
+`NS_R2D2_ROOT_RANK_EXTRA=0` runs exactly `--mpi-procs` ranks. GPU jobs, runs
+in place with an explicit `NS_MPI_PROCS`, and WSClean are unchanged.
+
+**A/B.** In-job on this gnhf node (half icelake, 38 CPUs on one socket, node
+load ~88), `NS_MPI_PROCS=38` (A, the old sized job: 38 ranks) against the
+same plus `NS_R2D2_ROOT_RANK_EXTRA=1` (B: 39 ranks, confirmed in the run's
+`mpi_procs`). The runs were async, with nlive 100, 5 repeats, 400 dead and
+seed 4242 (round 186's shape), in the order W0 A1 B1 B2 A2 B3 A3 A4 B4.
+Rows `r253-*`, stage row `r253-root-rank-extra`, script `.probe/r253/ab.sh`.
+
+| run | ranks | evals | steady evals/s | ms per eval | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| W0 (discarded) | 38 | 5,993 | 47.4 | 761 | 7,039 | 0.017394184523864 +/- 0.000795940269377829 |
+| A1 | 38 | 7,777 | 50.6 | 721 | 7,008 | 0.0161690704705988 +/- 0.00131276215943309 |
+| B1 | 39 | 6,320 | 49.5 | 756 | 6,814 | 0.0170905622646202 +/- 0.00089889065878906 |
+| B2 | 39 | 6,105 | 49.3 | 758 | 6,966 | 0.017428562173038 +/- 0.000757722363946419 |
+| A2 | 38 | 6,001 | 46.4 | 784 | 6,964 | 0.0174025233553157 +/- 0.000773688689440642 |
+| B3 | 39 | 6,586 | 48.3 | 776 | 6,988 | 0.016956188436949 +/- 0.000967224570316897 |
+| A3 | 38 | 5,809 | 45.5 | 788 | 7,162 | 0.017568627327135 +/- 0.000737492027114256 |
+| A4 | 38 | 6,006 | 48.1 | 757 | 7,049 | 0.0174323700337516 +/- 0.000785041317612504 |
+| B4 | 39 | 6,786 | 49.2 | 758 | 7,043 | 0.0169215860477515 +/- 0.000917906021654815 |
+
+**Learned.**
+- Steady geomean 49.1 (B) against 47.6 (A), **+3.1%**. B won 3 of 4 pairs
+  (-2.2%, +6.2%, +6.1%, +2.3%), in line with round 186's +3.7% (5 of 5).
+  The node load (~88 on 76 CPUs) makes single pairs noisy, and A1 was the
+  outlier.
+- B's ms per evaluation (756-776) sits inside A's range (721-788), so the
+  root's 39th rank costs the workers nothing measurable. The gain is the
+  extra worker.
+- All nine log(Z)s agree within their errors (0.0162-0.0176, sigma
+  0.0007-0.0013).
+- Only the R2D2 run script's submit and explicit-ranks branches changed, so
+  no WSClean guard was needed. CI's shellcheck 0.9.0 is clean,
+  `scripts/test_self_checks.py` passes 30 of 30 host checks, and
+  `slurm.sh --self-check` passes. The `r253-*` run dirs are deleted.
+
+## Round 254 (diagnostic, validation pending): ampere is booked to 31 Oct; a whole-sapphire check of today's defaults is queued
+
+**GPU race.** Round 243's 1-GPU job 39544674 had still not started after
+3h15m. `sbatch --test-only .probe/r243/ab.sh` (one Slurm call) estimates a
+start of **2026-10-31 07:07** (gpu-q-18). A second probe with `-t 00:40:00
+--cpus-per-task=16` gave 2026-10-31 07:10 (gpu-q-2) and still 32 CPUs:
+CSD3 gives a 1-GPU ampere job 32 cores whatever it asks for, and a shorter
+limit does not backfill it. So the delay is the partition, not the shape. The
+job stays queued (resubmitting would only lose its place). Round 243's
+rank-count change and the `NS_R2D2_CUDA_MAX_RANKS` question wait until
+`.probe/r243/ab-39544674.out` exists, after 31 Oct 07:00.
+
+**Sapphire check (pending).** `sbatch --test-only` for an exclusive sapphire
+node estimated a start ~80 minutes out, so the whole-node validation that
+rounds 150-253 never had is queued as job 39560906. It is round 239's
+production command (seed 190182240, nlive 150, 15 repeats, async, to
+convergence), submitted through `ns_submit_run` with no `--mpi-procs`, so a
+user's default whole-node shape is used: `--exclusive`, ranks = CPUs + 1,
+and per-socket ORT sessions (`.probe/r254/submit.sh`, run dir
+`results/nested-sampling/r254-sapphire`). The baselines are round 150's
+117 evals/s (short search, 112 ranks, before the root rank, stall and
+root-block fixes of rounds 186, 227 and 232) and round 252's 58.8 steady
+evals/s on 38 split icelake CPUs. A later round reads the job's
+`summary.json` and bench row, copies log(Z) at full precision, and deletes
+the run dir.
+Read in [round 255](#round-255-validation-todays-defaults-on-a-whole-sapphire-node-1475-evalss): 147.5 steady evals/s, log(Z) agrees.
+
+**Slurm hygiene.** The `--test-only` probes and the submission were three
+calls in ~3 minutes. The last came 22 s after the one before it, which breaks
+the two-minute rule: leave the full gap even for `--test-only`. Two jobs of
+this account are pending (39544674 and 39560906), the limit.
+
+## Round 255 (validation): today's defaults on a whole sapphire node, 147.5 evals/s
+
+**Question.** Rounds 150-253 were measured on half or whole icelake nodes,
+or in short sapphire searches. What does a user's default whole-node
+submission do on sapphire, the production partition, in the production
+search, and does log(Z) agree?
+
+**Method.** Round 254 queued round 239's production command (seed 190182240,
+nlive 150, 15 repeats, async, to convergence) on `0b81364` through
+`ns_submit_run` with no `--mpi-procs` (`.probe/r254/submit.sh`). Job 39560906
+got an exclusive sapphire node (cpu-r-94) and ran 113 ranks x 1 thread
+(112 CPUs + round 186's root rank) with per-socket ORT sessions. It started
+~2h after submission and ran 06:03:40-06:15:21.
+
+| | round 115 (24 x 1 sapphire) | round 252 (38 icelake CPUs, split) | round 255 (whole sapphire) |
+| --- | ---: | ---: | ---: |
+| ranks | 24 | 38 | 113 |
+| evaluations | 65,420 | 82,504 | 92,553 |
+| search span | 2,459 s (wall) | 1,410.0 s | **654.8 s** |
+| steady evals/s | 26.6 (whole run) | 58.8 | **147.5** |
+| steady evals/s per CPU | 1.11 | 1.55 | 1.32 |
+| ms per evaluation | 858 | 630 | 787 |
+| startup | - | 7.8 s | 27.4 s |
+| post-run phases (pack) | - | ~15 s (4.3 s) | 31.0 s (18.2 s) |
+| peak memory | - | 13.0 GB | 16.1 GB |
+| log(Z) | 0.01683 +/- 0.00041 | 0.0172910867005174 +/- 0.000406752036020735 | 0.017813855940541 +/- 0.000371068139993459 |
+| ndead, nlike | 1,368, - | 1,461, 80,834 | 1,918, 87,360 |
+
+**Results.**
+- The production search converges in **11 minutes of search** (~11.7 min of
+  job) on one sapphire node, against round 115's 41 minutes on 24 sapphire
+  CPUs and the original 22 Sep run's 6h20m. Steady 147.5 evals/s is +26% on
+  round 150's 117 (a shorter nlive 200 / 5 repeats / 1000 dead shape before
+  rounds 186, 227 and 232's root rank, chains-on-tmpfs and root-block fixes).
+- log(Z) agrees with round 239 within 0.74 sigma and with round 252 within
+  0.95 sigma. ndead is higher (1,918 against ~1,470) because 112 async
+  workers return more points per iteration; the evidence is unaffected.
+- No stalls, 0 failures, 0 retries, 0 meqserver wedges, idle fraction 0.0001.
+- An evaluation costs 787 ms here against 630 on split icelake: per CPU a
+  full sapphire node is ~15% less productive than 19 + 19 icelake CPUs. The
+  U-Net request is 751 of the 787 ms, so this is the shared L3/memory
+  bandwidth of 56 single-thread sessions per socket, not the harness.
+- Fixed overhead is ~58 s of the ~700 s job (27.4 s start-up, 31 s post-run,
+  18.2 s of it `pack`), ~8%. In a longer, larger-nlive search it shrinks in
+  proportion; in short sapphire validations it is worth subtracting.
+
+No default changes. Rows: bench `r254-sapphire` (written by the job) and
+stage `r254-sapphire-validation` (full-precision log(Z) for rounds 239, 252
+and 255). `.probe/r254/` keeps the submit script, `run.env`, `.stats`,
+gzipped `summary.json`, job output and run log. The run directory is deleted.
+
+## Round 256 (diagnostic): where the final record pack's time goes
+
+**Question.** Round 255's whole-sapphire search spent 18.2 s in the
+post-run `pack`, against 4.3 s for round 252's 82.5k records on 38 icelake
+CPUs. It has 12% more records but takes 4x longer. Is that CPU work that
+can be cut, or something about the node?
+
+**Method.** `.probe/r256/packbench.py` builds a synthetic run on RDS
+(`/rds/user/th773/hpc-work`): 92,553 records (round 255's count),
+90,553 of them already in `records.jsonl` and 2,000 left as flat files,
+with every 50th record edited as prune would. It then times
+`pack_evaluation_records` with every record known, as
+`pack_finished_run` does, inside `polychord.sif`'s Python 3.11 on this
+icelake allocation. The records are round 159's WSClean ones (~2.9 kB).
+Round 255's R2D2 records are 2.5 kB each (from its `summary.json`).
+
+| step | seconds |
+| --- | ---: |
+| lock | 0.0 |
+| list `evaluations/` | 0.0 |
+| read the pack (~260 MB) | 0.5 |
+| encode: `json.dumps` of every known record, to compare it with its packed line | 2.4 |
+| write + fsync 3,812 lines | 0.9 |
+| unlink 2,000 flat files | 0.3 |
+| **total** | **4.1** |
+
+**Result.** The pack's own work on a quiet node is ~4 s, matching round
+252's 4.3 s. Most of it is the `json.dumps` comparison (~60%). Encoding
+round 255's 92,553 R2D2 records takes 3.7 s with this loop's Python 3.13.
+So about 14 s of the sapphire run's 18.2 s is not the pack's CPU. It is
+I/O (the read of a pack that 112 ranks appended to through Lustre, or the
+unlinks) or contention at the end of the job, and this node cannot
+reproduce it. The pack runs after `summary.json` is written, so it never
+delays a result. On a whole node it costs ~18 s x 112 CPUs of allocation,
+~2.6% of an 11-minute search, and less for longer ones. That is too small
+to change the default without knowing the cause.
+
+**Change (diagnostic only).** `pack_evaluation_records` now times its
+steps into `LAST_PACK_SECONDS`, and the `post-run seconds` line shows them
+after `pack`, e.g. `pack 4.1 (lock 0.0, list 0.0, read 0.5, encode 2.4,
+write 0.9, unlink 0.3; 3812 lines, 2000 files)`. The next whole-node
+validation will name the slow step. If it is `encode`, the fix is to
+re-dump only the records prune edited. If it is `read` or `unlink`, the
+fix is Lustre-side.
+
+**Also seen in round 255's line.** `writer seconds, all ranks: record
+57237` over 112 workers x 655 s is ~78% of each rank's wall in its record
+writer thread. Round 252 shows the same share: 41,033 of 37 x 1,410 s.
+The writer is off the critical path (idle fraction 0.0001) and mostly
+waits on RDS, so it costs no evals/s. "coalesced" in that list is a
+count of records, not seconds.
+
+**WSClean guard.** One raced synchronous pair, run as round 235 did (seed
+229, nlive 100, 2 repeats, 4,000 dead, 19 ranks per arm on separate halves
+of the job's CPUs, `.probe/r256/ws.sh`). The base was `b762e2c` from a
+`/dev/shm` worktree. Both arms ran at 37.8 evals/s and made 4,071
+evaluations. All 10 chain files were bit-identical, and log(Z) was
+0.0967023094179472 +/- 0.000520957293962581 in both (ndead 861, nlike
+4,004), the same as round 234. The new arm's line read `pack 0.2 (lock 0.0,
+list 0.0, read 0.0, encode 0.1, write 0.0, unlink 0.0; 2932 lines, 165
+files)`. `scripts/test_self_checks.py` passes 30 of 30 host checks. The
+only exception was a run alongside the race, where `self_check_cpu_pinning`
+found every CPU claimed (`[None, None]`). That check cannot pass while a
+search holds the node's CPU claims. Run it on an idle allocation.
+
+
+## Round 257: the CPU pool loads weights-only checkpoints, half the bytes of a cold start
+
+**Question.** Round 255's whole-sapphire search reported `startup_s` 27.4 s
+against 7.8 s on 38 icelake CPUs. What is it?
+
+**Finding.** It is every rank's first evaluation. In round 255's
+`summary.json`, all 112 workers started an evaluation in the first instant
+and none finished for 27.4 s: those first evaluations took 27.4-29.2 s
+(U-Net request 24.9 s, simulate 4.1 s) against 0.79 s warm. The request
+waits for the R2D2 pool's warm-up, and on a node that has never read the
+weights that warm-up reads 8.7 GB off Lustre: 5.8 GB of torch checkpoints
+and 2.9 GB of optimised ONNX graphs (round 228). On a whole node it costs
+27 s x 112 CPUs once per job, ~4% of an 11-minute search and of every
+restart's first minute.
+
+Each Lightning checkpoint is 248 MB, but only its `state_dict` is used, and
+that is 124 MB. The rest is optimiser state, loops and callbacks.
+
+**Change.** On the CPU onnx path (the CPU default), `load_checkpoint_series`
+keeps each checkpoint's `state_dict` alone in
+`$RI_WORK_DIR/.cache/ri/r2d2-onnx/weights/<key>/` (25 files, 3.1 GB, keyed
+like the exported models by the checkpoints' names, sizes and mtimes). The
+first pool writes them once, and later pools and `prefetch_weights` read
+those instead. A cold pool now reads 5.6 GB rather than 8.7 GB. The torch
+and CUDA paths are unchanged. The image self-check `checkpoint_series`
+covers write-once and read-back.
+
+| load of the 25 checkpoints, `r2d2.sif`, page cache warm | seconds |
+| --- | ---: |
+| original checkpoints (as before) | 0.87 |
+| first load, writing the weights-only copies | 1.04 |
+| weights-only copies | 0.26-0.42 |
+
+The loaded dicts match the originals in key order, `_metadata`, dtype,
+stride and value for all 775,608,025 weights (`.probe/r257/load.py`).
+
+Interleaved tiny searches against HEAD from a `/dev/shm` worktree (seed
+196, nlive 100, 20 dead, 39 ranks, `.probe/r257/ab.sh`). The new arm's
+first run (pair 0) wrote the cache:
+
+| pair | 0 | 1 | 2 | 3 | 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| first request, HEAD | 4.53 | 4.42 | 4.55 | 4.52 | 4.43 s |
+| first request, new | 5.52 | 4.32 | 4.14 | 4.24 | 4.30 s |
+| search wall, HEAD | 9.53 | 9.16 | 9.32 | 9.48 | 9.38 s |
+| search wall, new | 10.35 | 9.37 | 9.01 | 9.14 | 9.20 s |
+
+Warm, the first request is 0.23 s faster (4 of 4 pairs) and search wall 0.16 s
+faster (3 of 4). log(Z) is 0.0101886951976723 in all 10 runs, bit-identical
+to rounds 198-204. The command-to-first-evaluation time is ~0.8 s longer in
+the new arm. That is the tree's location (RDS against `/dev/shm`), not the
+change, because the gap was already there in pair 0 before any search
+started. The cold gain cannot be measured on this node, whose page cache
+always holds the weights. At round 228's cold rate (5.8 GB in 8.9 s) it
+should be ~4.5 s of a fresh node's first request.
+The change is in `r2d2_serve.py` only, so WSClean is not touched.
+
+**Pending.** Exclusive sapphire job 39563276 (`.probe/r257/job.sh`) runs
+interleaved 113 x 1 against 57 x 2 rank x thread arms (nlive 200, 5
+repeats, 1,000 dead), to test round 255's suggestion that fewer ORT
+sessions per socket might beat 787 ms per evaluation. It runs this
+worktree, so its first arm (W0) is a fresh node's cold first request with
+the weights-only copies, to compare with round 255's 24.9 s. Read
+`.probe/r257/job-39563276.out` and the `r257-*` run dirs. Then record
+steady evals/s, `startup_s` and log(Z) at full precision, and delete the
+run dirs. (Read in [round 259](#round-259-negative-diagnostic-57-x-2-loses-40-to-113-x-1-on-a-whole-sapphire-node-the-cold-first-request-is-now-6-s).)
+
+Rows: `r257-weights-cache` stage row and the new arm's `r257-abb` rows in
+`benchmarks.jsonl`. Run dirs deleted.
+
+## Round 258: requests on more than one thread run ONNX Runtime, not torch
+
+**Question.** Round 257's queued sapphire job races 113 x 1 against 57 x 2.
+But `load_net` hands any request running more than one torch thread back
+to torch (round 141), so its 57 x 2 arm would have compared torch with
+ORT, not one layout with another. The same fallback covers every async
+run's tail, where `r2d2_thread_count` widens requests up to
+`R2D2_MAX_THREADS` (16).
+
+**Stage** (`.probe/r258/fwd.py`, `mem.py`, N1 and N13 U-Net, 32 x 32,
+`r2d2.sif`, icelake):
+
+| threads | 1 | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ORT (saved optimised graph), ms | 16.5 | 9.0 | 5.5 | 3.9 | 4.2 |
+| torch, ms | 28.3 | 16.5 | | | |
+
+ORT's output is bit-identical at every one of these thread counts. A
+pool thread does not survive fork, so a multi-thread session has to be
+built in the worker. Loading the 25 graphs there costs 2.9 GB of private
+memory and 1.8 s per worker (`add_external_initializers` copies too). With
+`add_initializer` over arrays the pool parent made before the fork, on a
+graph whose weights are declared external (0.8 MB for all 25), a worker
+builds the 25 sessions in 0.34 s for +0.25 GB, still bit-identical
+(`.probe/r258/share.py`). The arrays must be 64-byte aligned. At numpy's
+default alignment the 1-thread forward is 19.2 ms against 16.5 ms.
+
+**Change.** `r2d2_serve.py`: when a run's requests can take more than one
+thread (`R2D2_OMP_THREADS` or `R2D2_MAX_THREADS` > 1, i.e. every async
+run), `patch_onnx_network` also keeps each optimised graph's weights as
+aligned OrtValues (`ort_shared_parts`; one set per NUMA node, like the
+sessions; ~2.9 GB per set in the pool parent, not per rank). `load_net`
+gives a request on N > 1 threads `threaded_session(cur_iter, N)`, built on
+first use in the worker. N is floored to a power of two, and every count's
+sessions are kept (at most four sets, ~1 GB). R3D3 keeps torch. The image
+self-check `threaded_session` checks bit-identity with a file-loaded
+session and the per-count cache.
+
+**A/B, 19 ranks x 2 threads** (async, nlive 100, 150 dead, seed 196,
+interleaved ab ba ab ba against HEAD in a `/dev/shm` worktree; every
+request here is a 2-thread request):
+
+| pair | 0 | 1 | 2 | 3 |
+| --- | ---: | ---: | ---: | ---: |
+| evals/s, HEAD (torch) | 21.94 | 21.31 | 21.53 | 21.90 |
+| evals/s, new (ORT) | 27.27 | 27.54 | 28.64 | 28.30 |
+| mean request s, HEAD | 0.742 | 0.748 | 0.754 | 0.745 |
+| mean request s, new | 0.575 | 0.576 | 0.555 | 0.563 |
+
+That is **+29% evals/s**, with the request 24% shorter and search wall
+29.5 s against 23.3 s (4 of 4 pairs). The new arm's `steady_evals_per_s`
+(39-41) exceeds its `evals_per_s` because its first requests build
+sessions. Compare `evals_per_s` here. log(Z) is 0.01444-0.01477 for HEAD
+and 0.01435-0.01492 for new. Async runs do not repeat, and the U-Net
+moves from torch to ORT, which already differs by ~1e-5 of the peak
+(round 141), so the results are agreeing rather than bit-identical.
+
+**Guard, default layout** (39 x 1 async, otherwise the same). Here only
+the tail's requests change. The first version kept one thread count per
+worker and lost 4 of 5 pairs by ~1.5% (32.65-33.37 against 33.09-33.79
+evals/s), because the tail changes the count request by request and each
+change rebuilt 25 sessions. With power-of-two counts all kept, it won 3
+of 4 pairs: 33.53 against 32.52 evals/s mean (+3.1%, inside the ~5%
+noise, load 45-56). So the default is not slowed. The 1-thread path and
+synchronous runs (`R2D2_MAX_THREADS` = `R2D2_OMP_THREADS` = 1) are untouched.
+The change is in `r2d2_serve.py` only, so WSClean is not affected.
+
+**Consequence for job 39563276.** It runs this worktree when it starts,
+so its 57 x 2 arm now runs ORT at 2 threads. It is now the layout A/B it
+was meant to be. Read it as in round 257.
+
+Rows: `r258-ab{a,b}` and `r258-def{a,b}` bench rows and the
+`r258-threaded-ort` stage row in `benchmarks.jsonl`. Run dirs deleted.
+
+## Round 259 (negative, diagnostic): 57 x 2 loses 40% to 113 x 1 on a whole sapphire node; the cold first request is now ~6 s
+
+**Question.** Round 255 put a whole-sapphire evaluation at 787 ms against
+630 on split icelake, and suggested that fewer ORT sessions per socket might
+help. Round 258 made 2-thread requests run ORT instead of torch. So does
+57 ranks x 2 threads beat the default 113 x 1 on a whole sapphire node? And
+does round 257's weights-only cache shorten a fresh node's first request
+(round 255: 27.4 s)?
+
+**Method.** Exclusive sapphire job 39563276 (`.probe/r257/job.sh`, cpu-r-92),
+interleaved W0 A1 B1 B2 A2 A3 B3: `./ri search r2d2 --nlive 200
+--num-repeats 5 --max-ndead 1000 --seed 4242` (async). Arm A is the default
+(113 ranks, `R2D2_OMP_THREADS=1`); arm B is `NS_MPI_PROCS=57`, which derives
+`R2D2_OMP_THREADS=2`. W0 ran round 257's tree plus round 258's uncommitted
+change; A1 the same; B1 onwards ran `dad9dff` (round 258) clean. The A arms
+use the 1-thread path, which round 258 did not change.
+
+| arm | evals/s | steady evals/s | ms per eval | image_container ms | simulate ms | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| W0 (113 x 1) | 146.97 | 147.02 | 745.0 | 679.1 | 64.8 | 0.0176877867975606 +/- 0.000359539845140757 |
+| A1 (113 x 1) | 150.72 | 150.76 | 727.0 | 673.9 | 51.9 | 0.0175364754653707 +/- 0.000397843469083318 |
+| B1 (57 x 2) | 88.80 | 92.66 | 622.7 | 590.2 | 31.5 | 0.0181245677039065 +/- 0.000339626694415866 |
+| B2 (57 x 2) | 88.86 | 92.45 | 623.7 | 590.9 | 31.7 | 0.0180341232346788 +/- 0.000335677992076756 |
+| A2 (113 x 1) | 146.32 | 146.36 | 742.6 | 692.5 | 49.0 | 0.0176073253679468 +/- 0.000399276316153648 |
+| A3 (113 x 1) | 149.65 | 149.69 | 730.0 | 682.4 | 46.5 | 0.0170137811517355 +/- 0.000482718536058283 |
+| B3 (57 x 2) | 89.41 | 93.47 | 617.4 | 585.7 | 30.7 | 0.0179679913807668 +/- 0.000334514642347057 |
+
+**Results.**
+- **113 x 1 wins every pair by ~40%**: A1-A3 average 148.9 evals/s and B
+  89.0 (-40%). Steady evals/s, which leaves out B's 7.5-7.9 s of per-worker
+  session builds, gives -38%. The default stays.
+- Two threads per request cut the request only from ~680 to ~590 ms
+  (1.15x) under full-node load, against 1.8x for a solo forward (round
+  258: 16.5 -> 9.0 ms). B's load average sat at ~90 on 112 CPUs. The
+  second thread mostly waits on memory, the same limit as round 255's
+  shared L3/memory bandwidth. Halving the sessions per socket does not
+  relieve it: each forward still streams the same weights.
+- log(Z) agrees across all seven arms (0.0170-0.0181; the widest gap, A3
+  against B1, is 1.9 sigma). B's values sit ~1 sigma above A's. Async searches with
+  different worker counts take different paths, as in round 255.
+- **Cold first request.** `startup_s` reads 0.0 in A and W0 because
+  `bench.py` counts gaps between evaluation *starts*, and all 112 first
+  evaluations start together. Measured from the records instead, W0's
+  first requests take 5.0/6.0/7.7 s (min/median/max) and A1's (page cache
+  warm) 5.2/6.6/8.5 s, against 27.4-29.2 s in round 255 on a fresh node.
+  So W0 shows no cold-read penalty left, though this node may have had
+  some files cached from an earlier job. What is left is 112 workers' first
+  requests contending, not I/O. Round 257's weights-only cache is consistent
+  with that, but this does not prove it alone: cpu-r-92 is not round 255's
+  node.
+
+No code change. Rows: stage row `r259-spr-layout` (arm means, the first
+request timings and full-precision log(Z)) in `benchmarks.jsonl`, plus the
+job's own `r257-*` bench rows. Run dirs deleted. The job script, output and
+arm logs are in `.probe/r257/`.
+
+## Round 260 (tooling; sapphire A/B pending): `first_request_s` in every ledger row, and a record-writer A/B queued
+
+**Why.** Round 259 found `startup_s` reads 0.0 in async whole-node runs:
+all 112 ranks start their first evaluation together, and a 5-8 s cold first
+request is shorter than `start_gaps()`'s bound (10x the median evaluation),
+so no start-to-start gap opens. Round 259 had to dig the first-request time
+out of `summary.json` by hand.
+
+**Change** (`scripts/bench.py`). Each row gains `first_request_s`: the median
+duration of the evaluations that start within 1 s of the first. `./ri bench`
+shows it as "first request s". `startup_s`, `stall_s` and
+`steady_evals_per_s` are unchanged, so older rows still compare. The
+self-check gains a synthetic wave (5 first requests of 6.0 s, then 0.7 s
+evaluations): `startup_s` 0.0, `first_request_s` 6.0. A tiny real search on
+this half icelake node (`--nlive 100 --max-ndead 60 --seed 196`, 222
+evaluations, log(Z) 0.0101886951976723 +/- 0.00726) recorded
+`startup_s` 0.0 and `first_request_s` 4.17 against a 1.33 s mean evaluation.
+Its run dir is deleted.
+
+**Pending: does the record writer cost throughput on a whole node?** Round
+259's post-run lines show that at 113 ranks every rank's record writer is busy
+for the whole search. The flat writer spent 8,774-11,635 writer-seconds over
+113 ranks in ~87-90 s searches (~0.8 s a Lustre create), and 10,075-13,635
+records went out coalesced. At 57 ranks it spent 534-542 writer-seconds with 2-8
+coalesced. On half icelake, append (one held fd, no creates) gained nothing
+(rounds 240-241), but there the writers had slack. Exclusive sapphire job
+39567902 (`.probe/r260/job.sh`) runs round 259's arms, interleaved W0 A1 B1
+B2 A2 A3 B3 (113 x 1, nlive 200, 5 repeats, 1000 dead, seed 4242). A is the
+default writer, B is `NS_RECORD_APPEND=1`. Read `.probe/r260/job-39567902.out`
+and the `r260-*` dirs in a later round, record the evals/s, steady evals/s,
+`first_request_s` and full-precision log(Z), then delete the dirs.
+
+
+## Round 261 (durability check): a kill -9 and resume with the coalescing writer
+
+**Why.** The durability rule from round 244 is that a mid-search kill must
+not lose more than a few seconds of records, verified by a kill -9 and a
+`./ri resume`. Round 247 made the coalescing writer the default but did not
+kill a search. Round 260's sapphire job 39567902 had not started, so this
+check ran on this node.
+
+**Method.** Round 245's kill (`.probe/r261/kill.sh`: async R2D2, seed 242,
+`--nlive 48 --num-repeats 5 --max-ndead 600 --mpi-procs 20`, tree
+`e91eb36`). The default (coalescing) writer raced `NS_RECORD_APPEND=1`, one
+arm on each 19-CPU half of this job. Round 244's sampler ran every 10 s. At
+210 s, one `kill -9` hit the launcher's group and every process naming the
+run dir (0 left). Each arm then ran `./ri resume` to the end. RDS was quiet:
+no `evaluations/` listing took over 0.1 s.
+
+| arm | scored at kill | on disk | lost | most behind mid-run | resumed at (ndead) | resume wall | final evaluations = records | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| coalesce (default) | 5,078 (5,080 after) | 5,058 | **20-22** | 2 | 284 | 235 s | 10,074 | 0.0164934813192454 +/- 0.000719897271085676 |
+| append | 4,907 (4,910 after) | 4,909 | **0-1** | 1 | 280 | 247 s | 9,858 | 0.0165801785722601 +/- 0.00072200227030288 |
+
+**Results.**
+- The coalescing writer loses about one record per rank at a kill: the
+  in-flight writer job of each of 20 ranks. At ~24 evals/s that is ~0.8 s
+  of evaluations, inside the "few seconds" bar. Round 245's flat writer lost
+  27 on quiet RDS and 161 under load. Append lost nothing, as in round 245.
+- Both resumes restarted from the last `.resume` checkpoint, ran to the
+  end (rc 0), and left complete archives (unique records = the summary's
+  `evaluation_count`, no flat files). log(Z) agrees within 0.09 sigma.
+- Even on quiet RDS the coalescing writer spends 17x the writer-seconds of
+  append (1,146 against 68, all ranks), because a lone record is still a
+  Lustre create. That is the cost round 260's sapphire job weighs at 113
+  ranks.
+- Not covered: a kill under heavy MDS load. Rounds 247-248 bound the lag
+  there at 15-18 records behind, from the mid-run sampler.
+
+**Decision.** No code change. The coalescing default meets the durability
+rule on quiet RDS. Whether `NS_RECORD_APPEND=1` becomes the default
+depends on job 39567902's whole-node A/B, still pending.
+
+Stage row `r261-kill-coalesce` (full-precision log(Z) for both arms) is in
+`benchmarks.jsonl`. Run dirs are deleted. Script, sampler output and
+gzipped logs are in `.probe/r261/`.
+
+## Round 262 (negative probe, diagnostic): the pack's encode has no cheaper exact form; whole-sapphire load above 112 is blocked record writers
+
+**Question.** Sapphire job 39567902 (round 260) had not started, so this
+round took two things this node could answer. (1) Round 256 left a fix
+for the final pack: `encode` (a `json.dumps` of every known record to
+compare with its packed line) was ~60% of its CPU. Is there a cheaper exact
+comparison? (2) Round 259's 113-rank arms ran at load average 173-226 on
+112 CPUs, against ~90 for 57 x 2. Is that CPU oversubscription?
+
+**Method.** (1) `.probe/r262/enc.py` in `polychord.sif`'s Python on round
+159's 43,115-record pack (this icelake half, load ~50 from neighbours),
+three repeats of each comparison. (2) The `writer seconds` post-run lines
+in round 259's arm logs (`.probe/r257/*.log.gz`), set against the job's
+`uptime` after each arm. Each arm's search spans ~88 s.
+
+| comparison over 43,115 records | seconds | differing |
+| --- | ---: | ---: |
+| `json.dumps(record) != text` (today) | 1.10-1.11 | 0 |
+| `JSONEncoder(check_circular=False)` | 1.06-1.07 | 0 |
+| `json.loads(text) != record` | 0.82 | 0 |
+
+| arm (round 259) | record writer-seconds | / ~88 s | 1-min load after |
+| --- | ---: | ---: | ---: |
+| W0 113 x 1 | 8,774 | ~100 | 173 |
+| A1 113 x 1 | 9,978 | ~113 | 197 |
+| A2 113 x 1 | 11,205 | ~127 | 195 |
+| A3 113 x 1 | 11,635 | ~132 | 226 |
+| B1-B3 57 x 2 | 534-542 | ~6 | 90-94 |
+
+**Results.**
+- (1) Nothing worth shipping. `check_circular=False` saves 4%. Comparing
+  parsed records saves 25% but is not exact: `1` against `1.0` or a
+  reordered key would compare equal, and NaN would never compare equal.
+  On round 259's 1,000-dead runs `encode` is 0.7 s, after `summary.json`
+  is written. Skipping it needs the caller to say which records prune
+  edited, which `pack_evaluation_records`' callers do not track. That
+  is worth doing only if a production-length whole-node pack shows
+  `encode` as the slow step (round 256's open question).
+- (2) It is not oversubscription. The load above 112 tracks the record
+  writers blocked in Lustre creates (D state counts toward load): 113
+  workers plus ~100-132 blocked writers is ~213-245, and the 1-minute
+  average, lagging a 2-minute arm, reads 173-226 in the same order. At
+  57 ranks the writers are ~6 deep, so doubling the ranks costs ~20x the
+  writer-seconds. That is a single-directory create convoy on the MDS,
+  which `NS_RECORD_APPEND=1` (one fd, no creates) avoids. Job 39567902
+  tests whether it costs evals/s.
+- RDS is quiet today (2.5 kB create + rename on hpc-work: 10 ms median,
+  21 ms max over 40), so round 261's open case, a kill under MDS load,
+  could not be reproduced on demand.
+
+No code change, no search, no `benchmarks.jsonl` row. The probe is in
+`.probe/r262/`.
+
+## Round 263 (validation): rounds 240-262 in the production search; log(Z) agrees, no code regression
+
+**Question.** Sapphire job 39567902 (round 260) had still not started. Rounds
+240-262 changed the record writer (coalescing, round 247), the CPU pool's
+checkpoints (round 257) and the multi-thread runtime (round 258), and were
+never run together in the production search. Do they still converge to the
+same log(Z), and at round 239's speed?
+
+**Method.** Round 239's command unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs,
+`.probe/r263/run.sh`) on `8afee6e`, node cpu-q-124. Node load was 41 at the
+start and 95-120 for most of the run (round 239: 120-145 on cpu-q-566).
+
+| | round 239 (`d41efab`) | round 263 (`8afee6e`) |
+| --- | ---: | ---: |
+| evaluations | 70,202 | 67,058 |
+| evals/s (= steady) | 51.2 | 44.9 |
+| request (`r2d2 container`) | 712 ms | 802 ms |
+| simulate | 26.6 ms | 38.7 ms |
+| idle | 0.0% | 0.5% |
+| first request | - | 5.61 s |
+| post-run phases (pack) | 21.6 s (14.0 s) | 13.8 s (2.5 s) |
+| wrapper wall | 1,427 s | 1,514 s |
+| files left in the run dir | 711 | 749 |
+| writer-s, record / coalesced | 49,159 / - | 24,782 / 15,052 records |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.01710037195271 +/- 0.000395823425917893 |
+| ndead, nlike | 1,488, 68,540 | 1,459, 65,526 |
+
+The run was 12% slower, and both the request (+13%) and simulate (+46%) were
+slower with it. Simulate runs no R2D2 code, so the drop is more likely node
+load than code. To check, HEAD and `d41efab` (a `/dev/shm` worktree) were
+raced on the job's two 19-CPU halves, then swapped (`.probe/r263/ab.sh`,
+20 ranks, seed 240, nlive 48, 5 repeats, 400 dead):
+
+| | CPUs 0-36 | CPUs 38-74 |
+| --- | ---: | ---: |
+| pair 1 | HEAD 22.2 (811 ms) | `d41efab` 23.6 (751 ms) |
+| pair 2 | `d41efab` 23.7 (763 ms) | HEAD 24.4 (741 ms) |
+| HEAD against `d41efab`, same CPUs | -6.3% | +3.4% |
+
+log(Z) in the four arms: 0.0174284751036090 +/- 0.000663 (HEAD 1),
+0.0174873101886092 +/- 0.000587 (old 1), 0.0176241094368738 +/- 0.000593
+(old 2), 0.0175677369685795 +/- 0.000618 (HEAD 2). All four reached ndead
+448.
+
+**Results.**
+- log(Z) agrees: within 0.53 sigma of round 239, 0.34 sigma of round 252
+  (0.0172910867005174) and 0.33 sigma of round 233. No failures, no stalls
+  and no meqserver wedges. Rounds 240-262 are validated for results.
+- No code regression is visible. On the same CPUs, the raced pairs split in
+  sign (-6.3%, +3.4%, mean -1.5%), inside the ~5% control span. So the
+  production run's -12% is the node: on a shared icelake node, simulate's
+  +46% says other jobs took memory bandwidth.
+- The record writer coalesced 15,052 records, and writer-seconds on flat
+  records halved (24,782 against 49,159). Every rank's queue held at most 2
+  at the end, against 1,068 in round 239. So round 247's writer keeps up in
+  the production search on loaded RDS. The pack took 2.5 s against 14.0 s.
+- The 22 Sep production search now converges in ~25 min on half an icelake
+  node even under load 95-120.
+
+Rows: bench `r263-bigrun`, `r263-new1/2`, `r263-old1/2`, and stage
+`r263-validation` (full-precision log(Z) for every arm). `.probe/r263/`
+keeps the scripts, `summary.json`, `.stats`, the profile and gzipped logs.
+The run directories are deleted.
+
+**Sapphire job 39567902 (round 260) ran during this round** on cpu-r-81,
+exclusive, at `8afee6e`: 113 ranks x 1 thread, async, nlive 200, 5 repeats,
+1,000 dead, seed 4242, arms interleaved W0 A1 B1 B2 A2 A3 B3. A is the
+default coalescing writer, B is `NS_RECORD_APPEND=1`.
+
+| arm | writer | steady evals/s | evals/s | first request | request | record writer-s (coalesced records) | load at end | pack | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| W0 | default | 160.0 | 117.4 | 34.3 s | 707 ms | 8,370 (10,264) | 179 | 1.6 s | 0.0178004666207206 +/- 0.000386899732106165 |
+| A1 | default | 162.7 | 145.1 | 12.6 s | 650 ms | 9,639 (11,958) | 203 | 1.9 s | 0.0174979779748526 +/- 0.000434314316289035 |
+| B1 | append | 160.6 | 134.3 | 19.8 s | 659 ms | 217 | 112 | 0.6 s | 0.0172514684619337 +/- 0.000436751081455162 |
+| B2 | append | 157.9 | 134.3 | 16.3 s | 666 ms | 197 | 103 | 0.5 s | 0.0176887445407745 +/- 0.000368475652415278 |
+| A2 | default | 165.7 | 142.0 | 15.5 s | 637 ms | 8,630 (10,838) | 175 | 1.5 s | 0.0177547510533588 +/- 0.000374513635091155 |
+| A3 | default | 161.5 | 136.1 | 16.8 s | 652 ms | 8,396 (10,221) | 191 | 1.4 s | 0.0177822301619086 +/- 0.000367188647221824 |
+| B3 | append | 162.2 | 145.1 | 13.8 s | 653 ms | 245 | 119 | 0.7 s | 0.0171662451388133 +/- 0.000469591700363310 |
+
+- Steady evals/s: default 163.3 mean, append 160.2, **-1.9%**. The
+  adjacent pairs give -1.3%, -4.7% and +0.4%, so 2 of 3 are lower and all
+  are inside the ~5% control span. That is the same ~2% cost as rounds
+  240-241 on half icelake. The whole node's 113 writers did not make append
+  faster.
+- Append cuts the record writers' time ~40x (197-245 writer-s against
+  8,396-9,639), and the default coalesced 10-12k records an arm, so its
+  writers were behind for the whole search. The 1-minute load at the end of
+  each arm is 103-119 with append and 175-203 with the default. That
+  confirms round 262: the load above 112 is writers blocked in Lustre
+  creates, and append removes them. The pack is 0.5-0.7 s against 1.4-1.9 s.
+- log(Z) agrees across all seven arms. The widest A-B gap is A3 against B3,
+  1.04 sigma, for async paths at different speeds.
+- First requests took 12.6-34.3 s (W0 is the cold one), against round 259's
+  ~6 s on cpu-r-92. Each arm here started at node load ~100-200 left by the
+  previous arm's end, so this is not a cold-cache regression on its own.
+- **Decision.** This is the measurement the user's durability rule asked
+  for: append costs ~2% and takes the writers off Lustre's create path.
+  Round 245 (under load) and round 261 (quiet) show append loses 0 records
+  at a kill -9, and `./ri resume` finishes from it. So the next round should
+  make `NS_RECORD_APPEND=1` the default, with the WSClean guard that a
+  `common.py` change needs. The run dirs are deleted, and the arm logs are
+  gzipped in `.probe/r260/`. Stage row `r260-spr-append`.
+
+
+## Round 264: `NS_RECORD_APPEND=1` is the default
+
+**Change.** Round 263 made the case: on a whole sapphire node, append costs
+~2% steady evals/s and takes 113 record writers off Lustre's create path
+(~40x fewer writer-seconds, end-of-arm load 103-119 against 175-203), and it
+lost 0 records at a kill -9 under load (round 245) and on a quiet RDS (round
+261). So `write_evaluation_record` now appends every record to
+`evaluations/records.jsonl` unless `NS_RECORD_APPEND=0`, which brings back
+round 247's coalescing flat writer (`NS_RECORD_COALESCE=0` still gives the
+oldest one on top of that). The self-check runs its flat-writer cases under
+`NS_RECORD_APPEND=0` and its append cases under the default. Every
+`common.py` self-check passes in `polychord.sif`, and
+`scripts/test_self_checks.py` passes 30 of 30 host checks. `docs/robustness.md`
+describes the new writer.
+
+**WSClean guard.** Two raced synchronous pairs on the same tree, set up as
+in round 256 (seed 229, nlive 100, 2 repeats, 4,000 dead, 19 ranks per arm on
+separate halves of the job's CPUs, halves swapped for pair 2,
+`.probe/r264/ws.sh`). The flat arm sets `NS_RECORD_APPEND=0`, which is
+41ff6b3's code path exactly. The only other change is to comments and the
+self-check.
+
+| pair | arm | CPUs | evals/s | steady | writer-s (record) | pack files |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | flat | half 1 | 33.78 | 33.84 | 1,261 (+1,617 coalesced) | 156 |
+| 1 | append | half 2 | 33.73 | 33.78 | 146 | 0 |
+| 2 | flat | half 2 | 32.57 | 32.62 | 1,339 (+1,648 coalesced) | 28 |
+| 2 | append | half 1 | 32.84 | 32.90 | 150 | 0 |
+
+- Append minus flat: -0.2% and +0.8% steady, with the same sign as the CPU
+  half. That is noise, so there is no WSClean slowdown.
+- The 10 chain files and `clusters/` are bit-identical in both pairs. All
+  four arms made 4,071 evaluations, and log(Z) is 0.0967023094179472 +/-
+  0.000520957293962581 (ndead 861, nlike 4,004), the same as rounds 234 and
+  256.
+- The run dirs are deleted, and the gzipped logs are in `.probe/r264/`. The
+  bench rows are `r264-w{flat,app}{1,2}` and the stage row is
+  `r264-ws-guard`.
+
+## Round 265 (diagnostic): batched ONNX Runtime forwards are bit-identical, but lose at a fixed CPU count
+
+**Question.** Rounds 136-139 closed CPU batching with torch, where a batched
+forward is ~1e-6 of the peak off batch 1. ORT has been the CPU runtime since
+round 145 and was never batched. Is ORT's batch-B output bit-identical per
+sample, and does batching pay at one rank per CPU?
+
+**Why it could.** Shape inference on `N10.onnx` (`.probe/r265/shapes.py`):
+four average pools take the 32x32 input to 2x2, and the two 1024-channel
+convolutions at 2x2 hold 56.6 of the net's 124 MB of weights. Each weight is
+used 16 times or fewer per image, so a forward streams weights, and a loaded
+socket is memory-bound (round 137). Batching reads them once per batch.
+
+**Run.** The source graph with its batch dimension made symbolic, 1 thread,
+no arena, as in production (`.probe/r265/bt.py`). Throughput: P forked
+processes pinned to the job's CPUs, each running T-thread batch-B forwards for
+20 s, two mirrored passes, on cpu-q-124 at load 53-73 (the other half busy).
+`eq.py` compares the batch-4 graph with the production optimised graph run
+one sample at a time.
+
+- Accuracy: batch 2, 4, 8 and 16 are **bit-identical** per sample to batch 1,
+  and batch 4 is bit-identical to production's fixed-shape session. Unlike
+  torch, batching ORT needs no accuracy sign-off.
+
+| P procs x T threads, batch B | pass 1 img/s | pass 2 img/s | vs 36 x 1 x 1 |
+| --- | ---: | ---: | ---: |
+| 36 x 1, B 1 (production) | 1,276 / 1,281 | 1,263 / 1,302 | - |
+| 9 x 4, B 4 | 1,130 | 1,127 | **-12%** |
+| 4 x 8, B 8 | 929 | 918 | -28% |
+| 2 x 16, B 16 | 728 | 750 | -42% |
+
+B requests in flight per CPU (36 x 1, B swept; not a fixed-CPU layout):
+
+| B | 1 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: |
+| img/s, two passes | 1,278, 1,261 (1,270, 1,271 at the end) | 1,577, 1,552 | 1,614, 1,483 | 1,473, 1,397 |
+
+**Learned.**
+- ORT's MLAS U-Net is twice torch's rate at batch 1 (1,270 against round 136's
+  650-700 img/s on 36 icelake CPUs), and it gains far less from batching:
+  +22-26% at B 4-8 with B requests in flight per CPU (torch: +27% at B 4,
+  +95% at B 9). ORT already streams the weights well at batch 1.
+- At a fixed CPU count, the only layout a search has, batching with threads
+  loses: -12% at 9 x 4 and -42% at 2 x 16 (torch gained +14% and +64%).
+  So a lockstep worker (round 137) or a T-thread forward server (round 139)
+  cannot win on ORT even before prune thins the batch.
+- The one shape that gains, 1-thread batches of 4 with 4 requests per CPU,
+  needs 4 ranks per CPU feeding a per-CPU gatherer. Its ceiling is ~+24% of
+  the forward, ~75% of a loaded request, so ~+18% before prune thinning (a
+  batch of 4 averages 3.0, round 137) and 4x the rank memory. That is not
+  worth building, so CPU batching stays closed, now for ORT too.
+- No search was run, so there is no run dir to delete. The stage row is
+  `r265-ort-batch`; scripts are in `.probe/r265/`.
+
+## Round 266 (docs only): "Where it stands" brought up to round 265
+
+The status block at the top of this file still described round 215. It now
+opens with a short summary of rounds 216-265: the DRAM-bandwidth wall, and
+the levers that still paid (two-socket layout, Lustre stalls moved off the
+critical path, cold-start prefetch, the whole-sapphire figure, the append
+writer and the round 263 validation). Every anchor it links to was checked
+against this file's headings. No code changed, no search ran, and there
+is no `benchmarks.jsonl` row. Round 243's ampere race (job 39544674) still
+has no output file in `.probe/r243/`.
+
+## Round 267: a resume reads the records on rank 0 only
+
+**Why.** Every `./ri resume`, and every self-heal restart, runs
+`adopt_completed_evaluations()` on every rank, and each rank parsed every
+record into memory just to fill its `{key: objective}` cache. The Hetzner
+note in [run scaling](nested-sampling-run-scaling.md) called that harmless
+at 20 ranks. At CSD3 rank counts it is not: memory is the problem, not time.
+
+**Method.** Synthetic `records.jsonl` packs on RDS, 67,058 lines (the 22 Sep
+production search, round 263) and 400,000 lines (a large run), made from a
+real record with its parameters perturbed (2.7 KB a line, 181 MB and 1.08
+GB). The function was timed under `mpirun` in `polychord.sif` on half
+icelake, with HEAD's `common.py` against the change. Each rank hashed its
+sorted cache, and every arm gave one hash for all ranks
+(`.probe/r267/mpi_adopt.py`).
+
+**Change.** Rank 0 reads the records and broadcasts `(count, {key:
+objective})`. The keys are 16 hex characters, ~14 MB at 400k. The other
+ranks read nothing, and the `bcast` takes the place of the old `Barrier`
+(no rank reads a flat record after rank 0 packs). Rank 0 also passes to the
+pack only records that have a file. A record it read from the pack is already
+in it, and re-encoding it to compare was 1.6 s of a 67k resume.
+
+| arm | ranks | records | wall | rank-0 RSS | other ranks' RSS | all ranks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD | 38 | 67k | 10.62, 10.61 s | 1.30 GB | 1.10 GB | 42.0 GB |
+| broadcast only | 38 | 67k | 7.30, 7.56 s | 1.30 GB | 0.05 GB | 3.2 GB |
+| broadcast + pack skip | 38 | 67k | 5.29, 5.25 s | 1.09 GB | 0.05 GB | 3.0 GB |
+| HEAD | 8 | 400k | 52.8 s | 7.53 GB | 6.45 GB | 52.6 GB |
+| broadcast only | 38 | 400k | 47.4 s | 7.54 GB | 0.17 GB | 13.4 GB |
+| broadcast + pack skip | 38 | 400k | 32.3 s | 6.42 GB | 0.17 GB | 12.2 GB |
+
+HEAD was not run at 38 ranks on the 400k pack, because 38 x 6.45 GB is more
+than this node's 231 GB free. A whole sapphire resume (113 ranks) of a 400k
+run would have asked for ~730 GB, so it could not restart at all. It now
+needs ~25 GB.
+
+**WSClean guard** (shared code). HEAD in a `/dev/shm` worktree raced against
+the change: seed 229, nlive 100, 2 repeats, 2,000 max dead, synchronous,
+19 ranks per half, halves swapped per pair.
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 33.73 | 34.26 (+1.6%) |
+| 2 | 35.00 | 35.10 (+0.3%) |
+
+Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms. A fresh search adopts nothing, so
+this was only a check for regressions.
+
+**Kill and resume** (`.probe/r267/kill.sh`). A default R2D2 search (seed 242,
+nlive 48, 5 repeats, 600 max dead, 39 ranks) got `kill -9` at 150 s, with
+6,930 evaluations scored in its log, and then `./ri resume` ran on the change.
+All 39 ranks printed "6933 evaluations already done", which includes
+evaluations in flight whose records landed. The resume converged with rc 0
+in 153 s: log(Z) = 0.0165788375728644 +/- 0.0006268553649935, 618 dead,
+11,378 likelihood calls.
+
+**Learned.**
+- At CSD3 rank counts, per-rank copies of run-sized state are a memory
+  problem before they are a time problem. Before this change, a large run
+  on a whole sapphire node could not resume, which also means self-heal
+  could not restart it.
+- (Done in round 268.) Most of rank 0's remaining 32 s at 400k is `json.loads` in a 32-thread
+  pool: a serial loop parses the 67k pack in 2.5 s, against 3.3 s through
+  the pool. That is the next step if large resumes matter.
+- A `/dev/shm` HEAD worktree has its own `benchmarks.jsonl`, and
+  its arms write their bench rows there. Copy them back before
+  removing it.
+- Rows: bench `r267-w{old,new}{1,2}` and stage `r267-resume-adopt`, which has
+  every timing, the guard, and the kill/resume log(Z). Run dirs and the
+  synthetic packs are deleted. Logs and scripts are in `.probe/r267/`.
+
+## Round 268: packed records are parsed off the read pool
+
+Round 267 left rank 0's resume cost to `json.loads` running in
+`read_evaluation_records`' 32-thread pool. A packed record needs no IO, and
+holding the GIL across 32 threads made the parsing slower, not faster. Now
+`_read_records` (`common.py`) sends only names that have a record file
+(flat, or a pre-round-92 `metrics.json` dir) through the pool, and the
+calling thread parses the packed ones while the pool is busy. This covers
+`read_evaluation_records` (resume adoption, `load_evaluations_from_dir`:
+summary, report, merge) and `gathered_and_earlier_records` (the finish).
+
+Synthetic packs from `.probe/r267/mk.py` (2.9 KB records from r159-base) on
+`/dev/shm`, single process in `polychord.sif`, HEAD and the change
+alternating. Records were checked with a sha of `[(name, record)]`, which
+was identical in every pair.
+
+| case | HEAD | change |
+| --- | ---: | ---: |
+| `read_evaluation_records`, 67k packed (3 pairs) | 4.48, 4.15, 3.90 s | 2.73, 2.77, 2.76 s |
+| same, 67k packed + 3k flat files | 4.75, 3.82, 4.58 s | 3.27, 3.32, 3.32 s |
+| same, 400k packed (1 pair) | 28.20 s | 19.02 s |
+| `adopt_completed_evaluations`, 67k packed (2 pairs) | 5.86, 5.44 s | 4.14, 4.15 s |
+
+That is -33% on the read and -27% on a production-sized adoption. At 400k,
+9 s comes off every resume and every self-heal restart.
+
+**WSClean guard** (shared code): `.probe/r268/ws.sh`, which is round 267's
+script raced against a HEAD (d7b86d6) worktree on `/dev/shm`: seed 229,
+nlive 100, 2 repeats, 2,000 max dead, synchronous, 19 ranks per half,
+halves swapped per pair.
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 37.16 | 36.94 (-0.6%) |
+| 2 | 37.50 | 37.56 (+0.1%) |
+
+Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms. The change arms' larger publish and
+flush writer-seconds come from where they ran (the RDS worktree against
+`/dev/shm`), not from the code, which a fresh search does not reach.
+
+**Learned.**
+- A GIL-bound map in a thread pool is slower than a plain loop. Keep the
+  pool for IO only: here 32 threads of `json.loads` cost ~1.4 s against
+  one thread at 67k records.
+- The rest of a 67k adoption is ~2.7 s of serial parse plus ~1.4 s of pack
+  read and params keys. A faster parser (orjson is not in the image) or
+  caching each record's key in the pack line are what is left, and neither
+  is worth an image rebuild at today's run sizes.
+- Rows: bench `r268-w{old,new}{1,2}` and stage `r268-record-read`. Run dirs,
+  packs and the HEAD worktree are deleted. Scripts and timings are in
+  `.probe/r268/`.
+
+## Round 269: the finish's keep decision and prune skip what they do not need
+
+Ampere job 39544674 (round 243) still had no output file, so this round
+looked at rank 0's end-of-run work, which leaves every other rank of the
+node idle and grows with the evaluation count. At 67k records (round 263)
+the timed post-run phases total ~12 s, and the wrapper spends ~21 s
+outside `run_polychord`. A synthetic probe (`.probe/r269/p.py`, records
+copied from r263-bigrun's `summary.json`, single process in
+`polychord.sif`) timed the in-memory parts at HEAD:
+
+| step at HEAD (in memory) | 67k records | 400k records |
+| --- | ---: | ---: |
+| `evaluations_keeping_images` (runs twice: flush and prune) | 0.29 s | 1.98 s |
+| `prune_run_artefacts`, before any Lustre call | 0.93 s | 5.95 s |
+| `summarize_profiling` | 0.15 s | 0.90 s |
+| `_json_text` of the summary | 1.88 s | 11.10 s |
+
+Two of those did work with no effect:
+- `prune()` of a record naming no image changes nothing and touches no
+  file, but it still ran for every record, building ~4 `Path`s each. About
+  90% of records are like this (9-13% ever enter a rank's held extremes).
+  The loop now skips them.
+- `evaluation_key` built a `Path` only to take `.name`. It now takes the
+  text after the last `/`, and falls back to `Path` for a trailing `/` or
+  `.`. The pruning self-check asserts it equals `Path().name` for eight
+  spellings.
+
+Same probe, with 11% of records naming images, best of 3, evaluations dir
+absent (so in-memory cost only):
+
+| | HEAD 67k | change 67k | HEAD 400k | change 400k |
+| --- | ---: | ---: | ---: | ---: |
+| keep | 0.290 s | 0.086 s | 1.981 s | 0.702 s |
+| prune | 0.926 s | 0.111 s | 5.953 s | 0.906 s |
+
+The pruned records and the keep set hash the same at both sizes. Counting
+keep twice, the finish saves ~1.2 s at 67k and ~7.6 s at 400k. That is
+~0.1% and ~0.3% of those runs' wall clock, too small to see end to end, so
+it is measured by stage only.
+
+**WSClean guard** (shared code): `.probe/r269/ws.sh`, round 268's script
+raced against a HEAD (e619391) worktree on `/dev/shm`:
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 37.62 | 37.63 (+0.0%) |
+| 2 | 37.63 | 37.80 (+0.5%) |
+
+Chains are bit-identical in both pairs. log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms.
+
+**Learned.**
+- The largest remaining end-of-run step is `summary.json`'s JSON encode,
+  11 s at 400k records. Round 197 already moved it to the C encoder. A
+  cheaper form would need to reuse the ranks' record texts, which prune
+  edits for ~10% of records.
+- Rows: bench `r269-w{old,new}{1,2}`, stage `r269-post-run-keep-prune`.
+  Run dirs and the HEAD worktree are deleted. Scripts are in
+  `.probe/r269/`.
+
+## Round 270 (negative probe): `summary.json`'s encode has no cheaper exact form
+
+**Question.** Round 269 left `_json_text` as the largest end-of-run step
+(1.88 s at 67k records, 11.1 s at 400k). Is there a faster way to get the
+same bytes, and how much of it is the Lustre write?
+
+**Method.** `.probe/r270/enc.py`, host `python3.12`, on r263-bigrun's
+`summary.json` (67,058 records, 169 MB, ~2.5 kB a record), two passes each.
+
+| step at 67k records | seconds |
+| --- | ---: |
+| `",\n    ".join(map(json.dumps, records))` (today's body) | 1.56-1.59 |
+| one reused `c_make_encoder`, same separators (identical bytes) | 1.41 |
+| `json.dumps(records)` in one C call (wrong layout, the floor) | 1.35 |
+| `_json_text(summary)`, whole | 1.70 |
+| `_write_text_atomic` of the 169 MB to hpc-work | 0.16 |
+
+**Result.** Negative, nothing shipped. Per-call Python overhead is ~10% of
+the encode; the rest is the C encoder formatting ~30 floats and the path
+strings of each record. Even the wrong-layout single call saves only
+0.2 s, and the write is 0.16 s. A reused encoder would save ~0.15 s a
+67k-record run (~0.01% of its 1,493 s) through a private `json.encoder`
+API. The end of an R2D2 run is now ~2 s of rank-0 work at 67k records
+and grows linearly; only smaller records (e.g. not storing each one's
+`commands`) would shrink it, which changes the summary's content.
+
+No code change, no search; stage row `r270-summary-encode`. Probe in
+`.probe/r270/`.
+
+## Round 271 (negative probe): a lane-parallel PCG64 does not speed up the noise draw
+
+**Question.** Simulate is ~4.6% of an R2D2 evaluation (round 263), and
+round 187 put its noise draw at ~6 ms of a 17 ms call. `fastnoise.c`
+steps PCG64 one word at a time, so each draw waits on the 128-bit
+multiply of the one before. Four chains that each jump 4 positions
+(multiplier `M^4`, increment `inc (1 + M + M^2 + M^3)`) give the same
+word stream with no serial dependency. Is that faster?
+
+**Method.** `.probe/r271/lanes.c` adds `add_normal_f32_lanes()`: fill a
+1,024-word buffer from the four chains, run numpy's ziggurat over it
+(rejection paths read from the buffer too), and at the end jump the
+state forward by the words used. It is checked against today's
+`add_normal_f32()` on the R2D2 path's shape: 500k complex64
+visibilities, `every=4`, real then imaginary half. `gcc -O2
+-ffp-contract=off` as `start-sidecars.sh` builds it, pinned to one
+CPU, best of 20, on three CPUs. `.probe/r271/gen.c` times word
+generation alone.
+
+| step, 4M draws | today | four lanes |
+| --- | ---: | ---: |
+| whole fill (`every=4`, both halves) | 15.57-15.64 ms | 14.87-14.93 ms |
+| word generation only | 8.07-8.08 ms | 4.95-4.96 ms |
+
+The output bytes and the final generator state were identical in every run.
+
+**Result.** Negative, nothing shipped. The lanes cut word generation by
+3.1 ms, but reading from a buffer costs the ziggurat about as much
+again, so the fill is only 4.5% faster: ~0.35 ms of a ~840 ms
+evaluation, about 0.04%. Shipping it would also need a rebuilt
+`meqtrees.sif` (the library is baked in at `/opt/ri-lib`, and
+`start-sidecars.sh` builds a host copy only for images that have none)
+and a WSClean guard. The draw is now bound by the ziggurat's table
+lookup and compare (~1.9 ns a draw), not by the generator. Simulate has
+no bit-identical lever worth a rebuild left.
+
+No code change, no search; stage row `r271-noise-lanes`. Probe in
+`.probe/r271/`.
+
+## Round 272 (negative): a shorter R2D2 pool warm-up is not on a warm start's critical path
+
+**Question.** A fresh 38-rank R2D2 search (HEAD, nlive 48, 5 repeats, 150
+dead) spent 17.8 s of its 48 s before the first replies: all 38 first
+requests ended within 0.7 s of each other at ~17 s, so they were all waiting
+on the pool. How much of the pool's warm-up can go?
+
+**Warm-up, timed in `r2d2.sif`** (`.probe/r272/warm.py`, async defaults,
+warm page cache, three runs):
+
+| step | s |
+| --- | ---: |
+| `warm_imports` total | 8.2-8.3 (13.0 part-cold) |
+| `patch_onnx_network` | 4.9-5.1 (9.7) |
+| of it: 25 file-loaded 1-thread sessions | 1.9 |
+| of it: `ort_shared_parts` (async only) | 2.5-2.9 |
+| `load_checkpoints` | 0.64 |
+| imports (imager, torch) | ~2.5 |
+
+**Probe** (`.probe/r272/parts.py`, diff in
+`.probe/r272/sessions-from-parts.diff`). An async pool loads every optimised
+graph twice: once as file sessions and once as `ort_shared_parts`' aligned
+arrays. Building the 1-thread sessions over those arrays (`add_initializer`,
+as `threaded_session` does) is bit-identical over all 25 nets, runs a forward
+in 17.9 ms against 18.0, and builds in 0.29 s against 1.9 s. File sessions do
+not build faster on threads (1.88 s on 8). `ort_shared_parts` does (1.43 s
+against 2.53 s). Together, `patch_onnx_network` fell to 2.35 s and the
+warm-up to 5.5-6.8 s.
+
+**Search A/B** (interleaved against HEAD in a `/dev/shm` worktree, 38 CPUs,
+same settings, seed 272). The last four arms evicted the weight files from
+the page cache first (`posix_fadvise DONTNEED`, `.probe/r272/evict.py`):
+
+| arm | evals/s | first-wave request, median s | log(Z) |
+| --- | ---: | ---: | --- |
+| old1 | 41.58 | 4.68 | 0.0136886471941661 +/- 0.00420578 |
+| new1 | 42.13 | 4.42 | 0.0136110212808840 +/- 0.00429186 |
+| new2 | 40.70 | 4.65 | 0.0142161030146327 +/- 0.00372652 |
+| old2 | 40.93 | 4.62 | 0.0140562894142729 +/- 0.00372555 |
+| old3 | 39.33 | 4.64 | 0.0137478469470203 +/- 0.00438074 |
+| new3 | 37.45 | 8.86 | 0.0136397427887049 +/- 0.00429189 |
+| cnew1 (evicted) | 35.00 | 11.47 | 0.0138746997916213 +/- 0.00387888 |
+| cold1 (evicted) | 40.59 | 4.69 | 0.0141546376264786 +/- 0.00372602 |
+| cold2 (evicted) | 42.05 | 4.53 | 0.0130829161189566 +/- 0.00484644 |
+| cnew2 (evicted) | 41.92 | 4.68 | 0.0138312213096774 +/- 0.00403914 |
+
+**Learned.**
+- With the page cache warm, the first wave is bound by each worker's own
+  first request (4.0-5.3 s, spread over ~1 s), not by the pool. The pool's
+  warm-up overlaps the ranks' own start-up (mpirun and PolyChord). A 2.8 s
+  shorter warm-up therefore does not show.
+- Two of five new arms had a slow, synchronized first wave (8.9 and 11.5 s),
+  and none of five old arms did. That is unexplained, so nothing ships. The
+  change is a contained diff if a later round can show it helps a
+  genuinely cold node.
+- `posix_fadvise DONTNEED` on the Lustre weight files does evict one file
+  (1.28 s re-read against 0.02 s), but whole-arm evictions did not bring
+  back the 17 s of this round's first search. A true cold start needs a fresh node.
+- Every arm reports the same 6.16 GB worker peak floor, so the pool
+  parent's high-water mark is not set by the duplicate graph copy.
+- The next start-up lever is the worker's ~4 s first request against
+  0.35-0.8 s steady. It is ~0.3% of a 25-minute run on half icelake, but it
+  is paid at every pool restart.
+- log(Z) agrees across all eleven arms (0.0131-0.0142, sigma ~0.004).
+
+Rows: bench `r272-a`, `r272-{old,new}{1,2,3}`, `r272-{cold,cnew}{1,2}` and
+stage `r272-pool-warmup` in `benchmarks.jsonl`. The run dirs and the HEAD
+worktree are deleted. Scripts and gzipped logs are in `.probe/r272/`. Round
+243's ampere job 39544674 still has no output file in `.probe/r243/`.
+
+## Round 273 (fix): the R2D2 pool never saw its thread settings, so multi-thread requests ran torch
+
+**Question.** Round 272 left the worker's ~4-5 s first request (against
+0.35-0.8 s steady) as the next start-up lever. Where does it go?
+
+**First request, split** (one 38-rank search at HEAD, nlive 48, 5 repeats,
+60 dead, seed 273; a temporary cProfile and timestamps in `r2d2_serve.py`,
+reverted). Times are from the first evaluation's start:
+
+| event | s |
+| --- | ---: |
+| run script start (`./ri search`) | -4.1 |
+| R2D2 pool launched / pool's `serve_pool` starts | -2.13 / -1.75 |
+| mpirun starts | -1.77 |
+| first simulate done (median) | 0.97 |
+| pool warm-up done | 4.09-4.38 |
+| workers open their FIFOs (median) | 4.35-4.67 |
+| first wave done (median) | 5.3-5.6 |
+
+The pool's warm-up (imports 3.05 s, `load_checkpoints` 0.60 s,
+`patch_onnx_network` 2.15 s) is on the critical path: every rank finishes its
+first simulate at ~1 s and then waits ~3.3 s for its worker. That corrects
+round 272, which read the first wave as bound by the workers' own requests.
+Inside the worker, the imager's first request takes 0.97 s (median of 39)
+against 0.71 s and 0.63 s for the second and third, of which 0.30 s is
+`create_net_imaging` building the torch U-Net once.
+
+**Two shorter warm-ups that do not work.**
+- Building the ORT sessions on a thread while the main thread imports
+  (`.probe/r273/overlap.py`): the session builds hold the GIL, so the imports
+  go from 2.5 to 5.4 s. Total warm-up 8.7-9.1 s -> 7.7-7.9 s in a probe, only ~1 s.
+- Round 272's `sessions-from-parts.diff` does not change
+  `patch_onnx_network` in a search (2.11-2.15 s against 2.08-2.12 s, 3 + 2
+  arms). That is what led to the bug below.
+
+**The bug.** The pool's environment had `R2D2_OMP_THREADS=None` and
+`R2D2_MAX_THREADS=None`. The run script sets both but does not export them,
+and passes them to the ranks (`RUN_COMMAND`) but not to the pool's
+`sidecar_launch`. So `patch_onnx_network`'s `threaded` was always False:
+no `ort_shared_parts`, `threaded_session` returned None, and every request on
+more than one thread fell back to torch. Round 258's A/B passed
+`R2D2_OMP_THREADS=2` on the command line, which the pool did inherit; a layout
+that the script works out itself (`--mpi-procs 19` on 38 CPUs gives 2 threads)
+or an async tail (`R2D2_MAX_THREADS` 16) never did. Fix: `--env` both into
+the pool.
+
+**A/B** (interleaved against HEAD in a `/dev/shm` worktree, 38 CPUs, nlive 48,
+5 repeats, 150 dead, seed 273):
+
+| arm | layout | evals/s | steady | first request s | median request s | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| h1 (HEAD) | 19 x 2 | 25.51 | 25.51 | 5.74 | 0.635 | 0.0153575051337603 +/- 0.00255244 |
+| n1 (fix) | 19 x 2 | 34.35 | 40.33 | 8.63 | 0.420 | 0.0152459644779766 +/- 0.00245233 |
+| n2 (fix) | 19 x 2 | 37.19 | 43.04 | 8.48 | 0.384 | 0.0152855813971252 +/- 0.00255202 |
+| h2 (HEAD) | 19 x 2 | 25.19 | 25.20 | 5.79 | 0.651 | 0.0153079992492334 +/- 0.00226731 |
+| dn1 (fix) | 39 x 1 | 38.80 | 48.72 | 8.43 | 0.698 | 0.0140892842851275 +/- 0.00365477 |
+| dh1 (HEAD) | 39 x 1 | 42.23 | 42.26 | 5.42 | 0.666 | 0.0136061405528414 +/- 0.00388110 |
+| dh2 (HEAD) | 39 x 1 | 42.06 | 42.12 | 5.25 | 0.696 | 0.0133676241604217 +/- 0.00420792 |
+| dn2 (fix) | 39 x 1 | 39.42 | 49.59 | 8.08 | 0.666 | 0.0138439591513837 +/- 0.00380437 |
+
+**Learned.**
+- 19 x 2 gains +65% in steady evals/s (+42% end to end in these 1-minute
+  arms). Its 2-thread requests now run ONNX Runtime, so their outputs move
+  from torch's to ORT's (within round 144's 1.5e-5 of the peak). log(Z)
+  agrees (0.01525-0.01529 against 0.01531-0.01536, sigma ~0.0025).
+- The default 39 x 1 async layout runs the same per request (median
+  0.67-0.70 s in both arms). Its first request is ~3 s longer (8.1-8.4 s
+  against 5.3-5.4 s) because the pool now builds the ~2.9 GB of shared arrays.
+  That is -7% on these 35 s arms and ~0.2% of a 25-minute run. In exchange,
+  the async tail's multi-thread requests run ORT, not torch, so a request's
+  output no longer depends on how many threads it was given. Its steady
+  figure here (48.7/49.6 against 42.1/42.3) is bench's start-up cut opening
+  a gap for the longer start, not a gain.
+- The next lever is getting that ~3 s back. Round 272's diff (1-thread
+  sessions over the shared arrays, arrays on 8 threads) now applies, since
+  `threaded` is True in a search: standalone it took `patch_onnx_network`
+  from 5.1 to 2.35 s. It needs a search A/B now that the pool really builds
+  the arrays.
+- 19 x 2 at 40-43 steady is still below 39 x 1's ~42-45 in the same
+  allocation, so the default layout stays.
+
+Rows: bench `r273-{h,n,dh,dn}{1,2}` (HEAD rows copied back from the `/dev/shm`
+worktree), the instrumented first-wave runs `r273-a`, `r273-prof`,
+`r273-t{1..4}` and `r273-tl-*`, and stage `r273-pool-thread-env`, all in
+`benchmarks.jsonl`. The run dirs and the HEAD worktree are deleted. Probes
+are in `.probe/r273/`. Change is R2D2-only (`run-nested-sampling-r2d2.sh`),
+so no WSClean guard is needed.
+
+## Round 274 (shipped): the pool's 1-thread sessions come from the shared arrays, which wins back round 273's ~3 s
+
+**Question.** Round 273 made an async pool really build `ort_shared_parts`'
+~2.9 GB of aligned weight arrays, and that put ~3 s on the first request
+(5.3 -> 8.3 s). Round 272's unshipped diff
+(`.probe/r272/sessions-from-parts.diff`) builds the 25 1-thread sessions over
+those same arrays (`add_initializer`) instead of loading every graph file a
+second time, and copies the arrays on 8 threads. Standalone it took
+`patch_onnx_network` from 5.1 to 2.35 s. Does that show in a search now that
+`threaded` is True?
+
+**Change.** `patch_onnx_network`'s `build()` returns both dicts. When
+`threaded`, it builds `ort_shared_parts` on a fresh 8-thread pool (per NUMA
+set, so its threads take the caller's memory policy) and makes the 1-thread
+sessions with the new `parts_session(parts, 1)`, which `threaded_session` now
+uses too. It still loads the file sessions first if any optimised graph is
+missing, since that is what writes them. A run that is not threaded is
+unchanged. `self_check_threaded_session` now also checks that a
+`parts_session(…, 1)` output equals the file session's bit for bit. It passes
+in `r2d2.sif` with the cached onnxruntime, and `./ri self-check r2d2-serve`
+passes.
+
+**A/B** (interleaved against HEAD in a `/dev/shm` worktree, default async
+39 x 1 layout, 38 CPUs, nlive 48, 5 repeats, 150 dead, seed 274; order n1 h1
+h2 n2 n3 h3):
+
+| arm | evals/s | steady | first request s | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| n1 (new) | 41.92 | 41.96 | 5.66 | 8154 | 0.0136331980863233 +/- 0.00412448 |
+| h1 (HEAD) | 41.26 | 52.49 | 8.44 | 9751 | 0.0138136681317998 +/- 0.00388216 |
+| h2 (HEAD) | 39.71 | 50.07 | 8.46 | 9693 | 0.0137530707275181 +/- 0.00388182 |
+| n2 (new) | 42.96 | 42.98 | 5.70 | 8228 | 0.0137982726772110 +/- 0.00388189 |
+| n3 (new) | 41.83 | 41.86 | 5.70 | 8145 | 0.0137093469472998 +/- 0.00396099 |
+| h3 (HEAD) | 39.75 | 50.38 | 8.62 | 9889 | 0.0135728138091944 +/- 0.00404133 |
+
+**Learned.**
+- The first request is back to 5.7 s (8.4-8.6 at HEAD) in all three pairs,
+  just above round 273's pre-fix 5.3-5.4 s. End to end, these 35 s arms gain
+  +4.4% (42.2 against 40.2 mean). That is the ~2.8 s start-up, about 0.2% of
+  a 25-minute run, and paid again at every pool restart.
+- Peak memory drops ~1.6 GB (8.1-8.2 against 9.7-9.9 GB): the pool now holds
+  one copy of the weights, not a file session's copy plus the shared arrays.
+  On a node where `rank-budget.sh` clamps ranks by free memory, that is room
+  for ~4 more ranks at ~0.4 GB each.
+- HEAD's "steady" (50-52) is again bench's start-up cut opening a gap for
+  the longer start (round 273), not a faster steady state. The new arms
+  start fast enough that bench cuts no start-up (`startup_s` 0), so they
+  report steady = end to end. Compare `evals_per_s` and the median request
+  here, not `steady_evals_per_s`.
+- Round 272's two slow first waves (8.9 and 11.5 s) did not recur in three
+  new arms. Round 272 ran when the pool built no shared arrays, so its "new"
+  arms were a different code path from this one.
+- log(Z) agrees (0.01363-0.01380 against 0.01357-0.01381, sigma ~0.004).
+  The sessions are bit-identical to file-loaded ones, so a request's output
+  does not change.
+
+Rows: bench `r274-{n,h}{1,2,3}` (the HEAD rows copied back from the
+`/dev/shm` worktree) and stage `r274-pool-parts-sessions` in
+`benchmarks.jsonl`. The run dirs and the worktree are deleted. Arm logs are
+in `.probe/r274/`. The change is R2D2-only (`r2d2_serve.py`), so no WSClean
+guard is needed.
+
+## Round 275 (negative): the torch U-Net built before the fork does not shorten the first request
+
+**Question.** Round 273 found 0.30 s of a worker's ~0.97 s first imager
+request is `create_net_imaging` building the torch U-Net with Kaiming
+init, which `patch_net_reuse` then caches for later requests. In ONNX mode
+that net is only a wrapper (`OrtNet.torch_net`) and is never run. Does
+building it once in the pool parent, before the fork, take that off every
+worker's first request?
+
+**Change tried.** In `warm_imports`, after `patch_net_reuse`, a CPU pool
+called `create_net_imaging(layers=1, num_chans=64, architecture="unet",
+device=torch.device("cpu"))`, the kwargs `R2D2.__init__` passes (the device
+comes from `set_params` as `torch.device("cpu")`). In `r2d2.sif`
+(`.probe/r275/key.py`), the warmed `_NETS` key is exactly
+`((), [('architecture', 'unet'), ('device', device(type='cpu')),
+('layers', 1), ('num_chans', 64)])`, a second call takes 25 us, and a fresh
+build is 0.13 s solo on one CPU.
+
+**A/B** (interleaved against HEAD in a `/dev/shm` worktree, default async
+39 x 1, 38 CPUs, nlive 48, 5 repeats, 150 dead, seed 275, order n1 h1 h2
+n2 n3 h3, `.probe/r275/run.sh`; node load ~24 from the other half):
+
+| arm | evals/s | first request s | peak MB | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| n1 (new) | 39.54 | 6.22 | 8292 | 0.0134843104196883 +/- 0.00403999 |
+| h1 (HEAD) | 42.30 | 5.88 | 8064 | 0.0130483735695699 +/- 0.00446937 |
+| h2 (HEAD) | 42.34 | 6.18 | 8267 | 0.0135677500605269 +/- 0.00395927 |
+| n2 (new) | 40.99 | 6.15 | 8287 | 0.0125478408807106 +/- 0.00504766 |
+| n3 (new) | 40.70 | 6.04 | 8312 | 0.0126967461270412 +/- 0.00484675 |
+| h3 (HEAD) | 41.82 | 5.86 | 8142 | 0.0135730352971486 +/- 0.00387962 |
+
+**Learned.**
+- No gain: the first request is 6.04-6.22 s against HEAD's 5.86-6.18 s,
+  and end to end the new arms are 2-7% slower in all three pairs (inside
+  the ~5% control span, but never ahead). Reverted.
+- The build does not disappear, it moves: the pool parent's warm-up is
+  on the first wave's critical path (round 273), so 0.13-0.3 s of serial
+  parent work replaces 0.3 s that 38 workers paid in parallel. Pre-fork
+  work only pays when it removes a per-child cost that is larger than its
+  serial cost, or overlaps something already on the critical path.
+- Peak memory is ~100-200 MB higher with the parent's net (8.29-8.31
+  against 8.06-8.27 GB), consistent with children's copy-on-write of the
+  net when `load_net` would touch it, plus the parent's own copy.
+- log(Z) agrees (0.01255-0.01348 against 0.01305-0.01357, sigma
+  ~0.004-0.005); the net's random init never reaches an output in ONNX mode.
+
+Rows: bench `r275-{n,h}{1,2,3}` (HEAD rows copied back from the `/dev/shm`
+worktree) and stage `r275-net-prefork` in `benchmarks.jsonl`. The run dirs
+and the worktree are deleted. `r2d2_serve.py` is unchanged.
+
+## Round 276 (diagnostic): with ORT on 2 threads, 39 x 1 still beats 20 x 2 by ~15%
+
+**Question.** Round 273 found that every multi-thread request had been
+running torch, because the pool never saw `R2D2_OMP_THREADS`. That bug
+affects round 259's sapphire verdict (57 x 2 at -40%: its B arms derived 2
+threads from `NS_MPI_PROCS`, so they ran torch) and round 273's own 1-minute
+19 x 2 arms, which were measured before round 274's faster warm-up. Now that
+2-thread requests really run ONNX Runtime, does a 2-thread layout catch the
+default 39 x 1?
+
+**Method.** Interleaved at HEAD (`935f287`), async, 38 CPUs, `--nlive 48
+--num-repeats 5 --max-ndead 400 --seed 276` (~2.5-3 min arms, so start-up
+is ~3% of an arm), order d1 a1 b1 b2 a2 d2 d3 b3 a3 (`.probe/r276/`). d is
+the default (39 ranks x 1 thread), a is `--mpi-procs 19` (19 x 2, one rank
+is the root, so 18 workers) and b is `--mpi-procs 20` (20 x 2, 19 workers
+on 38 CPUs). The run's `run.env` confirms `R2D2_OMP_THREADS=2` and
+`R2D2_RUNTIME=onnx`. Node load was 50-64 from the other half's tenant.
+
+| arm | layout | evals/s | first request s | image_container ms | peak MB | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| d1 | 39 x 1 | 49.51 | 6.37 | 713.4 | 8223 | 0.0167461843166156 +/- 0.000614087153352181 |
+| a1 | 19 x 2 | 39.37 | 5.98 | 420.4 | 8595 | 0.0172007916576586 +/- 0.000637270747989700 |
+| b1 | 20 x 2 | 40.62 | 5.91 | 442.6 | 8639 | 0.0177522096621114 +/- 0.000676091188338956 |
+| b2 | 20 x 2 | 42.40 | 5.95 | 418.5 | 8454 | 0.0171200723030129 +/- 0.000658224038932077 |
+| a2 | 19 x 2 | 40.23 | 5.86 | 422.4 | 8622 | 0.0172034461573496 +/- 0.000646363348098511 |
+| d2 | 39 x 1 | 49.65 | 6.00 | 715.8 | 8156 | 0.0164851964645636 +/- 0.000661880870174482 |
+| d3 | 39 x 1 | 44.99 | 6.09 | 789.4 | 8188 | 0.0168976680702627 +/- 0.000630527107245824 |
+| b3 | 20 x 2 | 42.35 | 5.92 | 416.9 | 8582 | 0.0176983298165699 +/- 0.000674983156220804 |
+| a3 | 19 x 2 | 42.10 | 5.99 | 395.0 | 8561 | 0.0170989667420389 +/- 0.000634174058605387 |
+
+**Learned.**
+- The default stays. 39 x 1 averages 48.1 evals/s, 20 x 2 41.8 (-13%)
+  and 19 x 2 40.6 (-16%). 39 x 1 wins all three triples, including d3,
+  which ran while the node's load rose to 64.
+- A 2-thread ORT request takes 395-443 ms against 713-789 ms on 1 thread,
+  1.7x for twice the CPUs (0.85 per CPU). Half the workers then lose ~15%.
+  That is the DRAM-bandwidth wall again (rounds 205, 259): the second thread
+  mostly waits on the same weight stream.
+- Round 259's -40% on sapphire overstated the gap, since its 2-thread arms
+  ran torch. With ORT the gap here is -13%, so a re-run on sapphire would
+  still come out for 1 thread. It is not worth a whole-node job.
+- 2-thread arms peak ~350 MB *higher* (8.45-8.64 against 8.16-8.22 GB)
+  despite having half the workers. Each 2-thread worker builds its own
+  multi-thread sessions from `ort_shared_parts`, on top of the pool's 1-thread
+  sessions. So fewer ranks does not buy memory headroom on this path either.
+- log(Z) agrees: 39 x 1 gives 0.01649-0.01690 and 2 thread gives
+  0.01710-0.01775 (sigma ~0.00065). The widest pair, d2 against b1, is
+  1.4 combined sigma. The 2-thread arms sit ~1 sigma higher, as in round 259:
+  async searches with different worker counts take different paths.
+- The first request no longer differs (5.86-6.37 s in every layout), since
+  round 274 removed round 273's extra ~3 s.
+
+No code change. Rows: bench `r276-{d,a,b}{1,2,3}` and stage `r276-layout-ort`
+(every arm's figures and full-precision log(Z)) in `benchmarks.jsonl`. The run
+dirs are deleted, and the arm summary is `.probe/r276/run.out.gz`.
+
+## Round 278 (validation): rounds 263-276 in the production search; log(Z) agrees, 47.5 evals/s
+
+**Question.** Since round 263's validation, the record writer became append
+by default (round 264), resume and finish got faster (rounds 267-269), and
+the R2D2 pool now sees its thread settings and builds its 1-thread ORT
+sessions over shared arrays (rounds 273-274). Do these still converge to
+the same log(Z) in the production search, and at what speed?
+
+**Method.** Round 239's command unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on this job's 38 icelake CPUs,
+`.probe/r278/run.sh`) on `101346b`, node cpu-q-124. Node load was 19 at the
+start and 50-75 for most of the run (round 263: 95-120).
+
+| | round 239 (`d41efab`) | round 263 (`8afee6e`) | round 278 (`101346b`) |
+| --- | ---: | ---: | ---: |
+| evaluations | 70,202 | 67,058 | 75,278 |
+| evals/s (= steady) | 51.2 | 44.9 | 47.5 |
+| request (`r2d2 container`) | 712 ms | 802 ms | 763 ms |
+| simulate | 26.6 ms | 38.7 ms | 33.3 ms |
+| idle | 0.0% | 0.5% | 0.4% |
+| first request | - | 5.61 s | 5.81 s |
+| peak memory | - | - | 8,342 MB |
+| post-run phases (pack) | 21.6 s (14.0 s) | 13.8 s (2.5 s) | 11.6 s (2.6 s) |
+| wrapper wall | 1,427 s | 1,514 s | 1,610 s |
+| files left in the run dir | 711 | 749 | 776 |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.01710037195271 +/- 0.000395823425917893 | 0.0172503990041623 +/- 0.000401752587890735 |
+| ndead, nlike | 1,488, 68,540 | 1,459, 65,526 | 1,457, 73,707 |
+
+**Results.**
+- log(Z) agrees: -0.27 sigma from round 239, +0.27 sigma from round 263 and
+  -0.07 sigma from round 252. No failures, stalls or meqserver wedges in
+  `run.log`. Rounds 263-276 are validated for results.
+- 47.5 evals/s sits between round 239 (51.2, load 120-145 on another node)
+  and round 263 (44.9, load 95-120). Request and simulate time track node
+  load as in round 263, so the speed is consistent with the raced A/Bs of
+  rounds 264-276 and shows no regression. It is 90% of round 205's ~53
+  evals/s DRAM ceiling.
+- The wall is longer (1,610 s) only because this async path drew 12% more
+  evaluations (nlike 73,707 against 65,526-68,540) for the same ndead: the
+  async order differs run to run, as rounds 246 and 248 saw.
+- Append records (round 264): the pack took 2.6 s with every rank's queue
+  at most 2 at the end, as with round 263's coalescing writer, so the
+  durability default cost nothing visible here.
+
+No code change. Rows: bench `r278-bigrun` and stage `r278-validation` in
+`benchmarks.jsonl`. `.probe/r278/` keeps the script, `summary.json`,
+`.stats`, the profile and the gzipped log. The run directory is deleted.
+
+## Round 280 (check, test fix): self-heal and an R2D2 kill -9 + resume at HEAD
+
+**Why.** `./ri self-check self-heal` last ran in round 227. Since then the
+record writer became append by default (round 264), resume and finish
+changed (rounds 267-269) and the R2D2 pool builds its sessions differently
+(rounds 273-274). Round 245's kill covered append records at `ca86dd0`, but
+not `./ri resume` on today's code.
+
+**Self-heal.** At `c425390` it failed in scenario three: "the killed run
+scored nothing to corrupt". The scenario zeroes one `eval-*.json` to show
+that a half-written record cannot end a resume, but with append records a
+run writes `evaluations/records.jsonl` and no flat files. The check was
+stale; the code was fine. `scripts/test_self_heal.sh` now damages the
+pack the way a kill or a full disk does: one record's line is garbled and a
+torn `eval-9999-...` line with no newline is appended. The resume must warn
+`ignoring unreadable <name> in .../records.jsonl`, finish, and leave a pack
+that ends in a whole line with the torn line gone. With
+`NS_RECORD_APPEND=0` it still zeroes a flat record as before. All seven
+scenarios passed in 176 s (WSClean, with the squeue shim).
+
+**R2D2 kill -9 + `./ri resume`.** Round 245's shape (`.probe/r280/kill.sh`:
+async R2D2, seed 242, `--nlive 48 --num-repeats 5 --max-ndead 600
+--mpi-procs 20`). At 120 s, one `kill -9` took the launcher's group and
+every process naming the run dir.
+
+| | |
+| --- | ---: |
+| scored at the kill (log) | 4,800 (4,802 just after) |
+| on disk | 4,802, **0 lost**, 0 processes left |
+| `./ri resume` adopted | 4,802 ("4802 evaluations already done") |
+| resume wall | 114 s (`summary.json`: 104.3 s) |
+| records at the end | 9,081, no duplicate parameters |
+| ndead, nlike | 529, 8,431 |
+| log(Z) | 0.0167740326060257 +/- 0.000738664281660799 |
+
+log(Z) is 0.57 sigma from round 278's production 0.0172503990041623 +/-
+0.000401752587890735 (different nlive, same likelihood). So today's defaults
+meet the durability bar: a mid-search kill loses no records, and the resume
+picks up every one of them.
+
+**Seen, not changed.** A garbled packed line stays in `records.jsonl` after
+the resume (the repack rewrites only names it could read), so later readers
+warn about it again. Unlike a zeroed flat file, it holds no directory the
+sampler could collide with, so it costs only the warning.
+
+Test-only change (no search code, so no WSClean A/B). Stage row
+`r280-kill-resume` is in `benchmarks.jsonl`. The run dir is deleted; script
+and gzipped logs are in `.probe/r280/`.
+
+## Round 287 (feature, first step): `./ri search r2d2 --nodes N` runs one search over several nodes
+
+One node is DRAM-bandwidth bound (round 205), so the next lever is more nodes.
+Until now every search was `--nodes 1`. This round makes a CPU R2D2 search
+able to span N nodes and checks that it finishes correctly. It does not yet
+measure a speedup.
+
+**What the launch can use.** One 2-node probe job (`.probe/r287/probe.sh`,
+2 x 2 tasks on icelake) tested three things:
+
+| question | answer |
+| --- | --- |
+| `srun --mpi=pmix apptainer exec polychord.sif python3` (direct launch, host Slurm PMIx v3) | works: 4 ranks on 2 hosts, 45 us one-way 64-byte ping-pong |
+| the image's own `mpirun` (Open MPI 4.1.4), rsh/ssh to the second node | fails: the remote `orted` never connects back |
+| one Lustre FIFO path opened by a writer on node A and a reader on node B | no connection (writer times out): a FIFO is a pipe on each node by itself |
+
+**Design** (`scripts/run-nested-sampling-r2d2.sh`, opt-in through `NS_NODES`,
+so a single-node search runs exactly the code it ran before):
+
+- `slurm.sh` submits `--nodes N --ntasks-per-node 1 --exclusive`. `ns_expand_hostlist`
+  expands `SLURM_JOB_NODELIST` in bash, because this repo does not call
+  `scontrol` from a job.
+- `--mpi-procs` (or the default sizing) counts ranks per node, and srun
+  deals them out in blocks in nodelist order. The launcher creates every
+  host's FIFOs under `.r2d2-workers/<host>/` and `.simulate-workers/<host>/`.
+  A wrapper on each rank points it at its own host's directory and creates
+  that node's scratch tmpfs, which has the same name on every node
+  (`/dev/shm/ri-ns-scratch-<job>-<run>`).
+- The other nodes' pools are one `srun --overlap` step that runs the same
+  script as `NS_NODE_ROLE=pools`. That run skips the run-dir guards and the
+  run config, starts both pools on its own FIFOs, and holds them until the
+  launcher kills the step at the end. Its logs and `.launcher.pid` go to
+  `.node-<host>/`, so one node's reaper never reads another node's pid.
+- The ranks are `srun --mpi=pmix --kill-on-bad-exit=1`, with
+  `PMIX_MCA_gds=hash`: the image's PMIx printed a `gds_ds12_lock` error
+  against the host's PMIx on every rank. They also set
+  `btl_vader_single_copy_mechanism=none`, because each rank is its own
+  container and CMA cannot cross user namespaces. srun refuses to start if
+  the job's `SLURM_CPUS_PER_TASK` and `SLURM_TRES_PER_TASK` disagree, which
+  happened when Slurm raised `-c 8` to 13 to cover `--mem`, so both are
+  unset for the steps. The pools step takes the node's `SLURM_JOB_CPUS_PER_NODE`.
+
+**Bug found and fixed.** In the first 2-node search, PolyChord finished, and
+then all 8 ranks on the second node died with `FileNotFoundError:
+/dev/shm/ri-chains-<tag>/r2d2_vlaa.stats`. After the Fortran run,
+pypolychord's `run_polychord` reads `<root>.stats` on every rank, but the
+chains tmpfs (round 227) exists only on rank 0's node. srun then cancelled
+the step (exit 143), and the retry hung in the same place. Now
+`polychord_r2d2.py` catches that error only on a non-root rank whose base
+directory has no `.stats` file, and sets `output = None` (only rank 0 uses
+it).
+
+**Check** (2 icelake nodes x 13 CPUs; `--nlive 32 --max-ndead 60 --seed 287`;
+job `.probe/r287/twob.sh`), compared with a single-node search using the same
+settings on this node:
+
+| | 1 node, 16 ranks | 2 nodes, 2 x 14 ranks |
+| --- | ---: | ---: |
+| finished | yes, 20.7 s | yes, 21.6 s, no retry; the pools step is torn down after |
+| evaluations | 218 | 191 (340 lines in records.jsonl, both nodes' ranks) |
+| log(Z) | 0.00555735700481639 +/- 0.0109073752851461 | 0.00290183247440473 +/- 0.0137174585939859 |
+
+log(Z) agrees (0.15 sigma). Both runs are seconds long and their layouts
+differ (13-CPU slices, 14 ranks per node), so the bench rows `r287-1nodeb`
+and `r287-2nodeb` (18.0 against 15.1 evals/s) say nothing about speed.
+
+**Not done yet, next rounds:** a 1 vs 2 whole-node icelake search
+(wall-time speedup, evals/s per node, log(Z)); kill -9 + `./ri resume` on 2
+nodes. Retries need two fixes: `sidecar_reset_workers` globs only
+`.*-workers/*.pid`, so it misses the per-host directories, and the stall
+watchdog's `pkill` reaches only the launcher node's ranks (srun's
+`--kill-on-bad-exit` should take the rest). Also to check: `./ri health`
+and `./ri runs` on a multi-node run.
+
+The single-node path was smoke-tested at this change (`--mpi-procs 8
+--max-ndead 30`, 43 s, finished). Its only code change is that
+`RUN_COMMAND` is now built in three pieces. The other changes are WSClean-inert
+(`NS_NODES` unset): slurm.sh's `--nodes "${NS_NODES:-1}"` and an R2D2-only
+except clause. The slurm self-check, test_cli.py and shellcheck 0.9.0.6 pass.
+
+## Round 288 (measurement): two nodes run a converged R2D2 search in half the time
+
+Round 287 made `./ri search r2d2 --nodes N` work; this round measures it.
+One 2-node icelake job (39603719, 2 x 38 CPUs, `.probe/r288/ab.sh`, nodes
+cpu-q-141/142) ran single-node and 2-node arms back to back, so both see the
+same nodes: `--nlive 150 --num-repeats 15 --seed 288`, the default 39 ranks
+per node, order s1 d1 d2 s2 at `--max-ndead 300`, then one converged 2-node
+search. The single-node arms run on the job's first node only.
+
+| arm | nodes | evals/s | wall s | nlike | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| s1 | 1 | 52.6 | 160.0 | 7236 | 0.0153636807030894 +/- 0.00151323758138805 |
+| d1 | 2 | 102.0 | 53.5 | 4121 | 0.0146976670966879 +/- 0.00205033363394707 |
+| d2 | 2 | 91.9 | 57.3 | 3988 | 0.0145814437135266 +/- 0.00207633957920502 |
+| s2 | 1 | 53.3 | 156.5 | 7164 | 0.0153284322771618 +/- 0.00151296680481375 |
+| conv | 2 | 99.1 | 790.4 | 75427 | 0.0168288512870019 +/- 0.000360325682981326 |
+
+- **Throughput scales.** Two nodes give 1.83x (short arms) to 1.88x
+  (converged, 99.1 against 52.9) one node's evals/s: 49.6 per node, 94% of
+  the single-node rate. The off-root node's simulate stage is a little slower
+  (37.6 ms mean against 31.7 on one node), and the ranks' MPI traffic now
+  crosses the network; neither costs much.
+- **The short arms' wall-time ratio (2.9x) overstates it.** To the same 450
+  dead points the 2-node search made 44% fewer likelihood calls. That is an
+  early-run effect: the converged 2-node search needed 75427 calls for 1690
+  dead, the same as round 278's single-node search (73707 for 1457). Compare
+  multi-node arms by evals/s, or by converged wall time.
+- **Converged:** 790 s against round 278's 1586 s on one half-node (a
+  different seed and node load, so the ratio is approximate: 2.0x). log(Z)
+  0.01683 +/- 0.00036 is 0.78 sigma from round 278's 0.01725 +/- 0.00040.
+
+**Fixes for multi-node runs that this round also ships** (none of them
+changes the single-node path):
+
+- Before a retry, `sidecar_reset_workers` now also kills the pid files in this
+  host's `.<pool>-workers/<host>/` directory. A pid in another host's
+  directory belongs to a process on that host, and is never killed here. It
+  then calls `sidecar_reset_remote` if one is defined. In a multi-node launch,
+  that function writes `.node-<host>/reset` for each other node, and waits up
+  to 30 s for the files to go. The pools step on each node checks for its
+  file once a second (one Lustre stat), resets its own workers, and removes
+  the file. The start-sidecars self-check covers the own-host and other-host
+  cases. The remote half has not yet run in a real retry: that needs a kill -9
+  test on 2 nodes, the next item.
+- `run.env` records `NS_NODES` when it is above 1, so `./ri resume` submits
+  and relaunches on as many nodes. Before this, a 2-node run resumed on one
+  node. The run-config self-check covers both cases.
+
+**Sharp edge seen:** arm s1 ended with exit 2 after the search had finished
+(`unexpected EOF` at line 564). The fixes above were edited into
+`run-nested-sampling-r2d2.sh` while s1's bash was still reading it, and bash
+reads a script as it runs. Its summary was complete, and its bench row was
+added afterwards with `bench.py record`. Never edit a script that a running
+job is executing.
+
+**WSClean guard** (`start-sidecars.sh`, `run-config.sh` and the run script are
+shared): `.probe/r288/ws.sh`, round 269's script raced against a HEAD
+(139345e) worktree on `/dev/shm`, halves swapped by pair:
+
+| pair | HEAD steady evals/s | change |
+| --- | ---: | ---: |
+| 1 | 38.93 | 36.91 (-5.2%) |
+| 2 | 36.56 | 39.59 (+8.3%) |
+
+Mean +1.3%, which is within noise; the sign flips with the CPU half. Chains
+are bit-identical in both pairs, and log(Z) = 0.0967023094179472 +/-
+0.000520957293962581 in all four arms. The changed code runs only on a
+retry, or writes `NS_NODES` only when it is above 1.
+
+Still open: kill -9 plus `./ri resume` on 2 nodes, which would also exercise
+the remote reset; the stall watchdog's `pkill`, which still reaches only the
+launcher node; and `./ri health` / `./ri runs` on a multi-node run.
+
+## Round 289 (fix): a resumed multi-node search deadlocked; kill -9 and resume on 2 nodes
+
+**Why.** Round 288 left kill -9 and `./ri resume` on 2 nodes untested.
+`.probe/r289/kill.sh` runs two scenarios in one 2 x 38-CPU icelake job:
+`--nodes 2 --nlive 150 --num-repeats 15 --seed 289`. In A, one rank on the
+second node is killed mid-search, so `run_with_retries` and the remote worker
+reset run for real. In B, everything on both nodes is killed, and then
+`./ri resume` runs.
+
+**Bug.** The first job (39607545, at `1b7b9a9`) hung in A. The retry worked:
+`sidecar_reset_workers` killed 78 workers on node 1, and node 2 reset its own
+78 from its `.node-<host>/reset` file (`nodes.log`). But after the resume,
+completions ran at 53/s, which is one node's rate. At the finish, only
+workers 1-38 printed PolyChord's closing line, while node 2's 39 ranks sat
+at ~100% CPU in an MPI busy-wait. The cause is that PolyChord tests
+`<base_dir>/<root>.resume` on **every** rank (`resume_file_exists` in
+`nested_sampling.F90`). A rank that finds none runs `GenerateLivePoints`
+while the root resumes. Since round 227, `base_dir` is node tmpfs, and only
+rank 0's `ChainsMirror` seeds it from `<run>/chains`. So every multi-node
+retry and every multi-node `./ri resume` deadlocked. On one node, only a
+rank that tested before rank 0 had finished seeding could hit this.
+
+**Fix** (`polychord_r2d2.py`, `share_resume`). Before `run_polychord`, rank 0
+broadcasts its hostname. When the run resumes, every rank on another node
+whose tmpfs has no `.resume` copies it from `<run>/chains` under its own temp
+name and renames it, so ranks that share a node never read half a file. A
+barrier follows, which also closes the single-node window. Off-root ranks
+remove their tmpfs copy after the run. The self-check covers the copy, and
+the case where a second rank on the same node keeps the first copy.
+
+**After the fix** (job 39611623, `--max-ndead 450`):
+
+| scenario | result |
+| --- | --- |
+| A: kill -9 one node-2 rank at 75 s | retry, both nodes reset 78 workers, rate back to ~210/s, all 77 workers finish, done 78 s after the kill; log(Z) 0.0161040708362379 +/- 0.00148904501854405 (ndead 600, nlike 7304) |
+| B: kill -9 everything on both nodes at 100 s | 0 processes left on either node; `run.env` has `NS_NODES=2`; `./ri resume` comes back on 2 nodes, all 78 ranks resume from 8,152 records, finishes in 70 s; log(Z) 0.0160260937654155 +/- 0.00151697719929362 (ndead 600, nlike 7305) |
+| one node, 20 ranks, nlive 48, kill at 60 s, then resume | 2,104 printed, 2,104 adopted, **0 lost**; log(Z) 0.0170770776413862 +/- 0.000728404530376024 |
+
+A and B agree (0.04 sigma). The single-node smoke search also completes
+(log(Z) 0.0150440460113585 +/- 0.00272563567152167, nlive 48 to 150 dead).
+
+**Found, not fixed: on 2 nodes a kill loses ~10 s of records.** In B,
+10,059 records had been printed at the kill, but only 8,152 were on disk:
+2,007 were lost, or 20%. All ranks `O_APPEND` to one
+`evaluations/records.jsonl` on Lustre, so its locks ping-pong between the two
+Lustre clients. Record-writer seconds over all ranks show it:
+
+| run | ranks | writer record seconds | most queued on one rank |
+| --- | ---: | ---: | ---: |
+| r288 s1/s2 (one node) | 39 | 103 / 101 | 1 / 0 |
+| r288 d1/d2 (2 nodes) | 78 | 3,721 / 3,846 | 46 / 48 |
+| r288 conv (2 nodes, 790 s) | 78 | 59,804 (97% of rank-time) | 574 |
+| r289 A / B resume | 78 | 4,043 / 3,743 | 42 / 46 |
+
+The writer runs off the rank's thread, so this does not cost throughput
+(round 288's 94% per node). It does break the durability bar (a kill must
+lose only a few seconds), and in a long search the backlog could grow
+without bound. The next round should give each node its own pack
+(`records.<host>.jsonl`, with every reader globbing `records*.jsonl`). That
+touches `common.py`, so it needs the WSClean guard.
+
+Also in this round: the `rank-budget.sh` self-check now asserts that a pool
+serving `.<pool>-workers/<host>` is never read as reapable. The run's
+`.launcher.pid` is a pid on the first node, so if the reaper matched such a
+pool on any other node, it would kill a live one.
+
+No shared runtime code changed (`polychord_r2d2.py`, plus a self-check line
+in `rank-budget.sh`), so there is no WSClean A/B. Stage row `r289-kill` is in
+`benchmarks.jsonl`, and the run dirs are deleted.
+
+Pending, not read here: round 243's GPU A/B (39544674, batched TRT lanes) has
+finally started on gpu-q-10, at `1b7b9a9` plus this round's diff. Its rows
+`r243-*` (W1, A1-3, B1-3, C1-2) land in `benchmarks.jsonl` and
+`.probe/r243/ab-39544674.out`, for the next round to read.
+
+## Round 290 (fix): one record pack per node on multi-node runs; round 243's GPU A/B read
+
+**Why.** Round 289 showed that on 2 nodes, every rank `O_APPEND`ing one Lustre
+`evaluations/records.jsonl` cost ~37x one node's writer time, and a kill -9
+lost 20% of the printed records.
+
+**Change.** The multi-node launcher (`run-nested-sampling-r2d2.sh`, the
+srun wrapper that already picks each node's FIFOs) now sets
+`NS_RECORD_PACK=records.<host>.jsonl`, so each node's ranks append to their
+own pack (`_append_record` in `common.py`). Every reader takes the node packs
+first and then `records.jsonl`, which wins: `_read_record_pack`, `./ri health`
+(`packed_records`), `./ri runs`, the progress bar and `test_self_heal.sh`. The
+finish (`pack_finished_run`) and a resume (`adopt_completed_evaluations`)
+fold the node packs into `records.jsonl` under its lock, fsync, and then
+unlink them. No rank appends at either point. The run's own 15 s packer
+passes `fold_nodes=False`, because unlinking a pack another node is still
+appending to would lose its records. A single-node run never sets
+`NS_RECORD_PACK` and writes exactly as before. The `common.py` resume
+self-check covers the node-pack write, the read, the packer leaving it
+alone, a torn line, the fold on resume and on finish, and the run pack
+winning over a stale node line. The progress-bar fixture now splits its
+packed names across both kinds of pack.
+
+**Result** (job 39615438, 2 x 38 icelake, round 289's scenarios and seed:
+`--nodes 2 --nlive 150 --num-repeats 15 --seed 289 --max-ndead 450`):
+
+| | round 289 (one shared pack) | round 290 (node packs) |
+| --- | ---: | ---: |
+| unkilled: writer record seconds, all 78 ranks | 3,743-4,043 | 1,204 |
+| unkilled: most queued on one rank | 42-48 | 1 |
+| unkilled: evals/s | 102.0 / 91.9 (round 288) | 102.8 (steady 103.5) |
+| kill -9 of everything at 100 s: printed / on disk | 10,059 / 8,152 | 8,946 / 8,254 |
+| records lost | 2,007 (20%, ~19 s) | 692 (7.7%, ~6 s) |
+
+After the kill, `./ri resume` came back on 2 nodes, read 8,254 records from
+the two node packs, folded them into `records.jsonl` (none were left
+afterwards), and finished in 77 s. Full-precision evidence: unkilled
+0.0165143033200384 +/- 0.00113325543911799 (ndead 600, nlike 11398); killed
+and resumed 0.016176300802068 +/- 0.00150869829396101 (ndead 600, nlike 7402).
+These agree (0.18 sigma), and both agree with round 289's A/B.
+
+The loss is now ~3x smaller, but it is not yet one node's 0. Writer time is
+still ~12x one node's (~100 s for 39 ranks), even though no file is shared
+across nodes any more. So the remaining cost is not file-lock ping-pong.
+Candidates are the cluster-wide `flock` (each `LOCK_SH`/`LOCK_UN` is an MDS
+round trip on Lustre with `-o flock`) and the two clients sharing the
+evaluations directory. The next step is to time one append on each node.
+
+**WSClean guard** (`.probe/r290/ws.sh`, HEAD `b3ec3d9` in a `/dev/shm`
+worktree raced against this tree on swapped CPU halves): steady evals/s
+40.58 / 41.23 at HEAD against 41.14 / 40.53 (-0.15%, noise). Chains are
+md5-identical, and log(Z) is 0.0967023094179472 in all four arms.
+
+**Round 243 read** (job 39544674, one A100 on gpu-q-10, shared TensorRT,
+`--nlive 48 --num-repeats 5 --max-ndead 600 --seed 4242`; rows `r243-*`):
+
+| arm | steady evals/s | evals/s | startup s | log(Z) |
+| --- | ---: | ---: | ---: | --- |
+| A, 19 x 2 (default), x3 | 91.0 / 90.2 / 96.9 | 79.2 / 77.8 / 79.2 | 9.3-9.9 | 0.01860-0.01904 |
+| B, 33 x 1, x3 | 86.2 / 94.1 / 89.2 | 72.5 / 80.6 / (B3 wall unreadable, 0.07 s) | 9.0-9.2 | 0.01864-0.01905 |
+| C, 33 x 1, gathered batches of 8 on 4 lanes, x2 | 139.6 / 110.4 | 101.8 / 88.6 | 27.7-33.9 | 0.01864-0.01915 |
+
+Gathered batching (C) is +35% steady and +20% end to end over the default,
+with 0 s of stalls against ~8.5 s. Its startup is ~20 s longer (the
+batch-profile TensorRT plan). All log(Z)s agree within their ~0.0006 errors.
+Two arms are too few to change the GPU default. The next GPU step is a
+longer, converged C-against-A pair.
+
+## Round 291 (measurement): the record writer waits for the GIL, not for Lustre
+
+Round 290 left multi-node writer time at ~12x one node's, and named the
+cluster-wide `flock` as a suspect. This round times one append directly on
+this node (icelake, 38 CPUs, a scratch file in the repo's `results/` on RDS
+Lustre mounted `-o flock`). The probe scripts are inline in the round's
+transcript, and nothing they wrote was kept.
+
+**One append, 38 processes appending to one file, 200 each at 50 Hz:**
+
+| append | mean ms | median ms | max ms |
+| --- | ---: | ---: | ---: |
+| `flock` SH + `write` + `flock` UN (production) | 0.15-0.44 | 0.13-0.44 | 2.1 |
+| `write` only | 0.05 | 0.04 | 4.7 |
+
+The lock costs 0.1-0.4 ms. A real run's writer spends ~12 ms per record on one
+node (round 288 s1: 103 writer-seconds for 8,426 records) and ~86 ms on two
+(round 290: 1,204 s for 13,962). So neither the lock nor the syscall accounts
+for writer time.
+
+**The same append, made by a one-thread executor as in `_submit_record_job`,
+30 processes, 100 appends each:**
+
+| main thread | with `flock` | `write` only |
+| --- | ---: | ---: |
+| idle (waiting on the job) | 0.14 ms | 0.09 ms |
+| spinning pure Python (holds the GIL) | 14.88 ms | 4.90 ms |
+
+Each blocking call in the job (`flock`, `write`, `flock`) releases the GIL.
+Getting it back from a thread that holds it costs up to the 5 ms switch
+interval. Three calls make ~15 ms, which is one node's measured ~12 ms per
+record.
+
+**PolyChord never releases the GIL.** `_pypolychord.cpython-311-*.so` in
+`polychord.sif` (pypolychord 1.22.3) references no `PyEval_SaveThread`,
+`PyEval_RestoreThread` or `PyGILState_*` symbol. So while a rank is inside
+`run_polychord`'s Fortran, which is all the time it spends outside the
+likelihood callback (MPI waits for the root's next point), the GIL is held
+and the writer thread cannot run at all. It runs only when the callback
+blocks with the GIL released (the pool FIFO read). On two nodes the MPI waits
+cross the network and are longer, so the queue waits longer too. That is the
+likely cause of round 290's 692 records lost on a kill -9.
+
+**What follows (next round):** append on the rank's main thread at the end of
+the callback. That costs 0.1-0.4 ms against a ~750 ms evaluation (39 ranks at
+~52 evals/s), and leaves no queue for a kill to lose. The off-thread writer
+was built for flat-file creates (~50 ms, round 95), not for appends. Dropping
+the `flock` on node packs would also save two of the three GIL round trips.
+Nothing truncates a node pack while ranks append to it (only the finish and a
+resume fold them, and no rank writes then). Either change needs a 2-node A/B
+of writer seconds, evals/s and kill loss, plus the WSClean guard, because it
+touches `common.py`.
+
+**Pending:** a 4-node icelake scaling job (39616258, `.probe/r291/scale.sh`:
+arms of 1, 2, 4, 4, 2 and 1 nodes, `--nlive 300 --num-repeats 15 --max-ndead
+600 --seed 291`, with the root rank's CPU sampled every 10 s) had not started
+after 25 minutes in the queue. It runs whatever scripts are in the tree when
+it starts, so no script it executes may be edited while it is running. Read
+`.probe/r291/scale-39616258.out` next round.
+
+## Round 292 (negative, opt-in): appending records inline stops the kill loss but costs ~4%; `--nodes N` below the allocation fixed
+
+Round 291 proposed that each rank append its record on its own thread at the
+end of the callback, because `_pypolychord` holds the GIL and starves the
+writer thread. `NS_RECORD_INLINE=1` does that in `write_evaluation_record`.
+If a publish job is still queued, the record waits behind it on the thread as
+before, so a record never lands before its detail. The `common.py` self-check
+covers both paths. This round measured it on 2 icelake nodes (job 39618487,
+`.probe/r292/inline.sh`, `--nodes 2 --nlive 150 --num-repeats 15 --seed 289
+--max-ndead 450`, ABBA):
+
+| arm | records | evals/s | steady evals/s | record writer-seconds | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| a1 thread | 14,191 | 81.5 (cold start) | 106.36 | 2,455 | 0.0164705 ± 0.00113 |
+| b1 inline | 13,512 | 99.06 | 99.43 | 243 | 0.0165418 ± 0.00115 |
+| b2 inline | 14,042 | 100.65 | 101.70 | 388 | 0.0165872 ± 0.00110 |
+| a2 thread | 14,016 | 103.87 | 104.15 | 2,420 | 0.0165838 ± 0.00116 |
+
+- **Kill loss is gone.** Inline, with kill -9 of everything at 100 s, the log
+  had printed 7,827 records and 7,906 were on disk, so none were lost (the
+  log lags the packs). Round 290 lost 692. `./ri resume` folded both node
+  packs and finished, with log(Z) 0.0162592 ± 0.00145.
+- **But inline appends block the rank.** For inline arms, "writer-seconds" is
+  time on the rank's own thread: 243-388 s over 78 ranks and ~125 s, which is
+  18-28 ms a record and 2.5-4% of rank time. Round 291's microbenchmark
+  predicted 0.1-0.4 ms. Steady evals/s is 4.5% lower on the mean (pairs:
+  -6.5%, -2.3%). That is near the ~5% noise floor, but it agrees with the
+  blocked time, so it is probably real. So `NS_RECORD_INLINE` is opt-in
+  (default off). The 2-node default stays round 290's per-node pack on the
+  writer thread, which loses ~6 s of records on a kill.
+- **Next:** find out where the 18-28 ms goes. The three blocking calls
+  (`flock`, `write`, `flock`) each give up the GIL, and getting it back from
+  another Python thread costs up to the 5 ms switch interval. The likely
+  holders are the publish thread and the progress and watchdog threads, or
+  else Lustre itself under load. Nothing truncates a node pack while ranks
+  append (only the finish and a resume fold it), so dropping the `flock` on
+  node packs would leave one call instead of three. Retry inline after that
+  change.
+
+WSClean guard (common.py changed): HEAD raced against this tree on this
+node, with halves swapped. Steady evals/s was 40.31/41.22 at HEAD against
+41.15/40.63 with the change. Chains are md5-identical, and log(Z) is
+0.0967023094179472 in all four arms.
+
+**Bug fixed: `--nodes 2` inside a larger allocation died at once.**
+Round 291's 4-node job ran its `--nodes 2` arms in a 4-node allocation, and
+both exited with status 141 within 0.4 s.
+`ns_expand_hostlist "$SLURM_JOB_NODELIST" | head -n "$NS_NODES"` let `head`
+exit early, which sent SIGPIPE to the expansion, and pipefail made that the
+script's exit status. It reproduces in a plain shell: 200 loops of a
+400-host list through `head -n 2` exit with 141. `ns_expand_hostlist` now
+takes an optional count and stops itself, and the `slurm.sh` self-check
+covers it with a 4,000-host list.
+
+**4-node scaling, partial (job 39616258, `--nlive 300 --num-repeats 15
+--max-ndead 600 --seed 291`):**
+
+| arm | nodes | evals/s | steady evals/s | evaluations | nlike | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| n1a | 1 | 53.01 | 54.98 | 21,510 | 20,298 | 0.0168612 ± 0.00067 |
+| n4a | 4 | 169.44 | 196.88 | 11,131 | 8,124 | 0.0160311 ± 0.00104 |
+| n4b | 4 | 189.04 | 195.39 | 11,148 | 8,218 | 0.0160980 ± 0.00110 |
+
+At 4 nodes, steady evals/s is 3.57x one node (89% per-node efficiency). The
+2-node arms hit the bug above. The 4-node runs needed 40% of the likelihood
+calls and half the evaluations that one node needed for the same `ndead`.
+log(Z) agrees within 0.6σ, but the halved call count is not understood yet;
+check it next round before quoting wall-time speedups. n1b was still running
+when this was written. Read the end of `.probe/r291/scale-39616258.out`.
+
+One more sharp edge, from this round: `./ri resume` in the inline job exited
+with status 2 after it had written `summary.json`. The cause was this round
+editing `run-nested-sampling-r2d2.sh` while that job was still executing it,
+and bash reads a script as it runs ("unexpected EOF" at line 566). The
+search itself was intact. Never edit a script that a running job executes.
+
+## Round 293 (measurement): more ranks per live point cost PolyChord evaluations; 4-node scaling corrected
+
+Round 292 left one thing unexplained. At `--max-ndead 600`, 4-node R2D2 needed
+40% of one node's likelihood calls (nlike 8,124 against 20,298). That run's
+late arm finished afterwards: n1b had nlike 19,838 and log(Z)
+0.0167115 ± 0.00067, the same as n1a. This round reproduced the effect without
+R2D2. It used pypolychord from `polychord.sif` with a 6-d Gaussian
+(σ 0.1 in the unit cube, analytic log(Z) -8.301), a 3 ms sleep for the
+likelihood, `num_repeats` 15 and oversubscribed `mpirun` on this node
+(`.probe/r293/toy.py`).
+
+At `max_ndead` 600 and nlive 300, nlike falls with the rank count: 21,983
+(8 ranks), 20,330 (38), 18,326 (77) and 14,327 (157). So the 4-node gap is
+PolyChord's, and the reason is truncation. A worker slices inside the
+contour it was handed, and that contour has risen by the time it returns.
+With many workers in flight, each dead point is cheaper but compresses less.
+Run to convergence, the sign flips:
+
+| nlive | ranks | workers/nlive | nlike (seeds 1, 2) | vs fewest ranks | ndead |
+| ---: | ---: | ---: | --- | ---: | --- |
+| 300 | 8 | 0.02 | 302,771, 306,085 | - | 4,784, 4,834 |
+| 300 | 38 | 0.12 | 318,165, 323,659 | +5.5% | 5,024, 5,071 |
+| 300 | 77 | 0.25 | 334,616, 342,538 | +11% | 5,307, 5,460 |
+| 300 | 157 | 0.52 | 369,142, 371,081 | +22% | 5,875, 5,928 |
+| 1200 | 38 | 0.03 | 1,239,017, 1,243,482 | - | 19,635, 19,660 |
+| 1200 | 157 | 0.13 | 1,287,895, 1,296,153 | +4.1% | 20,421, 20,553 |
+
+The overhead depends on workers/nlive, not on the rank count alone (157
+ranks cost +4.1% at nlive 1200 and +22% at nlive 300). It is about
+0.4 x workers/nlive. log(Z) errors are unchanged (0.131-0.136 at nlive 300,
+0.068 at 1200), and every log(Z) lies within ~1σ of -8.301 (full precision in
+the `r293-ranks-vs-nlive` row of `benchmarks.jsonl`).
+
+**What this means for multi-node R2D2.** Round 292's 4-node 3.57x is in
+evals/s. At nlive 300 (155 workers, ratio 0.52), a converged search needs
+~16% more evaluations than one node (ratio 0.13), so the time to converge
+improves ~3.1x, not 3.57x. Round 288's converged 2-node result (1,586 to
+790 s, with 77 workers at nlive 300) already includes this overhead. The
+cure is cheap, because memory does not depend on nlive: raise `--nlive` with
+`--nodes`. `run-nested-sampling-r2d2.sh` now warns on a multi-node launch
+whenever workers x 4 > nlive, and suggests an nlive that keeps the overhead
+under ~10%. Single-node runs are unchanged (no warning, no behaviour change),
+so no WSClean guard was needed. `docs/cluster.md` states the rule.
+
+Benchmarks that stop at a fixed `--max-ndead` and compare different rank
+counts are biased by this effect. Compare them in evals/s, or run them to
+convergence.
+
+## Round 294 (negative): dropping the flock on node packs makes inline appends cheaper but no search faster
+
+Round 292 left a lever: each multi-node record append took a shared `flock`
+on its node pack, and `flock`, `write` and unlock each release and retake
+the GIL, which `_pypolychord` holds through PolyChord's MPI waits (round 291).
+Nothing truncates a node pack while ranks append to it (only a finish or a
+resume folds it), so the lock guards nothing there. This round skipped it for
+node packs and raced the change on 2 icelake nodes (job 39622959,
+cpu-q-243/244, `--nodes 2 --nlive 150 --num-repeats 15 --seed 289
+--max-ndead 450`, arms in ABCCBA order so that linear drift cancels):
+
+| arm | path | flock | steady evals/s | record seconds, all ranks | log(Z) |
+| --- | --- | --- | --- | --- | --- |
+| A | writer thread | yes (HEAD) | 114.7, 115.3 | 1,904, 1,928 | 0.016509 ± 0.00115, 0.016632 ± 0.00111 |
+| B | writer thread | no | 108.5, 113.6 | 1,859, 867 | 0.016556 ± 0.00113, 0.016509 ± 0.00115 |
+| C | inline (`NS_RECORD_INLINE=1`) | no | 106.9, 108.5 | 186, 51 | 0.016622 ± 0.00107, 0.016538 ± 0.00106 |
+
+(a1's 86.7 overall evals/s carries a 39 s start-up; its steady rate is the
+comparable one.)
+
+- Inline appends got cheaper. Without the lock a record costs the rank
+  3.7-12.7 ms of its own thread, against round 292's 18-28 ms with it.
+- No arm got faster. The writer thread without the lock (B) is 3.5% below
+  A, inside its own 5% spread, and inline (C) is still 3-6% below the writer
+  arms. Inline's 51-186 record-seconds are 0.5-1.9% of the ~9,700
+  rank-seconds in an arm, so append time alone does not explain inline's
+  loss. Something else on that path costs it (e.g. the rank waiting on its
+  queued publishes before an inline append, or noise between arms on 2
+  nodes).
+- Kill -9 of everything at 100 s with C: 10,380 records printed and 10,629
+  on disk (0 lost). `./ri resume` finished in 83 s with log(Z)
+  0.0161405 ± 0.00156, which agrees.
+- WSClean guard (single node, so the change did not touch its path; HEAD
+  raced against the working tree, halves swapped): 41.2/40.4 against
+  40.6/41.2 evals/s, log(Z) 0.09670 ± 0.00052 in all four.
+
+The code change was reverted. Inline stays opt-in and node packs keep the
+lock. Removing the lock gave no verified speed gain, so it is not worth the
+extra branch. Full-precision log(Z) is in the `r294-flock` row of
+`benchmarks.jsonl`. Next for multi-node: compare evals/s per node at a
+production-shaped nlive (≥ 4 × workers, round 293) rather than keep shaving
+the record path, which is now below the 2-node noise floor.
+
+## Round 296 (measurement, opt-in): per-node evals/s at production nlive; batched record appends
+
+**Evals/s per node at production-shaped nlive** (job 39625275, submitted in
+gnhf 295 and read here; icelake cpu-q-[210-211], `--num-repeats 15 --seed
+295 --max-ndead 600`, ABCCBA):
+
+| arm | nodes | nlive (workers/nlive) | steady evals/s | per node | log(Z) |
+| --- | --- | --- | --- | --- | --- |
+| A | 2 | 150 (0.51) | 95.0, 110.6 | 47.5-55.3 | 0.016875 ± 0.00062, 0.016833 ± 0.00060 |
+| B | 2 | 640 (0.12) | 98.9, 99.8 | 49.4-49.9 | 0.016421 ± 0.00076, 0.016485 ± 0.00078 |
+| C | 1 | 640 (0.06) | 52.5, 51.6 | 51.6-52.5 | 0.016740 ± 0.00070, 0.016667 ± 0.00071 |
+
+- At nlive 640 two nodes give 95% of one node's evals/s per node. Round
+  292's 3.57x on 4 nodes is consistent with that.
+- These runs stop at a fixed `--max-ndead`, so per round 293 their nlike and
+  wall times are biased between rank counts. Only evals/s is compared here.
+- Under a loaded Lustre the default record writer fell far behind. At the
+  finish there were still 11,085 of a2's 23,279 records queued across ranks
+  (5,348 in b2, 1,078 in single-node c2), and a2's post-run took 390 s
+  (drain 146, flush 180, summary 64). A kill -9 at that point would lose
+  every queued record, so on a loaded Lustre the default misses the
+  durability bar on both 1 and 2 nodes.
+
+**Batched appends** (`NS_RECORD_BATCH=1`, `common.py`). A record job now
+appends every line queued when it runs, in one write, as round 247 did for
+the flat writer. It stops at the first line whose detail is still queued for
+publishing; that line's own job runs after the publish and appends it. A
+line already covered by a queued job gets no job of its own. The A/B (job
+39634194, same nodes, `--nodes 2 --nlive 320 --max-ndead 300 --seed 296`,
+ABBA) ran the first version, which still queued one job per record:
+
+| arm | steady evals/s | record jobs queued at finish (max on one rank) | log(Z) |
+| --- | --- | --- | --- |
+| A, HEAD path | 90.0, 100.2 | 1,350 (44), 1,871 (53) | 0.015827 ± 0.00171, 0.015861 ± 0.00172 |
+| B, batched | 83.5, 87.9 | 131 (4), 105 (4) | 0.015810 ± 0.00173, 0.015802 ± 0.00170 |
+
+- The backlog at the finish fell 10-18x, and the queued counts for B are an
+  upper bound: they count jobs, and many of those were no-ops whose lines an
+  earlier batch had already written. 3,876 and 3,759 of B's ~4,900 lines
+  went out in batches.
+- B's steady evals/s was lower in both pairs (mean -10%). The 2-node spread
+  is ~5% (round 294) and the arms were short (~60 s of sampling), so this is
+  not settled, but the batching cannot ship as the default against it.
+- WSClean guard (cpu-q-140, HEAD in a /dev/shm worktree raced against this
+  tree on swapped halves): 29.6/36.8 against 35.9/36.9 evals/s, log(Z)
+  0.09670 ± 0.00052 in all four. The HEAD arm writes its records to tmpfs,
+  so writer seconds are not comparable between the two arms.
+
+What ships: the batched path as opt-in, in its second version (one job per
+batch, not per record). In that path the post-run line counts queued lines.
+The default path is HEAD's, and the self-check covers the batch order, the
+publish barrier and the job count. Next: a longer 2-node ABBA of HEAD
+against `NS_RECORD_BATCH=1` (v2) at nlive ≥ 4 × workers, reading both
+steady evals/s and the backlog, plus a kill -9 under load. If it holds
+evals/s, make it the default. Full-precision log(Z) is in the `r295-nlive`
+and `r296-batch` rows of `benchmarks.jsonl`.
+
+## Round 297 (measurement): batched record appends cost no evals/s in longer arms
+
+Round 296's open question was whether `NS_RECORD_BATCH=1` (now one job per
+batch) costs steady evals/s. Job 39641599 (cpu-q-210/211) ran the longer A/B:
+`--nodes 2 --nlive 320 --num-repeats 15 --seed 297 --max-ndead 1000` (the
+search ran to ndead 1,320, ~7 min of sampling per arm, ~40,000 evaluations),
+ABBA. nlive 320 is above 4 × 75 workers (round 293).
+
+| arm | steady evals/s | records queued at finish (max on one rank) | post-run drain s | log(Z) |
+| --- | --- | --- | --- | --- |
+| a1, HEAD path | 104.0 | 2,711 (62) | 2.8 | 0.016938 ± 0.000390 |
+| b1, batched | 103.3 | 339 (11) | 0.0 | 0.016914 ± 0.000379 |
+| b2, batched | 101.2 | 2,167 (77) | 0.6 | 0.017030 ± 0.000392 |
+| a2, HEAD path | 100.1 | 31,601 (529) | 184.9 | 0.016984 ± 0.000389 |
+
+- Steady evals/s means are A 102.0 and B 102.3. Round 296's -10% for
+  batching came from ~60 s arms running the job-per-record version and does
+  not reappear here. Batching costs nothing measurable.
+- Within each pair the batched arm had the smaller backlog at the finish:
+  8x smaller in the first pair and 15x in the second. a2 ran while Lustre
+  was loaded: 31,601 of its 42,466 records (74%) were still queued at the
+  finish and its drain took 185 s, the round 296 failure again but larger.
+  b2 was also loaded (2,167 lines), so batching does not remove the backlog
+  under load. It does shrink it by an order of magnitude.
+- log(Z) agrees across all four arms within 0.3σ. nlike was 38,313,
+  37,978, 37,194 and 39,259.
+- The arms took 7-8 min each, ndead 1,320 for `--max-ndead 1000`. A first
+  submission at `--max-ndead 1600` (job 39639944) ran ~15 min per arm and
+  was cancelled before a1 finished, because it would have overrun the 1 h
+  limit.
+
+**Kill -9 + resume found a multi-node bug.** The same job then started a
+batched search, killed every process on both nodes at 150 s and ran
+`./ri resume`. The search was still generating live points (357 records
+printed, none on disk; the writer was behind on a Lustre loaded enough to
+leave a2 with 31,601 queued). The resume died at its first evaluation with
+`OSError: [Errno 39] Directory not empty` renaming
+`/dev/shm/ri-ns-scratch-39641599-r297-k/eval-0001-…` into `.held/`. On
+multi-node runs the scratch is named after the job and run, not the launch
+(`run-nested-sampling-r2d2.sh`), and only the EXIT trap removes it. A
+kill -9 skips the trap, so a resume in the same job with the same seed
+finds the killed attempt's held directories under the same evaluation
+names. In production the next job has a new id, but `run_with_retries` and
+`./ri self-check self-heal` relaunch inside the job. Round 294's resume
+passed only because nothing had been held yet.
+
+Fix: the launch on every node removes the named scratch before creating
+it. No other search can own that directory, because `ns_refuse_live_run`
+refuses a live `OUTPUT_DIR`. shellcheck and `test_cli.py` pass. A re-run
+(job 39648108, `--max-ndead 400`, fresh nodes cpu-q-186/187) did not
+exercise the collision: start-up passed 150 s, so the kill came before any
+evaluation was scored. Its `./ri resume` in the same job finished (exit 0,
+log(Z) 0.015956 ± 0.00134, ndead 720, 7,858 records). The single-node
+scratch is per launch (`start-sidecars.sh`, `$$`), so single-node and
+WSClean runs never reach this line.
+
+Open: 357 printed against 0 on disk at the kill is a durability failure,
+but this round cannot tell whether it is batch-specific or the loaded-Lustre
+backlog that a2 shows on the default path. Next: a 2-node A/B kill -9 at a
+fixed number of scored evaluations (wait for N lines, not a fixed time), for
+both writers, then `NS_RECORD_BATCH=1` as the default if batch loses no more
+than the default does (WSClean guard needed, since `common.py` is shared).
+Full-precision log(Z) for every arm is in the `r297-batch` row of
+`benchmarks.jsonl`.
+
+## Round 298 (default): batched record appends; the scratch fix proven end to end
+
+Round 297 left two things open: a kill test at a fixed evaluation count for
+both record writers, and an end-to-end check of the stale-scratch fix. Job
+39649817 (cpu-q-589/590, `--nodes 2 --nlive 320 --num-repeats 15 --seed 298
+--max-ndead 400`) started each search, waited until the log had printed at
+least 3,000 scored evaluations, killed every process on both nodes with
+kill -9, then ran `./ri resume` in the same job.
+
+| arm | killed at | printed at kill | on disk | stale `.held/` dirs (node 1 / 2) | resume | log(Z) |
+| --- | --- | --- | --- | --- | --- | --- |
+| k0, `NS_RECORD_BATCH=0` | 128 s | 3,006 | 3,011 | 1,381 / 1,505 | exit 0, 130 s | 0.016014 ± 0.00136 |
+| k1, `NS_RECORD_BATCH=1` | 53 s | 3,061 | 3,079 | 1,422 / 1,493 | exit 0, 136 s | 0.016065 ± 0.00131 |
+
+- Neither writer lost a record. The packs held more lines than the log had
+  printed, because the log lags. Lustre was quiet in this job, so the kill
+  did not test round 297's loaded case. There, batching left 8-15x fewer
+  records queued.
+- Both resumes ran over thousands of the killed attempt's held scratch
+  directories on each node and finished. That is the collision that killed
+  round 297's resume, so the fix in `run-nested-sampling-r2d2.sh` is now
+  proven end to end. The two log(Z) values agree within 0.03σ.
+- The kill times differ (128 s against 53 s) because the first search
+  warmed each node's caches. That is why the kill waits for a count and not
+  a time.
+- WSClean guard (cpu-q-140, the same tree with `NS_RECORD_BATCH` 0 against
+  1, raced on swapped halves): 26.7/34.7 evals/s against 26.8/34.7, and
+  log(Z) 0.0967023 ± 0.00052 with nlike 4,004 in all four arms.
+
+What ships: `NS_RECORD_BATCH=1` is the default (`common.py`), and
+`NS_RECORD_BATCH=0` brings back one record job per record. The evidence is
+round 297 (no evals/s cost, an order of magnitude smaller backlog under
+load) plus this round (no extra kill loss, a flat WSClean guard). The
+host-runnable self-checks and `test_watchdogs.py` pass. Full-precision log(Z)
+is in the `r298-kill` row of `benchmarks.jsonl`.
+
+## Round 299 (check): batched record appends on one node; the GPU gathered-batch pair submitted
+
+Rounds 297-298 measured `NS_RECORD_BATCH=1` on 2 nodes and on WSClean, but
+not on a single-node CPU R2D2 search, the most common production shape. This
+round raced both writers on swapped 19-CPU halves of this allocation
+(cpu-q-140; 20 ranks a side, async, `--nlive 80 --num-repeats 5 --max-ndead
+300 --seed 299`, `.probe/r299/cpu.sh`).
+
+| pair | arm | steady evals/s | evals/s | post-run flush s | log(Z) |
+| --- | --- | ---: | ---: | ---: | --- |
+| 1 | b0 (one write per record) | 24.06 | 22.27 | 0.7 | 0.01603 ± 0.00141 |
+| 1 | b1 (default, batched) | 24.44 | 22.26 | 25.6 | 0.01755 ± 0.00082 |
+| 2 | b0 | 22.88 | 21.72 | 4.1 | 0.01736 ± 0.00084 |
+| 2 | b1 | 22.86 | 22.86 | 3.7 | 0.01690 ± 0.00099 |
+
+- Steady evals/s means 23.47 (b0) against 23.65 (b1), +0.8%, well inside
+  the ~5% band. Batching costs a single node nothing, as on 2 nodes.
+- log(Z)s agree within their errors. An async search is not bit-identical
+  run to run, so agreement is the test here.
+- Pair 1's 25.6 s flush is not the writer's: flush moves the kept extreme
+  evaluations from `/dev/shm` to Lustre, and pair 2's batched arm took 3.7 s.
+  It is Lustre noise on one arm.
+- Neither arm queued more than a few records at the finish (Lustre was
+  quiet), so this says nothing new about the loaded case.
+
+`docs/cluster.md` and `docs/robustness.md` now describe the batched default
+and round 298's 2-node kill instead of round 290's ~6 s loss.
+
+GPU: job 39651057 (one A100, `.probe/r299/ab.sh`) is round 243's open
+question, the converged pair of gathered TensorRT batching (C: 33 x 1,
+`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`) against the shared default (A: 19 x 2)
+at `--nlive 128` (≥ 4 x workers, round 293) in ACCAAC order. It had not started
+by the end of this iteration. The next round reads
+`.probe/r299/ab-39651057.out`. Full-precision log(Z) for the CPU arms is in
+the `r299-cpu-batch` row of `benchmarks.jsonl`.
+
+## Round 302 (validation): rounds 287-299 in the production search; log(Z) agrees, 60.2 evals/s
+
+**Question.** Since round 278's validation, multi-node support, the
+`/dev/shm` scratch fix (round 297) and batched record appends (round 298
+default) changed shared code. Does the single-node production search still
+converge to the same log(Z), and at what speed?
+
+**Method.** Round 239's command unchanged (seed 190182240, nlive 150, 15
+repeats, async, to convergence, 39 ranks on 38 icelake CPUs) on `3cc4f25`.
+Rounds 300 and 301 started it inside the gnhf job and were cut off before it
+finished, so this round ran it as its own 1-node icelake job (39652782,
+`.probe/r300/run.sh`, node cpu-q-577). Node load was 7.7 at the start and
+57-68 at the end.
+
+| | round 239 (`d41efab`) | round 278 (`101346b`) | round 302 (`3cc4f25`) |
+| --- | ---: | ---: | ---: |
+| evaluations | 70,202 | 75,278 | 72,286 |
+| evals/s | 51.2 | 47.5 | 60.2 |
+| steady evals/s | - | 47.5 | 62.8 |
+| request (`r2d2 container`) | 712 ms | 763 ms | 598 ms |
+| simulate | 26.6 ms | 33.3 ms | 29.2 ms |
+| idle | 0.0% | 0.4% | 0.5% |
+| first request | - | 5.81 s | 50.5 s |
+| peak memory (bench row) | - | 8,342 MB | 14,735 MB |
+| post-run phases (pack) | 21.6 s (14.0 s) | 11.6 s (2.6 s) | 12.9 s (2.4 s) |
+| wrapper wall | 1,427 s | 1,610 s | 1,260 s |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.0172503990041623 +/- 0.000401752587890735 | 0.0172602493141394 +/- 0.000402502115363966 |
+| ndead, nlike | 1,488, 68,540 | 1,457, 73,707 | 1,438, 70,887 |
+
+**Results.**
+- log(Z) agrees: -0.25 sigma from round 239 and +0.02 sigma from round 278.
+  `run.log` has no stalls or meqserver wedges. Rounds 287-299 are validated
+  for results on one node.
+- 60.2 evals/s (62.8 steady) is 27% above round 278 and above round 205's
+  ~53 evals/s "DRAM ceiling". The request time fell from 763 to 598 ms with
+  no code change to the U-Net path since round 278, so this is the node,
+  not the tree: the job started on a nearly idle node (load 7.7, against
+  19-75 for round 278 and 95-145 for rounds 239/263). Round 205's ~53 is a
+  weights-only bandwidth estimate (165 GB/s) taken on a busy node, so it is
+  not a hard ceiling on a quiet one. Absolute evals/s across nodes says
+  nothing about a change; only raced A/Bs do.
+- Cold-node start-up: every rank's first request took ~48 s (38
+  evaluations over 10 s, all in the first wave), against 5.8 s in round 278,
+  which ran on the gnhf node where the SIFs and checkpoints were already in
+  page cache. On a fresh node this costs ~45 s of the whole search once
+  (start-up 50.2 s in the bench row), ~4% of a 20-minute search and nothing
+  in a long one.
+- Peak memory reads 14.5-15.5 GB in every evaluation (median 14.9 GB),
+  against 8.3 GB in round 278. It is flat from the first evaluation to the
+  last, so it is a different baseline on this node or job, not growth
+  during the search. The cause was not investigated; it is within the
+  job's allocation.
+- Batched records: every rank's queue was at most 2 at the finish and the
+  pack took 2.4 s.
+
+No code change. Rows: bench `r300-bigrun` and stage `r302-validation` in
+`benchmarks.jsonl`. `.probe/r300/` keeps the script, the gzipped
+`summary.json`, `run.log` and console log, `.stats` and the profile. The
+run directory is deleted.
+
+GPU job 39651057 (`.probe/r299/ab.sh`) had still not started by the end of
+this round; the next round reads `.probe/r299/ab-39651057.out`.
+
+## Round 303 (negative): a fresh node's slow start is not the SIFs, so reading them first does not help
+
+**Question.** Round 302's job reported a ~48 s first request on a fresh node,
+against 5.8 s on the warm gnhf node. Where does that time go, and does reading
+`polychord.sif`, `meqtrees.sif` and `r2d2.sif` into the page cache first (16
+threads, 64 MB chunks, as round 217 did for TensorRT) hide it?
+
+**Probes** (three 1-node icelake array jobs; short search: nlive 48, 5 repeats,
+150 dead, seed 4303, 39 ranks). Each node is fresh only for the first search
+it runs. A second task that lands on the same node is a warm control.
+
+| measurement, fresh node | cold | warm |
+| --- | ---: | ---: |
+| `polychord.sif`: `import numpy, mpi4py, pypolychord` | 20.55 s | 0.64 s |
+| `meqtrees.sif`: `import numpy` | 7.46 s | 0.70 s |
+| `r2d2.sif`: `import torch` | 28.02 s | 2.92 s |
+| run script setup before `mpirun` (gnhf node, `bash -x` trace) | - | ~3 s |
+
+**A/B** (job 39656343, tasks alternating `NS_PREFETCH_SIFS` 0/1. The flag
+was a background reader in `run-nested-sampling-r2d2.sh` that started right
+after `ns_require_sifs`):
+
+| node | state | prefetch | first evaluation after launch | first-wave request | log(Z) |
+| --- | --- | --- | ---: | ---: | --- |
+| cpu-q-186 | fresh | off | 14.18 s | 25.55 s | 0.0136166 ± 0.00438 |
+| cpu-q-187 | fresh | on (3 SIFs) | 15.00 s | 24.71 s | 0.0143624 ± 0.00373 |
+| cpu-q-186 | warm | off | 3.06 s | 8.40 s | 0.0140516 ± 0.00404 |
+| cpu-q-187 | warm | on | 3.18 s | 8.00 s | 0.0139358 ± 0.00404 |
+
+Earlier probes agree. With the SIFs and onnxruntime's libraries read by hand
+first (cpu-q-498), the first-wave request was 24.05 s. After cold imports
+(cpu-q-245), it was 23.36 s. On the warm gnhf node, the first evaluation
+started 3.0-4.4 s after launch and the first-wave request took 4.3-5.1 s.
+
+**Learned.**
+- A fresh node costs ~25-30 s once: ranks start ~11 s later, and the
+  first-wave request takes ~17 s longer. A second job on the same node starts
+  warm. The cache that matters is the node's own, and it outlives the job.
+- Reading the SIF files first changes neither number, although single cold
+  imports from those images take 7-28 s. The cold reads that matter are
+  somewhere other than the SIF files' page cache. The likely place for the
+  first request is the pool's 8.7 GB weight read (checkpoint weights plus
+  optimised ONNX graphs), which `prefetch_weights` already parallelises
+  (round 228). Ranks starting ~11 s late are a separate, unexplained cost.
+  The probe did not split either one further.
+- In-node eviction (`posix_fadvise DONTNEED` on `r2d2.sif`) cannot reproduce
+  a cold start. `import torch` took 2.6 s with the file evicted and with it
+  cached (`.probe/r303/siftest.py`). Only a fresh node measures this.
+- The cost is ~2% of a 20-minute search and is paid once per node per job,
+  in parallel across the nodes of a multi-node search. It is not worth more
+  rounds unless searches get much shorter.
+- log(Z) agrees across all 13 short searches (0.0135-0.0144, sigma ~0.004).
+
+The flag is reverted; no code change. Rows: bench `r303-warm*`, `r303-local-pf`,
+`r303-pft{0..3}`, `r303-c2t{0,1,2}` and `r303-cold{0,1}`, plus stage
+`r303-cold-start`, in `benchmarks.jsonl`. Scripts, console logs and outputs
+are in `.probe/r303/`. All run directories are deleted.
+
+GPU job 39651057 (round 299's TensorRT pair) had been pending for over an
+hour. It was cancelled and resubmitted as job 39654485 (`.probe/r303/ab.sh`),
+which runs on a frozen worktree of `dffbf8d`
+(`../frozen-r303`), so this tree can be edited again while the job waits.
+Its output goes to `.probe/r303/ab-39654485.out`, and its bench rows go to
+`.probe/r303/bench-rows.jsonl`. Remove the frozen worktree
+(`git worktree remove ../frozen-r303`) once that file shows DONE.
+
+## Round 304 (docs only): "Where it stands" brought up to round 303
+
+The status block at the top of this file still described round 266, and it
+still called round 205's ~53 evals/s the one-socket ceiling, which round
+302's 60.2 evals/s on a quiet node disproved. The block now opens with a
+summary of rounds 266-303: the round 302 validation, multi-node search and
+its rules (rounds 288, 289, 290, 293, 298), the start-up findings (rounds
+273, 274, 276, 303), the faster resume and finish (rounds 267, 268), and
+the pending GPU pair. The ceiling line says it was a busy-node estimate.
+Every anchor in the block was checked against this file's headings. No code
+changed, no search ran, and there is no `benchmarks.jsonl` row. The GPU
+pair (job 39654485, `.probe/r303/ab.sh`) still has no output file at 19:45
+on 29 Oct.
+
+## Round 305 (check, test fix): every CI "Checks" step at HEAD; job-env's base-OS case is emptied
+
+With the GPU pair still queued (job 39654485, no output file at 19:48 on
+29 Oct), this round ran every step of `ci.yml`'s "Checks" job on this node
+with Slurm off `PATH`, through `uv run --no-project python3` as CI does (the
+system `python3` here is 3.6 and fails every script at `from __future__ import
+annotations`). `resume-nested-sampling-run.sh --self-check` was skipped, as
+the run rules ask. Every step passed except one:
+`scripts/lib/job-env.sh --self-check` failed with "the base OS alone must
+pass the check", because the shell that ran it exported
+`LOCALE_ARCHIVE_2_27=/nix/store/...` (a nix-portable login). That case ran
+`env -u NS_SCRATCH_DIR`, so it inherited every other variable from the
+caller. A real job never does that, because `job-env.sh` empties its
+environment with `env -i`. The case now runs under `env -i`, with only
+`PATH=/usr/bin:/bin` and the self-check's own `RI_JOB_*` settings. It passes
+from the Nix login shell and from `env -i`, and shellcheck 0.9.0.6 is clean.
+The negative cases above it, including the Nix-store binary, still fail the
+check as they should. No search ran, the run scripts' behaviour is
+unchanged (only a self-check changed), and there is no `benchmarks.jsonl`
+row.
+
+## Round 306 (fix): the benchmark ledger keeps multi-node searches out of 1-node cells
+
+With the GPU pair still queued (job 39654485, no output file at 19:52 on
+29 Oct), this round checked how `./ri bench` files multi-node searches,
+which are now the CPU lever for wall time. A row's group is its imager,
+preset, machine and `WORKLOAD_KEYS` settings. Its `NS_MPI_PROCS` comes from
+run.env, which holds the per-node count (39). `NS_NODES` was not a key,
+although run.env has named it on every multi-node run since round 288. So a
+2-node row at 39 ranks per node landed in the same cell as a 1-node row, and
+the table printed one median for both. At the same commit, three cells were
+mixed:
+
+| commit | rows | 1 node (median) | N nodes (median) | pooled median shown |
+| --- | --- | ---: | ---: | ---: |
+| 139345e (round 288) | s1, s2 / d1, d2 | 53.0 | 96.9 (2) | 72.6 |
+| ca3ab3c (round 291) | n1a / n4a, n4b | 53.0 | 179.2 (4) | 169.4 |
+| 0e0976f (round 295) | c1, c2 / b1, b2 | 49.0 | 61.1 (2) | 50.4 |
+
+The figures are evals/s, and every one of these cells mixed workloads that
+differ by 2-4x. `NS_NODES` is now a workload key in `scripts/bench.py`. A
+single-node run.env does not name it (`run-config.sh --self-check` asserts
+this), so every 1-node cell, past and future, keeps its group. The bench
+self-check now asserts that a 2-node row and a 1-node row with the same
+per-node `NS_MPI_PROCS` get different group keys, and it fails with the key
+removed. The 29 multi-node rows already in `benchmarks.jsonl` were backfilled
+with their node count, taken from each round's `.probe/<round>/*.sh`:
+`NS_NODES` "2" for r287-2nodeb, r288-d1/d2/conv, r290-c, r292-*, r294-*,
+r295-a1/a2/b1/b2, r296-* and r297-*, and "4" for r291-n4a/n4b. The diff
+adds only that key, and `./ri bench` now prints those cells with
+`nodes=2` or `nodes=4`. `docs/nested-sampling-benchmarks.md` notes the key.
+No search ran and the run scripts did not change, so no WSClean guard was
+needed.
+
+## Round 307 (analysis, guidance fix): the async overhead is a fixed ~0.4 x workers live points, so a bigger nlive never buys speed
+
+**Question.** Round 293 measured that a converged async search with more
+workers needs more evaluations, ~0.4 x workers/nlive more, and its launcher
+warning and `docs/cluster.md` advised raising `--nlive` with `--nodes` to keep
+that "under ~10%". Does raising nlive reduce the cost, or only its share?
+
+**Method.** No search ran. A least-squares fit of
+`nlike = k x nlive + c x workers` to round 293's twelve converged toy runs
+(nlive 300 and 1200; 8, 38, 77 and 157 ranks), then the same model against
+R2D2's converged production search (seed 190182240, nlive 150, 15 repeats):
+seven 38-rank runs (rounds 230, 231, 233, 239, 252, 278, 302: nlike 68,540 to
+80,834, mean 73,773, sd 4,101) and round 255's whole sapphire node (112
+workers, nlike 87,360).
+
+**Results.**
+- Toy: k = 1021 evaluations per live point, c = 417 per worker, so
+  c/k = 0.41. Every one of the twelve runs is within 2.1% of the fit, both
+  nlive values included. The extra evaluations are a fixed ~0.41 x workers
+  live points' worth, independent of nlive: at 157 ranks, nlive 300 costs
+  ~62k more evaluations than at 8 ranks, and nlive 1200 ~50k more for 119
+  more workers, the same per worker.
+- R2D2: k = 444 from the 38-rank mean predicts 88,219 for 112 workers;
+  round 255 measured 87,360 (-1.0%, inside the 38-rank runs' 5.6% sd). The
+  toy's coefficient carries over to the real likelihood.
+- So the converged cost is `k x (nlive + 0.41 x workers)` and the time to
+  converge goes as `nlive/workers + 0.41` at a fixed per-worker rate. Raising
+  nlive from 300 to 620 for 155 workers (round 293's advice) costs ~88% more
+  evaluations to remove a 21% share. A bigger nlive buys precision and never
+  wall time. The overhead puts a floor under wall time: workers beyond a few
+  times nlive add little.
+
+Speedup over one node of 39 ranks, from the fit alone (time to converge;
+real runs also lose round 288/292's 5-11% per-node rate):
+
+| nlive | 2 nodes | 4 nodes | 8 nodes |
+| ---: | ---: | ---: | ---: |
+| 150 | 1.85x | 3.16x | 4.88x |
+| 300 | 1.93x | 3.54x | 6.04x |
+| 600 | 1.98x | 3.78x | 6.93x |
+
+Round 288's converged 2-node pair (nlive 300, 1,586 to 790 s, 2.01x) is
+above the 1.93 x 0.94 the fit predicts, but its 1-node arm ran on a busier
+node, so it does not contradict the fit.
+
+Not settled: whether the extra dead points also buy precision. Round 255's
+log(Z) error (0.000371) is ~9% below the 38-rank runs' 0.000401-0.000411,
+which matches an effective nlive of ~180. The toy's errors did not move
+(0.131-0.136 at 8 and 157 ranks), so one R2D2 run cannot decide it.
+
+**Change.** The multi-node warning in `run-nested-sampling-r2d2.sh` keeps its
+threshold (workers x 4 > nlive) and its estimate. It no longer suggests a
+larger nlive: it says a larger `--nlive` adds evaluations and is for
+precision only. `docs/cluster.md` gives the time-to-converge rule and the
+table above instead of "at least 4x the total ranks". The message text is all
+that changed. Single-node launches never reach it, so no WSClean guard was
+needed. shellcheck 0.9.0.6 is clean. Row: stage `r307-async-overhead-fit` in
+`benchmarks.jsonl`.
+
+## Round 308 (measurement): the async overhead's extra dead points buy no measured precision
+
+**Question.** Round 307 left one thing open: a converged search with many
+workers runs ~0.41 x workers more live points' worth of evaluations. Is that
+pure cost, or does it buy precision like a larger nlive? If it bought
+precision, a multi-node search could lower `--nlive` and keep the same
+precision, and multi-node scaling at equal precision would be close to linear.
+
+**Method.** No R2D2 search ran. Round 293's toy (`polychord.sif`'s
+pypolychord, 6-d Gaussian with σ 0.1 in the unit cube, analytic log(Z)
+-8.3018, `num_repeats` 15, 3 ms sleep, run to convergence) was run 80 times
+per arm (seeds 101-180) under oversubscribed `mpirun` on this allocation,
+three runs at a time (`.probe/r308/run.sh`, `ana.py`). nlive 30 makes
+workers/nlive large (2.5 for B), so any effect is big. The error is the
+empirical rms of log(Z) about the analytic value, not PolyChord's estimate.
+
+| arm | ranks | nlive | ndead | nlike | rms of log(Z) - truth | bias | reported error |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| A | 8 | 30 | 530 | 33,542 | 0.353 ± 0.028 | +0.051 | 0.411 |
+| B | 77 | 30 | 934 | 56,673 | 0.405 ± 0.032 | -0.004 | 0.395 |
+| C | 8 | 50 | 852 | 53,943 | 0.363 ± 0.029 | -0.019 | 0.324 |
+
+- B runs 76% more dead points than A (round 307's fit predicts 1021 x
+  (30 + 0.41 x 76) = 62k evaluations; it measured 57k at this extreme
+  ratio). If they counted like live points, B's rms would be about
+  0.353 x sqrt(530/934) = 0.27. It measured 0.405, 1.2σ *above* A and 4σ
+  above that prediction. The extra dead points buy no measured precision.
+- PolyChord's own error estimate credits B a little (0.395 against 0.411),
+  as it did round 255's 112-worker R2D2 search (~9%). That estimate is not
+  borne out here.
+- Caveat: C (nlive 50) is not measurably more precise than A either
+  (0.363 against 0.353, where sqrt(H/nlive) with H = 5.3 predicts 0.33
+  against 0.42). At nlive 30-50 this toy's scatter does not follow the
+  textbook scaling, so 80 seeds cannot show a precision gain of either kind.
+  What the data do rule out is B being better than A.
+
+**Decision.** No change. Round 307's reading stands: the async overhead is
+a cost, and multi-node speedups at equal precision are the round 307 table
+(e.g. 1.85x for 2 nodes at nlive 150), not linear. Lowering `--nlive` on
+multi-node runs to compensate is not supported by evidence. The stale
+"raise `--nlive` with `--nodes`" advice in "Where it stands" is corrected.
+Row: stage `r308-async-precision` in `benchmarks.jsonl`, with every arm's
+log(Z), error, ndead and nlike.
+
+
+## Round 309 (tooling, re-reading): `./ri bench` prints the rate a converged search progresses at
+
+**Question.** Round 307 found that a converged async search needs
+nlive + 0.41 x workers live points' worth of evaluations. So raw evals/s
+favours more ranks, and the ledger had no column that compares rank counts
+or node counts fairly. Round 293 had already warned that short fixed
+`--max-ndead` arms are biased this way.
+
+**Change.** `scripts/bench.py` now prints a `converging evals/s` line under
+`steady evals/s`. It is the steady rate (the raw rate for rows that have no
+steady rate) times nlive / (nlive + 0.41 x workers), where workers =
+`NS_MPI_PROCS` x `NS_NODES` - 1, since PolyChord's root does not evaluate.
+It is computed when the table is read, so every existing async row gets it.
+Synchronous rows and rows without `NS_NLIVE` or `NS_MPI_PROCS` get none. The
+self-check pins the formula on round 288's 2-node row and on the synchronous
+case. This is a table-only change: no search, run script or shared code
+changed, so no WSClean guard was needed.
+
+**What it says about earlier decisions** (steady evals/s, means of three
+arms each):
+
+| layout | raw (nlive 48 arms) | converging at nlive 48 | at 150 | at 300 |
+| --- | ---: | ---: | ---: | ---: |
+| 39 x 1 thread (round 276) | 48.06 | 36.28 | 43.54 | 45.69 |
+| 20 x 2 threads | 43.04 | 37.03 | 40.92 | 41.95 |
+| 19 x 2 threads | 41.80 | 36.23 | 39.84 | 40.79 |
+
+- Round 276's 39 x 1 default still wins at the production nlive of 150, but
+  by +6.4% over 20 x 2, not the +11.7% the raw rates give. At the nlive 48
+  the bench arms used, the layouts tie. The default stands. The lesson is
+  that rank-layout A/Bs at bench nlive overstate the gain from more ranks.
+- Round 288's 2-node search: steady 99.17 gives 81.93 converging, against
+  47.7-48.3 for its 1-node arms, so 1.71x per converged search at
+  nlive 150. Round 307's table predicted ~1.85x before the per-node rate
+  loss. The 1,586 s to 790 s (2.0x) in round 288 compares against round
+  278's slower 1-node run (47.5 evals/s on a busier node), not against
+  r288-s1/s2.
+
+Row: stage `r309-converging-rate` in `benchmarks.jsonl`. GPU job 39654485
+(round 303's pair) still had no output at ~20:50 on 29 Oct.
+
+## Round 310 (docs only): agent guidance no longer says `--nlive` is free
+
+`AGENTS.md`, which every agent session loads, still said "raise `--nlive`
+freely" and that R2D2 throughput follows the rank x thread product (the old
+20-CPU Docker host's 15 x 2 beating 20 x 1). Both now contradict CSD3
+measurements: round 307 showed a converged search needs evaluations in
+proportion to nlive + 0.41 x workers, round 308 that the extra ones buy no
+precision, and rounds 276 and 309 that 39 x 1 beats 20 x 2 here, by +6.4% at
+the production nlive once judged on converging evals/s. The entry now says
+`--nlive` is a precision choice that costs time, and that rank or layout
+A/Bs are judged on `converging evals/s` at nlive 150.
+`docs/nested-sampling.md`'s "`NS_NLIVE` is free" bullet became "costs no
+memory", with the same time caveat. "Where it stands" now points at
+round 309's table line.
+
+No search ran and no code changed. GPU job 39654485 (round 303's pair, frozen
+worktree `../frozen-r303`) still had no output at ~20:40 on 29 Oct.
+
+## Round 311 (diagnostic): most of async PolyChord's overhead is chains that return below the contour
+
+**Question.** Rounds 293 and 307 measured that a converged async search needs
+~0.41 x workers live points' worth of extra evaluations, but not where they
+go. The epochs in `nested_sampling.F90` change only when clusters change, so
+it is not chains discarded by epoch. In PolyChordLite `370f6af`,
+`replace_point` (`run_time_info.f90`) puts a returned chain's final point
+into the live set only if it is above the *current* minimum live logL.
+Otherwise the point is filed as a dead point with `logzero` weight, and the
+whole chain is wasted. A worker's chain was seeded at the contour of its
+dispatch, and the other workers have raised that contour by the time it
+returns. Is this where the overhead goes?
+
+**Method.** Round 308's 6-d Gaussian toy (`.probe/r311/toy.py`, num_repeats
+15, 3 ms sleep, nlive 150, converged, seeds 1-3) at 9, 39 and 77 ranks
+(8, 38 and 76 workers), on this node in ~2 minutes. `t_dead-birth.txt` is
+in `RTI%dead` order, so a wasted point is one whose logL is below the running
+maximum of the dead points before it (`.probe/r311/waste.py`). This is a lower
+bound: a point between that maximum and the live minimum is missed.
+
+| workers | ndead | wasted (below contour) | wasted share | ndead - wasted | nlike | nlike vs 8 workers | round 307 predicts |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 2,424.7 | 41.7 | 1.7% | 2,383.0 | 153,410 | - | - |
+| 38 | 2,676.0 | 247.0 | 9.2% | 2,429.0 | 168,925 | +10.1% | +10.4% |
+| 76 | 2,928.3 | 487.3 | 16.6% | 2,441.0 | 184,352 | +20.2% | +20.8% |
+
+**Learned.**
+- 82% (38 workers) and 88% (76 workers) of the extra dead points over 8
+  workers are chains whose final point came back below the contour. The
+  useful dead points barely move (2,383 -> 2,441). Round 307's
+  0.41 x workers overhead is almost all of this one mechanism, and the
+  remainder is within the lower-bound undercount.
+- On the production R2D2 search (38 workers, nlive 150, ~49 evaluations per
+  chain at ~0.6 s each) that is ~9% of all evaluations. On two nodes it is
+  ~17%, and on four nodes ~29%.
+- The lever is in PolyChord, not this repo: a worker that adopts the newest
+  contour between slice steps, whenever its current point is above it,
+  wastes only the contour's movement during its last step. Every step is
+  still a valid slice step for the constrained prior it uses, so the
+  estimator keeps PolyChord's usual chain approximation. The cost is a
+  PolyChord patch: the administrator sends its minimum logL to the workers
+  after each replacement, and the workers check for it with `MPI_Iprobe`
+  in `slice_sampling`. The changed chains mean log(Z) can only agree within
+  error, not bit for bit, so the patch has to be validated against the
+  toy's analytic log(Z) over many seeds (round 308's method) and then on
+  R2D2. That is the next round's work. The alternative, using a returned
+  chain's last intermediate point that is still above the contour, is not
+  pursued: those points are correlated with the seed, which biases the
+  evidence.
+
+No code change. Stage row `r311-async-waste` in `benchmarks.jsonl`. Scripts
+and results are in `.probe/r311/`. GPU job 39654485 (round 303's pair) still
+had no output at ~20:45 on 29 Oct.
+
+## Round 312: a PolyChord patch that adopts the newest contour mid-chain cuts async evaluations 14% (38 workers) and 22% (76) with unbiased log(Z)
+
+**Correction to round 311 first.** Rounds 308 and 311 ran the toy with
+pypolychord's default `synchronous=True`, while every search here is async
+(`NS_SYNCHRONOUS=0`). Re-run async (`.probe/r312/toy.py` sets it from
+`TOY_SYNC`, default async), the waste is about twice as large: chains
+returning below the contour are 4.4% of dead points at 8 workers, 18% at 38
+and 29% at 76 (seeds 1-3, nlive 150). Async nlike is 160k / 184k / 211k against
+round 311's synchronous 153k / 169k / 184k. Round 308's precision result was
+measured in synchronous mode too.
+
+**Change.** `docker/polychord/patches/0001-adopt-newest-contour-mid-chain.patch`,
+applied by `docker/polychord/Dockerfile` to PolyChordLite `370f6af` and hashed
+into the image's build inputs. It is opt-in: `PC_ADOPT_CONTOUR=1` and async MPI
+only. After each replacement the administrator `MPI_Isend`s every worker its
+cluster's current contour (a worker whose previous send is still in flight is
+skipped). Between slice steps, `SliceSampling` drains those messages with
+`MPI_Iprobe` and raises its slice contour to the newest one when its current
+point is already above it. `catch_seed` skips contour messages queued ahead of
+a seed or stop signal, and the administrator `MPI_Waitall`s them after the
+stop signals go out. Unset, nothing is sent and serial (np 1) output is
+bit-identical to stock: log(Z) -8.15870627279788, nlike 50987 for both.
+
+**Method.** 6-d Gaussian toy (analytic log(Z) -8.3019), async, nlive 150,
+num_repeats 15, sleep 3 ms, converged. Seeds 101-140 per arm at 39 and 77
+ranks, four runs at a time on this node (~13 min for 160 runs).
+
+| arm | ranks | log(Z) - truth | rms | ndead | wasted | nlike | nlike vs stock |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| stock | 39 | +0.019 +/- 0.030 | 0.187 | 2,960.5 | 528.8 | 184,704 | - |
+| v1 (adopt on entry) | 39 | **-0.081 +/- 0.033** | 0.222 | 2,577.7 | 131.3 | 158,409 | -14.2% |
+| v2 (shipped) | 39 | -0.013 +/- 0.026 | 0.165 | 2,573.4 | 137.7 | 158,204 | **-14.3%** |
+| stock | 77 | +0.024 +/- 0.033 | 0.209 | 3,419.0 | 977.9 | 211,751 | - |
+| v1 (adopt on entry) | 77 | **-0.088 +/- 0.026** | 0.185 | 2,724.2 | 268.0 | 162,472 | -23.3% |
+| v2 (shipped) | 77 | -0.010 +/- 0.026 | 0.160 | 2,741.4 | 296.1 | 164,645 | **-22.2%** |
+
+**Learned.**
+- v1 remembered a contour the point was below and adopted it once the chain
+  climbed into it. That is a hitting-time rule: the point enters the new
+  region at its boundary and has too few steps left to mix away from it, so
+  new live points sit too low and log(Z) came out ~0.1 low (~3.5 sigma over
+  both arms, half a run's reported error). v2 adopts a contour only when it
+  arrives and the point is already inside it. Then the point is a draw from
+  the old region conditioned on the new one, which is uniform on the new one.
+  Its bias is -0.01 +/- 0.026 in both arms, and its rms is no worse than stock.
+  40 seeds rule out a v2 bias above ~0.05 (2 sigma).
+- The saving is the waste removed: useful dead points (ndead - wasted) are
+  ~2,435 in every arm, and wasted chains fall from 18% to 5% (38 workers)
+  and from 29% to 11% (76). Every evaluation of a dead chain is time on a
+  real search, so for production R2D2 (38 workers, async) v2 should cut a
+  converged search's evaluations by ~14% on one node and ~22% on two.
+- Not shipped as a default. It needs a polychord.sif rebuild (Docker host,
+  then `./ri images export`/`import`), `PC_ADOPT_CONTOUR` passed into the rank
+  environment, and a converged R2D2 search with log(Z) agreeing against
+  round 302 before it becomes the default. Results agree within error, not
+  bit for bit, because the chains change.
+
+Stage row `r312-adopt-contour` in `benchmarks.jsonl`; toy, sweep scripts and
+per-seed results in `.probe/r312/`. GPU job 39654485 (round 303) still had no
+output at ~21:05 on 29 Oct.
+
+## Round 313: the contour patch in a converged R2D2 search: log(Z) agrees, dead points -11%, evaluations -6% (one run)
+
+**Change.** `scripts/run-nested-sampling-r2d2.sh` passes `NS_ADOPT_CONTOUR`
+(default 0) to every rank as `PC_ADOPT_CONTOUR`, the switch round 312's
+patch reads. The `PC_` name could not be the setting itself: `job-env.sh`
+carries only `NS_*`/`R2D2_*`/... names into a Slurm job. `run.env` records
+it when set, so `./ri resume` keeps the same sampler, and `./ri bench` files
+it as a workload key, so `./ri bench run r2d2 --interleave NS_ADOPT_CONTOUR 0 1`
+works. Unset, `run.env` and every other path are unchanged. A polychord.sif
+without the patch ignores the variable.
+
+**A patched polychord.sif without Docker in 7 s.** `.probe/r313/adopt.def`
+is a `Bootstrap: localimage` over `images/polychord.sif` that copies round
+312's pypolychord build (`.probe/r312/pp2`: `pypolychord/`, whose
+`lib/libchord.so` carries the patch, and `_pypolychord*.so`) over
+`/opt/venv/lib/python3.11/site-packages/`. `apptainer build --fakeroot` on
+the gnhf node took 7 s. A copy is in `$RI_WORK_DIR/.cache/ri/polychord-adopt.sif`.
+Because `POLYCHORD_SIF` is always `$SIF_DIR/polychord.sif`, a run picks it up
+through a `SIF_DIR` of symlinks.
+
+**Method.** Round 302's command (seed 190182240, nlive 150, 15 repeats,
+async, converged, 39 ranks) with `NS_ADOPT_CONTOUR=1`, run in the gnhf job
+on cpu-q-140 (node load 48-66 from another job) at `08a4c91` plus the
+plumbing (`.probe/r313/run.sh`).
+
+| | round 239 | round 278 | round 302 | round 313 (adopt) |
+| --- | ---: | ---: | ---: | ---: |
+| ndead | 1,488 | 1,457 | 1,438 | **1,277** |
+| nlike | 68,540 | 73,707 | 70,887 | 66,738 |
+| evaluations | 70,202 | 75,278 | 72,286 | 68,426 |
+| nlike / ndead | 46.1 | 50.6 | 49.3 | 52.3 |
+| wasted dead points (`waste.py`) | - | - | (~237 inferred) | 76 (6.0%) |
+| log(Z) | 0.0174042104464403 +/- 0.000408942281146939 | 0.0172503990041623 +/- 0.000401752587890735 | 0.0172602493141394 +/- 0.000402502115363966 | 0.0173483242870011 +/- 0.000407794943306949 |
+| evals/s (steady) | 51.2 | 47.5 | 60.2 (62.8) | 47.7 (49.1) |
+| wrapper wall | 1,427 s | 1,610 s | 1,260 s | 1,461 s |
+
+**Results.**
+- log(Z) agrees: +0.15 sigma from round 302, -0.10 sigma from round 239.
+  The run had no stalls and exited cleanly.
+- The patch works in production: 6.0% of dead points are wasted chains,
+  the toy's v2 figure at 38 workers (5.3%), against the toy's stock 18%.
+  If useful dead points are the same as in round 302 (1,201), stock wasted
+  ~237 (16.5%), close to the toy's 18%.
+- Dead points fell 11.2% (12.6% against the three-run mean), but nlike
+  only 5.9% (6.1%) and evaluations 5.3% (5.7%). The toy saved evaluations
+  in proportion to dead points (nlike per dead point 62.4 stock, 61.5 v2).
+  Here nlike per dead point is 52.3 against 46.1-50.6 stock, but that
+  stock spread is itself +/-5% and this is one run, so the toy's ~14% is
+  not ruled out, and neither is a real cost per chain (a chain that adopts
+  a higher contour keeps its old slice width, so it may shrink more per
+  step). The three stock runs' evaluation counts span 70.2k-75.3k, so the
+  -6% is about 1.5x that spread.
+- evals/s is not comparable: this ran in the gnhf job on a shared, loaded
+  node, round 302 on its own quiet node.
+
+**Pending.** Array job 39660948 (`.probe/r313/array.sh`, six 1-node icelake
+tasks, 55 min each) runs the same command at `NS_ADOPT_CONTOUR` 0 and 1 for
+seeds 190182240, 7311 and 4242, both arms on the patched SIF, from the
+frozen worktree `../frozen-r313` (`08a4c91` plus the plumbing). Each task
+leaves `row-`, `stats-`, `sum-` and `dead-birth-` files in `.probe/r313/`
+and deletes its run directory. Read them in a later round: paired by seed,
+they give the evaluation saving per seed and the log(Z) differences, then
+append the rows to `benchmarks.jsonl` and remove `../frozen-r313`.
+
+Bench row `r313-adopt` and stage row `r313-adopt-r2d2` in `benchmarks.jsonl`;
+`.probe/r313/` keeps the gzipped `summary.json`, `run.log`, console log,
+dead-birth file, `.stats` and profile. The run directory is deleted.
+GPU job 39654485 (round 303) still had no output at ~21:45 on 29 Oct.
+
+## Round 315: the contour patch saves 4% of R2D2 evaluations over 3 raced seeds, not the toy's 14%
+
+**Method.** Round 313's array job 39660948 (`.probe/r313/array.sh`): six
+1-node icelake tasks, each a converged production R2D2 search (nlive 150,
+15 repeats, async, 39 ranks) on the patched polychord.sif, from the frozen
+worktree `../frozen-r313` (`08a4c91` plus the plumbing). Arms
+`NS_ADOPT_CONTOUR` 0 and 1, seeds 190182240, 7311 and 4242, all six started
+together at 21:36:56 on 29 Oct and exited 0 in 18-23 min.
+`.probe/r313/ana.py` pairs them; wasted chains are `waste.py`'s rule.
+Round 314 was cut off by the job limit before reading them.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall | node |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 190182240 | stock | 0.0173486835510407 +/- 0.00040752730532764 | 1,458 | 255 | 65,392 | 66,925 | 56.4 | 1,218 s | cpu-q-540 |
+| 190182240 | adopt | 0.0172950046702071 +/- 0.000402782692260155 | 1,288 | 81 | 60,472 | 62,132 | 52.2 | 1,225 s | cpu-q-608 |
+| 7311 | stock | 0.0174151767019566 +/- 0.000366463462114217 | 1,466 | 264 | 65,596 | 67,107 | 48.9 | 1,403 s | cpu-q-556 |
+| 7311 | adopt | 0.017291398985864 +/- 0.00036032300132719 | 1,300 | 84 | 65,495 | 66,851 | 65.0 | 1,061 s | cpu-q-557 |
+| 4242 | stock | 0.0182077471400141 +/- 0.000389309774867251 | 1,479 | 275 | 66,969 | 68,255 | 52.6 | 1,329 s | cpu-q-589 |
+| 4242 | adopt | 0.0179824722502375 +/- 0.000378356218975823 | 1,290 | 75 | 63,998 | 65,272 | 52.2 | 1,282 s | cpu-q-590 |
+
+| pooled (3 seeds) | stock | adopt | change |
+| --- | ---: | ---: | ---: |
+| evaluations | 202,287 | 194,255 | **-3.97%** (per seed -7.2 / -0.4 / -4.4%) |
+| nlike | 197,957 | 189,965 | -4.04% |
+| dead points | 4,403 | 3,878 | -11.92% |
+| wasted chains (share of dead) | 794 (18.0%) | 240 (6.2%) | -70% |
+| useful dead points (ndead - wasted) | 3,609 | 3,638 | +0.8% |
+| nlike per dead point | 44.96 | 48.99 | **+9.0%** |
+| nlike per useful dead point | 54.85 | 52.22 | -4.8% |
+
+**Results.**
+- log(Z) agrees seed by seed: -0.09, -0.24 and -0.41 sigma (adopt minus
+  stock), mean -0.25 sigma. No sign of the v1 bias.
+- The patch removes the waste exactly as in the toy: stock wastes 18.0% of
+  dead points (the toy's async 18% at 38 workers), adopt 6.2% (toy 5.3%),
+  and useful dead points stay the same (+0.8%).
+- But each chain costs 9% more: nlike per dead point rises 44.96 -> 48.99,
+  in every seed (44.8/44.7/45.3 stock, 46.9/50.4/49.6 adopt). In the toy it
+  was flat (62.4 stock, 61.5 v2). The saving left is -4.0% of evaluations,
+  not the -14% the waste alone predicts.
+- Wall time is not an A/B here: each arm ran on its own node and steady
+  evals/s span 48.9-65.0 across the six nodes, so the -9.7% mean wall
+  change is node noise; the evaluation counts are the measure.
+
+**Which R2D2 feature makes adopted chains cost more? Not three obvious
+ones.** `.probe/r315/toy.py` is round 312's 6-d toy (39 ranks, async, nlive
+150, converged, the patched SIF for both arms) with one R2D2-like feature
+added at a time. nlike per dead point, stock -> adopt:
+
+| toy variant | seeds | nlike change | nlike / dead stock | nlike / dead adopt | wasted stock -> adopt |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 3 dims snapped to 8 levels (integer plateaus, like `channel_count`) | 1 | -17.1% | 62.4 | 61.3 | 18.0% -> 4.5% |
+| two unequal modes (clustering; R2D2's posterior has 5 clusters) | 2 | -14.7% | 63.2 | 62.3 | 17.1% -> 4.2% |
+| evaluation time 0-8x by position (R2D2's cost varies with channels x minutes) | 2 | -15.5% | 62.4 | 61.3 | 17.3% -> 4.7% |
+
+All three keep the toy's flat per-chain cost and full saving, with log(Z)
+pairs within 0.9 sigma. So the extra cost comes from something else in
+R2D2's likelihood. Candidates left: its near-flat likelihood (log(Z) =
+0.017, so the contour rises through a region where logL barely changes,
+and the slice width set from the live points at a chain's start may be far
+too wide after adoption), and its ~3 calls per slice step against the
+toy's ~4. A per-chain nlike count from inside the patch, split by whether
+the chain adopted, would tell them apart.
+
+**Decision.** `NS_ADOPT_CONTOUR` stays opt-in (default 0), as the
+sampler-change guard requires. Defaulting it is the user's call: it saves
+~4% of evaluations at 38 workers with log(Z) agreeing over 3 seeds and the
+toy's 40-seed bias check, and should save more at 76 workers (two nodes),
+where the toy's waste is 29%. Shipping it also needs the patched
+polychord.sif built on a Docker host or layered at search start (like
+`ns_use_patched_wsclean_sif`).
+
+Bench rows `r313-a{0,1}-s{seed}` and stage row `r315-adopt-3seed` in
+`benchmarks.jsonl`. `.probe/r313/` keeps the per-task stats, rows,
+summaries and dead-birth files (console logs gzipped); `../frozen-r313` is
+removed. GPU job 39654485 (round 303) still has no output.
+
+## Round 316 (diagnostic): adopted R2D2 chains cost more because R2D2's cost per slice step rises with the contour
+
+**Question.** Round 315 found that under `NS_ADOPT_CONTOUR=1` each R2D2
+chain costs 9% more likelihood calls, which no toy reproduced. Is that
+a flaw in the patch (e.g. a slice width set at the chain's start that is
+too wide after adoption), or a property of R2D2's likelihood?
+
+**Method.** A probe-only PolyChord build (`.probe/r316/chain-log.diff` on
+top of `docker/polychord/patches/0001`, built in a fakeroot sandbox and
+layered over `polychord.sif` as in round 313; not shipped) writes one line
+per chain when `PC_CHAIN_LOG` is set: start and final contour, seed and
+final logL, the step it first adopted, and calls before and after
+adoption. Two R2D2 searches ran one after the other in the gnhf job on
+cpu-q-190 (seed 190182240, nlive 150, 15 repeats, 39 ranks,
+`--max-ndead 600`, which stops at 750 dead): `NS_ADOPT_CONTOUR` 0 then 1.
+Round 315's 6-d toy (seed 101, converged) ran with both settings for
+reference. `.probe/r316/ana*.py` reads the logs; the raw logs are in
+`.probe/r316/chain-logs.tgz`. The last chain of each rank is cut off by
+the stop signal and is dropped.
+
+| | chains | nlike / chain | calls / slice step |
+| --- | ---: | ---: | --- |
+| R2D2 stock | 525 | 51.7 | 3.45 |
+| R2D2 adopt | 527 | 54.0 | 2.60 before adopting, **3.71** after |
+| toy stock | 2,783 | 67.5 | 4.50 |
+| toy adopt | 2,392 | 67.2 | 4.03 before adopting, **4.51** after |
+
+Every chain in both adopt runs adopts, on average at step 2.2 (toy) or 2.6
+(R2D2). Calls per step against the chain's start contour, binned in
+sextiles of the stock run's contours:
+
+| contour sextile | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| R2D2 stock | 1.55 | 2.34 | 3.68 | 4.23 | 4.64 | 4.25 |
+| R2D2 adopt | 1.64 | 2.49 | 3.95 | 4.51 | 4.63 | 4.66 |
+| toy stock | 2.77 | 4.58 | 4.92 | 4.90 | 4.89 | 4.93 |
+| toy adopt | 2.78 | 4.63 | 4.91 | 4.91 | 4.90 | 4.88 |
+
+**Results.**
+- R2D2's cost per slice step climbs ~3x over the first 750 dead points
+  (1.55 -> ~4.6 calls), steadily through the run. The toy's climbs only in
+  its first sixth (the phase where the prior box, not the likelihood,
+  bounds the slice; points outside the box cost no call) and is then flat
+  at 4.9. R2D2's likelihood is nearly flat (log(Z) = 0.017), so the box
+  stays the binding edge in many directions for far longer.
+- Adopting moves a chain to a newer, higher contour. Where cost per step
+  rises with the contour, that costs more per step: +5-10% within the same
+  sextile in R2D2 (roughly the slope over the ~36 dead points a chain's
+  ~27 s spans), against 0-1% in the toy's flat phase. That is round 315's
+  +9% per chain. A stock chain also costs this much once the contour
+  reaches that height; adoption brings the cost forward.
+- So it is not a flaw in the patch, and rescaling the slice width on
+  adoption, round 315's candidate, cannot recover it: the chain's region
+  shrinks by ~exp(-36/150) in volume, a ~2-3% change in linear width in
+  R2D2's dimensions, while the extra calls come from the binding edge
+  changing from the prior box to the likelihood.
+- At 750 dead the adopt run spent +4.0% nlike (28,425 vs 27,321) for the
+  same dead points (with fewer of them wasted, so more useful ones); the
+  partial log(Z)s agree (0.0168735 +/- 0.00048 vs 0.0170246 +/- 0.00043).
+  These short runs are probes, not an A/B of wall time (arms ran in
+  sequence on a node at load 30-68).
+
+**Decision.** No change: round 315's -4.0% is what contour adoption buys
+on R2D2 at 38 workers, and it stays opt-in for the user to decide. At 76
+workers (two nodes) both the waste the patch removes and the contour
+advance per chain double, so this does not predict a bigger relative
+saving there; only a 2-node raced A/B would say.
+
+Stage row `r316-chain-cost` in `benchmarks.jsonl`; bench rows `r316-a0`
+and `r316-a1`. The run directories, the sandbox and `/dev/shm/r316` are
+deleted.
+
+## Round 317 (diagnostic + tooling): R2D2's early stop, not the node, slows a search mid-run
+
+Four converged production searches (rounds 239, 278, 300, 313; per-eval
+timings in their `.probe/*/summary.json.gz`) all lose 10-20% of evals/s
+part-way through. The R2D2 request goes from ~685 to ~780 ms around the
+fifth tenth of the run (objective 0.020 -> 0.024). Round 300's quiet
+own-job node does it too, so it is not neighbour load. The parameters
+explain little of the request time (R^2 0.08, `.probe/r317/cause.py`), but
+image content does: the lowest-peak quintile runs in ~300 ms against
+600-740 ms. The cause is upstream R2D2's `prune: True` stop criterion: a
+request runs 1-25 U-Net iterations depending on its residual.
+
+Each evaluation record now carries `timing.r2d2_iterations` (a count of
+the `RDR:` lines upstream prints, read from the tmpfs stdout log), and
+`./ri bench` rows carry its mean as `r2d2_iterations`. A 550-dead probe
+(bench row `r317-iters`, 44.9 evals/s on a load-30 node) fits request ms =
+168.9 + 33.3 x iterations (R^2 0.60), with a mean of 18.4 iterations and
+37% at the 25 cap. Its mean stays at ~18.5 over its 330 s, which ends
+before the mid-run step. Partial log(Z) 0.0164430991567243 +/-
+0.000958443752992411 (ndead 550, nlike 13508).
+
+What follows from this: the cost per request is set by the results, so it
+is not a speed lever. Short bench arms sit in the cheap early phase and
+overstate a converged search's evals/s by ~10-15%, and arms at different
+phases should be compared per iteration. A converged run to confirm that
+the mid-run step is the iteration count was started and then stopped at the
+iteration limit. That is next round's job (round 318 ran it).
+
+## Round 318 (validation): the mid-run slowdown is the iteration count; log(Z) agrees
+
+**Question.** Round 317 predicted that a converged search's mid-run drop
+in evals/s is R2D2 running more U-Net iterations per request, at a flat
+cost per iteration. Does a converged search with the new
+`timing.r2d2_iterations` field show that, and does HEAD still give round
+302's log(Z)?
+
+**Method.** Round 302's command (`.probe/r317/conv.sh`: seed 190182240,
+nlive 150, 15 repeats, async, to convergence, 39 ranks) on `fe35e0b`,
+inside the gnhf job on cpu-q-190. Neighbour load was 43 at the start and
+64-68 throughout, so the absolute rate (40.3 evals/s against round 302's
+60.2 on its own node) is the shared node, not the code. Per-tenth table
+from `.probe/r318/tenths.py` (output in `.probe/r318/tenths.txt`); the
+first 120 s are not skipped here.
+
+| tenth of wall | evals/s | mean iterations | request ms | ms per iteration above the intercept | objective |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 42.1 | 18.52 | 842 | 37.6 | 0.0178 |
+| 1 | 44.2 | 18.61 | 818 | 36.1 | 0.0190 |
+| 2 | 45.5 | 18.58 | 798 | 35.1 | 0.0198 |
+| 3 | 43.8 | 18.90 | 825 | 35.9 | 0.0209 |
+| 4 | 38.7 | 20.95 | 931 | 37.5 | 0.0228 |
+| 5 | 38.7 | 20.93 | 929 | 37.4 | 0.0244 |
+| 6 | 38.4 | 20.78 | 937 | 38.0 | 0.0249 |
+| 7 | 38.5 | 20.35 | 929 | 38.4 | 0.0255 |
+| 8 | 37.5 | 21.52 | 961 | 37.9 | 0.0256 |
+| 9 | 35.4 | 22.76 | 1,017 | 38.3 | 0.0250 |
+
+Whole run: 69,418 evaluations in 1,723 s, request ms = 146.0 + 37.2 x
+iterations (R^2 0.62), mean 20.09 iterations. log(Z)
+0.0173296529175051 +/- 0.000405335657033951 (ndead 1,453, nlike 67,635)
+against round 302's 0.0172602493141394 +/- 0.000402502115363966: +0.12
+sigma.
+
+**Results.**
+- Confirmed. The step lands in the fifth tenth, as in rounds 239-313:
+  evals/s falls 44.2 -> 38.6 (-13%) while mean iterations rise 18.6 ->
+  20.9 (+12%) and request time 818 -> 930 ms (+14%). The cost per
+  iteration stays at 35-38 ms throughout, so the node and the code do not
+  slow down; the search asks for harder images. The last tenth climbs
+  again to 22.8 iterations.
+- The 20.1-iteration mean is 9% above a 550-dead bench arm's ~18.5
+  (round 317), the size of the overstatement short arms carry.
+- log(Z) agrees with round 302 (+0.12 sigma) on HEAD with round 317's
+  counter in place, so the counter changes nothing in the results.
+
+**Decision.** No code change. The mid-run slowdown is fixed by the
+posterior, not a lever; an A/B between arms that reach different phases
+should compare `r2d2_iterations`-normalised cost. Bench row `r317-conv`
+(the search's own row) and stage row `r318-conv-iters` are in
+`benchmarks.jsonl`; the run directory is deleted.
+
+## Round 319 (GPU measurement): 33 workers on gathered TensorRT batches converge 16% sooner than the default; ranks or batching pending
+
+**Why.** This reads round 303's 1-GPU job 39654485 (round 299's pair on
+the frozen `../frozen-r303` tree, gpu-q-40, A100-SXM4-80GB, 32 CPUs). It
+started at 23:41 on 29 Oct, four rounds after it was submitted. Each arm
+is a converged seed-4299 search: `--nlive 128 --num-repeats 5`, with
+`--max-ndead 4000` as a cap that no arm reached. A is the GPU default (the
+shared TensorRT server, 19 ranks x 2 threads, one lane per worker). C is
+33 x 1 with the gathering server (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`),
+the case round 238 left open: more workers per card than its 19. The
+order was ACCAAC, after a 300-dead warm-up arm (W1).
+
+| arm | ranks | evals | wall to converge s | start-up s | stall s | steady evals/s | ms/eval (R2D2) | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| A1 | 19 x 2, shared | 21,391 | 209.1 | 10.2 | 7.7 | 111.8 | 144.8 | 0.016037683911542 +/- 0.000468220942461031 |
+| C1 | 33 x 1, gathered | 20,857 | 169.8 | 35.0 | 0.0 | 154.8 | 230.7 | 0.0164877890672801 +/- 0.00044661160134725 |
+| C2 | 33 x 1, gathered | 21,377 | 178.9 | 29.0 | 0.0 | 142.6 | 236.5 | 0.0164496737825921 +/- 0.000440671365537601 |
+| A2 | 19 x 2, shared | 19,061 | 201.1 | 9.9 | 7.7 | 103.9 | 157.8 | 0.01635038438896 +/- 0.000460407590856059 |
+| A3 | 19 x 2, shared | 19,445 | 193.8 | 10.4 | 7.7 | 110.7 | 148.9 | 0.0162635838793623 +/- 0.000470167424993285 |
+| C3 | 33 x 1, gathered | 19,854 | 158.6 | 28.1 | 0.0 | 152.2 | 226.2 | 0.0164785730928507 +/- 0.000445832054425629 |
+
+**Results.**
+- **Wall time to convergence: A 201.4 s, C 169.1 s (-16.0%)**. C won
+  all three adjacent pairs. Steady evals/s rose from 108.8 to 149.9
+  (+37.8%). C needs 3.7% more evaluations (20,696 against 19,966),
+  PolyChord's price for 33 workers instead of 19 (round 307), and pays
+  ~21 s more start-up to build its four lanes' 100 batch contexts. In a
+  longer search that start-up is amortised, so the gain tends toward the
+  steady +38% less the extra evaluations.
+- **log(Z) agrees.** The mean is 0.016217 for A and 0.016472 for C, a
+  difference of 0.00026, or 0.55 sigma of one run. The batched engines
+  are not bit-identical to the batch-1 plan (9-10e-6 of the peak, round
+  224), so this agreement is the bar, as it was in round 238.
+- Per request, a C worker's R2D2 stage takes ~231 ms against A's ~150 ms,
+  yet C completes more requests per second: the card is not the
+  bottleneck at 19 workers, and 14 more single-thread workers keep it
+  busier. Round 238 found the gathering server no faster than the default
+  at 19 x 2, so the gain here most likely comes from the extra ranks, and
+  `NS_R2D2_CUDA_MAX_RANKS=19` is a cap from eager torch's card memory
+  (round 124), which a shared server's workers do not use (round 208).
+  This is not yet proven: C changed the rank count and the server
+  together.
+
+**Pending** (read in [round 325](#round-325-gpu-measurement-the-card-saturates-at-19-shared-lanes-so-round-319s-gain-is-batching-not-ranks), as resubmitted job 39670215). Job 39667582 (`.probe/r319/ab.sh`, 1 x A100, same frozen
+tree and settings) splits the two changes. It races B (33 x 1 on the
+default shared server, no batching) against C in the order BCCBBC. If B
+matches C, the change to ship is a larger GPU rank cap for the shared
+server, with no new code path. If C beats B, batching earns its place at
+33 workers. Neither becomes a default until that job is read.
+
+Rows: `r303-W1`, `r303-A1..A3` and `r303-C1..C3` (bench) and stage row
+`r319-trt-gathered-33` in `benchmarks.jsonl`. `.probe/r303/` keeps the
+job output, the logs and the six `summary-*.json`; the run directories
+were deleted by the job.
+
+## Round 320 (fix): `./ri health` and live summaries counted a multi-node run's ranks per node
+
+**Why.** Round 288 left `./ri health` and `./ri runs` on a multi-node run
+untested. A multi-node `run.env` records `NS_MPI_PROCS` per node and adds
+`NS_NODES` only when it is above 1. The launcher multiplies the two for
+the ranks (`run-nested-sampling-r2d2.sh`), and `bench.py` already does the
+same, but `nested-sampling-health.py` and `live_runs.py` read
+`NS_MPI_PROCS` as the whole search's rank count.
+
+**What was wrong, on a 2 x 38 search.**
+
+- Health's occupancy divided imaging seconds by 38 ranks instead of 76, so
+  a half-busy run read as fully busy (the clamp hid the overshoot).
+- Its "ranks N% busy" figure was off in the same way, and its "X GB across
+  38 ranks" memory line gave half of what the search really holds.
+- The live summary (`summary.live.json`, which `./ri report --live` reads)
+  recorded `mpi_procs` 38, while the finished `summary.json` records 76,
+  so the profiling breakdown of a live run used half the workers.
+
+**Fix.** Health has a new `total_ranks(run_env)` helper
+(`NS_MPI_PROCS x NS_NODES`), used for the occupancy denominator, the busy
+percentage, the memory multiple and the "N ranks of M" line. That line
+now adds "on K nodes", because pgrep sees only this node's ranks. The live
+summary multiplies the two in the same way. `./ri runs` reads neither
+value: its record count already reads per-host packs (round 290), so it
+needed no change.
+
+**Verified.** There are new self-check cases in both scripts: a 4 x 2-node
+`run.env` must give the same occupancy as 8 ranks on one node, "16.0GB
+across 8 ranks" and "0 ranks of 8 on 2 nodes"; a 38 x 2 live summary must
+give `mpi_procs` 76. Both cases fail on the old code (the occupancy reads
+100% busy across 4 ranks; `mpi_procs` reads 38) and pass on the new. The
+CI host steps pass: compileall, `test_self_checks.py`, and the health,
+live-runs, runs and profile self-checks. No WSClean guard was run: the
+change is to host-side readers, which no search runs, and a single-node
+`run.env` gives the same numbers as before (`NS_NODES` is absent, so the
+factor is 1).
+
+**GPU job 39667582** (round 319's ranks-vs-batching split) had not
+started when this round began; `.probe/r319/` still holds only `ab.sh`.
+It is read next round.
+
+## Round 321 (diagnostic): every search stalls once at the prior-to-sampling switch, 7.66 s on the shared GPU server
+
+**Question.** Round 319's bench rows give every 19 x 2 shared-TensorRT
+arm `stall_s` 7.7 (W1 6.7) and every gathered arm 0.0. What is the
+stall, and does a CPU search have one too? (GPU job 39667582 had still
+not started, so this round reads kept summaries only.)
+
+**Method.** `.probe/r321/transition.py` lists each finished summary's
+biggest gaps between consecutive evaluation starts, skipping the first
+0.5 s (output in `.probe/r321/transition.txt`). It ran on round 303's
+seven GPU summaries, round 318's converged CPU search and five more kept
+CPU summaries. PolyChord's `generate.F90` at the pinned commit
+(`370f6af`) was read to place the gaps.
+
+| search | ranks | gap after the prior phase | gap after `time_speeds` |
+| --- | ---: | ---: | ---: |
+| GPU A1/A2/A3, 19 x 2 shared TRT | 19 | 7.66 / 7.66 / 7.66 s | 0.34 / 0.36 / 0.35 s |
+| GPU W1, same, warm-up arm | 19 | 6.67 s | 0.36 s |
+| GPU C1/C2/C3, 33 x 1 gathered TRT | 33 | 0.51 / 0.57 / 0.56 s | 0.43 / 0.38 / 0.41 s |
+| CPU, round 318 converged, 39 ranks | 39 | 1.25 s | 1.42 s |
+| CPU, four other kept 39-rank searches | 39 | 0.95-1.90 s | 1.06-1.38 s |
+
+**Where the two gaps are.** Both sit at fixed evaluation counts: the
+first after nlive + workers - 1 starts (A: start 144 = 128 + 17; CPU:
+186), which is the prior phase ending with every worker's in-flight
+point. The second comes one start per rank later (A: 163, CPU: 225).
+That is PolyChord's `time_speeds`, which runs whenever any
+`grade_frac <= 1` (the default). It has *every* rank, the root
+included, evaluate one random point, so the root's only evaluation of a
+search lands here and everyone waits for the slowest. In A1 all 19
+`time_speeds` evaluations start together at 22.52 s after the last
+prior evaluation ended at 15.11 s. So the workers were held in the
+`sum_integers` allreduce that follows the prior loop, and the root
+reached it 7.4 s late. Between its last `catch_point` and that
+allreduce the root only sorts 145 points and writes the prior-info file
+to tmpfs chains. The 7.66 s therefore comes from the root's process on
+the shared-server arm, not from PolyChord's own work. It is the same to
+0.01 s in three arms, which is a fixed cost, not load. What it is needs
+a timed root on a GPU node.
+
+**What it costs.**
+- CPU: ~2.5 s once per search, 0.15% of a 29-minute converged search.
+  A resume from a checkpoint skips it (`nested_sampling.F90` calls
+  `GenerateLivePoints` only when there is no resume file). Not worth a
+  PolyChord patch: skipping `time_speeds` would change the random
+  stream, so results stop being bit-identical, to save ~1.4 s.
+- GPU shared: 7.66 s once per search. That is 3.8% of A's ~201 s to
+  converge, and about 7 s of round 319's 32 s A-vs-C gap. `stall_s` is
+  a fixed transition cost, not a recurring whole-search stall, and
+  `steady_evals_per_s` already subtracts it. Round 319's steady-rate
+  comparison (+38%) stands; its wall-time gain (16%) includes ~3.5
+  points from this transition.
+
+**Correction (round 323).** The root is not late: each gap ends within
+0.01 s of the last in-flight evaluation's end. The 7.66 s is one shared
+lane's *first* evaluation, which ends 22.52 s in because the server brings
+its lanes up one at a time (~0.72 s each). See round 323.
+
+**Decision.** No code change. Next GPU round: time the root rank (e.g.
+`py-spy dump` or a timestamped print around `run_polychord`'s prior
+phase) in one shared-server arm to name the 7.4 s. If B (33 x 1,
+shared) in job 39667582 shows the same 7.66 s, the cost belongs to the
+shared server's start, not the rank count. Stage row
+`r321-prior-switch` is in `benchmarks.jsonl`.
+
+## Round 322 (fix, multi-node): the stall watchdog's kill left the other nodes' ranks running
+
+**Why.** Round 320 noted that no 2-node test had run the stall watchdog.
+The watchdog kills a hung run with `pkill -9 -f` on
+`ns_run_process_pattern`, which also matches the `srun` that starts a
+multi-node search's ranks: its command line carries
+`polychord_r2d2.py --output-dir <run>`. Round 289's scenario A killed one
+remote rank while `srun` was alive, so it never tested this path.
+
+**Test** (on this job's node: two `srun --overlap --kill-on-bad-exit=1 -n2`
+steps, with `sleep` tasks named like ranks, task 1 standing in for a remote
+node):
+
+| killed with SIGKILL | task 1 afterwards |
+| --- | --- |
+| `srun` (both its processes) and task 0, as the watchdog did | still running 60 s later, orphaned; the step never ends |
+| task 0 only | srun: "task 0: Killed ... Terminating StepId ... task 1: Terminated" within 3 s |
+
+So on N nodes the watchdog killed the launcher node's ranks and `srun`,
+and every rank on the other nodes stayed alive. A hung remote rank (the
+case the watchdog exists for) stays hung, holding its node's FIFOs and
+CPU while the retry starts a new step beside it.
+
+**Fix.** `ns_kill_run_ranks` (`rank-budget.sh`) kills the pattern's
+processes on this node except those whose `comm` is `srun`. `srun` then
+sees its rank die and cancels the step on every node. The watchdog now
+calls it. On one node nothing named `srun` matches, so the kill takes
+exactly the processes it took before (ranks and `mpirun`). A new
+`rank-budget.sh` self-check case starts a fake rank and a fake `srun`
+(a `sleep` symlink) with matching command lines: the rank must die, and
+`srun` must live. It fails with the old kill.
+
+**WSClean guard.** None raced: the changed line runs only when the
+watchdog fires, so it cannot change a healthy search's speed or chains,
+and on one node it kills the same set of processes. The progress-bar
+self-check (which kills a hung fixture through the watchdog), the
+rank-budget self-check, `test_watchdogs.py`, `test_self_checks.py` and
+shellcheck all pass.
+
+**2-node check** (job 39668720, `.probe/r322/stall.sh`, 2 x 38 icelake,
+`--nodes 2 --nlive 150 --num-repeats 15 --seed 322 --max-ndead 450`,
+`NS_STALL_TIMEOUT=60`). The fix and then the old code (frozen worktrees
+of `6599d99`, one with the two changed files) ran one search each. After
+90 s the probe SIGSTOPs node 1's 39 ranks so the watchdog fires, counts
+node 2's original 39 ranks 20 s later, and lets the retry finish:
+
+| arm | watchdog after STOP | node 2 ranks alive 20 s on | how they ended | retry | log(Z) | nlike |
+| --- | ---: | ---: | --- | --- | --- | ---: |
+| fix | 112 s | 0 of 39 | srun: "Terminating StepId=39668720.1", node 2 tasks "Terminated" | resumed 5,592, exit 0, 291 s | 0.0159308761182684 +/- 0.00140720607490015 | 7,452 |
+| old | 137 s | 0 of 39 | no srun message: srun was dead, so the ranks went by themselves | resumed 9,564, exit 0, 300 s | 0.0158680530233059 +/- 0.00140666262841561 | 7,175 |
+
+So the old kill did not orphan real ranks in this scenario. Node 2's
+ranks lost their MPI peers (the root among them) and exited, and the
+retry was clean. The orphan seen with `sleep` tasks needs a remote rank
+that never touches MPI again, for example one stuck in a syscall, which is
+the hang the watchdog exists for. The fix makes the teardown not depend on
+that: `srun` cancels the step on every node (SIGTERM, then SIGKILL). The
+fix is defensive, with no measured outcome difference. log(Z) agrees
+(0.03 sigma; arms differ after the kill because the retry's timing differs).
+Run dirs and frozen worktrees are deleted; logs are in `.probe/r322/`.
+
+## Round 323 (diagnostic, correction of round 321): the transition gaps are barriers waiting on the slowest rank; on the shared GPU server that is its last lane coming up
+
+**Question.** Round 321 said PolyChord's root reaches the allreduce after
+the prior loop late: ~1.25 s on CPU and 7.4 s on the 19 x 2 shared
+TensorRT server. What is the root doing then? py-spy cannot attach to a
+rank across Apptainer's user namespace ("Permission Denied", even with
+`ptrace_scope` 0), so the root could not be sampled. Instead,
+`.probe/r323/ends.py` asks the summaries something simpler: when did the
+*last* evaluation started before each gap end?
+
+**Method.** One fresh 39-rank CPU search on this node (`.probe/r323/root.sh`:
+round 302's command with `--max-ndead 60`, 272 evaluations, `6a92e96`),
+round 318's converged search, and round 303's GPU arms
+(`.probe/r303/summary-*.json`). `.probe/r323/slow.py` lists the
+evaluations that held each gap.
+
+| search | gap | last evaluation before it ends | next start | idle after that end |
+| --- | ---: | ---: | ---: | ---: |
+| CPU r323, gap 1 (start 186) | 1.25 s | 9.71 s | 9.72 s | 0.01 s |
+| CPU r323, gap 2 (`time_speeds`, start 225) | 1.31 s | 11.01 s | 11.03 s | 0.01 s |
+| CPU round 318, gap 1 / gap 2 | 1.25 / 1.42 s | 10.51 / 11.93 s | 10.51 / 11.94 s | 0.00 / 0.01 s |
+| GPU A1, gap 1 (start 144) | 7.66 s | 22.52 s | 22.52 s | 0.00 s |
+| GPU A2, gap 1 | 7.66 s | 22.30 s | 22.30 s | 0.00 s |
+| GPU C1, gap 1 (start 158) | 0.51 s | 36.48 s | 36.49 s | 0.01 s |
+
+**Results.**
+- **The root is never late.** Each gap ends within 0.01 s of the last
+  in-flight evaluation's end. Both gaps are barriers: the allreduce after
+  the prior loop waits for every worker's in-flight point, and
+  `time_speeds` waits for every rank's one point. On CPU each costs one
+  slow R2D2 request (~1.3 s, a 25-iteration request). Round 321's
+  "root reached it 7.4 s late" misread the last *started* prior point
+  (14.86 s) as the last to end.
+- **On the shared GPU server, gap 1 is the server's start-up.** In A1
+  the evaluation holding the barrier is one worker's *first*
+  evaluation, which started at 0 s and ended at 22.52 s. The 18 workers'
+  first evaluations end one after another, 0.72-0.73 s apart, in every
+  shared arm (A1 10.2 -> 22.5 s, A2 9.9 -> 22.3, A3 10.4 -> 22.8, W1
+  17.8 -> 30.2). `serve_trt_shared` builds its lanes (25 execution
+  contexts each) one at a time and starts serving each as soon as it
+  exists (round 221). Early lanes' ranks race through the 128 prior
+  points by ~15 s, then wait at the barrier for the last lane. The
+  gathering server (C) builds every context before it serves, so all 32
+  first evaluations end together (C1 34.96-35.20 s, C2 29.0-29.1, C3
+  28.1-28.4), and its gap 1 is only the ordinary ~0.5 s wait for one slow
+  request. Its start-up is longer, but
+  everyone pays it at once.
+- So round 303's constant `stall_s` 7.7 s on shared arms is the tail of
+  lane bring-up, not a transition cost. It is constant because the
+  bring-up is (~0.72 s per lane). It grows with the number of lanes:
+  ~0.72 x (ranks - 1) minus the time the fast lanes take to fill the
+  prior phase. Round 319's A-vs-C wall times include different start-ups
+  on both sides (A's lanes are all up ~6-12 s before C's first
+  evaluation ends), so the steady +38% is still the comparison that holds.
+
+**What it costs and what would fix it.**
+- CPU: nothing to fix. ~2.6 s once per search are two barriers, each
+  waiting for one slow request; skipping `time_speeds` would change the
+  random stream (round 321).
+- Shared GPU server: ~7.7 s of 19 ranks idle once per search (3.8% of
+  a 200 s arm, ~0.6% of a 20-minute one). The lever is to bring the
+  lanes up in parallel, building each lane's contexts in its own thread
+  (if TensorRT's Python binding releases the GIL in
+  `create_execution_context`), or to build the 475 contexts before any
+  lane serves, as the gathered server does. Both need a GPU node. Note it
+  for the next GPU round; nothing changes on CPU.
+
+**Decision.** No code change. Round 321's mechanism and "Where it
+stands" are corrected. Stage row `r323-transition-barriers` is in
+`benchmarks.jsonl` with the probe search's own bench row (`r323-root`,
+partial run, 19.8 evals/s: too short to compare). The run directory is
+deleted.
+
+## Round 324 (measurement + tooling): parallel TensorRT lane bring-up saves at most ~5 s once per search; per-rank stack dumps
+
+Round 323 traced the shared GPU server's constant 7.66 s `stall_s` to
+`serve_trt_shared` bringing its 19 lanes up one at a time, and named two
+levers that needed a GPU node. Round 324 measured them in one 10-minute
+1-A100 job (39669776, gpu-q-7, `.probe/r324/lanes.py`): deserialize the
+25 plans, then build 19 lanes (25 USER_MANAGED execution contexts each, the
+server's own code) serially and from thread pools, while a pure-Python
+thread spins to show whether the GIL is held. It then runs one input through
+every net of every lane and compares the outputs with the first lane's.
+
+| bring-up of 19 lanes | wall | spin thread, ticks/s |
+|---|---|---|
+| serial (today) | 17.31 s | 1.29e7 |
+| 19 threads | 13.51 s | 1.29e7 |
+| 4 threads | 13.54 s | 1.29e7 |
+| 8 threads | 12.10 s | 1.28e7 |
+
+- **The GIL is not the limit.** The spinning thread runs at the same rate
+  in every arm, so TensorRT's binding releases the GIL in
+  `create_execution_context`. Something inside TensorRT or the driver
+  serializes context creation instead. Four threads do as well as 19, and
+  the best (8) is only 1.43x serial.
+- **Outputs are unchanged:** 0 of 925 outputs (37 lanes x 25 nets) differ
+  from the first lane's, so contexts built concurrently are sound.
+- **What it is worth.** At best the last lane is ready ~5 s sooner
+  (17.3 -> 12.1 s; the job's cold plans deserialized in 21.5 s, which the
+  search's eight-reader load already overlaps). That bounds the gain at
+  ~5 s of the 7.66 s barrier, once per search: ~2.5% of a 200 s bench arm,
+  ~0.4% of a 20-minute search, and nothing on CPU. Building everything
+  before serving (the gathered server's way) would be worse: all lanes
+  would start at ~12 s, where today the first starts at ~1 s.
+- **Decision.** Not shipped. A change to the server needs its own raced GPU
+  A/B, which costs more than the lever is worth. The cheap form, if a
+  later GPU round touches `serve_trt_shared` anyway: build lanes in a
+  pool of 8 and start each lane's thread as soon as its contexts exist.
+
+**Tooling: `NS_STACK_DUMP_S`.** Round 323 found that py-spy cannot attach to
+a rank inside Apptainer. With `NS_STACK_DUMP_S=<s>`, each R2D2 search rank
+now arms `faulthandler.dump_traceback_later(s, repeat=True)` into
+`<run>/stacks/rank-NNN.txt` (`start_stack_dumps` in `polychord_r2d2.py`,
+passed through by `run-nested-sampling-r2d2.sh`; off by default, documented
+in `docs/run-health.md`). The dump comes from a C watchdog thread, so it
+also catches a rank stuck in C holding the GIL, which a Python sampling
+thread cannot do. A 39-rank `--nlive 40 --max-ndead 60` CPU search with
+`NS_STACK_DUMP_S=2` wrote 39 files, with workers in `worker_reply` (waiting
+on the R2D2 pool) and the root in `run_polychord`. Its log(Z) was
+0.00309108606104548 +/- 0.0128 (nlike 77); its bench row (`r324-stacks`,
+15.5 evals/s) is a 10 s run, too short to compare. New self-check
+`self_check_stack_dumps` (image-only, listed in `scripts/test_self_checks.py`)
+passes in polychord.sif. R2D2-only files, so there is no WSClean guard to run:
+with the variable unset the rank only reads an environment variable.
+
+Stage row `r324-trt-lane-bringup` is in `benchmarks.jsonl`. The probe run
+directory is deleted; its summary and stack dumps are kept in `.probe/r324`.
+
+## Round 325 (GPU measurement): the card saturates at ~19 shared lanes, so round 319's gain is batching, not ranks
+
+**Why.** Round 319 found that 33 x 1 workers on the gathering TensorRT server
+(C) converge 16% sooner than the 19 x 2 shared default (A), but C changed the
+rank count and the server together. Job 39667582, which splits them, never
+started in six rounds (32 CPUs for 55 minutes). It was cancelled and
+resubmitted as job 39670215 with `-t 00:38:00` and four arms instead of six
+(`.probe/r325/ab.sh`; otherwise round 319's script, the frozen `../frozen-r303`
+tree and the same settings: `--nlive 128 --num-repeats 5 --seed 4299`,
+converged, a 300-dead warm-up arm W1 first). It started 4 minutes after
+submission on gpu-q-63 (A100-SXM4-80GB) and finished in 18 minutes. B is
+33 x 1 on the default shared server (one lane per worker, no batching), and C
+is round 319's C (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`). The order was BCCB.
+
+| arm | ranks, server | evals | wall to converge s | start-up s | stall s | steady evals/s | R2D2 request ms | log(Z) |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| B1 | 33 x 1, shared | 23,390 | 235.3 | 10.1 | 16.8 | 112.3 | 284.3 | 0.0166370035199384 +/- 0.000453373783909247 |
+| C1 | 33 x 1, gathered | 29,378 | 233.4 | 31.8 | 0.0 | 145.7 | 227.6 | 0.0164066712571 +/- 0.000460445662194805 |
+| C2 | 33 x 1, gathered | 23,918 | 212.4 | 27.9 | 0.0 | 129.7 | 248.2 | 0.0164273324144557 +/- 0.000442536565345356 |
+| B2 | 33 x 1, shared | 21,723 | 210.7 | 10.3 | 16.8 | 118.3 | 268.2 | 0.0165186688093452 +/- 0.000444669272605961 |
+
+W1 (19 x 2 shared, 300 dead): log(Z) 0.0150462325838093 +/- 0.0011824641380044.
+
+**Results.**
+- **More ranks alone buy nothing on the shared server.** B's steady rate
+  (115.3 mean) is within noise of round 319's A (108.8, another node), because
+  the R2D2 request rises from ~150 ms at 19 lanes to ~276 ms at 33: 19/0.150
+  = 127 requests/s against 33/0.276 = 120. The card is saturated at ~19
+  single-image lanes, so `NS_R2D2_CUDA_MAX_RANKS=19` costs nothing on the
+  shared server and stays. The extra lanes also make the bring-up barrier
+  (round 323) longer: `stall_s` 16.8 s against 7.7 s at 19.
+- **Batching is what raises throughput.** At the same 33 ranks, C's steady
+  rate is 137.7 against B's 115.3 (+19%), with a shorter request (238 ms
+  mean against 276) because batches of up to 8 use the card better.
+- **But this job shows no wall-time gain.** B and C tie on wall to converge
+  (223.0 s against 222.9 s mean; one pair each way), because C1 needed 26%
+  more evaluations than the other three arms (29,378 against 21,723-23,918)
+  and C pays ~19 s more start-up building its batch contexts. Round 319's
+  C arms needed 3.7% more evaluations than A, so C1 looks like an async
+  outlier, but with two pairs that cannot be shown.
+- **log(Z) agrees.** B mean 0.016578, C mean 0.016417: a difference of
+  0.00016, 0.35 sigma of one run, consistent with round 319.
+
+**Decision.** No default changes. The open GPU question is narrower now:
+does the gathering server's +19-38% steady rate survive into wall time on a
+longer search, where its ~20 s extra start-up is amortised? The next GPU
+round should race A (19 x 2 shared, the default) against C at the production
+nlive (150) with `--num-repeats 15`, so a search lasts several minutes, in
+three pairs. The lever from rounds 323-324 (parallel lane bring-up) is not
+worth more at 19 lanes than round 324 found, since the shared server has no
+reason to run more than 19.
+
+**Scheduling.** A 1-A100, 32-CPU job with `-t 00:55:00` waited six rounds;
+the same job with `-t 00:38:00` started in 4 minutes. Keep GPU jobs short
+(under ~40 minutes) so the scheduler can backfill them.
+
+Rows: bench `r325-W1`, `r325-B1`, `r325-C1`, `r325-C2`, `r325-B2` (the job
+wrote them as `r319-*`; renamed when appended) and stage row
+`r325-gpu-ranks-vs-batching` in `benchmarks.jsonl`. `.probe/r325/` keeps the
+script, job output, gzipped logs and the five `summary-*.json`; the job
+deleted the run directories.
+
+## Round 326 (GPU measurement): at production settings the gathering server converges 8% sooner than the shared default
+
+**Why.** Round 325 left one question for the GPU default: does the gathering
+TensorRT server's higher steady rate (C: 33 x 1, `R2D2_TRT_BATCH=8
+R2D2_TRT_LANES=4`) survive into wall time once its ~20 s extra start-up is
+amortised, against A (19 x 2 on the shared server, the default)? Job
+39672142 (`.probe/r326/ab.sh`, `../frozen-r303` tree as rounds 319 and 325)
+raced them at production settings: `--nlive 150 --num-repeats 15 --seed
+4299`, converged, after a 300-dead warm-up arm W. It was a 2-task array of
+1-A100, 32-CPU, `-t 00:38:00` jobs. Both tasks backfilled at once onto
+gpu-q-20 (A100-SXM4-80GB), each on its own card. Task 0 ran A then C and
+task 1 ran C then A, so each task holds one pair. The two tasks shared the
+node's CPUs and memory bandwidth, so compare arms within a task only.
+
+| arm | evals | wall to converge s | start-up s | stall s | steady evals/s | R2D2 request ms | log(Z) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A, task 0 | 67,392 | 627.5 | 10.5 | 7.5 | 110.6 | 143.2 | 0.0167323476423319 +/- 0.000429961385611248 |
+| C, task 0 | 68,385 | **585.4** | 27.8 | 0.0 | 122.6 | 238.0 | 0.0166460282472607 +/- 0.000416700827149362 |
+| C, task 1 | 70,160 | **675.0** | 32.2 | 0.0 | 109.2 | 266.6 | 0.0167838812538423 +/- 0.000420868240741699 |
+| A, task 1 | 75,576 | 741.9 | 10.0 | 7.5 | 104.3 | 150.7 | 0.0166925721621368 +/- 0.000430471402563648 |
+
+Warm-up W (19 x 2 shared, 300 dead): task 0 0.0151892460421648 +/-
+0.00115958070488613, task 1 0.0151612368285483 +/- 0.00115324194198806.
+
+**Results.**
+- **C converges sooner in both pairs**: by 6.7% (585.4 against 627.5 s)
+  and 9.0% (675.0 against 741.9 s), 8.0% on the means (630.2 against
+  684.7 s). Its steady rate is 7.9% higher (115.9 against 107.4 evals/s),
+  and here it did not need more evaluations (69,273 against 71,484 mean).
+  Round 325's ~20 s start-up penalty is ~3% of a 10-minute search, so it
+  no longer cancels the batching gain.
+- **A against C has now been raced in five pairs** (three in round 319
+  at nlive 128 with 5 repeats, two here), on two nodes. C is sooner in all
+  five: by 16% on the short searches and 8% on these. Round 325's
+  wall-time tie was C against B (33 x 1 on the shared server), not
+  against A.
+- **log(Z) agrees**: A mean 0.016712, C mean 0.016715, a difference of
+  0.007 sigma of one run.
+- Noise between tasks is large: the two A arms differ by 18% in wall time
+  (12% in evaluations, 6% in steady rate) on the same node, which is why
+  only within-task pairs are compared.
+- Iteration 326's notes compared A of task 0 with C of task 1 (627 against
+  675 s) as if they were a pair. They ran at the same time on different
+  cards, so that comparison is void.
+
+**Decision.** The evidence now favours C as the GPU default for
+production-sized searches (10+ minutes). It is slower only where start-up
+dominates (searches of ~3 minutes or less). The default is not changed in
+this round. Making it the default means raising `NS_R2D2_CUDA_MAX_RANKS` to
+33 when batching and defaulting `R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4` on
+`--device cuda`. That needs its own round: a short GPU job that checks that
+the defaults resolve to C (`run.env`, `r2d2-engine.txt`), plus the WSClean
+guard for any shared script it touches.
+
+Rows: bench `r326-W-t0`, `r326-A-t0`, `r326-C-t0`, `r326-W-t1`,
+`r326-C-t1`, `r326-A-t1` and stage row `r326-gpu-a-vs-c-production` in
+`benchmarks.jsonl`. `.probe/r326/` keeps the script, the job outputs,
+gzipped logs and the six gzipped `summary-*.json`. The job deleted the run
+directories.
+
+## Round 328 (GPU default, resolution check pending): the gathering TensorRT server, 33 x 1, is the `--device cuda` default
+
+**Change.** On `--device cuda` with the shared TensorRT server (the default
+since round 215), `R2D2_TRT_BATCH` now defaults to 8 and `R2D2_TRT_LANES`
+to 4. With batching on, the rank cap is the CPUs (not
+`NS_R2D2_CUDA_MAX_RANKS=19`), plus one rank for PolyChord's root as on a CPU
+(round 186): 33 x 1 on a 32-CPU A100 job, round 326's arm C. The evidence is
+rounds 319 and 326: C converged sooner than 19 x 2 unbatched in all five
+pairs (8% at production settings), with log(Z) 0.007 sigma apart.
+`R2D2_TRT_BATCH=1` brings back 19 x 2 single forwards.
+`resume-nested-sampling-run.sh` resumes a run.env without `R2D2_TRT_BATCH`
+(from before this round) at batch 1. If TensorRT cannot be installed and
+the run falls back to eager torch, a rank count above
+`NS_R2D2_CUDA_MAX_RANKS` is now refused: eager workers hold their weights on
+the card, and CUDA OOMs past it would score as failures.
+
+**WSClean guard.** Not raced. Both edits are R2D2-only: the run-script
+change is in `run-nested-sampling-r2d2.sh`, and the resume change is gated on
+`NS_ALGORITHM = r2d2`.
+
+**Checks.** Shellcheck (CI's 0.9.0.6) on all scripts, `bash -n`, the
+self-checks of rank-budget/run-config/slurm, `test-defaults.sh`,
+`test_self_checks.py` and `test_cli.py` all pass. On this node,
+`resume-nested-sampling-run.sh --self-check` fails at its half-written
+summary case (`meqtrees.sif is missing` in its fixture). It fails the same
+way at HEAD (a2d8977), so this round did not cause it.
+
+**Pending.** Job 39673457 (`.probe/r328/check.sh`, 1 x A100, -t 00:25) runs
+a default search (D) and an `R2D2_TRT_BATCH=1` search (O) at nlive 128 with
+5 repeats, 600 dead points each. Its output, `.probe/r328/check-*.out`,
+should show D's run.env as `NS_MPI_PROCS=33 R2D2_TRT_BATCH=8
+R2D2_TRT_LANES=4 R2D2_OMP_THREADS=1`, O's as 19 x 2, and agreeing log(Z).
+It had not started when this iteration ended. Read it next round. If D does
+not resolve to C, revert this round. (Resolved in [round 329](#round-329-check-the-cuda-default-resolves-to-33-x-1-gathered-logz-agrees-resume-self-check-fixed): D resolves to C.)
+
+## Round 329 (check): the cuda default resolves to 33 x 1 gathered, log(Z) agrees; resume self-check fixed
+
+**Round 328's check (job 39673457, gpu-q-20, 1 x A100).** A default
+`./ri search r2d2 --device cuda` (D) and one with `R2D2_TRT_BATCH=1` (O)
+ran back to back at nlive 128, 5 repeats, 600 dead points, seed 4299.
+
+| arm | run.env | engine | wall s | evals | evals/s | steady | startup s | stall s | log(Z) |
+|---|---|---|---|---|---|---|---|---|---|
+| D (default) | `NS_MPI_PROCS=33 R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4 R2D2_OMP_THREADS=1` | plans `...-32-b1-2-4-8`, 33 workers gathered into batches of up to 8 on 4 lanes | 108.5 | 9,476 | 90.9 | 121.7 | 27.4 | 0.0 | 0.0165154851037018 +/- 0.000483519878283406 |
+| O (`R2D2_TRT_BATCH=1`) | `NS_MPI_PROCS=19 R2D2_TRT_BATCH=1 R2D2_OMP_THREADS=2` | one server, 19 lanes | 124.4 | 10,226 | 84.3 | 99.0 | 10.7 | 7.8 | 0.0162884883456009 +/- 0.00048688491664612 |
+
+The default resolves to round 326's arm C, the opt-out still gives 19 x 2,
+and log(Z) agrees (0.33 sigma), so round 328 stands. This was one
+sequential pair, a resolution check rather than an A/B. D's +23% steady
+rate is consistent with rounds 325-326, and its ~17 s extra start-up is the
+known cost of building four batched lanes. The rows are `r328-D-t0`,
+`r328-O-t0` and stage row `r328-gpu-default-check` in `benchmarks.jsonl`.
+
+**CI fix.** `resume-nested-sampling-run.sh --self-check` failed at its
+torn-summary case because line 113 still expected "2 evaluations already
+done" while the fixture has had 3 since round 92. Round 328 put the failure
+down to this node. It was this stale count, the same one fixed on
+origin/cluster as 8152274, and this round applies that change identically.
+The self-check now passes (with the squeue shim on PATH).
+
+
+## Round 330 (tooling + GPU measurement pending): the gathering server counts its batch sizes; is the batched default CPU-bound?
+
+**Why.** The batched GPU default (round 328: 33 x 1, `R2D2_TRT_BATCH=8`, 4
+lanes) spends ~16.7 ms of rank time per R2D2 iteration (308 ms over 18.5
+iterations in round 329's arm D), against ~4.5 ms of non-U-Net CPU work an
+iteration on the CPU path (15% of a ~598 ms request over ~20 iterations,
+round 302). So a rank waits most of an iteration on the server. Two things
+could cause that: the card (or how well the server batches), or 33 ranks
+plus the server's threads competing for 32 CPUs. Nothing recorded which one.
+Batches form only among workers at the *same* iteration, one of 25 nets, so
+33 workers spread over 25 nets may rarely fill a batch of 8. The server
+also kept no count of the batch sizes it ran.
+
+**Change (tooling).** `serve_trt_gathered` counts launches by batch size and
+rewrites `r2d2-trt-batches.txt` beside `r2d2-engine.txt` every 30 s and at
+exit (`launches N forwards M mean X sizes 1:a 2:b ...`, temp file then
+rename). `./ri bench` rows carry its mean as `trt_mean_batch`, and the
+comparison prints it as "TensorRT mean batch". The count is taken under the
+lock the server already holds when it picks a group. The gathered
+self-check now asserts that the launches add up to every request, and
+`bench.py --self-check` parses the file.
+
+**Local measurement (server overhead).** A stand-in for the gathering server
+on this icelake node: the real `gather_forwards`, a forward that returns at
+once, and N worker processes that each spin 10 ms of CPU, then do one
+round trip (r2d2-cuda.sif's Python, 38 CPUs, `/dev/shm/r330/gather_bench.py`).
+
+| workers | CPU between requests | requests/s | mean round trip | mean batch |
+|---:|---:|---:|---:|---:|
+| 1 | 10 ms | 96 | 0.41 ms | 1.00 |
+| 16 | 10 ms | 1,574 | 0.09 ms | 1.02 |
+| 24 | 10 ms | 2,300 | 0.14 ms | 1.07 |
+| 30 | 10 ms | 2,646 | 1.08 ms | 1.22 |
+| 33 | 10 ms | 2,451-2,517 | 2.6-3.2 ms | 1.5-1.6 |
+| 40 | 10 ms | 2,513-2,602 | 4.9-5.3 ms | 1.6-1.7 |
+| 33 | 0 | 50,728 | 0.64 ms | 1.12 |
+
+The server's own Python is not the limit: it answers 50k requests a second
+when nothing else wants the CPUs. The round trip grows from 0.1 to 3 ms only
+once the spinning workers come within a few of the CPU count. That is
+scheduling: a reply waits for a CPU. Nicing the workers to 5 (2.59 ms
+against 2.76) and a 0.2 ms GIL switch interval (2.46 against 2.87) do not
+change it. On the GPU node, 33 ranks share 32 CPUs with the server, so the
+same effect may cost the batched default part of each iteration. Fewer
+ranks could then be as fast, while more ranks would only pay if the ranks
+spend most of their time blocked on the card.
+
+**Pending (GPU).** Job 39673960 (`.probe/r330/ab.sh`, 1 x A100, 32 CPUs,
+`-t 00:38`, tree `../frozen-r330` = 77e4ff7 plus this round's counter) races
+A (the default, 33 ranks), B (45 ranks) and C (29 ranks, 1 thread each), in
+ABCCBA order, converged at nlive 128 with 5 repeats, seed 4299, after a
+300-dead warm-up. It samples the job cgroup's CPU time and `nvidia-smi`
+utilisation every 2 s (`util-r330-*.txt`). Judge on wall to converge and
+`converging evals/s`, since more workers cost evaluations (round 309). The
+job had not started when this iteration ended.
+
+**WSClean guard.** Not needed: both edits are R2D2-GPU-only (the gathering
+server) or bench reporting.
+
+## Round 331 (negative, reverted): pinning each R2D2 rank and its two workers to one CPU
+
+**Why.** GPU job 39673960 (round 330) had still not started, so this round
+took a CPU lever this node can answer. WSClean ranks have pinned themselves
+and their workers to one CPU each since round 16 (+10-20% there), but R2D2
+ranks have never been pinned: `pin_rank_cpu` is WSClean-only, and the R2D2
+path only follows its worker's socket (`follow_r2d2_worker_node`, round 176).
+That choice was made when R2D2 ranks ran multi-thread U-Nets. Since round
+276 they run 39 x 1, so a rank, its simulate worker and its R2D2 worker take
+turns on what could be one CPU. (Separately, a stand-in for the gathering GPU
+server, round 330's `gather_bench.py` with the server thread on its own CPU
+and 33 workers on the other 31 of 32, gave +20-23% requests/s and 3.2-3.7 ms
+round trips against 4.3-6.4 ms floating. That is a GPU-node question for a
+later round.)
+
+**Change (tried).** Opt-in `NS_R2D2_PIN_CPU=1`: after a rank's first
+evaluation, `pin_r2d2_rank_cpu` (`common.py`) claims a CPU with the same
+`/dev/shm/ri-cpu-<n>.lock` flock that `pin_rank_cpu` uses, pins the rank's
+main thread to it, and pins the R2D2 and simulate workers' process trees
+there too. The record writer keeps the whole set. The root rank never
+evaluates, so 38 workers get 38 CPUs. The affinity sampler shows 35+
+single-CPU process masks 90 s into each pinned arm and none in the default
+arms. The diff is kept at `.probe/r331/pin-r2d2-rank-cpu.diff`, with a host
+self-check.
+
+**Run.** On this half icelake node (38 CPUs), at 510cc01 plus the diff,
+async, `--nlive 48 --num-repeats 5 --max-ndead 400 --seed 331`, after a
+60-dead warm-up, in order p1 d1 d2 p2 p3 d3 (`.probe/r331/ab.sh`). The
+other half's tenant held the load average at 53-61 throughout.
+
+| arm | evals | steady evals/s | R2D2 iterations | image_container ms | ms / iteration | simulate ms | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| p1 pinned | 7034 | 43.73 | 19.94 | 811.1 | 40.67 | 42.5 | 0.0171419489667471 +/- 0.000677295834789436 |
+| d1 default | 7661 | 46.68 | 18.12 | 763.1 | 42.10 | 40.6 | 0.0172308665722291 +/- 0.000610409292634685 |
+| d2 default | 6314 | 45.43 | 18.12 | 778.5 | 42.97 | 43.5 | 0.0177644203806394 +/- 0.000597937251378693 |
+| p2 pinned | 8525 | 47.79 | 18.33 | 749.1 | 40.87 | 32.6 | 0.0168266553499682 +/- 0.000798281510098369 |
+| p3 pinned | 7822 | 44.78 | 18.89 | 793.8 | 42.02 | 39.4 | 0.0174345696366729 +/- 0.000633970957589139 |
+| d3 default | 6421 | 46.47 | 18.64 | 770.6 | 41.35 | 34.7 | 0.0176033321973591 +/- 0.000587966847088969 |
+
+**Learned.**
+- Null. Raw steady rates are 45.43 pinned against 46.19 default (-1.6%),
+  but the pinned arms happened to run more U-Net iterations per request
+  (round 317's early stop). Per iteration the pinned request is 41.19 ms
+  against 42.14 (-2.3%). The pairs go -3.4%, -4.9% and +1.6%, which is
+  inside this host's ~5% spread on a loaded node. That is not enough to
+  ship a new default under the "verified by A/B" rule, so the code is
+  reverted.
+- Pinning does not hurt: no stalls, peak memory unchanged (8.17-8.28 GB),
+  and log(Z) agrees (pinned 0.01683-0.01743, default 0.01723-0.01776, sigma
+  ~0.00065; the widest pair, p2 against d2, is 0.9 combined sigma). If it is
+  retried, it needs a quiet node and 6+ pairs, judged on ms per iteration.
+  The result fits round 205: the CPU forward is bound by DRAM bandwidth,
+  which no placement within one socket changes.
+- The GPU-side stand-in result (a dedicated server CPU, +20%) is a separate
+  and larger lever. On the GPU node, 33 ranks on 32 CPUs leaves `pin_rank_cpu`'s
+  `ranks <= cpus` guard false anyway, so nothing there is pinned today.
+
+**Pending (GPU).** Job 39673960 (round 330) started while this round ran.
+At 03:09 it had finished W, A1, B1 and C1 (walls 226, 214 and 205 s for A1, B1 and C1, one pass) and was running C2. The next round reads
+`.probe/r330/ab-39673960.out`.
+
+**WSClean guard.** Not needed: nothing shipped.
+
+## Round 332 (GPU measurement): the batched default is GPU-bound at a mean batch of 2; 29 ranks and 8 lanes raced
+
+**Read: job 39673960 (round 330).** 1 x A100 on gpu-q-20, 32 CPUs, tree
+77e4ff7 plus round 330's batch counter, gathered TensorRT batch 8 on 4
+lanes, nlive 128, 5 repeats, converged, seed 4299, order ABCCBA after a
+300-dead warm-up. A is the default (33 ranks), B 45 ranks, C 29 ranks. "CPUs
+busy" is the job cgroup's CPU time over wall after the first 30 s; "GPU" is
+the mean `nvidia-smi` utilisation over the same span.
+
+| arm | ranks | evals | wall to converge | steady evals/s | mean TRT batch | CPUs busy (of 32) | GPU | log(Z) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | 33 | 25,721 | 212.5 s | 139.6 | 2.04 | 18.6 | 87% | 0.0164320797761894 +/- 0.000455533062661695 |
+| B1 | 45 | 22,953 | 201.5 s | 131.7 | 2.43 | 22.4 | 81% | 0.0165085139887901 +/- 0.000434960864850737 |
+| C1 | 29 | 23,486 | 192.3 s | 142.8 | 2.02 | 16.0 | 91% | 0.0163268295497882 +/- 0.000437386497925277 |
+| C2 | 29 | 19,190 | 157.9 s | 147.8 | 2.06 | 15.4 | 90% | 0.0167271155037397 +/- 0.000457035689198552 |
+| B2 | 45 | 28,376 | 171.8 s | 196.5 | 3.47 | 18.2 | 88% | 0.0165352827742565 +/- 0.000442678932611848 |
+| A2 | 33 | 24,601 | 209.6 s | 135.8 | 2.16 | 18.0 | 91% | 0.0163676370876183 +/- 0.000439094867678744 |
+
+**Learned.**
+- The batched default is not CPU-bound. Only 15-22 of 32 CPUs are busy,
+  while the card is 87-91% busy. Round 331's idea of reserving a CPU for
+  the server answers a problem this node does not have, so it is dropped.
+- The card is busy with small batches: the mean is ~2 of a possible 8 at
+  29 and 33 ranks. Batches form only among workers at the same one of 25
+  nets, so with 4 lanes taking whatever is queued, most launches carry one
+  or two images. B2 is the only arm that reached a mean of 3.5, and it is
+  also the only arm far above the rest (196.5 steady); B1 at 45 ranks was
+  the slowest steady arm. That spread (B1 against B2, same settings) is
+  larger than any difference between arms, so one pass decides nothing.
+- C (29 ranks) converged sooner than A in both pairs (192.3 against 212.5 s,
+  157.9 against 209.6 s) and at a higher steady rate (+2.3%, +8.8%). Fewer
+  ranks use fewer evaluations to converge (round 309) without slowing the
+  card. Two pairs at this spread are not enough to move the default.
+- log(Z) agrees across all six arms (0.01633-0.01673, sigma ~0.00044; the
+  widest gap, C1 against C2, is 0.6 combined sigma).
+
+**Pending (GPU).** Job 39677203 (`.probe/r332/ab.sh`, 1 x A100, 32 CPUs,
+`-t 00:48`, tree `../frozen-r332` = bd967ef) races A (default 33 x 1, 4
+lanes), C (29 ranks) and L (33 ranks, `R2D2_TRT_LANES=8`) three times each,
+order A C L L C A A C L, at the same settings with seed 4332, and saves
+each run's `r2d2-trt-batches.txt` size histogram. More lanes take smaller
+groups but keep more forwards on the card at once; round 224 found
+concurrency, not batch size, was what helped. It was submitted this round
+and had not started when the iteration ended.
+
+**WSClean guard.** Not needed: nothing shipped.
+
+## Round 333 (diagnostic, docs only): R2D2 evaluations per SL3 unit, CPU against GPU, at today's defaults
+
+**Why.** GPU job 39677203 (round 332's A/C/L race) had not started, so this
+round took a question this node can answer from logged rows. The cost
+figures in "Where it stands" were round 174's: one A100 at 57-61 evals/s
+(MPS, 19 or 12 ranks) against 38 x 1 CPU arms at nlive 100. Both paths have
+changed since, so the advice on where production searches should run was
+stale. No search was run.
+
+**Method.** Charging as in round 174 (CSD3 policies: 1 unit per core-hour,
+1 per GPU-hour, the A100's 32 cores not charged; SL3 allowance 200,000
+core-hours and 3,000 GPU-hours a quarter, separate budgets). Rates are the
+converged 22 Sep production search (nlive 150, 15 repeats), evaluations over
+the bench row's `wall_s` (start-up included, post-run excluded):
+
+| shape (defaults of the time) | rows | evals | wall s | evals/s | evals per charged hour |
+| --- | --- | ---: | ---: | ---: | ---: |
+| half icelake, 39 ranks on 38 cores, busy node | `r278-bigrun` | 75,278 | 1,585.6 | 47.5 | 4,500 per core-h |
+| half icelake, 39 ranks on 38 cores, quiet node | `r300-bigrun` (round 302) | 72,286 | 1,200.7 | 60.2 | 5,700 per core-h |
+| two icelake nodes, 76 cores | `r288-conv` | 78,332 | 790.4 | 99.1 | 4,690 per core-h |
+| one A100, gathered TRT 33 x 1 (today's `--device cuda`) | `r326-C-t0` | 68,385 | 585.4 | 116.8 | 421,000 per GPU-h |
+| same, second task (node shared with another task) | `r326-C-t1` | 70,160 | 675.0 | 103.9 | 374,000 per GPU-h |
+
+**Learned.**
+- **One A100 hour now does the work of ~66-94 CPU core-hours** (central
+  ~78), up from round 174's 47-55. The GPU rate roughly doubled (shared,
+  then gathered TensorRT, rounds 215 and 328) while the CPU rate rose
+  ~10-30% (two sockets, extra root rank, filesystem fixes).
+- A converged production search costs **~0.18 GPU-hours** (~10.5 minutes
+  on one card) against **12-16 core-hours** on half an icelake node (20-26
+  minutes). The GPU is also the faster wall clock, beating two whole
+  icelake nodes (790 s).
+- A quarter's SL3 allowance buys ~0.90-1.14 billion evaluations on CPU and
+  ~1.12-1.26 billion on the GPU budget, ~16,000 and ~17,000 production
+  searches. Using both now gives **~2.0-2.4x** the evaluations of CPU alone
+  (round 174 said +70-80%). If GPU hours are scarce or queue for long, the
+  CPU budget still carries about half the work, so both belong in
+  production.
+- With paid hours, the GPU pays whenever a GPU hour costs less than ~66
+  core-hours (round 174 said ~50).
+- Caveats: GPU queue time is not counted (2-GPU ampere jobs never started
+  on this account, round 163; 1-GPU jobs have waited from minutes to hours);
+  the r326 tasks shared one node's CPUs and memory bandwidth, so a lone
+  card may run faster; the CPU range spans node load (round 302).
+
+**Pending (GPU).** Job 39677203 (round 332) still had not started when this
+iteration ended; `.probe/r332/` has no output file yet. Read it next round.
+
+Rows: stage row `r333-cost-per-unit` in `benchmarks.jsonl`.
+
+**WSClean guard.** Not needed: docs only.
+
+## Round 334 (negative): fewer CPU ranks relieve DRAM per request but lose throughput; 39 x 1 stays
+
+**Why.** GPU job 39677203 (round 332's race) had still not started, so this
+round took a CPU question this node can answer. The CPU forward is
+DRAM-bandwidth bound ([round 205](#round-205-diagnostic-the-r2d2-cpu-search-is-at-the-sockets-dram-bandwidth)),
+and a converged async search pays ~0.41 x workers extra live points
+([round 307](#round-307-analysis-guidance-fix-the-async-overhead-is-a-fixed-04-x-workers-live-points-so-a-bigger-nlive-never-buys-speed)).
+If bandwidth were fully saturated, fewer ranks would lose almost no
+throughput and win on overhead. At nlive 150, 30 ranks (29 workers) beat
+39 (38 workers) on `converging evals/s` if their raw rate is at least 97.8%
+of the default. Round 309 had compared thread layouts at full CPU, never
+fewer ranks.
+
+**Run.** On this half icelake node (38 CPUs) at b6719f3, async,
+`--nlive 48 --num-repeats 5 --max-ndead 400 --seed 331`, after a 60-dead
+warm-up (`.probe/r334/ab.sh`, `ab2.sh`). Race 1 (d1 f1 f2 d2 d3 f3) set only
+`NS_MPI_PROCS=30`, which also raises `R2D2_OMP_THREADS` to 2 (the per-rank
+CPU share rounded up), so f is 30 x 2. Race 2 (s1 e1 e2 s2) pins 30 x 1.
+Load average 51-72 from the other half's tenant.
+
+| arm | layout | evals | steady evals/s | R2D2 iterations | ms / iteration | U-Net iterations/s | converging at nlive 150 | log(Z) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| d1 | 39 x 1 | 6302 | 48.26 | 17.64 | 41.78 | 851 | 43.72 | 0.0176425155373878 +/- 0.00057758620753672 |
+| f1 | 30 x 2 | 5747 | 44.21 | 17.54 | 35.03 | 776 | 40.97 | 0.0179276333940078 +/- 0.000607454356381023 |
+| f2 | 30 x 2 | 7624 | 42.74 | 18.62 | 34.41 | 796 | 39.60 | 0.0173808812761932 +/- 0.000675675564714978 |
+| d2 | 39 x 1 | 7584 | 47.09 | 18.66 | 40.90 | 879 | 42.66 | 0.0173927466167287 +/- 0.00059691423949701 |
+| d3 | 39 x 1 | 6839 | 48.30 | 17.61 | 41.91 | 851 | 43.75 | 0.0175719957600345 +/- 0.000609537628436796 |
+| f3 | 30 x 2 | 6252 | 39.90 | 18.79 | 36.07 | 750 | 36.97 | 0.0177480060986081 +/- 0.000590349420716432 |
+| s1 | 30 x 1 | 7568 | 41.80 | 18.58 | 35.56 | 777 | 38.73 | 0.017427797864923 +/- 0.000630487591156867 |
+| e1 | 39 x 1 | 6910 | 44.78 | 18.18 | 43.48 | 814 | 40.56 | 0.0174094743444522 +/- 0.000603496236599646 |
+| e2 | 39 x 1 | 6039 | 46.45 | 18.38 | 41.79 | 854 | 42.08 | 0.017697106937523 +/- 0.000579809949408314 |
+| s2 | 30 x 1 | 6498 | 40.99 | 18.97 | 35.54 | 778 | 37.98 | 0.0175776566461186 +/- 0.000569372538338133 |
+
+ms / iteration is `image_container` ms over R2D2 iterations (round 317), and
+U-Net iterations/s is steady evals/s x iterations, the node's raw U-Net
+throughput with the early stop's per-image cost taken out.
+
+**Learned.**
+- The bandwidth relief is real but small: at 30 x 1 a U-Net iteration takes
+  35.6 ms against 40.9-43.5 ms (-15%) with 23% fewer ranks, so throughput
+  goes roughly as ranks^0.35, not flat. The node's U-Net iterations/s fall
+  8.6% (777 against a mean of 850), and the overhead saving (+2.3% at
+  nlive 150) does not make that up. `converging evals/s` is 38.4 against
+  42.6 (-9.9%; per iteration about -6.5%). 39 x 1 stays.
+- 30 x 2 is no better: its 2-thread ORT requests are no faster per
+  iteration than 30 x 1 (34.4-36.1 ms) while oversubscribing the CPUs, so
+  any R2D2 rank count below the CPU count wastes the CPUs it frees.
+  `--mpi-procs` alone changes the thread count too (`R2D2_OMP_THREADS`
+  rounds the share up), so a rank A/B must pin `R2D2_OMP_THREADS`.
+- log(Z) agrees across all ten arms (0.01738-0.01793, sigma ~0.0006; the
+  widest gap, f1 against f2, is 0.6 combined sigma).
+- Fewer ranks would only pay at a much smaller nlive, where the
+  0.41 x workers overhead dominates. That is the multi-node regime
+  (round 293), not one node at nlive 150.
+
+**Pending (GPU).** Job 39677203 (round 332: default vs 29 ranks vs 8 lanes
+on an A100) still had no output file at 03:52. The next round reads
+`.probe/r332/ab-39677203.out`, then removes `../frozen-r332`.
+
+**WSClean guard.** Not needed: nothing shipped. Rows: bench `r334-*` and
+stage `r334-fewer-cpu-ranks` in `benchmarks.jsonl`. The run dirs are deleted.
+
+## Round 335 (analysis, docs only): fewer ranks per node pay only once total ranks pass ~1.25 x nlive
+
+**Why.** GPU job 39677203 (round 332's race) had still not started, so this
+round answers the question round 334 left open with numbers already in
+hand: at what node count do fewer R2D2 ranks per node beat one per CPU?
+
+**Model** (`.probe/r335/model.py`, output `model.txt`). Round 334 measured
+the node's U-Net iterations/s at 39 x 1 (mean of five arms, 850) and 30 x 1
+(777), so node throughput goes as ranks^0.339. Round 307 measured a converged
+search's cost as `k x (nlive + 0.41 x workers)`. So time to converge on N
+nodes of r ranks goes as `(nlive + 0.41 (N r - 1)) / (N r^0.339)`, whose
+minimum is at **r\* = 1.25 x nlive / N**: one rank per CPU stays best while
+the job's total ranks are below ~1.25 x nlive.
+
+| nlive | nodes | best ranks/node | gain over 39 | 30 ranks/node |
+| ---: | ---: | ---: | ---: | ---: |
+| 150 | 1 | 39 | 0 | -6.4% |
+| 150 | 2 | 39 | 0 | -4.6% |
+| 150 | 4 | 39 | 0 | -1.7% |
+| 150 | 8 | 23 | +3.1% | +2.4% |
+| 150 | 16 | 12 | +19% | +7.1% |
+| 300 | 8 | 39 | 0 | -1.7% |
+| 300 | 16 | 23 | +3.1% | +2.4% |
+
+**Learned.**
+- Every search this repo runs today (1-4 nodes at nlive 150 or more) is
+  best at one rank per CPU, so the default stays. The one-node row matches
+  round 334's measured -6.5% per iteration, which is the fit's input, not a
+  test of it.
+- The first node count where fewer ranks could pay is 8 at nlive 150, and
+  there the gain (+3%) is inside a three-repeat control's ~5% spread, so it
+  is not worth a 16-node job to confirm. The 16-node figure extrapolates the
+  exponent to 12 ranks, far below the 30-39 it was measured over, and leaves
+  out round 288/292's 5-11% per-node rate loss; treat it as a direction,
+  not a number.
+- The rule is the same shape as round 307's: wide jobs pay for their
+  workers in PolyChord evaluations, and above ~1.25 x nlive total ranks
+  the DRAM a rank frees is worth more than the evaluations it adds.
+
+**Change.** Docs only: `docs/cluster.md` gives the rule next to the
+time-to-converge table. No code changed, so no WSClean guard. Stage row
+`r335-ranks-per-node-model` in `benchmarks.jsonl`.
+
+**Pending (GPU).** Job 39677203 still had no output file in `.probe/r332/`
+when this round ended. The next round reads `.probe/r332/ab-39677203.out`,
+then removes `../frozen-r332`.
+
+## Round 336: on two nodes the contour patch cuts R2D2 evaluations 22% and wall time 19%, log(Z) agreeing
+
+**Why.** GPU job 39677203 (round 332's race) had still not started, so this
+round asked a multi-node question instead. Round 315 put the opt-in
+contour-adoption patch (`NS_ADOPT_CONTOUR=1`,
+[round 312](#round-312-a-polychord-patch-that-adopts-the-newest-contour-mid-chain-cuts-async-evaluations-14-38-workers-and-22-76-with-unbiased-logz))
+at only -4.0% of evaluations on one node (38 workers). The async waste it
+removes grows with workers, though: the toy's saving went from 14% at 38
+workers to 22% at 76. Multi-node is where large runs go, and the patch had
+never been run in a multi-node R2D2 search.
+
+**Run.** Array job 39679058 (`.probe/r336/array.sh`): six 2-node icelake
+tasks (2 x 38 CPUs, `--nodes 2`, 2 x 39 ranks, 77 workers), each a
+converged production search (nlive 150, 15 repeats, async,
+`--max-ndead -1`) from the frozen tree `../frozen-r336` (`52b80c8`). Both
+arms run on round 313's patched `polychord-adopt.sif`, with
+`NS_ADOPT_CONTOUR` 0 or 1, on round 315's three seeds. Every arm ran on its
+own node pair, so per-arm wall time carries node noise, and evaluation
+counts are the clean measure. All six exited 0 (five started 04:15, the
+last 04:29). `.probe/r336/ana.py` is round 313's script, and wasted chains
+use the same rule.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | ms / eval | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | stock | 0.017470005208756 +/- 0.000383036741368901 | 1,673 | 462 | 74,887 | 78,353 | 108.1 | 719 | 736 s |
+| 190182240 | adopt | 0.0175253337325731 +/- 0.000382519334213831 | 1,397 | 185 | 62,798 | 65,960 | 102.9 | 757 | 653 s |
+| 7311 | stock | 0.017537086295114 +/- 0.000349919766134516 | 1,647 | 434 | 83,963 | 87,253 | 106.3 | 732 | 835 s |
+| 7311 | adopt | 0.0176906570266012 +/- 0.000358036726606559 | 1,402 | 192 | 60,975 | 64,181 | 103.2 | 756 | 634 s |
+| 4242 | stock | 0.0182430737611569 +/- 0.000350129516796424 | 1,679 | 449 | 89,486 | 93,094 | 101.8 | 762 | 926 s |
+| 4242 | adopt | 0.0182171347449805 +/- 0.000349562929821678 | 1,384 | 162 | 67,593 | 71,032 | 100.4 | 786 | 730 s |
+
+| pooled (3 seeds) | stock | adopt | change | 1 node (round 315) |
+| --- | ---: | ---: | ---: | ---: |
+| evaluations | 258,700 | 201,173 | **-22.2%** (per seed -15.8 / -26.4 / -23.7%) | -4.0% |
+| dead points | 4,999 | 4,183 | -16.3% | -11.9% |
+| wasted chains (share of dead) | 1,345 (26.9%) | 539 (12.9%) | -60% | 18.0% -> 6.2% |
+| useful dead points | 3,654 | 3,644 | -0.3% | +0.8% |
+| nlike per dead point | 49.68 | 45.75 | **-7.9%** | +9.0% |
+| summed search wall | 2,497.6 s | 2,016.4 s | **-19.3%** (-11.3 / -24.1 / -21.2%) | node noise |
+
+**Results.**
+- log(Z) agrees seed by seed: -0.05, +0.10 and +0.31 sigma (adopt minus
+  stock). Round 315's 1-node pairs were -0.09/-0.24/-0.41, so the patch
+  shows no sign of bias across six pairs.
+- The saving grows with workers much faster in R2D2 than in the toy.
+  Stock wastes 26.9% of dead points at 77 workers (18.0% at 38), and stock
+  chains get dearer too (nlike per dead point 44.96 on one node, 49.68 on
+  two). Adoption brings both back down: 45.75 per dead point, close to the
+  1-node stock cost. On one node, by contrast, adopted chains cost 9% more
+  ([round 316](#round-316-diagnostic-adopted-r2d2-chains-cost-more-because-r2d2s-cost-per-slice-step-rises-with-the-contour)).
+- Adoption removes most of the 2-node evaluation penalty. Stock needs
+  78-93k evaluations on two nodes against 66-68k on one (round 315).
+  Adopt needs 64-71k, the 1-node stock count. Round 315's 1-node stock
+  walls were 1,218-1,403 s (mean 1,317 s, other nodes), so 2 nodes speed
+  up 1.58x stock (mean 832 s) and **1.96x adopted (mean 672 s)**.
+- In every pair the adopted arm's ms per evaluation is 3-5% higher, at
+  equal `r2d2_iterations` (19.3). Each arm ran on different nodes, so this
+  may be node noise or adopted chains landing on costlier observations;
+  this round cannot tell which. It is already inside the -19.3% wall figure.
+- Sampler-change guard: the patch changes results (fewer, different dead
+  points), so it stays **opt-in**. Whether to make it the default for
+  multi-node searches is the user's call. The evidence for it is now six
+  raced converged pairs with log(Z) agreeing, plus round 312's 40-seed toy
+  check against the analytic log(Z).
+
+**Pending (GPU).** Job 39677203 still had no output file in `.probe/r332/`
+when this round ended. The next round reads `.probe/r332/ab-39677203.out`,
+then removes `../frozen-r332`.
+
+**WSClean guard.** Not needed: no code changed. Rows: bench `r336-a*-s*`
+(six) and stage `r336-adopt-contour-2-nodes`, which holds every log(Z)
+with its error, in `benchmarks.jsonl`. The run dirs were deleted by the
+job. Logs, stats and dead-birth files are in `.probe/r336/`.
+
+## Round 337: fix (multi-node): with more workers than nlive PolyChord stopped after the prior, exit 0, meaningless log(Z)
+
+**Why.** Round 336 proposed a 4-node pair of the contour patch to check
+that its saving keeps growing with workers. Array job 39680026 (six 4-node
+icelake tasks, 4 x 39 ranks = 155 workers, nlive 150, converged production
+settings, frozen tree `ed98305`) ran instead into two bugs.
+
+**Bug 1: an early stop that looks like success.** Both seed-190182240 arms
+"finished" in 34-50 s, after 762 evaluations, with `nlike` 304, ndead 455
+and log(Z) 0.0144 +/- 0.0033: exit 0, a `summary.json`, a benchmark row.
+`run.log` has the cause: `Warning, unable to proceed after 151: failed
+spawn events`. PolyChord's main loop runs only while consecutive failed
+replacements stay at or below `nfail` (`nested_sampling.F90`, default
+`nlive`). In async mode every chain whose seed the contour has passed by
+the time it returns cannot be placed, so with more workers than nlive the
+first wave of stale returns alone trips the guard. Reproduced on round
+312's 6-d toy (analytic log(Z) -8.30, nlive 30, `.probe/r337/toy.py`
+with a `TOY_NFAIL` override):
+
+| ranks | nfail | ndead | log(Z) | |
+| ---: | ---: | ---: | --- | --- |
+| 20 | default (30) | 746 | -8.62 +/- 0.41 | fine: 19 workers |
+| 38 | default (30) | 97 | -6.46 +/- 0.82 | **"unable to proceed after 31"** |
+| 38 | 1000 | 934 | -8.40 +/- 0.42 | |
+| 38 | 67 (nlive + workers), seeds 1/2/3 | 862-964 | -7.93 / -8.64 / -7.52 (+/- 0.39-0.41) | |
+| 76 | 105 (nlive + workers), seeds 1/2 | 1,210-1,245 | -7.96 / -8.73 (+/- 0.39-0.40) | |
+
+**Fix.** `polychord_r2d2.py` sets `settings.nfail = nlive + workers`
+(`polychord_nfail`, with a self-check). Where the guard never fired (every
+search with fewer workers than nlive, so every 1- and 2-node production
+search so far), nothing changes. It is still a stop for a run that truly
+cannot proceed, such as the failure storm in `csd3-experiments.md` (E5),
+only `workers` returns later. Note that the cluster.md speed-ups predicted
+for 4 and 8 nodes at nlive 150 (round 307) were unreachable before this:
+such a search would have ended at the prior. WSClean (`polychord_wsclean.py`)
+has the same default and is left unchanged under the R2D2-only scope. It
+matters only below ~36 nlive on one node, e.g. the `NS_NLIVE=8` smoke form.
+The R2D2 bench presets (nlive 8, `--max-ndead 12`, 38 workers) are also
+over the line, so an R2D2 bench search can now run to its `--max-ndead`
+where before a failure run could end it first. Compare such rows only with
+rows from the same side of this commit.
+
+**Bug 2: a scratch race on the pools nodes.** The seed-7311 stock arm died
+in 6 s: three ranks on `cpu-q-272` failed `mount /dev/shm/ri-ns-scratch-...:
+destination ... doesn't exist in container`. The launcher's rank step
+starts at once, and each rank `mkdir -p`s its node's scratch. But a remote
+node's pools copy of `run-nested-sampling-r2d2.sh` runs `rm -rf` and
+`mkdir` on the same path (round 297's stale-scratch fix) whenever its own
+`srun` gets there. If that lands after a rank's mkdir, the rank's container
+mount fails, and if a rank were already running it would wipe live scratch.
+Fix: each pools node touches `.node-<host>/scratch-ready` after its
+`rm -rf`/`mkdir`, and the launcher clears those markers first and starts no
+rank until every node's marker exists (300 s limit, then a FATAL naming
+`nodes.log`). Single-node runs skip all of this.
+
+**Run with both fixes.** Array job 39680617, same six tasks on the fixed
+tree (`.probe/r337/array.sh`, `fix.diff`). The markers appeared on all
+three remote nodes, and no log has a spawn warning.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | stock | 0.0176398577755772 +/- 0.000333839152725586 | 2,046 | 791 | 96,931 | 102,919 | 200.2 | 516 s |
+| 190182240 | adopt | 0.0176556658771305 +/- 0.000333601995974698 | 1,637 | 390 | 70,860 | 75,824 | 209.6 | 363 s |
+| 7311 | stock | 0.0177196046805723 +/- 0.000308771451142401 | 1,997 | 754 | 87,456 | 92,400 | 206.2 | 450 s |
+| 7311 | adopt | 0.0176669777389513 +/- 0.000306153594462748 | 1,618 | 371 | 64,659 | 70,559 | 204.7 | 360 s |
+
+- Stock log(Z) on 4 nodes agrees with the 1-node production search
+  (0.0172602 +/- 0.00040: +0.7 and +0.9 sigma) and with round 336's 2-node
+  stock arms of the same seeds (+0.3, +0.4 sigma). Adopt minus stock is
+  +0.03 and -0.12 sigma.
+- The contour patch saves **-26.3% / -23.6% evaluations and -29.6% /
+  -19.9% wall**. Pooled over the two seeds: evaluations 195,319 -> 146,383
+  (**-25.1%**), summed wall 966 -> 723 s (**-25.1%**). Round 336 got -21.4%
+  evaluations for the same two seeds on 2 nodes, so the saving still grows
+  with workers, but slowly. Stock wastes 38% of dead points here (791 of
+  2,046 and 754 of 1,997), against ~27% on 2 nodes and 18% on 1.
+- Against round 315's 1-node stock mean of 1,317 s, 4 nodes converge
+  2.73x faster stock (mean 483 s) and **3.64x adopted** (mean 362 s). On 2
+  nodes it was 1.58x and 1.96x.
+- Stock's evaluations grow 1.18x from 2 to 4 nodes over the two seeds
+  (165,606 -> 195,319; per seed 1.31x and 1.06x). That is exactly round
+  307's nlive + 0.41 x workers prediction ((150 + 63.6) / (150 + 31.6) =
+  1.18), so cluster.md's 4- and 8-node figures stand.
+- The contour patch stays opt-in (sampler-change guard). Defaulting it is
+  the user's call.
+
+**Pending.** The seed-4242 pair was still running or queued when this
+round ended. They write into
+`.probe/r337/` and delete their own run dirs. The next round adds them
+with `.probe/r337/ana.py`, then removes `../frozen-r337` and
+`$RI_WORK_DIR/.cache/ri/sifs-r337`. The first, broken array's logs are in
+`.probe/r337/first/`. GPU job 39677203 (round 332) still has no output.
+
+**WSClean guard.** Not needed: the change touches only R2D2 code
+(`polychord_r2d2.py`) and the multi-node branch of
+`run-nested-sampling-r2d2.sh`. `./ri self-check r2d2` passes (30 host
+checks plus the image checks), and so does shellcheck 0.9.0.6. Rows:
+bench `r337-a*-s190182240` and `r337-a*-s7311`, and stage `r337-nfail-fix` in `benchmarks.jsonl`.
+
+## Round 338: 4-node contour A/B complete (three seeds, -24% evaluations); a clean exit-0 early stop is now flagged
+
+**Seed 4242.** Round 337's array job 39680617 finished its last pair (tasks
+4-5). Both exited 0, and neither log has an `unable to proceed` line. The
+settings are unchanged: 4 nodes x 39 ranks (155 workers), nlive 150, 15
+repeats, converged.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4242 | stock | 0.0179546256573697 +/- 0.00031421237370391 | 2,030 | 783 | 91,104 | 96,357 | 207.6 | 487 s |
+| 4242 | adopt | 0.0180001782727063 +/- 0.000315672645932437 | 1,641 | 394 | 69,319 | 75,084 | 192.7 | 391 s |
+
+Adopt minus stock: -22.1% evaluations, -19.7% wall, log(Z) +0.10 sigma.
+
+**Pooled over all three seeds (4 nodes):**
+
+| | stock | adopt | change |
+| --- | ---: | ---: | ---: |
+| evaluations | 291,676 | 221,467 | **-24.1%** |
+| summed wall | 1,452 s | 1,114 s | **-23.3%** |
+| mean wall vs round 315's 1-node stock (1,317 s) | 2.72x | **3.55x** | |
+| same, 2 nodes (round 336) | 1.58x | 1.96x | |
+
+- log(Z), adopt minus stock: +0.03, -0.12 and +0.10 sigma. Stock agrees
+  with the 2-node arms of the same seeds (round 336) at +0.3, +0.4 and -0.6
+  sigma.
+- 4 nodes converge 1.72x (stock) and 1.81x (adopt) faster than 2. Stock's
+  evaluations grow 1.13x from 2 to 4 nodes (258,700 -> 291,676; per seed
+  1.31x, 1.06x and 1.04x), less than round 307's 1.18x. So cluster.md's 4-
+  and 8-node figures hold or are slightly pessimistic. Round 337's
+  two-seed 1.18x came from one high seed.
+- The saving grows slowly with workers: -4% at 38 (round 315), -22.2% at 77,
+  -24.1% at 155. The patch stays opt-in (sampler-change guard); defaulting
+  it is the user's call.
+
+**Guard: a clean exit that never converged.** Round 337's bug ended a
+search with exit 0, a `summary.json` and a benchmark row. Only one PolyChord
+line in `run.log` showed it. `nfail = nlive + workers` fixes that case, but
+the guard still fires, just as silently, in a failure storm. Now, when an
+attempt exits 0, `run_with_retries` (`scripts/lib/progress-bar.sh`) greps
+that attempt's output for `unable to proceed after`. If the line is there,
+it writes `WARNING: PolyChord stopped early ... its log(Z) is not a result`
+to `run.log` and stderr. It does not retry, because the same guard would
+fire again. A new fixture in the `progress-bar.sh` self-check covers both
+sides: a clean success gets no warning, and a success that prints the line
+gets it. Both still run once and return 0. The self-check (CI's
+`bash scripts/lib/progress-bar.sh`) and shellcheck 0.9.0.6 pass. The new
+behaviour is described in `docs/robustness.md`.
+
+**WSClean guard.** `progress-bar.sh` is shared code, but the change only
+adds a grep of the attempt's log after a successful exit. No evaluation,
+rank or timing path changes, and a converged WSClean run never prints that
+line, so no raced A/B was run. The cost is one `tail | grep` of `run.log`
+per search.
+
+**Cleanup.** The `../frozen-r337` worktree and `$RI_WORK_DIR/.cache/ri/sifs-r337`
+were removed. The jobs had already deleted their run dirs. Logs, stats and
+dead-birth files are kept in `.probe/r337/`. GPU job 39677203 (round 332)
+still has no output (`.probe/r332/`).
+
+Rows: bench `r337-a{0,1}-s4242` and stage `r338-adopt-contour-4-nodes-3-seeds`
+in `benchmarks.jsonl`.
+
+## Round 339: 8 nodes converge 4.4x (stock) and 5.7x (contour patch) faster than one; WSClean gets the nfail fix
+
+**8-node pair.** Array job 39681494 ran round 337's converged production
+search on 8 icelake half-nodes (8 x 39 ranks, 311 workers, nlive 150, 15
+repeats) with `NS_ADOPT_CONTOUR` 0 and 1. The frozen tree was 087ed59
+(`../frozen-r339`), and both arms used the patched `polychord.sif`. Both
+arms exited 0, and neither log has an `unable to proceed` line, so round
+337's `nfail` fix holds at twice the worker count.
+
+| seed | arm | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | wall |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | stock | 0.0175623136424466 +/- 0.000272166298027298 | 2,501 | 1,156 | 119,518 | 128,360 | 412.7 | 321 s |
+| 190182240 | adopt | 0.0175995868814326 +/- 0.000274343137855641 | 2,123 | 782 | 81,298 | 93,523 | 422.7 | 239 s |
+| 7311 | stock | 0.0179831988998666 +/- 0.000252337331246243 | 2,468 | 1,130 | 109,357 | 118,488 | 426.1 | 279 s |
+| 7311 | adopt | 0.0179816396502932 +/- 0.000250780257257865 | 2,100 | 760 | 79,032 | 89,177 | 424.8 | 219 s |
+Adopt minus stock: -27.1% and -24.7% evaluations, -25.5% and -21.5% wall,
+log(Z) +0.10 and -0.00 sigma. Pooled: evaluations 246,848 -> 182,700
+(**-26.0%**), summed wall 600 -> 458 s (**-23.6%**).
+
+**Scaling, both seeds summed** (1-node walls from round 315, 4-node from
+rounds 337-338, same seeds):
+
+| nodes | stock wall | x one node | adopt wall | x one node (stock) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2,621 s | 1.00x | 2,286 s | 1.15x |
+| 4 | 966 s | 2.71x | 723 s | 3.63x |
+| 8 | 600 s | **4.37x** | 458 s | **5.72x** |
+
+- Per-node throughput holds at 8 nodes: 51.6 and 53.3 steady evals/s a
+  node stock (50.0 and 51.5 on 4), so the loss against linear is all in
+  evaluations.
+- Stock's evaluations grow 1.26x from 4 to 8 nodes (195,319 -> 246,848;
+  per seed 1.25x and 1.28x). Round 307's model predicts (150 + 0.41 x 311)
+  / (150 + 0.41 x 155) = 1.30x, so cluster.md's ~4.9x for 8 nodes before
+  rate loss was close (measured 4.37x). Stock now wastes 46% of its dead
+  points (1,156 of 2,501 and 1,130 of 2,468), against 27% on 2 nodes and
+  39% on 4.
+- 8 nodes are 1.61x (stock) and 1.58x (adopt) faster than 4: doubling the
+  nodes again buys only ~60% more speed at nlive 150.
+- The patch's saving keeps growing with workers, slowly: -4% evaluations
+  at 38 (round 315), -22% at 77 (round 336), -24% at 155 (round 338), -26%
+  at 311.
+- log(Z) across node counts: seed 190182240 gives 0.017349 (1 node),
+  0.017640 (4) and 0.017562 (8); seed 7311 gives 0.017415, 0.017720 and
+  0.017983. The largest gap is 1.3 sigma (seed 7311, 1 against 8 nodes),
+  and stock and adopt agree within 0.1 sigma on 8 nodes.
+- The patch stays opt-in under the sampler-change guard; defaulting it is
+  the user's call. On 8 nodes it is worth about a quarter of the wall time.
+
+**WSClean had round 337's `nfail` bug.** `polychord_wsclean.py` never set
+`nfail`, so a WSClean search with `--mpi-procs` above `--nlive` ended
+early with exit 0. Default WSClean searches are safe, because they clamp
+ranks to nlive. On this node, `./ri search wsclean --nlive 8 --mpi-procs 30
+--max-ndead 300 --seed 339` stopped after 8 s at 45 dead points, with
+log(Z) 0.07020 +/- 0.02706 and PolyChord's `unable to proceed after 9`.
+Round 338's warning flagged it. `polychord_nfail` moved from
+`polychord_r2d2.py` to `common.py`, and both drivers now set `settings.nfail
+= polychord_nfail(args.nlive)`. Its self-check is now host-runnable (CI's
+`scripts/test_self_checks.py`: 31 host checks pass). After the fix:
+
+| run | ranks | log(Z) | ndead | evaluations | wall |
+| --- | ---: | --- | ---: | ---: | ---: |
+| before, `--mpi-procs 30` | 30 | 0.07020 +/- 0.02706 (stopped early) | 45 | 84 | 8 s |
+| after, `--mpi-procs 30` | 30 | 0.0978118296913875 +/- 0.00138542358918950 | 157 | 1,258 | 14 s |
+| before, default ranks | 8 | 0.09883 +/- 0.00237 | 113 | 777 | 23 s |
+| after, default ranks | 8 | 0.0996512456955600 +/- 0.00254388572622455 | 109 | 608 | 12 s |
+| after, default ranks (repeat) | 8 | 0.0874366459240915 +/- 0.0137499565479228 | 100 | 788 | 13 s |
+
+**WSClean guard.** Below the line (workers < nlive), `nfail` is a limit
+that never fires, so the change cannot alter a default search. The three
+8-rank runs agree within async noise at nlive 8. The same seed does not
+repeat bit for bit asynchronously (the before/after spread matches the
+repeat's), and nothing on the evaluation path changed, so no raced timing
+A/B was needed. (The 23 s "before" wall includes a cold start; the bench
+rows' `wall_s` are 8.9 / 6.0 / 7.1 s.)
+
+Rows: bench `r339-a{0,1}-s{190182240,7311}`, `r339-ws-*`, and stage
+`r339-8-nodes-and-wsclean-nfail` in `benchmarks.jsonl`. Logs, stats and
+dead-birth files are in `.probe/r339/`.
+
+**Cleanup.** The jobs deleted their own run dirs, and the WSClean probe
+dirs were deleted after their figures were recorded. `../frozen-r339` and
+`$RI_WORK_DIR/.cache/ri/sifs-r339` were removed. GPU job 39677203 (round
+332) still has no output in `.probe/r332/`.
+
+## Round 340: summary.json and the final pack share one encode per record (-2.7 s at 128k evaluations)
+
+**Question.** Round 339's 8-node jobs spent 29-51 s outside the
+evaluation span (`/usr/bin/time` wall minus bench `wall_s`): 12-14% of a
+4-6 minute search. About 20-26 s of that is rank 0's post-run work, done
+alone while 311 ranks wait: records 6.0, flush 5.8, prune 3.6, summary
+4.5 and pack 5.4 s (encode 4.0) at 128,360 evaluations. This cost grows
+with the evaluation count while the search span shrinks with nodes, so it
+is the serial part that grows with scale. What can come off it without
+changing any output?
+
+**Found.** After prune, rank 0 runs `json.dumps` on every record twice:
+once for the summary body (`_json_text`) and once more in the final pack,
+only to compare against the packed text. A fixture of 128k real records
+(r291-n1b's, made distinct) puts each pass at ~2.6 s on this node.
+
+**Change.** `encode_finished_records()` encodes each record once after
+prune. `write_json_atomic(..., encoded)` and `pack_finished_run(...,
+encoded)` both use those texts. Both drivers call it. If the lengths
+disagree, `_json_text` falls back to encoding. The resume-adoption
+self-check now packs from the encoded texts too, with an edited record,
+and the summary-json self-check compares both paths.
+
+| summary + final pack, 128,360 records, pack on hpc-work | 1 | 2 | 3 | 4 | mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD 31b6322 | 7.22 s | 6.45 s | 6.67 s | 6.65 s | 6.75 s |
+| encode once | 4.05 s | 4.07 s | 4.02 s | 4.07 s | **4.05 s** |
+
+The pairs ran interleaved (ABBA). The pack phase fell 3.44 -> 0.84 s and
+the summary phase did not change. Every arm wrote byte-identical
+`summary.json` (sha256 `01480a3aa927`) and `records.jsonl`
+(`ff6ab9cb6bd1`). Expected at round 339's 8 nodes: ~3-4 s off a 220-320 s
+search (~1-1.5%), and more at higher evaluation counts.
+
+**WSClean guard.** Two raced pairs (HEAD from a `/dev/shm` worktree
+against this tree, 19 ranks each on alternate CPU halves, seed 229, nlive
+100, synchronous, 2,000 max dead): HEAD 36.9 and 37.5 evals/s, new 36.9
+and 37.4. All four give log(Z) 0.0967023094179472 +/- 0.000520957293962581
+(861 dead) with identical `dead-birth.txt`. The new arm's pack reloads
+exactly as the summary's 4,071 evaluations.
+
+**Left.** `records` (6.0 s: a 282 MB pickle gather of parsed records to
+rank 0; unpickle alone is 1.2 s at 128k) and `flush` (5.8 s) are now the
+largest post-run parts at 8 nodes. The pre-run is ~19-25 s at 8 nodes
+against ~10 s on one node, and nothing yet breaks it down by phase.
+
+Rows: `r340-w{old,new}{1,2}` and stage row `r340-encode-once` in
+`benchmarks.jsonl`. Fixture and scripts are in `.probe/r340/`. All run
+dirs, the fixture and the base worktree were deleted.
+
+## Round 341: where the time outside an 8-node search goes (instrumentation)
+
+**Question.** Round 339's 8-node jobs spent 29-51 s outside the evaluation
+span, and round 340 could break down only rank 0's post-run part. Where
+does the rest go?
+
+**Change.** The R2D2 launcher appends each phase's end to `<run>/pre-run.tsv`
+(`ns_mark`: `job`, `sized`, `fifos`, `pools`, `environment`, `launch`, then
+`searched`, `recorded` and `finished` after the search). Before
+`run_polychord()` the ranks gather their `main`, `pypolychord`, `adopted` and
+`warm` times to rank 0, which writes the slowest and first rank of each
+(`write_pre_run_marks`). `./ri bench` reads the file into a `pre_run_s` row
+field: seconds per phase up to the first evaluation's start, their `total`,
+and `searched` (last evaluation's end to the search's exit, which is rank 0's
+post-run plus MPI teardown). The gather is the only new collective, and it
+runs where the ranks already meet in PolyChord's first one. Pools nodes write
+nothing. WSClean's launcher and shared code are unchanged.
+
+**Measured.** One icelake job on 8 nodes ran two short searches back to back
+(nlive 150, 1,500 max dead, seed 190182240, async, 311 workers): the first
+on cold nodes, the second straight after. The 1-node row is a 39-rank search
+on this allocation (300 max dead).
+
+| seconds | 8 nodes cold | 8 nodes warm | 1 node |
+| --- | ---: | ---: | ---: |
+| `./ri` to the launcher's `job` mark | 2.45 | 0.57 | - |
+| `job` -> `sized` (SIF checks, rank budget) | 0.96 | 0.62 | 0.03 |
+| -> `fifos` (622 FIFOs on Lustre, pools `srun`) | 1.69 | 1.27 | 0.48 |
+| -> `pools` (sidecar launch) | 0.88 | 0.35 | 0.34 |
+| -> `environment` (`record-environment.sh`) | 0.98 | 0.47 | 0.35 |
+| -> `launch` (wait for every node's scratch) | 0.33 | 1.11 | 0.00 |
+| -> `main` (ranks' container start + imports, slowest rank) | 2.22 | 2.92 | 0.95 |
+| -> `pypolychord` | 0.81 | 0.95 | 0.13 |
+| -> `adopted` | 0.98 | 0.45 | 0.48 |
+| -> `warm` (joins the workers) | 0.82 | 0.00 | 0.00 |
+| -> first evaluation | 0.76 | 1.06 | 0.02 |
+| **job to first evaluation** | **10.43** | **9.20** | **2.78** |
+| search span (`wall_s`) | 155.42 | 147.76 | 40.40 |
+| of which first-wave start-up (`startup_s`) | 9.4 | 0.0 | 14.3 |
+| last evaluation to search exit (`searched`) | 11.22 | 10.76 | - |
+| of which rank 0's post-run line | 9.7 | 8.7 | 1.4 |
+| search exit to launcher exit (bench record, teardown) | 8.91 | 3.13 | - |
+| `/usr/bin/time` wall | 187.67 | 170.35 | 47.8 |
+
+The parts add up to the measured wall within ~1 s. Evaluations were 62,860
+and 60,214; log(Z) 0.0174810383056297 +/- 0.000300410584012915 and
+0.0174905596935261 +/- 0.000299571339559985 (1,650 dead each, 0.02 sigma
+apart).
+
+**Found.**
+
+- Job start to the first evaluation is only 9-10 s at 8 nodes, against 2.8 s
+  on one node. No single phase dominates: the ranks' start (2.2-2.9 s) and
+  the FIFOs (1.3-1.7 s) grow most with nodes.
+- The larger part is after the last evaluation: 11 s to the search's exit
+  (rank 0's post-run, about 9 s of it), then 3-9 s more in the launcher. The
+  launcher's tail is `uv run scripts/bench.py record` (it parses the whole
+  `summary.json`) and the pool teardown; it was 8.9 s on cold nodes.
+- A cold node also adds a 9.4 s first-wave start-up inside the search span.
+  The second search in the same job had none.
+
+So at 8 nodes, 21-30 s of a ~3-minute job sits outside the evaluations, and
+two thirds of it comes after the result. The next targets are rank 0's
+`records` gather (2.9-3.1 s here, 6 s at 128k evaluations) and the
+launcher's post-search tail. The launcher could write the bench row in the
+background, since it is best effort.
+
+**R2D2 guard.** HEAD a13a845 (a `/dev/shm` worktree) raced against this
+tree, 19 ranks each on alternate CPU halves, swapped between pairs (seed
+190182240, nlive 150, synchronous, 450 max dead). I sized it too long: every
+arm hit its 900 s `timeout` before it finished.
+In both pairs the two arms' `dead-birth.txt` were byte-identical at the
+kill (315 dead). The new arm started 1.1% and 3.1% fewer evaluations, but
+the arms were not alike: HEAD's tree and run dir were on `/dev/shm` and this
+tree's on Lustre. A third pair, with both trees on `/dev/shm` and 150 max
+dead, finished: 4,324 evaluations each, 19.06 against 19.10 evals/s (steady
+19.07/19.10), 717.4 against 718.2 ms per evaluation, and identical log(Z)
+0.0147479521559665 +/- 0.00259029680327724 with identical `dead-birth.txt`.
+The marks cost nothing measurable, and the first two pairs' gap was the
+run dir's filesystem. That is worth knowing for any raced guard: put both
+arms' trees on the same filesystem.
+
+**Also fixed.** On HEAD, `./ri bench` stopped with `KeyError: 'machine'`.
+Hand-logged rows marked `"preset": "stage"` (round 340's among them) carry no
+machine, and `load_rows()` skipped only `"kind": "stage"`. It now skips both
+kinds, and any row without a machine. Its self-check has a row of that shape.
+
+Rows: `r341-a` (1 node), `r341-n8-cold`, `r341-n8-warm` and `r341-r{old,new}3`
+(bench rows; the new arms carry `pre_run_s`) and stage row `r341-pre-run-marks` in `benchmarks.jsonl`.
+The job script, logs and TSVs are in `.probe/r341/`. Every run dir was
+deleted.
+
+## Round 342: end-of-run records 7.1 s to 3.3 s at 128k evaluations (ranks encode, GC off)
+
+**Question.** Round 341 left rank 0's `records` gather and the encode that
+`summary.json` and the pack share as the largest steps after the last
+evaluation. Both are serial, and both scale with the evaluation count.
+
+**Change.** Two things in `finished_run_records()`, plus one line in `bench.py`.
+
+- `gc.disable()` at its start. Everything allocated from there on stays live
+  until exit and JSON records hold no cycles, so a cyclic collection walks
+  it for nothing. This costs no memory, because nothing here is a cycle.
+- Each rank also encodes the compact text of its own records, in parallel,
+  and sends it with the parsed record. `encode_finished_records()` uses that
+  text. A record naming an image gets no text, because
+  `prune_run_artefacts()` may edit it; rank 0 encodes those as before, and
+  records of an earlier resumed segment too. `_names_image()` is now the one
+  test both places use.
+- `bench.py record` also turns GC off (its whole `summary.json` stays live).
+  Measured in iteration 342 at 63k records: parse plus row helpers ~2.9 s to
+  ~2.3 s.
+
+**Measured, stage.** The real `finished_run_records()` and
+`encode_finished_records()` on 38 ranks in `polychord.sif`, on a 128,360-record
+fixture of real records in tmpfs, with a separate `json.dumps` check.
+Three interleaved pairs (`.probe/r342/post.py`):
+
+| seconds, rank 0 | HEAD | this round |
+| --- | ---: | ---: |
+| `finished_run_records()` (mean) | 3.53 | 2.43 |
+| of which the `records` phase | 3.13 | 2.0 |
+| `encode_finished_records()` (mean) | 3.61 | 0.91 |
+| **both** | **7.14** | **3.34** |
+
+That is -3.8 s (-53%), with pairs within 0.1 s. Every encoded text matched
+`json.dumps` of the pruned record (`bad 0`). Rank-encoded texts covered
+99,695 of 128,360 records (78%), not the ~90% that round 269 quotes for prune.
+
+This is a fixture, not an 8-node search, so the gather here is shared
+memory. Between nodes the texts add to what is gathered, so a real multi-node
+gain may be smaller; rank 0's GC saving does not depend on that. At 128k
+evaluations the whole saving is ~4 s of an hours-long search: it matters for
+short multi-node jobs and for tight feedback loops, not for production
+throughput.
+
+**Guards.** Raced against HEAD 264974d, with both trees on `/dev/shm`, 19 ranks each
+on alternate CPU halves, swapped between pairs, synchronous. The new tree
+also compared each text with a fresh `json.dumps` (`TEXTS-VERIFIED`).
+
+| pair | evals | evals/s HEAD / new | log(Z), both arms | dead-birth | texts bad |
+| --- | ---: | --- | --- | --- | ---: |
+| WSClean 1 (seed 229, nlive 100, 2,000 dead) | 4,071 | 37.1 / 37.1 | 0.0967023094179472 +/- 0.000520957293962581 | identical | 0 of 1,211 |
+| WSClean 2 | 4,071 | 38.0 / 38.0 | same | identical | 0 of 1,218 |
+| R2D2 (seed 190182240, nlive 150, 150 dead) | 4,324 | 19.0 / 19.1 | 0.0147479521559665 +/- 0.00259029680327724 | identical | 0 of 2,317 |
+
+In these short searches only 30-54% of records got a text, since more of them
+still name an image. On runs this size the post-run phases are ~0.1 s each,
+so the guards show no harm rather than a gain.
+
+`scripts/test_self_checks.py` (31 host-runnable checks) and `bench.py
+--self-check` pass; `self_check_resume_adoption` now asserts that a record
+naming an image gets no rank text and that the shared encode matches
+`json.dumps` after a prune edit.
+
+Iteration 342 ran out of time with its guard still running, so its edits were
+discarded unshipped. This round reapplied them from `.probe/r342/`, read that
+guard, and re-timed the stage: the `encode` figure printed in the first
+timing included the check's own `json.dumps`.
+
+Rows: `r342-{wnew,wold}{1,2}` and `r342-{rnew,rold}3` (bench rows) and stage
+row `r342-end-of-run` in `benchmarks.jsonl`. Run dirs were deleted.
+
+## Round 344: the target-size search converges in 20 minutes on 8 nodes; prune is the end of run's biggest phase
+
+**Why.** Every run so far stopped at 128k evaluations, but `docs/cluster.md`
+and earlier sizing work aim at `--nlive 500 --num-repeats 25`. A serial cost
+that only shows at that size would not have been seen. This is the first run
+at that size.
+
+**Method.** Converged R2D2 searches on 8 icelake half-nodes (312 ranks, 311
+workers), stock sampler, tree 0100306 frozen in `../frozen-r344`, jobs 39684651
+and 39685292 (`.probe/r344/big.sh`, `big2.sh`). The second tree differs only
+by prune timers, not committed. Rank 0's node was sampled every 30 s.
+
+| seed | log(Z) | ndead | wasted | nlike | evaluations | steady evals/s | ms/eval | job wall |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 344 | 0.0174309441303439 +/- 0.000188280573191559 | 5,820 | 1,785 | 432,376 | 450,922 | 387.4 | 796 | 1,254 s |
+| 345 | 0.0173758961596796 +/- 0.00020058887505272 | 5,926 | 1,892 | 406,776 | 425,400 | 398.6 | 774 | 1,145 s |
+
+- **Results agree.** The seeds differ by 0.2 sigma and sit within 0.4 sigma of
+  round 302's 0.0172602 +/- 0.00040 (nlive 150, one node). The error is about
+  half of round 302's.
+- **The cost model holds.** Round 307's model predicts ~465k evaluations from
+  round 339's ~123k; the two runs gave 451k and 425k. Waste falls to 31-32% of
+  dead points against 46% at nlive 150 on the same 311 workers.
+- **Per-node rate.** 48-50 steady evals/s a node against 52-53 in round 339,
+  with 19.1-19.4 R2D2 iterations. That is ~4-9% lower; two runs
+  do not say why. Simulate is 38-40 ms of ~785 ms (5%).
+- **Nothing size-related broke.** No stall (`stall_s` 0, idle 0.11-0.15%), peak RSS
+  8.5 GB (the pool parent), rank 0's node never above 40 GB used and 988 MB of
+  tmpfs. A run leaves ~2,000 files and 2.4 GB: `summary.json` 1.15 GB,
+  `run.log` 249 MB.
+- **Job start to first evaluation** is 7.7-9.4 s, unchanged from round 341.
+
+**Where the end of the run goes.** Last evaluation to search exit is 58-61 s,
+~5% of the job, with all 312 ranks held. `bench.py record` adds 10-16 s and the
+launcher ~1 s.
+
+| phase, seconds | seed 344 | seed 345 | 128k (round 339) |
+| --- | ---: | ---: | ---: |
+| drain | 0.9 | 0.5 | 0.4 |
+| records | 11.2 | 11.1 | 6.0 |
+| flush | 6.4 | 5.3 | 5.8 |
+| **prune** | **22.9** | **23.5** | 3.6 |
+| summary | 5.4 | 5.2 | 4.5 |
+| pack | 6.5 | 4.9 | 5.4 |
+
+Prune grew 6.4x on 3.5x the evaluations. The timers split seed 345's 23.5 s:
+
+| part of prune | seconds |
+| --- | ---: |
+| keep decision | 1.20 |
+| scan of 425k records | 1.09 |
+| 32-thread pool on Lustre | **20.80** |
+
+In-memory cost alone, on the real 450k records in `polychord.sif` with 12% made
+to name images, is 3.8 s under cProfile, so this is Lustre. At prune, 9,414
+directories were still listed with images, ~30 per rank, and only 205 were
+kept. The pool removed 64,463 files from the other 9,209, using 28.7 CPU-seconds
+in 20.8 s, so it never got near 32 threads' worth.
+
+These are the ranks' held extremes that were already published during the run.
+The keep-filtered flush (round 51) can only drop a held extreme still in tmpfs.
+This reading fits the numbers (9,414 / 312 is about the 20 lowest and 20 highest
+each rank holds) but no run has counted published extremes directly. It would
+explain why 128k-evaluation runs, at ~5 minutes, did not show it, and it means
+prune grows with ranks and run length, not with evaluations: a 16-node run
+would pay roughly double.
+
+**Next.** Have each rank delete its own published, unkept extremes in the flush
+phase, in parallel, so rank 0 finds almost nothing to prune. That can save ~20 s
+of ~1,200 (~1.7%) at 8 nodes. It touches `common.py`, so it needs the raced
+WSClean guard, and is left for the next round. `flush` and the Lustre load of
+312 ranks unlinking at once must be measured with it.
+
+Cost: ~100 core-hours on `WBARKER-SL3-CPU`. GPU job 39677203 (round 332) still has
+no output. Rows: `r344-big` and `r344-big2` (bench rows; the second is tagged
+`0100306+` for its timers) and stage row `r344-target-size` in
+`benchmarks.jsonl`. Run dirs were deleted, after copying full-precision log(Z).
+
+## Round 345: fix: the records gather failed past 2 GiB at the target size; ranks now strip what the run does not keep
+
+**The bug.** The run meant to measure round 344's prune lever (job 39686035,
+same settings and seed 345, 8 icelake half-nodes) finished sampling at 09:02 and
+then died in `finished_run_records()`:
+
+    gathered = comm.gather(mine, root=0)
+    mpi4py.MPI.Exception: MPI_ERR_ARG: invalid argument of some other kind
+
+`comm.gather` keeps its byte counts and displacements in C ints, so it fails once
+the pickles total 2 GiB. Round 342 added each record's compact text to what is
+gathered, which roughly doubled the payload, and round 344's two runs fitted
+under the limit. This one's `run.log` holds ~506k record lines against 425-451k
+evaluations there. It has no `summary.json`, so no report and no pack.
+
+Sampling had finished: `.stats` gives log(Z) 0.0172436562853834 +/-
+0.000244710303516306, in line with round 344. **It then held all 8 nodes for 16
+more minutes**, until the script's `timeout 2200` ended it (exit 124). That hang
+is not fixed here. Why no rank aborted was not traced; mpi4py finalising at
+interpreter exit while the other ranks wait in the collective is the likely
+cause. A collective failing on one rank should abort the job, and that is the
+next item.
+
+**Reproduced and fixed.** A stage fixture in `polychord.sif` (38 ranks, distinct
+strings, `.probe/r345/gather.py`):
+
+| payload | `comm.gather` | `gather_large` |
+| --- | ---: | ---: |
+| 60.9 MB x 38 = 2.31 GB | **`MPI_ERR_ARG`** | 2.95 s |
+| 30.4 MB x 38 = 1.16 GB | 1.38, 1.39 s | 1.23, 1.24 s |
+
+`gather_large()` receives rank by rank, each message well under the limit, in the
+same order as `comm.gather`. The first attempt at this fixture proved nothing:
+strings sharing one literal were memoised by pickle and the failing case passed.
+
+**The strip.** `strip_unkept_evaluations()` runs in the flush phase: each rank
+strips what it put on Lustre and the run does not keep. Candidates are records
+still naming an image that are a current extreme or one of the 1 in
+`NS_KEEP_DETAIL_EVERY`. That second group is new against round 344's reading,
+which blamed extremes alone. 1 in 100 of ~430k is ~4,300 of the ~9,200 dirs
+pruned, so both must go. Anything in `keep` is skipped, and `keep` is the decision
+prune itself makes, so a kept evaluation cannot be stripped.
+
+**Not measured yet: the saving at 8 nodes.** Job 39686035 died before the flush
+phase, so round 344's ~20 s is still only an expected saving. Job 39687378 repeats
+the run with both changes (`.probe/r345/big2.sh`, tree `../frozen-r345`, with
+per-rank strip counts and timers in `run.log`); it had not started when this
+round closed. On tmpfs guards prune fell from 0.2-0.7 s to 0.0-0.1 s, which says
+nothing about Lustre.
+
+**Guards.** Raced against ba7d75c, both trees on /dev/shm, synchronous, 19 ranks,
+with `NS_RETAIN_FLUSH_SECONDS=20` so extremes really are published. Pairs 1-3 had
+the strip only; 4-5 had the strip and `gather_large`.
+
+| pair | imager | log(Z) | steady evals/s old / new |
+| --- | --- | --- | ---: |
+| 1 | WSClean | 0.0967023094179472 +/- 0.000520957293962581 | 37.20 / 37.25 |
+| 2 | WSClean | same | 37.51 / 37.49 |
+| 3 | R2D2 | 0.0147479521559665 +/- 0.00259029680327724 | 18.98 / 18.98 |
+| 4 | WSClean | same as 1 | 37.43 / 37.55 |
+| 5 | R2D2 | same as 3 | 19.11 / 19.05 |
+
+Dead-birth chains are byte-identical in every pair (51f16314ee36 WSClean,
+85b5c92bed16 R2D2). In all ten runs every image a record names exists and every
+dir left has a record naming its images. Both R2D2 pairs compute the same keep
+set by parameter hash. The dirs left on disk differ by up to 3 points in a pair
+(0 in WSClean pairs 1-2, 1 in pair 4), because eval ids follow the schedule and so
+decide which points hash into the 1 in 100 or stay a rank's extreme. Two of pair
+3's differences were traced to that hash. No old-vs-old R2D2 control was run.
+
+Rows: `r345-*` and `r345b-*` (bench rows) and stage row `r345-gather-limit` in
+`benchmarks.jsonl`. The bench rows have commit `unknown`, as the trees are `git
+archive` copies. `self_check_streaming_retention` now covers both functions; its
+third pass goes through the real `finished_run_records()`.
+
+## Round 348: fix: a failing rank now aborts the job, a resume cuts a torn pack tail; round 345's strip measured at 8 nodes
+
+Gnhf 346 and 347 ran out of time on their guards and shipped nothing, so this
+round covers their work. `.probe/r346` keeps that older name.
+
+**The hang.** Round 345's failed gather held 8 nodes for 16 minutes. Reproduced
+with 8 ranks in `polychord.sif` (`.probe/r346/hang.py`): rank 0 raising, or
+calling `SystemExit`, while the others wait in `bcast` never exits. `timeout 60`
+ends it with exit 124. Each rank's `main()` now runs inside
+`abort_on_exception()`, so any exception or non-zero `SystemExit` calls
+`abort_run`, and a clean exit passes.
+
+| failure injected on rank 0 before the end-of-run gather | before | after |
+| --- | ---: | ---: |
+| 8-rank fixture, raise or `SystemExit` | never exits (killed at 60 s) | exit 1 in ~0.9 s |
+| 1-node search, 19 ranks, nlive 50 | not run | exit 1, 27 s in total |
+| 2-node search (job 39687787), 78 ranks | not run | exit 1, 31 s in total |
+| 8 nodes, the real gather failure (job 39686035) | exit 124 after 960 s | not rerun |
+
+The search figures include `run_with_retries`' one retry, which scores nothing
+and stops. `chains/` survives and no `summary.json` is written.
+
+**A second bug: a resume left a torn pack tail.** `./ri self-check self-heal`
+failed on the patched tree with "the torn last line survived the resume". The
+abort patch did not cause it. `adopt_completed_evaluations()` only called the
+pack writer when flat records or node packs existed, and an appending run (the
+default since round 264) has neither. So the truncate never ran, and the next
+append ran on into the fragment: the failing run's pack had
+`eval-9999-...<fragment>eval-0012-...` on one line, so a kill mid-append cost
+one more record, the resume's first. A one-byte tail check (`_pack_is_torn`) now
+sends that case to the pack writer without reading the pack.
+
+The check found this only because it ran. It last passed in round 280, and
+leftover `.self-heal-*-1817628` directories from 28 Oct (deleted here) show a run
+that stopped without cleaning up; its cause was not checked. The first version
+of the new self-check passed with the fix removed, because its fixture had flat
+records. The final one uses an append-only directory, and fails with
+"a resume left the torn line" when the fix is mutated out.
+
+**Round 345's strip, measured.** Job 39687378, same settings and seed 345 as
+round 344's second run, 8 icelake half-nodes, with `gather_large` and
+`strip_unkept_evaluations` (tree `../frozen-r345`):
+
+| | round 344, seed 345 | round 345's tree, seed 345 |
+| --- | ---: | ---: |
+| evaluations | 425,400 | 412,638 |
+| prune | ~23 s | **2.4 s** |
+| flush | ~6 s | 3.7 s |
+| wall | 1,145 s | 986 s |
+| log(Z) | 0.0173758961596796 +/- 0.00020058887505272 | 0.0173410242589495 +/- 0.00019941208120242 |
+
+Ranks stripped 16,418 evaluations in the flush (12,283 extremes, 4,135 of the 1 in
+100), slowest rank 2.63 s. The split confirms round 345: the 1 in 100 are a real
+part, and extremes are the larger one. Post-run: drain 0.4, records 9.5, flush
+3.7, prune 2.4, summary 5.2, pack 5.0 s. The run left 1,870 files, 2,257 MB, and
+exited 0 at 412,638 records with no gather failure, though that is under round
+345's failing count, so `gather_large` was not exercised past 2 GiB at this
+size. It ran at 419 steady evals/s against ~390 in round 344; one run per arm
+does not attribute that, and the arms stopped at different evaluation counts.
+The same seed gives different chains because async order differs; the log(Z)
+gap is ~0.1 sigma.
+
+**Guards.** Raced, both trees on /dev/shm, synchronous, 19 ranks,
+`NS_RETAIN_FLUSH_SECONDS=20`. Pairs 1-2 are HEAD against the abort patch; pair 3
+is the abort patch against the abort patch plus the resume fix. A later edit
+touched only the self-check, and no pair covers the resume fix on R2D2: it only
+adds one read in shared code.
+
+| pair | imager | log(Z) | steady evals/s old / new |
+| --- | --- | --- | ---: |
+| 1 | WSClean | 0.0967023094179472 +/- 0.000520957293962581 | 37.55 / 37.52 |
+| 2 | R2D2 | 0.0147479521559665 +/- 0.00259029680327724 | 19.00 / 18.93 |
+| 3 | WSClean | same as 1 | 37.52 / 37.45 |
+
+Dead-birth chains are byte-identical in every pair (51f16314ee36, 85b5c92bed16).
+All three new arms are slightly slower (0.1-0.4%), inside the ~5% noise.
+
+**Checks.** On the final code `./ri self-check r2d2` and `wsclean`,
+`test_self_checks.py` (32 host checks), `test_watchdogs.py`, bench's self-check
+and compileall pass. `./ri self-check self-heal` passed in 145 s with both fixes,
+before the last edit, which touched only a self-check. ruff is not a CI step; it
+gained two findings here, `BLE001` (deliberate) and `B023` (in the self-check).
+
+Rows: `r346-*` (bench rows, commit `unknown`), `r345-big2`, and stage row
+`r348-abort`.
+
+## Round 349: a finished run's ledger row no longer parses every record (~6 s of a target-size job, all nodes held)
+
+Round 344 put the ledger row at 10-16 s of a target-size job, with every node
+still held. `./ri bench record` parsed the whole summary to read eight figures
+off its records. On a synthetic 430k-record, 1.08 GB summary in `/dev/shm`:
+
+| bench phase | seconds |
+| --- | ---: |
+| `json.loads` | 6.81 |
+| read | 0.67 |
+| start gaps | 0.46 |
+| first request + iterations | 0.35 |
+| peak memory | 0.09 |
+
+**The change.** `summarize_profiling` now stores those figures as
+`profiling.record_digest`, and `read_summary_skeleton()` reads the summary's
+two ends only. A summary with no digest (older runs, merged runs) or another
+layout returns `None`, and the caller parses it whole, as before. `./ri
+profile` uses the same reader. The record helpers moved from `bench.py` to
+`common.py`.
+
+| at 430k records | before | after |
+| --- | ---: | ---: |
+| reading the summary | ~7.5 s | 0.0011 s |
+| digest, rank 0, all ranks held | none | 1.23 s |
+
+The net is **~6 s on tmpfs**, ~0.6% of a ~1,000 s job. A larger saving on Lustre
+is expected from round 344's 10-16 s but was not measured, and no target-size
+search has run this path yet. The digest is also computed on each live summary
+(`live_runs.py`), which already decodes every record.
+
+**Results are unchanged.** On all three real summaries from the guard, the
+skeleton equals the full parse apart from `evaluations`, and the stored digest
+equals one computed fresh from the records. That covers the R2D2
+`r2d2_iterations` branch, 17.962 in both arms. The non-timing bench fields
+matched.
+
+| raced pair (19 ranks each on its own CPU set, synchronous) | evals | base steady evals/s | new | change |
+| --- | ---: | ---: | ---: | ---: |
+| WSClean, seed 229, base on even CPUs 0-36 | 4,071 | 37.51 | 37.48 | -0.1% |
+| R2D2, seed 229, base on CPUs 38-74 | 1,012 | 10.59 | 10.00 | **-5.6%** |
+| R2D2, seed 229, CPU sets swapped | 1,012 | 11.10 | 11.22 | +1.0% |
+
+All three pairs have byte-identical `dead-birth` chains and `.stats`. log(Z) is
+0.0967023094179472 +/- 0.000520957293962581 (WSClean) and
+0.0148985533905123 +/- 0.00153417185770842 (R2D2).
+
+The -5.6% is not a slowdown from this patch, because `record_digest` runs only
+after the last evaluation and its stages (simulate, imager) are the ones that
+moved. The swap does not cleanly explain it as a CPU-set effect either: the new
+arm was slower on 0-36 than the base arm on the same CPUs (10.00 against 11.10),
+and faster on 38-74 (11.22 against 10.59). Treat it as the ~5% noise of a single
+short pair, cause not established.
+
+**Checks.** `bench.py`, `profile-nested-sampling-run.py`, `test_watchdogs.py`,
+`test_self_checks.py` (32 host checks) and `./ri self-check wsclean` passed.
+`self_check_summary_json` covers the skeleton reader: no digest, merge's layout,
+half a file, and a tail wider than the read window. `./ri self-check r2d2` and
+self-heal were not run; the change touches neither records nor resume. The one
+new ruff finding, RUF007, is `start_gaps`'s existing `zip` moving into
+`common.py`, whose lint scope differs.
+
+Not done: `anesthetic-gui.py`'s title, `anesthetic_io.py`, merge and
+`prune-run-artefacts.py` still parse the whole summary. Some of those need the
+records.

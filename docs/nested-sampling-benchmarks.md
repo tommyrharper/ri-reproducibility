@@ -67,6 +67,8 @@ consistent ~4% false positives here.
 `NS_WSCLEAN_MGAIN`, `NS_WSCLEAN_LOG_TIME`, `R2D2_OMP_THREADS`,
 `R2D2_INTEROP_THREADS`, and the rest). Anything else is rejected, because the
 two arms would land in one cell and the comparison would read as noise.
+`NS_MPI_PROCS` is per node, so a multi-node search (`--nodes N`) is grouped
+by `NS_NODES` too; its run.env names it only when N is above 1.
 
 Interleaving a setting the preset itself pins splits the arms across two
 groups: the arm that matches the preset stays in it, the other lands in
@@ -99,6 +101,20 @@ max(2s, 10x the median evaluation), such as a meqserver wedge sitting out
 its retry ladder). On a 3-minute GPU arm those two can be 25-105s and halve
 the headline rate, so compare short arms on the steady rate
 ([CSD3 speed](csd3-speed.md), round 211).
+`startup_s` only sees start-up that opens a gap, so it reads 0.0 when every
+rank starts at once and the cold first requests are under that bound (an async
+whole node: 5-8s against 0.7s warm). `first_request_s`, the median duration of
+the evaluations started within 1s of the first, is the start-up figure there
+([CSD3 speed](csd3-speed.md), rounds 259-260).
+An R2D2 row also carries `pre_run_s`: seconds per launcher and rank phase from
+the job's start to the first evaluation, and `searched`, the last evaluation
+to the search's exit. Both are outside `wall_s`. They come from the run's
+`pre-run.tsv` (round 341).
+`converging evals/s` is not stored. The table derives it as the steady rate
+x nlive / (nlive + 0.41 x workers), where workers is
+`NS_MPI_PROCS` x `NS_NODES` - 1. A converged async search needs that many extra evaluations
+([CSD3 speed](csd3-speed.md), round 307), so raw evals/s flatters more ranks.
+Compare rank or node layouts on this line, not on the raw rate (round 309).
 
 Rows are grouped by **machine, imager and settings**, and only rows in one
 group are ever compared. The machine id is derived from `/etc/machine-id` (the

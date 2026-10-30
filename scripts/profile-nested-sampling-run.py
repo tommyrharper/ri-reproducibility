@@ -20,6 +20,7 @@ from common import (  # noqa: E402
     format_duration,
     format_share,
     load_evaluations_from_dir,
+    read_summary_skeleton,
     profiling_breakdown,
 )
 
@@ -48,7 +49,7 @@ def load_summary(target: Path) -> dict[str, Any]:
             )
         raise SystemExit(f"no summary.json found at {summary_path}")
     try:
-        return json.loads(summary_path.read_text())
+        return read_summary_skeleton(summary_path) or json.loads(summary_path.read_text())
     except ValueError:
         raise SystemExit(
             f"{summary_path} is only half written - the run was killed while "
@@ -73,7 +74,7 @@ def print_report(summary: dict[str, Any]) -> None:
     budget = breakdown["worker_seconds_budget"]
 
     print(f"algorithm:        {summary.get('algorithm')}")
-    print(f"evaluations:      {len(summary.get('evaluations', []))}")
+    print(f"evaluations:      {summary.get('evaluation_count', len(summary.get('evaluations', [])))}")
     ranks = f"{mpi_procs}" if workers == mpi_procs else f"{mpi_procs} ({workers} workers + administrator)"
     print(f"mpi_procs:        {ranks}")
     print(f"wall clock:       {format_duration(breakdown['total_wall_seconds'])}")

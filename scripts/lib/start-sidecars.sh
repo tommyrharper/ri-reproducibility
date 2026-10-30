@@ -212,9 +212,13 @@ _sidecar_kill_tree() {
 # written. (The Docker branch had a restart's ranks start their own workers
 # instead; a rank inside a SIF cannot.) Each worker's pid is beside its FIFOs,
 # and it goes with its children - the meqserver a simulate worker drives.
+# A multi-node search keeps each node's pids under .<pool>-workers/<host>/;
+# only this host's are this node's processes, and sidecar_reset_remote (when
+# the launcher defines one) has the other nodes reset theirs.
 sidecar_reset_workers() {
   local pid_file pid killed=0
-  for pid_file in "${OUTPUT_DIR:-/nonexistent}"/.*-workers/*.pid; do
+  for pid_file in "${OUTPUT_DIR:-/nonexistent}"/.*-workers/*.pid \
+    "${OUTPUT_DIR:-/nonexistent}"/.*-workers/"$(hostname -s)"/*.pid; do
     [ -f "${pid_file}" ] || continue
     pid="$(cat "${pid_file}" 2>/dev/null)" || continue
     case "${pid}" in '' | *[!0-9]*) continue ;; esac
@@ -224,6 +228,9 @@ sidecar_reset_workers() {
   done
   [ "${killed}" -eq 0 ] \
     || echo "sidecar_reset_workers: killed ${killed} pool worker(s) so the retry starts on fresh ones" >&2
+  if declare -F sidecar_reset_remote >/dev/null; then
+    sidecar_reset_remote
+  fi
 }
 
 # `bash scripts/lib/start-sidecars.sh --self-check` - the exec line each pool
@@ -292,6 +299,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     kill -0 "${_pid}" || { echo "FAIL: the reset took pool ${_pid} with it"; exit 1; }
   done
   [ -z "$(sidecar_reset_workers 2>&1)" ] || { echo "FAIL: a second reset found something to kill"; exit 1; }
+  # Multi-node: this host's directory is reset, another host's pids are not
+  # this node's processes and are left alone.
+  mkdir -p "${_tmp}/.fake-workers/$(hostname -s)" "${_tmp}/.fake-workers/other-host"
+  sleep 30 &
+  _worker=$!
+  disown "${_worker}"
+  echo "${_worker}" >"${_tmp}/.fake-workers/$(hostname -s)/5.pid"
+  echo "$$" >"${_tmp}/.fake-workers/other-host/6.pid"
+  sidecar_reset_workers 2>&1 | grep -q "killed 1 pool worker" || { echo "FAIL: reset missed this host's worker"; exit 1; }
+  sleep 0.2
+  kill -0 "${_worker}" 2>/dev/null && { echo "FAIL: this host's worker ${_worker} survived the reset"; exit 1; }
+  rm -rf "${_tmp}/.fake-workers"
 
   # CUDA MPS: no control binary leaves the pool flags empty; a daemon that
   # starts gives the bind and pipe env, and teardown tells it to quit.

@@ -24,6 +24,7 @@ HOST_RUNNABLE = {
         "self_check_parameter_space",
         "self_check_parameter_toggle",
         "self_check_polychord_finish",
+        "self_check_polychord_nfail",
         "self_check_profiling",
         "self_check_resume_adoption",
         "self_check_streaming_retention",
@@ -32,6 +33,7 @@ HOST_RUNNABLE = {
         "self_check_cpu_pinning",
         "self_check_follow_worker_node",
         "self_check_worker_timeout",
+        "self_check_abort_on_exception",
     ),
     "r2d2_serve": (
         "self_check_checkpoint_cache",
@@ -78,10 +80,13 @@ IMAGE_ONLY = {
     "polychord_r2d2": (
         "self_check_failure_record_persistence",
         "self_check_r2d2_config_thread_cap",
+        "self_check_r2d2_iterations",
+        "self_check_share_resume",
+        "self_check_stack_dumps",
         "self_check_worker_death_is_not_scored",
     ),
     "polychord_wsclean": ("self_check_failure_record_persistence",),
-    "r2d2_serve": ("self_check_checkpoint_series", "self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback",
+    "r2d2_serve": ("self_check_checkpoint_series", "self_check_threaded_session", "self_check_imaging_weights", "self_check_request_io", "self_check_trt_fallback",
                    "self_check_trt_shared_protocol"),
 }
 

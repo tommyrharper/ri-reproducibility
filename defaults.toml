@@ -49,7 +49,9 @@ R2D2_DEVICE = "cpu"
 # NS_R2D2_MAX_RANKS for R2D2_DEVICE=cuda: the ranks share one A100 and the 32
 # cores CSD3 allows per GPU. 19 is all an 80GB card holds (see below); with
 # MPS and blocking sync, 19 ranks ran 43.9 evaluations/s against 41.1 for 16
-# (csd3-speed.md, round 124).
+# (csd3-speed.md, round 124). The batching TensorRT server (the GPU default
+# since round 328) holds nothing per worker on the card, so it ignores this
+# and runs a rank per CPU plus the root's.
 NS_R2D2_CUDA_MAX_RANKS = 19
 # GPU memory one R2D2 worker takes: all 25 checkpoints plus its CUDA context,
 # measured 3.56GiB (docs/csd3-experiments.md, E3). The run clamps ranks to what

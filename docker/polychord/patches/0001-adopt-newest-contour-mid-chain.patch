@@ -1,0 +1,231 @@
+diff --git a/src/polychord/chordal_sampling.f90 b/src/polychord/chordal_sampling.f90
+index adc785b..c70ae9c 100644
+--- a/src/polychord/chordal_sampling.f90
++++ b/src/polychord/chordal_sampling.f90
+@@ -7,6 +7,7 @@ module chordal_module
+     function SliceSampling(loglikelihood,prior,settings,logL,seed_point,cholesky,nlike,num_repeats)  result(baby_points)
+         use settings_module, only: program_settings
+         use random_module, only: random_orthonormal_basis,random_real
++        use mpi_module, only: poll_contour
+ 
+         implicit none
+         interface
+@@ -60,6 +61,8 @@ module chordal_module
+ 
+         real(dp) :: w
+ 
++        real(dp) :: logL_now, logL_new
++
+         ! Start the baby point at the seed point
+         previous_point = seed_point
+ 
+@@ -72,7 +75,16 @@ module chordal_module
+         ! Transform to the unit hypercube
+         nhats = matmul(cholesky,nhats)
+ 
++        logL_now = logL
+         do i_babies=1,size(nhats,2)
++            ! Adopt the administrator's newest contour if this point is already
++            ! above it when it arrives. A contour the point is below is dropped,
++            ! not kept until the chain climbs into it: adopting on entry would
++            ! leave the point near the new boundary and bias log(Z) low.
++            if(poll_contour(logL_new)) then
++                if(logL_new > logL_now .and. previous_point(settings%l0) > logL_new) logL_now = logL_new
++            end if
++
+             ! Get a new random direction
+             nhat = nhats(:,i_babies)
+ 
+@@ -82,7 +94,9 @@ module chordal_module
+             w = w * 3d0 !* exp( lgamma(0.5d0 * settings%nDims) - lgamma(1.5d0 + 0.5d0 * settings%nDims) ) * settings%nDims
+ 
+             ! Generate a new random point along the chord defined by the previous point and nhat
+-            baby_points(:,i_babies) = slice_sample(loglikelihood,prior,logL, nhat, previous_point, w, settings,nlike(speeds(i_babies)))
++            baby_points(:,i_babies) = slice_sample(loglikelihood,prior,logL_now, nhat, previous_point, w, settings,nlike(speeds(i_babies)))
++
++            baby_points(settings%b0,i_babies) = logL_now ! the contour it was born on
+ 
+             ! Save this for the next loop
+             previous_point = baby_points(:,i_babies)
+diff --git a/src/polychord/makefile.dep b/src/polychord/makefile.dep
+index a9465f6..ae6ba92 100644
+--- a/src/polychord/makefile.dep
++++ b/src/polychord/makefile.dep
+@@ -10,6 +10,7 @@ calculate.o : \
+ 	utils.o 
+ 
+ chordal_sampling.o : \
++	mpi_utils.o \
+ 	calculate.o \
+ 	random_utils.o \
+ 	settings.o \
+diff --git a/src/polychord/mpi_utils.F90 b/src/polychord/mpi_utils.F90
+index 0c587bb..ca62724 100644
+--- a/src/polychord/mpi_utils.F90
++++ b/src/polychord/mpi_utils.F90
+@@ -21,6 +21,18 @@ module mpi_module
+     integer, parameter :: tag_run_epoch_seed=9
+     integer, parameter :: tag_run_epoch_babies=10
+     integer, parameter :: tag_run_stop=11
++    integer, parameter :: tag_run_contour=12
++
++    ! Contour adoption (PC_ADOPT_CONTOUR=1, asynchronous MPI only): the
++    ! administrator sends each worker its cluster's newest contour after every
++    ! replacement, and a worker raises its slice contour to it between slice
++    ! steps when its current point is already above it, so fewer chains return
++    ! below the contour and are thrown away.
++    logical :: adopt_contour = .false.
++    integer :: contour_comm = 0
++    integer :: contour_root = 0
++    integer, allocatable, dimension(:) :: contour_requests
++    real(dp), allocatable, dimension(:) :: contour_buffers
+ 
+     type mpi_bundle
+         integer :: rank
+@@ -35,6 +47,27 @@ module mpi_module
+ 
+     contains
+ 
++    !> Worker: take the newest contour the administrator has sent, if any
++    function poll_contour(logL) result(got)
++        implicit none
++        real(dp), intent(inout) :: logL
++        logical :: got
++#ifdef MPI
++        logical :: flag
++        integer, dimension(MPI_STATUS_SIZE) :: mpistatus
++#endif
++        got = .false.
++#ifdef MPI
++        if(.not. adopt_contour) return
++        do
++            call MPI_IPROBE(contour_root,tag_run_contour,contour_comm,flag,mpistatus,mpierror)
++            if(.not. flag) exit
++            call MPI_RECV(logL,1,MPI_DOUBLE_PRECISION,contour_root,tag_run_contour,contour_comm,mpistatus,mpierror)
++            got = .true.
++        end do
++#endif
++    end function poll_contour
++
+     !> Subroutine to get all mpi information
+     function get_mpi_information(mpi_communicator,colour) result(mpi_information)
+         implicit none
+@@ -484,6 +517,7 @@ module mpi_module
+         integer, dimension(MPI_STATUS_SIZE) :: mpistatus ! status identifier
+ 
+ 
++        do
+         call MPI_RECV(                   &!
+             seed_point,                  &!
+             size(seed_point),            &!
+@@ -494,6 +528,8 @@ module mpi_module
+             mpistatus,                   &!
+             mpierror                     &!
+             )
++        if(mpistatus(MPI_TAG) /= tag_run_contour) exit
++        end do
+         if(mpistatus(MPI_TAG) == tag_run_stop ) then
+             more_points_needed = .false.
+             return
+@@ -698,6 +734,53 @@ module mpi_module
+ 
+     end function live_point_needed
+ 
++    !> Administrator: start adopting contours (PC_ADOPT_CONTOUR=1, asynchronous only)
++    subroutine init_contours(mpi_information,synchronous)
++        implicit none
++        type(mpi_bundle), intent(in) :: mpi_information
++        logical, intent(in) :: synchronous
++        character(len=8) :: env
++        integer :: length, status
++        call get_environment_variable('PC_ADOPT_CONTOUR',env,length,status)
++        adopt_contour = status==0 .and. env(1:1)=='1' .and. .not. synchronous .and. mpi_information%nprocs>1
++        contour_comm = mpi_information%communicator
++        contour_root = mpi_information%root
++        if(adopt_contour .and. is_root(mpi_information)) then
++            allocate(contour_requests(mpi_information%nprocs-1),contour_buffers(mpi_information%nprocs-1))
++            contour_requests = MPI_REQUEST_NULL
++        end if
++    end subroutine init_contours
++
++    !> Administrator: send worker i the contour logLs(i), skipping a worker whose last one is still in flight
++    subroutine throw_contours(logLs)
++        implicit none
++        real(dp), intent(in), dimension(:) :: logLs
++        integer :: worker_id
++        logical :: done
++        integer, dimension(MPI_STATUS_SIZE) :: mpistatus
++        if(.not. adopt_contour) return
++        do worker_id=1,size(logLs)
++            if(contour_requests(worker_id) /= MPI_REQUEST_NULL) then
++                call MPI_TEST(contour_requests(worker_id),done,mpistatus,mpierror)
++                if(.not. done) cycle
++            end if
++            contour_buffers(worker_id) = logLs(worker_id)
++            call MPI_ISEND(contour_buffers(worker_id),1,MPI_DOUBLE_PRECISION,worker_id,tag_run_contour, &
++                contour_comm,contour_requests(worker_id),mpierror)
++        end do
++    end subroutine throw_contours
++
++    !> Administrator: complete every contour send (workers drain them before their stop signal)
++    subroutine finish_contours()
++        implicit none
++        integer, allocatable, dimension(:,:) :: mpistatuses
++        if(.not. allocated(contour_requests)) return
++        allocate(mpistatuses(MPI_STATUS_SIZE,size(contour_requests)))
++        call MPI_WAITALL(size(contour_requests),contour_requests,mpistatuses,mpierror)
++        deallocate(contour_requests,contour_buffers)
++        adopt_contour = .false.
++    end subroutine finish_contours
++
+ 
+ #endif
+ 
+diff --git a/src/polychord/nested_sampling.F90 b/src/polychord/nested_sampling.F90
+index 276fe2e..ab51192 100644
+--- a/src/polychord/nested_sampling.F90
++++ b/src/polychord/nested_sampling.F90
+@@ -2,7 +2,8 @@ module nested_sampling_module
+     use utils_module, only: dp
+ 
+ #ifdef MPI
+-    use mpi_module, only: get_mpi_information,mpi_bundle,is_root,linear_mode,catch_babies,throw_babies,throw_seed,catch_seed,broadcast_integers,mpi_synchronise
++    use mpi_module, only: get_mpi_information,mpi_bundle,is_root,linear_mode,catch_babies,throw_babies,throw_seed,catch_seed,broadcast_integers,mpi_synchronise, &
++        init_contours,throw_contours,finish_contours
+ #else
+     use mpi_module, only: get_mpi_information,mpi_bundle,is_root,linear_mode
+ #endif
+@@ -145,6 +146,7 @@ module nested_sampling_module
+ #ifdef MPI
+         allocate(worker_cluster(mpi_information%nprocs-1)) ! Allocate the worker arrays
+         worker_cluster = 1                          ! initialise with 1
++        call init_contours(mpi_information,settings%synchronous)
+ 
+         ! worker switch
+         worker_epoch=0
+@@ -342,6 +344,9 @@ module nested_sampling_module
+ #endif
+                     end if! Delete any clusters as necessary
+                     if (RTI%ncluster == 0) exit
++#ifdef MPI
++                    call throw_contours(RTI%logLp(min(worker_cluster,RTI%ncluster)))
++#endif
+ 
+                     if(update) then
+                         !--------------------------------------------!
+@@ -439,6 +444,7 @@ module nested_sampling_module
+                     ! Send kill signal to worker worker_id (note that we no longer care about seed_point, so we'll just use the last one
+                     call throw_seed(seed_point,cholesky,logL,mpi_information,worker_id,administrator_epoch,.false.) 
+                 end do
++                call finish_contours()
+             end if
+ 
+ 
+@@ -478,7 +484,6 @@ module nested_sampling_module
+                 time0 = time()
+                 ! 2) Generate a new set of baby points
+                 baby_points = SliceSampling(loglikelihood,prior,settings,logL,seed_point,cholesky,nlike,num_repeats)
+-                baby_points(settings%b0,:) = logL ! Note the moment it is born at
+ 
+ 
+                 wait_time = wait_time + time0-time1

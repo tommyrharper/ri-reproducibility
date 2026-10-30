@@ -361,18 +361,20 @@ ENDED_EPOCH_PATTERN = re.compile(r'"ended_epoch":\s*([0-9.eE+-]+)')
 
 def packed_records(evaluations: Path) -> dict[str, tuple[float, str]]:
     """{name: (when it ended, record text)} from evaluations/records.jsonl,
-    without its torn last line if a killed packer left one."""
-    try:
-        data = (evaluations / "records.jsonl").read_bytes()
-        fallback = (evaluations / "records.jsonl").stat().st_mtime
-    except OSError:
-        return {}
+    and before it a multi-node run's records.<host>.jsonl (round 290),
+    without a torn last line if a killed writer left one."""
     packed = {}
-    for line in data[:data.rfind(b"\n") + 1].decode(errors="replace").splitlines():
-        name, tab, text = line.partition("\t")
-        if tab:
-            ended = ENDED_EPOCH_PATTERN.search(text)
-            packed[name] = (float(ended.group(1)) if ended else fallback, text)
+    for path in [*sorted(evaluations.glob("records.*.jsonl")), evaluations / "records.jsonl"]:
+        try:
+            data = path.read_bytes()
+            fallback = path.stat().st_mtime
+        except OSError:
+            continue
+        for line in data[:data.rfind(b"\n") + 1].decode(errors="replace").splitlines():
+            name, tab, text = line.partition("\t")
+            if tab:
+                ended = ENDED_EPOCH_PATTERN.search(text)
+                packed[name] = (float(ended.group(1)) if ended else fallback, text)
     return packed
 
 
@@ -655,6 +657,13 @@ def _setting(run_env: dict[str, str], key: str) -> int | None:
     return int(raw) if raw.lstrip("-").isdigit() else None
 
 
+def total_ranks(run_env: dict[str, str]) -> int | None:
+    """The search's ranks: run.env's NS_MPI_PROCS is per node, and NS_NODES is
+    there only when above 1 (round 288), so a 2 x 38 run is 76, not 38."""
+    procs = _setting(run_env, "NS_MPI_PROCS")
+    return procs * max(_setting(run_env, "NS_NODES") or 1, 1) if procs else None
+
+
 def sampler_stats(run_dir: Path) -> dict[str, object] | None:
     for path in (run_dir / "chains").glob("*.stats"):
         try:
@@ -834,7 +843,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     run_env = read_run_env(run_dir)
     dead, checkpoint_time = dead_points(run_dir)
     checkpoint_age = time.time() - checkpoint_time if checkpoint_time else None
-    scan = evaluation_scan(run_dir, _setting(run_env, "NS_MPI_PROCS") or 0,
+    scan = evaluation_scan(run_dir, total_ranks(run_env) or 0,
                            checkpoint_time)
     owned = run_processes(run_dir, processes)
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
@@ -1270,8 +1279,11 @@ def render(run: dict[str, object]) -> None:
     settings = run["settings"]
     assert isinstance(settings, dict)
     ranks = f"{run['ranks']} ranks"
-    if settings.get("NS_MPI_PROCS"):
-        ranks += f" of {settings['NS_MPI_PROCS']}"
+    if total := total_ranks(settings):
+        ranks += f" of {total}"
+        if (_setting(settings, "NS_NODES") or 1) > 1:
+            # pgrep sees this node's ranks only.
+            ranks += f" on {settings['NS_NODES']} nodes"
     if run["ranks_spinning"]:
         ranks += f", {run['ranks_spinning']} busy-waiting"
 
@@ -1360,7 +1372,7 @@ def render(run: dict[str, object]) -> None:
         # evaluation is banked at the moment it finished while its cost was
         # spent before that, so a window can hold more imaging seconds than it
         # had rank-seconds to spend and the raw ratio would print "23 of 16".
-        procs = settings.get("NS_MPI_PROCS") or (str(run["ranks"]) or "")
+        procs = total_ranks(settings) or (str(run["ranks"]) or "")
         def _busy(value: object) -> str:
             if value is None or not str(procs).isdigit() or int(procs) <= 0:
                 return ""
@@ -1468,8 +1480,7 @@ def render(run: dict[str, object]) -> None:
     peak = run["peak_memory_bytes"]
     if peak:
         across = ""
-        if str(settings.get("NS_MPI_PROCS", "")).isdigit():
-            procs = int(settings["NS_MPI_PROCS"])
+        if procs := total_ranks(settings):
             across = (f", {format_gb(float(peak) * procs)} across "
                       f"{procs} rank{'' if procs == 1 else 's'}")
         recent_peak = run["recent_peak_memory_bytes"]
@@ -2857,6 +2868,13 @@ def self_check() -> None:
                 flat_memory
             assert ("memory    2.0GB peak imager memory, 16.0GB across 8 ranks\n"
                     in io_capture(flat_memory)), io_capture(flat_memory)
+            # A multi-node run.env records NS_MPI_PROCS per node (round 288):
+            # 4 on each of 2 nodes is the same 8 ranks, not 4 always busy.
+            (half / "run.env").write_text("NS_MPI_PROCS=4\nNS_NODES=2\n")
+            spread = describe(half, [], DEFAULT_STALE_SECONDS)
+            assert spread["occupancy"] == steady, spread["occupancy"]
+            assert ("16.0GB across 8 ranks\n" in io_capture(spread)
+                    and "0 ranks of 8 on 2 nodes" in io_capture(spread)), io_capture(spread)
             # A run whose rank count is not recorded has no denominator, so it
             # gets no shape rather than one drawn against a guess.
             (half / "run.env").write_text("")

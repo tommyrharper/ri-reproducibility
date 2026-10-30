@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from common import (
+    polychord_nfail,
     DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_MGAIN,
@@ -24,6 +25,7 @@ from common import (
     WORKER_DIED,
     WorkerDied,
     ZYGOTE_COMMAND,
+    abort_on_exception,
     abort_run,
     adopt_completed_evaluations,
     clean_convergence_from,
@@ -35,6 +37,7 @@ from common import (
     start_chains_mirror,
     finished_run_records,
     pack_finished_run,
+    encode_finished_records,
     start_record_packer,
     stop_record_packer,
     post_run_line,
@@ -70,6 +73,7 @@ from common import (
     self_check_spectral_window,
     self_check_worker_pool_connect,
     self_check_cpu_pinning,
+    self_check_abort_on_exception,
     self_check_worker_timeout,
     sidecar_command,
     zygote_run,
@@ -456,6 +460,7 @@ def main() -> None:
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
+    settings.nfail = polychord_nfail(args.nlive)
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # Checkpoint long runs; `--output-dir <interrupted run>` resumes, while a
@@ -542,9 +547,10 @@ def main() -> None:
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
-        write_json_atomic(summary_path, summary)
+        encoded = encode_finished_records()
+        write_json_atomic(summary_path, summary, list(encoded.values()))
         started = post_run_phase("summary", started)
-        pack_finished_run(evaluations_dir)
+        pack_finished_run(evaluations_dir, encoded)
         post_run_phase("pack", started)
         print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
@@ -567,9 +573,10 @@ if __name__ == "__main__":
         self_check_chains_mirror()
         self_check_failure_record_persistence()
         self_check_resume_adoption()
+        self_check_abort_on_exception()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
         self_check_cpu_pinning()
         print("metric resolution self-check passed")
     else:
-        main()
+        abort_on_exception(main)

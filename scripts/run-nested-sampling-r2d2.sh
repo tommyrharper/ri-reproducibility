@@ -19,6 +19,16 @@ case "${R2D2_DEVICE:=cpu}" in
   *) echo "FATAL: R2D2_DEVICE must be cpu or cuda, got '${R2D2_DEVICE}'" >&2; exit 1 ;;
 esac
 export R2D2_DEVICE
+# NS_NODES=N (`./ri search r2d2 --nodes N`) spreads one search over N whole
+# nodes: one node is DRAM-bandwidth bound (docs/csd3-speed.md, round 205), so
+# more nodes is the way past it. Each node runs its own pools, scratch and
+# --mpi-procs ranks (per node); srun starts the ranks (round 287). CPU only.
+NS_NODES="${NS_NODES:-1}"
+if [ "${NS_NODES}" -gt 1 ] && [ "${R2D2_DEVICE}" != cpu ]; then
+  echo "FATAL: --nodes ${NS_NODES} is CPU only; a GPU search runs on one node" >&2
+  exit 1
+fi
+export NS_NODES
 # A CPU forward runs through ONNX Runtime unless R2D2_RUNTIME=torch: 33-44%
 # more evals/s, log(Z) within 0.25 sigma of torch's at convergence
 # (docs/csd3-speed.md, rounds 140-145). A GPU forward runs through TensorRT,
@@ -30,6 +40,13 @@ export R2D2_DEVICE
 export R2D2_RUNTIME
 if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}" = cuda:trt ]; then
   export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-1}"
+fi
+# The shared server gathers up to 8 workers' forwards of one net into one
+# launch on 4 lanes, and with its workers off the card a rank per CPU (33 x 1)
+# fits: the production search converged 8% sooner than 19 x 2 unbatched, in
+# all five pairs, log(Z) 0.007 sigma apart (csd3-speed.md, rounds 319 and 326).
+if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}:${R2D2_TRT_SHARED:-0}" = cuda:trt:1 ]; then
+  export R2D2_TRT_BATCH="${R2D2_TRT_BATCH:-8}" R2D2_TRT_LANES="${R2D2_TRT_LANES:-4}"
 fi
 ns_require_sifs "${MEQTREES_SIF}" "${R2D2_SIF}" "${POLYCHORD_SIF}"
 
@@ -47,7 +64,11 @@ HOST_CPUS="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)"
 ns_refuse_missing_checkpoints "${CHECKPOINTS_DIR}" "${R2D2_CKPT_NAME}"
 # Claim the default only after guards, so refused runs leave no empty result;
 # named directories may exist, but not while a job is still in them.
-if [ -n "${OUTPUT_DIR:-}" ]; then
+# NS_NODE_ROLE=pools is this script started again on another node of a
+# multi-node search, by its launcher, to run that node's pools only.
+if [ "${NS_NODE_ROLE:-}" = pools ]; then
+  :
+elif [ -n "${OUTPUT_DIR:-}" ]; then
   ns_refuse_live_run "${OUTPUT_DIR}"
   mkdir -p "${OUTPUT_DIR}"
   # Normalize once so containment and recorded paths are consistent.
@@ -56,7 +77,7 @@ if [ -n "${OUTPUT_DIR:-}" ]; then
 else
   OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" r2d2-vlaa-)"
 fi
-ns_warn_file_quota "${OUTPUT_DIR}" "${NS_NLIVE}" "${NS_NUM_REPEATS}" "${NS_MAX_NDEAD}"
+[ "${NS_NODE_ROLE:-}" = pools ] || ns_warn_file_quota "${OUTPUT_DIR}" "${NS_NLIVE}" "${NS_NUM_REPEATS}" "${NS_MAX_NDEAD}"
 # On a cluster login node the search leaves here: the claimed directory and the
 # whole environment go to a Slurm job that runs this script again inside the
 # allocation, where the cores and memory below are the job's (docs/cluster.md).
@@ -71,6 +92,10 @@ if ns_should_submit; then
     # copies switch on: +37% on sapphire (round 111), +26% on icelake (round 250).
     export NS_SLURM_SOCKETS="${NS_SLURM_SOCKETS:-2}"
   fi
+  # The job gets --mpi-procs CPUs; the root's rank goes on top, as below.
+  if [ "${R2D2_DEVICE}" = cpu ] && [ -n "${NS_MPI_PROCS:-}" ]; then
+    export NS_R2D2_ROOT_RANK_EXTRA="${NS_R2D2_ROOT_RANK_EXTRA:-1}"
+  fi
   NS_SLURM_GPUS="${NS_SLURM_GPUS:-0}" ns_submit_run "${OUTPUT_DIR}" "${NS_R2D2_MB}" scripts/run-nested-sampling-r2d2.sh \
     || { rmdir "${OUTPUT_DIR}" 2>/dev/null; exit 1; }
   exit 0
@@ -79,6 +104,17 @@ fi
 # job's own environment rather than the login node's (slurm.sh).
 export OUTPUT_DIR
 ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling-r2d2.sh
+# Each launcher phase's end, then each rank phase's slowest and first rank
+# (polychord_r2d2.py), so `./ri bench` can split the time before the first
+# evaluation, which grew from ~10 s on one node to ~20 s on eight (round 341).
+NS_PRE_RUN_TSV="${OUTPUT_DIR}/pre-run.tsv"
+ns_mark() {
+  [ "${NS_NODE_ROLE:-}" = pools ] && return 0
+  local now
+  now="$(date +%s.%N)"
+  printf '%.3f\t%s\t%.3f\n' "${now}" "$1" "${now}" >>"${NS_PRE_RUN_TSV}" 2>/dev/null || true
+}
+ns_mark job
 # Every exec reads the image through squashfuse, and a cold node pages it in
 # off Lustre one fault at a time: a cold `import torch` took 46 s against 23 s
 # after this read, 64MB pieces 16 at a time (~1.8GB/s against one reader's
@@ -106,6 +142,14 @@ sys.exit(0 if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0 an
     exit 1
   fi
   NS_R2D2_MAX_RANKS="${NS_R2D2_CUDA_MAX_RANKS}"
+  # A batching server's workers hold nothing on the card and its batches keep
+  # it fed past the ~19 single-image lanes that saturate it (round 325), so
+  # the CPUs are the cap, plus the root's rank as on a CPU (round 186).
+  ns_gpu_batching=0
+  if [ "${R2D2_RUNTIME}:${R2D2_TRT_SHARED:-0}" = trt:1 ] && [ "${R2D2_TRT_BATCH:-1}" -gt 1 ]; then
+    ns_gpu_batching=1
+    NS_R2D2_MAX_RANKS="${HOST_CPUS}"
+  fi
   # A TensorRT worker's 25 engines hold ~5.1GB on the card against eager's
   # ~3.1GB of weights, so an 80GB A100 fits 12, not 19 (csd3-speed.md, round 170).
   # R2D2_TRT_SHARED=1 holds them once, in one forward server, and its workers
@@ -147,14 +191,39 @@ if [ -z "${NS_MPI_PROCS:-}" ]; then
   # rank per CPU leaves one CPU without an R2D2 worker. One more rank fills it:
   # 38 -> 39 ranks on 38 icelake CPUs won 5 of 5 pairs, +3.7% evals/s, with
   # the same time per evaluation (csd3-speed.md, round 186).
-  if [ "${R2D2_DEVICE}" = cpu ] && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
+  if { [ "${R2D2_DEVICE}" = cpu ] || [ "${ns_gpu_batching:-0}" = 1 ]; } \
+    && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="$((HOST_CPUS + 1))"
   fi
   NS_MPI_PROCS="$(ns_budget_ranks "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2)"
 else
+  # A job a login node sized with --mpi-procs N has N CPUs, so N ranks would
+  # leave the root's CPU idle (round 186); NS_R2D2_ROOT_RANK_EXTRA=0 keeps N.
+  if [ "${NS_R2D2_ROOT_RANK_EXTRA:-0}" = 1 ] && [ "${R2D2_DEVICE}" = cpu ] \
+    && [ "${NS_MPI_PROCS}" = "${HOST_CPUS}" ]; then
+    NS_MPI_PROCS="$((HOST_CPUS + 1))"
+  fi
   # Explicitly asked for, so it is honoured - but said out loud if it will
   # not fit, because the way this run fails is silent.
   ns_budget_warn_if_over "${NS_MPI_PROCS}" "${NS_R2D2_MB}" r2d2
+fi
+# A multi-node search needs the nodes it asked for; the ranks above are per node.
+if [ "${NS_NODES}" -gt 1 ] && [ "${NS_NODE_ROLE:-}" != pools ]; then
+  if [ "${SLURM_JOB_NUM_NODES:-1}" -lt "${NS_NODES}" ]; then
+    echo "FATAL: --nodes ${NS_NODES} needs a Slurm allocation of ${NS_NODES} nodes; this one has ${SLURM_JOB_NUM_NODES:-1}" >&2
+    exit 1
+  fi
+  ns_node_hosts="$(ns_expand_hostlist "${SLURM_JOB_NODELIST}" "${NS_NODES}")"
+  # A worker slices inside the contour it was handed, which has risen by the
+  # time it returns, so each dead point compresses less: a converged PolyChord
+  # run costs about as many evaluations as one with ~0.4 x workers more live
+  # points, whatever nlive is (round 307: fits round 293's toy within 2% and
+  # R2D2's 112-worker search within 1%). A bigger --nlive dilutes the share but
+  # adds more evaluations than it saves, so it buys precision, never speed.
+  ns_workers=$((NS_NODES * NS_MPI_PROCS - 1))
+  if [ "$((ns_workers * 4))" -gt "${NS_NLIVE}" ]; then
+    echo "WARNING: ${ns_workers} workers against --nlive ${NS_NLIVE}: PolyChord will need ~$((ns_workers * 40 / NS_NLIVE))% more evaluations to converge than with few workers; a larger --nlive does not remove that cost (it adds evaluations), so raise it only for precision (docs/cluster.md)" >&2
+  fi
 fi
 # mpirun counts one slot per CPU and refuses -np past it.
 if [ "${NS_MPI_PROCS}" -gt "${HOST_CPUS}" ]; then
@@ -181,19 +250,77 @@ fi
 
 # Written before anything can go wrong, so that a run which stops - out of
 # memory, Ctrl-C, reboot - still says how to start it again exactly.
-write_run_config "${OUTPUT_DIR}" r2d2
+ns_mark sized
+[ "${NS_NODE_ROLE:-}" = pools ] || write_run_config "${OUTPUT_DIR}" r2d2
 # The workers are reached over FIFOs, so these have to sit on the bind mount the
 # ranks and the pools both see - REPO_ROOT, which OUTPUT_DIR is always under,
 # because ns_refuse_unmounted_run above is what makes that true.
 SIMULATE_FIFO_DIR="${OUTPUT_DIR}/.simulate-workers"
 R2D2_FIFO_DIR="${OUTPUT_DIR}/.r2d2-workers"
-rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
-mkdir -p "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
-for ((rank = 0; rank < NS_MPI_PROCS; rank++)); do
-  mkfifo "${SIMULATE_FIFO_DIR}/${rank}.in" "${SIMULATE_FIFO_DIR}/${rank}.out"
-  mkfifo "${R2D2_FIFO_DIR}/${rank}.in" "${R2D2_FIFO_DIR}/${rank}.out"
-done
+if [ "${NS_NODES}" = 1 ]; then
+  rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+  mkdir -p "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+  for ((rank = 0; rank < NS_MPI_PROCS; rank++)); do
+    mkfifo "${SIMULATE_FIFO_DIR}/${rank}.in" "${SIMULATE_FIFO_DIR}/${rank}.out"
+    mkfifo "${R2D2_FIFO_DIR}/${rank}.in" "${R2D2_FIFO_DIR}/${rank}.out"
+  done
+else
+  # A FIFO on Lustre is a pipe on each node by itself (round 287), so every
+  # node gets a directory of its own ranks' FIFOs, named after the host: srun
+  # deals the ranks out in blocks of NS_MPI_PROCS in nodelist order, and each
+  # rank's wrapper below points it at its host's directory. The launcher makes
+  # them all before anything starts; a node's pools serve only its own. The
+  # scratch tmpfs has one name on every node, so one bind fits all ranks.
+  if [ "${NS_NODE_ROLE:-}" != pools ]; then
+    rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+    node=0
+    for host in ${ns_node_hosts}; do
+      mkdir -p "${SIMULATE_FIFO_DIR}/${host}" "${R2D2_FIFO_DIR}/${host}" "${OUTPUT_DIR}/.node-${host}"
+      rm -f "${OUTPUT_DIR}/.node-${host}/reset" "${OUTPUT_DIR}/.node-${host}/scratch-ready"
+      for ((rank = node * NS_MPI_PROCS; rank < (node + 1) * NS_MPI_PROCS; rank++)); do
+        mkfifo "${SIMULATE_FIFO_DIR}/${host}/${rank}.in" "${SIMULATE_FIFO_DIR}/${host}/${rank}.out"
+        mkfifo "${R2D2_FIFO_DIR}/${host}/${rank}.in" "${R2D2_FIFO_DIR}/${host}/${rank}.out"
+      done
+      node=$((node + 1))
+    done
+  fi
+  NS_FIFO_ROOTS=("${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}")
+  ns_host="$(hostname -s)"
+  SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}/${ns_host}"
+  R2D2_FIFO_DIR="${R2D2_FIFO_DIR}/${ns_host}"
+  [ -d "${R2D2_FIFO_DIR}" ] || { echo "FATAL: ${ns_host} is not one of this search's nodes (${ns_node_hosts:-})" >&2; exit 1; }
+  # Named, not per-launch like start-sidecars.sh's, so a kill -9 (no trap)
+  # leaves it for the next launch in this job: its .held/ collided with
+  # ./ri resume's identical eval names, ENOTEMPTY (round 297). No other
+  # search can own it - ns_refuse_live_run guards OUTPUT_DIR.
+  NS_SCRATCH_DIR="/dev/shm/ri-ns-scratch-${SLURM_JOB_ID}-${OUTPUT_DIR##*/}"
+  rm -rf "${NS_SCRATCH_DIR}"
+  mkdir -p "${NS_SCRATCH_DIR}"
+  # The launcher starts no rank until every node says this is done: a pools
+  # node whose rm -rf landed after its ranks' mkdir failed their container
+  # mounts, "destination ... doesn't exist in container" (round 337).
+  [ "${NS_NODE_ROLE:-}" != pools ] || : >"${OUTPUT_DIR}/.node-${ns_host}/scratch-ready"
+  # Every other node starts this script again as its pools, now, so their
+  # warm-up overlaps this node's. Their logs and .launcher.pid go in
+  # .node-<host>, so no node's reaper reads another's pid.
+  if [ "${NS_NODE_ROLE:-}" != pools ]; then
+    others="$(printf '%s\n' "${ns_node_hosts}" | grep -vx "${ns_host}" | paste -sd,)"
+    # A step's CPUs are what it asks for, so the pools ask for the node's
+    # share of the job; the job's own -c is dropped, as srun refuses two.
+    env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK \
+      srun --overlap --export=ALL --nodes "$((NS_NODES - 1))" --ntasks-per-node 1 \
+      --cpus-per-task "${SLURM_JOB_CPUS_PER_NODE%%[(,]*}" --mem 0 --cpu-bind none --nodelist "${others}" \
+      env NS_NODE_ROLE=pools NS_MPI_PROCS="${NS_MPI_PROCS}" NS_R2D2_ROOT_RANK_EXTRA=0 \
+      R2D2_OMP_THREADS="${R2D2_OMP_THREADS}" R2D2_MAX_THREADS="${R2D2_MAX_THREADS}" \
+      /bin/bash "${REPO_ROOT}/scripts/run-nested-sampling-r2d2.sh" \
+      >>"${OUTPUT_DIR}/nodes.log" 2>&1 &
+    ns_pools_srun=$!
+  fi
+  OUTPUT_DIR_RUN="${OUTPUT_DIR}"
+  OUTPUT_DIR="${OUTPUT_DIR}/.node-${ns_host}"
+fi
 
+ns_mark fifos
 . "${REPO_ROOT}/scripts/lib/start-sidecars.sh"
 # Each evaluation uses MeqTrees for simulate and MS-to-`.mat`, and R2D2 for
 # imaging. One worker per rank in each pool, started here so their ~0.5-0.9s
@@ -306,6 +433,17 @@ case "${R2D2_DEVICE}:${R2D2_RUNTIME}" in
     ;;
   *) echo "FATAL: R2D2_RUNTIME must be torch or onnx on a CPU, torch or trt on a GPU; got '${R2D2_RUNTIME}' for R2D2_DEVICE=${R2D2_DEVICE}" >&2; exit 1 ;;
 esac
+# Eager torch holds every worker's weights on the card, which fits
+# NS_R2D2_CUDA_MAX_RANKS, not a batching server's rank per CPU: past it the
+# workers' CUDA OOMs would score as failures.
+if [ "${R2D2_DEVICE}:${R2D2_RUNTIME}" = cuda:torch ] && [ "${NS_MPI_PROCS}" -gt "${NS_R2D2_CUDA_MAX_RANKS}" ]; then
+  echo "FATAL: ${NS_MPI_PROCS} eager-torch workers do not fit one GPU (NS_R2D2_CUDA_MAX_RANKS=${NS_R2D2_CUDA_MAX_RANKS}); set --mpi-procs ${NS_R2D2_CUDA_MAX_RANKS}" >&2
+  exit 1
+fi
+# R2D2_OMP_THREADS and R2D2_MAX_THREADS are set above, not exported: without
+# them the pool builds no shared weights (patch_onnx_network), so a request on
+# more than one thread ran torch, not ONNX Runtime - 19 x 2 at 25 against
+# 40-43 steady evals/s (docs/csd3-speed.md, round 273).
 sidecar_launch "${R2D2_SIF}" \
   ${R2D2_POOL_FLAGS[@]+"${R2D2_POOL_FLAGS[@]}"} \
   --env R2D2_DEVICE="${R2D2_DEVICE}" \
@@ -315,6 +453,8 @@ sidecar_launch "${R2D2_SIF}" \
   --env MKL_NUM_THREADS="${R2D2_OMP_THREADS}" \
   --env OPENBLAS_NUM_THREADS="${R2D2_OMP_THREADS}" \
   --env R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-0}" \
+  --env R2D2_OMP_THREADS="${R2D2_OMP_THREADS}" \
+  --env R2D2_MAX_THREADS="${R2D2_MAX_THREADS}" \
   --env R2D2_INTERLEAVE_WEIGHTS="${R2D2_INTERLEAVE_WEIGHTS:-1}" \
   --env R2D2_NUMPY_WEIGHTS="${R2D2_NUMPY_WEIGHTS:-1}" \
   --env R2D2_FAST_IO="${R2D2_FAST_IO:-1}" \
@@ -323,6 +463,39 @@ sidecar_launch "${R2D2_SIF}" \
   --env R2D2_CUDA_BLOCKING_SYNC="${R2D2_CUDA_BLOCKING_SYNC:-1}" \
   --env OMP_WAIT_POLICY=PASSIVE \
   -- python3 "${REPO_ROOT}/scripts/lib/nested_sampling/r2d2_serve.py" --fifo-dir "${R2D2_FIFO_DIR}"
+ns_mark pools
+if [ "${NS_NODES}" -gt 1 ]; then
+  OUTPUT_DIR="${OUTPUT_DIR_RUN}"
+  if [ "${NS_NODE_ROLE:-}" = pools ]; then
+    # Held until the launcher's srun ends this step; the trap removes the pools.
+    # Before a retry the launcher asks, through a file, for this node's workers
+    # to be reset, as its own are (sidecar_reset_workers).
+    while sleep 1; do
+      if [ -e "${OUTPUT_DIR}/.node-${ns_host}/reset" ]; then
+        sidecar_reset_workers
+        rm -f "${OUTPUT_DIR}/.node-${ns_host}/reset"
+      fi
+    done
+    exit 0
+  fi
+  sidecar_reset_remote() {
+    local host waited=0
+    for host in ${others//,/ }; do
+      : >"${OUTPUT_DIR}/.node-${host}/reset"
+    done
+    while compgen -G "${OUTPUT_DIR}/.node-*/reset" >/dev/null; do
+      if [ "${waited}" -ge 30 ]; then
+        echo "sidecar_reset_remote: a node did not reset its workers in 30s" >&2
+        return 0
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+  }
+  trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null || true' EXIT
+  trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null; exit 130' INT
+  trap '_sidecar_remove; kill "${ns_pools_srun}" 2>/dev/null; exit 143' TERM
+fi
 
 sidecar_binds
 RUN_COMMAND=(
@@ -331,16 +504,22 @@ RUN_COMMAND=(
   MEQTREES_IMAGE="${MEQTREES_SIF}"
   R2D2_IMAGE="${R2D2_SIF}"
   CHECKPOINTS_DIR="${CHECKPOINTS_DIR}"
-  NS_MPI_PROCS="${NS_MPI_PROCS}"
+  NS_MPI_PROCS="$((NS_MPI_PROCS * NS_NODES))"
   NS_IMAGE_DIM="${NS_IMAGE_DIM}"
   NS_MPI_OVERSUBSCRIBE="${NS_MPI_OVERSUBSCRIBE:-}"
   NS_SIMULATE_FIFO_DIR="${SIMULATE_FIFO_DIR}"
   NS_SCRATCH_DIR="${NS_SCRATCH_DIR}"
+  NS_PRE_RUN_TSV="${NS_PRE_RUN_TSV}"
   NS_R2D2_FIFO_DIR="${R2D2_FIFO_DIR}"
   NS_ENABLE_PARAMS="${NS_ENABLE_PARAMS:-}"
   NS_DISABLE_PARAMS="${NS_DISABLE_PARAMS:-}"
   NS_SYNCHRONOUS="${NS_SYNCHRONOUS}"
+  # Async workers adopt the newest live contour mid-chain; needs a polychord.sif
+  # with docker/polychord/patches (round 312), and is ignored by one without.
+  PC_ADOPT_CONTOUR="${NS_ADOPT_CONTOUR:-0}"
   NS_CHAINS_TMPFS="${NS_CHAINS_TMPFS:-1}"
+  # Opt-in: every N seconds each rank's Python stacks to <run>/stacks/ (round 324).
+  NS_STACK_DUMP_S="${NS_STACK_DUMP_S:-}"
   NS_KEEP_MEASUREMENT_SETS="${NS_KEEP_MEASUREMENT_SETS}"
   # numpy's OpenBLAS in this image spawns one busy-waiting worker thread per
   # host CPU, in every rank. Nothing here has a BLAS call big enough to want
@@ -363,15 +542,45 @@ RUN_COMMAND=(
   R2D2_OMP_THREADS="${R2D2_OMP_THREADS}"
   R2D2_MAX_THREADS="${R2D2_MAX_THREADS}"
   R2D2_INTEROP_THREADS="${R2D2_INTEROP_THREADS:-1}"
+)
+RUN_CONTAINER=(
   "${APPTAINER}" exec --pwd "${REPO_ROOT}"
   "${SIDECAR_BINDS[@]}"
   --bind "${REPO_ROOT}/scripts/lib/nested_sampling:/opt/ri-nested-sampling"
   "${POLYCHORD_SIF}"
-  mpirun
-  # Match Open MPI's slot units to `nproc`'s hardware-thread rank count.
-  --use-hwthread-cpus
-  ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
-  -np "${NS_MPI_PROCS}"
+)
+if [ "${NS_NODES}" = 1 ]; then
+  RUN_COMMAND+=(
+    "${RUN_CONTAINER[@]}"
+    mpirun
+    # Match Open MPI's slot units to `nproc`'s hardware-thread rank count.
+    --use-hwthread-cpus
+    ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
+    -np "${NS_MPI_PROCS}"
+  )
+else
+  # Across nodes the ranks are a Slurm step, wired up by PMIx: the image's
+  # Open MPI cannot start ranks on another node itself (round 287). Each one
+  # makes its node's scratch and finds its node's FIFOs (above) by host name.
+  # shellcheck disable=SC2016  # for the rank's own sh
+  RUN_COMMAND+=(
+    # Each rank is its own container, so Open MPI's single-copy (CMA) cannot
+    # cross between them, and the image's PMIx locks its shared store in a
+    # way the host's Slurm PMIx refuses; both are switched to what works.
+    env -u SLURM_CPUS_PER_TASK -u SLURM_TRES_PER_TASK
+    OMPI_MCA_btl_vader_single_copy_mechanism=none PMIX_MCA_gds=hash
+    srun --overlap --export=ALL --mpi=pmix --kill-on-bad-exit=1
+    --nodelist "$(printf '%s\n' "${ns_node_hosts}" | paste -sd,)" --nodes "${NS_NODES}"
+    --ntasks-per-node "${NS_MPI_PROCS}" --overcommit --mem 0 --cpu-bind none
+    # And appends its records to its node's own pack (round 290).
+    /bin/sh -c 'h="$(hostname -s)"; mkdir -p "$NS_SCRATCH_DIR"
+      export NS_SIMULATE_FIFO_DIR="$1/$h" NS_R2D2_FIFO_DIR="$2/$h" NS_RECORD_PACK="records.$h.jsonl"
+      shift 2; exec "$@"' sh
+    "${NS_FIFO_ROOTS[@]}"
+    "${RUN_CONTAINER[@]}"
+  )
+fi
+RUN_COMMAND+=(
   python3 /opt/ri-nested-sampling/polychord_r2d2.py
   --output-dir "${OUTPUT_DIR}"
   --repo-root "${REPO_ROOT}"
@@ -391,19 +600,41 @@ scripts/record-environment.sh \
   --image "${POLYCHORD_SIF}" \
   --config docs/nested-sampling.md \
   -- "${RUN_COMMAND[@]}"
+ns_mark environment
 
 mkdir -p "${OUTPUT_DIR}/evaluations"
+if [ "${NS_NODES}" -gt 1 ]; then
+  ns_waited=0
+  for host in ${others//,/ }; do
+    until [ -e "${OUTPUT_DIR}/.node-${host}/scratch-ready" ]; do
+      if [ "${ns_waited}" -ge 300 ]; then
+        echo "FATAL: ${host} did not make its scratch in 300s; see ${OUTPUT_DIR}/nodes.log" >&2
+        exit 1
+      fi
+      sleep 1
+      ns_waited=$((ns_waited + 1))
+    done
+  done
+fi
+ns_mark launch
 run_with_retries "${NS_RETRIES}" "${OUTPUT_DIR}" "${NS_MAX_NDEAD}" "${NS_NLIVE}" -- "${RUN_COMMAND[@]}"
+ns_mark searched
 
 # One row in benchmarks.jsonl per finished search, so a change to this repo can
 # be shown to have helped rather than argued about; see
 # docs/nested-sampling-benchmarks.md. Best effort: the run is already done, and
 # no measurement of it is worth failing it after the fact.
 uv run scripts/bench.py record "${OUTPUT_DIR}" || true
+ns_mark recorded
 
 # Pools first: their loops start a worker again the moment the ranks let go
 # of the FIFOs, and that worker writes its pid file into the directory being
 # removed. The EXIT trap would kill them too, but only after this rm.
 _sidecar_remove
+if [ "${NS_NODES}" -gt 1 ]; then
+  kill "${ns_pools_srun}" 2>/dev/null || true
+  rm -rf "${NS_FIFO_ROOTS[@]}"
+fi
 rm -rf "${SIMULATE_FIFO_DIR}" "${R2D2_FIFO_DIR}"
+ns_mark finished
 echo "OK: nested-sampling R2D2 output in ${OUTPUT_DIR}"

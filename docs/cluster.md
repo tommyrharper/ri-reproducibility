@@ -155,7 +155,9 @@ does. `bash scripts/lib/job-env.sh --self-check` tests the check itself.
 
 Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive`;
 CSD3 refuses `--mem 0`) and the run script sizes the ranks from the allocation; with it the
-job asks for that many cores and the matching memory. `--partition` defaults
+job asks for that many cores and the matching memory. A CPU R2D2 job then
+runs one rank more than its cores, for PolyChord's root, which never
+evaluates (round 253; `NS_R2D2_ROOT_RANK_EXTRA=0` runs exactly `--mpi-procs`). `--partition` defaults
 to `icelake` and `--time` to `12:00:00`, the SL3 cap, which every service
 level accepts; SL1/SL2 accounts can pass `--time 36:00:00`, their own cap,
 and a limit above your level is refused by sbatch. Both, and anything
@@ -163,6 +165,45 @@ else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
 (`SBATCH_QOS`, `SBATCH_RESERVATION`, ...). `NS_SBATCH=0` forces a run in
 place. A failed submission (a bad account, say) removes the claimed directory
 again.
+
+`./ri search r2d2 --nodes N` (CPU only, `NS_NODES`) spreads one search over N
+whole nodes (`--nodes N --exclusive`), each with `--mpi-procs` ranks of its own
+(sized per node as above). The launcher's node starts the others' pools with
+an `srun` step that runs the same script as `NS_NODE_ROLE=pools`, and the ranks
+are a second `srun --mpi=pmix` step rather than the image's `mpirun`, which
+cannot reach another node. A FIFO on Lustre is a pipe on each node by itself,
+so each host's ranks and pools meet in `.r2d2-workers/<host>/` and
+`.simulate-workers/<host>/`; pool logs are in `.node-<host>/`. Only rank 0's node
+holds the chains tmpfs and its Lustre mirror. Before a retry each other node
+resets its own workers when the launcher drops a `.node-<host>/reset` file, and
+`run.env` keeps `NS_NODES`, so `./ri resume` comes back on as many nodes. Two
+icelake half-nodes ran a converged search in half the wall time of one, at 94%
+of the single-node rate per node (docs/csd3-speed.md, rounds 287-288). PolyChord
+looks for its `.resume` on every rank, so a resumed attempt copies it into each
+other node's chains tmpfs first (round 289: without that, every multi-node
+retry and resume deadlocked). Each node appends its records to its own
+`evaluations/records.<host>.jsonl`, which the finish or a resume folds into
+`records.jsonl`. Each append writes every queued line at once
+(`NS_RECORD_BATCH=1`), so a kill -9 on 2 nodes at 3,000 scored evaluations lost
+no record, and a same-job `./ri resume` clears the killed attempt's `/dev/shm`
+scratch on every node first (rounds 297-298). More nodes buy evaluations/s (4 nodes:
+3.57x one), but an async PolyChord search converges on about as many
+evaluations as one with ~0.4 x workers more live points, whatever `--nlive`
+is (rounds 293 and 307). Time to converge therefore goes as
+`nlive/workers + 0.4`, and extra nodes stop paying once workers pass a few
+times nlive: at nlive 150, 2, 4 and 8 nodes of 39 ranks converge ~1.85x,
+~3.2x and ~4.9x faster than one, and at nlive 300 ~1.9x, ~3.5x and ~6x
+(before the ~5-10% per-node rate loss). Measured on 4 nodes at nlive 150
+(rounds 337-338, three seeds), stock converged 2.72x faster than one node and
+`NS_ADOPT_CONTOUR=1` 3.55x, and on 8 nodes (round 339, two seeds) 4.37x
+and 5.72x; searches with more workers than nlive need
+round 337's `nfail` fix, as before it PolyChord stopped them after the prior
+with exit 0. A larger `--nlive` does not remove the
+extra evaluations: it adds more than it saves, so raise it for precision,
+never for speed. The launcher warns when the extra share passes ~10%.
+Keep one rank per CPU on every node until the job's total ranks pass ~1.25 x
+nlive (8 nodes at nlive 150): below that, fewer ranks per node lose more
+U-Net throughput than they save in evaluations (rounds 334-335).
 
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit
@@ -336,8 +377,15 @@ default is TensorRT with `R2D2_TRT_SHARED=1`: one forward server holds the 25
 engines for every worker, the workers stay on the CPU and no MPS daemon is
 started, so the 19 ranks fit again. It converged the 22 Sep search in 785 s
 against 1,165 s for eager torch (90.8 against 64.2 evals/s, log(Z) 0.06 sigma
-apart). `R2D2_RUNTIME=torch` brings back eager torch with MPS, and
-`R2D2_TRT_SHARED=0` brings back per-worker engines.
+apart). Since round 328 that server gathers up to 8 workers' forwards of one
+net into one launch on 4 lanes (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`), and
+because its batches keep the card fed past the ~19 single-image lanes that
+saturate it, the rank cap is the CPUs plus PolyChord's root: 33 x 1 on a
+32-CPU A100 job. The production search converged 8% sooner than at 19 x 2
+unbatched, in all five pairs, log(Z) 0.007 sigma apart (rounds 319 and 326).
+`R2D2_TRT_BATCH=1` brings back 19 x 2 single forwards, `R2D2_RUNTIME=torch`
+eager torch with MPS, and `R2D2_TRT_SHARED=0` per-worker engines. A run from
+before round 328 resumes unbatched.
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:

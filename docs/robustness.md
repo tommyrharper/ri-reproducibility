@@ -249,11 +249,19 @@ A run writes records on a background thread per rank (`write_records_in_backgrou
 ~50ms a record on CSD3's Lustre). A kill loses what the ranks had queued: a
 record or two on a quiet RDS, but the flat writer falls behind as metadata load
 rises (161 of 4,933 records lost at a moderately loaded kill, ~5,000 behind
-under heavy load), where `NS_RECORD_APPEND=1` lost none (docs/csd3-speed.md,
-rounds 244-245). So the writer now takes its whole backlog at once and appends
-it to `records.jsonl` in one write, keeping it ~15 records behind where flat
-files fell 120-170 behind on the same Lustre (round 247; `NS_RECORD_COALESCE=0`
-for the old writer). That costs the archive, not the search: an async run (the
+under heavy load), where appending to `records.jsonl` lost none
+(docs/csd3-speed.md, rounds 244-245 and 261). So the writer appends every
+record to `records.jsonl` through one descriptor and creates no file per
+record (round 264; `NS_RECORD_APPEND=0` for the flat writer, which takes its
+backlog in one append once it falls behind, round 247, and
+`NS_RECORD_COALESCE=0` on top of that for the oldest one). Each append takes
+every line queued so far in one write (`NS_RECORD_BATCH=1`; `=0` for one write
+per record), which leaves 8-15x fewer records queued under Lustre load at no
+evals/s cost, and a 2-node kill -9 at 3,000 evaluations lost none (rounds
+297-298). At 113 ranks the
+flat writer's creates also convoy in Lustre's metadata server, ~40x the
+writer time and a node load of ~200 on 112 CPUs, for ~2% evals/s (round 263).
+That costs the archive, not the search: an async run (the
 default) resumed from its checkpoint draws new points, so every evaluation
 scored after the checkpoint is imaged again whether or not its record landed,
 and none is adopted (rounds 242 and 246). A failed write re-raises on the rank's
@@ -346,6 +354,18 @@ When the budget is gone the run says so in `run.log` rather than just stopping,
 and `./ri health` reads that tail back. `--retries 0` restores the old
 behaviour, where the first failure ends the run.
 
+### A clean exit that is not a result
+
+PolyChord also ends a search when `nfail` consecutive replacements fail. It
+exits 0 and writes normal-looking chains and a `summary.json`, so the only
+trace is its `Warning, unable to proceed after N: failed spawn events` line.
+Async searches with more workers than nlive hit it after the prior until round
+337 raised `nfail` to nlive + workers (`polychord_nfail` in `common.py`; round
+339 gave WSClean searches the same fix, as `--mpi-procs` above `--nlive` cut
+them short too); a failure storm can still hit it. `run_with_retries` now looks for that line in the attempt's
+output and writes `WARNING: PolyChord stopped early ...` to `run.log` and
+stderr. It does not retry: the same guard would fire again.
+
 ## A run that hangs instead of dying
 
 `run_with_retries` can only act on a run that *exits*, and the worst failure
@@ -365,6 +385,10 @@ a multi-day search is exactly what somebody starts under `nohup`.
 The kill is by command line rather than by the pid the run script holds: that
 pid is `apptainer exec`, and the ranks are children of `mpirun`. `ns_run_process_pattern` builds the pattern, anchored on the
 run's own `--output-dir` so another search on the host is untouched.
+`ns_kill_run_ranks` spares `srun`, whose command line matches too: on a
+multi-node search it is what ends the other nodes' ranks once it sees one
+die (`--kill-on-bad-exit`), and an `srun` killed with them leaves those
+ranks running (csd3-speed.md, round 322).
 
 **The default is 7200s, deliberately far above anything legitimate.**
 `IMAGING_REPLY_TIMEOUT` already lets a single evaluation take an hour, so
@@ -390,6 +414,12 @@ round 246).
 
 The same hang is closed at its source too: the likelihood aborts the whole job
 (`MPI_Abort`) on **any** unexpected exception, not only `WorkerDied`.
+
+Outside the likelihood, `abort_on_exception()` wraps each rank's `main()`. A rank
+that raised in an end-of-run gather used to exit alone and leave the rest in
+`MPI_Finalize` or the next collective, which held 8 nodes for 16 minutes until
+the job's timeout (docs/csd3-speed.md, round 348). Any exception, or a
+`SystemExit` with a non-zero code, now aborts the job; a clean exit passes.
 
 ## A worker that died while nobody was talking to it
 
@@ -546,7 +576,7 @@ in the six ways that recover through different machinery:
 |---|---|
 | `SIGKILL` after 8 evaluations (fewer than `--nlive`, so before any checkpoint) | Restarts itself, records the kill, keeps the evaluations, writes `summary.json`, and `./ri health` says nothing on its headline |
 | `SIGSTOP` on one rank | Only the stall watchdog can notice; run with `--stall-timeout 20` and a 2s poll so it costs a minute rather than two hours |
-| `SIGKILL` on a search started with `--retries 0` | Does *not* recover on its own: `./ri health` must headline it `STOPPED` and name `./ri resume <run>`, and that command - taken from the report and typed verbatim - must continue the search rather than begin one |
+| `SIGKILL` on a search started with `--retries 0` | Does *not* recover on its own: `./ri health` must headline it `STOPPED` and name `./ri resume <run>`, and that command - taken from the report and typed verbatim - must continue the search rather than begin one, skipping a garbled `records.jsonl` line and truncating a torn last one first |
 | `SIGKILL` on every worker in the pool | Costs nothing: absorbed inside the evaluation, so `restarts.log` is never written |
 | `SIGKILL` on the pool's whole process group | Costs a restart: the run dies and `sidecar_restore` is what lets the retry fix it |
 | A truncated `chains/*.resume`, then a truncated `summary.json`, on the finished run | `./ri resume` finishes both, keeps the torn checkpoint as `*.resume.unreadable`, and leaves the evaluation count unchanged - nothing imaged twice |

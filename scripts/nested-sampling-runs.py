@@ -176,13 +176,15 @@ def count_evaluations(run_dir: Path) -> int:
                           or os.path.exists(os.path.join(e.path, "metrics.json")))}
     except OSError:  # no evaluations directory yet
         return 0
-    # And those a resume packed into records.jsonl (round 93), a name a line.
-    try:
-        with open(run_dir / "evaluations" / "records.jsonl", "rb") as pack:
-            names.update(line.partition(b"\t")[0].decode(errors="replace")
-                         for line in pack if line.endswith(b"\n"))
-    except OSError:
-        pass
+    # And those a resume packed into records.jsonl (round 93), a name a line,
+    # or a multi-node run appended to its records.<host>.jsonl (round 290).
+    for path in [*(run_dir / "evaluations").glob("records.*.jsonl"), run_dir / "evaluations" / "records.jsonl"]:
+        try:
+            with open(path, "rb") as pack:
+                names.update(line.partition(b"\t")[0].decode(errors="replace")
+                             for line in pack if line.endswith(b"\n"))
+        except OSError:
+            pass
     return len(names)
 
 
