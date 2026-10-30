@@ -5,8 +5,8 @@ is added below once the runs finish. Arrays 39721682 (Part A, 132 tasks) and
 39721865 (Part B, 18 tasks) were submitted on 2026-10-30. Part A started at 18:44
 with 10 tasks; by 19:08 its first 9 runs, covering stock, stock-repeat and all three
 treated arms, had finished and extracted cleanly, so the pipeline works end to end.
-Those rows were opened only to check they are complete. At 19:55 Part A had 25 of
-132 runs recorded, all status ok, with 33 tasks started and 0 task logs
+Those rows were opened only to check they are complete. At 19:56 Part A had 28 of
+132 runs recorded (status last read at 25, all ok), with 33 tasks started and 0 task logs
 holding a traceback, out-of-memory, cancellation, time-limit or EDQUOT line; Part B
 had 0 logs.
 Budget check at that point, from aggregate timing with no split by arm: 24 runs in 65
@@ -14,7 +14,7 @@ minutes on 10 slots is about 27 minutes per slot per run, against the 15-22 expe
 below, or ~2,260 core-hours for Part A. That estimate is rough because it ignores
 in-flight work. If Part B overruns by the same third, ~2,000 core-hours, the total is
 ~4,260, still under 5,000. At this rate Part A ends around 00:40. The file quota stood
-at ~528k of 1,048,576 at 19:53 (it reads ±20k with in-flight runs) with ~100-120k of that from the runs, and that part does not grow
+at ~495k of 1,048,576 at 19:56 (it reads ±20k with in-flight runs) with ~100-120k of that from the runs, and that part does not grow
 with finished runs: a task deletes its run directory once the record is written, and
 `keep/` held 187 files at 19:52. So it is ~12k per in-flight run, and ten slots hold
 it level; Part B's in-flight count is unmeasured, with ~500k of headroom. The
