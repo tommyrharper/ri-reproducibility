@@ -8,8 +8,10 @@ Current operating points on this host, from `./ri bench`:
 | R2D2 | **0.91** | 3.47 GB | 15 x 2 |
 
 For the 9-parameter space on CSD3, see [csd3-speed.md](csd3-speed.md).
-Whether the opt-in sampler changes (`NS_ADOPT_CONTOUR`, `NS_EARLY_STOP`) are safe to
-use is [csd3-sampler-validation.md](csd3-sampler-validation.md).
+Whether the opt-in sampler changes are safe to use is
+[csd3-sampler-validation.md](csd3-sampler-validation.md): over 150 converged runs
+`NS_EARLY_STOP` passed at production shape (-32% wall) and `NS_ADOPT_CONTOUR` failed
+and shifts the tail. Both stay opt-in; the user decides.
 
 Thirty-three profiling rounds got there. Values in the tables below are
 per-round baselines, except the two figures above; pre-round-18 rates are

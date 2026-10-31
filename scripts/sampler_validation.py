@@ -3,12 +3,14 @@
 
 docs/csd3-sampler-validation.md holds the design and pass rule; this is its
 tooling. `manifest` lists the array tasks, `extract` turns a finished run into
-one JSON record, `analyse` turns those records into the report's tables.
+one JSON record, `volumes` adds each kept chain's contours on PolyChord's own
+volumes, `analyse` turns those records into the report's tables.
 Stdlib only, because it runs on compute nodes and in CI.
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import random
@@ -128,6 +130,34 @@ def extract(run_dir: Path, stem: str = "r2d2_vlaa") -> dict[str, Any]:
     record["contour_at_log_x"] = {str(x): dead[-x * nlive] for x in LOG_X_POINTS if -x * nlive < len(dead)}
     record["wrong_stop"] = wrong_stops(summary.get("evaluations") or [])
     return record
+
+
+def contours_at_volume(rows: list[list[float]]) -> dict[str, float]:
+    """Objective at each ln X, from a .txt chain's weights, which carry PolyChord's own volumes.
+
+    The dead file also holds chains that returned below the contour and were thrown away, so
+    contour_at_log_x, indexed by dead-point count, sits on the wrong axis wherever chains go stale.
+    """
+    points = sorted(((-row[1] / 2, row[0]) for row in rows if row[0] > 0), reverse=True)
+    total = sum(w * math.exp(-log_l) for log_l, w in points)
+    contours: dict[str, float] = {}
+    pending = sorted(LOG_X_POINTS)
+    volume = 0.0
+    for log_l, w in points:
+        volume += w * math.exp(-log_l) / total
+        while pending and volume >= math.exp(pending[0]):
+            contours[str(pending.pop(0))] = log_l
+    return contours
+
+
+def add_volumes(path: Path, keep: Path) -> None:
+    """Add contour_at_volume to every record, from the chains kept beside the run records."""
+    rows = load([path])
+    for r in rows:
+        name = f"val-{r['part']}-{r['seed']}-{r['arm']}".replace("+", "-")
+        with gzip.open(keep / name / "r2d2_vlaa.txt.gz", "rt") as chain:
+            r["contour_at_volume"] = contours_at_volume([[float(v) for v in line.split()] for line in chain])
+    path.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
 
 
 def record(args: argparse.Namespace) -> None:
@@ -257,10 +287,11 @@ def verdict(result: dict[str, Any], control_significant: int) -> str:
     return "INCONCLUSIVE"
 
 
-def tail_differences(runs: dict[str, dict[int, dict[str, Any]]], arms: list[str]) -> list[str]:
+def tail_differences(runs: dict[str, dict[int, dict[str, Any]]], arms: list[str],
+                     key: str = "contour_at_log_x") -> list[str]:
     """Secondary: paired difference from stock at each tail point. * = interval excludes 0."""
     points: list[tuple[str, Any]] = [("max objective", lambda r: r.get("max_log_l"))]
-    points += [(f"ln X {x}", lambda r, x=x: r.get("contour_at_log_x", {}).get(str(x))) for x in LOG_X_POINTS]
+    points += [(f"ln X {x}", lambda r, x=x: r.get(key, {}).get(str(x))) for x in LOG_X_POINTS]
     lines = ["| point | " + " | ".join(arms) + " |", "| --- |" + " --- |" * len(arms)]
     for label, read in points:
         cells = []
@@ -339,6 +370,17 @@ def analyse(records: list[dict[str, Any]], part: str) -> str:
         ratio = statistics.stdev(log_z) / quoted
         lines.append(f"| {arm} | {len(values)} | {statistics.fmean(log_z):.6f} | {statistics.stdev(log_z):.3e} | "
                      f"{quoted:.3e} | {ratio:.3f} +/- {ratio / math.sqrt(2 * (len(values) - 1)):.3f} |")
+    lines += ["", "Per arm, mean over seeds:", "", "| arm | runs | log(Z) error | ndead | nlike | wall (s) |",
+              "| --- | ---: | ---: | ---: | ---: | ---: |"]
+    for arm in PARTS[part]["arms"] + PARTS[part]["shadow_arms"]:
+        values = list(runs.get(arm, {}).values())
+        if values:
+            cells = [statistics.fmean(v[k] for v in values) for k in ("log_z_err", "ndead", "nlike", "wall_s")]
+            lines.append(f"| {arm} | {len(values)} | {cells[0]:.3e} | {cells[1]:.0f} | {cells[2]:.0f} | {cells[3]:.0f} |")
+    lines += ["", "Smallest Holm-adjusted p across parameters, per statistic:", "",
+              "| arm | " + " | ".join(STATISTICS) + " |", "| --- |" + " ---: |" * len(STATISTICS)]
+    for arm, r in results.items():
+        lines.append(f"| {arm} | " + " | ".join(f"{min(r['holm'][s]['adjusted'].values()):.3g}" for s in STATISTICS) + " |")
     lines += ["", "Secondary, outside the pass rule: the tail, which is what the search is for.", "",
               "| arm | runs | mean max objective | mean contour at ln X -4 | at -6 | at -8 |",
               "| --- | ---: | ---: | ---: | ---: | ---: |"]
@@ -352,6 +394,13 @@ def analyse(records: list[dict[str, Any]], part: str) -> str:
             cells.append(statistics.fmean(have) if have else float("nan"))
         lines.append(f"| {arm} | {len(values)} | " + " | ".join(f"{c:.5f}" for c in cells) + " |")
     lines += ["", "Paired difference from stock (mean, 95% CI, * = excludes 0):", ""] + tail_differences(runs, arms)
+    if any("contour_at_volume" in r for r in ok):
+        lines += ["", "Post hoc, outside the design: the same on PolyChord's volumes (contour_at_volume), stock mean first:", ""]
+        lines += ["| point | stock mean |", "| --- | ---: |"]
+        for x in LOG_X_POINTS:
+            have = [r["contour_at_volume"][str(x)] for r in runs["stock"].values()]
+            lines.append(f"| ln X {x} | {statistics.fmean(have):.5f} |")
+        lines += [""] + tail_differences(runs, arms, "contour_at_volume")
     lines += ["", spend(rows, part)]
     for arm in PARTS[part]["shadow_arms"]:
         counts = [r["wrong_stop"] for r in ok if r["arm"] == arm and r.get("wrong_stop")]
@@ -378,6 +427,10 @@ def self_check() -> None:
 
     assert read_table(_scratch("0.1-100 0.2E+001\n")) == [[0.1e-100, 2.0]]
 
+    volumes = contours_at_volume([[0.9, 0.0], [0.09 * math.e, -2.0], [0.01 * math.e ** 2, -4.0], [0.0, 1e30]])
+    assert volumes["-8"] == volumes["-5"] == 2.0 and volumes["-4"] == volumes["-3"] == 1.0
+    assert volumes["-2"] == volumes["-1"] == 0.0
+
     shadow = [
         {"objective": 2.0, "contour": 1.0, "early_checks": [[3, 0.5]]},  # wrong
         {"objective": 0.5, "contour": 1.0, "early_checks": [[3, 0.5]]},  # right
@@ -393,7 +446,7 @@ def self_check() -> None:
         base = rng.gauss(0.017, 0.0001)
         return {
             "part": "A", "seed": seed, "arm": arm, "status": "ok", "log_z": base + shift * err * math.sqrt(2)
-            + rng.gauss(0, err * jitter), "log_z_err": err, "wall_s": 1000.0, "nlike": 70000, "max_log_l": 0.03,
+            + rng.gauss(0, err * jitter), "log_z_err": err, "wall_s": 1000.0, "ndead": 1400, "nlike": 70000, "max_log_l": 0.03,
             "contour_at_log_x": {"-4": 0.02},
             "posterior": {p: {s: rng.gauss(1.0 + (shift if p == "bad" else 0), 0.02) for s in STATISTICS}
                           for p in ("good", "bad")},
@@ -435,6 +488,9 @@ def main() -> int:
     for name, kind in (("run_dir", Path), ("out", Path), ("part", str), ("seed", int), ("arm", str), ("exit_code", int),
                        ("start", str), ("end", str), ("job", str), ("nodes", str), ("bench", Path)):
         p.add_argument(name, type=kind)
+    p = commands.add_parser("volumes")
+    p.add_argument("records", type=Path)
+    p.add_argument("keep", type=Path)
     p = commands.add_parser("analyse")
     p.add_argument("part", choices=PARTS)
     p.add_argument("records", type=Path, nargs="+")
@@ -449,6 +505,8 @@ def main() -> int:
         print(json.dumps(extract(args.run_dir)))
     elif args.command == "record":
         record(args)
+    elif args.command == "volumes":
+        add_volumes(args.records, args.keep)
     elif args.command == "analyse":
         print(analyse(load(args.records), args.part))
     else:

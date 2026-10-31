@@ -18112,3 +18112,21 @@ and shared code are untouched, so no WSClean guard ran.
 
 Rows: `r366-big-m1`, `r366-big-m2`, `r371-big-s346`, `r371-big-x346`. `../frozen-r366` and
 `../frozen-r371` are removed, diffs in `.probe/r366/` and `.probe/r371/`. Run directories are deleted.
+
+## Round 396: the many-seed validation finished: early stop passes at production shape, contour adoption fails and shifts the tail
+
+The final task: [csd3-sampler-validation.md](csd3-sampler-validation.md) holds the design,
+every table and the conclusion. 150 of 150 runs finished, none excluded, 3,105 of 5,000
+core-hours. Under the committed rule: `NS_EARLY_STOP=1` PASS at nlive 150 (log(Z) +0.003
+sigma, -32.3% wall, 6 of 241,196 wrong stops); `NS_ADOPT_CONTOUR=1` FAIL (`source_l_pixels` sd
+-1.2%); both FAIL at nlive 150 (three statistics) and PASS at nlive 500, on a test that could
+not see the posterior. Nothing became a default.
+
+The secondary tail table was on the wrong axis: indexing `_dead.txt` by count also counts rows
+that never reach the posterior. `sampler_validation.py volumes` re-reads contours from
+PolyChord's weights. On that axis stock at nlive 150 and 500 agree, early stop matches stock, and
+adoption lags by ~0.2-0.3 nats (A) to ~0.4-0.5 nats (B) from ln X -4 on, cause unknown. This is
+post hoc and changes no verdict.
+
+Rows: 150 `val-*`, all appended to `benchmarks.jsonl`. Records with full-precision log(Z) are in
+`docs/csd3-sampler-validation-runs.jsonl`. `../frozen-val` is removed.
