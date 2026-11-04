@@ -25,15 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:${PATH}
 
-# Local patches, applied to the pinned PolyChordLite tree before the build;
-# `git apply` fails the build if a commit bump makes one stale. 0001 is opt-in
-# at run time (PC_ADOPT_CONTOUR=1, async MPI only) and changes nothing when
-# unset: docs/csd3-speed.md, round 312. 0002 only publishes the slice contour
-# for NS_EARLY_STOP (round 355).
-COPY docker/polychord/patches /usr/src/polychord-patches
 RUN git clone ${POLYCHORD_GIT_URL} /usr/src/polychord \
     && git -C /usr/src/polychord checkout ${POLYCHORD_GIT_COMMIT} \
-    && git -C /usr/src/polychord apply --verbose /usr/src/polychord-patches/*.patch \
     && pip install --upgrade pip \
     && pip install \
         /usr/src/polychord \

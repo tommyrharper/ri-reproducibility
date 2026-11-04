@@ -1,5 +1,9 @@
 # Many-seed validation of `NS_ADOPT_CONTOUR` and `NS_EARLY_STOP`
 
+**Both settings were removed on 2026-11-04 by the user's decision, with the
+PolyChord patches they needed.** This report is the record of why. Its tooling and
+the settings exist at `7a9ed9f` and earlier.
+
 Status: **complete.** 150 of 150 runs finished, none failed, none excluded. 3,105 of
 the 5,000 core-hours were spent. The criteria were committed before any result was
 read and were not changed. Nothing becomes a default: both settings stay opt-in, this
@@ -437,7 +441,7 @@ on top of early stop. The recommendation is to leave it off. The Part B PASS for
 pair should not be read as clearing it, because that test could not see the posterior
 and the tail table says otherwise.
 
-Reproduce with `python3 scripts/sampler_validation.py analyse A
+Reproduce at `7a9ed9f` with `python3 scripts/sampler_validation.py analyse A
 docs/csd3-sampler-validation-runs.jsonl` (or `B`). The gzipped chains and task logs are
 in `.probe/val/` (1.9 GB, untracked), left in place for now in case the tail question
 is pursued.
