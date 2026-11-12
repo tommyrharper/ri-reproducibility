@@ -5,8 +5,29 @@ whose `gnhf N:` commit shipped it, so gaps are iterations that shipped no round.
 [The speed index](nested-sampling-speed.md) covers the 5-parameter work on
 the Hetzner host.
 
-**Where it stands (round 349; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
+**Where it stands (round 360; R2D2 CPU levers closed as of [round 160](#round-160-final-status-stop-condition-met); work continues on the GPU path, see [round 161](#round-161-pending-the-2-gpu-r2d2-ab-resubmitted)).**
 
+- **Largest open lever: stopping below-contour evaluations.** `NS_EARLY_STOP=1`
+  (opt-in) stops R2D2 once an iterate's RMS is well under the contour. Three
+  converged bench-size seeds: wall **-33%** (1.50x), evaluations -1.8%, log(Z)
+  -0.33/+0.23/-0.04 sigma. It changes the sampler, so it stays opt-in until
+  the many-seed validation, and defaulting it is the user's call. It needs a
+  polychord.sif with patch 0002
+  ([round 355](#round-355-early-stop-built-opt-in-wall--33-over-three-seeds-logz-agreeing)).
+  At production nlive 150, in half-node races, it gave wall **-16%** with
+  log(Z) -0.44/+0.34 sigma and 0.12% wrong stops, a rate a toy's log(Z) cannot
+  see ([round 356](#round-356-early-stop-at-production-nlive-wall--16-logz-agreeing-wrong-stops-measured-at-012-and-too-rare-to-move-a-toys-logz)).
+  Timed directly, what does not scale with iterations is ~100 ms of a ~700 ms
+  request, not the ~210-270 ms round 356's fit implied
+  ([round 357](#round-357-a-requests-fixed-cost-timed-directly-100-ms-not-210-270-recompiling-imagerpy-was-11-ms-of-it)).
+  Combined with `NS_ADOPT_CONTOUR=1`, one race gave wall **-28%** against shadow
+  mode, log(Z) +0.06 sigma, 0.06% wrong stops. At 16 workers adoption added
+  nothing on top of early stop, and multi-node is still unmeasured
+  ([round 358](#round-358-early-stop-with-contour-adoption-wall--28-logz-agreeing-adoption-adds-nothing-at-16-workers)).
+  On two nodes (77 workers) the pair gave wall **-38%** (1.62x) over three seeds
+  with log(Z) within 0.44 sigma, and adoption added -18% there; wrong stops ran
+  0.025-0.375% by seed; on a clean node early stop alone stays ~-14%
+  ([round 360](#round-360-early-stop-across-two-nodes-wall--38-with-adoption-over-three-seeds-logz-agreeing-on-a-clean-node-it-stays--14)).
 - **Target size reached.** Two converged searches at `docs/cluster.md`'s
   `--nlive 500 --num-repeats 25` on 8 icelake half-nodes took **19-21
   minutes** (~390 evals/s, ~430k evaluations) and agree on log(Z) within
@@ -125,6 +146,10 @@ the Hetzner host.
     converged sooner than 33 in both pairs, so the rank count and lane
     count are being re-raced
     ([round 332](#round-332-gpu-measurement-the-batched-default-is-gpu-bound-at-a-mean-batch-of-2-29-ranks-and-8-lanes-raced)).
+    That race kept the default, and showed identical settings can need
+    1.7x more evaluations at this size, so quote evaluations beside any GPU
+    wall time
+    ([round 351](#round-351-gpu-race-read-the-default-stays-evaluations-to-converge-span-17x-multi-nodes-per-node-loss-is-not-in-the-imager)).
     The shared arms' constant 7.66 s `stall_s` is the shared server
     bringing its lanes up one at a time (~0.72 s each): early ranks fill
     the prior phase, then wait at its barrier for the last lane. The
@@ -17144,3 +17169,964 @@ new ruff finding, RUF007, is `start_gaps`'s existing `zip` moving into
 Not done: `anesthetic-gui.py`'s title, `anesthetic_io.py`, merge and
 `prune-run-artefacts.py` still parse the whole summary. Some of those need the
 records.
+
+## Round 351: GPU race read: the default stays; evaluations to converge span 1.7x; multi-node's per-node loss is not in the imager
+
+**Round 332's race (job 39677203).** Same settings throughout: 1 A100, nlive
+128, 5 repeats, seed 4332, run to convergence, arms in order ACLLCAACL. A is
+the default (33 x 1, 4 lanes), C is 29 ranks, L is 33 ranks on 8 lanes.
+
+| arm | wall s (each) | mean wall s | evaluations | steady evals/s | ms of wall per evaluation (mean) |
+| --- | --- | ---: | --- | --- | ---: |
+| A | 280.6, 172.0, 150.9 | 201.5 | 28,380, 21,146, 18,145 | 112, 148, 148 | 8.9 |
+| C | 195.6, 211.6, 233.0 | 213.4 | 20,865, 22,508, 23,991 | 124, 123, 117 | 9.5 |
+| L | 265.3, 233.4, 215.6 | 238.4 | 30,585, 24,667, 20,395 | 153, 132, 121 | 9.5 |
+
+**Decision: no default changes.** A has the lowest mean wall and wall per
+evaluation, though three runs each with this spread do not separate A from C.
+Round 332's "29 ranks converged sooner in both pairs" did not repeat. L does
+not earn its lanes: its start-up was 46-66 s against ~28 s, its mean batch fell
+to 1.4-1.8 from ~2.1, and its steady rate is not reliably higher. All nine
+log(Z) values lie in 0.01703-0.01741, each +/- ~0.0004, so they agree.
+
+**Why that race could not settle it.** Identical settings needed 18,145 to
+30,585 evaluations for the same `ndead` (1,207-1,274) and the same error, a
+1.7x range with a 1.6x range inside arm A alone. That is larger than every
+effect raced on the GPU, so a converged wall time at this size says little
+without the evaluation count beside it. The extra evaluations are late: 62-78%
+of the gap between the longest and shortest runs of A and of L is above
+objective 0.025, and the running median stays above 0.029 for ~13k evaluations
+in A1 but ~6k in A3. Looking at the last 1,500 evaluations above 0.029,
+runs end on different structures: A1 and L1 on a thin wall at `source_l_pixels`
+near -16 (the box edge) with nearly every evaluation at R2D2's 25-iteration
+cap; A3 is split across both l edges at a median of 6 iterations. A thin wall is
+the likely reason the tail costs more (it fits round 316's rising calls per
+slice step), but no chain log was taken here, so that is a reading rather than
+a measurement. It is the search's own landing point, and these tails are what
+the search is for, so nothing here is a speed lever. At the target size it
+matters less: 412,638-450,922 evaluations over three runs at nlive 500, a 1.09x
+range.
+
+**Multi-node's per-node loss is not in the imager.** Rounds 288-292 left a 5-11%
+per-node rate loss unattributed. Dividing `image_container` by R2D2 iterations
+across the ledger's 39-rank CPU rows of at least 20,000 evaluations:
+
+| nodes, nlive | runs | hosts | ms/iteration, median (range) | iterations | request ms | steady evals/s per node |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 2, 150 | 3 | 3 | 36.2 (34.5-37.6) | 19.34 | 700 | 53.1 |
+| 4, 150 | 3 | 3 | 38.4 (37.6-38.6) | 18.75 | 723 | 51.5 |
+| 8, 150 | 4 | 2 | 37.3 (36.1-38.4) | 18.51 | 685 | 52.4 |
+| 8, 500 | 3 | 2 | 38.6 (36.5-39.0) | 19.28 | 736 | 49.8 |
+
+Cost per iteration has no trend from 2 to 8 nodes at nlive 150. The last row's
+-6% per node against 2 nodes has the same iterations and a ms/iteration ~7%
+higher, but that figure matches the 4-node rows and sits on two hosts, so it
+is not separable from host differences. Against 8 nodes at nlive 150, the same
+row's -5% is +4% iterations and +3% ms/iteration. So 2 to 8 nodes adds no
+measurable per-evaluation cost and there is no scaling bug to chase here. The
+1-to-2-node step is not covered: only one 1-node row passed this filter, at
+44.5 ms/iteration, and its load was not checked.
+
+**Shipped.** `./ri bench` prints `ms/R2D2 iteration`, derived from each row like
+`converging evals/s`, because ms/eval moves with where a run lands. Self-check
+extended; `bench.py` only reads the ledger, so no raced guard applies.
+
+`bench.py --self-check` and `test_self_checks.py` passed. No search was run this
+round. Rows: the ten `r332-*` bench rows and stage row `r351-gpu-race-and-spread`
+(full-precision log(Z)) in `benchmarks.jsonl`. The `frozen-r332` worktree is
+removed; summaries stay in `.probe/r332/`.
+
+## Round 352: one worker more than CPUs costs nothing measurable, so the multi-node layout stays
+
+**Question.** A multi-node `srun` uses a uniform `--ntasks-per-node`, so every
+non-root node of a default 39 x N job runs 39 workers on 38 CPUs. Round 186's
+extra rank is PolyChord's root, which never evaluates, and it only exists on
+the root's node. Read from the code, not measured on a real multi-node job.
+Does that one extra worker time-slice enough to pay for a non-uniform layout?
+
+**Race.** One node stands in for it: 39 ranks (38 workers) against 40 ranks
+(39 workers) on 38 CPUs. R2D2 CPU, `R2D2_OMP_THREADS=1`, nlive 48, 5 repeats,
+`--max-ndead 400`, seed 331, one warm-up, arms in order a b b a a b. Ranks were
+not pinned (no single-CPU masks). Load read 67-77 throughout, which was not
+broken down, so how much of it was this job is unknown. A converged wall time would
+be dominated by the evaluations each run happened to need, so the arms are
+judged on U-Net iterations/s (`evals_per_s` x `r2d2_iterations`).
+
+| arm | workers | U-Net iterations/s (each) | mean | evals/s (each) | evaluations | wall s |
+| --- | ---: | --- | ---: | --- | --- | --- |
+| a | 38 | 878.4, 888.2, 868.4 | 878.3 | 46.6, 49.0, 52.3 | 6,010, 6,710, 7,435 | 129.0, 136.8, 142.0 |
+| b | 39 | 901.6, 867.4, 918.4 | 895.8 | 47.8, 47.2, 48.4 | 6,752, 6,650, 7,299 | 141.3, 140.9, 150.8 |
+
+**Result.** The extra worker gives +2.0% iterations/s for +2.6% workers, so
+each worker's time per iteration moves +0.6% (43.3 to 43.5 ms). The arms
+overlap and a three-repeat control spans ~5%, so this cannot show a gain; it
+only shows no large penalty. Mean wall reads 6% longer on b, but b also ran 2%
+more evaluations, and the wall figures follow how many each run needed
+(a alone spans 129-142 s).
+
+log(Z) agrees: a 0.01803, 0.01728, 0.01753; b 0.01750, 0.01749, 0.01738, each
++/- ~0.0006 (full precision in the `r352-oversubscribed-worker` stage row).
+
+**Decision.** No change. A non-uniform layout would save ~0.5% of evaluations
+at 8 nodes and nlive 500 and ~1% at nlive 150 (estimated, not measured), which
+nothing here could see, and it would add a layout to a multi-node launch that
+works. Not measured: a real multi-node job, or a host with a known load.
+
+## Round 354 (diagnostic): 70% of U-Net iterations go to evaluations already below the contour; stopping them early could save ~40%
+
+**Question.** Slice sampling only compares an evaluation with its contour, yet
+an evaluation that ends below it still runs every U-Net iteration. The metric
+(`total_rms_jy`) is the RMS of the image minus the known point source, so it can
+be read off every iterate. How much of the search is below-contour work, and how
+early does an iterate show it?
+
+**Probe.** One converged production-shaped search (1 node, default 39 x 1, nlive
+150, 15 repeats, seed 354) with a temporary trace (`.probe/r354/trace.diff`,
+reverted) that saved each iterate and logged its RMS. log(Z) 0.0169589 +/-
+0.00038 agrees with round 302, 70,427 evaluations, 48.0 evals/s (trace overhead
+included, so this is not a speed figure). The contour at each moment comes from
+`_dead-birth.txt`: a point's birth contour is the contour in force when it was
+accepted, and 1,438 of 1,476 dead points matched a trace by value.
+
+**Where the iterations go.**
+
+| | share of evaluations | mean iterations | share of U-Net iterations |
+| --- | ---: | ---: | ---: |
+| ended above the contour | 33% | 17.2 | 30% |
+| ended below it | 67% | 20.1 | 70% |
+
+Above-contour evaluations fall from 40% in the first third of the search to 25%
+in the last. RMS falls with iteration but not strictly (21% of steps rise), and
+the final value can sit ~6% above an iterate (1st percentile of RMS at iteration
+k over final is 0.94), so a below-contour iterate is strong evidence, not proof.
+
+**Rule tested, replayed offline.** Stop at the first check (iteration 2, 3, 4,
+5, 6, 8, 10, 12, 15, 18) where the iterate's RMS is under c(k) x contour, with
+c(k) set from the above-contour evaluations of a fitting set, either tight on
+their minimum (eps 0) or allowing a share eps of them through. Iterations saved
+and above-contour evaluations wrongly stopped, on data not used to fit, except
+the first row:
+
+| fit -> test | eps | iterations saved | wrongly stopped (of above) | below-contour stopped |
+| --- | ---: | ---: | ---: | ---: |
+| all -> all (in-sample) | 0 | 39.8% | 0 | 73% |
+| odd -> even evaluations | 0 | 40.3% | 0.035% | 74% |
+| first half -> second | 0 | 41.2% | 0.066% | 67% |
+| second half -> first | 0 | 43.1% | 0.157% | 85% |
+| first half -> second | 0.01 | 48.3% | 1.4% | 72% |
+
+Past eps 0 the extra saving comes with far more wrong stops, so the tight rule
+is the candidate. c(k) sits around 0.83-0.93. With the R2D2 request ~95% of an
+evaluation, ~40% of iterations would be about -37% of worker time, or roughly
+1.6x evaluations/s. That is an estimate from a replay, not a measured speed-up.
+
+**What this does not establish.**
+
+- One search, one seed, one metric, one node. c(k) may not transfer to another
+  seed or to `--nodes N`; a fit on the second half gave a different c(6) (0.93
+  against 0.83) than a fit on the first.
+- The contour is interpolated in time. A real chain holds the contour of its
+  seed, which is older than the newest, so the true margins differ slightly.
+- A wrong stop shortens a slice bracket or rejects a valid point, so this changes
+  the sampler. Under the sampler-change guard it can only ship opt-in, after
+  statistical validation of log(Z), and whether to default it is the user's call.
+- Only the end of a chain enters the live set, so the replay cannot say how many
+  wrong stops touch a point the search keeps.
+- Not implemented. PolyChord's Python likelihood is not told the contour, so
+  this needs a `docker/polychord/patches/` change exposing `logL` from
+  `slice_sample`, plus a rebuilt `polychord.sif`, plus the source flux and pixel
+  sent to the R2D2 worker, whose stop test must run inside `R2D2.run`. Records
+  of stopped evaluations would hold a partial metric, so anything reading all
+  evaluations (the failure-mode analysis itself) needs to expect that.
+
+**Next.** Build the opt-in path and race it for wall time and log(Z). The
+iterate traces, summary and dead-birth file are in `.probe/r354/`. WSClean is
+untouched: no shared code changed.
+
+## Round 355: early stop built, opt-in: wall -33% over three seeds, log(Z) agreeing
+
+**Change.** Round 354's rule, built. `docker/polychord/patches/0002` publishes
+the contour of the slice step in progress as a C symbol, `polychord_contour`;
+`contour_reader()` reads it through ctypes, and `evaluate()` sends it to the
+worker with the source's flux and pixel. `patch_early_stop()` wraps
+`R2D2._stop_criteria`, and at iterations 2, 3, 4, 5, 6, 8, 10, 12, 15 and 18
+ends the request once RMS is under `EARLY_STOP_RATIOS[k]` x contour. The ratios
+are round 354's in-sample minima, about 1% lower, and all below 1, so a stopped
+evaluation always scores under its contour. Every record of an opted-in run
+carries its `contour`, and a stopped one `early_stopped`, holding the stop line.
+Its metrics are those of the unfinished image, so failure-mode analysis must not
+read them as finished. `NS_EARLY_STOP=2` is a shadow mode that logs the stops
+without making them. A metric other than `total_rms_jy`, or a polychord.sif
+without the patch, is refused at start.
+
+**Patched SIF without Docker.** A `python:3.11-slim-bookworm` fakeroot sandbox
+with gfortran and Open MPI built pypolychord from the pinned commit with both
+patches, and a `Bootstrap: localimage` layered it over `images/polychord.sif`.
+Copy in `$RI_WORK_DIR/.cache/ri/polychord-contour.sif`. The shipped SIF does not
+have it, and neither round 313's `polychord-adopt.sif`.
+
+**Control, and exact wrong stops (seeded, synchronous, nlive 48, 5 repeats,
+max-ndead 300).** The shadow arm's `_dead-birth.txt` is byte-identical to the
+off arm's, so the patch and plumbing change nothing while no stop is made. With
+true contours, 56.7% of evaluations would stop, saving 45.6% of iterations, and
+**1 of 1,495** above-contour evaluations (0.067%) would be stopped wrongly, at
+iteration 4, its final value 2% above the contour. That rate agrees with the
+replay. The real stop arm diverged from dead point 92, and ended on log(Z)
+0.01469 +/- 0.00172 against 0.01677 +/- 0.00057, with 29% more `nlike`. That is
+one unconverged seed: a path that diverges is a different search, and round 351
+saw identical settings vary 1.7x in evaluations, so it does not show bias.
+
+**Race (async, converged, nlive 48, 5 repeats, 39 x 1, 1 node, paired by seed,
+arm order off-on, on-off, off-on; `.probe/r355/ab.sh`).**
+
+| seed | wall off (s) | wall on (s) | evaluations off | on | iterations off | on | log(Z) off | on | on-off (sigma) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3551 | 256.4 | 204.9 | 12,619 | 14,824 | 233,509 | 186,964 | 0.017495 +/- 0.00061 | 0.017214 +/- 0.00059 | -0.33 |
+| 3552 | 308.4 | 198.3 | 14,322 | 12,609 | 297,608 | 170,222 | 0.017259 +/- 0.00058 | 0.017446 +/- 0.00059 | +0.23 |
+| 3553 | 246.0 | 136.5 | 10,746 | 9,573 | 230,326 | 123,465 | 0.017263 +/- 0.00057 | 0.017228 +/- 0.00057 | -0.04 |
+| sum | 810.8 | 539.7 | 37,687 | 37,006 | 761,443 | 480,651 | | | |
+
+Wall **-33.4%** (1.50x), evaluations -1.8%, iterations -36.9% (20.2 to 13.0 per
+evaluation). 34-43% of async evaluations stopped, against 57% in the synchronous
+shadow: chains hold older contours here. Wall is the `summary.json` figure.
+Seed 3552's off arm also spent 123 s outside it, and may have been slowed, so
+without that pair wall is -32%.
+
+**What this does not establish.** Three seeds at nlive 48 on one node cannot
+show absence of a small bias: mean shift -0.05 sigma, with each sigma ~0.0008.
+The ratios were fitted to nlive 150 and seed 354 only; the production nlive and
+multi-node are unmeasured, as is how the rule interacts with `NS_ADOPT_CONTOUR`.
+Under the sampler-change guard this needs many seeds against the stock log(Z),
+with posterior moments, plus the production search. It stays opt-in, and any
+default is the user's decision. A rebuilt polychord.sif is also needed; until
+then a run points `SIF_DIR` at symlinks holding the copy above.
+
+**WSClean guard.** `common.py` and `run-config.sh` changed, so HEAD and this tree
+raced simultaneously (17 ranks each, seeded, synchronous, nlive 48, 300 dead):
+all `.txt` chain files byte-identical, log(Z) 0.0965029136823395 +/-
+0.000768628 on both, 125.5 s against 125.3 s. Off by default, R2D2 only reads
+one more environment variable and installs one no-op wrapper.
+
+## Round 356: early stop at production nlive: wall -16%, log(Z) agreeing; wrong stops measured at 0.12% and too rare to move a toy's log(Z)
+
+Nothing was built. This round tests round 355's opt-in `NS_EARLY_STOP` where it
+had not been tested: production nlive, async, and against an analytic log(Z).
+
+**Race (async, nlive 150, 5 repeats, converged, 1 node, 17 ranks each, 16 workers
+x 1 thread, started 2 s apart; `.probe/r356/race.sh`).** The second pair's control
+is shadow mode, `NS_EARLY_STOP=2`, which makes no stops and so also gives the true
+wrong-stop rate.
+
+| seed | control | wall control (s) | wall on (s) | evaluations control | on | iterations per evaluation | steady evals/s | log(Z) control | log(Z) on | on-control (sigma) |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3561 | off | 989.9 | 842.3 | 22,976 | 25,655 | 19.96 to 12.24 | 23.2 to 30.7 | 0.0181016463848412 +/- 0.000373 | 0.0178739395353099 +/- 0.000366 | -0.44 |
+| 3562 | shadow | 1043.9 | 863.6 | 22,802 | 22,523 | 18.78 to 13.14 | 21.8 to 26.3 | 0.0169284238979196 +/- 0.000404 | 0.0171211245115164 +/- 0.000401 | +0.34 |
+| sum | | 2033.8 | 1705.9 | 45,778 | 48,178 | | | | | |
+
+Wall **-16.1%** (1.19x), evaluations +5.2%, iterations -31.2%. Posterior moments
+agree on all 9 columns of the chain: mean shifts are at most 0.13 posterior sd,
+sd ratios 0.95-1.03, largest |z| 1.56.
+
+This is half of round 355's -33%, and the cause is not separated. Two things are
+known. The stop arm finished first both times, so its control had the node's
+freed CPUs for the last ~140-180 s, which understates the gain. And a toy sweep
+held ~6 CPUs throughout. Round 355's arms ran one after another on the full node,
+where a U-Net iteration costs more. A fit of `image_container` time per evaluation
+against iterations per evaluation (two points per pair: 664 to 490 ms, 690 to
+565 ms) gives ~22 ms per iteration plus **~210-270 ms that does not scale with
+iterations**. An early stop cannot save that part. It is inferred from two
+different mixes of points, not timed directly.
+
+**True wrong stops (seed 3562, shadow, async, nlive 150).** 10,972 of 22,802
+evaluations (48%) would have stopped. **9 of 7,386** above-contour evaluations
+(0.12%) would have stopped wrongly. That is at the top of round 354's replay
+range (0.04-0.16%). The margins were larger than round 355's single 2% case: 1.002
+to 1.104 x contour, three of them over 6%.
+
+**Sensitivity against an analytic log(Z) (`.probe/r356/toy.py`).** This is a 6-d
+Gaussian, analytic log(Z) -8.3019, async, 3 ranks, nlive 48, 15 repeats, reading the
+real `polychord_contour` from the patched library. A wrong stop returns a value just
+under the contour. `iid` rejects any above-contour point; `band` rejects only points
+within 0.3 of the contour in ln(prior volume); `hole` is the same band with a fixed
+hash of the point, because a real stop is deterministic. The 0.3 is a rough scale:
+the whole search covers ~0.56 in ln(RMS) over ~8 in ln(volume), so 2% is ~0.3. Each
+arm has ~215 seeds, and PolyChord's scatter is ~0.33. Each mean is paired with the
+stock arm by seed.
+
+| arm | wrong stops (% of above-contour) | log(Z) minus stock | posterior sd (stock 0.0994; truth 0.1) |
+| --- | ---: | ---: | ---: |
+| band | 0.20 | -0.059 +/- 0.032 | 0.0994 |
+| iid | 1.00 | -0.027 +/- 0.029 | 0.0993 |
+| band | 1.99 | +0.007 +/- 0.032 | 0.0986 |
+| band | 9.88 | **+0.254 +/- 0.028** | 0.0950 |
+| hole | 9.93 | **+0.219 +/- 0.028** | 0.0953 |
+
+So the failure has the expected sign: rejecting points near the contour tightens
+it, log(Z) rises and the posterior narrows. The method can see it, at 10%. At 2%,
+16x the measured rate, no shift is visible, with a two-sigma limit of ~+0.07 (0.2 of
+one run's scatter). The 0.2% arm's -0.059 is under 2 sigma and of the wrong sign for
+this failure. The stock arm itself sits +0.046 +/- 0.023 from the analytic value.
+
+**What this does not establish.** Two more seeds at nlive 150, with round 355's
+three, are still few for the real search. The toy is a Gaussian with far fewer
+dimensions of structure than R2D2's RMS, its wrong stops are placed by a model, not
+by the rule, and real margins reach 10% of the contour, beyond the 2% the band was
+sized on. Multi-node and `NS_ADOPT_CONTOUR` are still unmeasured. Under the
+sampler-change guard this stays opt-in and off by default, and that decision is the
+user's. No code changed, so no WSClean guard ran. Run directories are deleted;
+gzipped summaries and posteriors are in `.probe/r356`.
+
+## Round 357: a request's fixed cost timed directly: ~100 ms, not 210-270; recompiling imager.py was 11 ms of it
+
+**Why.** Round 356 inferred ~210-270 ms per evaluation that does not scale with
+R2D2 iterations, from two points per pair. That was a fit, so this round timed it
+with temporary stamps inside the workers of live searches (`.probe/r357/stamp.diff`,
+not shipped): default layout, 39 ranks x 1 thread on 38 CPUs, nlive 150, 5
+repeats, 500 dead, ~5,000-7,500 requests per search.
+
+**Result: the fit was about twice too high.** A request of ~690 ms is ~110 ms of
+set-up, then ~31.5 ms per iteration, of which the U-Net forward is all but ~0.6 ms.
+The per-iteration cost is flat: 31-32.5 ms from net 1 to net 25, so no net is a
+cheap one to stop before. A regression of request time on iterations over the
+requests themselves gave an intercept of 109-145 ms across two searches, so the
+stamps are the better number. Why round 356's fit read high is not separated: it
+compared different mixes of points, and its control had freed CPUs at the end.
+
+| set-up phase (ms per request) | before | after |
+| --- | ---: | ---: |
+| redirect stdout/stderr | 0.17 | 0.18 |
+| **`runpy.run_path` until `parse_args`** | **11.12** | **0.37** |
+| `parse_args_imaging` | 1.66 | 1.74 |
+| `load_data_to_tensor` (`.mat` load) | 20.19 | 19.08 |
+| to `gen_imaging_weights` | 1.38 | 1.37 |
+| `gen_imaging_weights` | 15.86 | 15.73 |
+| `create_meas_op` | 3.01 | 3.05 |
+| `data["y"] * nW * nWimag` | 3.86 | 4.07 |
+| `get_psf` (normal kernel) | 29.97 | 29.88 |
+| dirty `adjoint_op` | 22.51 | 22.94 |
+| total set-up | 110.5 | 99.2 |
+
+**Change.** `runpy.run_path` re-read and compiled `imager.py` (178 lines, on
+squashfuse) for every request. `run_imager()` in `r2d2_serve.py` compiles it
+once, during warm-up in the pool parent so every forked worker inherits the code
+object, and `exec`s it in a fresh namespace per request. Upstream reads none of
+`__main__`, `__file__` or `__spec__` beyond the `__name__` guard (grep of its
+tree). New `self_check_run_imager`: fresh globals each run, the imager's exit
+reaches the caller, and a second run does not read the file.
+
+**Effect.** -10.8 ms a request, ~1.6%, seen at the stage. That is below the ~5%
+an end-to-end A/B can show, so it is claimed only at the stage. Before and after
+are separate searches, not interleaved, but every other phase held within ~1 ms.
+The HEAD vs tree race (seeded, synchronous, 2 x 19 ranks, nlive 48, 150 dead,
+simultaneous) gave **all seven `.txt` chains byte-identical**, log(Z)
+0.0164687287364301 +/- 0.0015685880842399 on both, 2,571 evaluations each, and
+wall 183.9 vs 183.5 s. `r2d2_serve.py` is not shared with WSClean, so no WSClean
+guard ran.
+
+**What is left outside the U-Net.** ~100 ms, 14% of a request: the two NUFFTs 53 ms
+(the eps 1e-6 kernel was rejected just before round 148), `.mat` load 19 ms, imaging weights 16 ms. The
+U-Net at ~84% stays the only large term, so a stopped iteration saves more of a
+request than round 356's fit implied.
+
+The stamped searches left two rows named `r357-stamp` (`dirty: true`) in
+`benchmarks.jsonl`. They carry a few ms of stamp overhead; do not compare them.
+Run directories are deleted; the gap tables are in `.probe/r357`.
+
+## Round 358: early stop with contour adoption: wall -28%, log(Z) agreeing; adoption adds nothing at 16 workers
+
+Nothing was built. Rounds 355 and 356 left `NS_EARLY_STOP` with
+`NS_ADOPT_CONTOUR` unmeasured. Both change the sampler, and adoption raises the
+contour the stop rule reads, because patch 0002 publishes `logL_now` after
+adoption. So this is the combination's first test.
+
+**Race (async, nlive 150, 5 repeats, converged, 1 node, 17 ranks each, 16 workers
+x 1 thread, started 2 s apart; `.probe/r358/race.sh`).** Unlike round 356 nothing
+else ran on the node. Early stop is `stop`, adoption is `adopt`, and the shadow
+arm makes no stops, so it also gives the true wrong-stop rate under adoption.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | stopped |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3581 | stop | 644.8 | 19,986 | 11.90 | 31.0 | 0.0169828702720885 +/- 0.000393391331263844 | 9,760 |
+| 3581 | stop + adopt | 676.4 | 23,254 | 11.98 | 34.4 | 0.0170522995627088 +/- 0.000392668833807572 | 11,332 |
+| 3582 | shadow + adopt | 912.2 | 21,072 | 20.07 | 23.1 | 0.0175126074302257 +/- 0.000408267174396098 | (10,223 would) |
+| 3582 | stop + adopt | 658.5 | 21,203 | 12.34 | 32.2 | 0.0175472431067311 +/- 0.000408296512581093 | 10,783 |
+
+**Early stop under adoption (seed 3582).** Wall **-27.8%** (1.39x), evaluations
++0.6%, iterations -38.1%, log(Z) +0.06 sigma. Posterior moments agree on all 9
+columns: mean shifts at most 0.11 posterior sd, sd ratios 0.96-1.01, largest |z|
+1.36. The stop arm finished first, so its control had freed CPUs for the last
+~250 s, which understates the gain. This is one pair, and it sits between round
+356's -16% and round 355's -33%. Round 356's pairs shared the node with a toy
+sweep, but one pair cannot show that as the cause.
+
+**Adoption on top of early stop (seed 3581).** Wall +4.9%, evaluations +16.4%,
+iterations per evaluation unchanged at ~12, log(Z) +0.13 sigma, mean shifts at
+most 0.09 posterior sd, sd ratios 0.97-1.06, largest |z| 1.07. Adoption's own
+effect at this worker count is small, and round 351 saw identical settings vary
+1.7x in evaluations, so one seed's +16% is scatter until shown otherwise. It does
+not show adoption hurting. It does show no sign that the two compound here.
+
+**Wrong stops under adoption (seed 3582, shadow).** 4 of 6,722 above-contour
+evaluations (0.06%), margins 1.005 to 1.034 x contour. That is inside the
+0.04-0.16% replay range and below round 356's 0.12% without adoption, so adopted
+contours did not make the rule less safe. The four stop-arm rows cannot give this
+number, since a stopped evaluation always scores under its contour. Stops were
+48.5-50.9% of evaluations with adoption, against 48.8% without, so adoption did
+not lift the stop rate at 16 workers.
+
+**What this does not establish.** One pair per question, at 16 workers. Adoption
+pays at 77 workers (round 336's two-node result, -19.3% wall), which is where the
+combination matters, and that remains unmeasured. Under the sampler-change guard
+both stay opt-in, and any default is the user's decision. No code changed, so no
+WSClean guard ran. `benchmarks.jsonl` gained rows r358-3581-1-0/1 and
+r358-3582-1-1/2-1 from the searches. Run directories are deleted; gzipped
+summaries and posteriors are in `.probe/r358`.
+
+## Round 360: early stop across two nodes: wall -38% with adoption over three seeds, log(Z) agreeing; on a clean node it stays ~-14%
+
+Nothing was built. Round 358 left two questions: does early stop compound with
+contour adoption at 77 workers, where adoption pays, and was round 356's -16%
+depressed by the toy sweep sharing its node? Runs and files carry the `r359`
+label, because round 359 started them and logged nothing. Its local race was
+reported stopped, but `timeout` makes its own process group, so the group kill
+missed both 3591 arms. They were still running and were adopted here. Their
+settings were checked in `/proc`, and only their console logs were lost.
+
+**Two nodes (async, nlive 150, 15 repeats, converged, `--nodes 2`, 2 x 38 CPUs, 77
+workers; array 39708539, `.probe/r359/array.sh`).** `shadow` makes no stops, so it
+is the control. Every arm got its own node pair, so these are not simultaneous
+races, and each row's full-precision log(Z) is in `benchmarks.jsonl`.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | against shadow (sigma) |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 190182240 | shadow + adopt | 632.6 | 66,372 | 18.84 | 104.9 | 0.0176540757742428 +/- 0.000387823083641412 | |
+| 190182240 | stop + adopt | 458.5 | 64,515 | 10.77 | 140.7 | 0.0174853333258051 +/- 0.000380176336546292 | -0.31 |
+| 190182240 | stop | 616.8 | 91,585 | 11.21 | 148.5 | 0.0176470349606619 +/- 0.000388663250747397 | -0.01 |
+| 7311 | shadow + adopt | 733.0 | 73,395 | 18.37 | 100.1 | 0.017542759710522 +/- 0.000348928841945722 | |
+| 7311 | stop + adopt | 383.6 | 64,420 | 10.77 | 167.9 | 0.0176976467563864 +/- 0.000357262939046478 | +0.31 |
+| 7311 | stop | 431.6 | 74,976 | 11.64 | 173.7 | 0.0177316628229008 +/- 0.00036172904033314 | +0.37 |
+| 4242 | shadow + adopt | 710.8 | 67,730 | 19.26 | 95.3 | 0.0183202621119982 +/- 0.000354418211264077 | |
+| 4242 | stop + adopt | 440.3 | 68,532 | 10.74 | 155.6 | 0.01810335897134 +/- 0.000342817682927003 | -0.44 |
+| 4242 | stop | 523.6 | 79,681 | 10.98 | 152.2 | 0.0183815234243697 +/- 0.0003585229102406 | +0.12 |
+| sum | shadow + adopt | 2,076.4 | 207,497 | | 99.9 | | |
+| sum | stop + adopt | 1,282.4 | 197,467 | | 154.0 | | |
+| sum | stop | 1,572.0 | 246,242 | | 156.6 | | |
+
+Stop + adopt against shadow + adopt: wall **-38.2%** (1.62x), -27.5% to -47.7% by
+seed, evaluations -4.8%. Adoption on top of early stop: wall **-18.4%**,
+evaluations -19.8%, in line with round 336's -19.3% without early stop, so the two
+do compound at 77 workers, unlike round 358's one seed at 16. The stop arm without
+adoption gained -24.3%, with 18.7% more evaluations.
+
+Posterior moments agree on all 9 columns for both arms against shadow: mean shifts
+at most 0.07 posterior sd, sd ratios 0.98-1.04, largest |z| 0.98. Log(Z) is within
+0.44 sigma on every seed, with no shared sign.
+
+**Wrong stops at 77 workers, with adoption.** 91 of 58,621 above-contour
+evaluations pooled (0.16%), but 69 of 18,403 (0.375%), 5 of 19,889 (0.025%) and 17
+of 20,329 (0.084%) by seed. Seed 190182240 is 15x seed 7311 and over twice the top
+of round 354's replay range (0.04-0.16%), with margins up to 1.115 x contour. So
+the rate is not one number: it varies by seed more than it did at 16 workers, and
+the cause is not known. No moment or log(Z) moved with it here, but three seeds
+cannot bound that.
+
+**Clean node (async, nlive 150, 5 repeats, converged, 1 node, 17 ranks each, 16
+workers x 1 thread, started ~2 s apart, nothing else on the node).** Simultaneous
+pairs, no adoption.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | stopped |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3591 | shadow | 893.3 | 20,724 | 19.49 | 23.2 | 0.0173447980427914 +/- 0.000408753726328148 | (10,267 would) |
+| 3591 | stop | 822.1 | 24,857 | 13.14 | 30.2 | 0.0173207376067225 +/- 0.000411886451789813 | 11,882 |
+| 3592 | shadow | 831.1 | 20,367 | 18.70 | 24.5 | 0.0170227716198689 +/- 0.00040246449579278 | (7,788 would) |
+| 3592 | stop | 657.9 | 20,864 | 11.82 | 31.7 | 0.0170041035712933 +/- 0.00039825737905899 | 9,725 |
+
+Wall -8.0% and -20.8%, **-14.2%** summed (1.17x), evaluations +11.3%, log(Z) -0.04
+and -0.03 sigma, mean shifts at most 0.12 posterior sd, sd ratios 0.95-1.03, largest
+|z| 1.46. Time per evaluation fell 23% in both pairs. So the toy sweep does not
+explain round 356: a clean node gives the same ~-15%, and round 358's -28% was one
+pair. The spread comes from how many evaluations a seed needs, and the rate gain
+of ~+30% is the stable part. Wrong stops were 2 of 14,617 above-contour evaluations
+(0.014%), both shadow arms together.
+
+**What this does not establish.** The two-node arms ran on different node pairs,
+some starting on busy nodes (load ~43 on one), so wall by seed carries node
+variation that the sum only partly averages. Three seeds at nlive 150 are not the
+target-size search, and early stop has never run at nlive 500. Round 356's toy
+shifted log(Z) only at ~10% wrong stops, far above 0.375%, but that toy is not this
+posterior. Both settings change the sampler, so under
+the guard they stay opt-in, and any default is the user's decision. No code changed,
+so no WSClean guard ran. `benchmarks.jsonl` gained the 13 rows above. Run
+directories, `../frozen-r359` and the `sifs-r359` links are deleted; gzipped
+summaries and posteriors are in `.probe/r359`.
+
+## Round 362: the `.mat` load is memory copies, not parsing, so it stays; early stop at target size queued
+
+**Why.** Round 357 left `load_data_to_tensor` at ~19 ms a request. With early stop
+near 11 iterations, set-up is a larger share of a request, and this was the
+cheapest-looking phase.
+
+**Method.** Solo, one thread, in `r2d2.sif`, on a real 404,352-visibility `.mat` on
+tmpfs (`.probe/r362/t.py`, `t2.py`, not shipped).
+
+**Result: closed, no code changed.** The whole function takes 12.8 ms here (15.2 ms
+on its first pass). A profile splits it into `scipy` element reads ~4.4 ms,
+`torch.tensor` copies ~4.3 ms and the function's own array arithmetic ~3.5 ms, with
+Python and file-open overhead too small to matter. A hand-written parser of
+`write_mat_columns`' exact layout returned identical arrays but took 4.1-5.1 ms
+against `loadmat`'s 3.6-4.4 ms, so it is no faster. A zero-copy path could save
+at most ~8 ms of ~690 ms (~1%), below what an end-to-end race can see, and is
+not worth a second loader.
+
+**Pending.** Array 39710059 (2 nodes, 6 tasks, `.probe/r361/array.sh`) tests dropping
+early stop's iteration-2 check; its edit is uncommitted in `../frozen-r361` and its
+`self_check_early_stop` passes there. Array 39710176 (8 nodes, 2 tasks,
+`.probe/r362/array.sh`) is the first `NS_EARLY_STOP=1` + `NS_ADOPT_CONTOUR=1` run at
+nlive 500, 25 repeats, on round 344's seeds, using that same candidate tree. Neither
+had produced an output file when this round closed, so neither gives a result here.
+Keep `../frozen-r361` and `sifs-r361` until both are read. Both settings stay opt-in.
+
+## Round 365: early stop's first checks tightened; 8-node target size halves wall time with log(Z) +0.03 sigma
+
+Code: `EARLY_STOP_RATIOS` loses iteration 2 and iteration 3 goes from 0.90 to 0.82,
+in `r2d2_serve.py`; `NS_EARLY_STOP=2` records now carry every check's RMS as
+`early_checks`, so any rule can be replayed on them. The new ratios only remove
+stops, so they cannot add a wrong one. `NS_EARLY_STOP` and `NS_ADOPT_CONTOUR` stay
+opt-in, and any default is the user's decision. Neither edited file is shared with
+WSClean, so no WSClean guard was needed. This logs arrays 39710059 and 39710176
+(`r361`, `r362`) from the rounds before it; gnhf 363 and 364 logged nothing.
+
+**Dropping iteration 2 alone moved the wrong stops to iteration 3 (2 nodes, 77
+workers, nlive 150, 15 repeats, adopting; array 39710059).** Same seeds as round
+360, each arm on its own node pair, not simultaneous.
+
+| seed | arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) | against shadow (sigma) |
+|---|---|---|---|---|---|---|---|
+| 190182240 | shadow | 617.8 | 73,863 | 18.72 | 119.6 | 0.017459441791776 +/- 0.000378090693799191 | |
+| 190182240 | stop | 381.5 | 66,281 | 11.60 | 173.8 | 0.0175366365341782 +/- 0.000382598094878383 | +0.14 |
+| 7311 | shadow | 771.5 | 65,189 | 18.60 | 84.5 | 0.0176416967649003 +/- 0.000353859698792249 | |
+| 7311 | stop | 393.4 | 64,731 | 11.09 | 164.5 | 0.0176925206617616 +/- 0.000357554573728627 | +0.10 |
+| 4242 | shadow | 671.0 | 66,315 | 18.57 | 98.8 | 0.0183781133655519 +/- 0.00035668535431306 | |
+| 4242 | stop | 452.1 | 63,481 | 11.31 | 140.4 | 0.0181966229197922 +/- 0.000347820073720918 | -0.36 |
+| sum | shadow | 2,060.3 | 205,367 | | 99.7 | | |
+| sum | stop | 1,227.0 | 194,493 | | 158.5 | | |
+
+Wall -40.4% (1.68x), against -38.2% with the iteration-2 check, which is inside
+the scatter between node pairs. Moments agree on all 9 columns: mean shifts at most
+0.08 posterior sd, sd ratios 0.95-1.04, largest |z| 1.00.
+
+Wrong stops fell only from 91 of 58,621 above-contour evaluations (0.16%) to 60 of
+59,882 (0.10%), and by seed they went 69 to 13, 5 to 46 and 17 to 1, so this was
+not the fix round 361 hoped for. 58 of the 60 first stopped at iteration 3, the
+other two at 4 and 5. All 58 had RMS at or over 0.82 x contour, which is where the
+new ratio comes from; it would have cost 25,629 of the 66,883 iteration-3 stops.
+A stop lost there mostly stops at the next check, so the cost is small.
+
+**Held-out replay (seed 190182240, 1 node, 37 workers, nlive 150, 15 repeats,
+adopting, shadow, 65,588 evaluations; run `r363-trace`, `.probe/r363/`).** Log(Z)
+0.0172349353569231 +/- 0.000401204109504618, wall 1,386 s. This is the first
+replay on the contour a chain really held. It was not used to fit the old ratios,
+but it did inform the 0.82 choice below, so only the fresh seed further down is
+fully held out. Of 26,519 above-contour evaluations:
+
+| rule | iterations saved | wrong stops | rate |
+|---|---|---|---|
+| ratios before this round | 39.3% | 27 (26 at iteration 2) | 0.102% |
+| no iteration 2 | 38.2% | 6 (5 at 3) | 0.023% |
+| no iteration 2, iteration 3 at 0.85 | 37.0% | 3 | 0.011% |
+| **no iteration 2, iteration 3 at 0.82 (shipped)** | 36.8% | 1 | 0.004% |
+| no iterations 2 or 3 | 35.8% | 1 | 0.004% |
+
+Only 5 of the 26 iteration-2 wrong stops would also stop at a later check under the
+old ratios. The rule costs ~4% more iterations than before (63.2 against 60.7 per
+100), and the worst wrong stop scores 1.016 x contour rather than 1.146.
+
+**Fresh seed with the shipped ratios (seed 3651, simultaneous pair, 1 node, 18
+workers each, nlive 150, 5 repeats, adopting; `.probe/r365/race.sh`).** No ratio
+was picked from this seed.
+
+| arm | wall (s) | evaluations | iterations per evaluation | evals/s | log(Z) |
+|---|---|---|---|---|---|
+| shadow | 836.3 | 21,086 | 19.78 | 25.2 | 0.0168261487794877 +/- 0.000419270046834374 |
+| stop | 679.7 | 22,034 | 12.89 | 32.4 | 0.0170519410623811 +/- 0.000434160186874423 |
+
+Wall -18.7% (1.23x), log(Z) +0.37 sigma, mean shifts at most 0.10 posterior sd, sd
+ratios 0.97-1.05, largest |z| 1.27. Wrong stops: 0 of 6,359 in the shadow arm. That
+is one seed: at the 0.10% of the old rule only ~6 were expected, so it does not
+bound the rate. It is also a small-layout figure, in line with round 358's -8% to
+-28% at 16 workers.
+
+**First stop + adopt at target size (nlive 500, 25 repeats, 8 icelake half-nodes;
+array 39710176, `.probe/r362/array.sh`).** Against round 344's stock run on the same
+seed. Stock had neither setting, so this is the two together, on different nodes
+on a different day, with no shadow control. It ran the no-iteration-2 rule with
+iteration 3 still at 0.90, not the shipped ratios, and wrong stops cannot be read
+from it.
+
+| seed 344 | search wall (s) | job (s) | evaluations | iterations per evaluation | evals/s | log(Z) |
+|---|---|---|---|---|---|---|
+| stock (round 344) | 1,165.7 | 1,254 | 450,922 | 19.36 | 386.8 | 0.0174309441303439 +/- 0.000188280573191559 |
+| stop + adopt | 620.7 | 673 | 380,252 | 11.28 | 612.7 | 0.0174394826051968 +/- 0.000188373014295059 |
+
+Search wall **-46.8% (1.88x)**, job -46.3%, evaluations -15.7%, evals/s +58%, log(Z)
++0.03 sigma. This is one seed. Moments were not compared, because round 344's chains are gone. Seed 345
+(task 1) had no output when this round closed: read `.probe/r362/big-39710176_1.out`,
+compare with `r344-big2`, and only then delete `../frozen-r361` and `sifs-r361`.
+
+**Still open.** At target size the shipped ratios are unmeasured; expect a few
+percent more wall time. The wrong-stop rate has now been measured on one fresh
+seed only. Checks passed: `./ri self-check r2d2-serve` (including early stop),
+`./ri self-check r2d2`, `scripts/test_self_checks.py`.
+
+## Round 366 (negative, replay): neither the RMS trend nor retuned ratios close early stop's gap; shipped ratios queued at target size
+
+**Question.** Round 365's shipped rule saves 36-39% of U-Net iterations. If every
+below-contour evaluation stopped at the first check under its contour, it would
+save 59%. Can a better rule, replayed on the two shadow traces with `early_checks`,
+take a useful part of that gap? `r363-trace` (65,312 evaluations with a live
+contour, seed 190182240, 15 repeats) and the shadow arm of round 365's pair (20,686
+evaluations, seed 3651, 5 repeats). No search ran for this, and no code changed.
+Scripts are `.probe/r366/{a,b,c}.py`.
+
+**Where the shipped rule stops.** Share of evaluations by the check that stops them:
+
+| trace | 3 | 4 | 5 | 6 | 8 | 10 | 12 | 15 | 18 | never |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| r363-trace | 20.2 | 10.5 | 0.9 | 0.4 | 3.6 | 4.7 | 4.4 | 4.0 | 2.6 | 48.7 |
+| seed 3651 | 15.2 | 10.6 | 1.2 | 0.6 | 4.0 | 5.1 | 5.1 | 5.0 | 3.8 | 49.5 |
+
+Checks 5 and 6 do almost nothing, because their ratios sit under iteration 4's. Of
+the evaluations never stopped, 39% end below the contour (12,457 of 31,794 and
+3,999 of 10,242).
+
+**A rule using the RMS trend gains ~2 points and costs more wrong stops.** The
+ratio at check k was binned by RMS(k) / RMS(previous check), fitted on one trace
+as the lowest RMS(k) / final (or an eps quantile of it, less 1%), and tested on the
+other. Check 3 stayed at 0.82.
+
+| fit -> test | rule | iterations saved | wrong stops |
+|---|---|---:|---:|
+| r363 -> 3651 | shipped | 36.1% | 0 of 6,243 |
+| r363 -> 3651 | trend, eps 0 | 33.8% | 0 |
+| r363 -> 3651 | trend, eps 0.001 | 41.1% | 0 |
+| 3651 -> r363 | shipped | 39.0% | 1 of 19,338 |
+| 3651 -> r363 | trend, eps 0 | 41.3% | 6 |
+| 3651 -> r363 | trend, eps 0.001 | 43.5% | 8 |
+
+The trend does not explain the tail. Over round 354's 70,427 full traces, RMS(k) /
+final has a 1st percentile of 0.94 at most iterations, but its minimum falls to
+0.29 by iteration 6. Those evaluations finish far above an early iterate, and they
+are the high-RMS points this search exists to find, so the rule cannot be fitted
+around them.
+
+**Retuned fixed ratios gain ~3 points, also in-sample.** Check 3 at 0.82 and 4 at
+0.86 throughout, unless the row says otherwise:
+
+| ratios at 5, 6, 8, 10, 12, 15, 18 | r363 saved | r363 wrong | 3651 saved | 3651 wrong |
+|---|---:|---:|---:|---:|
+| shipped: .84 .82 .84 .87 .90 .93 .95 | 39.0% | 1 | 36.1% | 0 |
+| .86 .86 .86 .87 .90 .93 .95 | 39.6% | 2 | 36.8% | 0 |
+| .87 .88 .88 .89 .91 .93 .95 | 40.7% | 2 | 37.9% | 0 |
+| .88 .89 .90 .91 .92 .94 .95 | 41.8% | 3 | 39.2% | 0 |
+| .89 .90 .92 .93 .94 .95 .96 | 43.7% | 7 | 41.6% | 0 |
+
+Each extra point of iterations is worth under one point of wall, so the ratios stay
+as shipped. These traces are too small to choose between 1 and 3 wrong stops. The
+target-size shadow run below should hold ~6x as many above-contour evaluations as
+`r363-trace` (estimated from 400k evaluations at ~30% above contour).
+
+**Target-size control queued (array 39712455, `.probe/r366/array.sh`, frozen tree
+`../frozen-r366` at 17d68b8).** Seed 344, nlive 500, 25 repeats, 8 icelake
+half-nodes, adopting, `SIF_DIR` `.cache/ri/sifs-r361`. Task 0 is the shipped ratios
+and task 1 is shadow on the same code and seed, so this gives the first target-size
+wall time for the shipped ratios, a same-tree control, the wrong-stop rate at 311
+workers, and a trace in `.probe/r366/checks-r366-big-m2.jsonl.gz`. Neither task had
+output when this round closed, and neither had seed 345 of array 39710176.
+
+**Noted, not measured.** Round 365's 8-node run lost 38.6 s to a whole-search stall
+at its start, all of it the first request (`first_request_s` 38.76), which is 6.2%
+of a 620.7 s search. Round 303 called a fresh node's start ~2% of a 20-minute
+search; a faster search raises that share. The stdout records carry no timing and
+that run's `summary.json` is deleted, so this log cannot split it by node. The
+checkpoints are already striped over 32 OSTs.
+
+## Round 367: the CPU onnx pool no longer loads torch weights it never uses: peak -43%, first request -21%, chains identical
+
+**Why.** Rounds 303 and 366 left a fresh node's start unexplained, and it is now
+6.2% of a 620 s target-size search. The likely cost is the pool's weight read, so
+what does that read contain? The two queued arrays hold this account at its limit
+of pending jobs, so this was worked on the gnhf node.
+
+**Found.** A CPU onnx pool read and kept the 25 torch state dicts (per NUMA node
+when it pins), then ran every forward through ONNX Runtime sessions built from the
+optimised graphs. The dict is touched only by `export_onnx` for a missing graph and
+by the torch fallback for a request ONNX cannot serve; `load_net` passes it along
+unread otherwise. `layers` is always 1 in this repo, so R3D3 never takes that path.
+
+**The change.** On that path `load_checkpoint_series` returns `LazyCheckpoints`,
+a dict that loads an entry when first asked for, after the same file checks.
+`prefetch_weights` reads only the graphs there. `_NODE_CHECKPOINTS` still holds one
+(empty) series per NUMA node, so worker pinning is unchanged. Torch and GPU pools
+load as before.
+
+**Race.** New tree against 17d68b8 (same `r2d2_serve.py` as HEAD), `.probe/r367/ab.sh`:
+19 ranks on their own 19 CPUs at once, synchronous, seed 367, nlive 48, 5 repeats,
+150 dead, CPU sets swapped between pairs.
+
+| arm | CPUs | evaluations | steady evals/s | first request s | peak MB |
+|---|---|---:|---:|---:|---:|
+| old | first 19 | 2,569 | 13.37 | 6.56 | 6,915 |
+| new | last 19 | 2,569 | 13.83 | 4.33 | 3,930 |
+| old | last 19 | 2,569 | 13.60 | 5.30 | 6,928 |
+| new | first 19 | 2,569 | 13.17 | 5.06 | 3,920 |
+
+- **Results identical.** All four `dead-birth` and `.stats` hashes match; log(Z)
+  0.0162567459194733 +/- 0.00152457882352641.
+- **Peak memory -43%** (6.92 to 3.93 GB), which is the pool parent's floor and so
+  every worker's reported peak. `NS_R2D2_SHARED_MB` was not lowered: the budget
+  only clamps when memory is short, and half-nodes have far more than it needs.
+- **First request** 5.93 to 4.70 s (mean, -21%) on this warm node, two pairs only.
+- **Steady rate** +0.1% (mean of pairs: 13.48 old, 13.50 new), inside the noise.
+  This is a start-up change; no per-evaluation gain is claimed.
+- **Async default** (39 ranks, 16 max threads, threaded sessions): one search, 42.1
+  steady evals/s, first request 5.2 s, peak 5,379 MB, no traceback, log(Z)
+  0.0133014836613859 +/- 0.00420051362229134.
+
+**Not measured.** The saving on a fresh node, which is the point, because only a
+new job on a new node can show it. Volume read falls from ~6 GB to round 228's
+2.9 GB of graphs, but no 8-node search has run this tree, and the queued arrays
+use frozen trees without it. Compare the next target-size run's `first_request_s`
+with round 365's 38.76 s. A request that falls back to torch now loads each
+weight file in its worker on first use, off Lustre and per worker; no search here
+has taken that path, and it was exercised only by the self-check's series test.
+
+Checks: `./ri self-check r2d2-serve` (with a new assertion that the series loads
+nothing up front), `./ri self-check r2d2`, `scripts/test_self_checks.py` (33
+host-runnable passed) and ruff (22 findings before and after). `r2d2_serve.py` is
+not shared with WSClean, so no WSClean guard ran. Rows: `r367-old1`, `r367-old2`,
+`r367-new1`, `r367-new2`, `r367-async`. Run directories and `/dev/shm/r367` are deleted.
+
+## Round 368: the 38 s first request was one bad start, not the cost of a fresh node; second target-size seed halves wall time; pool warm-up now timed
+
+**Why.** Round 367 assumed round 365's 38.76 s first request was the pool's weight
+read. This round tested that assumption, with the array for seed 345 finishing
+during it.
+
+**Weights are not the cold cost on this node.** Short searches (39 ranks, nlive 48,
+5 repeats, 100 dead, seed 368, CPU onnx), with the ONNX cache and checkpoints evicted
+by `posix_fadvise` before the `c` arms:
+
+| arm | evicted | `imager` s | `networks` s | first request s | steady evals/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| c1 | yes | 3.2 | 2.4 | 5.05 | 31.1 |
+| w1 | no | 3.1 | 2.4 | 5.13 | 30.8 |
+| c2 | yes | 3.2 | 2.5 | 5.17 | 31.0 |
+| w2 | no | 3.1 | 2.4 | 5.03 | 30.8 |
+
+A direct read of one 118 MB graph after eviction ran at ~2.1 GB/s, against ~5 GB/s
+from cache. Eviction is only a partial stand-in for a fresh node, as round 303 found,
+but at that rate 2.9 GB of graphs is ~1.4 s of 16-thread reading at most, so the
+weight read cannot be most of a 38 s stall unless Lustre was far slower at the time.
+The `networks` phase, which holds the sessions, is 2.4 s whether evicted or not.
+
+**The stall does not repeat.** Target-size first requests on 8 icelake half-nodes:
+
+| run | tree | first request s | stall s |
+| --- | --- | ---: | ---: |
+| r344-big | stock | 9.1 | 0.0 |
+| r344-big2 | stock | 4.39 | 0.0 |
+| r362-big-s344 | stop + adopt | 38.76 | 38.6 |
+| r362-big-s345 | stop + adopt, same tree | 7.35 | 5.9 |
+
+Same tree, same checkpoint volume, same SIFs: 7.35 s against 38.76 s, so the 38 s is
+something about that start (its nodes or Lustre at that moment), not the size of the
+read. Round 367's memory saving stands; its "first request" motive for a fresh node
+does not, and its cold-node saving should be expected to be small. What the 38 s was
+is still unknown: one occurrence in four.
+
+**Second target-size seed** (array 39710176 task 1, seed 345, nlive 500, 25 repeats,
+8 half-nodes, stop + adopt on the rule before round 365's iteration-3 tightening),
+against stock `r344-big2` on the same seed:
+
+| | stock | stop + adopt | change |
+| --- | ---: | ---: | ---: |
+| search wall s | 1,068.4 | 555.7 | **-48.0% (1.92x)** |
+| job wall s | 1,145 | 607 | -47.0% |
+| evaluations | 425,400 | 385,457 | -9.4% |
+| steady evals/s | 398.6 | 702.9 | +76% |
+| log(Z) | 0.0173758961596796 +/- 0.00020058887505272 | 0.0173119266687414 +/- 0.000198078417026602 | -0.23 sigma |
+
+Two seeds now give -46.8% and -48.0%, with log(Z) +0.03 and -0.23 sigma. The same
+caveats as round 365 hold: different day and nodes, no same-run control, the rule
+before the tightening, and stock's chains are gone so moments cannot be compared.
+Task 0 and 1 of array 39712455 supply the control. Both settings stay opt-in;
+defaulting them is the user's decision.
+
+**The end of the job is now the largest fixed cost.** `searched` (last evaluation to
+the search's exit) was 37.36 s here and 39.61 s on seed 344, and the job's 51.7 s
+outside the search span is 8.5% of a 607 s job with all 8 nodes held. The post-run
+line accounts for 26.9 s (records 11.0, flush 4.0, prune 2.2, summary 4.8, pack 4.6,
+drain 0.2), which leaves ~10 s between `searched` and that line that no timer
+covers. Round 341 had that gap at ~1.5 s at 60k evaluations, so it grows with the
+run. That is the next lever.
+
+**Change (measurement only).** The pool prints `r2d2 pool warm-up seconds: imager,
+patches, checkpoints, networks, operator` to `workers-r2d2.log`, one line per node,
+and `./ri bench` stores each phase's slowest pool as `pool_warm_s` in the row, so the
+split outlives a deleted run directory. A warm pool reads imager 3.2, networks 2.4.
+`../frozen-r366` carries the same timing plus a copy to `results/warm-*.txt`, because
+that array deletes its run directories; it changes no result.
+
+Checks: `./ri self-check r2d2-serve`, `scripts/bench.py --self-check` (new
+`pool_warm_phases` cases), `scripts/test_self_checks.py` (33 host-runnable passed).
+`r2d2_serve.py` and `bench.py` are not shared evaluation code, so no WSClean guard
+ran. Rows: `r368-c1`, `r368-w1`, `r368-c2`, `r368-w2`, `r368-v1`, `r362-big-s345`.
+Run directories are deleted. Array 39712455 had no output when this round closed.
+
+## Round 369: the end of a search gets timers (measurement only)
+
+**Why.** Round 368 left ~10 s between `searched` and the post-run line that no timer
+covered. `polychord_r2d2.py`'s post-run line now also reports `stop` (finish, chains
+mirror, packer), `window_fit` and `profile`.
+
+Synthetic estimates at 385k records: `summarize_profiling` ~3.0 s (mostly
+`record_digest`), left alone because a rewrite is worth ~0.25% of a 607 s job and
+touches `common.py`; interpreter exit of a process holding them ~0.8 s. The real
+8-node reading is in round 371. gnhf 370 left no commit and no log entry, so its
+number is unused here.
+
+## Round 371: the same-seed control reads -27.8%, wrong stops 1 in 98,616; a rank's exit no longer frees its heap (end of `main` to `mpirun` exit 4.4 to 0.43 s)
+
+**Why.** Array 39712455 finished: seed 344 at target size (nlive 500, 25 repeats,
+8 icelake half-nodes, adopting, the rule shipped by round 365), task 0 stopping and
+task 1 in shadow (`NS_EARLY_STOP=2`, same code, every check recorded). This is the
+control rounds 365 and 368 lacked. It is the same seed and same code but different
+nodes (6 of 8 shared), and async searches diverge, so it is two samples of one seed
+rather than a paired replay.
+
+| | stock `r344-big` | adopt only (shadow) | stop + adopt | stop against shadow |
+| --- | ---: | ---: | ---: | ---: |
+| search wall s | 1,165.7 | 817.2 | 590.0 | **-27.8% (1.38x)** |
+| job wall s | - | 869 | 643 | -26.0% |
+| evaluations | 450,922 | 351,114 | 388,809 | +10.7% |
+| dead points | - | 4,667 | 4,564 | -2.2% |
+| steady evals/s | 387.4 | 434.3 | 668.7 | +54% |
+| iterations a request | 19.36 | 18.89 | 11.65 | -38.3% |
+| log(Z) | - | 0.017454469399169 +/- 0.000188541166658583 | 0.0174615129419248 +/- 0.000188580059150255 | +0.03 sigma |
+
+Against stock on this seed, stop + adopt is -49.4% (1.98x), after -46.8% and -48.0%
+on the earlier rows, which ran the rule before the tightening.
+
+Early stop costs +10.7% evaluations here. Faster requests do not change PolyChord's
+need for points, so that is either seed noise or the price of stopped evaluations;
+one pair cannot say which. It is why the wall gain (-27.8%) is less than the
+iterations gain (-38.3%).
+
+**Wrong stops, measured live at target size.** Replaying the shipped ratios over the
+shadow's 345,681 evaluations with checks: 181,103 stopped (52.4%), 40.0% of iterations
+saved, and **1 of 98,616 above-contour evaluations stopped wrongly (0.001%)**, by
+0.39% of the contour at iteration 4. Round 365's replay predicted 0.004%. This is the
+shadow run's rate; the stopping run's own wrong stops cannot be counted, because its
+stopped evaluations never reach a final RMS.
+
+**Posterior moments** (stop against shadow, 9 dimensions): means differ by at most
+0.028 posterior sigma, 0.56 standard errors at ~820 equal-weight samples; sigmas agree
+within 1.7%. The stopping run's PolyChord split into 3 clusters and the shadow stayed
+in 1; the global log(Z) agrees regardless, and the two small clusters hold ~1.8% and
+~1.2% of the evidence. One seed; not a many-seed validation. Both
+settings stay opt-in and the default is the user's decision.
+
+**Where the end goes.** Task 1 (shadow) carried round 369's timers, 351,114
+records:
+
+| step | s |
+| --- | ---: |
+| records | 9.5 |
+| summary | 5.2 |
+| flush | 4.9 |
+| profile (was untimed) | 4.8 |
+| pack | 4.4 |
+| prune | 2.2 |
+| stop (was untimed) | 0.6 |
+| `run_polychord` return to end of `main`, sum | 31.7 |
+| end of `main` to `searched` (was untimed) | 8.2 |
+| `searched` | 39.9 |
+
+So the post-run timers are complete: the epochs give 31.68 s and the line sums to 31.7.
+The rest of round 368's ~10 s is `profile` (4.8, about 1.6x the synthetic estimate)
+plus **8.2 s after `main` returns** on this run.
+
+**What the 8.2 s was.** Job 39719836 (seed 346, stop + adopt on the current rule,
+8 half-nodes, `../frozen-r371` = c7860ed plus per-rank `flush`, an explicit
+`Barrier`/`Finalize` after `main` and an `mpirun` exit epoch; no result-affecting change)
+split it. Every one of the 312 ranks had finished `MPI_Finalize` by 0.13 s after its
+`Barrier`, and `mpirun` exited 4.40 s after the last of them. So it is not MPI: it is
+what a process does after `MPI_Finalize`, freeing its heap and exiting.
+
+A host estimate had pointed the other way, and was wrong by about 3x: Python 3.11.16 in
+`polychord.sif` holding a real 65,588-record summary exits in 0.32-0.33 s, 0.11-0.12 s
+through libc `exit`, which scales to ~1.2 s of saving at 350k. The 8-node run shows more.
+On a short single-node search the same gap is 0.27 s (39 ranks, 100 dead).
+
+**Change.** `exit_without_teardown()` in `polychord_r2d2.py`: after a clean `main`, a
+rank runs its `atexit` hooks, flushes, calls `MPI.Finalize()` and leaves through libc
+`exit`. That is `os._exit` less its loss of libgfortran's buffered output. An exception
+still goes through `abort_on_exception` as before.
+
+| run | seed | teardown | end of `main` to `mpirun` exit s | `searched` s | job wall s |
+| --- | ---: | --- | ---: | ---: | ---: |
+| r366-big-m2 | 344 | interpreter | 8.2 | 39.9 | 869 |
+| r371-big-s346 | 346 | `MPI.Finalize` first, then interpreter | 4.40 | 40.75 | 618 |
+| r371-big-x346 | 346 | libc `exit` | **0.43** | 32.49 | 612 |
+
+`searched` is smaller by less than the gap alone would say because the arms' other
+steps vary (x346: flush 7.0, records 8.4; s346: flush 6.4, records 9.5). Saving 4-8 s
+of a ~610 s job on 8 held nodes is 0.6-1.3%, with one reading each side.
+
+`flush` is the slowest rank's publish plus strip on Lustre (rank 43: 3.07 + 2.44 s of
+5.5, ranks holding ~40 kept dirs of 3,600 kept), not a fixed wait; it was 0.9 s on a
+short search and has now read 4.0-7.0 s at target size.
+
+**Third target-size seed.** Stop + adopt on the current rule, seed 346, twice:
+
+| run | search wall s | evaluations | steady evals/s | iterations | log(Z) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| r371-big-s346 | 555.5 | 355,945 | 651.6 | 11.20 | 0.017258659781934 +/- 0.000193658959314901 |
+| r371-big-x346 | 563.7 | 356,363 | 641.6 | 11.11 | 0.017254793393842 +/- 0.000193575893608552 |
+
+The two differ by 0.01 sigma, and seeds 344 (0.017462) and 346 (0.017257) on this rule
+differ by 0.75 sigma, within noise. No stock run exists on seed 346.
+Both settings stay opt-in and the default is the user's decision.
+
+**Results unchanged, with one thing not explained.** Two raced short searches, HEAD
+against the tree (19 ranks, nlive 48, 100 dead, seed 371, synchronous): the second was
+byte-identical in all 7 chain files. The first was not (5 of 7 differ, from around
+line 100 of 148, `equal_weights` the same, log(Z) equal at the printed 5 digits). The
+new code runs after every chain file is closed, so it cannot be the cause, and gnhf 370's
+two races at seed 370 (one R2D2, one WSClean) were identical; a synchronous 19-rank search is apparently not
+always reproducible on a shared node, cause unknown, one occurrence in four.
+
+Checks: `./ri self-check r2d2` (new `self_check_exit_without_teardown`, classified
+image-only), `scripts/test_self_checks.py` (33 host-runnable passed). `polychord_wsclean.py`
+and shared code are untouched, so no WSClean guard ran.
+
+Rows: `r366-big-m1`, `r366-big-m2`, `r371-big-s346`, `r371-big-x346`. `../frozen-r366` and
+`../frozen-r371` are removed, diffs in `.probe/r366/` and `.probe/r371/`. Run directories are deleted.
+
+## Round 396: the many-seed validation finished: early stop passes at production shape, contour adoption fails and shifts the tail
+
+The final task: [csd3-sampler-validation.md](csd3-sampler-validation.md) holds the design,
+every table and the conclusion. 150 of 150 runs finished, none excluded, 3,105 of 5,000
+core-hours. Under the committed rule: `NS_EARLY_STOP=1` PASS at nlive 150 (log(Z) +0.003
+sigma, -32.3% wall, 6 of 241,196 wrong stops); `NS_ADOPT_CONTOUR=1` FAIL (`source_l_pixels` sd
+-1.2%); both FAIL at nlive 150 (three statistics) and PASS at nlive 500, on a test that could
+not see the posterior. Nothing became a default.
+
+The secondary tail table was on the wrong axis: indexing `_dead.txt` by count also counts rows
+that never reach the posterior. `sampler_validation.py volumes` re-reads contours from
+PolyChord's weights. On that axis stock at nlive 150 and 500 agree, early stop matches stock, and
+adoption lags by ~0.2-0.3 nats (A) to ~0.4-0.5 nats (B) from ln X -4 on, cause unknown. This is
+post hoc and changes no verdict.
+
+Rows: 150 `val-*`, all appended to `benchmarks.jsonl`. Records with full-precision log(Z) are in
+`docs/csd3-sampler-validation-runs.jsonl`. `../frozen-val` is removed.

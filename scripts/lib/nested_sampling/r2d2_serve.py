@@ -7,7 +7,6 @@ import json
 import os
 import resource
 import signal
-import runpy
 import sys
 import time
 import traceback
@@ -72,6 +71,18 @@ def install_lazy_utils() -> None:
     sys.modules["utils"] = package
 
 
+class LazyCheckpoints(dict):
+    """A checkpoint series that loads an entry the first time something asks for it."""
+
+    def __init__(self, load):
+        super().__init__()
+        self.load = load
+
+    def __missing__(self, name: str):
+        state_dict = self[name] = self.load(name)
+        return state_dict
+
+
 def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
     """Upstream `get_DNNs`, with its torch.loads on 4 threads.
 
@@ -110,6 +121,11 @@ def load_checkpoint_series(num_iter: int, ckpt_path) -> dict:
                 partial.unlink(missing_ok=True)  # a full quota: the next pool tries again
         return state_dict
 
+    # A CPU onnx pool forwards through its sessions, so only an export (a new
+    # torch or checkpoint) or a request ONNX cannot serve needs these weights
+    # (round 367).
+    if weights is not None:
+        return LazyCheckpoints(lambda name: load(paths[int(name[1:]) - 1]))
     with ThreadPoolExecutor(max(1, min(4, len(paths)))) as pool:
         return {f'N{i+1}': state_dict for i, state_dict in enumerate(pool.map(load, paths))}
 
@@ -346,10 +362,10 @@ def onnx_cpu_key() -> str:
 def prefetch_weights() -> int:
     """Fork a child that reads the pool's weights into the page cache, 16 files at a time; return its pid.
 
-    A cold pool reads 5.8GB of checkpoints and (onnx) 2.9GB of optimised
-    graphs one file at a time off Lustre: 8.9s and 10.3s of a 22-34s warm-up,
-    against 5.8s warm (round 228). Forked before any import, so the parent's
-    peak RSS, which every worker reports as its floor, does not see the reads.
+    A cold pool reads 5.8GB of checkpoints or (onnx, round 367) 2.9GB of
+    optimised graphs one file at a time off Lustre: 8.9s and 10.3s of a 22-34s
+    warm-up, against 5.8s warm (round 228). Forked before any import, so the
+    parent's peak RSS, which every worker reports as its floor, does not see the reads.
     """
     pid = os.fork()
     if pid:
@@ -358,11 +374,8 @@ def prefetch_weights() -> int:
         import concurrent.futures
 
         files = sorted(Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1")).glob("*.ckpt"))
-        weights = checkpoint_weights_dir(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
-        if weights is not None:
-            files = [weights / path.name if (weights / path.name).exists() else path for path in files]
         if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
-            files += sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
+            files = sorted(ONNX_DIR.glob(f"models/*/opt-{onnx_cpu_key()}/N*.onnx"))
 
         def read(path: Path) -> None:
             chunk = bytearray(1 << 22)
@@ -1194,7 +1207,31 @@ def enter_node(node: int, nodes: dict[int, list[int]]) -> None:
         _ORT_SHARED.update(_NODE_ORT_SHARED.get(node, {}))
 
 
+_imager_code: dict[Path, Any] = {}
+
+
+def run_imager(run_name: str) -> None:
+    """`runpy.run_path` without re-reading and compiling imager.py each request (round 357)."""
+    code = _imager_code.get(IMAGER)
+    if code is None:
+        code = _imager_code[IMAGER] = compile(IMAGER.read_text(), str(IMAGER), "exec")
+    exec(code, {"__name__": run_name, "__file__": str(IMAGER)})
+
+
+# Seconds each warm-up phase took, for the line serve_pool prints to the pool's
+# workers log: a fresh node's ~38s first request is this, and a search's records
+# cannot split it (round 368).
+WARM_SECONDS: dict[str, float] = {}
+
+
+def warm_phase(name: str, started: float) -> float:
+    now = time.monotonic()
+    WARM_SECONDS[name] = now - started
+    return now
+
+
 def warm_imports() -> None:
+    started = time.monotonic()
     os.chdir(R2D2_HOME)
     sys.path.insert(0, str(IMAGER.parent))
     install_lazy_utils()
@@ -1202,7 +1239,8 @@ def warm_imports() -> None:
     # JSON reply stream.
     with redirect_fds(Path(os.devnull), Path(os.devnull)):
         try:
-            runpy.run_path(str(IMAGER), run_name="__warmup__")
+            run_imager("__warmup__")
+            started = warm_phase("imager", started)
             import torch
 
             # On the pinned CPU build this selects a faster MKLDNN convolution
@@ -1220,19 +1258,23 @@ def warm_imports() -> None:
             patch_net_reuse()
             if r2d2_device() == "cuda" and not trt_shared():
                 patch_cuda_network()
+            started = warm_phase("patches", started)
             checkpoint_path = Path(os.environ.get("R2D2_CKPT_PATH", "/checkpoints/R2D2_A1"))
             if checkpoint_path.is_dir():
                 # Load before fork: tensor pages stay shared until a child
                 # writes them, instead of paying torch.load once per rank.
                 load_checkpoints(checkpoint_path)
+                started = warm_phase("checkpoints", started)
                 if r2d2_device() == "cpu" and r2d2_runtime() == "onnx":
                     patch_onnx_network(checkpoint_path)
                 if r2d2_device() == "cuda" and r2d2_runtime() == "trt":
                     patch_trt_network(checkpoint_path)
+                started = warm_phase("networks", started)
             # `create_meas_op` imports this backend lazily; preload it.
             from ri_measurement_operator.pysrc.measOperator import (  # noqa: F401
                 meas_op_nufft_pytorch_finufft,
             )
+            warm_phase("operator", started)
         except Exception:
             traceback.print_exc()
 
@@ -1518,6 +1560,7 @@ def serve_pool(fifo_dir: str) -> None:
     keeper = {base: (os.open(f"{base}.in", os.O_RDONLY | os.O_NONBLOCK), os.open(f"{base}.out", os.O_RDWR))
               for base in bases}
     warm_imports()
+    print("r2d2 pool warm-up seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in WARM_SECONDS.items()), file=sys.stderr, flush=True)
     # Whatever it has not read by now the loads already have. Reaped here, not
     # by the os.wait() below, which forks a replacement for every pid it gets.
     os.kill(prefetcher, signal.SIGKILL)
@@ -1657,7 +1700,7 @@ def answer(fifo_base: str | None) -> None:
             saved_argv = sys.argv
             try:
                 sys.argv = [str(IMAGER), *request["argv"]]
-                runpy.run_path(str(IMAGER), run_name="__main__")
+                run_imager("__main__")
             except SystemExit as exc:
                 returncode = exc.code if isinstance(exc.code, int) else 1
             except Exception:
@@ -1671,6 +1714,30 @@ def answer(fifo_base: str | None) -> None:
 
 # Stub imager exits under real imager's guard, so warm-up imports only.
 _GUARDED_EXIT_IMAGER = "import sys\nif __name__ == '__main__':\n    sys.exit(int(sys.argv[1]))\n"
+
+
+def self_check_run_imager() -> None:
+    import tempfile
+
+    global IMAGER
+    saved_imager, saved_argv = IMAGER, sys.argv
+    with tempfile.TemporaryDirectory() as tmp:
+        IMAGER = Path(tmp) / "imager.py"
+        IMAGER.write_text("import sys\nassert 'seen' not in globals()\nseen = 1\nsys.exit(int(sys.argv[1]))\n")
+        sys.argv = ["imager", "3"]
+        try:
+            for _ in range(2):
+                try:
+                    run_imager("__main__")
+                except SystemExit as exc:
+                    assert exc.code == 3
+                else:
+                    raise AssertionError("the imager's exit did not reach the caller")
+                IMAGER.unlink(missing_ok=True)  # the second run must not read the file
+        finally:
+            _imager_code.pop(IMAGER, None)
+            IMAGER, sys.argv = saved_imager, saved_argv
+    print("run_imager self-check passed")
 
 
 def self_check_serve_reply_stream() -> None:
@@ -2104,6 +2171,7 @@ def self_check_checkpoint_series() -> None:
         with tempfile.TemporaryDirectory() as cache:
             ONNX_DIR, os.environ["R2D2_RUNTIME"] = Path(cache), "onnx"
             try:
+                assert not load_checkpoint_series(6, tmp), "a CPU onnx series loads nothing up front"
                 assert all(torch.equal(load_checkpoint_series(6, tmp)[name]["unet.w"], loaded[name]["unet.w"])
                            for _ in range(2) for name in loaded)
                 written = sorted(p.name for p in checkpoint_weights_dir(tmp).iterdir())
@@ -2397,6 +2465,7 @@ if __name__ == "__main__":
         self_check_checkpoint_cache()
         self_check_checkpoint_series()
         self_check_threaded_session()
+        self_check_run_imager()
         self_check_serve_reply_stream()
         self_check_serve_fifo()
         self_check_serve_pool()

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import ctypes
 import json
 import os
 import subprocess
+import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -37,6 +40,7 @@ from common import (
     encode_finished_records,
     start_record_packer,
     stop_record_packer,
+    POST_RUN_SECONDS,
     post_run_line,
     post_run_phase,
     gathered_window_fit_stats,
@@ -773,6 +777,7 @@ def main() -> None:
             raise
         output = None
     total_wall_seconds = time.monotonic() - run_start
+    returned = time.monotonic()
     finish.close()
     if node_copy:
         import shutil
@@ -781,11 +786,15 @@ def main() -> None:
     if mirror is not None:
         mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
     stop_record_packer(packer)
+    stopped = time.monotonic() - returned
     # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
     all_evaluations = finished_run_records(evaluations_dir)
+    started = time.monotonic()
     window_fit_stats = gathered_window_fit_stats()
+    POST_RUN_SECONDS["stop"] = stopped  # before finished_run_records(), which clears the dict
 
     if all_evaluations is not None:
+        started = post_run_phase("window_fit", started)
         best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
         mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
         summary = {
@@ -826,10 +835,10 @@ def main() -> None:
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
+        started = post_run_phase("profile", started)
         # Rank-based, so it can only run now that every evaluation is scored.
         # Mutates the records the summary embeds, so summary.json never names
         # an image this just deleted.
-        started = time.monotonic()
         prune_run_artefacts(evaluations_dir, all_evaluations)
         started = post_run_phase("prune", started)
         summary_path = output_dir / "summary.json"
@@ -844,6 +853,30 @@ def main() -> None:
         print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")
+
+
+def exit_without_teardown() -> None:
+    """End a finished rank through libc, as an interpreter exit does, less its
+    freeing of every record: mpirun outlived the last MPI_Finalize by 4.4s at
+    356k evaluations, with all 8 nodes held (csd3-speed.md, round 371). libc's
+    exit, not os._exit: libgfortran flushes PolyChord's last output there."""
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    from mpi4py import MPI
+
+    MPI.Finalize()
+    ctypes.CDLL(None).exit(0)
+
+
+def self_check_exit_without_teardown() -> None:
+    code = ("import atexit, polychord_r2d2 as p; atexit.register(print, 'hook'); "
+            "print('printed'); p.exit_without_teardown(); print('after')")
+    env = {key: value for key, value in os.environ.items() if key != "POLYCHORD_R2D2_SELF_CHECK"}
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                          cwd=Path(__file__).parent, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["printed", "hook"], done.stdout
 
 
 if __name__ == "__main__":
@@ -867,6 +900,8 @@ if __name__ == "__main__":
         self_check_worker_pool_connect()
         self_check_follow_worker_node()
         self_check_share_resume()
+        self_check_exit_without_teardown()
         print("metric resolution self-check passed")
     else:
         abort_on_exception(main)
+        exit_without_teardown()
