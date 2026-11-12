@@ -459,6 +459,13 @@ func TestScannedRunRefusesDeletion(t *testing.T) {
 	}
 }
 
+func TestQueuedRunRefusesDeletion(t *testing.T) {
+	queued := Run{Name: "r2d2-vlaa-20260101T000000Z", Status: "queued"}
+	if queued.deletable() == nil {
+		t.Fatal("a queued run agreed to be deleted")
+	}
+}
+
 func TestScanFillsTheTableThenTheListingReplacesIt(t *testing.T) {
 	m := newModel(ri{root: t.TempDir()})
 	scanned := []Run{{Name: "r2d2-vlaa-20260101T000000Z", Preliminary: true,

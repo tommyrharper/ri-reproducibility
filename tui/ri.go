@@ -143,7 +143,7 @@ func (r Run) deletable() error {
 		// to be running" must never be read as "safe to delete".
 		return fmt.Errorf("%s is still loading - wait for the table to fill in", r.Name)
 	}
-	if r.Status == "running" || r.Status == "starting" {
+	if r.Status == "running" || r.Status == "starting" || r.Status == "queued" {
 		return fmt.Errorf("%s is still going - stop it before deleting it", r.Name)
 	}
 	return nil
@@ -151,7 +151,7 @@ func (r Run) deletable() error {
 
 // runArtifacts mirrors RUN_ARTIFACTS in scripts/nested-sampling-runs.py: what
 // makes a directory under results/nested-sampling a run rather than a note.
-var runArtifacts = []string{"run.env", "run.log", "summary.json", "evaluations", "chains"}
+var runArtifacts = []string{"run.env", "run.log", "summary.json", "evaluations", "chains", ".job-settings.env"}
 
 // runStamp matches the UTC timestamp a run's name ends with.
 var runStamp = regexp.MustCompile(`(\d{8}T\d{6}Z)$`)
