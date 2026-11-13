@@ -27,7 +27,9 @@ from casacore.tables import table
 
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
 ANTENNA_TABLE_NAME = "VLAA_ANT"
-TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
+# Beside this file, so a check run from the working tree compiles its forest,
+# not the copy baked into the image.
+TDL_SCRIPT = Path(__file__).resolve().with_name("point_source_forest.py")
 # Shared with prebuild_skeletons(), which enumerates evaluation NTimes.
 DEFAULT_INTEGRATION_SECONDS = 120.0
 # The declination every archived run was simulated at, and the only one the
