@@ -70,6 +70,7 @@ IMAGE_ONLY = {
         "self_check_noise_weighting",
         "self_check_fast_noise",
         "self_check_mat_only",
+        "self_check_multi_source_predict",
         "self_check_observation_prefix",
         "self_check_predict_timeout_recovery",
         "self_check_scratch_root",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a noisy VLA Measurement Set for a single point source."""
+"""Create a noisy VLA Measurement Set for one or more point sources."""
 
 from __future__ import annotations
 
@@ -27,7 +27,9 @@ from casacore.tables import table
 
 Cattery_VLA_A = Path("/usr/share/doc/makems/VLAA_ANT.tar.gz")
 ANTENNA_TABLE_NAME = "VLAA_ANT"
-TDL_SCRIPT = Path("/opt/ri-nested-sampling/point_source_forest.py")
+# Beside this file, so a check run from the working tree compiles its forest,
+# not the copy baked into the image.
+TDL_SCRIPT = Path(__file__).resolve().with_name("point_source_forest.py")
 # Shared with prebuild_skeletons(), which enumerates evaluation NTimes.
 DEFAULT_INTEGRATION_SECONDS = 120.0
 # The declination every archived run was simulated at, and the only one the
@@ -68,6 +70,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-flux-jy", type=float, default=1.0)
     parser.add_argument("--source-l-arcsec", type=float, default=0.0)
     parser.add_argument("--source-m-arcsec", type=float, default=0.0)
+    parser.add_argument(
+        "--extra-source-arcsec", nargs=2, type=float, action="append", default=[], metavar=("L", "M"),
+        help="Another --source-flux-jy source at this (l, m); repeatable",
+    )
     parser.add_argument("--declination-deg", type=float, default=DEFAULT_DECLINATION_DEG)
     parser.add_argument("--dynamic-range", type=float, required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -792,6 +798,7 @@ def run_meqtrees_predict(
     l_rad: float,
     m_rad: float,
     wait_seconds: float | None = None,
+    extra_lm_rad: list[tuple[float, float]] | tuple = (),
 ) -> None:
     # None, not the module constant as a default argument: the constant is a
     # global the self-checks replace, and a default argument would freeze the
@@ -807,6 +814,9 @@ def run_meqtrees_predict(
                 f"source_flux_jy = {source_flux_jy!r}",
                 f"source_l_rad = {l_rad!r}",
                 f"source_m_rad = {m_rad!r}",
+                # Always written, as "none" when empty: TDLOptions.config.read()
+                # merges, so a missing key keeps the previous compile's sources.
+                "extra_sources_lm_rad = " + (";".join(f"{l!r} {m!r}" for l, m in extra_lm_rad) or "none"),
                 "",
             ]
         )
@@ -906,13 +916,22 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
 
 def point_source_visibilities(
     uvw: np.ndarray, freqs_hz: np.ndarray, source_flux_jy: float, l_rad: float, m_rad: float, n_corr: int,
-    rng: np.random.Generator | None = None, sigma: float = 0.0
+    rng: np.random.Generator | None = None, sigma: float = 0.0,
+    extra_lm_rad: list[tuple[float, float]] | tuple = (),
 ) -> np.ndarray:
     """Stokes-I point source at (l, m): what the Meow forest predicts, to float32
     rounding, at ~1/30 of its cost. self_check_analytic_predict() is the guard.
+    extra_lm_rad adds more sources of the same flux (self_check_multi_source_predict()).
     sigma > 0 adds add_complex_noise(rng, ..., sigma, xxyy=True)'s noise."""
-    n_minus_1 = math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0
-    delay_m = uvw @ np.array([l_rad, m_rad, n_minus_1])
+    delay_m = _source_delay_m(uvw, l_rad, m_rad)
+    if extra_lm_rad:
+        # Summed before the noise, which is then the same draw a lone source gets.
+        data = _phase_ramp(delay_m, freqs_hz, source_flux_jy, n_corr, _fastramp())
+        for l_extra, m_extra in extra_lm_rad:
+            data += _phase_ramp(_source_delay_m(uvw, l_extra, m_extra), freqs_hz, source_flux_jy, n_corr, _fastramp())
+        if sigma:
+            add_complex_noise(rng, data, sigma, xxyy=True)
+        return data
     if sigma and n_corr == len(XXYY) and _plain_pcg(rng):
         fused = _fastramp_xxyy2()
         if fused is not None:
@@ -921,6 +940,15 @@ def point_source_visibilities(
     if sigma:
         add_complex_noise(rng, data, sigma, xxyy=True)
     return data
+
+
+def _source_delay_m(uvw: np.ndarray, l_rad: float, m_rad: float) -> np.ndarray:
+    n_minus_1 = math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0
+    return uvw @ np.array([l_rad, m_rad, n_minus_1])
+
+
+def extra_lm_rad_of(args: argparse.Namespace) -> list[tuple[float, float]]:
+    return [(math.radians(l / 3600.0), math.radians(m / 3600.0)) for l, m in args.extra_source_arcsec]
 
 
 def _plain_pcg(rng: np.random.Generator) -> bool:
@@ -1201,8 +1229,8 @@ def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse
     noise_sigma_jy = noise_sigma_of(args)
     l_rad = math.radians(args.source_l_arcsec / 3600.0)
     m_rad = math.radians(args.source_m_arcsec / 3600.0)
-    # ponytail: this simulator supports one unpolarized point source; full Stokes
-    # models and multi-source dynamic-range stress cases are a follow-up ceiling.
+    # ponytail: unpolarized equal-flux point sources only; full Stokes models
+    # and per-source fluxes are a follow-up ceiling.
     # The MeqTrees predict this replaced was half the stage on CSD3 (0.79s of
     # 1.51s in the 9-parameter space); docs/csd3-speed.md.
     rng = np.random.default_rng(args.seed)
@@ -1211,7 +1239,7 @@ def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse
     if n_chan != len(freqs_hz):
         raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
     data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr,
-                                     rng, noise_sigma_jy / math.sqrt(2.0))
+                                     rng, noise_sigma_jy / math.sqrt(2.0), extra_lm_rad_of(args))
 
     ms.putcol("DATA", data)
     for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
@@ -1284,6 +1312,7 @@ def simulation_metadata(args: argparse.Namespace, output_ms: Path | None, uvw: n
             "flux_jy": args.source_flux_jy,
             "l_arcsec": args.source_l_arcsec,
             "m_arcsec": args.source_m_arcsec,
+            "extra_lm_arcsec": args.extra_source_arcsec,
         },
         "observation": {
             "max_proj_baseline_lambda": max_proj_baseline_lambda,
@@ -1337,7 +1366,8 @@ def write_mat_only(args: argparse.Namespace, output_ms: Path) -> dict[str, objec
     freqs_hz = channel_frequencies(args)
 
     vis = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, math.radians(args.source_l_arcsec / 3600.0),
-                                    math.radians(args.source_m_arcsec / 3600.0), 1)[:, :, 0]
+                                    math.radians(args.source_m_arcsec / 3600.0), 1,
+                                    extra_lm_rad=extra_lm_rad_of(args))[:, :, 0]
     if noise_sigma_jy:
         # The whole column's stream is drawn, as the fill does, so correlation 0
         # gets the same numbers; only its slice is added.
@@ -1696,6 +1726,40 @@ def self_check_analytic_predict() -> None:
             assert error < 2.5e-7, f"analytic predict differs from MeqTrees by {error:.3g} in case {index}"
     _FOREST.clear()
     print(f"analytic predict self-check passed (worst |MeqTrees - analytic| / flux = {worst:.3g})")
+
+
+def self_check_multi_source_predict() -> None:
+    """Extra sources must add to the prediction, each where it was placed, in
+    the Meow forest and in point_source_visibilities() alike."""
+    a, b, c = (1e-5, 2e-5), (-3e-5, 1e-5), (2e-5, -4e-5)
+
+    def predict(scratch: Path, name: str, first: tuple[float, float], extras: list) -> tuple[np.ndarray, np.ndarray]:
+        ms = scratch / name / "sim.ms"
+        built = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", "4.0",
+            "--channel-count", "2", "--start-frequency-hz", "1.0e9",
+            "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
+        ])
+        make_ms_skeleton(write_makems_config(built, ms), ms, built)
+        corr_sel, n_corr = determine_corr_selection(ms)
+        run_meqtrees_predict(ms, corr_sel, 1.0, *first, wait_seconds=300.0, extra_lm_rad=extras)
+        with table(str(ms), readonly=True, ack=False) as opened:
+            predicted = np.asarray(opened.getcol("DATA"), dtype=np.complex128)
+            uvw = opened.getcol("UVW")
+        with table(str(ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
+            freqs_hz = spw.getcol("CHAN_FREQ")[0]
+        analytic = point_source_visibilities(uvw, freqs_hz, 1.0, *first, n_corr, extra_lm_rad=extras)
+        return predicted, analytic.astype(np.complex128)
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        together, analytic = predict(Path(scratch), "abc", a, [b, c])
+        apart = sum(predict(Path(scratch), f"one-{i}", lm, [])[0] for i, lm in enumerate((a, b, c)))
+        # The extras-less compile after an extras one is the stale-config case.
+        assert np.allclose(together, apart, atol=1e-5), np.abs(together - apart).max()
+        # Three float32 roundings, one a source.
+        assert np.abs(together - analytic).max() < 1e-6, np.abs(together - analytic).max()
+    _FOREST.clear()
+    print("multi-source predict self-check passed")
 
 
 def self_check_noise_weighting() -> None:
@@ -2063,6 +2127,7 @@ if __name__ == "__main__":
             self_check_declination_config()
             self_check_forest_reuse()
             self_check_analytic_predict()
+            self_check_multi_source_predict()
             self_check_noise_weighting()
             self_check_fast_noise()
             self_check_mat_only()
