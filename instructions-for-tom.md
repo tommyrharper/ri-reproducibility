@@ -147,3 +147,26 @@ Then for wsclean:
 ./ri search wsclean --account WBARKER-SL3-CPU --nodes 4 --nlive 500 \
  --num-repeats 25 --max-ndead -1 --seed 1001 --time 02:00:00
  ```
+
+Then generate the plots:
+```bash
+srun -A WBARKER-SL3-CPU -p icelake --qos=intr -c 4 -t 00:30:00 ./ri report --run results/nested-sampling/r2d2-vlaa-<ID>
+srun -A WBARKER-SL3-CPU -p icelake --qos=intr -c 4 -t 00:30:00 ./ri report --run results/nested-sampling/wsclean-vlaa-<ID>
+```
+
+Then to merge the results:
+ ```bash
+ srun -A WBARKER-SL3-CPU -p icelake --qos=intr -c 4 -t 00:30:00 bash -c './ri plot likelihood --last && ./ri report'
+ ./ri report
+ ```
+
+ Then to serve them:
+ ```
+ ./ri serve
+ ```
+ Now run the `ssh -NC -L 8000:127.0.0.1:8000 th773@128.232.224.16` style command returned, and open `http://localhost:8000/`.
+
+Faster way in the future is along the lines of:
+```
+./ri search wsclean --then r2d2 --plot --report
+```
