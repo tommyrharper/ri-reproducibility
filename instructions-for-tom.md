@@ -135,3 +135,15 @@ Then it spits out:
 NS_MAX_NDEAD=-1 NS_NLIVE=500 NS_NODES=4 NS_NUM_REPEATS=25 NS_SEED=1001 SBATCH_ACCOUNT=WBARKER-SL3-CPU SBATCH_TIMELIMIT=02:00:00 scripts/run-nested-sampling-r2d2.sh
 ```
 And you just run that.
+
+Then for wsclean:
+```
+./ri --dry-run search wsclean --account WBARKER-SL3-CPU --nodes 4 --nlive 500 \
+ --num-repeats 25 --max-ndead -1 --seed 1001 --time 02:00:00
+ ```
+
+ And then:
+ ```
+./ri search wsclean --account WBARKER-SL3-CPU --nodes 4 --nlive 500 \
+ --num-repeats 25 --max-ndead -1 --seed 1001 --time 02:00:00
+ ```
