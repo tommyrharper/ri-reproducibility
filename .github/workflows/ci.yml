@@ -51,18 +51,11 @@ jobs:
           go -C tui vet ./...
           go -C tui test ./...
 
-  # These execute code, and the code branches on the platform - rank-budget.sh
-  # reads /proc/meminfo on Linux and vm_stat on macOS, and defaults.sh picks an
-  # image architecture from `uname -m`. Both hosts run real searches, so both
-  # get checked. Everything here is seconds of work and needs no Docker, which
-  # is what keeps a second runner cheap.
+  # Code that executes, but needs no Docker. Linux only: this branch runs on
+  # CSD3, and main keeps the macOS job.
   checks:
-    name: Checks (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Checks
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
