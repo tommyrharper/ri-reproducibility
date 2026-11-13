@@ -1,12 +1,34 @@
 # shellcheck shell=bash  # sourced, so no shebang
 # Clamp rank count to memory; reservations prevent concurrent overcommit.
-# Source this, then call `ns_budget_ranks <requested> <MB per rank> <label>`.
+# Source this, then call `ns_budget_ranks <requested> <memory> <label>`, where
+# <memory> is MB per rank, or `SHARED+PER` for a run whose ranks share SHARED MB.
 # NS_RANK_BUDGET_DIR and NS_AVAILABLE_MB override state for checks.
 # ponytail: a fixed MB-per-rank measured on one host, not a live measurement.
 # Re-measure after a material change to the imaging stack's resident set.
 
-# Rounded-up warm-worker RSS estimates from this repo's images.
-NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-3500}"
+# Rounded-up warm-worker RSS estimates from this repo's images. R2D2's pool
+# parent loads the checkpoints once and forks every rank's worker from it, so
+# the run pays them once (SHARED) and each rank only its own working set
+# (docs/csd3-speed.md, round 18). On a balanced multi-socket job it loads one
+# copy per NUMA node (R2D2_WEIGHTS_PER_NODE): 6.8GB peak on two, still inside
+# SHARED (round 106). Under onnx each node also gets its own ~3.5GB of session
+# weights (round 149), ~14GB on two: past SHARED, but that only happens on
+# balanced multi-socket jobs, whose memory (e.g. 256GB for 76 ranks) never
+# clamps the rank count.
+NS_R2D2_SHARED_MB="${NS_R2D2_SHARED_MB:-8000}"
+NS_R2D2_MB_PER_RANK="${NS_R2D2_MB_PER_RANK:-600}"
+# R2D2_RUNTIME=onnx: each worker's ONNX Runtime buffers add ~0.4GB of heap,
+# 0.83GB a rank against torch's 0.34 at 38 ranks (round 143).
+NS_R2D2_ONNX_MB_PER_RANK="${NS_R2D2_ONNX_MB_PER_RANK:-1000}"
+# `SHARED+PER` for R2D2 under the R2D2_RUNTIME in force when it is called.
+ns_r2d2_mb() {
+  case "${R2D2_RUNTIME:-torch}" in
+    onnx) printf '%s\n' "${NS_R2D2_SHARED_MB}+${NS_R2D2_ONNX_MB_PER_RANK}" ;;
+    *) printf '%s\n' "${NS_R2D2_SHARED_MB}+${NS_R2D2_MB_PER_RANK}" ;;
+  esac
+}
+# shellcheck disable=SC2034  # read by the scripts that source this
+NS_R2D2_MB="$(ns_r2d2_mb)"
 NS_WSCLEAN_MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK:-200}"
 
 # Left free for the OS, the page cache and the non-worker parts of a run.
@@ -16,6 +38,13 @@ NS_RANK_BUDGET_HEADROOM_MB="${NS_RANK_BUDGET_HEADROOM_MB:-4096}"
 # short enough that a later run is sized from MemAvailable instead.
 NS_RANK_BUDGET_RESERVE_SECONDS="${NS_RANK_BUDGET_RESERVE_SECONDS:-60}"
 
+# MB that <ranks> ranks of <memory> (`PER` or `SHARED+PER`) need.
+ns_mb_for_ranks() {
+  local ranks="$1" memory="$2" shared=0
+  case "${memory}" in *+*) shared="${memory%%+*}" memory="${memory#*+}" ;; esac
+  printf '%s\n' "$((shared + ranks * memory))"
+}
+
 _ns_available_mb() {
   if [ -n "${NS_AVAILABLE_MB:-}" ]; then
     printf '%s\n' "${NS_AVAILABLE_MB}"
@@ -23,8 +52,8 @@ _ns_available_mb() {
   fi
   # Inside a Slurm job the cgroup limit is what the OOM killer enforces, and
   # MemAvailable on a shared node says nothing about it. Slurm spells the limit
-  # per node (--mem) or per core (the partition default); `--mem 0` is the
-  # whole node, which MemAvailable below then describes truthfully.
+  # per node (--mem) or per core (the partition default, and what a whole-node
+  # --exclusive job gets); `--mem 0`, the whole node, falls through to MemAvailable.
   if [ -n "${SLURM_MEM_PER_NODE:-}" ] && [ "${SLURM_MEM_PER_NODE}" != 0 ]; then
     printf '%s\n' "${SLURM_MEM_PER_NODE}"
     return 0
@@ -80,6 +109,17 @@ ns_run_process_pattern() {
   printf 'polychord_[a-z0-9_]*\.py .*--output-dir %s( |$)' "$1"
 }
 
+# Kill `$1`'s processes on this node, except srun. A multi-node search's ranks
+# are one srun step started with --kill-on-bad-exit: left alive, srun sees its
+# rank die and ends the step on every node within seconds, but an srun killed
+# with its ranks never does, and the other nodes' ranks outlive it (round 322).
+ns_kill_run_ranks() {
+  local pid
+  for pid in $(pgrep -f "$(ns_run_process_pattern "$1")"); do
+    [ "$(ps -o comm= -p "${pid}" 2>/dev/null)" = srun ] || kill -9 "${pid}" 2>/dev/null || true
+  done
+}
+
 # On a cluster the ranks are on a compute node whose processes the login node
 # cannot see, so a run is also live while a Slurm job named after it (slurm.sh)
 # is queued or running - other than the job asking, which is the run itself.
@@ -132,18 +172,28 @@ _ns_dead_pools() {
   done
 }
 
+# One row from a pool process's pgid and command line, or none if the command
+# line is no longer a pool shell's. pgrep matches a worker's subshell before it
+# execs `wsclean-zygote` or `python3 ...`; read after the exec, the last word
+# was taken for the run directory - one with no ranks and no `.launcher.pid` -
+# and the live pool was killed (round 154: a raced search lost its pool while
+# the other's 56 workers were starting).
+_ns_pool_row() {
+  local pgid="$1" args="$2" fifo_dir launcher
+  fifo_dir="${args##* }"
+  [[ "${fifo_dir}" =~ /\.[a-z0-9]*-workers$ ]] || return 0
+  launcher="$(cat "${fifo_dir%/*}/.launcher.pid" 2>/dev/null || true)"
+  printf '%s\t%s\t%s\n' "${pgid}" "${launcher}" "${fifo_dir%/*}"
+}
+
 # Every pool on the host: the pool's shell names its FIFO directory, which is
 # `<run dir>/.<worker>-workers`, as its last argument, and start-sidecars.sh
 # leaves the launcher's pid in `<run dir>/.launcher.pid`.
 _ns_pool_table() {
-  local pid pgid args fifo_dir launcher
+  local pid pgid args
   for pid in $(pgrep -f -- '/\.[a-z0-9]*-workers$' 2>/dev/null); do
-    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-    args="$(ps -ww -o args= -p "${pid}" 2>/dev/null)"
-    { [ -n "${pgid}" ] && [ -n "${args}" ]; } || continue
-    fifo_dir="${args##* }"
-    launcher="$(cat "${fifo_dir%/*}/.launcher.pid" 2>/dev/null || true)"
-    printf '%s\t%s\t%s\n' "${pgid}" "${launcher}" "${fifo_dir%/*}"
+    read -r pgid args < <(ps -ww -o pgid=,args= -p "${pid}" 2>/dev/null) || continue
+    _ns_pool_row "${pgid}" "${args}"
   done | sort -u
 }
 
@@ -162,7 +212,7 @@ ns_reap_leaked_sidecars() {
 
 # Echoes the rank count to use. Never more than requested, never less than 1.
 ns_budget_ranks() {
-  local requested="$1" mb_per_rank="$2" label="$3"
+  local requested="$1" memory="$2" label="$3" shared mb_per_rank
   local dir="${NS_RANK_BUDGET_DIR:-${TMPDIR:-/tmp}/ri-ns-rank-budget-$(id -u)}"
   local available reserved=0 budget affordable now entry pid expiry mb
 
@@ -206,7 +256,9 @@ ns_budget_ranks() {
     reserved=$((reserved + mb))
   done
 
-  budget=$((available - reserved - NS_RANK_BUDGET_HEADROOM_MB))
+  shared="$(ns_mb_for_ranks 0 "${memory}")"
+  mb_per_rank="$(($(ns_mb_for_ranks 1 "${memory}") - shared))"
+  budget=$((available - reserved - NS_RANK_BUDGET_HEADROOM_MB - shared))
   affordable=$((budget / mb_per_rank))
 
   if [ "${affordable}" -lt "${requested}" ]; then
@@ -215,7 +267,8 @@ ns_budget_ranks() {
       # sampling the OOM killer instead of the algorithm.
       echo "FATAL: not enough free memory for a single ${label} rank:" \
         "${available}MB available, ${reserved}MB reserved by other runs," \
-        "${NS_RANK_BUDGET_HEADROOM_MB}MB headroom, ${mb_per_rank}MB needed per rank." \
+        "${NS_RANK_BUDGET_HEADROOM_MB}MB headroom, ${shared}MB shared and" \
+        "${mb_per_rank}MB per rank needed." \
         "Sidecars left by a dead run were already removed, so this is memory" \
         "something live is holding: wait for the other runs to finish," \
         "or see ./ri health." >&2
@@ -226,12 +279,12 @@ ns_budget_ranks() {
     # be its own surprise, and this is the line that explains a slow run.
     echo "NOTE: ${label} ranks ${requested} -> ${affordable}" \
       "(${available}MB available, ${reserved}MB reserved by other runs," \
-      "${mb_per_rank}MB per rank)" >&2
+      "${shared}MB shared + ${mb_per_rank}MB per rank)" >&2
     requested="${affordable}"
   fi
 
   printf '%s %s\n' "$((now + NS_RANK_BUDGET_RESERVE_SECONDS))" \
-    "$((requested * mb_per_rank))" >"${dir}/$$"
+    "$(ns_mb_for_ranks "${requested}" "${memory}")" >"${dir}/$$"
   _ns_unlock "${dir}"
 
   printf '%s\n' "${requested}"
@@ -240,14 +293,15 @@ ns_budget_ranks() {
 # Warn, but obey: an explicit NS_MPI_PROCS is the caller saying they know
 # better than the guard, and that is theirs to decide.
 ns_budget_warn_if_over() {
-  local requested="$1" mb_per_rank="$2" label="$3"
-  local available
+  local requested="$1" memory="$2" label="$3"
+  local available needed
   ns_reap_leaked_sidecars
   _ns_available_mb >/dev/null 2>&1 || return 0
   available="$(_ns_available_mb)"
-  if [ "$((requested * mb_per_rank))" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
+  needed="$(ns_mb_for_ranks "${requested}" "${memory}")"
+  if [ "${needed}" -gt "$((available - NS_RANK_BUDGET_HEADROOM_MB))" ]; then
     echo "WARNING: ${label} was asked for ${requested} ranks," \
-      "~$((requested * mb_per_rank))MB, with only ${available}MB available." \
+      "~${needed}MB, with only ${available}MB available." \
       "An evaluation the OOM killer takes is never scored, so this costs the" \
       "run rather than the result: the attempt is retried against a fresh" \
       "worker and then the run stops, to be picked up with ./ri resume" \
@@ -278,6 +332,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   clear_reservations() { rm -f "${NS_RANK_BUDGET_DIR}"/[0-9]*; }
 
   ns_reap_leaked_sidecars() { :; }
+
+  [ "$(R2D2_RUNTIME=onnx ns_r2d2_mb)" = "${NS_R2D2_SHARED_MB}+${NS_R2D2_ONNX_MB_PER_RANK}" ]
+  [ "$(R2D2_RUNTIME=torch ns_r2d2_mb)" = "${NS_R2D2_SHARED_MB}+${NS_R2D2_MB_PER_RANK}" ]
 
   [ "$(ns_budget_ranks 8 3400 r2d2)" = 8 ]
   [ "$(awk '{print $2}' "${NS_RANK_BUDGET_DIR}/$$")" = 27200 ]
@@ -310,6 +367,16 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   [ "$(printf '4242\t\t\n' | _ns_dead_pools)" = 4242 ]
   [ -z "$(printf 'notapgid\t999999\t\nsomething-else\n' | _ns_dead_pools)" ]
   [ -z "$(printf '' | _ns_dead_pools)" ]
+  [ "$(_ns_pool_row 4242 'sh -c loop sh /r/run-1/.wsclean-workers')" = "$(printf '4242\t\t/r/run-1')" ]
+  [ -z "$(_ns_pool_row 4242 'wsclean-zygote')" ] \
+    || { echo "FAIL: a worker that has just exec'd was read as a pool"; exit 1; }
+  [ -z "$(_ns_pool_row 4242 'python3 /opt/s.py --serve --fifo /r/run-1/.simulate-workers/3')" ] \
+    || { echo "FAIL: a worker's FIFO path was read as a pool"; exit 1; }
+  # A multi-node pool serves `.<pool>-workers/<host>`, and its run's
+  # .launcher.pid is a pid on the first node, so on any other node it would
+  # read as dead and the live pool would be reaped (round 289).
+  [ -z "$(_ns_pool_row 4242 'sh -c loop sh /r/run-1/.r2d2-workers/cpu-q-126')" ] \
+    || { echo "FAIL: a multi-node pool was read as a reapable pool"; exit 1; }
 
   # The orphaned run: launcher pid gone, run directory that still has ranks.
   # Reaping these is what would kill the search - so a live run wins over the
@@ -349,7 +416,35 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     && { echo "FAIL: another run's job must not make this one live"; exit 1; }
   PATH="${_orphan_dir}/bin:${PATH}" SLURM_JOB_ID=4242 ns_run_is_live "${_orphan_run}" \
     && { echo "FAIL: the run's own job must not count as a rival"; exit 1; }
+
+  # The kill takes the run's ranks and spares its srun, which has to live to
+  # end the step on the other nodes.
+  # Not sleep: uutils' multi-call sleep refuses to run as `srun`.
+  ln -s "$(command -v bash)" "${_orphan_dir}/bin/srun"
+  bash -c 'exec -a "polychord_r2d2.py --output-dir $1" sleep 60' sh "${_orphan_run}" &
+  _rank_pid=$!
+  bash -c 'exec -a "srun -n 2 polychord_r2d2.py --output-dir $1" "$2" -c "exec 2>/dev/null; sleep 60; :"' sh "${_orphan_run}" "${_orphan_dir}/bin/srun" &
+  _srun_pid=$!
+  sleep 0.5
+  ns_kill_run_ranks "${_orphan_run}"
+  wait "${_rank_pid}" 2>/dev/null || true
+  kill -0 "${_rank_pid}" 2>/dev/null && { echo "FAIL: ns_kill_run_ranks left a rank"; kill "${_rank_pid}" "${_srun_pid}"; exit 1; }
+  kill -0 "${_srun_pid}" 2>/dev/null || { echo "FAIL: ns_kill_run_ranks killed srun"; exit 1; }
+  pkill -P "${_srun_pid}"; wait "${_srun_pid}" 2>/dev/null || true
   rm -rf "${_orphan_dir}"
+
+  # Shared memory is paid once: 40960 - 4096 headroom - 8000 shared = 28864,
+  # 72 ranks of 400, where 3400 a rank would allow 10.
+  [ "$(ns_mb_for_ranks 3 8000+400)" = 9200 ]
+  [ "$(ns_mb_for_ranks 3 400)" = 1200 ]
+  [ "$(ns_budget_ranks 100 8000+400 r2d2 2>/dev/null)" = 72 ]
+  [ "$(awk '{print $2}' "${NS_RANK_BUDGET_DIR}/$$")" = 36800 ]
+  clear_reservations
+  NS_AVAILABLE_MB=12000 ns_budget_ranks 1 8000+400 r2d2 >/dev/null 2>&1 && {
+    echo "FAIL: one rank granted when the shared 8000MB does not fit"; exit 1
+  }
+  clear_reservations
+  [ -n "$(ns_budget_warn_if_over 2 40000+1 r2d2 2>&1)" ]
 
   ns_budget_warn_if_over 8 3400 r2d2 2>/dev/null
   [ -n "$(ns_budget_warn_if_over 20 3400 r2d2 2>&1)" ]

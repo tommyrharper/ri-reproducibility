@@ -83,7 +83,17 @@ run_with_retries() {
     status=0
     started="$(date +%s)"
     run_with_progress "${args[@]}" || status=$?
-    [ "${status}" -eq 0 ] && return 0
+    if [ "${status}" -eq 0 ]; then
+      # PolyChord's nfail guard ends the search with exit 0 and a normal-looking
+      # log(Z); only this line says it never converged (round 337).
+      if _ns_attempt_output "${output_dir}" "${log_before}" | grep -q 'unable to proceed after'; then
+        _ns_retry_say "${output_dir}" \
+          "WARNING: PolyChord stopped early (\"unable to proceed after N: failed spawn" \
+          "events\"), so this search did not converge and its log(Z) is not a result." \
+          "See docs/robustness.md."
+      fi
+      return 0
+    fi
     after="$(_ns_completed_evals "${output_dir}")"
     # Let the attempt that earned the reset use it.
     if [ "$(($(date +%s) - started))" -ge "${reset_after}" ]; then
@@ -149,8 +159,14 @@ run_with_retries() {
     if declare -F sidecar_reset_workers >/dev/null; then
       sidecar_reset_workers 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
     fi
+    # Not piped: a pipeline runs it in a subshell, and the pid of the pool it
+    # starts must reach this shell's SIDECAR_PIDS, or the exit trap leaves
+    # that pool running and the next retry starts a second one beside it. Nor
+    # a process substitution, whose pipe the new pool would hold open.
     if declare -F sidecar_restore >/dev/null; then
-      sidecar_restore 2>&1 | tee -a "${output_dir}/run.log" >&2 || true
+      sidecar_restore 2>"${output_dir}/.restore.log" || true
+      tee -a "${output_dir}/run.log" <"${output_dir}/.restore.log" >&2 || true
+      rm -f "${output_dir}/.restore.log"
     fi
     attempt=$((attempt + 1))
     printf '%s exit %s after %s evaluations\n' \
@@ -170,7 +186,7 @@ _ns_retry_rank_count() {
   for arg in "$@"; do
     case "${prev}" in -np) current="${arg}" ;; esac
     case "${arg}" in
-      *polychord_r2d2.py) mb="${NS_R2D2_MB_PER_RANK}" label=r2d2 ;;
+      *polychord_r2d2.py) mb="${NS_R2D2_MB}" label=r2d2 ;;
       *polychord_wsclean.py) mb="${NS_WSCLEAN_MB_PER_RANK}" label=wsclean ;;
     esac
     prev="${arg}"
@@ -194,13 +210,29 @@ _ns_retry_say() {
   echo "run_with_retries: $*" | tee -a "${output_dir}/run.log" >&2
 }
 
-# Evaluations this run has finished, across every attempt. metrics.json
-# rather than the directory holding it, because a directory without one is an
-# evaluation that was in flight when the run died and the next attempt deletes
-# those before it starts - so this counts work that survived, and cannot be
-# inflated by the handful of directories a crash leaves half-written.
+# Evaluations this run has finished, across every attempt. Records
+# (eval-*.json, or eval-*/metrics.json from before round 92) rather than
+# directories, because a directory without one is an evaluation that was in
+# flight when the run died and the next attempt deletes those before it starts
+# - so this counts work that survived, and cannot be inflated by the handful
+# of directories a crash leaves half-written.
+# Records packed into evaluations/records.jsonl (round 93) count too, by name,
+# since a packed record may also still be a file, or be packed twice.
 _ns_completed_evals() {
-  find "$1/evaluations" -maxdepth 2 -name metrics.json 2>/dev/null | wc -l | tr -d ' '
+  { find "$1/evaluations" -maxdepth 2 \( -name metrics.json -o -name 'eval-*.json' \) 2>/dev/null |
+      sed 's#/metrics\.json$##; s#\.json$##; s#.*/##'
+    _ns_packed_names "$1/evaluations"
+  } | sort -u | wc -l | tr -d ' '
+}
+
+# The names in a run's record packs, one a line: `name<TAB>record` lines, in
+# records.jsonl and a multi-node run's records.<host>.jsonl (round 290).
+_ns_packed_names() {
+  local pack
+  for pack in "$1"/records.jsonl "$1"/records.*.jsonl; do
+    [ -f "${pack}" ] && cut -f1 "${pack}"
+  done
+  return 0
 }
 
 # Return run.log size so retry output can be isolated from earlier attempts.
@@ -245,7 +277,11 @@ _ns_stall_watchdog() {
   local last quiet=0 now poll scanned
   poll="${floor}"
   last="$(_ns_completed_evals "${output_dir}")"
-  while sleep "${poll}"; do
+  # The sleep outlives a watchdog killed mid-poll, so it must hold none of the
+  # run's output: `./ri search | tee` waited up to a poll (60s) for it after
+  # the search had finished (round 196). Stdin included, so SC2217 is wrong here.
+  # shellcheck disable=SC2217
+  while sleep "${poll}" </dev/null >/dev/null 2>&1; do
     scanned="$(_ns_now_us)"
     now="$(_ns_completed_evals "${output_dir}")"
     if [ "${now}" != "${last}" ]; then
@@ -258,7 +294,7 @@ _ns_stall_watchdog() {
           "no evaluation has finished in ${quiet}s (${now} scored, still counting)." \
           "A run that is alive but landing nothing is hung, not slow - killing it" \
           "so it can restart from PolyChord's checkpoint."
-        pkill -9 -f "$(ns_run_process_pattern "${output_dir}")" || true
+        ns_kill_run_ranks "${output_dir}"
         return 0
       fi
     fi
@@ -396,23 +432,30 @@ _ns_count_evals() {
   # GNU find can classify both counts during one directory walk. Keep the
   # portable two-pass fallback for macOS and other BSD find implementations.
   if find "${dir}" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    # One evaluation can be two entries: its record, eval-*.json, and the
+    # dir beside it holding what it keeps (round 92). Counted once, by name.
     if [ -n "${reference}" ] && [ -e "${reference}" ]; then
       read -r total since < <(
-        find "${dir}" -maxdepth 1 -name 'eval-*' \
-          \( -newer "${reference}" -printf 's\n' -o -printf 't\n' \) 2>/dev/null |
-          awk '{ total++; since += ($1 == "s") } END { print total + 0, since + 0 }'
+        find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' \
+          \( -newer "${reference}" -printf 's %f\n' -o -printf 't %f\n' \) 2>/dev/null |
+          { cat; _ns_packed_names "${dir}" | sed 's/^/t /'; } |
+          awk '{ n = $2; sub(/\.json$/, "", n)
+                 if (!(n in seen)) { seen[n]; total++ }
+                 if ($1 == "s" && !(n in new)) { new[n]; since++ } }
+               END { print total + 0, since + 0 }'
       )
     else
-      total="$(find "${dir}" -maxdepth 1 -name 'eval-*' -printf 'x\n' 2>/dev/null |
-        wc -l | tr -d ' ')"
+      total="$({ find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -printf '%f\n' \
+        2>/dev/null; _ns_packed_names "${dir}"; } | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
     fi
     echo "${total:-0} ${since:-0}"
     return
   fi
-  total="$(find "${dir}" -maxdepth 1 -name 'eval-*' 2>/dev/null | wc -l | tr -d ' ')"
+  total="$({ find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' 2>/dev/null |
+    sed 's#.*/##'; _ns_packed_names "${dir}"; } | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
   if [ -n "${reference}" ] && [ -e "${reference}" ]; then
-    since="$(find "${dir}" -maxdepth 1 -name 'eval-*' -newer "${reference}" 2>/dev/null |
-      wc -l | tr -d ' ')"
+    since="$(find "${dir}" -maxdepth 1 -name 'eval-*' ! -name '*.partial' -newer "${reference}" \
+      2>/dev/null | sed 's/\.json$//' | sort -u | wc -l | tr -d ' ')"
   fi
   echo "${total} ${since}"
 }
@@ -691,8 +734,13 @@ self_check() {
   }
   [ "$(_ns_count_lines "${tmp}/chains/wsclean_vlaa_dead-birth.txt")" = "3" ] || { echo "FAIL: dead-birth line count"; exit 1; }
 
+  # Both layouts (round 92): eval-0003-c is a record with the dir it keeps
+  # beside it, eval-0004-d a record alone, and a .partial is not a record.
   mkdir "${tmp}/evaluations/eval-0001-a" "${tmp}/evaluations/eval-0002-b" \
-    "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+    "${tmp}/evaluations/eval-0003-c"
+  echo '{}' >"${tmp}/evaluations/eval-0003-c.json"
+  echo '{}' >"${tmp}/evaluations/eval-0004-d.json"
+  echo '{' >"${tmp}/evaluations/eval-0005-e.json.partial"
   local dead_file="${tmp}/chains/wsclean_vlaa_dead-birth.txt"
   [ "$(_ns_count_evals "${tmp}/evaluations")" = "4 0" ] || {
     echo "FAIL: evaluations count: $(_ns_count_evals "${tmp}/evaluations")"; exit 1
@@ -700,7 +748,8 @@ self_check() {
   # -t rather than -d: the timestamp form is POSIX and BSD touch has no -d.
   touch -t 202601010000 "${tmp}/evaluations"/eval-*
   touch -t 202601010100 "${dead_file}"
-  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0003-c.json" \
+    "${tmp}/evaluations/eval-0004-d.json"
   [ "$(_ns_count_evals "${tmp}/evaluations" "${dead_file}")" = "4 2" ] || {
     echo "FAIL: split either side of the checkpoint: $(_ns_count_evals "${tmp}/evaluations" "${dead_file}")"
     exit 1
@@ -708,6 +757,21 @@ self_check() {
   [ "$(_ns_count_evals "${tmp}/evaluations" "${tmp}/chains/absent")" = "4 0" ] || {
     echo "FAIL: missing reference must not split"; exit 1
   }
+  # Packed records (round 93) count once by name, before the checkpoint: one
+  # still a file too (eval-0004-d), one packed only (eval-0006-f).
+  # And a multi-node run's node pack (round 290) as one with them.
+  printf 'eval-0004-d\t{}\n' >"${tmp}/evaluations/records.jsonl"
+  printf 'eval-0006-f\t{}\n' >"${tmp}/evaluations/records.node-b.jsonl"
+  [ "$(_ns_count_evals "${tmp}/evaluations" "${dead_file}")" = "5 2" ] || {
+    echo "FAIL: packed records: $(_ns_count_evals "${tmp}/evaluations" "${dead_file}")"; exit 1
+  }
+  [ "$(_ns_count_evals "${tmp}/evaluations")" = "5 0" ] || {
+    echo "FAIL: packed records, no reference: $(_ns_count_evals "${tmp}/evaluations")"; exit 1
+  }
+  [ "$(_ns_completed_evals "${tmp}")" = "3" ] || {
+    echo "FAIL: completed with packed records: $(_ns_completed_evals "${tmp}")"; exit 1
+  }
+  rm "${tmp}/evaluations/records.jsonl" "${tmp}/evaluations/records.node-b.jsonl"
 
   # The redraw backs off with the cost of the draw, so the bar cannot grow
   # into a share of the machine on a long run. A shell that cannot time itself
@@ -849,7 +913,8 @@ self_check() {
   # from the checkpoint and is as stale as it is, so overtaking it means the
   # estimate is out of date rather than that the run has finished.
   touch -t 202601010100 "${dead_file}"
-  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0004-d"
+  touch -t 202601010200 "${tmp}/evaluations/eval-0003-c" "${tmp}/evaluations/eval-0003-c.json" \
+    "${tmp}/evaluations/eval-0004-d.json"
   line="$(_ns_status_line "${tmp}" -1 2 "$(($(date +%s) - 60))")"
   case "${line}" in
     *"~100%"*"~20/~18 dead points"*"eta ~?"*"past the ~18 estimate; the next checkpoint revises it"*) ;;
@@ -930,6 +995,14 @@ self_check() {
   }
   # And the pipe it went through is not left behind in the run directory.
   [ ! -e "${run_dir}/.run.log.fifo" ] || { echo "FAIL: fifo left behind"; exit 1; }
+  # A piped run ends with its command, not with the watchdog's orphaned
+  # sleep, which used to hold the pipe open for the rest of a poll (round 196).
+  local piped_start
+  piped_start="$(date +%s)"
+  NS_STALL_TIMEOUT=600 NS_STALL_POLL_SECONDS=30 \
+    run_with_progress "${run_dir}" -1 2 -- sleep 2 2>&1 | cat >/dev/null
+  [ $(($(date +%s) - piped_start)) -lt 15 ] \
+    || { echo "FAIL: a piped run waited on the stall watchdog's sleep"; exit 1; }
 
   # run_with_retries: a failure that scored evaluations gets another go, a
   # failure that scored none does not, and the exit status still travels.
@@ -968,12 +1041,18 @@ self_check() {
   # not by this file, which keeps the retry loop runnable without apptainer.
   local hook_dir="${tmp}/hook"
   mkdir -p "${hook_dir}/chains"
-  sidecar_restore() { echo r >>"${hook_dir}/restores"; }
+  _restored_here=0
+  sidecar_restore() { echo r >>"${hook_dir}/restores"; _restored_here=$((_restored_here + 1)); }
   run_with_retries 2 "${hook_dir}" -1 2 -- sh -c "${progressing}" "${hook_dir}" \
     >/dev/null 2>&1 || true
   unset -f sidecar_restore
   [ "$(_ns_count_lines "${hook_dir}/restores")" = "2" ] || {
     echo "FAIL: sidecar_restore called $(_ns_count_lines "${hook_dir}/restores") times, want 2"
+    exit 1
+  }
+  # In this shell, not a subshell: the real hook records the pool it starts.
+  [ "${_restored_here}" = "2" ] || {
+    echo "FAIL: sidecar_restore ran in a subshell; the pools it starts would leak"
     exit 1
   }
 
@@ -1115,12 +1194,13 @@ self_check() {
     mkdir -p "$0"/evaluations/eval-$n; echo {} >"$0"/evaluations/eval-$n/metrics.json;
     echo "$*" >>"$0"/attempts; exit 5'
   status=0
-  # 4096MB of headroom plus two R2D2 ranks, against a command asking for 8.
+  # 4096MB of headroom, R2D2's shared memory and two of its ranks, against a
+  # command asking for 8.
   # shellcheck disable=SC2030,SC2031  # the subshell is the point: each case
   # gets its own budget dir and free-memory reading and leaks neither
   (
     export NS_RANK_BUDGET_DIR="${tmp}/budget"
-    export NS_AVAILABLE_MB=$((4096 + 2 * 3500))
+    export NS_AVAILABLE_MB=$((4096 + NS_R2D2_SHARED_MB + 2 * NS_R2D2_MB_PER_RANK))
     run_with_retries 1 "${resize_dir}" -1 2 -- sh -c "${recording}" "${resize_dir}" \
       -e NS_MPI_PROCS=8 -np 8 python3 /opt/ri-nested-sampling/polychord_r2d2.py
   ) >/dev/null 2>&1 || status=$?
@@ -1205,6 +1285,16 @@ self_check() {
   run_with_retries 2 "${once_dir}" -1 2 -- sh -c 'echo b >>"$0"/attempts' "${once_dir}" \
     >/dev/null 2>&1 || { echo "FAIL: success returned nonzero"; exit 1; }
   [ "$(_ns_count_lines "${once_dir}/attempts")" = "2" ] || { echo "FAIL: success re-ran"; exit 1; }
+  grep -q 'stopped early' "${once_dir}/run.log" && { echo "FAIL: early-stop warning on a clean run"; exit 1; }
+  # A success that PolyChord's nfail guard cut short says so (round 337).
+  # shellcheck disable=SC2016
+  run_with_retries 2 "${once_dir}" -1 2 -- sh -c \
+    'echo c >>"$0"/attempts; echo "Warning, unable to proceed after    151: failed spawn events"' \
+    "${once_dir}" >/dev/null 2>&1 || { echo "FAIL: early stop returned nonzero"; exit 1; }
+  [ "$(_ns_count_lines "${once_dir}/attempts")" = "3" ] || { echo "FAIL: early stop re-ran"; exit 1; }
+  grep -q 'WARNING: PolyChord stopped early' "${once_dir}/run.log" || {
+    echo "FAIL: early stop not flagged"; exit 1
+  }
 
   # The retry budget is for a crash loop, not for the run's lifetime: an
   # attempt that ran a long time before dying hands it back, so a multi-day

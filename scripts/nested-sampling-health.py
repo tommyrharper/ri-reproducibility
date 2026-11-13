@@ -14,6 +14,7 @@ import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
 
@@ -308,6 +309,15 @@ def occupancy(times: list[float], costs: list[float | None],
     }
 
 
+def _evaluation_bytes(eval_dir: Path) -> int:
+    """An evaluation's dir and, from round 92, the record file beside it."""
+    try:
+        record = os.stat(f"{eval_dir}.json").st_blocks * 512
+    except OSError:
+        record = 0
+    return _dir_bytes(eval_dir) + record
+
+
 def _dir_bytes(path: Path) -> int:
     total = 0
     stack = [path]
@@ -342,32 +352,86 @@ class Evaluation(NamedTuple):
     peak_memory_bytes: float | None
 
 
+# Lustre reads are latency-bound, not CPU-bound: a fixed pool, never sized
+# from the core count (login nodes have a few CPUs to share).
+RECORD_READ_THREADS = 32
+
+ENDED_EPOCH_PATTERN = re.compile(r'"ended_epoch":\s*([0-9.eE+-]+)')
+
+
+def packed_records(evaluations: Path) -> dict[str, tuple[float, str]]:
+    """{name: (when it ended, record text)} from evaluations/records.jsonl,
+    and before it a multi-node run's records.<host>.jsonl (round 290),
+    without a torn last line if a killed writer left one."""
+    packed = {}
+    for path in [*sorted(evaluations.glob("records.*.jsonl")), evaluations / "records.jsonl"]:
+        try:
+            data = path.read_bytes()
+            fallback = path.stat().st_mtime
+        except OSError:
+            continue
+        for line in data[:data.rfind(b"\n") + 1].decode(errors="replace").splitlines():
+            name, tab, text = line.partition("\t")
+            if tab:
+                ended = ENDED_EPOCH_PATTERN.search(text)
+                packed[name] = (float(ended.group(1)) if ended else fallback, text)
+    return packed
+
+
 def evaluation_scan(run_dir: Path, procs: int = 0,
                     checkpoint: float | None = None) -> dict[str, object]:
     evaluations = run_dir / "evaluations"
-    directories = 0
     records: list[Evaluation] = []
     wedged_lines = 0
-    for entry in evaluations.glob("eval-*"):
-        if not entry.is_dir():
-            continue
-        directories += 1
-        metrics = entry / "metrics.json"
+    # A record is eval-*.json beside the dir of what the evaluation keeps
+    # (round 92), or eval-*/metrics.json in runs from before; a dir with
+    # neither is in flight, or a leftover the next run will sweep.
+    try:
+        listed = list(os.scandir(evaluations))
+    except OSError:
+        listed = []
+    flat = {e.name.removesuffix(".json") for e in listed
+            if e.name.startswith("eval-") and e.name.endswith(".json")}
+    dirs = {e.name for e in listed if e.name.startswith("eval-") and e.is_dir()}
+    # Records packed into records.jsonl (round 93) by a finish or a resume:
+    # a `name<TAB>record` line each, timed by the record's own end.
+    packed = packed_records(evaluations)
+
+    def _read(name: str) -> tuple[Evaluation | None, int]:
+        entry = evaluations / name
+        metrics = evaluations / f"{name}.json" if name in flat else entry / "metrics.json"
+        record = None
         try:
-            when, text = metrics.stat().st_mtime, metrics.read_text()
+            if name in packed and name not in flat:
+                when, text = packed[name]
+            else:
+                when, text = metrics.stat().st_mtime, metrics.read_text()
         except OSError:
             pass  # in flight, or a leftover the next run will sweep
         else:
             cost = WALL_SECONDS_PATTERN.search(text)
             peak = PEAK_MEMORY_PATTERN.search(text)
-            records.append(Evaluation(
+            record = Evaluation(
                 when, FAILURE_OBJECTIVE_MARKER in text, entry,
                 float(cost.group(1)) if cost else None,
-                float(peak.group(1)) if peak else None))
+                float(peak.group(1)) if peak else None)
+        if name not in dirs:
+            return record, 0
         try:
-            wedged_lines += len((entry / "meqserver-wedged.log").read_text().splitlines())
+            return record, len((entry / "meqserver-wedged.log").read_text().splitlines())
         except OSError:
-            pass
+            return record, 0
+
+    # Threaded like common.py's record reader: serially, a cold Lustre
+    # record cost ~34ms here, so a 20k-record live run took minutes to
+    # report; 32 threads bring it under 1ms a record (round 116).
+    names = flat | dirs | packed.keys()
+    directories = len(names)
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        for record, wedged in pool.map(_read, names):
+            if record is not None:
+                records.append(record)
+            wedged_lines += wedged
     records.sort()
     times = [r.when for r in records]
     failed = sum(1 for r in records if r.failed)
@@ -450,7 +514,7 @@ def evaluation_scan(run_dir: Path, procs: int = 0,
     # deterministic strides keep unchanged readings stable.
     stride = max(1, len(records) // DISK_SAMPLE)
     sample = [r.path for r in records[::stride]]
-    per_evaluation = (statistics.mean(_dir_bytes(where) for where in sample)
+    per_evaluation = (statistics.mean(_evaluation_bytes(where) for where in sample)
                       if sample else None)
     rate = (len(times) * 60 / span if span >= MIN_RATE_SPAN_SECONDS else None)
 
@@ -591,6 +655,13 @@ def dead_points_now(dead: int, completed: int, banked: int) -> int:
 def _setting(run_env: dict[str, str], key: str) -> int | None:
     raw = run_env.get(key, "")
     return int(raw) if raw.lstrip("-").isdigit() else None
+
+
+def total_ranks(run_env: dict[str, str]) -> int | None:
+    """The search's ranks: run.env's NS_MPI_PROCS is per node, and NS_NODES is
+    there only when above 1 (round 288), so a 2 x 38 run is 76, not 38."""
+    procs = _setting(run_env, "NS_MPI_PROCS")
+    return procs * max(_setting(run_env, "NS_NODES") or 1, 1) if procs else None
 
 
 def sampler_stats(run_dir: Path) -> dict[str, object] | None:
@@ -772,7 +843,7 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
     run_env = read_run_env(run_dir)
     dead, checkpoint_time = dead_points(run_dir)
     checkpoint_age = time.time() - checkpoint_time if checkpoint_time else None
-    scan = evaluation_scan(run_dir, _setting(run_env, "NS_MPI_PROCS") or 0,
+    scan = evaluation_scan(run_dir, total_ranks(run_env) or 0,
                            checkpoint_time)
     owned = run_processes(run_dir, processes)
     ranks = [p for p in owned if RANK_COMMAND.match(str(p["args"]))]
@@ -941,6 +1012,20 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
             f"read this run - ./ri resume {resume_target(run_dir)} rewrites it from "
             "the evaluations already on disk"
         )
+    # The shared TensorRT server dying leaves a GPU search right but at CPU
+    # speed (14.9 against 100 evals/s in round 219), and nothing but the rate
+    # shows it. The pool parent records it in r2d2-engine.txt.
+    if status != "finished":
+        engine = run_dir / "r2d2-engine.txt"
+        fallback = next((line for line in (engine.read_text(errors="replace").splitlines()
+                                           if engine.is_file() else [])
+                         if line.startswith("fallback:")), None)
+        if fallback:
+            warnings.append(
+                f"the shared TensorRT server is gone ({fallback[len('fallback: '):]}), so "
+                "every forward runs on the CPU at a fraction of the GPU rate; stopping it "
+                f"and running ./ri resume {resume_target(run_dir)} starts a new server"
+            )
     # A run whose shell was killed keeps going and keeps looking healthy - the
     # one thing it has lost is invisible in every other number here, and only
     # shows up as the crash it never came back from.
@@ -1059,6 +1144,16 @@ def describe(run_dir: Path, processes: list[dict[str, object]],
                            if status in ("healthy", "stalled", "starting", "restarting") else None),
         "warnings": warnings,
         **scan,
+        # A rank with scratch builds its evaluation in /dev/shm and puts
+        # nothing on the run directory until it is scored (docs/csd3-speed.md,
+        # round 14), so a live run has no directories to count. Little's law
+        # does it instead: imaging seconds per elapsed second is the number of
+        # evaluations held at once. Live runs only - a dead run's leftover
+        # directories are the count.
+        "in_flight": (max(int(scan["in_flight"]),
+                          round(float(scan["recent_busy_ranks"] or scan["busy_ranks"] or 0)))
+                      if ranks or job == "RUNNING" else scan["in_flight"]),
+        "flying": bool(ranks) or job == "RUNNING",
     }
 
 
@@ -1184,8 +1279,11 @@ def render(run: dict[str, object]) -> None:
     settings = run["settings"]
     assert isinstance(settings, dict)
     ranks = f"{run['ranks']} ranks"
-    if settings.get("NS_MPI_PROCS"):
-        ranks += f" of {settings['NS_MPI_PROCS']}"
+    if total := total_ranks(settings):
+        ranks += f" of {total}"
+        if (_setting(settings, "NS_NODES") or 1) > 1:
+            # pgrep sees this node's ranks only.
+            ranks += f" on {settings['NS_NODES']} nodes"
     if run["ranks_spinning"]:
         ranks += f", {run['ranks_spinning']} busy-waiting"
 
@@ -1240,7 +1338,7 @@ def render(run: dict[str, object]) -> None:
         # "in flight" reads as work still happening on a run that ended hours
         # ago.
         ("progress", f"{run['completed']} evaluations, {run['in_flight']} "
-                     + ("in flight" if run["ranks"] else "abandoned")),
+                     + ("in flight" if run.get("flying", run["ranks"]) else "abandoned")),
         ("activity", "nothing yet" if idle is None else
                      f"last evaluation {format_elapsed(float(idle))} ago"
                      + (f", {rate:.1f}/min over {format_elapsed(float(run['span_seconds']))}"
@@ -1274,7 +1372,7 @@ def render(run: dict[str, object]) -> None:
         # evaluation is banked at the moment it finished while its cost was
         # spent before that, so a window can hold more imaging seconds than it
         # had rank-seconds to spend and the raw ratio would print "23 of 16".
-        procs = settings.get("NS_MPI_PROCS") or (str(run["ranks"]) or "")
+        procs = total_ranks(settings) or (str(run["ranks"]) or "")
         def _busy(value: object) -> str:
             if value is None or not str(procs).isdigit() or int(procs) <= 0:
                 return ""
@@ -1382,8 +1480,7 @@ def render(run: dict[str, object]) -> None:
     peak = run["peak_memory_bytes"]
     if peak:
         across = ""
-        if str(settings.get("NS_MPI_PROCS", "")).isdigit():
-            procs = int(settings["NS_MPI_PROCS"])
+        if procs := total_ranks(settings):
             across = (f", {format_gb(float(peak) * procs)} across "
                       f"{procs} rank{'' if procs == 1 else 's'}")
         recent_peak = run["recent_peak_memory_bytes"]
@@ -1651,9 +1748,10 @@ def self_check() -> None:
     def write_eval(run: Path, index: int, mtime: float, objective: float = 0.008,
                    wedges: int = 0, wall_seconds: float | None = None,
                    peak_memory_bytes: float | None = None) -> None:
+        # The round-92 layout: a record file, and a dir only for what is kept.
         eval_dir = run / "evaluations" / f"eval-{index:04d}-abc"
-        eval_dir.mkdir(parents=True)
-        metrics = eval_dir / "metrics.json"
+        eval_dir.parent.mkdir(parents=True, exist_ok=True)
+        metrics = eval_dir.with_name(eval_dir.name + ".json")
         body: dict[str, object] = {"eval_id": index, "objective": objective}
         if wall_seconds is not None or peak_memory_bytes is not None:
             metric_values: dict[str, float] = {}
@@ -1665,6 +1763,7 @@ def self_check() -> None:
         metrics.write_text(json.dumps(body, indent=2))
         os.utime(metrics, (mtime, mtime))
         if wedges:
+            eval_dir.mkdir()
             (eval_dir / "meqserver-wedged.log").write_text(
                 "".join(f"attempt {i + 1}: no reply to the predict in 3.0s\n"
                         for i in range(wedges)))
@@ -1828,6 +1927,20 @@ def self_check() -> None:
             assert "next past ~7" in aged, aged
             assert report["completed"] == 4 and report["in_flight"] == 1, report
             assert report["dead_points"] == 3, report
+
+            # Packed records (round 93) are completed, not in flight, even
+            # with a kept dir beside one; timed by ended_epoch; torn tail ignored.
+            with tempfile.TemporaryDirectory() as packed_tmp:
+                packed = Path(packed_tmp)
+                (packed / "evaluations" / "eval-0002-b").mkdir(parents=True)
+                (packed / "evaluations" / "records.jsonl").write_text(
+                    'eval-0001-a\t{"objective": 0.5, "timing": {"ended_epoch": 1000.0}}\n'
+                    'eval-0002-b\t{"objective": 100.0, "timing": {"ended_epoch": 1010.0}}\n'
+                    'eval-0003-c\t{"objec')
+                write_eval(packed, 4, now)
+                scanned = evaluation_scan(packed)
+                assert scanned["completed"] == 3 and scanned["in_flight"] == 0, scanned
+                assert scanned["failed"] == 1 and scanned["span_seconds"] == now - 1000.0, scanned
             assert report["ranks"] == 4 and report["failed"] == 0, report
             assert report["warnings"] == [], report
             # The headline is the exit status in words. Clean run: HEALTHY and
@@ -2559,6 +2672,19 @@ def self_check() -> None:
             # ...and a whole one is still a finished run, with nothing said.
             (live / "summary.json").write_text("{}")
             assert describe(live, [], 5.0)["warnings"] == []
+            # A dead TensorRT server is said while the run is not finished,
+            # and only then.
+            (live / "r2d2-engine.txt").write_text(
+                "trt: 25 plans\nshared: one server, 19 lanes\n"
+                "fallback: server exited (139) at 2026-10-28T10:00:00, CPU U-Net from here\n")
+            assert describe(live, [], 5.0)["warnings"] == []
+            (live / "summary.json").unlink()
+            assert any("TensorRT server is gone (server exited (139)" in w and "./ri resume" in w
+                       for w in describe(live, [], 5.0)["warnings"])
+            (live / "r2d2-engine.txt").write_text("trt: 25 plans\nshared: one server, 19 lanes\n")
+            assert not any("TensorRT" in w for w in describe(live, [], 5.0)["warnings"])
+            (live / "r2d2-engine.txt").unlink()
+            (live / "summary.json").write_text("{}")
             (live / "summary.json").unlink()
             # Nothing to say about a run that has no summary at all - that is
             # every stopped run, and the half-written line must not be on it.
@@ -2692,6 +2818,12 @@ def self_check() -> None:
             # have said 125% and 50% - see _duty.
             assert abs(float(serial["busy_ranks"]) - 3.654) < 0.01, serial
             assert abs(float(serial["recent_busy_ranks"]) - 0.510) < 0.01, serial
+            # With scratch a live run leaves no directory for an evaluation it
+            # is holding, so the count comes from the duty instead; a stopped
+            # run's is still its leftover directories.
+            assert serial["in_flight"] == 0 and "0 abandoned" in io_capture(serial), serial
+            flying = describe(idle, [], 1e9, jobs={idle.resolve().name: "RUNNING"})
+            assert flying["in_flight"] == 1 and "1 in flight" in io_capture(flying), flying
             rendered_idle = io_capture(serial)
             assert "20.0s per evaluation, ranks 46% busy" in rendered_idle, rendered_idle
             assert "(last 50: 5.0s, 6% busy)" in rendered_idle, rendered_idle
@@ -2736,6 +2868,13 @@ def self_check() -> None:
                 flat_memory
             assert ("memory    2.0GB peak imager memory, 16.0GB across 8 ranks\n"
                     in io_capture(flat_memory)), io_capture(flat_memory)
+            # A multi-node run.env records NS_MPI_PROCS per node (round 288):
+            # 4 on each of 2 nodes is the same 8 ranks, not 4 always busy.
+            (half / "run.env").write_text("NS_MPI_PROCS=4\nNS_NODES=2\n")
+            spread = describe(half, [], DEFAULT_STALE_SECONDS)
+            assert spread["occupancy"] == steady, spread["occupancy"]
+            assert ("16.0GB across 8 ranks\n" in io_capture(spread)
+                    and "0 ranks of 8 on 2 nodes" in io_capture(spread)), io_capture(spread)
             # A run whose rank count is not recorded has no denominator, so it
             # gets no shape rather than one drawn against a guess.
             (half / "run.env").write_text("")

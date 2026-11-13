@@ -1382,6 +1382,9 @@ directly measured proxy for what the change actually moves (here, when the
 
 ### The operator norm is solved with Lanczos, not a power iteration
 
+Superseded: the run now sets `target_dynamic_range`, so the operator norm is
+never computed and this patch was removed ([csd3-speed.md](csd3-speed.md), round 4).
+
 With `get_op_norm()` at 85-96% of an R2D2 imaging request, it is the whole
 per-evaluation cost worth attacking. Upstream's
 `MeasOp.get_op_norm` is a plain power iteration: start from `torch.randn`,
@@ -1621,6 +1624,8 @@ imaging pool is CPU-bound with 8 workers on a 20-CPU host, so work removed from
 a worker is worth more than its solo cost.
 
 #### The operator norm runs on a coarser upsampling grid
+
+Removed with the Lanczos patch above.
 
 Once the plans are cached and the checkpoints are absent, an imaging request is
 *almost entirely* `get_op_norm`. `cProfile` of one warm request, 0.038s solo:

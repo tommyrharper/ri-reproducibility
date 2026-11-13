@@ -11,6 +11,7 @@ source "${REPO_ROOT}/scripts/lib/defaults.sh"
 source "${REPO_ROOT}/scripts/lib/progress-bar.sh"
 
 ns_require_sifs "${MEQTREES_SIF}" "${WSCLEAN_SIF}" "${POLYCHORD_SIF}"
+ns_warn_stale_wsclean_sif "${WSCLEAN_SIF}"
 
 # Inside a Slurm job this is the allocation, not the node. OMP_NUM_THREADS and
 # OMP_THREAD_LIMIT are dropped because GNU nproc honours them, and CSD3's login
@@ -29,6 +30,7 @@ if [ -n "${OUTPUT_DIR:-}" ]; then
 else
   OUTPUT_DIR="$(ns_claim_run_dir "${REPO_ROOT}/results/nested-sampling" wsclean-vlaa-)"
 fi
+ns_warn_file_quota "${OUTPUT_DIR}" "${NS_NLIVE}" "${NS_NUM_REPEATS}" "${NS_MAX_NDEAD}"
 # On a cluster login node the search leaves here: the claimed directory and the
 # whole environment go to a Slurm job that runs this script again inside the
 # allocation, where the cores and memory below are the job's (docs/cluster.md).
@@ -44,6 +46,7 @@ fi
 # job's own environment rather than the login node's (slurm.sh).
 export OUTPUT_DIR
 ns_enter_job_env "${OUTPUT_DIR}" scripts/run-nested-sampling.sh
+ns_use_patched_wsclean_sif "${HOST_CPUS}"
 if [ -z "${NS_MPI_PROCS:-}" ]; then
   if [ "${NS_NLIVE}" -lt "${HOST_CPUS}" ]; then
     NS_MPI_PROCS="${NS_NLIVE}"
@@ -93,13 +96,20 @@ sidecar_launch "${MEQTREES_SIF}" \
 # The WSClean fork server, one per rank over a FIFO pair like the simulate
 # workers: a rank inside polychord.sif cannot start another SIF, so the zygote
 # the Docker branch spawned per rank is a host-started pool here.
+# The malloc tunables keep freed blocks in the heap, so each gridding pass
+# reuses pages the last one faulted in instead of mmapping fresh ones: ~6.5ms
+# less kernel time per evaluation at 38 ranks (docs/csd3-speed.md, round 28).
+# The thresholds are 2^62, not 1GB: WSClean sizes each pass's buffers from the
+# machine's RAM (47-110GB virtual on a CSD3 node), so at 1GB they were still
+# mmapped per pass and faulted in again (round 41).
 # shellcheck disable=SC2016
 sidecar_launch "${WSCLEAN_SIF}" -- sh -c '
   for fifo in "$1"/*.in; do
     [ -e "${fifo}" ] || continue
     base="${fifo%.in}"
     ( while :; do
-        wsclean-zygote <"${fifo}" >"${base}.out" & echo $! >"${base}.pid"; wait $!
+        GLIBC_TUNABLES=glibc.malloc.mmap_threshold=4611686018427387904:glibc.malloc.trim_threshold=4611686018427387904:glibc.malloc.top_pad=67108864 \
+          wsclean-zygote <"${fifo}" >"${base}.out" & echo $! >"${base}.pid"; wait $!
       done ) &
   done
   wait
@@ -120,6 +130,7 @@ RUN_COMMAND=(
   NS_ENABLE_PARAMS="${NS_ENABLE_PARAMS:-}"
   NS_DISABLE_PARAMS="${NS_DISABLE_PARAMS:-}"
   NS_SYNCHRONOUS="${NS_SYNCHRONOUS}"
+  NS_CHAINS_TMPFS="${NS_CHAINS_TMPFS:-1}"
   NS_KEEP_MEASUREMENT_SETS="${NS_KEEP_MEASUREMENT_SETS}"
   NS_WSCLEAN_MGAIN="${NS_WSCLEAN_MGAIN}"
   NS_WSCLEAN_NITER="${NS_WSCLEAN_NITER}"
@@ -137,6 +148,9 @@ RUN_COMMAND=(
   "${POLYCHORD_SIF}"
   mpirun
   --use-hwthread-cpus
+  # Each rank pins itself and its two workers to one CPU (pin_rank_cpu() in
+  # common.py); Open MPI's own per-socket binding would hide most CPUs from it.
+  --bind-to none
   ${NS_MPI_OVERSUBSCRIBE:+--oversubscribe}
   -np "${NS_MPI_PROCS}"
   python3 /opt/ri-nested-sampling/polychord_wsclean.py

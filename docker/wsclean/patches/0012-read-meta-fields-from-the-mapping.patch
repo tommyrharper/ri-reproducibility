@@ -1,0 +1,52 @@
+diff --git a/msproviders/msreaders/reorderedmsreader.cpp b/msproviders/msreaders/reorderedmsreader.cpp
+index 6e1c638..975c590 100644
+--- a/msproviders/msreaders/reorderedmsreader.cpp
++++ b/msproviders/msreaders/reorderedmsreader.cpp
+@@ -1,6 +1,7 @@
+ #include "reorderedmsreader.h"
+ #include "../reorderedmsprovider.h"
+ 
++#include <cstddef>
+ #include <cstring>
+ #include <filesystem>
+ 
+@@ -110,17 +111,30 @@ void ReorderedMsReader::ReadMeta(MSProvider::MetaData& metadata) {
+ 
+ void ReorderedMsReader::CacheMeta() {
+   if (Provider().IsRegular()) {
+-    schaapcommon::reordering::details::MetaRecordBuffer record;
+-    if (!ReadMappedRecord(meta_file_, meta_size_, meta_pos_, &record))
++    using Record = schaapcommon::reordering::details::MetaRecordBuffer;
++    if (meta_pos_ >= meta_size_ || meta_size_ - meta_pos_ < sizeof(Record)) {
++      Record record;
++      ReadMapped(meta_file_, meta_size_, meta_pos_, &record, sizeof(Record));
+       return;
+-    metadata_.u_in_m = record.u;
+-    metadata_.v_in_m = record.v;
+-    metadata_.w_in_m = record.w;
+-    metadata_.time = record.time;
++    }
++    // Each field straight from the mapping. Copying the packed 38-byte record
++    // to the stack first stores it as 16+16+8 bytes, and reloading u..time as
++    // one 32-byte word cannot be forwarded from those stores, so every row
++    // stalled (see docs/csd3-speed.md, round 55).
++    const char* p = meta_file_.Data() + meta_pos_;
++    meta_pos_ += sizeof(Record);
++    std::memcpy(&metadata_.u_in_m, p + offsetof(Record, u), sizeof(double));
++    std::memcpy(&metadata_.v_in_m, p + offsetof(Record, v), sizeof(double));
++    std::memcpy(&metadata_.w_in_m, p + offsetof(Record, w), sizeof(double));
++    std::memcpy(&metadata_.time, p + offsetof(Record, time), sizeof(double));
++    uint16_t antenna1, antenna2, field_id;
++    std::memcpy(&antenna1, p + offsetof(Record, antenna1), sizeof(uint16_t));
++    std::memcpy(&antenna2, p + offsetof(Record, antenna2), sizeof(uint16_t));
++    std::memcpy(&field_id, p + offsetof(Record, field_id), sizeof(uint16_t));
+     // data_desc_id is already set in constructor
+-    metadata_.field_id = record.field_id;
+-    metadata_.antenna1 = record.antenna1;
+-    metadata_.antenna2 = record.antenna2;
++    metadata_.field_id = field_id;
++    metadata_.antenna1 = antenna1;
++    metadata_.antenna2 = antenna2;
+   } else {
+     schaapcommon::reordering::details::BdaMetaRecordBuffer record;
+     if (!ReadMappedRecord(meta_file_, meta_size_, meta_pos_, &record))

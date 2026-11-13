@@ -72,6 +72,104 @@ check "the generated seed is exported, so the run scripts see it" \
 check "{REPO_ROOT} is expanded" \
   "${REPO_ROOT}/results" "$(load RESULTS_DIR)"
 
+# A stand-in apptainer whose `inspect --labels` prints LABELS.
+fake_bin="$(mktemp -d)"
+trap 'rm -rf "${fake_bin}"' EXIT
+# shellcheck disable=SC2016  # expanded by the stand-in, not here
+printf '#!/bin/sh\nprintf "%%b" "${LABELS}"\n' >"${fake_bin}/apptainer"
+chmod +x "${fake_bin}/apptainer"
+# Prints "warned" or "quiet" for a SIF labelled with LABELS.
+stale() {
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM LABELS="$1" APPTAINER="${fake_bin}/apptainer" bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "${REPO_ROOT}/scripts/lib/defaults.sh"
+    ns_warn_stale_wsclean_sif some.sif 2>&1 | grep -q WARNING && echo warned || echo quiet
+  ' _ "${REPO_ROOT}"
+}
+# Runs one defaults.sh function in a clean child shell.
+call() {
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "${REPO_ROOT}/scripts/lib/defaults.sh"
+    "$2"
+  ' _ "${REPO_ROOT}" "$1"
+}
+patches="$(call ns_wsclean_patches_hash)"
+inputs="$(call ns_wsclean_build_inputs)"
+
+check "a SIF built from this tree's docker/wsclean is not stale" \
+  "quiet" "$(stale "ri.build-inputs: ${inputs}\n")"
+check "a SIF built from another tree's docker/wsclean is stale" \
+  "warned" "$(stale "ri.build-inputs: 0123\n")"
+check "a SIF layered with this tree's patches is not stale" \
+  "quiet" "$(stale "ri.build-inputs: 0123\nri.wsclean-patches: ${patches}\n")"
+check "a SIF layered with other patches is stale" \
+  "warned" "$(stale "ri.build-inputs: ${inputs}\nri.wsclean-patches: 0123\n")"
+
+# Prints ns_image_id for a SIF labelled with LABELS.
+image_id() {
+  touch "${fake_bin}/some.sif"
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM LABELS="$1" APPTAINER="${fake_bin}/apptainer" bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "${REPO_ROOT}/scripts/lib/defaults.sh"
+    ns_image_id "$2"
+  ' _ "${REPO_ROOT}" "${fake_bin}/some.sif"
+}
+check "an image id is its build-input label" \
+  "abcd" "$(image_id "ri.build-inputs: abcd\n")"
+check "a patched wsclean.sif's id carries its patches" \
+  "abcd+p0123456789ab" "$(image_id "ri.build-inputs: abcd\nri.wsclean-patches: 0123456789abcdef\n")"
+check "an unlabelled SIF's id is unknown" \
+  "unknown" "$(image_id "")"
+
+# ns_use_patched_wsclean_sif in a stand-in checkout whose patch-wsclean-sif.sh
+# writes its output and counts its builds. Prints the WSClean SIF a run uses
+# and the build count; args: labels, then env assignments.
+fake_repo="${fake_bin}/repo"
+mkdir -p "${fake_repo}/scripts" "${fake_repo}/work"
+cp "${REPO_ROOT}/defaults.toml" "${fake_repo}/"
+cp -r "${REPO_ROOT}/docker" "${fake_repo}/"
+# shellcheck disable=SC2016  # expanded by the stand-in, not here
+printf '#!/bin/sh\necho x >>"%s/builds"\n[ -n "${FAIL:-}" ] && exit 1\necho sif >"$1"\n' \
+  "${fake_repo}" >"${fake_repo}/scripts/patch-wsclean-sif.sh"
+chmod +x "${fake_repo}/scripts/patch-wsclean-sif.sh"
+touch "${fake_repo}/wsclean.sif"
+use_patched() {
+  local labels="$1"
+  shift
+  # shellcheck disable=SC2016
+  env -u DOCKER_DEFAULT_PLATFORM -u SLURM_JOB_ID -u NS_PATCH_WSCLEAN LABELS="${labels}" \
+    APPTAINER="${fake_bin}/apptainer" RI_WORK_DIR="${fake_repo}/work" "$@" bash -c '
+    REPO_ROOT="$1"
+    # shellcheck source=scripts/lib/defaults.sh
+    source "$2/scripts/lib/defaults.sh"
+    WSCLEAN_SIF="${REPO_ROOT}/wsclean.sif"
+    ns_use_patched_wsclean_sif 2 >/dev/null 2>&1
+    echo "${WSCLEAN_SIF##*/} $(cat "${REPO_ROOT}/builds" 2>/dev/null | wc -l)"
+  ' _ "${fake_repo}" "${REPO_ROOT}"
+}
+fake_patches="$(REPO_ROOT="${fake_repo}"; cat "${REPO_ROOT}"/docker/wsclean/patches/*.patch \
+  "${REPO_ROOT}"/docker/wsclean/src/*.cpp | sha256sum | cut -c1-16)"
+check "a stale SIF is used as it is outside a job" \
+  "wsclean.sif 0" "$(use_patched "ri.build-inputs: 0123\n")"
+check "a stale SIF is used as it is with NS_PATCH_WSCLEAN=0" \
+  "wsclean.sif 0" "$(use_patched "ri.build-inputs: 0123\n" SLURM_JOB_ID=1 NS_PATCH_WSCLEAN=0)"
+check "a failed build keeps the stale SIF" \
+  "wsclean.sif 1" "$(use_patched "ri.build-inputs: 0123\n" SLURM_JOB_ID=1 FAIL=1)"
+rm -f "${fake_repo}/builds"
+check "a stale SIF in a job is patched once" \
+  "wsclean-0123-p${fake_patches:0:12}.sif 1" "$(use_patched "ri.build-inputs: 0123\n" SLURM_JOB_ID=1)"
+check "and the cached copy is reused" \
+  "wsclean-0123-p${fake_patches:0:12}.sif 1" "$(use_patched "ri.build-inputs: 0123\n" SLURM_JOB_ID=1)"
+check "a SIF patched to this tree is used as it is" \
+  "wsclean.sif 1" "$(use_patched "ri.build-inputs: 0123\nri.wsclean-patches: ${fake_patches}\n" SLURM_JOB_ID=1)"
+
 if [[ "${failures}" -gt 0 ]]; then
   echo "${failures} check(s) failed" >&2
   exit 1

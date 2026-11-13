@@ -270,3 +270,244 @@ Upstream-shaped only in the trivial sense that it is a one-word change;
 upstream would not take it, because `do_wgridding` is a parameter and turning
 it off unconditionally is wrong for any field wide enough to need it. Revert
 by deleting the patch file - nothing else refers to it.
+
+## 0007: reuse ducc0's gridder index across passes
+
+ducc0 builds a tile index (`countRanges()` in
+`external/schaapcommon/external/ducc0/wgridder/wgridder.h`) on every gridding
+and degridding pass, and a WSClean evaluation makes ~7 passes over the same
+rows: PSF, then one grid and one degrid per major cycle. The index depends
+only on the visibility mask `scanData()` has just built, the baselines, the
+channel frequencies and the gridder's scalars (grid size, kernel support,
+shifts, pixel sizes, visibility count). The patch keeps the last index in a
+`thread_local` cache, keyed on all of those compared byte for byte, and
+reuses it when they match. Grid and degrid share the entry, because the index
+does not depend on the direction. The cache only works with one ducc0
+thread (`-j 1`, as the search runs). There the index is built in a fixed
+order, so a reused index is byte-identical to a rebuilt one. With more
+threads the patch does nothing.
+
+At CSD3's 9-parameter sizes (~40k rows x 5 channels for a median
+evaluation), `countRanges` was ~11% of the `wsclean` binary's CPU in `perf`.
+The patch measured -7.4% on the binary solo and ~-9% in 38-rank searches,
+with the restored, model, residual and PSF data blocks byte-identical and
+log(Z) identical in a synchronous pair. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 23.
+
+Upstream-shaped: it changes nothing ducc0 computes. Upstream ducc0 would
+more likely expose the index as a reusable object than hide a cache in the
+constructor.
+
+## 0008: map the reordered part files
+
+Every gridding and degridding pass reads the reordered part files row by row
+(`msproviders/msreaders/reorderedmsreader.cpp`): one `istream::read` for the
+row's metadata record, one for its data and one for its weights, each a few
+tens of bytes. At CSD3's sizes that is ~120k small reads a pass and ~7
+passes an evaluation. The patch maps the three files with WSClean's own
+`MappedFile` (as the model file already is) and copies each record out of
+the map with `memcpy`. The cursors advance exactly as the streams did,
+including stopping at the end of a file, so the bytes handed to the gridder
+are the same.
+
+It measured -6.0% on the binary solo over six real-draw Measurement Sets,
+with the restored, model, residual and PSF data blocks byte-identical (24 of
+24). The in-run numbers are in [csd3-speed.md](csd3-speed.md), round 24.
+
+Upstream-shaped: it changes how the files are read, not what is read.
+
+## 0009: a fast path in ducc0's `scanData`
+
+Every gridding and degridding pass starts with ducc0's `scanData()`
+(`external/schaapcommon/external/ducc0/wgridder/wgridder.h`), which marks
+each visibility with `norm(vis)*weight*mask != 0` and tracks the w range of
+the marked ones. WSClean always passes weights and a mask that are a uniform
+1 (zero strides), and through the `mav` accessors the compiler reloads every
+array's pointer and strides on each visibility, because the store into the
+local mask may alias them. With one ducc0 thread, uniform weights of 1 and a
+uniform mask of 1, the patch runs the same loop over local pointers. The
+test is the same, since `x*1*1 == x` exactly, and every other case falls
+through to the original loop.
+
+`scanData` was ~7% of the `wsclean` binary's CPU after 0008. The patch
+measured -2.5% on the binary solo and ~-4.5% in 38-rank searches, with the
+restored, model, residual and PSF data blocks byte-identical (24 of 24) and
+every chain file identical in a synchronous pair. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 25.
+
+Upstream-shaped: it changes nothing ducc0 computes.
+
+## 0010: map each reordered file once per process
+
+Every gridding and degridding pass builds its own `ReorderedMsProvider` and
+`ReorderedMsReader`s, and each one used to `mmap` the model, meta, part
+and weight files again and `munmap` them on destruction. On the search's
+Measurement Sets that is 9 model mappings and 16 of each part file per
+evaluation, and every new mapping faults all of its pages in again. The
+model file faults worst, because writes to a shared mapping get no
+fault-around. The patch keeps one mapping per (device, inode, size) in a
+process-wide cache inside `MappedFile` (`system/mappedfile.h`) and never
+unmaps before exit. The mapping is `MAP_SHARED`, so every user sees the same
+bytes it saw before. A file that is removed and recreated
+(`ResetModelColumn`, which only runs with facets) gets a new inode, because
+an inode that is still mapped cannot be reused. Every evaluation is a fresh
+fork of the zygote, and the zygote maps none of these files, so the cache
+lasts exactly one evaluation.
+
+Solo, it halves the binary's minor faults (6.0k to 3.5k on MS 4). In a
+37-way concurrent driver it takes 1.7% off WSClean wall time. All 24 FITS
+data blocks are byte-identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 30.
+
+Not upstream-shaped as it stands: a long-lived WSClean process with many
+parts would keep every temporary file's pages until it exits.
+
+## 0011: read each meta record at its fixed size
+
+`ReorderedMsReader::CacheMeta()` reads one meta record per row on every
+gridding and degridding pass, through 0008's `ReadMapped()`, which takes the
+length at run time. GCC copied it with a loop of narrow stores into the
+stack record, and the caller then reloaded the record with one 32-byte
+vector load, which cannot be forwarded from those stores, so it stalled on
+every row. In a `perf` profile that load held 37% of `CacheMeta`'s samples,
+and `CacheMeta` was 3.7% of the binary. The patch adds
+`ReadMappedRecord<Record>()`, which copies a whole record at
+`sizeof(Record)` and falls back to `ReadMapped()` for a short record at the
+end of the file, so the bytes read and the return value are unchanged.
+
+Over six real-draw MSs the FITS data blocks are byte-identical (24 of 24),
+and WSClean is 1.0% faster with 37 copies running at once. The measurements
+are in [csd3-speed.md](csd3-speed.md), round 35.
+
+Upstream-shaped: it changes only how bytes are copied.
+
+## 0012: read each meta field straight from the mapping
+
+0011 did not remove the stall. The 38-byte packed `MetaRecordBuffer` is
+copied to the stack as two 16-byte stores and one overlapping 8-byte store,
+and `CacheMeta()` then reloads `u`..`time` as one 32-byte word. A load that
+spans two stores cannot be forwarded either, so every row still waited. In a
+36-rank search `CacheMeta` held 5.7% of the zygote's samples, two thirds of
+them on that one load. The patch drops the stack record on the regular path
+and `memcpy`s each field from the mapped meta file into `metadata_`, keeping
+`ReadMapped()` for a short record at the end of the file, so the bytes read
+and the position are unchanged. BDA files keep 0011's path.
+
+Solo over six real-draw MSs, `CacheMeta` falls from 2.9% to 0.9% of the
+binary's samples, and WSClean is 1.3% faster (1.0-1.8% in 6 of 6
+interleaved ABBA blocks). All 24 FITS data blocks are byte-identical. The
+measurements are in [csd3-speed.md](csd3-speed.md), round 55.
+
+Upstream-shaped: it changes only how bytes are copied.
+
+## 0013: buffer the reordered rows in memory
+
+The reorder (`ReorderMS()` in `msproviders/reorderedmsprovider.cpp`) writes
+each row through schaapcommon's `FileWriter`
+(`external/schaapcommon/src/reordering/filewriter.cc`): one `ostream::write`
+for the meta record, one for the data and one for the weights, each a few
+tens of bytes, plus two `std::vector`s allocated and freed per row. On the
+search's MSs that per-row overhead was about half of the reorder, which is
+the second-largest phase of an evaluation after 0001-0012 (~17ms of ~140ms).
+The patch appends every row to an in-memory buffer per file, extracting the
+data and weights straight into it, and writes a buffer once it reaches 1MB.
+`UpdateMetaHeaders()` and `UpdatePartHeaders()` write whatever is left before
+they seek, so each file gets the same bytes in the same order. The meta
+fields are narrowed to `uint16_t` exactly as `MetaRecord` did.
+
+Solo over five real-draw MSs, the reorder is 19.5% faster and WSClean 3.3%
+faster (6 of 6 interleaved ABBA blocks). The four reordered files
+(`-save-reordered`) and all 20 FITS data blocks are byte-identical. The
+measurements are in [csd3-speed.md](csd3-speed.md), round 58.
+
+Upstream-shaped: it changes how the files are written, not what is written.
+A write error now surfaces at the next flush rather than on the row that
+caused it.
+
+## 0014: skip the time-offset lookups outside facets
+
+Every gridded row goes through `LoadAndApplyCorrections()`
+(`gridding/msgridderdata.h`), which read and then wrote back the visibility
+modifier's `std::map` of time offsets, though only a facet's corrections
+move the offset. The search never images facets, so both lookups were
+pure overhead on every row of every pass. The patch returns before them
+unless the gridder is a facet whose PSF mode is not `kSingle`, the only
+case that ever changed the offset. The map's entry was only ever read
+back through the same `operator[]`, so skipping the insert changes nothing.
+
+Solo over five real-draw MSs, "loading data in memory" is 5.3% faster
+and WSClean 0.35% faster (6 of 6 interleaved ABBA blocks). All 20 FITS data
+blocks are byte-identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 59.
+
+Upstream-shaped: it changes nothing computed.
+
+## 0015: reuse each row's weights across major cycles
+
+Every inversion - the PSF, then one per major cycle - loads every row
+through `GetCollapsedVisibilities()` (`gridding/msgridderdata.h`): read the
+meta record and the weights, compute the imaging weight from u/v, multiply,
+and add to the weight counters. Only the residual data changes between
+cycles; uvw, visibility weights and imaging weights do not. The patch keeps
+each row's uvw and final weight from the first inversion of a measurement
+set (`InversionWeightCache`, filled in `GridRegularMeasurementSet()` in
+`wgridder/wgriddingmsgridder.cpp`), and later inversions read only data and
+model, subtract, and multiply by the cached weight. The counters the full
+pass ends with are restored as they were, so `WSCNVIS`, `WSCENVIS`,
+`WSCVWSUM` and the normalisation match. It applies only where the full path
+reduces to exactly that: one visibility polarization, no facets, beams,
+solutions or stored imaging weights, counters at zero on entry. The cache is
+thread-local and keyed on the process id, MS index, row and channel counts,
+first frequency, the `ImageWeights` object, weighting and gain mode, so a
+forked zygote child never inherits one.
+
+On the largest real-draw MS, "loading data in memory" drops from ~33 ms to
+~15 ms on every pass after the first. Solo over five MSs, WSClean is 6.2-7.3%
+faster on the three largest (24 of 24 interleaved ABBA blocks each), 3.9%
+on the median one and unchanged on the smallest; all 1440 FITS data blocks
+and headers are byte-identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 68.
+
+Not upstream-shaped as is: a cleaner version would hold the weights in the
+gridder across inversions instead of in a thread-local.
+
+## 0016: read residual rows in blocks
+
+With 0015 in, a residual inversion (one per major cycle after the first)
+still spent ~14 ms on the largest MS "loading data in memory". The time is not
+per-row call overhead: reading the rows in blocks through a copying API
+changed nothing. It is memory traffic. Each pass copies the data and the
+model into row buffers and then into the chunk buffer, copies the cached
+uvws, and touches a freshly allocated chunk buffer, which costs page faults.
+For residual inversions (no PSF, model subtracted, one visibility
+polarization), the patch adds `MSReader::MapDataAndModelRows()`. In the
+reordered reader (`msproviders/msreaders/reorderedmsreader.cpp`), a regular
+set's rows are consecutive in both the data file and the model file, so the
+call returns pointers into the two mappings for a whole chunk and advances
+the cursors exactly as the row-by-row reads would. `GridRegularMeasurementSet()`
+then forms `(data - model) * weight` in one loop into a buffer kept in the
+0015 cache, and passes the cached uvws to the gridder directly. The
+arithmetic is the same operations in the same order, so the result is
+byte-identical. Readers without the method, and every other kind of pass,
+take the 0015 path.
+
+The per-pass load on the largest MS drops from ~14 ms to ~5.7 ms. Solo over
+five MSs, WSClean is 2.9-4.6% faster on the three largest (24 of 24 ABBA
+blocks each), 2.8% faster on the median one and unchanged on the smallest.
+All 1440 FITS data blocks and headers are identical. The measurements are in
+[csd3-speed.md](csd3-speed.md), round 69.
+
+## 0017: skip the unused w-range scan
+
+Every gridding and degridding pass starts with ducc0's `scanData()`, which
+marks the non-zero visibilities and, for each one, folds `|w * f/c|` into a
+running min and max. Those two numbers are read only when w-gridding is on:
+they size the w planes and feed the kernel cost model. 0006 turns w-gridding
+off, so on 0009's fast path (one thread, uniform weights and mask) the patch
+skips the w arithmetic and the min/max when `do_wgridding` is false. The
+mask and visibility count are built exactly as before, so the output is
+byte-identical. A `perf` profile of the largest MS put the scan at ~5% of the
+binary's samples, behind the two gridding kernels (54%). Solo, WSClean is
+1.9-2.3% faster on the three largest MSs (21-24 of 24 ABBA blocks) and
+unchanged on the two smallest, with all 1440 FITS data blocks identical
+([csd3-speed.md](csd3-speed.md), round 74).

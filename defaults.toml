@@ -32,19 +32,14 @@ CHECKPOINTS_DIR = "{REPO_ROOT}/checkpoints"
 R2D2_CKPT_NAME = "R2D2_A1"
 RESULTS_DIR = "{REPO_ROOT}/results"
 
-# Most concurrent R2D2 evaluations worth running, before the memory clamp in
-# scripts/lib/rank-budget.sh has its say. R2D2 is core-bound, not rank-bound:
-# measured on the 20-thread rig, paired and interleaved, throughput is flat
-# from 8 ranks (0.878, 0.917 evaluations/second) to 15 (0.898, 0.916) while
-# per-rank memory takes the run from 28GB to 53GB - per-evaluation work doubles
-# and the total does not move. Without this cap the derived rank count is
-# whatever memory allows, which buys nothing and spends the headroom a long run
-# needs. WSClean has no equivalent: it is 200MB a rank and scales to one rank
-# per core. See docs/nested-sampling-throughput.md.
-# ponytail: one number measured on one host, not a live probe. Re-measure with
-# `./ri search r2d2 --nlive 40 --num-repeats 2 --max-ndead 40 --mpi-procs N`
-# on a machine with a different core count.
-NS_R2D2_MAX_RANKS = 8
+# Most concurrent R2D2 evaluations worth running on the CPU, before the memory
+# clamp in scripts/lib/rank-budget.sh has its say. One rank per CPU is fastest
+# on every CSD3 CPU node now: a whole icelake node does 47 evals/s at 76 x 1
+# against 38-41 at 56 x 2, and a whole sapphire node 83 at 112 x 1 against 66
+# at 56 x 2 (docs/csd3-speed.md, round 105). 112 is sapphire's core count, so
+# the cap no longer binds there; the old 56 (E4 in docs/csd3-experiments.md)
+# predated the speed rounds.
+NS_R2D2_MAX_RANKS = 112
 
 # Where R2D2's U-Net runs: "cpu", or "cuda" for one A100 on CSD3's ampere
 # partition (`./ri search r2d2 --device cuda`; docs/cluster.md, "R2D2 on a
@@ -52,12 +47,24 @@ NS_R2D2_MAX_RANKS = 8
 # scoring stay on the CPU. Needs images/r2d2-cuda.sif.
 R2D2_DEVICE = "cpu"
 # NS_R2D2_MAX_RANKS for R2D2_DEVICE=cuda: the ranks share one A100 and the 32
-# cores CSD3 allows per GPU. Measured on gpu-q-23 (nlive 16, max-ndead 48, one
-# run each): 8 ranks 1.8 evaluations/s, 16 ranks 1.5 - at 16 each rank has half
-# the cores for the CPU side of imaging, which grew from 1.19s to 1.56s.
-# ponytail: one short run per arm; re-measure with --mpi-procs N and a longer
-# --max-ndead before trusting a change (docs/cluster.md, "R2D2 on a GPU").
-NS_R2D2_CUDA_MAX_RANKS = 8
+# cores CSD3 allows per GPU. 19 is all an 80GB card holds (see below); with
+# MPS and blocking sync, 19 ranks ran 43.9 evaluations/s against 41.1 for 16
+# (csd3-speed.md, round 124). The batching TensorRT server (the GPU default
+# since round 328) holds nothing per worker on the card, so it ignores this
+# and runs a rank per CPU plus the root's.
+NS_R2D2_CUDA_MAX_RANKS = 19
+# GPU memory one R2D2 worker takes: all 25 checkpoints plus its CUDA context,
+# measured 3.56GiB (docs/csd3-experiments.md, E3). The run clamps ranks to what
+# 95% of the card holds - 19 on an 80GB A100 - and refuses an explicit
+# --mpi-procs above it: past it workers die of CUDA OOM.
+NS_R2D2_CUDA_MB_PER_RANK = 4096
+# The same for R2D2_RUNTIME=trt: 25 TensorRT engines (206MB each) and a CUDA
+# context measured ~5.6GB, so 12 fit an 80GB A100 (csd3-speed.md, round 170).
+NS_R2D2_CUDA_TRT_MB_PER_RANK = 6144
+# R2D2_DEVICE=cuda starts a CUDA MPS daemon for the run, so the workers share
+# the card rather than time-slice it (csd3-speed.md, rounds 117-118). 0 turns
+# it off, for an A/B.
+NS_CUDA_MPS = 1
 
 # Pixels on a side of the image both imagers make, and with it the field of
 # view: source_offset_to_lm() in common.py scales the sampled
@@ -112,6 +119,20 @@ NS_KEEP_MEASUREMENT_SETS = 0
 # docs/nested-sampling-clean-loop.md for the per-metric cost and
 # docs/nested-sampling-evaluation-floor.md for why nothing cheaper is left.
 NS_WSCLEAN_MGAIN = 0.8
+# Most Measurement Set skeletons one run caches in /dev/shm before it stops
+# adding more; see publish_skeleton() in simulate_point_source_ms.py.
+NS_MS_SKELETON_CACHE_MAX = 512
+# Predicts before a simulate worker replaces its meqserver, which holds every
+# MS it has written open and so pins it in /dev/shm; see NS_MEQSERVER_RECYCLE
+# in simulate_point_source_ms.py.
+NS_MEQSERVER_RECYCLE = 20
+# Failed evaluations per run that keep their Measurement Set and images; the rest
+# keep logs and metrics. A failure storm once filled the one-million-file quota.
+NS_KEEP_FAILED_ARTEFACTS = 20
+# 1 in this many successful evaluations keeps its logs and images while a run
+# goes; the rest keep metrics.json only, bar each rank's lowest and highest
+# objectives (retain_evaluation_detail in common.py). 1 keeps everything.
+NS_KEEP_DETAIL_EVERY = 100
 
 # CLEAN's minor-iteration budget per major cycle, WSClean's `-niter`. At the
 # old value of 100 roughly four evaluations in five stopped on `maximum number
@@ -123,7 +144,7 @@ NS_WSCLEAN_MGAIN = 0.8
 # threshold; each record's `clean_stop_reason` says which of the two ended it,
 # so the question is now answerable from the summary rather than the logs.
 # Costs imaging time: deconvolution was ~7% of an evaluation at 100.
-NS_WSCLEAN_NITER = 10000
+NS_WSCLEAN_NITER = 100000
 
 # How many times a search that died with work already banked restarts itself
 # from PolyChord's checkpoint before giving up. 0 disables it. An attempt that
@@ -229,14 +250,14 @@ name = "source_l_pixels"
 kind = "image_pixels"
 fraction = 1
 default = 0.0
-enabled = false
+enabled = true
 
 [[parameter_space]]
 name = "source_m_pixels"
 kind = "image_pixels"
 fraction = 1
 default = 0.0
-enabled = false
+enabled = true
 
 # Point sources in the truth sky, all `source_flux_jy`. The first is the one
 # the position dimensions above place; the rest sit at fixed pixels drawn from
@@ -260,7 +281,7 @@ min = -15
 max = 75
 kind = "integer"
 default = 34
-enabled = false
+enabled = true
 
 # Correlator dump time, makems' `StepTime`: `NTimes = ceil(observation_minutes
 # * 60 / this)`, so it trades sampling density against track length. The only
@@ -277,7 +298,7 @@ min = 1
 max = 10
 kind = "integer"
 default = 2
-enabled = false
+enabled = true
 
 # The receiver bands the sampled spectral window has to fit inside, in Hz.
 # These are the VLA's; nothing in the code is VLA-specific, so pointing this

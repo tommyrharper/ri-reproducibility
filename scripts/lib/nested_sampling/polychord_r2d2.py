@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import ctypes
 import json
 import os
 import subprocess
+import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -16,21 +19,35 @@ from typing import Any
 import numpy as np
 
 from common import (
+    polychord_nfail,
     DEFAULT_SUPER_RESOLUTION,
     FAILURE_OBJECTIVE,
     WORKER_DIED,
     WorkerDied,
+    abort_on_exception,
     abort_run,
     adopt_completed_evaluations,
     cube_like_from_theta,
     cube_to_params,
+    drain_record_writes,
+    evidence_record,
+    PolyChordFinish,
+    chains_base_dir,
+    start_chains_mirror,
+    finished_run_records,
+    follow_r2d2_worker_node,
+    pack_finished_run,
+    encode_finished_records,
+    start_record_packer,
+    stop_record_packer,
+    POST_RUN_SECONDS,
+    post_run_line,
+    post_run_phase,
     gathered_window_fit_stats,
     compute_image_metrics,
     extra_source_offsets_arcsec,
     image_dim,
     image_pixel_size_arcsec,
-    convert_ms_to_mat,
-    evaluation_scratch_dir,
     load_evaluations_from_dir,
     load_parameter_space,
     mark_evaluation_start,
@@ -38,20 +55,24 @@ from common import (
     params_key,
     prewarm,
     prune_run_artefacts,
+    salvage_evaluation_logs,
     prior_vector,
     r2d2_thread_count,
     r2d2_worker,
     resolve_metric,
     run_r2d2_imaging,
     self_check_lazy_numpy,
+    self_check_follow_worker_node,
     self_check_metric_resolution,
     self_check_parameter_space,
     self_check_parameter_toggle,
+    self_check_evidence_record,
     self_check_profiling,
     self_check_resume_adoption,
     self_check_source_offset,
     self_check_spectral_window,
     self_check_worker_pool_connect,
+    self_check_abort_on_exception,
     self_check_worker_timeout,
     simulate_measurement_set,
     simulate_worker,
@@ -61,6 +82,7 @@ from common import (
     write_evaluation_record,
     write_json_atomic,
     write_polychord_paramnames,
+    write_records_in_background,
 )
 
 DEFAULT_R2D2_NUM_ITER = 25
@@ -89,7 +111,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> None:
+def r2d2_iterations(stdout_path: Path) -> int | None:
+    """U-Net forwards this request ran: upstream prints one `RDR:` line per
+    iteration, and `prune: True` stops the series early on the residual, so the
+    count (1-25) follows the image and drifts with the search (round 317)."""
+    try:
+        text = stdout_path.read_text(errors="replace")
+    except OSError:
+        return None
+    return sum(line.startswith("RDR:") for line in text.splitlines()) or None
+
+
+def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> int:
+    threads = r2d2_thread_count()
     lines = [
         f"data_file: {data_file}",
         f"output_path: {output_path}",
@@ -110,6 +144,10 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         f"architecture: {DEFAULT_R2D2_ARCHITECTURE}",
         "prune: True",
         "sigma_res_tol: 1e-4",
+        # Only read against a ground truth (`gdth_file`) or across several
+        # realisations, neither used here. Unset, imager.py estimates it from
+        # the operator norm: 0.38s of a 1.8s request on CSD3.
+        "target_dynamic_range: 0.0",
         f"ckpt_path: {R2D2_CKPT_PATH}",
         f"ckpt_realisations: {DEFAULT_R2D2_CKPT_REALISATIONS}",
         # R2D2's set_common_args() calls torch.set_num_threads() itself, from
@@ -117,10 +155,11 @@ def write_r2d2_config(config_path: Path, data_file: str, output_path: str) -> No
         # worker pool's `apptainer exec --env` sets. Without this every rank
         # asked torch for all 20 host CPUs, so the 8 default ranks ran 160
         # threads on 20 cores.
-        f"ncpus: {r2d2_thread_count()}",
+        f"ncpus: {threads}",
         "",
     ]
     config_path.write_text("\n".join(lines))
+    return threads
 
 
 def evaluate(
@@ -133,7 +172,9 @@ def evaluate(
     # Open interval lets profiler separate PolyChord time from idle time.
     mark_evaluation_start()
     sim_start = time.perf_counter()
-    ms_path, sim_cmd, sim_error = simulate_measurement_set(params, eval_dir, args.meqtrees_image, args.platform)
+    ms_path, sim_cmd, sim_error = simulate_measurement_set(
+        params, eval_dir, args.meqtrees_image, args.platform, r2d2_mat=True
+    )
     simulate_seconds = time.perf_counter() - sim_start
     # Dead worker is host failure, not an algorithm score.
     if sim_error is not None and sim_error.returncode == WORKER_DIED:
@@ -152,9 +193,11 @@ def evaluate(
     # R2D2 sizes its own pixels from the data and writes no WCS, so the metrics
     # have to be told the cell size it used. Same figure WSClean is handed as
     # `-scale`, from the same recorded baseline, so the two score the same sky
-    # - see image_pixel_size_arcsec() in common.py. Read here rather than after
-    # the convert because the convert needs this file's noise sigma too.
-    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    # - see image_pixel_size_arcsec() in common.py.
+    # Everything below is written beside the MS: tmpfs scratch when the run
+    # has one, which publish_evaluation_scratch() empties at scoring.
+    work_dir = ms_path.parent
+    simulation = json.loads((work_dir / "simulation.json").read_text())
     if "max_proj_baseline_lambda" not in simulation["observation"]:
         raise SystemExit(
             "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
@@ -162,37 +205,17 @@ def evaluate(
         )
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
-    # Keep conversion output beside the MS when run uses tmpfs scratch.
-    mat_path = (evaluation_scratch_dir(eval_dir) or eval_dir) / "r2d2_data.mat"
-    # Convert in simulate worker; passing noise sigma once avoids a 31% fill cost.
-    convert_cmd = [
-        "--ms-path", str(ms_path),
-        "--mat-path", str(mat_path),
-        "--noise-sigma-jy", repr(float(simulation["noise"]["complex_sigma_jy"])),
-    ]
-    convert_start = time.perf_counter()
-    convert_returncode = convert_ms_to_mat(convert_cmd, eval_dir, args.meqtrees_image, args.platform)
-    convert_seconds = time.perf_counter() - convert_start
-    if convert_returncode == WORKER_DIED:
-        raise WorkerDied(f"simulate worker died converting evaluation {eval_id} ({eval_dir})")
-    if convert_returncode != 0:
-        return write_evaluation_record(eval_dir, {
-            "eval_id": eval_id,
-            "params": params,
-            "objective": FAILURE_OBJECTIVE,
-            "error": f"ms_to_r2d2_mat failed with exit {convert_returncode}",
-            "paths": {"eval_dir": str(eval_dir), "measurement_set": str(ms_path)},
-            "commands": {"simulate": sim_cmd, "ms_to_r2d2_mat": convert_cmd},
-            "timing": {"simulate_seconds": simulate_seconds, "convert_seconds": convert_seconds},
-        })
+    # The simulate request wrote it from the arrays it put in the MS
+    # (--mat-path), so there is no convert stage any more.
+    mat_path = work_dir / "r2d2_data.mat"
 
-    r2d2_dir = eval_dir / "r2d2"
+    r2d2_dir = work_dir / "r2d2"
     r2d2_dir.mkdir()
-    config_path = eval_dir / "r2d2_config.yaml"
-    write_r2d2_config(config_path, str(mat_path), str(r2d2_dir))
+    config_path = work_dir / "r2d2_config.yaml"
+    r2d2_threads = write_r2d2_config(config_path, str(mat_path), str(r2d2_dir))
 
-    r2d2_stdout = eval_dir / "r2d2.stdout.log"
-    r2d2_stderr = eval_dir / "r2d2.stderr.log"
+    r2d2_stdout = work_dir / "r2d2.stdout.log"
+    r2d2_stderr = work_dir / "r2d2.stderr.log"
     # `imager.py` argv for this rank's long-lived R2D2 worker (see
     # run_r2d2_imaging): a fresh `docker run` of this image cost ~2.4s warm, of
     # which ~1.8s was container start plus torch and R2D2 imports.
@@ -221,7 +244,6 @@ def evaluate(
             "peak_memory_bytes": peak_memory_bytes,
             "timing": {
                 "simulate_seconds": simulate_seconds,
-                "convert_seconds": convert_seconds,
                 "image_container_seconds": run_result.wall_seconds,
             },
         })
@@ -259,7 +281,6 @@ def evaluate(
             },
             "timing": {
                 "simulate_seconds": simulate_seconds,
-                "convert_seconds": convert_seconds,
                 "image_container_seconds": run_result.wall_seconds,
                 "metrics_seconds": metrics_seconds,
             },
@@ -270,12 +291,13 @@ def evaluate(
         "eval_id": eval_id,
         "params": params,
         "image_pixel_size_arcsec": scale_arcsec,
+        "r2d2_threads": r2d2_threads,
         "metrics": metrics,
         "objective": objective,
         "paths": {
             "eval_dir": str(eval_dir),
             "measurement_set": str(ms_path),
-            "simulation_metadata": str(eval_dir / "simulation.json"),
+            "simulation_metadata": str(work_dir / "simulation.json"),
             "mat": str(mat_path),
             "image": str(image_path),
             "dirty": str(dirty_path),
@@ -283,42 +305,119 @@ def evaluate(
         },
         "commands": {
             "simulate": sim_cmd,
-            "ms_to_r2d2_mat": convert_cmd,
             "r2d2": r2d2_cmd,
         },
         "timing": {
             "simulate_seconds": simulate_seconds,
-            "convert_seconds": convert_seconds,
             "image_container_seconds": run_result.wall_seconds,
             "metrics_seconds": metrics_seconds,
+            "r2d2_iterations": r2d2_iterations(r2d2_stdout),
         },
     }
     return write_evaluation_record(eval_dir, record)
 
 
-def self_check_r2d2_config_thread_cap() -> None:
-    """`ncpus` must reach the config, or torch takes every host CPU per rank."""
+_STACK_DUMP_FILES: list = []
+
+
+def start_stack_dumps(output_dir: Path) -> None:
+    """NS_STACK_DUMP_S=<s>: every s seconds, this rank's Python stacks, all threads, to stacks/rank-NNN.txt.
+
+    py-spy cannot attach to a rank inside Apptainer (round 323), and a Python
+    sampling thread stops whenever a C call holds the GIL. faulthandler's
+    watchdog is a C thread that needs neither. Its dumps carry no time: dump k
+    is at the header's start + k x s.
+    """
+    every = float(os.environ.get("NS_STACK_DUMP_S") or 0)
+    if every <= 0:
+        return
+    import faulthandler
+
+    stacks = output_dir / "stacks"
+    stacks.mkdir(exist_ok=True)
+    out = open(stacks / f"rank-{mpi_rank():03d}.txt", "a")
+    out.write(f"# start {time.time():.3f} every {every:g}s pid {os.getpid()}\n")
+    out.flush()
+    faulthandler.dump_traceback_later(every, repeat=True, file=out)
+    _STACK_DUMP_FILES.append(out)
+
+
+def self_check_stack_dumps() -> None:
+    import faulthandler
     import tempfile
 
-    saved = os.environ.get("R2D2_OMP_THREADS")
+    os.environ["NS_STACK_DUMP_S"] = "0.1"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            start_stack_dumps(Path(tmp))
+            time.sleep(0.35)
+            faulthandler.cancel_dump_traceback_later()
+            text = (Path(tmp) / "stacks" / f"rank-{mpi_rank():03d}.txt").read_text()
+            assert text.startswith("# start "), text[:80]
+            assert text.count("Thread 0x") >= 2 and "self_check_stack_dumps" in text, text[:400]
+    finally:
+        os.environ.pop("NS_STACK_DUMP_S")
+        _STACK_DUMP_FILES.pop().close()
+
+
+def self_check_r2d2_iterations() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "r2d2.stdout.log"
+        assert r2d2_iterations(out) is None, "a missing log has no count"
+        out.write_text("RDR: 1.0e-01\nRDR rel. diff: 2.0e-01\nRDR: 8.0e-02\nRDR rel. diff: 2.0e-05\n"
+                       "Imaging finished in 2/25 iterations in 0.5 sec, \n")
+        assert r2d2_iterations(out) == 2, r2d2_iterations(out)
+
+
+def self_check_r2d2_config_thread_cap() -> None:
+    """`ncpus` must reach the config, or torch takes every host CPU per rank.
+    Under R2D2_MAX_THREADS it grows as the evaluations in flight fall."""
+    import tempfile
+
+    names = ("R2D2_OMP_THREADS", "R2D2_MAX_THREADS", "NS_SCRATCH_DIR")
+    saved = {name: os.environ.pop(name, None) for name in names}
     os.environ["R2D2_OMP_THREADS"] = "3"
     try:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "r2d2_config.yaml"
-            write_r2d2_config(config, "/data.mat", tmp)
-            assert "ncpus: 3" in config.read_text().splitlines()
+
+            def ncpus() -> int:
+                write_r2d2_config(config, "/data.mat", tmp)
+                return int(next(line for line in config.read_text().splitlines()
+                                if line.startswith("ncpus: "))[len("ncpus: "):])
+
+            assert ncpus() == 3
+            os.environ["R2D2_MAX_THREADS"] = "24"
+            assert ncpus() == 3, "adaptive threads without a scratch dir"
+            os.environ["NS_SCRATCH_DIR"] = str(Path(tmp) / "scratch")
+            mark_evaluation_start()
+            assert ncpus() == 24, "one evaluation in flight should get every CPU"
+            busy = Path(tmp) / "scratch" / ".busy"
+            for pid in range(1, 5):
+                (busy / f"other-{pid}").touch()
+            assert ncpus() == 4, "five in flight share 24 CPUs"
+            for pid in range(5, 12):
+                (busy / f"other-{pid}").touch()
+            assert ncpus() == 3, "never below R2D2_OMP_THREADS"
+            eval_dir = Path(tmp) / "eval-1"
+            eval_dir.mkdir()
+            write_evaluation_record(eval_dir, {"eval_id": 1, "objective": 0.0})
+            drain_record_writes()
+            assert not (busy / str(os.getpid())).exists(), "scoring must clear the busy marker"
     finally:
-        if saved is None:
-            del os.environ["R2D2_OMP_THREADS"]
-        else:
-            os.environ["R2D2_OMP_THREADS"] = saved
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def self_check_worker_death_is_not_scored() -> None:
     """A dead worker must stop the run, not become its best point."""
     import tempfile
 
-    original_convert = globals()["convert_ms_to_mat"]
     original_run_r2d2 = globals()["run_r2d2_imaging"]
     original_simulate = globals()["simulate_measurement_set"]
 
@@ -327,10 +426,11 @@ def self_check_worker_death_is_not_scored() -> None:
         eval_dir: Path,
         meqtrees_image: str,
         platform: str,
+        r2d2_mat: bool = False,
     ) -> tuple[Path, list[str], None]:
         eval_dir.mkdir(parents=True, exist_ok=False)
-        # A real simulate always leaves this, and evaluate() reads it before the
-        # convert for the cell size and the noise sigma; a stub without one
+        # A real simulate always leaves this, and evaluate() reads it for the
+        # cell size; a stub without one
         # takes the run out on FileNotFoundError before reaching what is being
         # checked here.
         (eval_dir / "simulation.json").write_text(
@@ -355,7 +455,6 @@ def self_check_worker_death_is_not_scored() -> None:
     )
     try:
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["convert_ms_to_mat"] = lambda *a, **k: 0
 
         globals()["run_r2d2_imaging"] = imaging(WORKER_DIED)
         with tempfile.TemporaryDirectory() as tmp:
@@ -380,7 +479,9 @@ def self_check_worker_death_is_not_scored() -> None:
 
         # The same split applies to a dead simulate worker.
         globals()["run_r2d2_imaging"] = imaging(0)
-        globals()["convert_ms_to_mat"] = lambda *a, **k: WORKER_DIED
+        globals()["simulate_measurement_set"] = lambda params, eval_dir, *a, **k: (
+            eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(WORKER_DIED, ["simulate"])
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             try:
@@ -391,7 +492,6 @@ def self_check_worker_death_is_not_scored() -> None:
                 raise AssertionError("a dead simulate worker was scored instead of stopping the run")
     finally:
         globals()["simulate_measurement_set"] = original_simulate
-        globals()["convert_ms_to_mat"] = original_convert
         globals()["run_r2d2_imaging"] = original_run_r2d2
 
 
@@ -399,7 +499,6 @@ def self_check_failure_record_persistence() -> None:
     import tempfile
 
     original_compute_metrics = globals()["compute_image_metrics"]
-    original_convert = globals()["convert_ms_to_mat"]
     original_run_r2d2 = globals()["run_r2d2_imaging"]
     original_simulate = globals()["simulate_measurement_set"]
 
@@ -408,6 +507,7 @@ def self_check_failure_record_persistence() -> None:
         eval_dir: Path,
         meqtrees_image: str,
         platform: str,
+        r2d2_mat: bool = False,
     ) -> tuple[Path, list[str], subprocess.CalledProcessError]:
         eval_dir.mkdir(parents=True, exist_ok=False)
         return eval_dir / "sim.ms", ["simulate"], subprocess.CalledProcessError(7, ["simulate"])
@@ -428,11 +528,11 @@ def self_check_failure_record_persistence() -> None:
             eval_dir: Path,
             meqtrees_image: str,
             platform: str,
+            r2d2_mat: bool = False,
         ) -> tuple[Path, list[str], None]:
             eval_dir.mkdir(parents=True, exist_ok=False)
             # A real simulate always leaves this behind, and evaluate() reads it
-            # for the cell size R2D2's images carry no header for and for the
-            # noise sigma the .mat convert needs.
+            # for the cell size R2D2's images carry no header for.
             (eval_dir / "simulation.json").write_text(
                 json.dumps({
                     "observation": {"max_proj_baseline_lambda": 1.0e5},
@@ -441,9 +541,6 @@ def self_check_failure_record_persistence() -> None:
             )
             return eval_dir / "sim.ms", ["simulate"], None
 
-        def successful_convert(*args: Any, **kwargs: Any) -> int:
-            return 0
-
         def successful_r2d2(*args: Any, **kwargs: Any) -> argparse.Namespace:
             return argparse.Namespace(returncode=0, wall_seconds=2.0, peak_memory_bytes=4096)
 
@@ -451,7 +548,6 @@ def self_check_failure_record_persistence() -> None:
             raise ValueError("bad fits")
 
         globals()["simulate_measurement_set"] = successful_simulate
-        globals()["convert_ms_to_mat"] = successful_convert
         globals()["run_r2d2_imaging"] = successful_r2d2
         globals()["compute_image_metrics"] = failing_metrics
         with tempfile.TemporaryDirectory() as tmp:
@@ -470,12 +566,94 @@ def self_check_failure_record_persistence() -> None:
             assert loaded[0]["timing"]["metrics_seconds"] >= 0.0
     finally:
         globals()["compute_image_metrics"] = original_compute_metrics
-        globals()["convert_ms_to_mat"] = original_convert
         globals()["run_r2d2_imaging"] = original_run_r2d2
         globals()["simulate_measurement_set"] = original_simulate
 
 
+def share_resume(chains: Path, base_dir: Path, file_root: str, read_resume: bool) -> bool:
+    """Every rank, before run_polychord: make sure this rank sees <root>.resume.
+
+    PolyChord tests `base_dir/<root>.resume` on every rank (resume_file_exists
+    in nested_sampling.F90), and a rank that finds none runs GenerateLivePoints
+    while the root resumes, so the search deadlocks. base_dir is node tmpfs,
+    which only rank 0's ChainsMirror seeds, so with NS_NODES > 1 every resumed
+    attempt hung on the other nodes (round 289). Each rank copies under its own
+    name and renames, so ranks sharing a node never see half a file. The
+    barrier also keeps rank 0's own node from testing before it has seeded.
+    Returns whether base_dir is a copy on another node, to remove at the end."""
+    try:
+        import socket
+
+        from mpi4py import MPI
+    except ImportError:
+        return False
+    comm = MPI.COMM_WORLD
+    off_root = comm.bcast(socket.gethostname(), root=0) != socket.gethostname()
+    if off_root and read_resume and base_dir != chains:
+        seed_resume(chains, base_dir, file_root, comm.Get_rank())
+    comm.Barrier()
+    return off_root and base_dir != chains
+
+
+def seed_resume(chains: Path, base_dir: Path, file_root: str, rank: int) -> None:
+    import shutil
+
+    target = base_dir / f"{file_root}.resume"
+    if not target.exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
+        partial = base_dir / f".{target.name}.{rank}"
+        shutil.copyfile(chains / target.name, partial)
+        partial.replace(target)
+
+
+def self_check_share_resume() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        chains, shm = Path(tmp) / "chains", Path(tmp) / "shm"
+        chains.mkdir()
+        (chains / "r.resume").write_text("checkpoint")
+        # One rank, no other node: nothing to copy and nothing to remove.
+        assert share_resume(chains, shm, "r", True) is False
+        assert not shm.exists()
+        # Another node: a whole copy under the final name, no partial left.
+        seed_resume(chains, shm, "r", 7)
+        assert (shm / "r.resume").read_text() == "checkpoint"
+        assert [p.name for p in shm.iterdir()] == ["r.resume"]
+        # A rank on the same node that comes second keeps the first copy.
+        (chains / "r.resume").write_text("newer")
+        seed_resume(chains, shm, "r", 8)
+        assert (shm / "r.resume").read_text() == "checkpoint"
+
+
+def write_pre_run_marks(marks: dict[str, float]) -> None:
+    """Append each rank phase's slowest and first rank to NS_PRE_RUN_TSV.
+
+    Collective when the launcher set it. The search starts at the slowest
+    rank, which on another node is not rank 0 (round 341).
+    """
+    path = os.environ.get("NS_PRE_RUN_TSV")
+    if not path:
+        return
+    try:
+        from mpi4py import MPI
+
+        gathered = MPI.COMM_WORLD.gather(marks, root=0)
+    except ImportError:
+        gathered = [marks]
+    if mpi_rank() != 0:
+        return
+    lines = "".join(f"{max(m[name] for m in gathered):.3f}\t{name}\t{min(m[name] for m in gathered):.3f}\n"
+                    for name in marks)
+    try:
+        with open(path, "a") as out:
+            out.write(lines)
+    except OSError:
+        pass
+
+
 def main() -> None:
+    marks = {"main": time.time()}
     args = parse_args()
     args.repo_root = str(Path(args.repo_root).resolve())
     if not args.checkpoints_dir:
@@ -492,6 +670,7 @@ def main() -> None:
     # every rank ran this line, so twenty of them raced over one file.
     if mpi_rank() == 0:
         write_json_atomic(output_dir / "parameter-space.json", load_parameter_space())
+    start_stack_dumps(output_dir)
 
     # Start both workers before `import pypolychord`, then join before evaluation.
     warm = prewarm(
@@ -502,6 +681,7 @@ def main() -> None:
     import pypolychord
     from pypolychord.settings import PolyChordSettings
 
+    marks["pypolychord"] = time.time()
     objective_from_metrics, likelihood_framing = resolve_metric(args.metric)
 
     # key -> objective, not key -> record: nothing reads the record back (the
@@ -510,13 +690,18 @@ def main() -> None:
     # id counter the list length used to supply.
     cache: dict[str, float] = {}
     scored = 0
+    # After the first evaluation, not at connect: the pool holds both FIFO
+    # ends, so a rank connects before its worker has forked onto its node.
+    followed = False
 
     def prior(cube: np.ndarray) -> np.ndarray:
         params = cube_to_params(cube, track=True)
         return prior_vector(cube, params)
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
-        nonlocal scored
+        nonlocal scored, followed
+        if finish.finished():
+            return finish.discarded(), []
         params = cube_to_params(cube_like_from_theta(theta))
         key = params_key(params)
         params["noise_seed"] = stable_seed(args.seed, key)
@@ -530,6 +715,7 @@ def main() -> None:
             except WorkerDied as exc:
                 # No honest likelihood exists for an evaluation the host never
                 # ran, and any value invented here would steer the sampler.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(str(exc))
             except (Exception, SystemExit):
                 # Anything else is a bug in this file, and a bug here used to
@@ -538,21 +724,26 @@ def main() -> None:
                 # only and every other rank waits forever in a collective that
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(traceback.format_exc())
             cache[key] = float(record["objective"])
+            if not followed:
+                followed = True
+                follow_r2d2_worker_node(args.r2d2_image, args.meqtrees_image)
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
         return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
-    settings.base_dir = str(output_dir / "chains")
+    settings.base_dir = str(chains_base_dir(output_dir))
     settings.file_root = "r2d2_vlaa"
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
+    settings.nfail = polychord_nfail(args.nlive)
     # Checkpoint long runs so interruptions are resumable via `--output-dir`.
-    resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
+    resume_path = output_dir / "chains" / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
     # Always adopt disk evaluations: retries can die before PolyChord writes a
@@ -564,17 +755,48 @@ def main() -> None:
                  else "no checkpoint to resume from, re-sampling from the cache")
         print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
+    marks["adopted"] = time.time()
 
-    write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    if mpi_rank() == 0:  # one writer: rank 0's mirror seeds tmpfs from it, and another
+        # rank's truncating rewrite once seeded an empty file (round 229)
+        write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
+    marks["warm"] = time.time()
+    write_pre_run_marks(marks)
     run_start, run_started_epoch = time.monotonic(), time.time()
-    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
+    write_records_in_background()
+    packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
+    mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
+    node_copy = share_resume(output_dir / "chains", Path(settings.base_dir), settings.file_root, settings.read_resume)
+    finish = PolyChordFinish()
+    try:
+        output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
+    except FileNotFoundError:
+        # pypolychord reads <root>.stats on every rank once the run is over, and
+        # across nodes (NS_NODES) a rank off the root's node has no copy of its
+        # tmpfs chains; only rank 0 uses the output (docs/csd3-speed.md, round 287).
+        if mpi_rank() == 0 or (Path(settings.base_dir) / f"{settings.file_root}.stats").exists():
+            raise
+        output = None
     total_wall_seconds = time.monotonic() - run_start
-    # Collective, so every rank calls it before rank 0 goes on alone.
-    window_fit_stats = gathered_window_fit_stats()
+    returned = time.monotonic()
+    finish.close()
+    if node_copy:
+        import shutil
 
-    if mpi_rank() == 0:
-        all_evaluations = load_evaluations_from_dir(evaluations_dir)
+        shutil.rmtree(settings.base_dir, ignore_errors=True)
+    if mirror is not None:
+        mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
+    stop_record_packer(packer)
+    stopped = time.monotonic() - returned
+    # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
+    all_evaluations = finished_run_records(evaluations_dir)
+    started = time.monotonic()
+    window_fit_stats = gathered_window_fit_stats()
+    POST_RUN_SECONDS["stop"] = stopped  # before finished_run_records(), which clears the dict
+
+    if all_evaluations is not None:
+        started = post_run_phase("window_fit", started)
         best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
         mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
         summary = {
@@ -605,23 +827,58 @@ def main() -> None:
                 "ckpt_realisations": DEFAULT_R2D2_CKPT_REALISATIONS,
             },
             "parameter_space": load_parameter_space(),
+            # Before the bulk, so a listing reads it out of the head rather
+            # than stat-ing every evaluation directory.
+            "evaluation_count": len(all_evaluations),
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "evidence": evidence_record(output),
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
+        started = post_run_phase("profile", started)
         # Rank-based, so it can only run now that every evaluation is scored.
         # Mutates the records the summary embeds, so summary.json never names
         # an image this just deleted.
         prune_run_artefacts(evaluations_dir, all_evaluations)
+        started = post_run_phase("prune", started)
         summary_path = output_dir / "summary.json"
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
-        write_json_atomic(summary_path, summary)
+        encoded = encode_finished_records()
+        write_json_atomic(summary_path, summary, list(encoded.values()))
+        started = post_run_phase("summary", started)
+        pack_finished_run(evaluations_dir, encoded)
+        post_run_phase("pack", started)
+        print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")
+
+
+def exit_without_teardown() -> None:
+    """End a finished rank through libc, as an interpreter exit does, less its
+    freeing of every record: mpirun outlived the last MPI_Finalize by 4.4s at
+    356k evaluations, with all 8 nodes held (csd3-speed.md, round 371). libc's
+    exit, not os._exit: libgfortran flushes PolyChord's last output there."""
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    from mpi4py import MPI
+
+    MPI.Finalize()
+    ctypes.CDLL(None).exit(0)
+
+
+def self_check_exit_without_teardown() -> None:
+    code = ("import atexit, polychord_r2d2 as p; atexit.register(print, 'hook'); "
+            "print('printed'); p.exit_without_teardown(); print('after')")
+    env = {key: value for key, value in os.environ.items() if key != "POLYCHORD_R2D2_SELF_CHECK"}
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                          cwd=Path(__file__).parent, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["printed", "hook"], done.stdout
 
 
 if __name__ == "__main__":
@@ -632,13 +889,21 @@ if __name__ == "__main__":
         self_check_spectral_window()
         self_check_lazy_numpy()
         self_check_r2d2_config_thread_cap()
+        self_check_r2d2_iterations()
+        self_check_stack_dumps()
         self_check_source_offset()
         self_check_profiling()
+        self_check_evidence_record()
         self_check_failure_record_persistence()
         self_check_worker_death_is_not_scored()
         self_check_resume_adoption()
+        self_check_abort_on_exception()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
+        self_check_follow_worker_node()
+        self_check_share_resume()
+        self_check_exit_without_teardown()
         print("metric resolution self-check passed")
     else:
-        main()
+        abort_on_exception(main)
+        exit_without_teardown()

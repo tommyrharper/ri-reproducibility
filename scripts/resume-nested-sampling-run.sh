@@ -84,10 +84,11 @@ if [ "${1:-}" = "--self-check" ]; then
   printf 'NS_ALGORITHM=wsclean\nNS_MPI_PROCS=1\n' >"${COUNT_RUN}/run.env"
   echo '{}' >"${COUNT_RUN}/evaluations/eval-0001-a/metrics.json"
   echo '{}' >"${COUNT_RUN}/evaluations/eval-0002-b/metrics.json"
+  echo '{}' >"${COUNT_RUN}/evaluations/eval-0004-d.json"
 
   OUT="$(NS_AVAILABLE_MB=4900 bash "$0" "${COUNT_RUN}" 2>&1 || true)"
   case "${OUT}" in
-    *"(wsclean, 2 evaluations already done, 1 rank)"*) ;;
+    *"(wsclean, 3 evaluations already done, 1 rank)"*) ;;
     *) echo "FAIL: resume must count scored evaluations, got: ${OUT}"; exit 1 ;;
   esac
   case "${OUT}" in
@@ -109,7 +110,7 @@ if [ "${1:-}" = "--self-check" ]; then
       echo "FAIL: a torn summary must not count as finished, got: ${OUT}"; exit 1 ;;
   esac
   case "${OUT}" in
-    *"half-written summary.json"*"2 evaluations already done"*) ;;
+    *"half-written summary.json"*"3 evaluations already done"*) ;;
     *) echo "FAIL: the resume must say it is rewriting the summary, got: ${OUT}"; exit 1 ;;
   esac
   rm -f "${COUNT_RUN}/summary.json"
@@ -171,10 +172,24 @@ set -a
 . "${RUN_DIR}/run.env"
 set +a
 export OUTPUT_DIR="${RUN_DIR}"
+# A run.env from before round 141 has no R2D2_RUNTIME and was torch; without
+# this it would resume under the newer onnx default.
+if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_RUNTIME=' "${RUN_DIR}/run.env"; then
+  export R2D2_RUNTIME="${R2D2_RUNTIME:-torch}"
+fi
+# Likewise a TensorRT run.env from before round 215 without R2D2_TRT_SHARED
+# ran per-worker engines, not the newer shared default.
+if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_TRT_SHARED=' "${RUN_DIR}/run.env"; then
+  export R2D2_TRT_SHARED="${R2D2_TRT_SHARED:-0}"
+fi
+# And one from before round 327 without R2D2_TRT_BATCH sent single forwards.
+if [ "${NS_ALGORITHM}" = r2d2 ] && ! grep -q '^R2D2_TRT_BATCH=' "${RUN_DIR}/run.env"; then
+  export R2D2_TRT_BATCH="${R2D2_TRT_BATCH:-1}"
+fi
 
 case "${NS_ALGORITHM}" in
   r2d2) RUN_SCRIPT="scripts/run-nested-sampling-r2d2.sh"
-        MB_PER_RANK="${NS_R2D2_MB_PER_RANK}" ;;
+        MB_PER_RANK="$(ns_r2d2_mb)" ;;  # run.env may set R2D2_RUNTIME
   wsclean) RUN_SCRIPT="scripts/run-nested-sampling.sh"
         MB_PER_RANK="${NS_WSCLEAN_MB_PER_RANK}" ;;
   *)
@@ -193,8 +208,7 @@ fi
 # Count scored evaluations; guard missing evaluations/ under `pipefail`.
 DONE=0
 if [ -d "${RUN_DIR}/evaluations" ]; then
-  DONE="$(find "${RUN_DIR}/evaluations" -mindepth 2 -maxdepth 2 -name 'metrics.json' \
-    | wc -l | tr -d ' ')"
+  DONE="$(_ns_completed_evals "${RUN_DIR}")"
 fi
 if [ "${NS_MPI_PROCS:-}" = 1 ]; then RANKS="1 rank"; else RANKS="${NS_MPI_PROCS:-?} ranks"; fi
 # Record downtime beside automatic retries; health excludes it.

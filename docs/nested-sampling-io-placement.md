@@ -13,6 +13,10 @@ a rename. The other two - WSClean's `-temp-dir` and its FITS output - are free
 where they are, and this document records the measurements that say so, because
 the rig that first said otherwise was wrong in a way worth remembering.
 
+On CSD3 the evaluation directory is on Lustre, where the FITS output and logs
+are not free: every evaluation file now goes to the scratch tmpfs first
+([docs/csd3-speed.md](csd3-speed.md), round 5).
+
 Everything below was measured on the current tree, 29 August 2026, on the host
 described in
 [docs/nested-sampling-power-limit.md](nested-sampling-power-limit.md).

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import io
 import json
 import math
 import os
+import pickle
 import shutil
 import signal
 import subprocess
@@ -47,6 +49,13 @@ def scratch_root_for(destination: Path) -> str | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _parser().parse_args(argv)
+
+
+# Built once per worker: constructing it per request cost 0.41ms of a 7.5ms
+# small simulate, mostly argparse's gettext lookups (docs/csd3-speed.md, round 61).
+@functools.lru_cache(maxsize=None)
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-ms", required=True, help="Measurement Set path to create")
     parser.add_argument("--metadata-json", help="Optional JSON metadata path")
@@ -69,7 +78,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # On the argv rather than in the worker request, so the command recorded in
     # metrics.json reproduces the evaluation's bound as well as its parameters.
     parser.add_argument("--predict-wait-seconds", type=float, default=None)
-    return parser.parse_args(argv)
+    # The R2D2 PoC's .mat, written from the arrays this run just put in the MS
+    # instead of a second worker request reading them back (round 13).
+    parser.add_argument("--mat-path", default=None, help="Also write R2D2's .mat (correlation 0) here")
+    # R2D2 reads only the .mat, so building and filling an MS nobody opens was a
+    # third of the stage (docs/csd3-speed.md, round 21). Falls back to the MS
+    # whenever makems has to run, since that build is what fills the caches.
+    parser.add_argument("--mat-only", action="store_true", help="With --mat-path: write no MS when its observation is cached")
+    # The search's longest observation. An uncached (declination, integration)
+    # is then built once at that length, not once per new longest draw
+    # (docs/csd3-speed.md, round 36).
+    parser.add_argument("--observation-horizon-minutes", type=float, default=0.0)
+    return parser
 
 
 def require_clean_output(output_ms: Path) -> None:
@@ -94,13 +114,13 @@ def makems_declination(degrees: float) -> str:
     return f"{'-' if degrees < 0 else ''}{d}.{m}.{s}"
 
 
+def n_times_of(args: argparse.Namespace) -> int:
+    return max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds)))
+
+
 def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
     output_ms.parent.mkdir(parents=True, exist_ok=True)
-    antenna_dst = output_ms.parent / ANTENNA_TABLE_NAME
-    if not antenna_dst.exists():
-        shutil.unpack_archive(Cattery_VLA_A, output_ms.parent)
-
-    n_times = max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds)))
+    n_times = n_times_of(args)
     cfg = output_ms.parent / "makems.cfg"
     cfg.write_text(
         "\n".join(
@@ -128,6 +148,10 @@ def write_makems_config(args: argparse.Namespace, output_ms: Path) -> Path:
 
 
 def run_makems(output_ms: Path) -> None:
+    # Unpacked only here: makems is the one reader, and most evaluations
+    # extend a cached observation without running it.
+    if not (output_ms.parent / ANTENNA_TABLE_NAME).exists():
+        shutil.unpack_archive(Cattery_VLA_A, output_ms.parent)
     log_path = output_ms.parent / "makems.log"
     with log_path.open("w") as log:
         subprocess.run(
@@ -151,8 +175,11 @@ def run_makems(output_ms: Path) -> None:
 # Cache by (NTimes, NFrequencies): copy/patch ~0.002s vs makems ~0.05s;
 # shared /dev/shm serves all ranks.
 #
-# ponytail: no eviction - the cache ends with the run and the full parameter
-# space is ~20MB. Add an LRU sweep if a longer-lived cache reuses one.
+# Capped at NS_MS_SKELETON_CACHE_MAX shapes, then stops publishing: the default
+# 5-parameter space has under 100 shapes (~20MB), but with integration_seconds
+# and declination_deg searched nearly every evaluation is a new shape. Uncapped,
+# a 112-rank run put 138GB in /dev/shm in 25 minutes and WSClean then died of
+# bad_alloc (docs/csd3-experiments.md, E5).
 _SKELETON_DIR: Path | None = None
 _SKELETON_DIR_EXPLICIT = False
 
@@ -195,6 +222,10 @@ def cached_skeleton(key: str) -> Path:
 
 
 def publish_skeleton(built_ms: Path, cached: Path) -> None:
+    limit = int(os.environ.get("NS_MS_SKELETON_CACHE_MAX", "512"))
+    # Staging directories are mkdtemp's `tmp*`; published shapes are hex names.
+    if sum(1 for name in os.listdir(skeleton_dir()) if not name.startswith("tmp")) >= limit:
+        return
     staging = Path(tempfile.mkdtemp(dir=skeleton_dir()))
     try:
         shutil.copytree(built_ms, staging / "ms", symlinks=True)
@@ -206,19 +237,27 @@ def publish_skeleton(built_ms: Path, cached: Path) -> None:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def spectral_window_values(n_chan: int, start_frequency_hz: float, channel_width_hz: float) -> dict[str, np.ndarray]:
+    widths = np.full((1, n_chan), channel_width_hz)
+    return {"CHAN_FREQ": (start_frequency_hz + (np.arange(n_chan) + 0.5) * channel_width_hz)[None, :],
+            "CHAN_WIDTH": widths, "EFFECTIVE_BW": widths, "RESOLUTION": widths,
+            "REF_FREQUENCY": np.array([start_frequency_hz + n_chan * channel_width_hz / 2.0]),
+            "TOTAL_BANDWIDTH": np.array([n_chan * channel_width_hz])}
+
+
 def patch_spectral_window(output_ms: Path, start_frequency_hz: float, channel_width_hz: float) -> None:
     with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=False, ack=False) as spw:
         n_chan = int(spw.getcol("NUM_CHAN")[0])
-        spw.putcol("CHAN_FREQ", (start_frequency_hz + (np.arange(n_chan) + 0.5) * channel_width_hz)[None, :])
-        widths = np.full((1, n_chan), channel_width_hz)
-        for column in ("CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION"):
-            spw.putcol(column, widths)
-        spw.putcol("REF_FREQUENCY", np.array([start_frequency_hz + n_chan * channel_width_hz / 2.0]))
-        spw.putcol("TOTAL_BANDWIDTH", np.array([n_chan * channel_width_hz]))
+        for column, value in spectral_window_values(n_chan, start_frequency_hz, channel_width_hz).items():
+            spw.putcol(column, value)
+
+
+def skeleton_key(cfg_text: str) -> str:
+    return "\n".join(line for line in cfg_text.splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
 
 
 def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune_unused: bool = False) -> None:
-    key = "\n".join(line for line in cfg.read_text().splitlines() if not line.startswith(("StartFreq=", "StepFreq=")))
+    key = skeleton_key(cfg.read_text())
     cached = cached_skeleton(key)
     if not cached.exists():
         run_makems(output_ms)
@@ -228,6 +267,389 @@ def make_ms_skeleton(cfg: Path, output_ms: Path, args: argparse.Namespace, prune
     shutil.copytree(cached, output_ms, symlinks=True, ignore=ignore)
     patch_spectral_window(output_ms, args.start_frequency_hz, args.channel_width_hz)
     (output_ms.parent / "makems.log").write_text(f"reused a cached makems skeleton for:\n{key}\n")
+
+
+# With declination_deg and integration_seconds searched, the whole-shape cache
+# above almost never hits, and makems spends ~3ms a timestep converting antenna
+# positions to J2000 UVW (docs/csd3-speed.md, round 2). But timestep k of an
+# observation does not depend on its length, so one makems build per
+# (declination, integration) serves every shorter observation: a one-timestep
+# template for the channel count, extended with the cached rows. A row's UVW is
+# makems' per-antenna UVW (relative to antenna 0) of ANTENNA2 minus ANTENNA1,
+# which is what is cached; save_observation() refuses anything it cannot
+# rebuild bit for bit.
+def _config_key(cfg_text: str, dropped: tuple[str, ...]) -> str:
+    key = "\n".join(line for line in cfg_text.splitlines() if not line.startswith(dropped))
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
+def _observation_path(cfg_text: str) -> Path:
+    directory = skeleton_dir() / "observations"
+    directory.mkdir(exist_ok=True)
+    # A pickle, not an .npz: np.load's zip parse of the ten arrays was ~0.8ms of
+    # every extended evaluation, 4% of simulate in-run (docs/csd3-speed.md, round 78).
+    return directory / (_config_key(cfg_text, ("StartFreq=", "StepFreq=", "NFrequencies=", "NTimes=")) + ".pkl")
+
+
+def _template_path(cfg_text: str) -> Path:
+    # "templates" held round 33-65's 4-correlation layout; a run of older
+    # code on this node may still read it.
+    directory = skeleton_dir() / "templates-xxyy"
+    directory.mkdir(exist_ok=True)
+    return directory / _config_key(cfg_text, ("StartFreq=", "StepFreq=", "NTimes=", "Declination=", "StepTime="))
+
+
+def _atomic_publish(write, destination: Path) -> None:
+    staging = Path(tempfile.mkdtemp(dir=destination.parent))
+    try:
+        write(staging / "entry")
+        try:
+            os.replace(staging / "entry", destination)
+        except OSError:
+            pass  # another rank published this directory first
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def save_observation(ms_path: Path, cfg_text: str) -> None:
+    with table(str(ms_path), ack=False) as ms:
+        cols = {c: ms.getcol(c) for c in ("TIME", "TIME_CENTROID", "UVW", "ANTENNA1", "ANTENNA2", "INTERVAL", "EXPOSURE")}
+    with table(str(ms_path / "FIELD"), ack=False) as field:
+        dirs = {c: field.getcol(c) for c in ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME")}
+    with table(str(ms_path / "OBSERVATION"), ack=False) as obs:
+        time_range = obs.getcol("TIME_RANGE")
+    n_rows = len(cols["TIME"])
+    a1, a2 = cols["ANTENNA1"], cols["ANTENNA2"]
+    n_base = int(np.count_nonzero(cols["TIME"] == cols["TIME"][0]))
+    n_times = n_rows // n_base
+    if n_base * n_times != n_rows or not (np.array_equal(a1, np.tile(a1[:n_base], n_times))
+                                           and np.array_equal(a2, np.tile(a2[:n_base], n_times))):
+        return
+    uvw = cols["UVW"].reshape(n_times, n_base, 3)
+    first = a1[:n_base] == 0
+    antenna_uvw = np.zeros((n_times, int(max(a1.max(), a2.max())) + 1, 3))
+    antenna_uvw[:, a2[:n_base][first]] = uvw[:, first]
+    per_time = {c: cols[c].reshape(n_times, n_base)[:, 0] for c in ("TIME", "TIME_CENTROID")}
+    interval, exposure = cols["INTERVAL"][0], cols["EXPOSURE"][0]
+    rebuilt = antenna_uvw[:, a2[:n_base]] - antenna_uvw[:, a1[:n_base]]
+    if not (np.array_equal(rebuilt, uvw)
+            and all(np.array_equal(np.repeat(per_time[c], n_base), cols[c]) for c in per_time)
+            and np.all(cols["INTERVAL"] == interval) and np.all(cols["EXPOSURE"] == exposure)
+            and time_range[0, 1] == time_range[0, 0] + n_times * interval):
+        return
+
+    def write(path: Path) -> None:
+        observation = dict(time=per_time["TIME"], time_centroid=per_time["TIME_CENTROID"], antenna_uvw=antenna_uvw,
+                           interval=interval, exposure=exposure, time_range_start=time_range[0, 0],
+                           **{f"FIELD_{c}": v for c, v in dirs.items()})
+        with path.open("wb") as out:
+            pickle.dump({k: np.asarray(v) for k, v in observation.items()}, out, protocol=5)
+
+    for destination in (_observation_path(cfg_text), _persistent_observation_path(cfg_text)):
+        if destination is not None and _observation_times(destination) < n_times:
+            try:
+                _atomic_publish(write, destination)
+            except OSError:
+                pass  # a persistent cache that went away costs only its speed-up
+
+
+# The run's cache starts empty, so a short run pays makems for nearly every
+# evaluation (docs/csd3-speed.md, round 6). Observations also go to
+# NS_OBSERVATION_CACHE_DIR, which outlives the run; the launcher keys it on
+# the meqtrees image id, since makems and its IERS tables decide the rows.
+def _persistent_observation_path(cfg_text: str) -> Path | None:
+    root = os.environ.get("NS_OBSERVATION_CACHE_DIR")
+    return Path(root) / _observation_path(cfg_text).name if root else None
+
+
+_UNREADABLE = (OSError, EOFError, pickle.UnpicklingError, ValueError, KeyError, TypeError)
+
+
+def _read_observation(path: Path) -> dict:
+    with path.open("rb") as cached:
+        return pickle.load(cached)
+
+
+def _observation_times(path: Path) -> int:
+    try:
+        return len(_read_observation(path)["time"])
+    except _UNREADABLE:
+        return 0
+
+
+def load_observation(cfg_text: str, n_times: int) -> dict | None:
+    local = _observation_path(cfg_text)
+    for source in (local, _persistent_observation_path(cfg_text)):
+        if source is None:
+            continue
+        try:
+            observation = _read_observation(source)
+            if len(observation["time"]) < n_times:
+                continue
+        except _UNREADABLE:
+            continue
+        if source != local and _observation_times(local) < n_times:
+            _atomic_publish(lambda path: shutil.copyfile(source, path), local)
+        return observation
+    return None
+
+
+def one_timestep_template(cfg_text: str, args: argparse.Namespace, scratch: Path) -> Path:
+    template = _template_path(cfg_text)
+    if not template.exists():
+        one = argparse.Namespace(**vars(args))
+        one.observation_minutes = args.integration_seconds / 120.0  # NTimes=1
+        with tempfile.TemporaryDirectory(dir=scratch) as build:
+            ms = Path(build) / Path(args.output_ms).name
+            write_makems_config(one, ms)
+            run_makems(ms)
+            _atomic_publish(lambda path: _write_template(ms, path), template)
+    return template
+
+
+SSM_TIME_COLUMNS = ("TIME", "TIME_CENTROID")
+# XX and YY's places in makems' 4 correlations, whose noise stream every
+# simulated MS still draws whole.
+XXYY = [0, 3]
+STREAM_CORRELATIONS = 4
+
+
+def _template_dminfo(dminfo: dict) -> dict:
+    """makems' StandardStMan bucket is 256 bytes, 32 rows of ANTENNA1/2, so
+    every extended evaluation's addrows and two putcols walked ~1000 buckets
+    through a 2-bucket cache. Same values, 32KB buckets: -2.3ms solo
+    (docs/csd3-speed.md, round 33). TIME and TIME_CENTROID move into it from
+    makems' IncrementalStMan, whose putcol compares every row with the last:
+    -3ms solo, same values (round 45)."""
+    ssm = next(m for m in dminfo.values() if m["TYPE"] == "StandardStMan" and "ANTENNA1" in m["COLUMNS"])
+    ssm["SPEC"]["BUCKETSIZE"] = 32768
+    for key, manager in list(dminfo.items()):
+        if manager["TYPE"] == "IncrementalStMan":
+            moved = [c for c in manager["COLUMNS"] if c in SSM_TIME_COLUMNS]
+            manager["COLUMNS"] = [c for c in manager["COLUMNS"] if c not in moved]
+            ssm["COLUMNS"] = list(ssm["COLUMNS"]) + moved
+            if not manager["COLUMNS"]:
+                del dminfo[key]
+    return dminfo
+
+
+def _write_template(ms: Path, destination: Path) -> None:
+    """makems' MS with _template_dminfo()'s layout, and with DATA, FLAG,
+    WEIGHT and SIGMA cut to XX and YY: `-pol I` reads nothing else, and a
+    2-correlation MS images byte for byte the same with half the DATA to
+    write and reorder (docs/csd3-speed.md, round 66)."""
+    with table(str(ms), ack=False) as t:
+        t.copy(str(destination), deep=True, valuecopy=True, dminfo=_template_dminfo(t.getdminfo())).close()
+    with table(str(destination), readonly=False, ack=False) as t:
+        for column in ("DATA", "FLAG"):
+            desc, dminfo = t.getcoldesc(column), t.getdminfo(column)
+            n_chan, n_corr = desc["shape"]
+            tile = dminfo["SPEC"]["DEFAULTTILESHAPE"]
+            t.removecols(column)
+            desc["shape"] = np.array([n_chan, len(XXYY)])
+            spec = {"DEFAULTTILESHAPE": np.array([len(XXYY), tile[1], tile[2] * n_corr // len(XXYY)], dtype=np.int32)}
+            t.addcols({column: desc}, {"TYPE": dminfo["TYPE"], "NAME": dminfo["NAME"], "SPEC": spec})
+        for column in ("WEIGHT", "SIGMA"):
+            t.putcol(column, t.getcol(column)[:, XXYY])
+    with table(str(destination / "POLARIZATION"), readonly=False, ack=False) as pol:
+        pol.putcell("NUM_CORR", 0, len(XXYY))
+        pol.putcell("CORR_TYPE", 0, pol.getcell("CORR_TYPE", 0)[XXYY])
+        pol.putcell("CORR_PRODUCT", 0, np.ascontiguousarray(pol.getcell("CORR_PRODUCT", 0)[XXYY]))
+
+
+_TEMPLATE_BYTES: dict[str, tuple[tuple[int, int], list[tuple[str, int, bytes | None]], tuple[dict, dict] | None]] = {}
+# The subtable values extend_template() writes: ~10 float64s in three
+# one-row tables, each a casacore open, putcol and close of ~0.3ms.
+SPLICED_COLUMNS = {
+    "FIELD": ("PHASE_DIR", "DELAY_DIR", "REFERENCE_DIR", "TIME"),
+    "OBSERVATION": ("TIME_RANGE",),
+    "SPECTRAL_WINDOW": ("CHAN_FREQ", "CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION", "REF_FREQUENCY", "TOTAL_BANDWIDTH"),
+}
+
+
+def _subtable_files(root: Path) -> dict[str, bytes]:
+    return {f"{sub}/{f.name}": f.read_bytes() for sub in SPLICED_COLUMNS for f in sorted((root / sub).iterdir())
+            if f.name != "table.lock"}
+
+
+def _put_subtables(root: Path, values: dict) -> None:
+    for sub, columns in SPLICED_COLUMNS.items():
+        with table(str(root / sub), readonly=False, ack=False) as t:
+            for column in columns:
+                t.putcol(column, values[sub, column])
+
+
+def _splice_plan(template: Path, scratch: Path) -> tuple[dict, dict] | None:
+    """(base, plan): `base` is the SPLICED_COLUMNS subtables' files as
+    casacore leaves them after one write session on the template (it also
+    rewrites a few header bytes), and `plan` says where in them each value
+    sits, found by writing unique values. None unless splicing a second set
+    of values into `base` reproduces casacore's own write of that set byte
+    for byte (all but table.lock, whose counters every writable open bumps)."""
+    rng = np.random.default_rng(90)
+    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
+        probe, check = Path(tmp) / "probe", Path(tmp) / "check"
+        for sub in SPLICED_COLUMNS:
+            shutil.copytree(template / sub, probe / sub)
+            shutil.copytree(template / sub, check / sub)
+        shapes = {}
+        for sub, columns in SPLICED_COLUMNS.items():
+            with table(str(probe / sub), ack=False) as t:
+                shapes.update({(sub, c): t.getcol(c).shape for c in columns})
+        probe_values = {k: 1.0 + rng.random(shape) for k, shape in shapes.items()}
+        check_values = {k: 1.0 + rng.random(shape) for k, shape in shapes.items()}
+        _put_subtables(probe, probe_values)
+        _put_subtables(check, check_values)
+        base, expected = _subtable_files(probe), _subtable_files(check)
+    plan = {}
+    for (sub, column), value in probe_values.items():
+        hits = [(name, data.find(value.astype(dtype).tobytes()), dtype)
+                for name, data in base.items() if name.startswith(sub + "/") for dtype in ("<f8", ">f8")
+                if data.count(value.astype(dtype).tobytes()) == 1]
+        if len(hits) != 1:
+            return None
+        plan[sub, column] = hits[0] + (value.shape,)
+    if _splice(base, plan, check_values) != expected:
+        return None
+    return base, plan
+
+
+def _splice(files: dict[str, bytes], plan: dict, values: dict) -> dict[str, bytes] | None:
+    out = {name: bytearray(data) for name, data in files.items()}
+    for key, (name, offset, dtype, shape) in plan.items():
+        value = np.asarray(values[key], dtype=np.float64)
+        if value.shape != shape:
+            return None
+        raw = value.astype(dtype).tobytes()
+        out[name][offset:offset + len(raw)] = raw
+    return {name: bytes(data) for name, data in out.items()}
+
+
+def _copy_template(template: Path, output_ms: Path, subtable_values: dict | None = None) -> bool:
+    """shutil.copytree() minus UNUSED_SUBTABLES, from bytes this worker read
+    once: ~39 files a copy, each an open, sendfile and copystat, were ~2.5ms
+    of a ~18ms solo simulate (docs/csd3-speed.md, round 62). A published
+    template is never written again, and a new one is a new directory, so
+    its inode and mtime are the whole key. With `subtable_values`, those are
+    spliced into the copied bytes where _splice_plan() found casacore keeps
+    them (round 90); False means the caller still has to write them."""
+    st = os.stat(template)
+    key = (st.st_ino, st.st_mtime_ns)
+    cached = _TEMPLATE_BYTES.get(str(template))
+    if cached is None or cached[0] != key:
+        entries = []
+        for root, dirs, files in os.walk(template):
+            if root == str(template):
+                dirs[:] = [d for d in dirs if d not in UNUSED_SUBTABLES]
+            rel = os.path.relpath(root, template)
+            entries.append((rel, 0, None))
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as f:
+                    entries.append((os.path.join(rel, name), os.stat(path).st_mode & 0o7777, f.read()))
+        try:
+            plan = _splice_plan(template, output_ms.parent)
+        except (OSError, RuntimeError):
+            plan = None
+        cached = _TEMPLATE_BYTES[str(template)] = (key, entries, plan)
+    spliced = None
+    if subtable_values is not None and cached[2] is not None:
+        spliced = _splice(*cached[2], subtable_values)
+    for rel, mode, data in cached[1]:
+        path = os.path.normpath(os.path.join(output_ms, rel))
+        if data is None:
+            os.mkdir(path)
+            continue
+        if spliced is not None:
+            data = spliced.get(os.path.normpath(rel), data)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError(f"short write to {path}")
+        finally:
+            os.close(fd)
+    return spliced is not None
+
+
+def extend_template(template: Path, observation: dict, output_ms: Path, n_times: int, args: argparse.Namespace,
+                    fill: bool = False) -> tuple | None:
+    """With `fill`, also writes the visibilities while the table is open and
+    returns fill_point_source_visibilities()'s (data, uvw, freqs_hz)."""
+    filled = None
+    start = observation["time_range_start"]
+    values = {("FIELD", c): observation[f"FIELD_{c}"] for c in SPLICED_COLUMNS["FIELD"]}
+    values["OBSERVATION", "TIME_RANGE"] = np.array([[start, start + n_times * observation["interval"]]])
+    values.update({("SPECTRAL_WINDOW", c): v for c, v in spectral_window_values(
+        args.channel_count, args.start_frequency_hz, args.channel_width_hz).items()})
+    spliced = _copy_template(template, output_ms, values)
+    with table(str(output_ms), readonly=False, ack=False) as ms:
+        a1, a2 = ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2")
+        n_base = len(a1)
+        # INTERVAL and EXPOSURE are IncrementalStMan columns, which carry the
+        # last row's value into added rows: set on the template's rows, they
+        # cover the whole table for ~4ms less than a putcol over every row.
+        ms.putcol("INTERVAL", np.full(n_base, observation["interval"]))
+        ms.putcol("EXPOSURE", np.full(n_base, observation["exposure"]))
+        ms.addrows((n_times - 1) * n_base)
+        antenna_uvw = observation["antenna_uvw"][:n_times]
+        uvw = (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3)
+        ms.putcol("UVW", uvw)
+        ms.putcol("ANTENNA1", np.tile(a1, n_times))
+        ms.putcol("ANTENNA2", np.tile(a2, n_times))
+        ms.putcol("TIME", np.repeat(observation["time"][:n_times], n_base))
+        ms.putcol("TIME_CENTROID", np.repeat(observation["time_centroid"][:n_times], n_base))
+        if fill:
+            # patch_spectral_window()'s CHAN_FREQ and the UVW just written, both
+            # float64 columns that read back unchanged: no reopen, no getcol.
+            freqs_hz = channel_frequencies(args)
+            filled = (write_visibilities(ms, uvw, freqs_hz, args), uvw, freqs_hz)
+    if not spliced:
+        _put_subtables(output_ms, values)
+    return filled
+
+
+def make_ms(cfg: Path, output_ms: Path, args: argparse.Namespace, fill: bool = False) -> tuple | None:
+    """Build the evaluation's MS skeleton, running makems only for an
+    observation no earlier evaluation has covered. With `fill`, an extended
+    observation also gets its visibilities, returned as extend_template() does;
+    None means fill_point_source_visibilities() still has to write them."""
+    cfg_text = cfg.read_text()
+    if cached_skeleton(skeleton_key(cfg_text)).exists():
+        make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
+        return None
+    n_times = n_times_of(args)
+    observation = load_observation(cfg_text, n_times)
+    if observation is None and args.observation_horizon_minutes > args.observation_minutes:
+        cache_observation_to_horizon(args, output_ms.parent)
+        observation = load_observation(cfg_text, n_times)
+    if observation is None:
+        make_ms_skeleton(cfg, output_ms, args, prune_unused=True)
+        save_observation(output_ms, cfg_text)
+        return None
+    template = one_timestep_template(cfg_text, args, output_ms.parent)
+    filled = extend_template(template, observation, output_ms, n_times, args, fill)
+    (output_ms.parent / "makems.log").write_text(f"extended a cached observation to {n_times} timesteps\n")
+    return filled
+
+
+def cache_observation_to_horizon(args: argparse.Namespace, scratch: Path) -> None:
+    """One makems build at the horizon, for save_observation() alone. Each key
+    (declination x integration, 910 of them in the default space) used to run
+    makems again for every new longest draw, ~1/3 of evaluations in a 7k-eval
+    run and ~85% of simulate's time there. makems costs ~3ms a timestep
+    whatever the channel count, so this builds one channel."""
+    horizon = argparse.Namespace(**vars(args))
+    horizon.observation_minutes, horizon.channel_count = args.observation_horizon_minutes, 1
+    with tempfile.TemporaryDirectory(dir=scratch) as build:
+        ms = Path(build) / Path(args.output_ms).name
+        cfg = write_makems_config(horizon, ms)
+        run_makems(ms)
+        save_observation(ms, cfg.read_text())
+
+
+def make_and_fill_ms(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
+    filled = make_ms(write_makems_config(args, output_ms), output_ms, args, fill=True)
+    return fill_point_source_visibilities(args, output_ms, filled)
 
 
 def prebuild_skeletons(space: dict) -> None:
@@ -290,6 +712,7 @@ def redirect_fds(out_path: Path, err_path: Path | None = None):
 
 
 _MQS = None
+_PREDICTS_SINCE_RESTART = 0
 
 # The forest currently loaded into the meqserver, keyed on the tdlconf text
 # with the MS name removed - see run_meqtrees_predict().
@@ -328,8 +751,10 @@ def restart_meqserver_session() -> None:
     global _MQS
     from Timba.Apps import meqserver
 
+    global _PREDICTS_SINCE_RESTART
     pid = getattr(_MQS, "serv_pid", None)
     _MQS = None
+    _PREDICTS_SINCE_RESTART = 0
     _FOREST.clear()
     # default_mqs() hands back its own module global whenever that is already a
     # meqserver, so clearing it is what makes a restart possible at all.
@@ -407,9 +832,20 @@ def run_meqtrees_predict(
     # no longer a stuck server but something this worker cannot fix, so it goes
     # back to the rank as a dead worker rather than a failed evaluation - see
     # MeqserverWedged.
+    #
+    # Errors from a predict get the same one retry on a fresh meqserver: on
+    # CSD3 they came from a newly compiled forest in a new server ("node
+    # 'VisDataMux' not found"), and every failing evaluation replayed alone
+    # succeeded (docs/csd3-experiments.md). Parameters that really break the
+    # predict fail again and are scored as before.
     for attempt in range(2):
         try:
             errors = _compile_and_predict(tdlconf, key, output_ms, wait_seconds)
+            if errors and not attempt:
+                with (output_ms.parent / "meqserver-wedged.log").open("a") as note:
+                    note.write(f"attempt 1: {len(errors)} predict error(s): {errors!r}\n")
+                restart_meqserver_session()
+                continue
             break
         except MeqserverWedged as exc:
             # Its own file, not meqtree-pipeliner.log: the retry reopens that
@@ -421,6 +857,14 @@ def run_meqtrees_predict(
             if attempt:
                 raise
             restart_meqserver_session()
+    # The meqserver keeps every MS it has predicted into open after the rank
+    # deletes it, so a tmpfs scratch never gets that memory back: 13MB an
+    # evaluation in the 9-parameter space, 96GB over a 112-rank node in 20
+    # minutes (docs/csd3-experiments.md, E6). Replacing it closes them.
+    global _PREDICTS_SINCE_RESTART
+    _PREDICTS_SINCE_RESTART += 1
+    if _PREDICTS_SINCE_RESTART >= int(os.environ.get("NS_MEQSERVER_RECYCLE", "20")):
+        restart_meqserver_session()
     if errors:
         raise SystemExit(f"FATAL: meqserver reported {len(errors)} error(s) during the predict")
 
@@ -442,6 +886,9 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
             # previous entry rather than adding to it.
             _FOREST.clear()
             _FOREST[key] = module
+            # The compiled selector can still name the MS an earlier compile
+            # read (the warm-up's, gone), whatever the tdlconf says.
+            point_to_measurement_set(module, output_ms)
         else:
             point_to_measurement_set(module, output_ms)
             print("### reusing the compiled forest; only the Measurement Set changed")
@@ -465,11 +912,82 @@ def _compile_and_predict(tdlconf: Path, key: str, output_ms: Path, wait_seconds:
     return errors
 
 
-def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
-    """Return constant Stokes-I visibilities for a phase-centre source."""
-    model = np.zeros(n_corr, dtype=np.complex64)
-    model[0] = model[-1] = source_flux_jy
-    return model
+def point_source_visibilities(
+    uvw: np.ndarray, freqs_hz: np.ndarray, source_flux_jy: float, l_rad: float, m_rad: float, n_corr: int,
+    rng: np.random.Generator | None = None, sigma: float = 0.0,
+    extra_lm_rad: list[tuple[float, float]] | tuple = (),
+) -> np.ndarray:
+    """Stokes-I point source at (l, m): what the Meow forest predicts, to float32
+    rounding, at ~1/30 of its cost. self_check_analytic_predict() is the guard.
+    extra_lm_rad adds more sources of the same flux (self_check_multi_source_predict()).
+    sigma > 0 adds add_complex_noise(rng, ..., sigma, xxyy=True)'s noise."""
+    delay_m = _source_delay_m(uvw, l_rad, m_rad)
+    if extra_lm_rad:
+        # Summed before the noise, which is then the same draw a lone source gets.
+        data = _phase_ramp(delay_m, freqs_hz, source_flux_jy, n_corr, _fastramp())
+        for l_extra, m_extra in extra_lm_rad:
+            data += _phase_ramp(_source_delay_m(uvw, l_extra, m_extra), freqs_hz, source_flux_jy, n_corr, _fastramp())
+        if sigma:
+            add_complex_noise(rng, data, sigma, xxyy=True)
+        return data
+    if sigma and n_corr == len(XXYY) and _plain_pcg(rng):
+        fused = _fastramp_xxyy2()
+        if fused is not None:
+            return _ramp_xxyy2(delay_m, freqs_hz, source_flux_jy, rng, sigma, fused)
+    data = _phase_ramp(delay_m, freqs_hz, source_flux_jy, n_corr, _fastramp())
+    if sigma:
+        add_complex_noise(rng, data, sigma, xxyy=True)
+    return data
+
+
+def _source_delay_m(uvw: np.ndarray, l_rad: float, m_rad: float) -> np.ndarray:
+    n_minus_1 = math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0
+    return uvw @ np.array([l_rad, m_rad, n_minus_1])
+
+
+def extra_lm_rad_of(args: argparse.Namespace) -> list[tuple[float, float]]:
+    return [(math.radians(l / 3600.0), math.radians(m / 3600.0)) for l, m in args.extra_source_arcsec]
+
+
+def _plain_pcg(rng: np.random.Generator) -> bool:
+    state = rng.bit_generator.state
+    return state["bit_generator"] == "PCG64" and not state["has_uint32"]
+
+
+def _ramp_xxyy2(delay_m: np.ndarray, freqs_hz: np.ndarray, flux: float, rng: np.random.Generator,
+                sigma: float, fused) -> np.ndarray:
+    # The ramp and the real halves of the noise in one pass, then the
+    # imaginary halves: one DATA-sized pass fewer (docs/csd3-speed.md, round 82).
+    data = np.empty((len(delay_m), len(freqs_hz), len(XXYY)), np.complex64)
+    delay_m = np.ascontiguousarray(delay_m, dtype=np.float64)
+    freqs_hz = np.ascontiguousarray(freqs_hz, dtype=np.float64)
+    k = ((2j * math.pi) / SPEED_OF_LIGHT).imag
+    bitgen, words = _pcg_words(rng)
+    fused(delay_m.ctypes.data, len(delay_m), freqs_hz.ctypes.data, len(freqs_hz), k, flux, data.ctypes.data,
+          words.ctypes.data, sigma)
+    _fastnoise_xxyy2()(words.ctypes.data, sigma, data.ctypes.data + 4, 2 * data.size, 2)
+    bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
+    rng.bit_generator.state = bitgen
+    return data
+
+
+def _phase_ramp(delay_m: np.ndarray, freqs_hz: np.ndarray, flux: float, n_corr: int, lib) -> np.ndarray:
+    # The C ramp writes correlations 0 and n_corr - 1, i.e. every element of
+    # 1- and 2-correlation data, so only 4-correlation data needs the zeros:
+    # a full extra write pass otherwise (docs/csd3-speed.md, round 80).
+    shape = (len(delay_m), len(freqs_hz), n_corr)
+    data = np.empty(shape, np.complex64) if lib is not None and n_corr <= 2 else np.zeros(shape, np.complex64)
+    if lib is None:
+        vis = flux * np.exp((2j * math.pi / SPEED_OF_LIGHT) * np.outer(delay_m, freqs_hz))
+        data[:, :, 0] = vis
+        data[:, :, -1] = vis
+        return data
+    delay_m = np.ascontiguousarray(delay_m, dtype=np.float64)
+    freqs_hz = np.ascontiguousarray(freqs_hz, dtype=np.float64)
+    # The imaginary part of numpy's complex constant, so the same double.
+    k = ((2j * math.pi) / SPEED_OF_LIGHT).imag
+    lib(delay_m.ctypes.data, len(delay_m), freqs_hz.ctypes.data, len(freqs_hz), k, flux, data.ctypes.data, n_corr)
+    return data
 
 
 # makems writes the full MSv2 subtable set, and casacore attaches every subtable
@@ -479,103 +997,303 @@ def phase_centre_visibility(source_flux_jy: float, n_corr: int) -> np.ndarray:
 # unpolarised point-source simulation depends on, so they are dropped once the
 # visibilities are written - not in the cached skeleton, because casacore
 # refuses to open an MS that is missing any of them and the MeqTrees predict
-# needs it opened that way. An evaluation that runs no predict never copies them
-# out of the skeleton at all (make_ms_skeleton()'s `prune_unused`); the delete
-# below is what covers the one that does, and stays unconditional because it
-# already tolerates them being absent. Worth -13.8% on the wsclean binary and +14.9%
+# (now only self_check_analytic_predict()'s) needs it opened that way. Runs
+# never copy them out of the skeleton (make_ms_skeleton()'s `prune_unused`);
+# the delete below covers a fresh makems build. Worth -13.8% on the wsclean binary and +14.9%
 # evaluations per second for the first five, and FEED another ~3%, with
 # bit-identical images; see docs/nested-sampling-ms-open.md. The six that
 # stay were each tried and each kills WSClean, so this list is complete.
 UNUSED_SUBTABLES = ("FEED", "FLAG_CMD", "HISTORY", "POINTING", "PROCESSOR", "STATE")
 
 
-def meqtrees_predict_needed(args: argparse.Namespace) -> bool:
-    return bool(args.source_l_arcsec or args.source_m_arcsec or args.extra_source_arcsec)
+# docker/meqtrees/src/fastnoise.c, built into the image outside the bind-mounted
+# /opt/ri-nested-sampling. numpy's own normal() is 2.9x slower: ~13ns a draw
+# through the bitgen pointer plus two float64 temporaries per half, which was a
+# quarter of simulate in 38-rank CSD3 searches (docs/csd3-speed.md, round 26).
+FASTNOISE_SO = Path("/opt/ri-lib/fastnoise.so")
+_FAST: dict[str, object] = {}
 
 
-def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) -> dict[str, object]:
+def _fast(name: str, argtypes: list, agrees) -> object | None:
+    """FASTNOISE_SO's `name`, or None. Loaded and checked once per process:
+    `agrees(fn)` false (or no library, or an older one without `name`) means
+    numpy does the work."""
+    if name not in _FAST:
+        _FAST[name] = None
+        try:
+            import ctypes
+
+            fn = getattr(ctypes.CDLL(str(FASTNOISE_SO)), name)
+            fn.argtypes = argtypes
+            fn.restype = None
+        except (OSError, AttributeError):
+            return None
+        _FAST[name] = fn if agrees(fn) else None
+    return _FAST[name]
+
+
+def _noise_agrees(lib) -> bool:
+    for every in (1, 4):
+        # 100k draws, ~1,200 of them through the ziggurat's rejection paths.
+        want = np.zeros((2500, 4, every), np.complex64)[:, :, 0]
+        got = want.copy()
+        _add_complex_noise(np.random.default_rng(12345), want, 0.3, every, None)
+        _add_complex_noise(np.random.default_rng(12345), got, 0.3, every, lib)
+        if want.tobytes() != got.tobytes():
+            return False
+    return True
+
+
+def _ramp_agrees(lib) -> bool:
+    # VLA-sized delays (metres) over L to X band, 16k phases: a part block
+    # at the end, and one delay far enough out that its phases take libm's
+    # path rather than fastnoise.c's polynomial.
+    rng = np.random.default_rng(12345)
+    delay_m, freqs_hz = np.append(rng.normal(0.0, 300.0, 3999), 4e4), 1e9 + np.arange(4) * 2.7e9
+    return all(_phase_ramp(delay_m, freqs_hz, flux, 2, None).tobytes()
+               == _phase_ramp(delay_m, freqs_hz, flux, 2, lib).tobytes() for flux in (1.0, 0.37))
+
+
+def _fastnoise():
+    """The C noise filler, or None."""
+    import ctypes
+
+    return _fast("add_normal_f32", [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 3,
+                 _noise_agrees)
+
+
+def _xxyy_agrees(fn) -> bool:
+    # What add_complex_noise(..., xxyy=True) promises: XX and YY as numpy
+    # draws them, XY and YX untouched, the stream left where numpy leaves it.
+    want = np.full((2500, 2, 4), 0.25 - 0.5j, np.complex64)
+    got = want.copy()
+    reference = np.random.default_rng(12345)
+    _add_complex_noise(reference, want, 0.3, 1, None)
+    want[..., 1:3] = got[..., 1:3]
+    rng = np.random.default_rng(12345)
+    _add_xxyy_noise(rng, got, 0.3, fn)
+    return want.tobytes() == got.tobytes() and rng.random() == reference.random()
+
+
+def _fastnoise_xxyy():
+    """add_normal_f32_xxyy(), or None."""
+    import ctypes
+
+    return _fast("add_normal_f32_xxyy", [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 2,
+                 _xxyy_agrees)
+
+
+def _xxyy2_agrees(fn) -> bool:
+    # XX and YY of the 4-correlation fill, packed side by side.
+    want = np.full((2500, 2, 4), 0.25 - 0.5j, np.complex64)
+    got = np.ascontiguousarray(want[..., XXYY])
+    reference = np.random.default_rng(12345)
+    _add_complex_noise(reference, want, 0.3, 1, None)
+    rng = np.random.default_rng(12345)
+    _add_xxyy_noise(rng, got, 0.3, fn, 2 * got.size)
+    return want[..., XXYY].tobytes() == got.tobytes() and rng.random() == reference.random()
+
+
+def _fastnoise_xxyy2():
+    """add_normal_f32_xxyy2(), or None."""
+    import ctypes
+
+    return _fast("add_normal_f32_xxyy2", [ctypes.c_void_p, ctypes.c_double, ctypes.c_void_p] + [ctypes.c_ssize_t] * 2,
+                 _xxyy2_agrees)
+
+
+def _ramp_xxyy2_agrees(fused) -> bool:
+    # _ramp_agrees()'s phases, ~770 draws a half through the ziggurat's
+    # rejection paths, against numpy's ramp and numpy's 4-correlation fill.
+    if _fastnoise_xxyy2() is None:
+        return False
+    rng = np.random.default_rng(12345)
+    delay_m, freqs_hz = np.append(rng.normal(0.0, 300.0, 3999), 4e4), 1e9 + np.arange(4) * 2.7e9
+    for flux in (1.0, 0.37):
+        full = np.zeros((len(delay_m), len(freqs_hz), STREAM_CORRELATIONS), np.complex64)
+        full[..., XXYY] = _phase_ramp(delay_m, freqs_hz, flux, 2, None)
+        reference = np.random.default_rng(54321)
+        _add_complex_noise(reference, full, 0.3, 1, None)
+        rng = np.random.default_rng(54321)
+        got = _ramp_xxyy2(delay_m, freqs_hz, flux, rng, 0.3, fused)
+        if full[..., XXYY].tobytes() != got.tobytes() or rng.random() != reference.random():
+            return False
+    return True
+
+
+def _fastramp_xxyy2():
+    """phase_ramp_c64_xxyy2(), or None."""
+    import ctypes
+
+    return _fast("phase_ramp_c64_xxyy2", [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_ssize_t,
+                                          ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_double], _ramp_xxyy2_agrees)
+
+
+def _fastramp():
+    """phase_ramp_c64(), or None: numpy's predict ~4.5x faster, bit for bit."""
+    import ctypes
+
+    return _fast("phase_ramp_c64", [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_ssize_t,
+                                    ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_ssize_t],
+                 _ramp_agrees)
+
+
+def _add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int, lib) -> None:
+    shape = (*data.shape, every)
+    if lib is None or not data.flags.c_contiguous or data.dtype != np.complex64:
+        data.real += rng.normal(0.0, sigma, shape)[..., 0].astype(np.float32)
+        data.imag += rng.normal(0.0, sigma, shape)[..., 0].astype(np.float32)
+        return
+    bitgen, words = _pcg_words(rng)
+    base = data.ctypes.data
+    lib(words.ctypes.data, sigma, base, data.size, 2, every)
+    lib(words.ctypes.data, sigma, base + 4, data.size, 2, every)
+    bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
+    rng.bit_generator.state = bitgen
+
+
+def _pcg_words(rng: np.random.Generator) -> tuple[dict, np.ndarray]:
+    bitgen = rng.bit_generator.state
+    pcg = bitgen["state"]
+    return bitgen, np.array([pcg["state"] >> 64, pcg["state"] & (2**64 - 1), pcg["inc"] >> 64,
+                             pcg["inc"] & (2**64 - 1)], dtype=np.uint64)
+
+
+def _add_xxyy_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, fn, draws: int | None = None) -> None:
+    draws = data.size if draws is None else draws
+    bitgen, words = _pcg_words(rng)
+    fn(words.ctypes.data, sigma, data.ctypes.data, draws, 2)
+    fn(words.ctypes.data, sigma, data.ctypes.data + 4, draws, 2)
+    bitgen["state"]["state"] = (int(words[0]) << 64) | int(words[1])
+    rng.bit_generator.state = bitgen
+
+
+def add_complex_noise(rng: np.random.Generator, data: np.ndarray, sigma: float, every: int = 1,
+                      xxyy: bool = False) -> None:
+    """In place and bit for bit, what
+
+        data.real += rng.normal(0.0, sigma, (*data.shape, every))[..., 0].astype(np.float32)
+        data.imag += <the same again>
+
+    does, for complex64 data. Rounding each component to float32 before the
+    add is what the old `.astype(np.complex64)` did; the two halves are drawn
+    in this order because that, not the arithmetic, is what fixes the stream.
+    every > 1 draws a whole column's stream and keeps only correlation 0.
+    xxyy=True, for 4-correlation data, may leave XY and YX without their noise
+    (the C path does; numpy's fallback adds it): `-pol I` reads XX and YY only,
+    and the draws are skipped ~15% faster than made (docs/csd3-speed.md, round 65).
+    For 2-correlation data, xxyy=True means XX and YY of that 4-correlation
+    stream (round 66)."""
+    lib = _fastnoise()
+    if lib is not None and (rng.bit_generator.state["bit_generator"] != "PCG64"
+                            or rng.bit_generator.state["has_uint32"]):
+        lib = None
+    if xxyy and every == 1 and data.ndim and data.shape[-1] == len(XXYY):
+        fn = _fastnoise_xxyy2() if lib is not None and data.flags.c_contiguous and data.dtype == np.complex64 else None
+        if fn is not None:
+            _add_xxyy_noise(rng, data, sigma, fn, 2 * data.size)
+            return
+        full = np.zeros((*data.shape[:-1], STREAM_CORRELATIONS), data.dtype)
+        full[..., XXYY] = data
+        _add_complex_noise(rng, full, sigma, 1, lib)
+        data[...] = full[..., XXYY]
+        return
+    if (lib is not None and xxyy and every == 1 and data.ndim and data.shape[-1] == 4
+            and data.flags.c_contiguous and data.dtype == np.complex64):
+        fn = _fastnoise_xxyy()
+        if fn is not None:
+            _add_xxyy_noise(rng, data, sigma, fn)
+            return
+    _add_complex_noise(rng, data, sigma, every, lib)
+
+
+def noise_sigma_of(args: argparse.Namespace) -> float:
     if args.dynamic_range <= 0:
         raise SystemExit("FATAL: --dynamic-range must be positive")
     if args.source_flux_jy <= 0:
         raise SystemExit("FATAL: --source-flux-jy must be positive")
+    return args.source_flux_jy / args.dynamic_range
 
-    noise_sigma_jy = args.source_flux_jy / args.dynamic_range
+
+def channel_frequencies(args: argparse.Namespace) -> np.ndarray:
+    """The CHAN_FREQ patch_spectral_window() writes."""
+    return args.start_frequency_hz + (np.arange(args.channel_count) + 0.5) * args.channel_width_hz
+
+
+def write_visibilities(ms, uvw: np.ndarray, freqs_hz: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    """Fill the open, writable main table `ms` and drop UNUSED_SUBTABLES'
+    keywords; returns the DATA written."""
+    noise_sigma_jy = noise_sigma_of(args)
     l_rad = math.radians(args.source_l_arcsec / 3600.0)
     m_rad = math.radians(args.source_m_arcsec / 3600.0)
-
-    with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
-        freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
-
     # ponytail: unpolarized equal-flux point sources only; full Stokes models
     # and per-source fluxes are a follow-up ceiling.
-    # A lone source at the phase centre predicts a constant, so the meqserver
-    # is not asked for it - see phase_centre_visibility().
-    predicted = meqtrees_predict_needed(args)
-    if predicted:
-        corr_sel, n_corr = determine_corr_selection(output_ms)
-        extra_lm_rad = [(math.radians(l / 3600.0), math.radians(m / 3600.0)) for l, m in args.extra_source_arcsec]
-        run_meqtrees_predict(
-            output_ms, corr_sel, args.source_flux_jy, l_rad, m_rad, args.predict_wait_seconds, extra_lm_rad
-        )
-
+    # The MeqTrees predict this replaced was half the stage on CSD3 (0.79s of
+    # 1.51s in the 9-parameter space); docs/csd3-speed.md.
     rng = np.random.default_rng(args.seed)
-    with table(str(output_ms), readonly=False, ack=False) as ms:
-        if predicted:
-            data = np.asarray(ms.getcol("DATA"), dtype=np.complex64)
-            _, n_chan, data_n_corr = data.shape
-            if data_n_corr != n_corr:
-                raise SystemExit(f"FATAL: DATA correlation count changed from {n_corr} to {data_n_corr} after MeqTrees predict")
-        else:
-            # Every value in DATA is about to be overwritten with the same
-            # constant, so the skeleton's zeros are not read back: only the
-            # shape is wanted, and one row of it costs 0.05ms against 0.38ms
-            # for the whole column. determine_corr_selection()'s separate open
-            # of the same table goes with it (another 0.43ms) - its correlation
-            # count comes from this probe, and its `corr_sel` string is only
-            # ever handed to a predict this path does not run.
-            _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
-            data = np.empty((ms.nrows(), n_chan, n_corr), dtype=np.complex64)
-            data[:] = phase_centre_visibility(args.source_flux_jy, n_corr)
-        uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
-        if n_chan != len(freqs_hz):
-            raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
+    # One row for the shape: DATA is about to be overwritten whole.
+    _, n_chan, n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape
+    if n_chan != len(freqs_hz):
+        raise SystemExit(f"FATAL: DATA has {n_chan} channels, SPW has {len(freqs_hz)}")
+    data = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, l_rad, m_rad, n_corr,
+                                     rng, noise_sigma_jy / math.sqrt(2.0), extra_lm_rad_of(args))
 
-        if noise_sigma_jy:
-            per_component_sigma = noise_sigma_jy / math.sqrt(2.0)
-            # Added in place to the two float32 halves rather than built as a
-            # complex128 array and added out of place. Rounding each component
-            # to float32 before the add is what the old `.astype(np.complex64)`
-            # did, so the column is bit-identical for a given seed - it just
-            # stops allocating three more copies of DATA to get there (0.69ms
-            # an evaluation). The two draws stay separate calls in this order
-            # because that, not the arithmetic, is what fixes the stream.
-            data.real += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
-            data.imag += rng.normal(0.0, per_component_sigma, data.shape).astype(np.float32)
+    ms.putcol("DATA", data)
+    for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
+        if optional_col in ms.colnames():
+            ms.putcol(optional_col, data)
+    # FLAG is not written: it is a TiledColumnStMan column in every MS this
+    # gets (makems' and the template's), and casacore zero-fills new tiles,
+    # so every row already reads False. The all-False putcol was a DATA-sized
+    # bool array packed to bits (docs/csd3-speed.md, round 79).
+    # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
+    # noise is one sigma for every row and channel, so the pair carried a
+    # single number written to every row - and they are variable-shaped
+    # IncrementalStMan columns, the slowest thing in the whole stage to
+    # write (a TaQL UPDATE, the cheapest of the three ways tried, was 31% of
+    # it). The number itself is in this evaluation's simulation.json as
+    # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
+    # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
+    # weight of 1.0 images identically to a uniform 1/sigma^2.
 
-        ms.putcol("DATA", data)
-        for optional_col in ("MODEL_DATA", "CORRECTED_DATA"):
-            if optional_col in ms.colnames():
-                ms.putcol(optional_col, data)
-        if "FLAG" in ms.colnames():
-            ms.putcol("FLAG", np.zeros(ms.getcol("FLAG").shape, dtype=bool))
-        # WEIGHT and SIGMA are deliberately left at makems' 1.0. This simulator's
-        # noise is one sigma for every row and channel, so the pair carried a
-        # single number written to every row - and they are variable-shaped
-        # IncrementalStMan columns, the slowest thing in the whole stage to
-        # write (a TaQL UPDATE, the cheapest of the three ways tried, was 31% of
-        # it). The number itself is in this evaluation's simulation.json as
-        # noise.complex_sigma_jy, which is what ms_to_r2d2_mat.py's
-        # --noise-sigma-jy is handed. WSClean weights naturally, so a uniform
-        # weight of 1.0 images identically to a uniform 1/sigma^2.
+    attached = ms.getkeywords()
+    for unused in UNUSED_SUBTABLES:
+        if unused in attached:
+            ms.removekeyword(unused)
+    return data
 
-        attached = ms.getkeywords()
-        for unused in UNUSED_SUBTABLES:
-            if unused in attached:
-                ms.removekeyword(unused)
+
+def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path,
+                                   filled: tuple | None = None) -> dict[str, object]:
+    """`filled` is make_ms(fill=True)'s result, when it wrote the visibilities."""
+    noise_sigma_jy = noise_sigma_of(args)
+    if filled is None:
+        with table(str(output_ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
+            freqs_hz = np.asarray(spw.getcol("CHAN_FREQ")[0], dtype=np.float64)
+        with table(str(output_ms), readonly=False, ack=False) as ms:
+            uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
+            data = write_visibilities(ms, uvw, freqs_hz, args)
+    else:
+        data, uvw, freqs_hz = filled
     # After the close, so casacore is never holding a table whose files are gone.
     for unused in UNUSED_SUBTABLES:
         shutil.rmtree(output_ms / unused, ignore_errors=True)
 
+    if args.mat_path:
+        # Imported here, not at module scope: the WSClean PoC never asks for a
+        # .mat and its worker should not pay for scipy. WEIGHT is makems' 1.0
+        # (above), and DATA is the complex64 column itself, so this is the file
+        # ms_to_r2d2_mat.py would have read back - array for array.
+        from ms_to_r2d2_mat import write_r2d2_mat
+
+        write_r2d2_mat(Path(args.mat_path), data[:, :, 0], uvw, freqs_hz, np.ones(len(uvw)), noise_sigma_jy)
+
+    return simulation_metadata(args, output_ms, uvw, freqs_hz, noise_sigma_jy)
+
+
+def simulation_metadata(args: argparse.Namespace, output_ms: Path | None, uvw: np.ndarray,
+                        freqs_hz: np.ndarray, noise_sigma_jy: float) -> dict[str, object]:
     # The longest projected baseline in wavelengths, which is what both imagers
     # size their pixels from - R2D2 computes it itself from the .mat's u/v (see
     # image_pixel_size_arcsec() in common.py), and the WSClean runner reads this
@@ -584,10 +1302,10 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     max_proj_baseline_lambda = float(np.max(np.hypot(uvw[:, 0], uvw[:, 1]))) * float(freqs_hz.max()) / SPEED_OF_LIGHT
 
     return {
-        "measurement_set": str(output_ms),
+        "measurement_set": str(output_ms) if output_ms is not None else None,
         "vla_config": args.vla_config,
         "antenna_table_source": str(Cattery_VLA_A),
-        "visibility_engine": "MeqTrees Meow point-source RIME predict (meqtree-pipeliner.py) plus seeded thermal-noise fill",
+        "visibility_engine": "analytic point-source RIME (checked against the MeqTrees Meow predict) plus seeded thermal-noise fill",
         "source": {
             "flux_jy": args.source_flux_jy,
             "l_arcsec": args.source_l_arcsec,
@@ -598,7 +1316,7 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
             "max_proj_baseline_lambda": max_proj_baseline_lambda,
             "requested_minutes": args.observation_minutes,
             "integration_seconds": args.integration_seconds,
-            "time_samples": max(1, int(math.ceil(args.observation_minutes * 60.0 / args.integration_seconds))),
+            "time_samples": n_times_of(args),
             "channel_count": args.channel_count,
             "start_frequency_hz": args.start_frequency_hz,
             "channel_width_hz": args.channel_width_hz,
@@ -613,6 +1331,52 @@ def fill_point_source_visibilities(args: argparse.Namespace, output_ms: Path) ->
     }
 
 
+_TEMPLATE_LAYOUT: dict[Path, tuple[np.ndarray, np.ndarray, int]] = {}
+
+
+def write_mat_only(args: argparse.Namespace, output_ms: Path) -> dict[str, object] | None:
+    """--mat-only: the .mat fill_point_source_visibilities() writes, array for
+    array, from the cached rows alone - no MS copied, extended or filled. None
+    when the observation is not cached yet: makems has to run, and the MS it
+    builds is what publishes the observation for the next evaluation."""
+    noise_sigma_jy = noise_sigma_of(args)
+    cfg_text = write_makems_config(args, output_ms).read_text()
+    skeleton = cached_skeleton(skeleton_key(cfg_text))
+    if skeleton.exists():
+        # make_ms_skeleton() copies this and changes only the SPECTRAL_WINDOW.
+        with table(str(skeleton), readonly=True, ack=False) as ms:
+            uvw = np.asarray(ms.getcol("UVW"), dtype=np.float64)
+            n_corr = ms.getcol("DATA", startrow=0, nrow=1).shape[2]
+    else:
+        n_times = n_times_of(args)
+        observation = load_observation(cfg_text, n_times)
+        if observation is None:
+            return None
+        template = one_timestep_template(cfg_text, args, output_ms.parent)
+        if template not in _TEMPLATE_LAYOUT:
+            with table(str(template), readonly=True, ack=False) as ms:
+                _TEMPLATE_LAYOUT[template] = (ms.getcol("ANTENNA1"), ms.getcol("ANTENNA2"), STREAM_CORRELATIONS)
+        a1, a2, n_corr = _TEMPLATE_LAYOUT[template]
+        # extend_template()'s UVW, which round-trips the float64 column unchanged.
+        antenna_uvw = observation["antenna_uvw"][:n_times]
+        uvw = (antenna_uvw[:, a2] - antenna_uvw[:, a1]).reshape(-1, 3)
+    # patch_spectral_window()'s CHAN_FREQ, again a float64 column read back as is.
+    freqs_hz = channel_frequencies(args)
+
+    vis = point_source_visibilities(uvw, freqs_hz, args.source_flux_jy, math.radians(args.source_l_arcsec / 3600.0),
+                                    math.radians(args.source_m_arcsec / 3600.0), 1,
+                                    extra_lm_rad=extra_lm_rad_of(args))[:, :, 0]
+    if noise_sigma_jy:
+        # The whole column's stream is drawn, as the fill does, so correlation 0
+        # gets the same numbers; only its slice is added.
+        add_complex_noise(np.random.default_rng(args.seed), vis, noise_sigma_jy / math.sqrt(2.0), n_corr)
+
+    from ms_to_r2d2_mat import write_r2d2_mat
+
+    write_r2d2_mat(Path(args.mat_path), vis, uvw, freqs_hz, np.ones(len(uvw)), noise_sigma_jy)
+    return simulation_metadata(args, None, uvw, freqs_hz, noise_sigma_jy)
+
+
 def simulate(args: argparse.Namespace) -> None:
     final_ms = Path(args.output_ms)
     require_clean_output(final_ms)
@@ -621,10 +1385,20 @@ def simulate(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=scratch_root_for(final_ms.parent)) as scratch:
         scratch_ms = Path(scratch) / final_ms.name
-        cfg = write_makems_config(args, scratch_ms)
-        make_ms_skeleton(cfg, scratch_ms, args, prune_unused=not meqtrees_predict_needed(args))
-        metadata = fill_point_source_visibilities(args, scratch_ms)
-        metadata["measurement_set"] = str(final_ms)
+        if args.mat_only and not args.mat_path:
+            raise SystemExit("FATAL: --mat-only needs --mat-path")
+        try:
+            metadata = write_mat_only(args, scratch_ms) if args.mat_only else None
+            if metadata is None:
+                metadata = make_and_fill_ms(args, scratch_ms)
+        except BaseException:
+            # The meqserver's error text is only in these, and the temporary
+            # directory is about to take them with it.
+            for log in Path(scratch).glob("*.log"):
+                shutil.copy2(log, final_ms.parent / log.name)
+            raise
+        if metadata["measurement_set"] is not None:
+            metadata["measurement_set"] = str(final_ms)
         for produced in sorted(Path(scratch).iterdir()):
             destination = final_ms.parent / produced.name
             if destination.is_dir():
@@ -637,8 +1411,9 @@ def simulate(args: argparse.Namespace) -> None:
     print(json.dumps(metadata, indent=2))
 
 
-def warm_forest() -> None:
-    """Prewarm forest and first predict before FIFO requests arrive."""
+def warm_up() -> None:
+    """Build one skeleton before FIFO requests arrive, so makems and casacore
+    are warm for the first evaluation."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
         ms = Path(scratch) / "sim.ms"
         args = parse_args([
@@ -647,38 +1422,24 @@ def warm_forest() -> None:
             "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
         ])
         make_ms_skeleton(write_makems_config(args, ms), ms, args)
-        corr_sel, _ = determine_corr_selection(ms)
-        run_meqtrees_predict(ms, corr_sel, 1.0, 0.0, 0.0)
 
 
 def handle_request(request: dict) -> None:
-    """Run one simulation or conversion request."""
-    if request.get("action") == "convert":
-        # Imported on first use, not at module scope: only the R2D2 PoC
-        # converts, and the WSClean PoC's worker should not pay for scipy.
-        from ms_to_r2d2_mat import main as convert
-
-        convert(request["argv"])
-    else:
-        simulate(parse_args(request["argv"]))
+    """Run one simulation request."""
+    simulate(parse_args(request["argv"]))
 
 
 def serve(fifo_base: str | None = None) -> None:
     """Serve JSON requests over stdin/stdout or a shared FIFO pair."""
-    # meqserver_session() is otherwise first called inside request one, so every
-    # rank paid ~0.3s of Timba import and meqserver startup in front of its first
-    # evaluation - and because PolyChord asks all ranks for their initial live
-    # points at once, all of it landed on the wall clock. Nothing has been asked
-    # of this worker yet, so starting the server here instead overlaps it with
-    # the caller's own sampler startup. Under redirect_fds because Timba prints
-    # to fd 1 on startup, which is the stdin path's reply pipe.
-    with redirect_fds(Path(os.devnull)):
-        try:
-            meqserver_session()
-            if fifo_base is not None:
-                warm_forest()
-        except Exception:
-            traceback.print_exc()
+    # Nothing has been asked of this worker yet, so warming up here overlaps
+    # with the caller's own sampler startup. Under redirect_fds because makems
+    # prints to fd 1, which is the stdin path's reply pipe.
+    if fifo_base is not None:
+        with redirect_fds(Path(os.devnull)):
+            try:
+                warm_up()
+            except Exception:
+                traceback.print_exc()
     if fifo_base is None:
         requests, replies = sys.stdin, os.fdopen(os.dup(1), "w")
     else:
@@ -692,23 +1453,6 @@ def serve(fifo_base: str | None = None) -> None:
         with redirect_fds(Path(request["stdout"]), Path(request["stderr"])):
             try:
                 handle_request(request)
-            except MeqserverWedged:
-                # Past what this worker can fix - it has already replaced its
-                # meqserver once for this request. Die instead of answering, so
-                # the rank sees the worker death it already knows how to retry
-                # (common.py's WORKER_DIED) rather than an exit status, which it
-                # would score as a failure of these parameters. The parameters
-                # did nothing wrong, and a host fault the sampler chases is the
-                # one outcome FAILURE_OBJECTIVE must never be spent on.
-                #
-                # os._exit() because Timba's octopussy event thread is not a
-                # daemon, so a normal exit blocks joining it forever - the same
-                # trap stop_meqserver_session() exists to avoid, and it cannot
-                # help here because it needs a server that answers.
-                traceback.print_exc()
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(1)
             except Exception:
                 traceback.print_exc()
                 returncode = 1
@@ -772,6 +1516,91 @@ def self_check_skeleton_cache() -> None:
                         assert np.array_equal(values, expected), f"{sub or 'MAIN'}.{column} differs after a cached skeleton reuse"
     use_skeleton_cache(None)
     print("MS skeleton cache self-check passed")
+
+
+def self_check_observation_prefix() -> None:
+    """An MS extended from a cached observation must be the MS makems writes."""
+    def values(ms: Path, sub: str) -> dict:
+        with table(str(ms / sub if sub else ms), readonly=True, ack=False) as t:
+            out = {"__keywords": repr(t.getkeywords()) if sub else None, "__rows": t.nrows()}
+            for column in t.colnames():
+                try:
+                    out[column] = np.asarray(t.getcol(column))
+                except RuntimeError:
+                    out[column] = None  # optional array column left unset by makems
+            return out
+
+    def simulate_with(scratch: Path, name: str, dec: int, step: int, n_times: int, n_chan: int, prefix: bool,
+                      horizon_times: int = 0) -> Path:
+        ms = scratch / name / "sim.ms"
+        args = parse_args([
+            "--output-ms", str(ms), "--observation-minutes", repr(n_times * step / 60.0 - 0.001),
+            "--observation-horizon-minutes", repr(horizon_times * step / 60.0 if prefix else 0.0),
+            "--integration-seconds", str(step), "--channel-count", str(n_chan), f"--declination-deg={dec}",
+            "--start-frequency-hz", "1.0374e9", "--channel-width-hz", "1.3331e6", "--dynamic-range", "300",
+            f"--source-l-arcsec={0.2 * dec}", "--source-m-arcsec=-0.1",
+        ])
+        if prefix:
+            make_and_fill_ms(args, ms)
+        else:
+            write_makems_config(args, ms)
+            run_makems(ms)
+            fill_point_source_visibilities(args, ms)
+        return ms
+
+    # (declination, integration, NTimes, channels, served from the cache[, horizon NTimes])
+    steps = [(34, 2, 10, 1, False), (34, 2, 4, 3, True), (34, 2, 20, 8, False), (34, 2, 15, 2, True),
+             (34, 2, 20, 4, True), (-15, 7, 3, 3, False), (-15, 7, 1, 3, True), (75, 2, 5, 1, False)]
+    # A second run, with a fresh run cache: served from the persistent one.
+    steps += [(34, 2, 20, 1, True), (-15, 7, 4, 2, False), (75, 2, 5, 2, True)]
+    # With a horizon, an unseen key is built at it and its first draw is served
+    # by extension, as is the horizon itself afterwards.
+    steps += [(50, 3, 4, 2, True, 25), (50, 3, 25, 3, True, 25), (50, 3, 26, 1, False, 25)]
+    saved_env = os.environ.get("NS_OBSERVATION_CACHE_DIR")
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch_dir:
+        scratch = Path(scratch_dir)
+        os.environ["NS_OBSERVATION_CACHE_DIR"] = str(scratch / "persistent")
+        (scratch / "persistent").mkdir()
+        for i, (dec, step, n_times, n_chan, served, *horizon) in enumerate(steps):
+            use_skeleton_cache(scratch / ("cache" if i < 8 else "cache2"))
+            got = simulate_with(scratch, f"prefix{i}", dec, step, n_times, n_chan, prefix=True, horizon_times=sum(horizon))
+            log = (got.parent / "makems.log").read_text()
+            assert ("extended a cached observation" in log) == served, f"step {i}: cache use was not {served}: {log}"
+            expected = simulate_with(scratch, f"makems{i}", dec, step, n_times, n_chan, prefix=False)
+            with table(str(got), ack=False) as left, table(str(expected), ack=False) as right:
+                layouts = [table_.getdminfo() for table_ in (left, right)]
+            if served:  # the intended differences: _template_dminfo(), and _write_template()'s XX and YY
+                layouts = [sorted((m["NAME"], m["TYPE"], sorted(m["COLUMNS"]), m["SPEC"].get("BUCKETSIZE"))
+                                  for m in layout.values())
+                           for layout in (layouts[0], _template_dminfo(layouts[1]))]
+            assert repr(layouts[0]) == repr(layouts[1]), f"step {i}: storage layout differs: {layouts}"
+            for sub in ("", "SPECTRAL_WINDOW", "ANTENNA", "FIELD", "DATA_DESCRIPTION", "POLARIZATION", "OBSERVATION"):
+                left, right = values(got, sub), values(expected, sub)
+                if served and sub == "":
+                    for column in ("DATA", "FLAG"):
+                        right[column] = right[column][..., XXYY]
+                    for column in ("WEIGHT", "SIGMA"):
+                        right[column] = right[column][:, XXYY]
+                if served and sub == "POLARIZATION":
+                    right["NUM_CORR"] = np.full_like(right["NUM_CORR"], len(XXYY))
+                    for column in ("CORR_TYPE", "CORR_PRODUCT"):
+                        right[column] = right[column][:, XXYY]
+                if sub == "":  # write_visibilities() leaves FLAG to casacore's zero-filled tiles
+                    assert not left["FLAG"].any() and not right["FLAG"].any(), f"step {i}: FLAG is not all False"
+                assert left.keys() == right.keys(), f"step {i}: {sub or 'MAIN'} columns differ"
+                for column in left:
+                    same = (left[column] is None and right[column] is None) if left[column] is None or right[column] is None \
+                        else np.array_equal(left[column], right[column])
+                    assert same, f"step {i}: {sub or 'MAIN'}.{column} differs from a makems build"
+    # Served steps must have had their subtables spliced, not casacore-written.
+    assert _TEMPLATE_BYTES and all(entry[2] is not None for entry in _TEMPLATE_BYTES.values()), \
+        "a template has no subtable splice plan"
+    if saved_env is None:
+        os.environ.pop("NS_OBSERVATION_CACHE_DIR")
+    else:
+        os.environ["NS_OBSERVATION_CACHE_DIR"] = saved_env
+    use_skeleton_cache(None)
+    print("observation prefix self-check passed")
 
 
 def self_check_skeleton_prebuild() -> None:
@@ -853,35 +1682,56 @@ def self_check_forest_reuse() -> None:
     print("forest reuse self-check passed")
 
 
-def self_check_phase_centre_predict() -> None:
-    """The constant phase_centre_visibility() writes must be what MeqTrees predicts."""
-    cases = ((1, 0.3, 5.4e10, 2.0e6, 1.0), (8, 20.0, 5.4e7, 0.1e6, 1.0), (5, 7.3, 1.4e9, 1.1e6, 2.5))
+def self_check_analytic_predict() -> None:
+    """point_source_visibilities() must be what MeqTrees predicts, on and off
+    the phase centre, across the searched shapes and declinations."""
+    cases = (
+        # n_chan, minutes, integration s, declination, start Hz, width Hz, flux, l", m"
+        (1, 0.3, 120.0, 65.0, 5.4e10, 2.0e6, 1.0, 0.0, 0.0),
+        (8, 20.0, 120.0, 65.0, 5.4e7, 0.1e6, 1.0, 0.0, 0.0),
+        (5, 7.3, 120.0, 65.0, 1.4e9, 1.1e6, 2.5, 0.0, 0.0),
+        (2, 9.6, 3.0, 1.0, 4.36e10, 6.4e5, 1.0, -0.152, -0.193),
+        (6, 13.5, 6.0, 37.0, 4.27e10, 1.04e6, 1.0, 0.190, 0.212),
+        (4, 30.0, 1.0, -15.0, 9.6e9, 1.4e6, 1.0, 0.212, -0.491),
+        (3, 5.0, 10.0, 75.0, 1.1e9, 2.0e6, 1.0, -3.0, 5.0),
+    )
+    worst = 0.0
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
-        for index, (n_chan, minutes, start_hz, width_hz, flux) in enumerate(cases):
-            ms = Path(scratch) / f"phase-centre-{index}" / "sim.ms"
+        for index, (n_chan, minutes, step, dec, start_hz, width_hz, flux, l_as, m_as) in enumerate(cases):
+            ms = Path(scratch) / f"predict-{index}" / "sim.ms"
             built = parse_args([
                 "--output-ms", str(ms), "--observation-minutes", str(minutes),
+                "--integration-seconds", str(step), f"--declination-deg={dec}",
                 "--channel-count", str(n_chan), "--start-frequency-hz", repr(start_hz),
                 "--channel-width-hz", repr(width_hz), "--dynamic-range", "300",
                 "--source-flux-jy", repr(flux),
             ])
             make_ms_skeleton(write_makems_config(built, ms), ms, built)
             corr_sel, n_corr = determine_corr_selection(ms)
-            run_meqtrees_predict(ms, corr_sel, flux, 0.0, 0.0)
+            l_rad, m_rad = math.radians(l_as / 3600.0), math.radians(m_as / 3600.0)
+            run_meqtrees_predict(ms, corr_sel, flux, l_rad, m_rad, wait_seconds=300.0)
             with table(str(ms), readonly=True, ack=False) as opened:
                 predicted = np.asarray(opened.getcol("DATA"))
-            expected = np.broadcast_to(phase_centre_visibility(flux, n_corr), predicted.shape)
-            assert np.array_equal(predicted, expected), \
-                f"MeqTrees predicts more than the phase-centre constant at {(n_chan, minutes, start_hz, width_hz, flux)}"
+                uvw = opened.getcol("UVW")
+            with table(str(ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
+                freqs_hz = spw.getcol("CHAN_FREQ")[0]
+            analytic = point_source_visibilities(uvw, freqs_hz, flux, l_rad, m_rad, n_corr)
+            if not (l_as or m_as):
+                assert np.array_equal(predicted, analytic), f"phase-centre constant differs from MeqTrees in case {index}"
+            # One float32 ulp at |V| = flux, per component: rounding, not physics.
+            error = float(np.abs(predicted - analytic).max()) / flux
+            worst = max(worst, error)
+            assert error < 2.5e-7, f"analytic predict differs from MeqTrees by {error:.3g} in case {index}"
     _FOREST.clear()
-    print("phase-centre predict self-check passed")
+    print(f"analytic predict self-check passed (worst |MeqTrees - analytic| / flux = {worst:.3g})")
 
 
 def self_check_multi_source_predict() -> None:
-    """Extra sources must add to the prediction, each where it was placed."""
+    """Extra sources must add to the prediction, each where it was placed, in
+    the Meow forest and in point_source_visibilities() alike."""
     a, b, c = (1e-5, 2e-5), (-3e-5, 1e-5), (2e-5, -4e-5)
 
-    def predict(scratch: Path, name: str, first: tuple[float, float], extras: list) -> np.ndarray:
+    def predict(scratch: Path, name: str, first: tuple[float, float], extras: list) -> tuple[np.ndarray, np.ndarray]:
         ms = scratch / name / "sim.ms"
         built = parse_args([
             "--output-ms", str(ms), "--observation-minutes", "4.0",
@@ -889,16 +1739,23 @@ def self_check_multi_source_predict() -> None:
             "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
         ])
         make_ms_skeleton(write_makems_config(built, ms), ms, built)
-        corr_sel, _ = determine_corr_selection(ms)
-        run_meqtrees_predict(ms, corr_sel, 1.0, *first, extra_lm_rad=extras)
+        corr_sel, n_corr = determine_corr_selection(ms)
+        run_meqtrees_predict(ms, corr_sel, 1.0, *first, wait_seconds=300.0, extra_lm_rad=extras)
         with table(str(ms), readonly=True, ack=False) as opened:
-            return np.asarray(opened.getcol("DATA"), dtype=np.complex128)
+            predicted = np.asarray(opened.getcol("DATA"), dtype=np.complex128)
+            uvw = opened.getcol("UVW")
+        with table(str(ms / "SPECTRAL_WINDOW"), readonly=True, ack=False) as spw:
+            freqs_hz = spw.getcol("CHAN_FREQ")[0]
+        analytic = point_source_visibilities(uvw, freqs_hz, 1.0, *first, n_corr, extra_lm_rad=extras)
+        return predicted, analytic.astype(np.complex128)
 
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
-        together = predict(Path(scratch), "abc", a, [b, c])
-        apart = sum(predict(Path(scratch), f"one-{i}", lm, []) for i, lm in enumerate((a, b, c)))
+        together, analytic = predict(Path(scratch), "abc", a, [b, c])
+        apart = sum(predict(Path(scratch), f"one-{i}", lm, [])[0] for i, lm in enumerate((a, b, c)))
         # The extras-less compile after an extras one is the stale-config case.
         assert np.allclose(together, apart, atol=1e-5), np.abs(together - apart).max()
+        # Three float32 roundings, one a source.
+        assert np.abs(together - analytic).max() < 1e-6, np.abs(together - analytic).max()
     _FOREST.clear()
     print("multi-source predict self-check passed")
 
@@ -920,7 +1777,7 @@ def self_check_noise_weighting() -> None:
                     "--observation-minutes", "4.0", "--channel-count", "2",
                     "--start-frequency-hz", "1.0e9", "--channel-width-hz", "1.0e6",
                     "--source-flux-jy", "1.0", "--dynamic-range", repr(dynamic_range),
-                    "--seed", "42",
+                    "--seed", "42", "--mat-path", str(ms.parent / "direct.mat"),
                 ]))
             with table(str(ms), readonly=True, ack=False) as opened:
                 weight = np.asarray(opened.getcol("WEIGHT"), dtype=np.float64)
@@ -930,9 +1787,23 @@ def self_check_noise_weighting() -> None:
             mat = ms.parent / "r2d2_data.mat"
             ms_to_r2d2_mat(ms, mat, noise_sigma_jy=sigma)
             nW = np.asarray(loadmat(str(mat))["nW"], dtype=np.float64)
+            # --mat-path must write the file the convert reads back, array for array.
+            direct, converted = loadmat(str(ms.parent / "direct.mat")), loadmat(str(mat))
+            for key in ("u", "v", "y", "nW"):
+                assert direct[key].dtype == converted[key].dtype and np.array_equal(
+                    direct[key].view(np.uint8), converted[key].view(np.uint8)
+                ), f"--mat-path {key} differs from ms_to_r2d2_mat's"
             expected = np.sqrt(1.0 / (sigma * sigma))
             assert np.allclose(nW, expected, rtol=0.0, atol=0.0), \
                 f"nW is {nW.min()}..{nW.max()}, not the {expected} the WEIGHT column used to carry"
+            # The convert reads one correlation's slice; it must be the column's.
+            with table(str(ms), readonly=True, ack=False) as opened:
+                data = np.asarray(opened.getcol("DATA"), dtype=np.complex128)
+            for corr in (0, data.shape[2] - 1):
+                ms_to_r2d2_mat(ms, mat, corr_index=corr, noise_sigma_jy=sigma)
+                y = loadmat(str(mat))["y"]
+                assert np.array_equal(y.view(np.uint8), data[:, :, corr].reshape(-1, 1).view(np.uint8)), \
+                    f"y differs from DATA[:, :, {corr}]"
     print("noise weighting self-check passed")
 
 
@@ -1090,43 +1961,6 @@ def self_check_predict_timeout_recovery() -> None:
     print("predict timeout recovery self-check passed")
 
 
-def self_check_wedge_kills_worker() -> None:
-    """A wedged worker must die as WORKER_DIED, not answer with a status."""
-    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
-        ms = Path(scratch) / "sim.ms"
-        # A worker whose predicts can never succeed, without a knob in the
-        # production path: the bound is set in the child before serve() runs.
-        bootstrap = (
-            f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); "
-            "import simulate_point_source_ms as s; s.PREDICT_WAIT_SECONDS = 0.001; s.serve()"
-        )
-        worker = subprocess.Popen(
-            [sys.executable, "-c", bootstrap],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        request = {
-            # Offset, so the request actually reaches the meqserver: a source at
-            # the phase centre never asks it for anything (see
-            # phase_centre_visibility()) and a wedged worker would answer it.
-            "argv": [
-                "--output-ms", str(ms), "--observation-minutes", "4.0",
-                "--channel-count", "2", "--start-frequency-hz", "1.0e9",
-                "--channel-width-hz", "1.0e6", "--dynamic-range", "300",
-                "--source-l-arcsec", "0.5",
-            ],
-            "stdout": str(Path(scratch) / "out.log"),
-            "stderr": str(Path(scratch) / "err.log"),
-        }
-        worker.stdin.write(json.dumps(request) + "\n")
-        worker.stdin.flush()
-        reply = worker.stdout.readline()
-        assert reply == "", f"a wedged worker answered instead of dying: {reply!r}"
-        assert worker.wait(timeout=300) != 0, "a wedged worker must not exit successfully"
-    print("wedge kills worker self-check passed")
-
-
 def self_check_serve_reply_stream() -> None:
     """A worker's stdout must carry replies only, never meqserver startup chatter."""
     with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
@@ -1177,6 +2011,96 @@ def self_check_serve_fifo() -> None:
     print("serve fifo self-check passed")
 
 
+def self_check_fast_noise() -> None:
+    if not FASTNOISE_SO.exists():
+        print(f"fast noise self-check skipped: no {FASTNOISE_SO} in this image (rebuild meqtrees)")
+        return
+    lib = _fastnoise()
+    if lib is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO} does not reproduce numpy's normal() stream")
+    for seed, shape, every in ((7, (1000, 5, 4), 1), (2049643611, (3000, 7), 4), (1, (351, 1, 2), 1)):
+        want = np.full(shape, 0.25 - 0.5j, np.complex64)
+        got = want.copy()
+        _add_complex_noise(np.random.default_rng(seed), want, 0.01, every, None)
+        rng = np.random.default_rng(seed)
+        add_complex_noise(rng, got, 0.01, every)
+        if want.tobytes() != got.tobytes():
+            raise SystemExit(f"FAIL: fast noise differs from numpy for seed {seed}, shape {shape}")
+        # The generator is left where numpy's two draws would leave it.
+        reference = np.random.default_rng(seed)
+        reference.normal(size=(2, *shape, every))
+        if rng.random() != reference.random():
+            raise SystemExit("FAIL: fast noise left the generator in a different state")
+    import ctypes
+
+    if not hasattr(ctypes.CDLL(str(FASTNOISE_SO)), "add_normal_f32_xxyy"):
+        print(f"fast noise self-check: {FASTNOISE_SO} predates XX/YY-only noise (rebuild meqtrees)")
+    elif _fastnoise_xxyy() is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s XX/YY-only noise does not match numpy's XX and YY")
+    if not hasattr(ctypes.CDLL(str(FASTNOISE_SO)), "add_normal_f32_xxyy2"):
+        print(f"fast noise self-check: {FASTNOISE_SO} predates 2-correlation noise (rebuild meqtrees)")
+    elif _fastnoise_xxyy2() is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s 2-correlation noise does not match numpy's XX and YY")
+    if not hasattr(ctypes.CDLL(str(FASTNOISE_SO)), "phase_ramp_c64_xxyy2"):
+        print(f"fast noise self-check: {FASTNOISE_SO} predates the fused ramp and noise (rebuild meqtrees)")
+    elif _fastramp_xxyy2() is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s fused ramp and noise does not match numpy's")
+    print("fast noise self-check passed")
+    if not hasattr(__import__("ctypes").CDLL(str(FASTNOISE_SO)), "phase_ramp_c64"):
+        print(f"phase ramp self-check skipped: {FASTNOISE_SO} predates phase_ramp_c64 (rebuild meqtrees)")
+        return
+    lib = _fastramp()
+    if lib is None:
+        raise SystemExit(f"FAIL: {FASTNOISE_SO}'s phase_ramp_c64 does not reproduce numpy's predict")
+    rng = np.random.default_rng(3)
+    for n_rows, n_chan, n_corr in ((351 * 40, 8, 4), (351, 1, 2), (1000, 3, 1)):
+        uvw = rng.normal(0.0, 3000.0, (n_rows, 3))
+        freqs_hz = rng.uniform(5e7, 1.2e10) + (np.arange(n_chan) + 0.5) * rng.uniform(1e5, 2e6)
+        flux, l_rad, m_rad = float(rng.uniform(0.1, 10.0)), 1.2e-3, -7e-4
+        delay_m = uvw @ np.array([l_rad, m_rad, math.sqrt(1.0 - l_rad * l_rad - m_rad * m_rad) - 1.0])
+        want = _phase_ramp(delay_m, freqs_hz, flux, n_corr, None)
+        if want.tobytes() != point_source_visibilities(uvw, freqs_hz, flux, l_rad, m_rad, n_corr).tobytes():
+            raise SystemExit(f"FAIL: phase ramp differs from numpy for {n_rows} rows, {n_chan} channels, {n_corr} corr")
+    print("phase ramp self-check passed")
+
+
+def self_check_mat_only() -> None:
+    """--mat-only must write the full path's .mat and metadata on every cache path."""
+    from scipy.io import loadmat
+
+    def run(directory: Path, minutes: str, mat_only: bool) -> tuple[dict, dict]:
+        ms = directory / "sim.ms"
+        with contextlib.redirect_stdout(io.StringIO()):
+            simulate(parse_args([
+                "--output-ms", str(ms), "--observation-minutes", minutes, "--channel-count", "3",
+                "--start-frequency-hz", "1.4e9", "--channel-width-hz", "2.0e6", "--integration-seconds", "30",
+                "--declination-deg=40", "--source-l-arcsec=0.3", "--source-m-arcsec=-0.2",
+                "--dynamic-range", "500", "--seed", "11", "--mat-path", str(directory / "r2d2_data.mat"),
+            ] + (["--mat-only"] if mat_only else [])))
+        assert ms.exists() != mat_only or directory.name == "miss", f"{directory.name}: MS presence is wrong"
+        metadata = json.loads((directory / "simulation.json").read_text())
+        metadata.pop("measurement_set")
+        return loadmat(str(directory / "r2d2_data.mat")), metadata
+
+    with tempfile.TemporaryDirectory(dir=SCRATCH_ROOT) as scratch:
+        root = Path(scratch)
+        use_skeleton_cache(root / "cache")
+        try:
+            # A miss builds the MS (and so the caches); the shape is then a
+            # skeleton hit, and a shorter one an observation-prefix hit.
+            for name, minutes in (("miss", "6.0"), ("skeleton", "6.0"), ("observation", "3.0")):
+                direct, direct_meta = run(root / name, minutes, True)
+                full, full_meta = run(root / f"{name}-full", minutes, False)
+                for key in ("u", "v", "y", "nW"):
+                    assert direct[key].dtype == full[key].dtype and np.array_equal(
+                        direct[key].view(np.uint8), full[key].view(np.uint8)), f"{name}: --mat-only {key} differs"
+                assert direct_meta == full_meta, f"{name}: --mat-only metadata differs"
+            assert not (root / "observation" / "sim.ms").exists() and (root / "miss" / "sim.ms").exists()
+        finally:
+            use_skeleton_cache(None)
+    print("mat-only self-check passed")
+
+
 if __name__ == "__main__":
     # --serve and --self-check take no other arguments, so they are checked before
     # argparse, which requires the full simulate argument set.
@@ -1197,15 +2121,17 @@ if __name__ == "__main__":
             self_check_scratch_root()
             self_check_skeleton_cache()
             self_check_skeleton_prebuild()
+            self_check_observation_prefix()
             self_check_declination_config()
             self_check_forest_reuse()
-            self_check_phase_centre_predict()
+            self_check_analytic_predict()
             self_check_multi_source_predict()
             self_check_noise_weighting()
+            self_check_fast_noise()
+            self_check_mat_only()
             self_check_dropped_subtables()
             self_check_meqserver_restart()
             self_check_predict_timeout_recovery()
-            self_check_wedge_kills_worker()
             self_check_serve_reply_stream()
             self_check_serve_fifo()
         else:

@@ -1,0 +1,186 @@
+diff --git a/gridding/msgridderdata.h b/gridding/msgridderdata.h
+index bcb5539..8d367a8 100644
+--- a/gridding/msgridderdata.h
++++ b/gridding/msgridderdata.h
+@@ -21,6 +21,8 @@
+ 
+ #include <aocommon/uvector.h>
+ 
++#include <unistd.h>
++
+ namespace wsclean {
+ 
+ enum class PsfMode {
+@@ -745,6 +747,119 @@ class MsGridderData {
+       ms_reader.WriteImagingWeights(scratch_image_weights_.data());
+   }
+ 
++  /**
++   * Each row's uvw and final (visibility x imaging) weight, kept from the
++   * first inversion of a measurement set so that later inversions of the
++   * same set - every major cycle - only read data and model. Weights depend
++   * on nothing a major cycle changes, so the cached values are the ones the
++   * full path would compute, bit for bit. Only used where the full path
++   * reduces to that: one visibility polarization, no facets, beams,
++   * solutions or stored imaging weights.
++   */
++  struct InversionWeightCache {
++    pid_t pid = 0;
++    size_t ms_index = ~size_t(0);
++    size_t n_rows = 0;
++    size_t n_channels = 0;
++    double first_frequency = 0.0;
++    const ImageWeights* image_weights = nullptr;
++    VisibilityWeightingMode weighting = VisibilityWeightingMode{};
++    GainMode gain_mode = GainMode::kTrace;
++    bool complete = false;
++    aocommon::UVector<double> uvws;
++    aocommon::UVector<float> weights;
++    size_t gridded_visibility_count = 0;
++    double total_weight = 0.0;
++    double max_gridded_weight = 0.0;
++    double visibility_weight_sum = 0.0;
++  };
++
++  /**
++   * Returns the thread's cache, made ready for this inversion: complete
++   * (rows can be read with @ref ReadCachedVisibilities()), or empty and
++   * keyed to be filled with @ref FillWeightCache(). Returns nullptr when
++   * the cache does not apply.
++   */
++  InversionWeightCache* PrepareWeightCache(MSProvider& ms_provider,
++                                           const aocommon::BandData& band) {
++    if (n_vis_polarizations_ != 1 || GetNVisibilities(gain_mode_) != 1 ||
++        IsFacet() || StoreImagingWeights() || visibility_modifier_.HasH5Parm() ||
++        settings_.applyFacetBeam || settings_.gridWithBeam ||
++        gridded_visibility_count_ != 0 || total_weight_ != 0.0 ||
++        max_gridded_weight_ != 0.0 || visibility_weight_sum_ != 0.0)
++      return nullptr;
++    thread_local InversionWeightCache cache;
++    // The pid keeps a forked child (the zygote's) from inheriting entries.
++    const bool same = cache.pid == getpid() &&
++                      cache.ms_index == original_ms_index_ &&
++                      cache.n_rows == ms_provider.NRows() &&
++                      cache.n_channels == band.ChannelCount() &&
++                      cache.first_frequency == band.ChannelFrequency(0) &&
++                      cache.image_weights == GetImageWeights() &&
++                      cache.weighting == GetVisibilityWeightingMode() &&
++                      cache.gain_mode == gain_mode_;
++    if (same && cache.complete) return &cache;
++    cache.pid = getpid();
++    cache.ms_index = original_ms_index_;
++    cache.n_rows = ms_provider.NRows();
++    cache.n_channels = band.ChannelCount();
++    cache.first_frequency = band.ChannelFrequency(0);
++    cache.image_weights = GetImageWeights();
++    cache.weighting = GetVisibilityWeightingMode();
++    cache.gain_mode = gain_mode_;
++    cache.complete = false;
++    cache.uvws.clear();
++    cache.weights.clear();
++    cache.uvws.reserve(cache.n_rows * 3);
++    cache.weights.reserve(cache.n_rows * cache.n_channels);
++    return &cache;
++  }
++
++  /** Called after @ref GetCollapsedVisibilities() on a filling pass. */
++  void FillWeightCache(InversionWeightCache& cache, const double* uvw,
++                       const float* weight_buffer) {
++    cache.uvws.insert(cache.uvws.end(), uvw, uvw + 3);
++    cache.weights.insert(cache.weights.end(), weight_buffer,
++                         weight_buffer + cache.n_channels);
++  }
++
++  /** Marks a filled cache complete, or replays its counters on a hit. */
++  void FinishWeightCache(InversionWeightCache& cache, size_t n_rows) {
++    if (cache.complete) {
++      gridded_visibility_count_ = cache.gridded_visibility_count;
++      total_weight_ = cache.total_weight;
++      max_gridded_weight_ = cache.max_gridded_weight;
++      visibility_weight_sum_ = cache.visibility_weight_sum;
++    } else if (n_rows == cache.n_rows &&
++               cache.uvws.size() == n_rows * 3 &&
++               cache.weights.size() == n_rows * cache.n_channels) {
++      cache.gridded_visibility_count = gridded_visibility_count_;
++      cache.total_weight = total_weight_;
++      cache.max_gridded_weight = max_gridded_weight_;
++      cache.visibility_weight_sum = visibility_weight_sum_;
++      cache.complete = true;
++    }
++  }
++
++  /**
++   * The cached equivalent of @ref GetCollapsedVisibilities() for row @p row:
++   * reads data and model, and applies the cached weight.
++   */
++  inline void ReadCachedVisibilities(MSReader& ms_reader,
++                                     const InversionWeightCache& cache,
++                                     size_t row, InversionRow& row_data,
++                                     std::complex<float>* model_buffer,
++                                     const aocommon::BandData& band) {
++    if (GetPsfMode() == PsfMode::kNone) ms_reader.ReadData(row_data.data);
++    if (DoSubtractModel()) ms_reader.ReadModel(model_buffer);
++    std::copy_n(&cache.uvws[row * 3], 3, row_data.uvw);
++    ModifyVisibilities<1, false>(row_data.data, row_data.uvw, band,
++                                 model_buffer);
++    const float* weights = &cache.weights[row * cache.n_channels];
++    for (size_t ch = 0; ch != cache.n_channels; ++ch)
++      row_data.data[ch] *= weights[ch];
++  }
++
+   /**
+    * Same as @ref GetCollapsedVisibilities(), but without collapsing the
+    * polarization direction. This implies that the output visibility buffer in
+diff --git a/wgridder/wgriddingmsgridder.cpp b/wgridder/wgriddingmsgridder.cpp
+index e968af2..dfea452 100644
+--- a/wgridder/wgriddingmsgridder.cpp
++++ b/wgridder/wgriddingmsgridder.cpp
+@@ -188,6 +188,9 @@ size_t WGriddingMSGridder::GridRegularMeasurementSet(
+   row_data.data = row_visibilities.data();
+ 
+   const size_t n_parms = NumValuesPerSolution();
++  InversionWeightCache* cache =
++      PrepareWeightCache(*ms_data.ms_provider, selected_band);
++  const bool cache_hit = cache && cache->complete;
+ 
+   // Iterate over chunks until all data has been gridded
+   size_t n_total_rows_read = 0;
+@@ -198,7 +201,21 @@ size_t WGriddingMSGridder::GridRegularMeasurementSet(
+     size_t n_chunk_rows_read = 0;
+ 
+     // Read / fill the chunk
+-    while (ms_reader->CurrentRowAvailable() &&
++    while (cache_hit && ms_reader->CurrentRowAvailable() &&
++           n_chunk_rows_read < max_rows_per_chunk) {
++      const size_t row = n_total_rows_read + n_chunk_rows_read;
++      if (row >= cache->n_rows)
++        throw std::runtime_error("Inversion weight cache row out of range");
++      ReadCachedVisibilities(*ms_reader, *cache, row, row_data,
++                             model_buffer.data(), selected_band);
++      std::copy_n(
++          row_data.data, selected_band.ChannelCount(),
++          &visibility_buffer[n_chunk_rows_read * selected_band.ChannelCount()]);
++      std::copy_n(row_data.uvw, 3, &uvw_buffer[n_chunk_rows_read * 3]);
++      ++n_chunk_rows_read;
++      ms_reader->NextInputRow();
++    }
++    while (!cache_hit && ms_reader->CurrentRowAvailable() &&
+            n_chunk_rows_read < max_rows_per_chunk) {
+       MSProvider::MetaData metadata;
+       ms_reader->ReadMeta(metadata);
+@@ -217,6 +234,7 @@ size_t WGriddingMSGridder::GridRegularMeasurementSet(
+                                     model_buffer.data(),
+                                     selection_buffer.data(), metadata);
+       }
++      if (cache) FillWeightCache(*cache, row_data.uvw, weight_buffer.data());
+ 
+       std::copy_n(
+           row_data.data, selected_band.ChannelCount(),
+@@ -234,6 +252,7 @@ size_t WGriddingMSGridder::GridRegularMeasurementSet(
+ 
+     n_total_rows_read += n_chunk_rows_read;
+   }  // end of chunk
++  if (cache) FinishWeightCache(*cache, n_total_rows_read);
+   return n_total_rows_read;
+ }
+ 

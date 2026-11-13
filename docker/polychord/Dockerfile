@@ -25,9 +25,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:${PATH}
 
-RUN pip install --upgrade pip \
+RUN git clone ${POLYCHORD_GIT_URL} /usr/src/polychord \
+    && git -C /usr/src/polychord checkout ${POLYCHORD_GIT_COMMIT} \
+    && pip install --upgrade pip \
     && pip install \
-        "git+${POLYCHORD_GIT_URL}@${POLYCHORD_GIT_COMMIT}" \
+        /usr/src/polychord \
         astropy \
         mpi4py
 

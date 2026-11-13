@@ -10,6 +10,10 @@ Only finished runs are touched: summary.json is written once PolyChord returns,
 so a run without one is incomplete or resumable, and `./ri resume` rebuilds its
 cache by walking evaluations/.
 
+It also packs a finished run's record files into evaluations/records.jsonl,
+as a run finishing today does (round 93): ~1 file an evaluation back to the
+project's file quota.
+
     scripts/prune-run-artefacts.py results/nested-sampling/*/
 """
 from __future__ import annotations
@@ -23,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib" / "nested_samplin
 from common import (  # noqa: E402
     PRUNED_ARTEFACTS,
     evaluations_keeping_images,
+    pack_evaluation_records,
     prune_run_artefacts,
     write_json_atomic,
 )
@@ -58,7 +63,7 @@ def drop_always_pruned(evaluations_dir: Path, records: list[dict]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    total_removed = 0
+    total_removed = total_packed = 0
     for arg in argv:
         run = Path(arg)
         summary_path = run / "summary.json"
@@ -79,7 +84,13 @@ def main(argv: list[str]) -> int:
             kept = len(evaluations_keeping_images(records))
             print(f"{run.name}: removed {removed} images, kept {kept} of {len(records)} evaluations")
         total_removed += removed
-    print(f"removed {total_removed} images")
+        named = {Path(eval_dir).name: record for record in records
+                 if (eval_dir := (record.get("paths") or {}).get("eval_dir"))}
+        packed = pack_evaluation_records(run / "evaluations", named)
+        if packed:
+            print(f"{run.name}: packed {packed} records")
+        total_packed += packed
+    print(f"removed {total_removed} images, packed {total_packed} records")
     return 0
 
 

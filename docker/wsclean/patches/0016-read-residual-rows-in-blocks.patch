@@ -1,0 +1,149 @@
+diff --git a/gridding/msgridderdata.h b/gridding/msgridderdata.h
+index 8d367a8..cb1efc9 100644
+--- a/gridding/msgridderdata.h
++++ b/gridding/msgridderdata.h
+@@ -768,6 +768,8 @@ class MsGridderData {
+     bool complete = false;
+     aocommon::UVector<double> uvws;
+     aocommon::UVector<float> weights;
++    /// Kept between inversions so its pages are already mapped.
++    aocommon::UVector<std::complex<float>> residuals;
+     size_t gridded_visibility_count = 0;
+     double total_weight = 0.0;
+     double max_gridded_weight = 0.0;
+diff --git a/msproviders/msreaders/msreader.h b/msproviders/msreaders/msreader.h
+index 26df22b..64a60d3 100644
+--- a/msproviders/msreaders/msreader.h
++++ b/msproviders/msreaders/msreader.h
+@@ -56,6 +56,20 @@ class MSReader {
+ 
+   virtual void ReadWeights(float* buffer) = 0;
+ 
++  /**
++   * Points @p data and @p model at the data and model of up to @p max_rows
++   * rows of @p n_values visibilities each, starting at the current row, and
++   * moves past them, as that many ReadData(), ReadModel() and NextInputRow()
++   * calls would. The pointers stay valid until the reader or the model column
++   * changes. Returns the number of rows, or 0 if the reader cannot provide
++   * rows in blocks (the caller then reads row by row).
++   */
++  virtual size_t MapDataAndModelRows(size_t /*max_rows*/, size_t /*n_values*/,
++                                     const std::complex<float>*& /*data*/,
++                                     const std::complex<float>*& /*model*/) {
++    return 0;
++  }
++
+   /**
+    * Write imaging weights to the current READING position.
+    * Note that despite this is a write operation, the reading position is
+diff --git a/msproviders/msreaders/reorderedmsreader.cpp b/msproviders/msreaders/reorderedmsreader.cpp
+index 975c590..d0a5762 100644
+--- a/msproviders/msreaders/reorderedmsreader.cpp
++++ b/msproviders/msreaders/reorderedmsreader.cpp
+@@ -171,6 +171,40 @@ void ReorderedMsReader::ReadModel(std::complex<float>* buffer) {
+               buffer_size, reinterpret_cast<char*>(buffer));
+ }
+ 
++size_t ReorderedMsReader::MapDataAndModelRows(
++    size_t max_rows, size_t n_values, const std::complex<float>*& data,
++    const std::complex<float>*& model) {
++  ReorderedMsProvider& reordered_ms =
++      static_cast<ReorderedMsProvider&>(*ms_provider_);
++  // In a regular set every row has the same width, so the rows' data are
++  // consecutive in the data file and their models in the model file.
++  if (!Provider().IsRegular() || has_data_ ||
++      !reordered_ms.part_header_.has_model ||
++      NVisibilitiesPerRow(metadata_.data_desc_id) != n_values)
++    return 0;
++  const size_t available =
++      reordered_ms.meta_header_.selected_row_count - current_input_row_;
++  const size_t n_rows = std::min(max_rows, available);
++  const size_t n_bytes = n_rows * n_values * sizeof(std::complex<float>);
++  if (n_rows == 0 || data_pos_ > data_size_ || data_size_ - data_pos_ < n_bytes)
++    return 0;
++  data = reinterpret_cast<const std::complex<float>*>(data_file_.Data() +
++                                                      data_pos_);
++  model = reinterpret_cast<const std::complex<float>*>(
++              reordered_ms.model_file_.Data()) +
++          current_value_position_;
++  data_pos_ += n_bytes;
++  current_value_position_ += n_rows * n_values;
++  current_input_row_ += n_rows;
++  has_weights_ = false;
++  // The current row's meta record has been read; skip the others and read
++  // the next row's, as NextInputRow() would have.
++  meta_pos_ += (n_rows - 1) *
++               sizeof(schaapcommon::reordering::details::MetaRecordBuffer);
++  CacheMeta();
++  return n_rows;
++}
++
+ void ReorderedMsReader::ReadWeights(float* buffer) {
+   const int64_t n_visibilities = NVisibilitiesPerRow(metadata_.data_desc_id);
+   if (!has_weights_) {
+diff --git a/msproviders/msreaders/reorderedmsreader.h b/msproviders/msreaders/reorderedmsreader.h
+index 57b9d78..954ea19 100644
+--- a/msproviders/msreaders/reorderedmsreader.h
++++ b/msproviders/msreaders/reorderedmsreader.h
+@@ -32,6 +32,10 @@ class ReorderedMsReader final : public MSReader {
+ 
+   void ReadWeights(float* buffer) override;
+ 
++  size_t MapDataAndModelRows(size_t max_rows, size_t n_values,
++                             const std::complex<float>*& data,
++                             const std::complex<float>*& model) override;
++
+   void WriteImagingWeights(const float* buffer) override;
+ 
+   size_t CurrentDataDescId() const { return metadata_.data_desc_id; }
+diff --git a/wgridder/wgriddingmsgridder.cpp b/wgridder/wgriddingmsgridder.cpp
+index dfea452..8a77ee5 100644
+--- a/wgridder/wgriddingmsgridder.cpp
++++ b/wgridder/wgriddingmsgridder.cpp
+@@ -191,6 +191,10 @@ size_t WGriddingMSGridder::GridRegularMeasurementSet(
+   InversionWeightCache* cache =
+       PrepareWeightCache(*ms_data.ms_provider, selected_band);
+   const bool cache_hit = cache && cache->complete;
++  // A residual inversion from the cache: data minus model, times the cached
++  // weight, taken straight from the reader's mappings a chunk at a time.
++  const bool block_hit = cache_hit && GetPsfMode() == PsfMode::kNone &&
++                         DoSubtractModel() && n_vis_polarizations == 1;
+ 
+   // Iterate over chunks until all data has been gridded
+   size_t n_total_rows_read = 0;
+@@ -201,6 +205,35 @@ size_t WGriddingMSGridder::GridRegularMeasurementSet(
+     size_t n_chunk_rows_read = 0;
+ 
+     // Read / fill the chunk
++    const std::complex<float>* block_data = nullptr;
++    const std::complex<float>* block_model = nullptr;
++    const size_t n_block_rows =
++        block_hit ? ms_reader->MapDataAndModelRows(
++                        max_rows_per_chunk, selected_band.ChannelCount(),
++                        block_data, block_model)
++                  : 0;
++    if (n_block_rows) {
++      if (n_total_rows_read + n_block_rows > cache->n_rows)
++        throw std::runtime_error("Inversion weight cache row out of range");
++      // What ReadCachedVisibilities() does to each row, for the whole block.
++      const size_t n = n_block_rows * selected_band.ChannelCount();
++      cache->residuals.resize(std::max(cache->residuals.size(), n));
++      std::complex<float>* residuals = cache->residuals.data();
++      const float* weights =
++          &cache->weights[n_total_rows_read * selected_band.ChannelCount()];
++      for (size_t i = 0; i != n; ++i) {
++        std::complex<float> value = block_data[i];
++        value -= block_model[i];
++        value *= weights[i];
++        residuals[i] = value;
++      }
++      Logger::Info << "Gridding " << n_block_rows << " rows...\n";
++      gridder_->AddInversionData(n_block_rows, selected_band.ChannelCount(),
++                                 &cache->uvws[n_total_rows_read * 3],
++                                 frequencies.data(), residuals);
++      n_total_rows_read += n_block_rows;
++      continue;
++    }
+     while (cache_hit && ms_reader->CurrentRowAvailable() &&
+            n_chunk_rows_read < max_rows_per_chunk) {
+       const size_t row = n_total_rows_read + n_chunk_rows_read;

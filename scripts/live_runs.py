@@ -18,6 +18,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -84,7 +85,9 @@ def build_live_summary(run_dir: Path, now: float | None = None) -> dict[str, Any
     # Wall clock since the run id's stamp, not summed evaluation time: it is
     # what the finished summary records, and the only clock a live run has.
     wall_seconds = max(0.0, now - started)
-    mpi_procs = int(settings.get("NS_MPI_PROCS") or 1)
+    # Per node in run.env, with NS_NODES only when above 1 (round 288); the
+    # finished summary counts every node's ranks, so this does too.
+    mpi_procs = int(settings.get("NS_MPI_PROCS") or 1) * int(settings.get("NS_NODES") or 1)
 
     def number(name: str) -> int | None:
         try:
@@ -193,6 +196,7 @@ def self_check() -> None:
             assert summary["metric"] == "total_rms_jy - snr", summary
             assert summary["polychord"]["nlive"] == 8, summary
             assert summary["polychord"]["synchronous"] is True, summary
+            assert summary["polychord"]["mpi_procs"] == 4, summary
             assert summary["parameter_space"][0]["name"] == "channel_count", summary
             assert [ev["eval_id"] for ev in summary["evaluations"]] == [1], summary
             assert summary["worst_evaluation"]["eval_id"] == 1, summary
@@ -213,6 +217,14 @@ def self_check() -> None:
             assert drop_stale_live_summaries({run_dir}) == [], "still live"
             assert drop_stale_live_summaries(set()) == [path], "finished"
             assert not path.exists()
+
+            # A multi-node run.env counts NS_MPI_PROCS per node.
+            nodes = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
+            nodes.mkdir()
+            (nodes / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_MPI_PROCS=38\nNS_NODES=2\n")
+            spread = json.loads(write_live_summary(nodes).read_text())
+            assert spread["polychord"]["mpi_procs"] == 76, spread["polychord"]
+            shutil.rmtree(nodes)
 
             # A run with nothing on disk yet is still summarisable.
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260102T000000Z"

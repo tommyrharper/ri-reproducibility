@@ -1,0 +1,29 @@
+diff --git a/external/schaapcommon/external/ducc0/wgridder/wgridder.h b/external/schaapcommon/external/ducc0/wgridder/wgridder.h
+--- a/external/schaapcommon/external/ducc0/wgridder/wgridder.h
++++ b/external/schaapcommon/external/ducc0/wgridder/wgridder.h
+@@ -1674,6 +1674,25 @@
+           const ptrdiff_t ls0=lmask.stride(0), ls1=lmask.stride(1);
+           double lwmin_d=1e300, lwmax_d=-1e300;
+           size_t lnvis=0;
++          // ri: the w range is read only when w-gridding is on (nplanes,
++          // wmin and the kernel cost model); WSClean turns it off (0006).
++          if (!do_wgridding)
++            {
++            for (size_t irow=0; irow<nrow; ++irow)
++              for (size_t ichan=0; ichan<nchan; ++ichan)
++                if (norm(vis[ptrdiff_t(irow)*vs0+ptrdiff_t(ichan)*vs1]) != 0)
++                  {
++                  lm[ptrdiff_t(irow)*ls0+ptrdiff_t(ichan)*ls1]=1;
++                  ++lnvis;
++                  }
++                else
++                  {
++                  if (!gridding) ms_out(irow, ichan)=0;
++                  }
++            nvis = lnvis;
++            timers.pop();
++            return;
++            }
+           for (size_t irow=0; irow<nrow; ++irow)
+             for (size_t ichan=0; ichan<nchan; ++ichan)
+               if (norm(vis[ptrdiff_t(irow)*vs0+ptrdiff_t(ichan)*vs1]) != 0)

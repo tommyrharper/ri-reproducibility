@@ -171,10 +171,10 @@ result back.
 
 Two smaller notes for a run that size:
 
-- `adopt_completed_evaluations()` runs on **every** rank, so a resume of an
-  850k-evaluation run parses 850k records twenty times over - 18 s of CPU per
-  rank, all twenty at once. Fine once; it is a reason not to resume a big run
-  repeatedly.
+- On resume, `adopt_completed_evaluations()` reads the records on rank 0 only
+  and broadcasts `{key: objective}` to the others. Before CSD3 round 267 every
+  rank parsed every record, which at 400k records was 6.4 GB a rank, too much
+  for a 113-rank node ([csd3-speed](csd3-speed.md), round 267).
 - The last eighth of a bounded run reads ~25% slow in `--over-time` at the same
   `vis/eval` (89.5 evals/s against 120.7 at `--nlive 60`). That is the ranks
   draining as PolyChord terminates, a fixed cost, and it is why a short

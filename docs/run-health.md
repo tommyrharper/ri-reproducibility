@@ -33,6 +33,13 @@ host
   sidecars  3 running, 0 leaked
 ```
 
+"In flight" on a live run counts the evaluations being imaged right now. A rank
+with scratch builds each one in `/dev/shm` and writes nothing to the run
+directory until it is scored, so the count is the recent imaging seconds per
+elapsed second (Little's law), or the number of directories with no
+`metrics.json` if that is larger. On a dead run it is those leftover
+directories, shown as "abandoned".
+
 `--monitor` redraws every `--interval` seconds (default 5, matching the TUI's
 own timer) instead of printing once, so watching a run does not fill the
 terminal with one scrollback entry per poll. Ctrl-C to stop.
@@ -93,6 +100,15 @@ A directory with none of `run.env`, `run.log`, `summary.json`, `evaluations/`
 or `chains/` is `Not a nested-sampling run` rather than a status - every status
 above is decided by an absence, which is also what an unrelated directory looks
 like. `./ri runs` skips the same directories.
+
+## Where a rank is stuck
+
+`py-spy` cannot attach to a rank inside Apptainer ("Permission Denied"). For
+an R2D2 search, `NS_STACK_DUMP_S=<s>` makes every rank write its Python stacks
+(all threads) to `<run>/stacks/rank-NNN.txt` every `s` seconds, through
+`faulthandler`, which needs no GIL and so still dumps a rank stuck in C. Dump
+`k` is at the header's `start` + `k` x `s`. It adds one Lustre file per rank,
+so leave it off for production searches.
 
 ## Warnings
 
@@ -385,6 +401,11 @@ Nothing else on disk or in the process table shows this. Found through the
 run's worker pools (`scripts/lib/start-sidecars.sh`), whose ancestors are
 searched for a run script rather than checked for pid 1, because a reparented
 orphan lands on whatever subreaper the session has.
+
+**TensorRT** - a warning when a GPU search's shared TensorRT server has died.
+Its workers fall back to the CPU U-Net, so the results are still right but the
+rate drops to about a sixth (round 219). Read from the `fallback:` line the pool
+writes to `<run>/r2d2-engine.txt`. `./ri resume` starts a new server.
 
 **failures** - evaluations that scored `FAILURE_OBJECTIVE` (100.0), and
 `meqserver-wedged.log` lines. **The one a run can pass every other check and

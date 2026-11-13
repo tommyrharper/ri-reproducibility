@@ -20,15 +20,81 @@ if [ -z "${NS_SCRATCH_DIR:-}" ] && [ -w /dev/shm ]; then
 fi
 export NS_SCRATCH_DIR="${NS_SCRATCH_DIR:-}"
 
+# The caches below live in the work directory job-env.sh puts XDG_CACHE_HOME
+# in (RI_WORK_DIR, else the repo's parent: hpc-work on CSD3), whether or not
+# the run entered the job environment - never /home (docs/cluster.md).
+_ri_cache="${RI_WORK_DIR:-$(dirname "$(cd "${REPO_ROOT}" && pwd -P)")}/.cache/ri"
+
+# makems observations kept across runs (load_observation() in
+# simulate_point_source_ms.py), per meqtrees image. Empty turns it off.
+if [ -z "${NS_OBSERVATION_CACHE_DIR+set}" ] && [ -n "${MEQTREES_SIF:-}" ] && declare -F ns_image_id >/dev/null; then
+  _meqtrees_id="$(ns_image_id "${MEQTREES_SIF}")"
+  if [ "${_meqtrees_id}" != unknown ]; then
+    NS_OBSERVATION_CACHE_DIR="${_ri_cache}/ms-observations/${_meqtrees_id}"
+    mkdir -p "${NS_OBSERVATION_CACHE_DIR}" 2>/dev/null || NS_OBSERVATION_CACHE_DIR=""
+  fi
+fi
+export NS_OBSERVATION_CACHE_DIR="${NS_OBSERVATION_CACHE_DIR:-}"
+
+# A meqtrees.sif built before docker/meqtrees/src/fastnoise.c has no
+# /opt/ri-lib/fastnoise.so, and the simulator then draws noise with numpy:
+# ~20ms more per evaluation (docs/csd3-speed.md, round 42). Such an image is
+# given a host-built copy, cached per source and compiler, so a cluster need
+# not wait for a rebuild. The simulator checks it against numpy on load and
+# falls back if it disagrees. Empty NS_FASTNOISE_DIR turns this off.
+if [ -z "${NS_FASTNOISE_DIR+set}" ] && [ -f "${MEQTREES_SIF:-}" ] && [ -n "${APPTAINER:-}" ] \
+  && command -v gcc >/dev/null 2>&1 \
+  && ! "${APPTAINER}" exec "${MEQTREES_SIF}" test -e /opt/ri-lib/fastnoise.so 2>/dev/null; then
+  _fastnoise_src="${REPO_ROOT}/docker/meqtrees/src"
+  _fastnoise_key="$( { cat "${_fastnoise_src}/fastnoise.c" "${_fastnoise_src}/ziggurat_double.h"; gcc --version; } \
+    | sha256sum | cut -c1-16)"
+  NS_FASTNOISE_DIR="${_ri_cache}/fastnoise/${_fastnoise_key}"
+  if [ ! -f "${NS_FASTNOISE_DIR}/fastnoise.so" ]; then
+    if ! { mkdir -p "${NS_FASTNOISE_DIR}" 2>/dev/null \
+      && gcc -O2 -ffp-contract=off -shared -fPIC -o "${NS_FASTNOISE_DIR}/fastnoise.so.$$" \
+        "${_fastnoise_src}/fastnoise.c" -lm 2>/dev/null \
+      && mv -f "${NS_FASTNOISE_DIR}/fastnoise.so.$$" "${NS_FASTNOISE_DIR}/fastnoise.so"; }; then
+      rm -f "${NS_FASTNOISE_DIR}/fastnoise.so.$$"
+      NS_FASTNOISE_DIR=""
+    fi
+  fi
+fi
+export NS_FASTNOISE_DIR="${NS_FASTNOISE_DIR:-}"
+
 _sidecar_remove() {
   local pid
   for pid in ${SIDECAR_PIDS[@]+"${SIDECAR_PIDS[@]}"}; do
     kill -KILL -- "-${pid}" 2>/dev/null || true
   done
+  if [ -n "${NS_CUDA_MPS_DIR:-}" ]; then
+    echo quit | CUDA_MPS_PIPE_DIRECTORY="${NS_CUDA_MPS_DIR}/pipe" nvidia-cuda-mps-control >/dev/null 2>&1 || true
+  fi
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
     # Best-effort cleanup must not replace a successful search's exit status.
     rm -rf "${NS_SCRATCH_DIR}" 2>/dev/null || true
   fi
+}
+
+# CUDA MPS for a GPU pool: one daemon merges the workers' CUDA contexts, so
+# they share the card instead of time-slicing it - 2.8x the U-Net forwards a
+# second on an A100 at 16 workers (csd3-speed.md, round 117). It runs on the
+# host (no root needed), in this run's scratch, and _sidecar_remove stops it.
+# Fills CUDA_MPS_FLAGS with the apptainer flags that point a pool at it, in
+# place like SIDECAR_BINDS; leaves it empty (and the pool runs without MPS)
+# where there is no control binary or the daemon will not start.
+sidecar_cuda_mps_flags() {
+  CUDA_MPS_FLAGS=()
+  command -v nvidia-cuda-mps-control >/dev/null 2>&1 || return 0
+  NS_CUDA_MPS_DIR="${NS_SCRATCH_DIR:-${TMPDIR:-/tmp}}/cuda-mps-$$"
+  mkdir -p "${NS_CUDA_MPS_DIR}/pipe" "${NS_CUDA_MPS_DIR}/log"
+  if ! CUDA_MPS_PIPE_DIRECTORY="${NS_CUDA_MPS_DIR}/pipe" CUDA_MPS_LOG_DIRECTORY="${NS_CUDA_MPS_DIR}/log" \
+      nvidia-cuda-mps-control -d >&2; then
+    echo "WARNING: CUDA MPS did not start; the GPU workers will time-slice the card" >&2
+    NS_CUDA_MPS_DIR=""
+    return 0
+  fi
+  # shellcheck disable=SC2034  # read by the caller
+  CUDA_MPS_FLAGS=(--bind "${NS_CUDA_MPS_DIR}" --env "CUDA_MPS_PIPE_DIRECTORY=${NS_CUDA_MPS_DIR}/pipe")
 }
 
 # The bind mounts every pool and every rank gets: the repo at its own path
@@ -42,6 +108,9 @@ sidecar_binds() {
   SIDECAR_BINDS=(--bind "${REPO_ROOT}")
   if [ -n "${NS_SCRATCH_DIR:-}" ]; then
     SIDECAR_BINDS+=(--bind "${NS_SCRATCH_DIR}" --env "NS_SCRATCH_DIR=${NS_SCRATCH_DIR}")
+  fi
+  if [ -n "${NS_OBSERVATION_CACHE_DIR:-}" ]; then
+    SIDECAR_BINDS+=(--bind "${NS_OBSERVATION_CACHE_DIR}" --env "NS_OBSERVATION_CACHE_DIR=${NS_OBSERVATION_CACHE_DIR}")
   fi
 }
 
@@ -78,11 +147,18 @@ sidecar_launch() {
   name="$(basename "${sif}" .sif)"
   # Which shell owns these pools, for the leak rule in rank-budget.sh: a pool
   # whose run has no ranks is only leaked once this pid is gone too - between
-  # retries the ranks are dead and the pools are not.
+  # retries the ranks are dead and the pools are not. Renamed into place:
+  # each pool's launch rewrites it, and a `>` truncation read by another
+  # search's reaper while this run's first pool is up and its ranks are not
+  # yet started looks like no launcher, so that pool was killed (round 135).
   if [ -n "${OUTPUT_DIR:-}" ]; then
-    echo "$$" >"${OUTPUT_DIR}/.launcher.pid"
+    echo "$$" >"${OUTPUT_DIR}/.launcher.pid.$$"
+    mv -f "${OUTPUT_DIR}/.launcher.pid.$$" "${OUTPUT_DIR}/.launcher.pid"
   fi
   sidecar_binds
+  if [ "${sif}" = "${MEQTREES_SIF:-}" ] && [ -n "${NS_FASTNOISE_DIR:-}" ]; then
+    args+=(--bind "${NS_FASTNOISE_DIR}:/opt/ri-lib:ro")
+  fi
   local -a run=(
     "${APPTAINER}" exec --pwd "${REPO_ROOT}"
     "${SIDECAR_BINDS[@]}"
@@ -136,9 +212,13 @@ _sidecar_kill_tree() {
 # written. (The Docker branch had a restart's ranks start their own workers
 # instead; a rank inside a SIF cannot.) Each worker's pid is beside its FIFOs,
 # and it goes with its children - the meqserver a simulate worker drives.
+# A multi-node search keeps each node's pids under .<pool>-workers/<host>/;
+# only this host's are this node's processes, and sidecar_reset_remote (when
+# the launcher defines one) has the other nodes reset theirs.
 sidecar_reset_workers() {
   local pid_file pid killed=0
-  for pid_file in "${OUTPUT_DIR:-/nonexistent}"/.*-workers/*.pid; do
+  for pid_file in "${OUTPUT_DIR:-/nonexistent}"/.*-workers/*.pid \
+    "${OUTPUT_DIR:-/nonexistent}"/.*-workers/"$(hostname -s)"/*.pid; do
     [ -f "${pid_file}" ] || continue
     pid="$(cat "${pid_file}" 2>/dev/null)" || continue
     case "${pid}" in '' | *[!0-9]*) continue ;; esac
@@ -148,6 +228,9 @@ sidecar_reset_workers() {
   done
   [ "${killed}" -eq 0 ] \
     || echo "sidecar_reset_workers: killed ${killed} pool worker(s) so the retry starts on fresh ones" >&2
+  if declare -F sidecar_reset_remote >/dev/null; then
+    sidecar_reset_remote
+  fi
 }
 
 # `bash scripts/lib/start-sidecars.sh --self-check` - the exec line each pool
@@ -180,6 +263,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   { [ -f "${_tmp}/workers-a.log" ] && [ -f "${_tmp}/workers-b.log" ]; } \
     || { echo "FAIL: pool logs not written beside the run"; exit 1; }
   [ "$(cat "${_tmp}/.launcher.pid")" = "$$" ] || { echo "FAIL: launcher pid not recorded"; exit 1; }
+  compgen -G "${_tmp}/.launcher.pid.*" >/dev/null && { echo "FAIL: launcher pid temp file left behind"; exit 1; }
 
   # Restore starts a dead pool again with its own command, and leaves the
   # live one alone.
@@ -215,9 +299,38 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     kill -0 "${_pid}" || { echo "FAIL: the reset took pool ${_pid} with it"; exit 1; }
   done
   [ -z "$(sidecar_reset_workers 2>&1)" ] || { echo "FAIL: a second reset found something to kill"; exit 1; }
+  # Multi-node: this host's directory is reset, another host's pids are not
+  # this node's processes and are left alone.
+  mkdir -p "${_tmp}/.fake-workers/$(hostname -s)" "${_tmp}/.fake-workers/other-host"
+  sleep 30 &
+  _worker=$!
+  disown "${_worker}"
+  echo "${_worker}" >"${_tmp}/.fake-workers/$(hostname -s)/5.pid"
+  echo "$$" >"${_tmp}/.fake-workers/other-host/6.pid"
+  sidecar_reset_workers 2>&1 | grep -q "killed 1 pool worker" || { echo "FAIL: reset missed this host's worker"; exit 1; }
+  sleep 0.2
+  kill -0 "${_worker}" 2>/dev/null && { echo "FAIL: this host's worker ${_worker} survived the reset"; exit 1; }
+  rm -rf "${_tmp}/.fake-workers"
+
+  # CUDA MPS: no control binary leaves the pool flags empty; a daemon that
+  # starts gives the bind and pipe env, and teardown tells it to quit.
+  PATH="${_tmp}/nobin" APPTAINER=x sidecar_cuda_mps_flags
+  [ "${#CUDA_MPS_FLAGS[@]}" = 0 ] || { echo "FAIL: MPS flags without nvidia-cuda-mps-control"; exit 1; }
+  mkdir -p "${_tmp}/bin"
+  # shellcheck disable=SC2016  # expanded by the stand-in, not here
+  printf '#!/bin/sh\necho "$CUDA_MPS_PIPE_DIRECTORY $* $(cat)" >>"%s/mps"\n' "${_tmp}" >"${_tmp}/bin/nvidia-cuda-mps-control"
+  chmod +x "${_tmp}/bin/nvidia-cuda-mps-control"
+  _path="${PATH}"
+  PATH="${_tmp}/bin:${PATH}"
+  sidecar_cuda_mps_flags </dev/null
+  [ "${CUDA_MPS_FLAGS[*]}" = "--bind ${NS_CUDA_MPS_DIR} --env CUDA_MPS_PIPE_DIRECTORY=${NS_CUDA_MPS_DIR}/pipe" ] \
+    || { echo "FAIL: MPS flags: ${CUDA_MPS_FLAGS[*]}"; exit 1; }
+  grep -q -- "^${NS_CUDA_MPS_DIR}/pipe -d" "${_tmp}/mps" || { echo "FAIL: MPS daemon not started"; exit 1; }
 
   # Teardown kills whole groups, children included.
   _sidecar_remove
+  grep -q -- "^${NS_CUDA_MPS_DIR}/pipe  quit" "${_tmp}/mps" || { echo "FAIL: teardown did not stop MPS"; exit 1; }
+  PATH="${_path}"
   sleep 0.2
   for _pid in "${SIDECAR_PIDS[@]}"; do
     kill -0 "${_pid}" 2>/dev/null && { echo "FAIL: pool ${_pid} survived _sidecar_remove"; exit 1; }

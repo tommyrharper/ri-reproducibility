@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from common import (
+    polychord_nfail,
     DEFAULT_SUPER_RESOLUTION,
     DEFAULT_WSCLEAN_AUTO_THRESHOLD,
     DEFAULT_WSCLEAN_MGAIN,
@@ -24,11 +25,23 @@ from common import (
     WORKER_DIED,
     WorkerDied,
     ZYGOTE_COMMAND,
+    abort_on_exception,
     abort_run,
     adopt_completed_evaluations,
     clean_convergence_from,
     cube_like_from_theta,
     cube_to_params,
+    evidence_record,
+    PolyChordFinish,
+    chains_base_dir,
+    start_chains_mirror,
+    finished_run_records,
+    pack_finished_run,
+    encode_finished_records,
+    start_record_packer,
+    stop_record_packer,
+    post_run_line,
+    post_run_phase,
     gathered_window_fit_stats,
     compute_image_metrics,
     extra_source_offsets_arcsec,
@@ -40,21 +53,28 @@ from common import (
     mark_evaluation_start,
     mpi_rank,
     params_key,
+    pin_rank_cpu,
     prewarm,
     prune_run_artefacts,
+    salvage_evaluation_logs,
     prior_vector,
     resolve_metric,
     self_check_fits_reader,
     self_check_image_pixel_size,
     self_check_lazy_numpy,
     self_check_metric_resolution,
+    self_check_chains_mirror,
+    self_check_polychord_finish,
     self_check_parameter_space,
     self_check_parameter_toggle,
+    self_check_evidence_record,
     self_check_profiling,
     self_check_resume_adoption,
     self_check_source_offset,
     self_check_spectral_window,
     self_check_worker_pool_connect,
+    self_check_cpu_pinning,
+    self_check_abort_on_exception,
     self_check_worker_timeout,
     sidecar_command,
     zygote_run,
@@ -67,6 +87,7 @@ from common import (
     write_evaluation_record,
     write_json_atomic,
     write_polychord_paramnames,
+    write_records_in_background,
 )
 
 
@@ -115,7 +136,10 @@ def evaluate(
     # R2D2 sizes its pixels from the data; WSClean has to be told. Reading the
     # figure the simulator recorded keeps the two imaging the same sky - see
     # image_pixel_size_arcsec() in common.py.
-    simulation = json.loads((eval_dir / "simulation.json").read_text())
+    # Everything below is written beside the MS: tmpfs scratch when the run
+    # has one, which publish_evaluation_scratch() empties at scoring.
+    work_dir = ms_path.parent
+    simulation = json.loads((work_dir / "simulation.json").read_text())
     if "max_proj_baseline_lambda" not in simulation["observation"]:
         raise SystemExit(
             "FATAL: simulation.json has no observation.max_proj_baseline_lambda - "
@@ -123,10 +147,10 @@ def evaluate(
         )
     scale_arcsec = image_pixel_size_arcsec(simulation["observation"]["max_proj_baseline_lambda"])
 
-    wsclean_dir = eval_dir / "wsclean"
+    wsclean_dir = work_dir / "wsclean"
     wsclean_dir.mkdir()
-    wsclean_stdout = eval_dir / "wsclean.stdout.log"
-    wsclean_stderr = eval_dir / "wsclean.stderr.log"
+    wsclean_stdout = work_dir / "wsclean.stdout.log"
+    wsclean_stderr = work_dir / "wsclean.stderr.log"
     wsclean_cmd = [
         *sidecar_command(args.wsclean_image),
         "-name",
@@ -160,7 +184,7 @@ def evaluate(
           if os.environ.get("NS_WSCLEAN_LOG_TIME", "1") != "0" else []),
     ]
     # zygote wait4() supplies exact child wall time and peak RSS.
-    run_result = zygote_run(args.wsclean_image, args.platform, eval_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
+    run_result = zygote_run(args.wsclean_image, args.platform, work_dir, wsclean_cmd, wsclean_stdout, wsclean_stderr)
     peak_memory_bytes = run_result.peak_memory_bytes
     image_binary_seconds = run_result.binary_seconds
     if is_infrastructure_failure(run_result.returncode):
@@ -230,7 +254,7 @@ def evaluate(
         "paths": {
             "eval_dir": str(eval_dir),
             "measurement_set": str(ms_path),
-            "simulation_metadata": str(eval_dir / "simulation.json"),
+            "simulation_metadata": str(work_dir / "simulation.json"),
             "image": str(image_path),
             "dirty": str(dirty_path),
             "residual": str(residual_dirty_path),
@@ -375,6 +399,7 @@ def main() -> None:
     # Before `import pypolychord`, so the rank's pool attachments come up
     # while the sampler is still loading. Joined just below, right before the
     # first evaluation can ask for one.
+    pin_rank_cpu()
     warm = prewarm(
         lambda: simulate_worker(args.meqtrees_image, args.platform),
         lambda: zygote_worker(args.wsclean_image),
@@ -398,6 +423,8 @@ def main() -> None:
 
     def likelihood(theta: np.ndarray) -> tuple[float, list[float]]:
         nonlocal scored
+        if finish.finished():
+            return finish.discarded(), []
         # ponytail: theta values are rounded back to the documented parameter
         # space here; a later science run should keep integer/discrete handling
         # in one sampler-aware transform instead of this bridge.
@@ -414,6 +441,7 @@ def main() -> None:
             except WorkerDied as exc:
                 # No honest likelihood exists for an evaluation the host never
                 # ran, and any value invented here would steer the sampler.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(str(exc))
             except (Exception, SystemExit):
                 # Anything else is a bug in this file, and a bug here used to
@@ -422,22 +450,24 @@ def main() -> None:
                 # only and every other rank waits forever in a collective that
                 # never completes: every core busy, nothing landing, and
                 # run_with_retries never even reached because nothing exited.
+                salvage_evaluation_logs(eval_dir)
                 abort_run(traceback.format_exc())
             cache[key] = float(record["objective"])
             print(json.dumps({"eval_id": eval_id, "objective": record["objective"], "params": params}), flush=True)
         return cache[key], []
 
     settings = PolyChordSettings(len(load_parameter_space()), 0)
-    settings.base_dir = str(output_dir / "chains")
+    settings.base_dir = str(chains_base_dir(output_dir))
     settings.file_root = "wsclean_vlaa"
     settings.nlive = args.nlive
     settings.num_repeats = args.num_repeats
     settings.max_ndead = args.max_ndead
+    settings.nfail = polychord_nfail(args.nlive)
     settings.seed = args.seed
     settings.synchronous = os.environ.get("NS_SYNCHRONOUS", "0") != "0"
     # Checkpoint long runs; `--output-dir <interrupted run>` resumes, while a
     # fresh run without a resume file starts clean.
-    resume_path = Path(settings.base_dir) / f"{settings.file_root}.resume"
+    resume_path = output_dir / "chains" / f"{settings.file_root}.resume"
     settings.write_resume = True
     settings.read_resume = resume_path.exists()
     # Always adopt disk evaluations: retries can die before PolyChord writes a
@@ -450,16 +480,26 @@ def main() -> None:
         print(f"{where}, {done} evaluations already done", flush=True)
     settings.feedback = 1
 
-    write_polychord_paramnames(output_dir / "chains", settings.file_root)
+    if mpi_rank() == 0:  # one writer: rank 0's mirror seeds tmpfs from it, and another
+        # rank's truncating rewrite once seeded an empty file (round 229)
+        write_polychord_paramnames(output_dir / "chains", settings.file_root)
     warm()
     run_start, run_started_epoch = time.monotonic(), time.time()
-    pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior)
+    write_records_in_background()
+    packer = start_record_packer(evaluations_dir) if mpi_rank() == 0 else None
+    mirror = start_chains_mirror(output_dir, Path(settings.base_dir))
+    finish = PolyChordFinish()
+    output = pypolychord.run_polychord(likelihood, len(load_parameter_space()), 0, settings, prior, finish.dumper)
     total_wall_seconds = time.monotonic() - run_start
-    # Collective, so every rank calls it before rank 0 goes on alone.
+    finish.close()
+    if mirror is not None:
+        mirror.stop()  # before summary.json: a finished run's chains are all on Lustre
+    stop_record_packer(packer)
+    # Collective, as is the one below, so every rank calls both before rank 0 goes on alone.
+    all_evaluations = finished_run_records(evaluations_dir)
     window_fit_stats = gathered_window_fit_stats()
 
-    if mpi_rank() == 0:
-        all_evaluations = load_evaluations_from_dir(evaluations_dir)
+    if all_evaluations is not None:
         best = max(all_evaluations, key=lambda item: item["objective"]) if all_evaluations else None
         mpi_procs = int(os.environ.get("NS_MPI_PROCS", "1"))
         summary = {
@@ -489,21 +529,32 @@ def main() -> None:
                 "super_resolution": DEFAULT_SUPER_RESOLUTION,
             },
             "parameter_space": load_parameter_space(),
+            # Before the bulk, so a listing reads it out of the head rather
+            # than stat-ing every evaluation directory.
+            "evaluation_count": len(all_evaluations),
             "evaluations": all_evaluations,
             "worst_evaluation": best,
             "total_wall_seconds": total_wall_seconds,
+            "evidence": evidence_record(output),
             "profiling": summarize_profiling(all_evaluations, total_wall_seconds, mpi_procs, run_started_epoch),
             "spectral_window_fitting": window_fit_stats,
         }
         # Rank-based, so it can only run now that every evaluation is scored.
         # Mutates the records the summary embeds, so summary.json never names
         # an image this just deleted.
+        started = time.monotonic()
         prune_run_artefacts(evaluations_dir, all_evaluations)
+        started = post_run_phase("prune", started)
         summary_path = output_dir / "summary.json"
         # Atomic: every reader treats a run with a summary.json as finished,
         # so half of one is a finished run nobody can report on, merge or
         # resume. See write_json_atomic().
-        write_json_atomic(summary_path, summary)
+        encoded = encode_finished_records()
+        write_json_atomic(summary_path, summary, list(encoded.values()))
+        started = post_run_phase("summary", started)
+        pack_finished_run(evaluations_dir, encoded)
+        post_run_phase("pack", started)
+        print(post_run_line())
         print(window_fit_summary_line(window_fit_stats))
         print(f"wrote {summary_path}")
 
@@ -519,10 +570,15 @@ if __name__ == "__main__":
         self_check_image_pixel_size()
         self_check_source_offset()
         self_check_profiling()
+        self_check_evidence_record()
+        self_check_polychord_finish()
+        self_check_chains_mirror()
         self_check_failure_record_persistence()
         self_check_resume_adoption()
+        self_check_abort_on_exception()
         self_check_worker_timeout()
         self_check_worker_pool_connect()
+        self_check_cpu_pinning()
         print("metric resolution self-check passed")
     else:
-        main()
+        abort_on_exception(main)

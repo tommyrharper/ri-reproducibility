@@ -1,0 +1,45 @@
+diff --git a/msproviders/msreaders/reorderedmsreader.cpp b/msproviders/msreaders/reorderedmsreader.cpp
+index 7ecefe7..6e1c638 100644
+--- a/msproviders/msreaders/reorderedmsreader.cpp
++++ b/msproviders/msreaders/reorderedmsreader.cpp
+@@ -17,6 +17,20 @@ bool ReadMapped(const MappedFile& file, size_t size, size_t& pos, void* dest,
+   pos += count;
+   return count == n;
+ }
++
++// A whole record is the common case: copy it at its compile-time size, so the
++// copy is two vector moves rather than a variable-length loop whose narrow
++// stores the caller's wide reload of the record then stalls on.
++template <typename Record>
++bool ReadMappedRecord(const MappedFile& file, size_t size, size_t& pos,
++                      Record* dest) {
++  if (pos < size && size - pos >= sizeof(Record)) {
++    std::memcpy(dest, file.Data() + pos, sizeof(Record));
++    pos += sizeof(Record);
++    return true;
++  }
++  return ReadMapped(file, size, pos, dest, sizeof(Record));
++}
+ }  // namespace
+ 
+ ReorderedMsReader::ReorderedMsReader(ReorderedMsProvider* reordered_ms)
+@@ -97,8 +111,7 @@ void ReorderedMsReader::ReadMeta(MSProvider::MetaData& metadata) {
+ void ReorderedMsReader::CacheMeta() {
+   if (Provider().IsRegular()) {
+     schaapcommon::reordering::details::MetaRecordBuffer record;
+-    if (!ReadMapped(meta_file_, meta_size_, meta_pos_, &record,
+-                    sizeof(record)))
++    if (!ReadMappedRecord(meta_file_, meta_size_, meta_pos_, &record))
+       return;
+     metadata_.u_in_m = record.u;
+     metadata_.v_in_m = record.v;
+@@ -110,8 +123,7 @@ void ReorderedMsReader::CacheMeta() {
+     metadata_.antenna2 = record.antenna2;
+   } else {
+     schaapcommon::reordering::details::BdaMetaRecordBuffer record;
+-    if (!ReadMapped(meta_file_, meta_size_, meta_pos_, &record,
+-                    sizeof(record)))
++    if (!ReadMappedRecord(meta_file_, meta_size_, meta_pos_, &record))
+       return;
+     metadata_.u_in_m = record.u;
+     metadata_.v_in_m = record.v;

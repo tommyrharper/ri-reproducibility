@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import math
 import os
 import re
 import select
 import signal
+import statistics
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache, lru_cache
@@ -119,6 +122,14 @@ def predict_wait_seconds(n_times: int = 0) -> float:
     return PREDICT_BASE_SECONDS + PREDICT_CONTENTION_MARGIN * PREDICT_SECONDS_PER_TIME_SAMPLE * n_times
 
 
+@cache
+def observation_horizon_minutes() -> float:
+    """The longest observation the search can draw, 0.0 when that is pinned:
+    the length the simulator caches an unseen observation at."""
+    spec = next((spec for spec in load_parameter_space() if spec["name"] == "observation_minutes"), None)
+    return float(spec["max"]) if spec else 0.0
+
+
 def simulate_reply_timeout(n_times: int = 0) -> float:
     """How long the rank waits on the worker: its two predict attempts, and the rest.
 
@@ -163,6 +174,7 @@ class WorkerDied(RuntimeError):
 
 def abort_run(message: str) -> None:
     print(f"FATAL: {message}", file=sys.stderr, flush=True)
+    drain_record_writes(timeout=30.0)
     try:
         from mpi4py import MPI
 
@@ -172,6 +184,21 @@ def abort_run(message: str) -> None:
         # to the hard exit, which the launcher turns into a failed run anyway.
         pass
     os._exit(1)
+
+
+def abort_on_exception(main: Any) -> None:
+    """Run a rank's main(), aborting the job if it raises. A rank that just
+    exits leaves the others in their next collective and MPI_Finalize waiting
+    for them: a failed end-of-run gather held 8 nodes until the job's timeout
+    (round 348). Only a clean exit gets past here without Abort."""
+    try:
+        main()
+    except SystemExit as error:
+        if error.code not in (None, 0):
+            abort_run(str(error.code))
+        raise
+    except BaseException:
+        abort_run(traceback.format_exc())
 
 
 # CLEAN's minor-iteration budget. At the old 100 roughly four evaluations in
@@ -499,9 +526,19 @@ class DockerRunResult:
 
 def r2d2_thread_count() -> int:
     override = os.environ.get("R2D2_OMP_THREADS")
-    if override:
-        return max(1, int(override))
-    return os.cpu_count() or 1
+    base = max(1, int(override)) if override else os.cpu_count() or 1
+    # Spread the job's CPUs over the evaluations in flight. A run's final
+    # chain otherwise images alone on one thread while every other core idles:
+    # the last ~30 of the 71k-evaluation run's 289 minutes (docs/csd3-speed.md, round 9).
+    ceiling = int(os.environ.get("R2D2_MAX_THREADS") or 0)
+    busy_dir = _busy_dir()
+    if ceiling <= base or busy_dir is None:
+        return base
+    try:
+        busy = len(os.listdir(busy_dir))
+    except FileNotFoundError:
+        busy = 0
+    return max(base, ceiling // max(1, busy))
 
 
 def fill_disabled_parameters(raw: dict[str, Any]) -> None:
@@ -873,7 +910,7 @@ def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
             continue
         eval_dir = (record.get("paths") or {}).get("eval_dir")
         try:
-            ended = (Path(eval_dir) / "metrics.json").stat().st_mtime
+            ended = evaluation_record_file(Path(eval_dir)).stat().st_mtime
         except (OSError, TypeError):
             return profiling
         spans.append({"timing": {"started_epoch": ended - length, "ended_epoch": ended}})
@@ -887,6 +924,87 @@ def backfill_busy_seconds(summary: dict[str, Any]) -> dict[str, Any]:
         return profiling
     return {**profiling, "busy_worker_seconds": busy_worker,
             "busy_wall_seconds": busy_wall, "busy_seconds_reconstructed": True}
+
+
+def start_gaps(records: Any) -> tuple[float, float, float] | None:
+    """(startup, stall, span) seconds from the evaluations' own start epochs.
+
+    A gap is a stretch in which no rank started an evaluation for longer than
+    max(2s, 10x the median evaluation). The first is start-up (the first
+    evaluations load the imager: 23-88s on a GPU node); later ones are the whole
+    search waiting, e.g. on PolyChord's root blocked 20-45s creating its resume
+    file on Lustre (round 225; tmpfs chains since 227). Both swamp a 3-minute arm, so evals over the span
+    minus the gaps is the rate a long run settles at (docs/csd3-speed.md, round 211).
+    """
+    timed = sorted((float(t["started_epoch"]), float(t["ended_epoch"]))
+                   for t in ((record.get("timing") or {}) for record in records)
+                   if t.get("started_epoch") is not None and t.get("ended_epoch") is not None)
+    if len(timed) < 2:
+        return None
+    bound = max(2.0, 10.0 * statistics.median(end - start for start, end in timed))
+    first_end = min(end for _, end in timed)
+    startup = stall = 0.0
+    for (earlier, _), (later, _) in zip(timed, timed[1:]):
+        if later - earlier > bound:
+            # Every rank starts together, so start-up opens before any ends.
+            if earlier < first_end:
+                startup += later - earlier
+            else:
+                stall += later - earlier
+    return startup, stall, max(end for _, end in timed) - timed[0][0]
+
+
+def first_request(records: Any) -> float | None:
+    """Median seconds of the evaluations started within 1s of the first.
+
+    When every rank starts together and a cold first request is shorter than
+    start_gaps()'s bound (an async whole node: 112 first requests of 5-8s
+    against 0.7s warm), no start-to-start gap opens and startup_s reads 0.0,
+    so this is the start-up figure there (docs/csd3-speed.md, round 259).
+    """
+    starts = [(float(t["started_epoch"]), float(t["ended_epoch"]))
+              for t in ((record.get("timing") or {}) for record in records)
+              if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    if not starts:
+        return None
+    first = min(start for start, _ in starts)
+    return statistics.median(end - start for start, end in starts if start - first < 1.0)
+
+
+def mean_r2d2_iterations(records: Any) -> float | None:
+    """Mean U-Net forwards per R2D2 request. R2D2 stops its series early on
+    the residual, so a request's cost goes as ~170 + 33 ms per iteration and
+    the mean rises ~10-20% as a search climbs (round 317): arms at different
+    phases differ in this, not in speed."""
+    counts = [record["timing"]["r2d2_iterations"] for record in records or ()
+              if isinstance(record, dict) and (record.get("timing") or {}).get("r2d2_iterations")]
+    return sum(counts) / len(counts) if counts else None
+
+
+def record_digest(records: Any) -> dict[str, Any]:
+    """What `./ri bench` wants from every record, kept in the summary's profiling
+    block so a finished run's ledger row does not parse them all: 7s of a 1.1 GB
+    summary, with every node of the job still held (round 349)."""
+    gaps = start_gaps(records)
+    timed = [t for t in ((record.get("timing") or {}) for record in records)
+             if t.get("started_epoch") is not None and t.get("ended_epoch") is not None]
+    return {
+        "startup_s": gaps[0] if gaps else None,
+        "stall_s": gaps[1] if gaps else None,
+        "span_s": gaps[2] if gaps else None,
+        "first_request_s": first_request(records),
+        "r2d2_iterations": mean_r2d2_iterations(records),
+        "peak_memory_bytes": max(
+            (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
+             or float(record.get("peak_memory_bytes", 0.0))
+             for record in records
+             if (record.get("metrics") or {}).get("peak_memory_bytes")
+             or record.get("peak_memory_bytes")),
+            default=0.0,
+        ),
+        "first_started_epoch": min((float(t["started_epoch"]) for t in timed), default=None),
+        "last_ended_epoch": max((float(t["ended_epoch"]) for t in timed), default=None),
+    }
 
 
 def summarize_profiling(
@@ -933,6 +1051,7 @@ def summarize_profiling(
     ) if window_start is not None else (None, None)
 
     return {
+        "record_digest": record_digest(evaluations),
         "mpi_procs": mpi_procs,
         "total_wall_seconds": total_wall_seconds,
         "busy_worker_seconds": busy_worker,
@@ -991,7 +1110,7 @@ def format_share(fraction: float | None) -> str:
 
 # (stage key, eval-count key, label, indented under the row above it).
 PROFILING_VIEW_STAGES = (
-    ("simulate", "simulate_seconds", "simulate (MeqTrees)", False),
+    ("simulate", "simulate_seconds", "simulate (visibilities + noise)", False),
     ("convert", "convert_seconds", "convert (MS -> .mat)", False),
     ("image_container", "image_container_seconds", "{imager} container (total)", False),
     ("image_binary", "image_binary_seconds", "of which: {imager} itself", True),
@@ -1212,12 +1331,278 @@ def worker_procs(mpi_procs: int) -> int:
     return mpi_procs - 1 if mpi_procs > 1 else 1
 
 
+# An evaluation's record is one file, eval-NNNN-xxx.json, beside the eval dir
+# that holds only what it keeps: a dir plus its metrics.json was two inodes an
+# evaluation, and the file quota, not CPU time, capped a run (round 91). Runs
+# from before round 92 have eval-NNNN-xxx/metrics.json, which is still read.
+RECORD_SUFFIX = ".json"
+
+
+def flat_record_path(eval_dir: Path) -> Path:
+    return eval_dir.with_name(eval_dir.name + RECORD_SUFFIX)
+
+
+def evaluation_record_paths(evaluations_dir: Path) -> dict[str, Path]:
+    """{eval dir name: its record path} for every evaluation an entry names,
+    from one listing: a flat record if there is one, else the dir's metrics.json
+    (which may not exist: an evaluation in flight, or one a killed rank left)."""
+    try:
+        names = os.listdir(evaluations_dir)
+    except FileNotFoundError:
+        return {}
+    paths: dict[str, Path] = {}
+    for name in names:
+        if not name.startswith("eval-") or name.endswith(".partial"):
+            continue
+        if name.endswith(RECORD_SUFFIX):
+            paths[name[:-len(RECORD_SUFFIX)]] = evaluations_dir / name
+        else:
+            paths.setdefault(name, evaluations_dir / name / "metrics.json")
+    return paths
+
+
+# Records packed into one file, a `name<TAB>record json` line each, so that a
+# finished run is one inode of records rather than one an evaluation, and a
+# resumed run carries only its last segment's as files (round 93). Packed when
+# a run finishes and when it resumes, the two moments no rank writes records;
+# a flat record beside a packed one wins. A line without its newline is a torn
+# append, and is ignored.
+RECORD_PACK = "records.jsonl"
+# Across nodes each node's ranks append to a pack of their own,
+# records.<host>.jsonl (NS_RECORD_PACK, set by the multi-node launcher): on
+# one shared file 2 nodes spent ~37x one node's writer-seconds and a kill lost
+# ~20% of the printed records (round 289). Readers take the node packs and
+# then the run's pack, which wins; a finish or a resume folds them into it.
+NODE_PACK_GLOB = "records.*.jsonl"
+
+
+def node_packs(evaluations_dir: Path) -> list[Path]:
+    try:
+        return sorted(evaluations_dir.glob(NODE_PACK_GLOB))
+    except OSError:
+        return []
+
+
+def _read_pack_file(path: Path, texts: dict[str, str]) -> int:
+    """Add {name: record json} from one pack to `texts`; its whole lines' length."""
+    try:
+        data = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
+    whole = data.rfind(b"\n") + 1
+    for line in data[:whole].decode(errors="replace").splitlines():
+        name, tab, text = line.partition("\t")
+        if tab:
+            texts[name] = text
+    return whole
+
+
+def _pack_is_torn(evaluations_dir: Path) -> bool:
+    """Whether the run pack ends in a killed rank's half-written line."""
+    try:
+        with open(evaluations_dir / RECORD_PACK, "rb") as pack:
+            pack.seek(-1, os.SEEK_END)
+            return pack.read(1) != b"\n"
+    except OSError:  # no pack, or an empty one
+        return False
+
+
+def _read_record_pack(evaluations_dir: Path, nodes: bool = True) -> tuple[dict[str, str], int, set[str]]:
+    """({name: record json} from the packs, the length of the run pack's
+    whole lines, the names only a node pack holds)."""
+    texts: dict[str, str] = {}
+    for path in node_packs(evaluations_dir) if nodes else []:
+        _read_pack_file(path, texts)
+    on_nodes = set(texts)
+    own: dict[str, str] = {}
+    whole = _read_pack_file(evaluations_dir / RECORD_PACK, own)
+    texts.update(own)
+    return texts, whole, on_nodes - own.keys()
+
+
+def packed_record_texts(evaluations_dir: Path) -> dict[str, str]:
+    return _read_record_pack(evaluations_dir)[0]
+
+
+def _record_reader(evaluations_dir: Path) -> tuple[list[str], Any, dict[str, Path]]:
+    """(every evaluation name, a function reading one's record or None,
+    evaluation_record_paths())."""
+    paths = evaluation_record_paths(evaluations_dir)
+    packed = packed_record_texts(evaluations_dir)
+
+    def read(name: str) -> dict[str, Any] | None:
+        path = paths.get(name)
+        if name in packed and (path is None or path.parent != evaluations_dir
+                               or not path.exists()):  # the run's packer just moved it
+            try:
+                record = json.loads(packed[name])
+            except ValueError:
+                record = None
+            if isinstance(record, dict):
+                return record
+            print(f"WARNING: ignoring unreadable {name} in {evaluations_dir / RECORD_PACK}",
+                  file=sys.stderr, flush=True)
+            return None
+        return read_evaluation_record(path)
+
+    return sorted(paths.keys() | packed.keys()), read, paths
+
+
+def _read_records(names: list[str], read: Any, files: dict[str, Path]) -> list[dict[str, Any] | None]:
+    """read() of each name. Only names with a record file go through the
+    pool: a packed one is a json.loads, which holds the GIL, so 32 threads
+    parsed the pack slower than this one does meanwhile (round 268)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    on_disk = [name for name in names if name in files]
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        pending = pool.map(read, on_disk)  # submitted now, run while this thread parses
+        records = {name: read(name) for name in names if name not in files}
+        records.update(zip(on_disk, pending))
+    return [records[name] for name in names]
+
+
+def pack_evaluation_records(evaluations_dir: Path, known: dict[str, dict[str, Any]],
+                            fold_nodes: bool = True, encoded: dict[str, str] | None = None) -> int:
+    """Move the records named in `known` ({name: record}) into the pack and
+    unlink their files - a flat record, or a pre-round-92 metrics.json and
+    then its dir if that held nothing else - and append again any packed one
+    `known` has edited since; how many lines it appended. Writers of the pack
+    (a resume, the run's packer, the finish) take its lock in turn.
+    `fold_nodes` also moves the node packs in, which only a caller no rank
+    is appending beside may do: the run's own packer passes False.
+    `encoded` holds json.dumps() of records in `known` the caller has already
+    encoded, which this then does not encode again."""
+    import fcntl
+    from concurrent.futures import ThreadPoolExecutor
+
+    clock = [time.monotonic()]
+
+    def lap(phase: str) -> None:
+        clock.append(time.monotonic())
+        LAST_PACK_SECONDS[phase] = clock[-1] - clock[-2]
+
+    LAST_PACK_SECONDS.clear()
+    with open(evaluations_dir / RECORD_PACK, "ab") as pack:
+        fcntl.flock(pack, fcntl.LOCK_EX)
+        lap("lock")
+        paths = evaluation_record_paths(evaluations_dir)  # one listing, not a stat a record
+        lap("list")
+        texts, whole, on_nodes = _read_record_pack(evaluations_dir, fold_nodes)
+        folding = node_packs(evaluations_dir) if fold_nodes else []
+        lap("read")
+        lines: dict[str, str] = {name: texts[name] for name in sorted(on_nodes)}
+        moving = []
+        for name in sorted(known):
+            if name in paths and (paths[name].parent == evaluations_dir or name not in texts):
+                moving.append(name)  # a packed name's dir has no record file: only a flat one is newer
+            text = encoded[name] if encoded and name in encoded else json.dumps(known[name])
+            # Not on disk at all: a record write the finish cancelled.
+            if name in moving or name in on_nodes or text != texts.get(name):
+                lines[name] = text  # the last line of a name is its record
+        lap("encode")
+        # A torn last line from a killed packer, or a killed rank's append,
+        # which the next append would otherwise run on into.
+        if whole < os.fstat(pack.fileno()).st_size:
+            pack.truncate(whole)
+        if lines:
+            pack.write("".join(f"{name}\t{text}\n" for name, text in lines.items()).encode())
+            pack.flush()
+            os.fsync(pack.fileno())
+        for path in folding:  # every line of them is in the run's pack now
+            path.unlink(missing_ok=True)
+        lap("write")
+        if not lines:
+            return 0
+
+    def unlink(name: str) -> None:
+        paths[name].unlink(missing_ok=True)
+        if paths[name].parent != evaluations_dir:
+            try:
+                paths[name].parent.rmdir()
+            except OSError:
+                pass  # it keeps something
+
+    # Off rank 0's pinned CPU, as the record writer is (round 54): pinned, a
+    # thread holding the directory's lock waits for the core, and an unlink
+    # cost ~6ms rather than ~0.2ms (round 93).
+    with ThreadPoolExecutor(RECORD_READ_THREADS, initializer=_unpin_thread) as pool:
+        list(pool.map(unlink, moving))
+    lap("unlink")
+    LAST_PACK_SECONDS["lines"], LAST_PACK_SECONDS["files"] = len(lines), len(moving)
+    return len(lines)
+
+
+# Where the last pack_evaluation_records() call's time went, for the post-run
+# line: a whole sapphire node's final pack took 18.2s against 4.3s on 38
+# icelake CPUs for 12% more records, and nothing said why (round 256).
+LAST_PACK_SECONDS: dict[str, float] = {}
+
+
+# A Lustre unlink holds the evaluations dir's lock, ~0.13ms each whatever the
+# thread count, so packing 67k records after the sampler cost 17.8s (round
+# 196). A run's rank 0 packs the flat records as they land instead, in a
+# child process: pypolychord's root holds the GIL, so a thread would never
+# run (round 199).
+RECORD_PACK_SECONDS = 15.0
+
+
+def pack_flat_records(evaluations_dir: Path) -> int:
+    """Pack every flat record on disk now; how many lines it appended."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    flat = [path for path in evaluation_record_paths(evaluations_dir).values()
+            if path.parent == evaluations_dir]
+    if not flat:
+        # A run appending its records (round 240): no pass may hold the pack's
+        # lock, which every rank's next append then waits on, for nothing.
+        return 0
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        records = dict(zip((path.name.removesuffix(RECORD_SUFFIX) for path in flat),
+                           pool.map(read_evaluation_record, flat)))
+    return pack_evaluation_records(
+        evaluations_dir, {name: record for name, record in records.items() if record is not None},
+        fold_nodes=False)
+
+
+def start_record_packer(evaluations_dir: Path) -> subprocess.Popen | None:
+    """Rank 0: pack records every RECORD_PACK_SECONDS until stop_record_packer()."""
+    if os.environ.get("NS_PACK_DURING_RUN", "1") == "0":
+        return None
+    # Until rank 0 is gone too: a packer orphaned by a crash ends at its next pass.
+    code = ("import os, sys, time; sys.path.insert(0, sys.argv[1]); import common\n"
+            "if sys.argv[4]: os.sched_setaffinity(0, map(int, sys.argv[4].split(',')))\n"
+            "while os.getppid() == int(sys.argv[3]):\n"
+            "    time.sleep(common.RECORD_PACK_SECONDS)\n"
+            "    try:\n"
+            "        common.pack_flat_records(common.Path(sys.argv[2]))\n"
+            "    except OSError as error:\n"
+            "        print(f'record packer: {error}', file=sys.stderr, flush=True)\n")
+    return subprocess.Popen(
+        [sys.executable, "-c", code, str(Path(__file__).resolve().parent), str(evaluations_dir),
+         str(os.getpid()), ",".join(map(str, _UNPINNED_CPUS))],
+        stdin=subprocess.DEVNULL)
+
+
+def stop_record_packer(packer: subprocess.Popen | None) -> None:
+    """Before rank 0 reads the run's records back: none may move under it."""
+    if packer is not None:
+        packer.kill()  # a pack it cut short is whole lines and files still on disk
+        packer.wait()
+
+
+def evaluation_record_file(eval_dir: Path) -> Path:
+    """The record of one evaluation, in either layout (two stats at most)."""
+    flat = flat_record_path(eval_dir)
+    return flat if flat.exists() else eval_dir / "metrics.json"
+
+
 def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
     try:
         record = json.loads(metrics_path.read_text())
-    except FileNotFoundError:
-        # An evaluation that was still in flight. The ordinary case on every
-        # resume, and not worth a word.
+    except (FileNotFoundError, NotADirectoryError):
+        # An evaluation that was still in flight (or a stray eval-* file).
+        # The ordinary case on every resume, and not worth a word.
         return None
     except (OSError, ValueError):
         record = None
@@ -1227,34 +1612,477 @@ def read_evaluation_record(metrics_path: Path) -> dict[str, Any] | None:
     return record
 
 
+# Concurrent record reads. On CSD3's Lustre a cold metrics.json read is ~86ms
+# and globbing eval-*/metrics.json another ~19ms per directory, so reading a
+# 71k-evaluation run back serially took ~2h; 32 threads read one every ~2ms.
+RECORD_READ_THREADS = 32
+
+
+def read_evaluation_records(evaluations_dir: Path) -> list[tuple[Path, dict[str, Any] | None]]:
+    """(eval dir, record or None) for every eval-* entry, in name order."""
+    names, read, files = _record_reader(evaluations_dir)
+    records = _read_records(names, read, files)
+    return [(evaluations_dir / name, record) for name, record in zip(names, records)]
+
+
 def load_evaluations_from_dir(evaluations_dir: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for metrics_path in sorted(evaluations_dir.glob("eval-*/metrics.json")):
-        record = read_evaluation_record(metrics_path)
+    return [record for _, record in read_evaluation_records(evaluations_dir) if record is not None]
+
+
+def gathered_and_earlier_records(evaluations_dir: Path, written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The run's records in name order, as load_evaluations_from_dir() gives
+    them, reading from disk only those not already in `written`."""
+    listed, read_one, files = _record_reader(evaluations_dir)
+    names = set(listed)
+    earlier = sorted(names - written.keys())
+    read = dict(zip(earlier, _read_records(earlier, read_one, files)))
+    _FINISHED_RECORDS.clear()
+    for name in sorted(names | written.keys()):
+        record = written.get(name) or read.get(name)
         if record is not None:
-            records.append(record)
+            _FINISHED_RECORDS[name] = record
+    return list(_FINISHED_RECORDS.values())
+
+
+# The records finished_run_records() gave rank 0, by name, which
+# pack_finished_run() packs once prune_run_artefacts() has edited them.
+_FINISHED_RECORDS: dict[str, dict[str, Any]] = {}
+# json.dumps() of those a rank encoded for it and prune cannot edit.
+_FINISHED_TEXTS: dict[str, str] = {}
+
+
+def pack_finished_run(evaluations_dir: Path, encoded: dict[str, str] | None = None) -> int:
+    """Rank 0, once the summary is written: no rank writes records now."""
+    return pack_evaluation_records(evaluations_dir, _FINISHED_RECORDS, encoded=encoded)
+
+
+def encode_finished_records() -> dict[str, str]:
+    """json.dumps() of each finished record, by name, once prune has edited
+    them: the summary and the final pack each encoded all of them, 2.6s a
+    time at 128k evaluations (round 340), so they share this. The ranks
+    encoded nearly all of them, in parallel (round 342)."""
+    return {name: _FINISHED_TEXTS.get(name) or json.dumps(record) for name, record in _FINISHED_RECORDS.items()}
+
+
+class PolyChordFinish:
+    """Ends the chains still in flight once PolyChord has finished (round 81).
+
+    An async run's root writes every output (chains, .resume, stats) and
+    makes its final dump() call, then waits for each worker's chain only to
+    throw its points away (NestedSampling's cleanup keeps just nlike). That
+    wait was the last ~30s of a run, one rank slicing alone. On the final
+    dump - the only one with no live points - the root tells every worker,
+    which then answers PolyChord without evaluating: low, low, high, so a
+    step-out ends on a low and the shrink on a high within three calls.
+    Build it on every rank before run_polychord (Dup() is collective) and
+    call close() on every rank after it.
+    """
+
+    TAG = 81
+
+    def __init__(self) -> None:
+        try:
+            from mpi4py import MPI
+
+            self.comm = MPI.COMM_WORLD.Dup()
+        except Exception:
+            self.comm = None  # no MPI: one process, nothing in flight to end
+        self.rank = self.comm.Get_rank() if self.comm is not None else 0
+        self.done = False
+        self.skipped = 0
+        self._sent: list | None = None
+
+    def dumper(self, live, dead, logweights, logZ, logZerr) -> None:
+        if self.rank == 0 and len(live) == 0:
+            self._send()
+
+    def _send(self) -> None:
+        if self._sent is None and self.comm is not None:
+            self._sent = [self.comm.isend(None, dest=rank, tag=self.TAG) for rank in range(1, self.comm.Get_size())]
+
+    def finished(self) -> bool:
+        """On a worker, True once the root's final dump has happened. One
+        Iprobe a call, which costs microseconds."""
+        if not self.done and self.rank and self.comm.iprobe(source=0, tag=self.TAG):
+            self.comm.recv(source=0, tag=self.TAG)
+            self.done = True
+        return self.done
+
+    def discarded(self) -> float:
+        self.skipped += 1
+        return 1e300 if self.skipped % 3 == 0 else -1e300
+
+    def close(self) -> None:
+        if self.comm is None:
+            return
+        if self.rank == 0:
+            self._send()  # a run whose final dump was missed must not hang its workers below
+            from mpi4py import MPI
+
+            MPI.Request.Waitall(self._sent)
+        elif not self.done:
+            self.comm.recv(source=0, tag=self.TAG)  # synchronous runs end with no chain in flight
+            self.done = True
+        if self.skipped:
+            print(f"rank {self.rank}: {self.skipped} likelihood calls answered without evaluating "
+                  "after PolyChord finished", flush=True)
+
+
+CHAINS_MIRROR_SECONDS = 2.0
+
+
+def chains_base_dir(output_dir: Path) -> Path:
+    """Where PolyChord writes: node tmpfs, mirrored to <run>/chains (round 227).
+
+    The root creates <root>_temp.resume at every checkpoint, and on CSD3's
+    Lustre about one such create in 60-80 blocks 15-45s; no worker gets a seed
+    meanwhile, so the whole search stops (round 225). mpirun forks every
+    rank on one node, so they all see the same tmpfs.
+    """
+    chains = output_dir / "chains"
+    if os.environ.get("NS_CHAINS_TMPFS", "1") == "0" or not os.path.isdir("/dev/shm"):
+        return chains
+    import hashlib
+
+    tag = hashlib.sha1(str(chains.resolve()).encode()).hexdigest()[:16]
+    return Path("/dev/shm") / f"ri-chains-{tag}"
+
+
+def sync_chains(src: Path, dst: Path, seen: dict[Path, tuple[int, int]]) -> int:
+    """Copy each file changed since `seen` to dst. A .resume goes through a
+    temp name and a rename, so <run>/chains never holds half a checkpoint;
+    the text files PolyChord only writes are rewritten in place, because a
+    Lustre create blocks for up to ~40 s (12 of 1,211 under load) while an
+    in-place rewrite never passed 1 s (round 229). PolyChord renames its
+    .resume into place, so the copy reads a whole one; a text file caught
+    mid-write is copied again on the next pass, its stamp having moved."""
+    import shutil
+
+    copied = 0
+    for path in sorted(src.rglob("*")):
+        if "_temp." in path.name:
+            continue
+        try:
+            stat = path.stat()
+            if not path.is_file() or seen.get(path) == (stat.st_mtime_ns, stat.st_size):
+                continue
+            target = dst / path.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if path.suffix != ".resume" and target.is_file():
+                with open(path, "rb") as source, open(target, "r+b") as out:
+                    shutil.copyfileobj(source, out)
+                    out.truncate()
+            else:
+                partial = target.with_name(f".{target.name}.mirror")
+                shutil.copyfile(path, partial)
+                partial.replace(target)
+        except FileNotFoundError:
+            continue  # renamed away under us; the next pass sees its successor
+        seen[path] = (stat.st_mtime_ns, stat.st_size)
+        copied += 1
+    return copied
+
+
+class ChainsMirror:
+    """Rank 0: seed tmpfs from <run>/chains, then mirror it back every
+    CHAINS_MIRROR_SECONDS from a child process, which Lustre may block without
+    stopping the root. Not a thread: run_polychord holds the GIL in Fortran,
+    so a thread never runs. stop() is the blocking final sync. A crash loses
+    the mirror's lag: one pass, up to ~40s while Lustre blocks its copy
+    (round 227). `./ri resume` and run_with_retries read <run>/chains."""
+
+    def __init__(self, output_dir: Path, base_dir: Path) -> None:
+        import shutil
+
+        self.lustre, self.tmpfs = output_dir / "chains", base_dir
+        self.child: subprocess.Popen | None = None
+        if self.tmpfs == self.lustre:
+            return
+        shutil.rmtree(self.tmpfs, ignore_errors=True)  # a killed run's leftovers: Lustre is the authority
+        if self.lustre.is_dir():
+            shutil.copytree(self.lustre, self.tmpfs, ignore=shutil.ignore_patterns(".*.mirror"))
+        self.tmpfs.mkdir(parents=True, exist_ok=True)
+        # Until rank 0 is gone too, so a crash orphans it for one pass at most.
+        code = ("import os, sys, time; sys.path.insert(0, sys.argv[1]); import common\n"
+                "if sys.argv[5]: os.sched_setaffinity(0, map(int, sys.argv[5].split(',')))\n"
+                "src, dst = common.Path(sys.argv[2]), common.Path(sys.argv[3])\n"
+                "seen = {}  # one full pass first: whatever changed before it started\n"
+                "while os.getppid() == int(sys.argv[4]):\n"
+                "    time.sleep(common.CHAINS_MIRROR_SECONDS)\n"
+                "    try:\n"
+                "        common.sync_chains(src, dst, seen)\n"
+                "    except OSError as error:\n"
+                "        print(f'chains mirror: {error}', file=sys.stderr, flush=True)\n")
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", code, str(Path(__file__).resolve().parent), str(self.tmpfs),
+             str(self.lustre), str(os.getpid()), ",".join(map(str, _UNPINNED_CPUS))],
+            stdin=subprocess.DEVNULL)
+        atexit.register(self.stop)
+
+    def stop(self) -> None:
+        import shutil
+
+        if self.child is None:
+            return
+        self.child.kill()  # a copy it cut short is a .mirror file the sync below replaces
+        self.child.wait()
+        self.child = None
+        sync_chains(self.tmpfs, self.lustre, {})
+        shutil.rmtree(self.tmpfs, ignore_errors=True)
+
+
+def start_chains_mirror(output_dir: Path, base_dir: Path) -> ChainsMirror | None:
+    return ChainsMirror(output_dir, base_dir) if mpi_rank() == 0 else None
+
+
+def self_check_chains_mirror() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run, shm = Path(tmp) / "run", Path(tmp) / "shm"
+        (run / "chains").mkdir(parents=True)
+        (run / "chains" / "r.resume").write_text("old")
+        (run / "chains" / "r.paramnames").write_text("p")
+        mirror = ChainsMirror(run, shm)
+        assert (shm / "r.resume").read_text() == "old", "seeded from <run>/chains"
+        (shm / "r.resume").write_text("new")
+        (shm / "r_temp.resume").write_text("half")
+        (shm / "clusters").mkdir()
+        (shm / "clusters" / "r_1.txt").write_text("c")
+        time.sleep(CHAINS_MIRROR_SECONDS * 2.5)
+        assert (run / "chains" / "r.resume").read_text() == "new", "mirrored while running"
+        (shm / "r.stats").write_text("s")
+        paramnames, resume = ((run / "chains" / name).stat().st_ino for name in ("r.paramnames", "r.resume"))
+        (shm / "r.paramnames").write_text("longer than before")
+        (shm / "r.resume").write_text("x")
+        mirror.stop()
+        assert (run / "chains" / "r.stats").read_text() == "s", "final sync"
+        assert (run / "chains" / "r.paramnames").read_text() == "longer than before"
+        assert (run / "chains" / "r.paramnames").stat().st_ino == paramnames, "text rewritten in place: no create"
+        assert (run / "chains" / "r.resume").read_text() == "x"
+        assert (run / "chains" / "r.resume").stat().st_ino != resume, ".resume renamed into place"
+        assert (run / "chains" / "clusters" / "r_1.txt").read_text() == "c"
+        assert not (run / "chains" / "r_temp.resume").exists(), "temp files stay behind"
+        assert not list((run / "chains").glob(".*.mirror")), "no partial left"
+        assert not shm.exists(), "tmpfs removed"
+        same = ChainsMirror(run, run / "chains")
+        assert same.child is None, "NS_CHAINS_TMPFS=0 mirrors nothing"
+        os.environ["NS_CHAINS_TMPFS"] = "0"
+        try:
+            assert chains_base_dir(run) == run / "chains"
+        finally:
+            del os.environ["NS_CHAINS_TMPFS"]
+
+
+def evidence_record(output: Any) -> dict[str, Any] | None:
+    """log(Z) and its error from the PolyChordOutput run_polychord() returns,
+    which has already parsed chains/<root>.stats, so it costs nothing. In the
+    summary because a validation run in tmpfs loses its chains, and run.log
+    gives log(Z) to 2 decimals at a checkpoint before the end (round 184)."""
+    try:
+        return {"log_z": output.logZ, "log_z_err": output.logZerr, "ndead": output.ndead, "nlike": output.nlike}
+    except AttributeError:
+        return None
+
+
+GATHER_LARGE_TAG = 5302
+
+
+def gather_large(comm: Any, mine: Any) -> list[Any] | None:
+    """comm.gather(), rank by rank: its byte counts and displacements are C
+    ints, so past 2 GiB in all it raises MPI_ERR_ARG, ~500k records at the
+    target size, with every evaluation done (csd3-speed.md, round 345)."""
+    if comm.Get_rank() != 0:
+        comm.send(mine, dest=0, tag=GATHER_LARGE_TAG)
+        return None
+    return [mine, *(comm.recv(source=rank, tag=GATHER_LARGE_TAG) for rank in range(1, comm.Get_size()))]
+
+
+def finished_run_records(evaluations_dir: Path) -> list[dict[str, Any]] | None:
+    """Drain every rank's records and settle its held extremes; rank 0 gets
+    every record, the others None. Collective: every rank calls it.
+
+    Each rank holds its own 20 lowest and highest so far, so a run ends with
+    ~40 held per rank of which only the run's 40 survive prune_run_artefacts().
+    Flushing all of them cost ~20s of copies to Lustre and ~10s of unlinks
+    after a 36-rank run (csd3-speed.md, round 51). So rank 0 reads the
+    records first, decides what the run keeps - the same decision prune
+    makes - and the ranks publish only that and drop the rest in tmpfs.
+    """
+    # The run's last moments, when what they allocate all stays live: a cyclic
+    # collection walks it for nothing, ~60% of unpickling 128k records here
+    # (csd3-speed.md, round 342).
+    gc.disable()
+    POST_RUN_SECONDS.clear()
+    POST_RUN_BACKLOG.clear()
+    started = time.monotonic()
+    # This rank's own backlog and drain, apart from the barrier's wait for
+    # the slowest: round 233's 60s drain was one of the two (round 234).
+    queued = [future.kind for future in _RECORD_WRITES if not future.done() and future.kind != "record"]
+    with _PENDING_LOCK:
+        lines = len(_PENDING_LINES)
+    queued += ["record"] * (lines or sum(future.kind == "record" for future in _RECORD_WRITES
+                                         if not future.done()))
+    # A record still queued has its text in _WRITTEN_RECORDS, which rank 0
+    # gathers and pack_finished_run() writes into the pack: writing the file
+    # first only for the pack to unlink it was most of a backlog of up to
+    # 400 jobs a rank behind a Lustre slower than ~0.5s a create (round 234).
+    for future in _RECORD_WRITES:
+        if future.kind == "record":
+            future.cancel()
+    # And a queued publish of a held extreme goes back to being held, so that
+    # the keep-filtered flush below drops it in tmpfs unless the run keeps it.
+    for name in list(_PUBLISHING):
+        cancelled = _cancel_held_publish(name)
+        if cancelled is not None:
+            _HELD[name] = cancelled
+    _PUBLISHING.clear()
+    _RECORD_WRITES[:] = [future for future in _RECORD_WRITES if not future.cancelled()]
+    drain_record_writes(flush_held=False)
+    _PENDING_RECORDS.clear()  # their texts are in _WRITTEN_RECORDS too
+    _PENDING_LINES.clear()
+    backlog = (queued, time.monotonic() - started, dict(_WRITER_SECONDS))
+    try:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+    except Exception:
+        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    if comm is not None:
+        comm.Barrier()  # apart from the gather, so post_run_line() tells the two apart
+    started = post_run_phase("drain", started)
+    backlogs = comm.gather(backlog, root=0) if comm is not None else [backlog]
+    if backlogs:
+        kinds = [kind for queued, _, _ in backlogs for kind in queued]
+        POST_RUN_BACKLOG.update({kind: kinds.count(kind) for kind in sorted(set(kinds))},
+                                queued_max=max(len(q) for q, _, _ in backlogs),
+                                writer_max_s=max(s for _, s, _ in backlogs))
+        busy = [spent for _, _, spent in backlogs]
+        POST_RUN_BACKLOG.update({f"{kind}_s": sum(b.get(kind, 0.0) for b in busy)
+                                 for kind in sorted({k for b in busy for k in b})})
+    # Each rank parses its own records, in parallel, and hands them to rank 0,
+    # which reads from Lustre only what an earlier segment of a resumed run
+    # wrote: re-reading 43k metrics.json files took it 7.5s (round 52). The
+    # texts held for this cost ~4KB a record, ~5MB a rank in that run.
+    here = os.path.abspath(evaluations_dir)
+    mine = [(os.path.basename(path), json.loads(text)) for path, text in _WRITTEN_RECORDS.items()
+            if os.path.dirname(path) == here]
+    # The compact text too, which rank 0 alone took ~3s to encode at 128k
+    # evaluations. Not for a record prune_run_artefacts() may edit (~22% at 128k).
+    mine = [(name, record, None if _names_image(record) else json.dumps(record)) for name, record in mine]
+    gathered = gather_large(comm, mine) if comm is not None else [mine]
+    records = None
+    if mpi_rank() == 0:
+        written = {name: record for rank_records in gathered for name, record, _ in rank_records}
+        _FINISHED_TEXTS.clear()
+        _FINISHED_TEXTS.update((name, text) for rank_records in gathered for name, _, text in rank_records if text)
+        records = gathered_and_earlier_records(evaluations_dir, written)
+    started = post_run_phase("records", started)
+    keep = (None if records is None or os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
+            else evaluations_keeping_images(records))
+    if comm is not None:
+        keep = comm.bcast(keep, root=0)
+    flush_held_evaluations(force=True, keep=keep)
+    if keep is not None:
+        strip_unkept_evaluations(Path(evaluations_dir), [name for name, _, text in mine if text is None], keep)
+    if comm is not None:
+        comm.Barrier()  # the kept extremes are on Lustre before rank 0 prunes
+    post_run_phase("flush", started)
     return records
+
+
+# Seconds per step between run_polychord() returning and the summary landing,
+# which `./ri bench` never sees (its wall is the evaluation span) and which
+# grows with the evaluation count: 13.5% of a production run in round 51.
+POST_RUN_SECONDS: dict[str, float] = {}
+# Rank 0's view of every rank's record-writer backlog when the run ended.
+POST_RUN_BACKLOG: dict[str, float] = {}
+
+
+def post_run_phase(name: str, started: float) -> float:
+    now = time.monotonic()
+    POST_RUN_SECONDS[name] = now - started
+    return now
+
+
+def post_run_line() -> str:
+    line = "post-run seconds: " + ", ".join(f"{k} {v:.1f}" for k, v in POST_RUN_SECONDS.items())
+    if "pack" in POST_RUN_SECONDS and LAST_PACK_SECONDS:
+        pack = dict(LAST_PACK_SECONDS)
+        counts = f"{pack.pop('lines', 0):.0f} lines, {pack.pop('files', 0):.0f} files"
+        line += " (" + ", ".join(f"{k} {v:.1f}" for k, v in pack.items()) + f"; {counts})"
+    if POST_RUN_BACKLOG:
+        backlog = dict(POST_RUN_BACKLOG)
+        line += "; slowest rank's drain {:.1f}, most queued on one rank {:.0f}".format(
+            backlog.pop("writer_max_s"), backlog.pop("queued_max"))
+        line += "".join(f", {kind} {count:.0f}" for kind, count in backlog.items()
+                        if not kind.endswith("_s"))
+        cancelled = backlog.pop("cancelled_held_s", None)
+        line += "; writer seconds, all ranks: " + ", ".join(
+            f"{kind[:-2]} {spent:.0f}" for kind, spent in backlog.items() if kind.endswith("_s"))
+        if cancelled is not None:
+            line += f"; held publishes cancelled {cancelled:.0f}"
+    return line
 
 
 def adopt_completed_evaluations(
     evaluations_dir: Path,
     cache: dict[str, float],
 ) -> int:
-    """Cache finished evaluations and remove incomplete directories."""
+    """Cache finished evaluations and remove incomplete directories.
+
+    Rank 0 alone reads the records and broadcasts {key: objective}: every
+    rank parsing every record cost 1 GB and 6 s a rank at 67k evaluations,
+    and 6.4 GB a rank at 400k, which a 113-rank resume cannot hold (round 267).
+    """
     import shutil
 
+    try:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+        if comm.Get_size() == 1:
+            comm = None
+    except Exception:
+        comm = None  # no MPI (a host run, or the self-checks): this process is the run
+    if comm is not None and comm.Get_rank() != 0:
+        adopted, keys = comm.bcast(None, root=0)
+        cache.update(keys)
+        return adopted
     adopted = 0
-    for eval_dir in sorted(evaluations_dir.glob("eval-*")):
-        if not eval_dir.is_dir():
-            continue
-        record = read_evaluation_record(eval_dir / "metrics.json")
+    keys: dict[str, float] = {}
+    good: dict[str, dict[str, Any]] = {}
+    # A record a killed writer left half-written: the record it was replacing,
+    # if any, is still there beside it.
+    for partial in evaluations_dir.glob("eval-*" + RECORD_SUFFIX + ".partial"):
+        partial.unlink(missing_ok=True)
+    # Only these can need packing: a record read from the pack is in it.
+    listed = evaluation_record_paths(evaluations_dir)
+    for eval_dir, record in read_evaluation_records(evaluations_dir):
+        if record is not None and eval_dir.name in listed:
+            good[eval_dir.name] = record
         if record is None:
-            # ignore_errors because every rank runs this, and they are all
-            # removing the same directories at the same moment.
+            # A half-written record goes too, or every resume warns about it.
+            flat_record_path(eval_dir).unlink(missing_ok=True)
+            if not eval_dir.is_dir():
+                continue
+            # ignore_errors: best effort, the next resume sweeps what is left.
             shutil.rmtree(eval_dir, ignore_errors=True)
             continue
-        cache[params_key(record["params"])] = float(record["objective"])
+        keys[params_key(record["params"])] = float(record["objective"])
         adopted += 1
+    cache.update(keys)
+    # Collective, and before the pack: no rank reads a flat record after it.
+    if comm is not None:
+        comm.bcast((adopted, keys), root=0)
+    # An appending run leaves no flat records, so a torn last line alone must
+    # still reach the pack writer, or the next append runs on into it (round 348).
+    if good or node_packs(evaluations_dir) or _pack_is_torn(evaluations_dir):
+        started = time.monotonic()
+        packed = pack_evaluation_records(evaluations_dir, good)
+        if packed:
+            print(f"packed {packed} earlier records into {RECORD_PACK} in "
+                  f"{time.monotonic() - started:.1f}s", flush=True)
     return adopted
 
 
@@ -1279,6 +2107,17 @@ def self_check_resume_adoption() -> None:
         assert cache[params_key(params)] == 0.5
         # The next eval id continues rather than restarting at 1.
         assert adopted + 1 == 2
+
+        # A resumed run's records: rank 0 is handed this segment's and reads
+        # only the earlier segment's back, and the result is what reading
+        # them all from disk gives, in the same order.
+        later = evaluations_dir / "eval-0002-def"
+        later.mkdir()
+        write_evaluation_record(later, {"eval_id": 2, "params": {"a": 2}, "objective": 0.25})
+        (evaluations_dir / "eval-0003-ghi").mkdir()  # in flight: no record
+        written = {"eval-0002-def": json.loads(flat_record_path(later).read_text())}
+        assert gathered_and_earlier_records(evaluations_dir, written) == load_evaluations_from_dir(evaluations_dir)
+        assert [r["eval_id"] for r in finished_run_records(evaluations_dir)] == [1, 2]
 
     with tempfile.TemporaryDirectory() as tmp:
         # An evaluation that was in flight when the run stopped has a
@@ -1329,15 +2168,243 @@ def self_check_resume_adoption() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         # The record is renamed into place rather than truncated and rewritten,
-        # so a rank killed mid-write leaves no metrics.json at all instead of
-        # half of one. A rename gives a new inode; an in-place write does not.
+        # so a rank killed mid-write leaves no record at all instead of half
+        # of one. A rename gives a new inode; an in-place write does not.
         eval_dir = Path(tmp) / "eval-0001-abc"
-        eval_dir.mkdir()
         write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
-        first_inode = (eval_dir / "metrics.json").stat().st_ino
+        first_inode = flat_record_path(eval_dir).stat().st_ino
         write_evaluation_record(eval_dir, {"eval_id": 1, "params": {"a": 1}, "objective": 0.7})
-        assert (eval_dir / "metrics.json").stat().st_ino != first_inode
-        assert list(eval_dir.iterdir()) == [eval_dir / "metrics.json"]
+        assert flat_record_path(eval_dir).stat().st_ino != first_inode
+        # One inode an evaluation that keeps nothing: no dir beside it.
+        assert list(Path(tmp).iterdir()) == [flat_record_path(eval_dir)]
+        # A half-written record a killed writer left is swept on resume, and
+        # the record it was replacing still counts.
+        flat_record_path(eval_dir).with_name("eval-0001-abc.json.partial").write_text('{"ev')
+        assert adopt_completed_evaluations(Path(tmp), {}) == 1
+        # ...and the record, adopted, is packed (round 93).
+        assert list(Path(tmp).iterdir()) == [Path(tmp) / RECORD_PACK]
+        # ...and one that was renamed into place half-written (a full disk).
+        torn = Path(tmp) / "eval-0009-zzz.json"
+        torn.write_text('{"ev')
+        assert adopt_completed_evaluations(Path(tmp), {}) == 1
+        assert not torn.exists()
+        # Both layouts in one run (a run resumed across round 92) read as one.
+        legacy = Path(tmp) / "eval-0002-def"
+        legacy.mkdir()
+        (legacy / "metrics.json").write_text(json.dumps({"eval_id": 2, "params": {"a": 2}, "objective": 0.1}))
+        kept = Path(tmp) / "eval-0001-abc" / "wsclean"
+        kept.mkdir(parents=True)  # a kept evaluation's artefacts, beside its record
+        assert [r["eval_id"] for _, r in read_evaluation_records(Path(tmp))] == [1, 2]
+        assert evaluation_record_file(legacy) == legacy / "metrics.json"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The pack (round 93): a resume packs every earlier flat record, keeps
+        # a packed evaluation's dir, reads a flat record over a packed one and
+        # drops a torn last line; a finished run packs what prune left.
+        evaluations_dir = Path(tmp)
+        kept = evaluations_dir / "eval-0001-abc"
+        (kept / "wsclean").mkdir(parents=True)
+        write_evaluation_record(kept, {"eval_id": 1, "params": {"a": 1}, "objective": 0.5})
+        write_evaluation_record(evaluations_dir / "eval-0002-def",
+                                {"eval_id": 2, "params": {"a": 2}, "objective": 0.25})
+        cache = {}
+        assert adopt_completed_evaluations(evaluations_dir, cache) == 2 and len(cache) == 2
+        assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 2  # nothing left to pack
+        assert (kept / "wsclean").is_dir(), "a packed evaluation's kept dir was swept"
+        with open(evaluations_dir / RECORD_PACK, "a") as pack:
+            pack.write('eval-0003-ghi\t{"eval_id": 3, "par')  # a packer killed mid-line
+        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2]
+        write_evaluation_record(evaluations_dir / "eval-0002-def",
+                                {"eval_id": 2, "params": {"a": 2}, "objective": 0.75})
+        assert [r["objective"] for r in load_evaluations_from_dir(evaluations_dir)] == [0.5, 0.75]
+        write_evaluation_record(evaluations_dir / "eval-0004-jkl",
+                                {"eval_id": 4, "params": {"a": 4}, "objective": 0.1,
+                                 "paths": {"image": "x"}})
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4]
+        # Rank-encoded texts: never one prune may edit (round 342).
+        assert "eval-0002-def" in _FINISHED_TEXTS and "eval-0004-jkl" not in _FINISHED_TEXTS
+        records[2]["paths"] = {}  # as prune_run_artefacts() edits a record
+        assert list(encode_finished_records().values()) == [json.dumps(r) for r in records]
+        assert pack_finished_run(evaluations_dir) == 2
+        assert sorted(p.name for p in evaluations_dir.iterdir()) == ["eval-0001-abc", RECORD_PACK]
+        assert (evaluations_dir / RECORD_PACK).read_text().count("\n") == 4  # 1, 2, 2 again, 4
+        assert load_evaluations_from_dir(evaluations_dir) == records
+        # The run's packer (round 199): flat records into the pack as they
+        # land, then the finish appends only what prune edited since.
+        write_evaluation_record(evaluations_dir / "eval-0007-stu",
+                                {"eval_id": 7, "params": {"a": 7}, "objective": 0.2,
+                                 "paths": {"image": "x"}})
+        assert pack_flat_records(evaluations_dir) == 1 and pack_flat_records(evaluations_dir) == 0
+        assert not flat_record_path(evaluations_dir / "eval-0007-stu").exists()
+        _WRITTEN_RECORDS.clear()  # a second finish, from records on disk alone
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 7]
+        assert pack_finished_run(evaluations_dir) == 0  # nothing edited
+        records[3]["paths"] = {}
+        assert pack_finished_run(evaluations_dir, encode_finished_records()) == 1  # the summary's texts
+        assert load_evaluations_from_dir(evaluations_dir) == records
+        packer = start_record_packer(evaluations_dir)
+        assert packer is not None and packer.poll() is None
+        stop_record_packer(packer)
+        assert packer.returncode is not None
+        # A pre-round-92 run: metrics.json goes, and its dir unless it keeps something.
+        for name, keeps in (("eval-0005-mno", False), ("eval-0006-pqr", True)):
+            (evaluations_dir / name).mkdir()
+            (evaluations_dir / name / "metrics.json").write_text(json.dumps(
+                {"eval_id": 5 + keeps, "params": {"a": 5 + keeps}, "objective": 0.2}))
+            if keeps:
+                (evaluations_dir / name / "wsclean").mkdir()
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 6
+        assert sorted(p.name for p in evaluations_dir.iterdir()) == [
+            "eval-0001-abc", "eval-0006-pqr", RECORD_PACK]
+        assert [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)] == [1, 2, 4, 5, 6, 7]
+        # A record still queued when the run ends goes into the pack, never
+        # to its own file (round 234), with the flat writer too.
+        import threading
+
+        _WRITTEN_RECORDS.clear()
+        os.environ["NS_RECORD_APPEND"] = "0"
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        queued = evaluations_dir / "eval-0008-vwx"
+        write_evaluation_record(queued, {"eval_id": 8, "params": {"a": 8}, "objective": 0.3})
+        threading.Timer(0.5, gate.set).start()
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8]
+        assert not flat_record_path(queued).exists(), "a queued record was written"
+        assert pack_finished_run(evaluations_dir) == 1
+        assert load_evaluations_from_dir(evaluations_dir) == records
+        # A writer that fell behind appends its backlog to the pack in one
+        # write; one that keeps up writes a flat file (round 247).
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        backlog = [evaluations_dir / f"eval-002{i}-bkl" for i in range(3)]
+        for i, eval_dir in enumerate(backlog):
+            write_evaluation_record(eval_dir, {"eval_id": 20 + i, "params": {"a": 20 + i}, "objective": 0.5})
+        gate.set()
+        drain_record_writes()
+        assert not any(flat_record_path(eval_dir).exists() for eval_dir in backlog), "a backlog went flat"
+        assert [json.loads(packed_record_texts(evaluations_dir)[d.name])["eval_id"] for d in backlog] == [20, 21, 22]
+        write_records_in_background()
+        lone = evaluations_dir / "eval-0023-bkl"
+        write_evaluation_record(lone, {"eval_id": 23, "params": {"a": 23}, "objective": 0.5})
+        drain_record_writes()
+        assert flat_record_path(lone).exists(), "a lone record was not written flat"
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 20, 21, 22, 23]
+        assert pack_finished_run(evaluations_dir) == 1  # the flat one; the appended are packed
+        # A run's writer (the default since round 264) appends its records
+        # to the pack, never a flat file, and the finish then has nothing to
+        # add (round 240). A torn last
+        # line - a rank killed mid-append - is cut by the next pack writer,
+        # so the next append does not run on into it.
+        _WRITTEN_RECORDS.clear()
+        os.environ["NS_RECORD_APPEND"] = "1"
+        write_records_in_background()
+        appended = evaluations_dir / "eval-0010-yza"
+        write_evaluation_record(appended, {"eval_id": 10, "params": {"a": 10}, "objective": 0.4})
+        drain_record_writes()
+        assert not flat_record_path(appended).exists(), "an appended record was written flat"
+        assert json.loads(packed_record_texts(evaluations_dir)[appended.name])["eval_id"] == 10
+        records = finished_run_records(evaluations_dir)
+        assert [r["eval_id"] for r in records] == [1, 2, 4, 5, 6, 7, 8, 10, 20, 21, 22, 23]
+        assert pack_finished_run(evaluations_dir) == 0, "the finish re-appended an appended record"
+        with open(evaluations_dir / RECORD_PACK, "a") as pack:
+            pack.write('eval-0011-bcd\t{"eval_id": 11, "par')
+        # With no flat record for the resume to pack it must still cut the tail.
+        appending = evaluations_dir / "appending"
+        appending.mkdir()
+        (appending / RECORD_PACK).write_text(
+            'eval-0001-a\t{"eval_id": 1, "params": {"a": 1}, "objective": 0.5}\n'
+            'eval-0002-b\t{"eval_id": 2, "par')
+        assert _pack_is_torn(appending)
+        assert adopt_completed_evaluations(appending, {}) == 1
+        assert not _pack_is_torn(appending), "a resume left the torn line for the next append"
+        (appending / RECORD_PACK).unlink()
+        appending.rmdir()
+        assert pack_evaluation_records(evaluations_dir, {}) == 0
+        write_records_in_background()
+        write_evaluation_record(evaluations_dir / "eval-0012-efg",
+                                {"eval_id": 12, "params": {"a": 12}, "objective": 0.6})
+        drain_record_writes()
+        # An appending writer that fell behind writes its backlog in one
+        # append, in order, but never a line ahead of a queued publish of its
+        # evaluation's detail (round 296).
+        os.environ["NS_RECORD_BATCH"] = "1"
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        appends = []
+        real_append = _append_record
+        globals()["_append_record"] = lambda d, line: (appends.append(line), real_append(d, line))
+        published = threading.Event()
+        try:
+            for i in range(3):
+                write_evaluation_record(evaluations_dir / f"eval-003{i}-bat",
+                                        {"eval_id": 30 + i, "params": {"a": 30 + i}, "objective": 0.5})
+            assert sum(f.kind == "record" for f in _RECORD_WRITES) == 1, "a covered line got a job"
+            _submit_record_job(published.wait, "publish")
+            _PENDING_LINES.append((evaluations_dir, b'eval-0033-bat\t{"eval_id": 33, "params": {"a": 33}, "objective": 0.5}\n', _RECORD_WRITES[-1]))
+            _submit_record_job(_append_pending_lines)
+            gate.set()
+            time.sleep(0.2)
+            assert [line.count(b"\n") for line in appends] == [3], appends
+            published.set()
+            drain_record_writes()
+        finally:
+            gate.set()
+            published.set()  # so a failed assertion cannot hang the drain at exit
+            globals()["_append_record"] = real_append
+            os.environ.pop("NS_RECORD_BATCH")
+        assert [line.count(b"\n") for line in appends] == [3, 1], appends
+        assert appends[0].startswith(b"eval-0030-bat\t") and b"eval-0032-bat\t" in appends[0]
+        os.environ.pop("NS_RECORD_APPEND")
+        assert 12 in [r["eval_id"] for r in load_evaluations_from_dir(evaluations_dir)]
+        # Across nodes a rank appends to its node's pack (round 290), which
+        # every reader takes too; the run's packer leaves it alone, and a
+        # finish or a resume folds it into the run's pack, which wins.
+        # NS_RECORD_INLINE=1 appends inline (round 292): the line is on disk
+        # when the call returns - unless a job is queued, which it waits behind.
+        os.environ["NS_RECORD_PACK"] = "records.node-b.jsonl"
+        os.environ["NS_RECORD_INLINE"] = "1"
+        node_pack = evaluations_dir / "records.node-b.jsonl"
+        write_records_in_background()
+        gate = threading.Event()
+        _submit_record_job(gate.wait, "held")
+        remote = evaluations_dir / "eval-0013-hij"
+        write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        assert not node_pack.exists(), "an inline record overtook a queued job"
+        gate.set()
+        drain_record_writes()
+        write_records_in_background()
+        write_evaluation_record(remote, {"eval_id": 13, "params": {"a": 13}, "objective": 0.6})
+        assert not _RECORD_WRITES and node_pack.read_text().count("eval-0013-hij") == 2, \
+            "an inline record was queued"
+        drain_record_writes()
+        os.environ.pop("NS_RECORD_PACK")
+        os.environ.pop("NS_RECORD_INLINE")
+        assert node_pack.read_text().startswith("eval-0013-hij\t"), "a node's record missed its pack"
+        assert json.loads(packed_record_texts(evaluations_dir)[remote.name])["eval_id"] == 13
+        write_evaluation_record(evaluations_dir / "eval-0014-klm",
+                                {"eval_id": 14, "params": {"a": 14}, "objective": 0.6})  # flat
+        assert pack_flat_records(evaluations_dir) == 1 and node_pack.exists()
+        with open(node_pack, "a") as pack:
+            pack.write('eval-0015-nop\t{"eval_id": 15, "par')  # a rank killed mid-append
+        assert adopt_completed_evaluations(evaluations_dir, {}) == 19
+        assert not node_pack.exists(), "a resume left a node pack unfolded"
+        texts = packed_record_texts(evaluations_dir)
+        assert json.loads(texts[remote.name])["eval_id"] == 13 and "eval-0015-nop" not in texts
+        node_pack.write_text('eval-0013-hij\t{"eval_id": 13, "params": {"a": 13}, "objective": 9}\n'
+                             'eval-0016-qrs\t{"eval_id": 16, "params": {"a": 16}, "objective": 0.1}\n')
+        _WRITTEN_RECORDS.clear()
+        records = finished_run_records(evaluations_dir)
+        assert {r["eval_id"]: r["objective"] for r in records}[13] == 0.6, "a node pack beat the run's"
+        assert pack_finished_run(evaluations_dir) == 1 and not node_pack.exists()
+        assert load_evaluations_from_dir(evaluations_dir) == records
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fresh run adopts nothing and starts at id 1.
@@ -1345,13 +2412,92 @@ def self_check_resume_adoption() -> None:
         assert adopt_completed_evaluations(Path(tmp), cache) == 0
 
 
-def write_json_atomic(path: Path, payload: Any) -> None:
-    """Write JSON through a same-directory temporary file, then replace `path` atomically."""
+def write_json_atomic(path: Path, payload: Any, encoded: list[str] | None = None) -> None:
+    """Write JSON through a same-directory temporary file, then replace `path` atomically.
+    `encoded`, if given, is json.dumps() of each of payload["evaluations"]."""
+    _write_text_atomic(path, _json_text(payload, encoded))
+
+
+def read_summary_skeleton(path: Path) -> dict[str, Any] | None:
+    """A summary without its `evaluations`, or None if it needs reading whole:
+    no record_digest (older runs, merged runs) or not _json_text()'s layout.
+    Reads the two ends only; a target-size summary is over 1 GB (round 349)."""
+    marker, close = b'\n  "evaluations": [', b"\n  ],\n"
+    with open(path, "rb") as handle:
+        head = handle.read(1 << 16)
+        opened = head.find(marker)
+        if opened < 0:
+            return None
+        records_at = opened + len(marker)
+        size = handle.seek(0, os.SEEK_END)
+        handle.seek(max(records_at, size - (1 << 20)))
+        tail = handle.read()
+    # A record is one line, so the first such close is the array's. The record
+    # before it proves the read began inside the array, not past it.
+    closed = tail.find(close)
+    if closed < 0 or tail.rfind(b'\n    {"', 0, closed) < 0:
+        return None
+    try:
+        summary = json.loads(head[:records_at] + b"]" + tail[closed + len(close) - 2:])
+    except ValueError:  # caught mid-write
+        return None
+    if not (summary.get("profiling") or {}).get("record_digest"):
+        return None
+    return summary
+
+
+def _json_text(payload: Any, encoded: list[str] | None = None) -> str:
+    # A summary's evaluations go one compact line each: indent=2 takes the
+    # pure-Python encoder, 5.1s of a 67k-evaluation summary against ~1.6s
+    # this way (round 197). The same JSON values; the head stays indented.
+    evaluations = payload.get("evaluations") if isinstance(payload, dict) else None
+    if not isinstance(evaluations, list) or not evaluations:
+        return json.dumps(payload, indent=2) + "\n"
+    # Two spaces and a newline: only the top-level key (a string holds no raw newline).
+    slot = '\n  "evaluations": []'
+    head = json.dumps({**payload, "evaluations": []}, indent=2)
+    if encoded is None or len(encoded) != len(evaluations):
+        encoded = list(map(json.dumps, evaluations))
+    body = ",\n    ".join(encoded)
+    return head.replace(slot, slot[:-1] + "\n    " + body + "\n  ]", 1) + "\n"
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
     partial = path.with_name(path.name + ".partial")
-    with partial.open("w") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+    partial.write_text(text)
     partial.replace(path)
+
+
+def self_check_summary_json() -> None:
+    summary = {"evaluation_count": 2, "note": '"evaluations": []', "nested": {"evaluations": []},
+               "evaluations": [{"eval_id": 1, "objective": float("nan")}, {"eval_id": 2, "params": {}}],
+               "after": [1, 2]}
+    text = _json_text(summary)
+    assert text.startswith('{\n  "evaluation_count": 2,'), text  # the head readers' layout
+    assert '\n    {"eval_id": 2, "params": {}}\n  ],\n  "after"' in text, text
+    assert repr(json.loads(text)) == repr(summary)
+    assert _json_text(summary, [json.dumps(e) for e in summary["evaluations"]]) == text
+    for payload in ({}, {"evaluations": []}, [1], {"eval_id": 1}):
+        assert _json_text(payload) == json.dumps(payload, indent=2) + "\n"
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "summary.json"
+        digest = {"profiling": {"record_digest": {"span_s": 1.0}}}
+        records = [{"eval_id": 1, "timing": {}}, {"eval_id": 2, "seen": [1, 2]}]
+        whole = {"a": 1, "evaluations": records, "worst_evaluation": records[1], **digest, "z": [{}]}
+        path.write_text(_json_text(whole))
+        assert read_summary_skeleton(path) == {**whole, "evaluations": []}
+        path.write_text(_json_text({**whole, "profiling": {}}))
+        assert read_summary_skeleton(path) is None, "no digest, so the caller parses it whole"
+        path.write_text(json.dumps(whole, indent=2))  # merge's layout
+        assert read_summary_skeleton(path) is None
+        path.write_text(_json_text(whole)[:-20])
+        assert read_summary_skeleton(path) is None, "half a file"
+        # A tail wider than the window starts past the array's close.
+        path.write_text(_json_text({**whole, "wide": ["x" * (1 << 20)], "after": [{}]}))
+        assert read_summary_skeleton(path) is None
+    print("OK: summary.json writer")
 
 
 # Scored evaluations keep only replayable inputs, metrics and the three images
@@ -1363,6 +2509,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 PRUNED_ARTEFACTS = (
     ("sim.ms", "measurement_set"),
     ("VLAA_ANT", None),
+    ("makems.cfg", None),
     ("r2d2_data.mat", "mat"),
     ("wsclean/recon-model.fits", None),
     ("wsclean/recon-psf.fits", None),
@@ -1375,33 +2522,98 @@ def evaluation_scratch_dir(eval_dir: Path) -> Path | None:
     return Path(root) / eval_dir.name if root else None
 
 
-def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> None:
+_FAILED_ARTEFACT_SLOTS_FULL: set[Path] = set()
+
+
+def claim_failed_artefacts_slot(eval_dir: Path) -> bool:
+    """One of the run's NS_KEEP_FAILED_ARTEFACTS slots for a failure's MS and
+    images. A failure storm otherwise keeps hundreds of files per failure: one
+    in docs/csd3-experiments.md (E5, E6) filled the one-million-file quota.
+    Slots are never freed, so once a rank finds them full it stops asking:
+    otherwise every later failure costs ~21 contended Lustre mkdirs on the
+    rank's main thread (~36ms with 36 ranks; docs/csd3-speed.md, round 38)."""
+    slots = eval_dir.parent / ".failed-artefacts-kept"
+    if slots in _FAILED_ARTEFACT_SLOTS_FULL:
+        return False
+    slots.mkdir(exist_ok=True)
+    for index in range(int(os.environ.get("NS_KEEP_FAILED_ARTEFACTS", "20"))):
+        try:
+            (slots / str(index)).mkdir()
+            return True
+        except FileExistsError:
+            continue
+    _FAILED_ARTEFACT_SLOTS_FULL.add(slots)
+    return False
+
+
+def prune_evaluation_artefacts(eval_dir: Path, record: dict[str, Any]) -> bool:
+    """Delete the artefacts no reader needs; True if this evaluation keeps them."""
     import shutil
 
-    keeping = "error" in record or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
-    scratch = evaluation_scratch_dir(eval_dir)
-    if scratch is not None and scratch.is_dir():
-        if keeping:
-            for produced in scratch.iterdir():
-                destination = eval_dir / produced.name
-                if destination.is_dir():
-                    shutil.rmtree(destination)
-                shutil.move(str(produced), destination)
-            if (eval_dir / "sim.ms").exists() and "measurement_set" in record.get("paths", {}):
-                record["paths"]["measurement_set"] = str(eval_dir / "sim.ms")
-            if (eval_dir / "r2d2_data.mat").exists() and "mat" in record.get("paths", {}):
-                record["paths"]["mat"] = str(eval_dir / "r2d2_data.mat")
-        shutil.rmtree(scratch, ignore_errors=True)
+    failed = "error" in record
+    keeping = os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0" or (
+        failed and claim_failed_artefacts_slot(eval_dir))
     if keeping:
-        return
+        return True
+    work = evaluation_scratch_dir(eval_dir) or eval_dir
     for name, path_key in PRUNED_ARTEFACTS:
-        target = eval_dir / name
+        target = work / name
         if target.is_dir():
             shutil.rmtree(target, ignore_errors=True)
         else:
             target.unlink(missing_ok=True)
         if path_key:
             record.get("paths", {}).pop(path_key, None)
+    return False
+
+
+def publish_evaluation_scratch(eval_dir: Path, record: dict[str, Any], kept: bool,
+                               files_only: bool = False, defer: Any = None) -> None:
+    """Move what an evaluation wrote to scratch beside its record, if it is kept.
+
+    Everything an evaluation writes goes to tmpfs scratch because on CSD3's
+    Lustre each file created costs 25-40ms and each unlink ~10ms, and most
+    evaluations are stripped to metrics.json straight after scoring
+    (docs/csd3-speed.md, round 5). Records name the final paths either way.
+    `defer`, if given, runs the move to Lustre instead (the record writer).
+    """
+    import shutil
+
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is None or not scratch.is_dir():
+        return
+    if kept:
+        (defer or (lambda job: job()))(
+            lambda: _move_scratch(scratch, eval_dir, files_only))
+    else:
+        shutil.rmtree(scratch, ignore_errors=True)
+    paths = record.get("paths") or {}
+    for key, value in paths.items():
+        if isinstance(value, str) and Path(value).is_relative_to(scratch):
+            paths[key] = str(eval_dir / Path(value).relative_to(scratch))
+
+
+def _move_scratch(scratch: Path, eval_dir: Path, files_only: bool) -> None:
+    import shutil
+
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    for produced in scratch.iterdir():
+        if files_only and produced.is_dir():
+            continue
+        destination = eval_dir / produced.name
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        shutil.move(str(produced), destination, copy_function=shutil.copyfile)
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+def salvage_evaluation_logs(eval_dir: Path) -> None:
+    """Keep a dead evaluation's logs: its scratch goes with the job, and a dead
+    worker's stderr is the only record of why it died."""
+    try:
+        publish_evaluation_scratch(eval_dir, {}, kept=True, files_only=True)
+    except OSError:
+        pass
 
 
 # A finished run keeps every image for the IMAGE_KEEP_ENDS worst and best
@@ -1427,6 +2639,7 @@ RETAINED_IMAGE_KEYS = ("image", "dirty", "residual")
 _CLEAN_STOPPED = re.compile(r"Stopped on peak [^,]+, because ([^\n]+)")
 _CLEAN_ITERATIONS = re.compile(r"Performed (\d+) iterations in total")
 _CLEAN_MAJOR = re.compile(r"(\d+) major iterations were performed")
+_GRIDDED = re.compile(r"Gridded visibility count: (\d+)")
 
 
 def clean_convergence(log_text: str) -> dict[str, Any]:
@@ -1454,6 +2667,12 @@ def clean_convergence(log_text: str) -> dict[str, Any]:
     major = _CLEAN_MAJOR.search(log_text)
     if major:
         out["clean_major_iterations"] = int(major.group(1))
+    # What drives an evaluation's cost (docs/nested-sampling-cost-model.md),
+    # kept in the record so `./ri profile --over-time` need not read logs the
+    # retention policy deletes from all but ~1 in 100 evaluations.
+    gridded = _GRIDDED.search(log_text)
+    if gridded:
+        out["gridded_visibilities"] = int(gridded.group(1))
     return out
 
 
@@ -1475,7 +2694,12 @@ def evaluation_key(record: dict[str, Any]) -> str:
     name carries the parameter hash and is unique.
     """
     eval_dir = (record.get("paths") or {}).get("eval_dir")
-    return Path(eval_dir).name if eval_dir else f"eval_id:{record.get('eval_id')}"
+    if not eval_dir:
+        return f"eval_id:{record.get('eval_id')}"
+    # Path().name, without building a Path: ~4 a record at the end of a run
+    # (round 269). Only a trailing "/" or "." needs Path's normalising.
+    name = eval_dir.rpartition("/")[2] if isinstance(eval_dir, str) else ""
+    return name if name not in ("", ".") else Path(eval_dir).name
 
 
 def evaluations_keeping_images(
@@ -1543,6 +2767,11 @@ PRUNED_EVALUATION_LOGS = (
 )
 
 
+def _names_image(record: dict[str, Any]) -> bool:
+    paths = record.get("paths") or {}
+    return any(paths.get(key) for key in RETAINED_IMAGE_KEYS)
+
+
 def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) -> int:
     """Delete images and logs of evaluations the retention policy does not keep.
 
@@ -1550,18 +2779,38 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
     is what lets the report fall back to its placeholder. Set
     NS_KEEP_ALL_IMAGES=1 to keep everything.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     if os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0":
         return 0
     keep = evaluations_keeping_images(records)
-    removed = 0
-    for record in records:
+    # One listing. An extreme a rank later evicted still names the images its
+    # stripped dir lost, and was over half a run's records: resolving those
+    # paths on Lustre, ~3 stats and a realpath each, was ~95% of prune
+    # (docs/csd3-speed.md, round 198). A dir not listed holds no image.
+    try:
+        listed = set(os.listdir(evaluations_dir))
+    except FileNotFoundError:
+        listed = set()
+
+    # Each record's own paths only, so records can go concurrently (see
+    # RECORD_READ_THREADS: ~26ms of Lustre stats per record serially).
+    def prune(record: dict[str, Any]) -> int:
+        removed = 0
         paths = record.get("paths") or {}
         retained = evaluation_key(record) in keep
+        dir_name = Path(paths.get("eval_dir") or "").name
+        gone = bool(dir_name) and dir_name not in listed
+        # A scored record that names no image was stripped to its record as
+        # it was scored (retain_evaluation_detail() drops the paths), so its
+        # dir holds nothing but metrics.json: no Lustre listing for it. That
+        # was 80% of a production run's records (round 52).
+        named = any(paths.get(key) for key in RETAINED_IMAGE_KEYS)
         for key in RETAINED_IMAGE_KEYS:
             recorded = paths.get(key)
             if not recorded:
                 continue
-            target = _recorded_image_path(evaluations_dir, recorded)
+            target = None if gone else _recorded_image_path(evaluations_dir, recorded)
             if target is None:
                 # Already gone; the record must not keep pointing at it.
                 paths.pop(key, None)
@@ -1571,18 +2820,45 @@ def prune_run_artefacts(evaluations_dir: Path, records: list[dict[str, Any]]) ->
             target.unlink(missing_ok=True)
             paths.pop(key, None)
             removed += 1
-        if retained or "error" in record:
-            continue
+        if retained or "error" in record or not named or gone:
+            return removed
         eval_dir = Path(paths.get("eval_dir") or "")
-        local = evaluations_dir / eval_dir.name if eval_dir.name else None
-        if local is None or not local.is_dir():
-            continue
-        for name in PRUNED_EVALUATION_LOGS:
-            log = local / name
-            if log.is_file():
-                log.unlink()
-                removed += 1
-    return removed
+        if not eval_dir.name:
+            return removed
+        # Stripped like an evaluation evicted as it was scored: its logs,
+        # simulation.json and the emptied wsclean/ and r2d2/ go, and so does
+        # the dir. Left behind they were ~3 inodes for each extreme a flush
+        # published and the run did not keep, ~1,000 per 4,000-evaluation
+        # WSClean run against the file quota (round 236).
+        local = evaluations_dir / eval_dir.name
+        try:
+            entries = os.listdir(local)
+        except (FileNotFoundError, NotADirectoryError):
+            return removed
+        removed += sum(name in PRUNED_EVALUATION_LOGS for name in entries)
+        _strip_to_record(local)
+        return removed
+
+    # Only a record naming an image in a dir still listed touches Lustre: ~1%
+    # of them. The rest go inline, since a future each cost ~1s of the pool's
+    # own overhead at 78k records (round 201).
+    def touches_lustre(record: dict[str, Any]) -> bool:
+        paths = record.get("paths") or {}
+        dir_name = Path(paths.get("eval_dir") or "").name
+        return (not dir_name or dir_name in listed) and any(
+            paths.get(key) for key in RETAINED_IMAGE_KEYS)
+
+    slow, removed = [], 0
+    for record in records:
+        paths = record.get("paths") or {}
+        if not _names_image(record):
+            continue  # prune() of a record naming no image does nothing: ~90% of them (round 269)
+        if touches_lustre(record):
+            slow.append(record)
+        else:
+            removed += prune(record)
+    with ThreadPoolExecutor(RECORD_READ_THREADS) as pool:
+        return removed + sum(pool.map(prune, slow))
 
 
 
@@ -1625,7 +2901,7 @@ def self_check_evaluation_pruning() -> None:
         assert "measurement_set" not in written["paths"] and "mat" not in written["paths"]
         assert written["paths"]["image"].endswith("recon-image.fits")
         assert written["paths"]["dirty"].endswith("recon-dirty.fits")
-        assert json.loads((scored / "metrics.json").read_text())["paths"] == written["paths"]
+        assert json.loads(flat_record_path(scored).read_text())["paths"] == written["paths"]
 
         # A failed evaluation keeps its inputs: that is the case worth looking at.
         failed = evaluation(root, "eval-0002-failed")
@@ -1719,6 +2995,10 @@ def self_check_image_retention() -> None:
     assert evaluations_keeping_images(shared, ends=1, stride=100) == {
         "eval-0007-aaa", "eval-0007-bbb"}
     assert len({evaluation_key(r) for r in shared}) == 2
+    # Path().name, whatever the spelling (round 269 skips building the Path).
+    for spelled in ("/run/evaluations/eval-0007-aaa", "eval-0007-aaa", "/run//eval-1/", "/run/eval-1/.",
+                    "/run/..", "/", "a/./b", Path("/run/evaluations/eval-0007-aaa")):
+        assert evaluation_key({"paths": {"eval_dir": spelled}}) == Path(spelled).name, spelled
 
     with tempfile.TemporaryDirectory() as tmp:
         evaluations = Path(tmp) / "evaluations"
@@ -1731,7 +3011,7 @@ def self_check_image_retention() -> None:
                               ("residual", "recon-residual.fits")):
                 (eval_dir / "wsclean" / name).write_text(name)
                 paths[key] = str(eval_dir / "wsclean" / name)
-            for name in PRUNED_EVALUATION_LOGS:
+            for name in PRUNED_EVALUATION_LOGS + ("simulation.json",):
                 (eval_dir / name).write_text(name)
             made.append({"eval_id": i, "objective": i / 60, "paths": paths})
         # A failure keeps every artefact whatever its rank.
@@ -1741,8 +3021,15 @@ def self_check_image_retention() -> None:
             (failed_dir / name).write_text(name)
         made.append({"eval_id": 99, "objective": FAILURE_OBJECTIVE, "error": "wsclean failed",
                      "paths": {"eval_dir": str(failed_dir)}})
+        # A rank's extreme it later evicted: stripped, dir and all, but its
+        # record still names images. Mid-ranked, so the keep set is unchanged.
+        evicted = {"eval_id": 98, "objective": 0.505, "paths": {
+            "eval_dir": str(evaluations / "eval-0098-x"),
+            "image": str(evaluations / "eval-0098-x" / "wsclean" / "recon-image.fits")}}
 
-        removed = prune_run_artefacts(evaluations, made)
+        removed = prune_run_artefacts(evaluations, made + [evicted])
+        # Gone already: no file to count, and no path left to name it.
+        assert evicted["paths"] == {"eval_dir": str(evaluations / "eval-0098-x")}, evicted
         keep = evaluations_keeping_images(made, ends=20, stride=100)
         # 60 scored evaluations, ends of 20: 40 at the ends plus every 100th of
         # the 20 between, which is just the first of them - and the failure,
@@ -1758,10 +3045,12 @@ def self_check_image_retention() -> None:
                 # A summary must never name a file this deleted.
                 assert (key in rec["paths"]) == kept, (rec["eval_id"], key)
 
-        # Logs go with the images, and a failure keeps all of them.
+        # Logs go with the images, and a failure keeps all of them. A dropped
+        # one is stripped dir and all, as if evicted when it was scored.
         for rec in made:
             eval_dir = Path(rec["paths"]["eval_dir"])
             kept = evaluation_key(rec) in keep or "error" in rec
+            assert eval_dir.is_dir() == kept, (rec["eval_id"], "dir")
             for name in PRUNED_EVALUATION_LOGS:
                 assert (eval_dir / name).is_file() == kept, (rec["eval_id"], name)
 
@@ -1789,15 +3078,31 @@ def self_check_clean_convergence() -> None:
 
     # A log that never got as far as cleaning yields nothing, not a crash.
     assert clean_convergence("WSClean version 3.7\n") == {}
+    assert clean_convergence("2026-Aug-29 10:19:02.105500 Gridded visibility count: 4140\n"
+                             "Gridded visibility count: 4140\n") == {"gridded_visibilities": 4140}
     assert clean_convergence("") == {}
     assert clean_convergence_from(Path("/nonexistent/wsclean.stdout.log")) == {}
 
     print("clean convergence self-check passed")
 
 
+def _busy_dir() -> Path | None:
+    root = os.environ.get("NS_SCRATCH_DIR", "")
+    return Path(root) / ".busy" if root else None
+
+
+def _busy_marker() -> Path | None:
+    busy_dir = _busy_dir()
+    return busy_dir / str(os.getpid()) if busy_dir else None
+
+
 def mark_evaluation_start() -> None:
     global _EVALUATION_STARTED_EPOCH
     _EVALUATION_STARTED_EPOCH = time.time()
+    marker = _busy_marker()
+    if marker is not None:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
 
 
 def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
@@ -1807,9 +3112,635 @@ def write_evaluation_record(eval_dir: Path, record: dict[str, Any]) -> dict[str,
         timing["started_epoch"] = _EVALUATION_STARTED_EPOCH
         timing["ended_epoch"] = time.time()
         _EVALUATION_STARTED_EPOCH = None
-    prune_evaluation_artefacts(eval_dir, record)
-    write_json_atomic(eval_dir / "metrics.json", record)
+        marker = _busy_marker()
+        if marker is not None:
+            marker.unlink(missing_ok=True)
+    keeping = prune_evaluation_artefacts(eval_dir, record)
+    published: list[Any] = []
+    kept = retain_evaluation_detail(eval_dir, record) or keeping
+    if kept and not keeping and not _always_retained(eval_dir, record):
+        hold_evaluation_scratch(eval_dir, record)
+    else:
+        # The 1 in NS_KEEP_DETAIL_EVERY kept whole is ~7 files to Lustre,
+        # ~0.2s, and the rank sat idle through it: ~2% of a 36-rank search
+        # (docs/csd3-speed.md, round 95).
+        publish_evaluation_scratch(eval_dir, record, kept, defer=(
+            (lambda job: published.append(_submit_record_job(job, "publish")))
+            if _RECORD_WRITER is not None else None))
+    flush_held_evaluations()
+    text = _json_text(record)
+    _WRITTEN_RECORDS[os.path.abspath(eval_dir)] = text
+    if _RECORD_WRITER is None:
+        _write_record(flat_record_path(eval_dir), text)
+    elif os.environ.get("NS_RECORD_APPEND", "1") == "1":
+        line = f"{eval_dir.name}\t{json.dumps(record)}\n".encode()
+        # _pypolychord holds the GIL through PolyChord's MPI waits, so the
+        # writer thread runs only while a callback blocks: on 2 nodes an
+        # append cost ~86ms of GIL waits, the writer fell hundreds of records
+        # behind and a kill lost 692 records. NS_RECORD_INLINE=1 appends on
+        # the rank's thread: no loss, but 18-28ms a record there and ~4% fewer
+        # evals/s on 2 nodes, so it is opt-in (round 292). A queued publish
+        # keeps the thread, so a record never lands before its detail.
+        if os.environ.get("NS_RECORD_INLINE") == "1" and all(
+                future.done() for future in _RECORD_WRITES):
+            _timed_record_job(lambda: _append_record(eval_dir.parent, line), "record")
+        elif os.environ.get("NS_RECORD_BATCH", "1") == "0":
+            _submit_record_job(lambda: _append_record(eval_dir.parent, line))
+        else:
+            publish = published[0] if published else None
+            with _PENDING_LOCK:
+                # A job queued for an earlier line takes this one too.
+                covered = bool(_PENDING_LINES) and publish is None
+                _PENDING_LINES.append((eval_dir.parent, line, publish))
+            if not covered:
+                _submit_record_job(_append_pending_lines)
+    elif os.environ.get("NS_RECORD_COALESCE", "1") == "0":
+        _submit_record_job(lambda: _write_record(flat_record_path(eval_dir), text))
+    else:
+        with _PENDING_LOCK:
+            _PENDING_RECORDS.append((eval_dir, text, record))
+        _submit_record_job(_write_pending_records)
     return record
+
+
+# A flat writer that falls behind - a create in evaluations/ costs 2ms on a
+# quiet RDS and up to 1.2s on a loaded one - held 58-67% of a run's records
+# only in memory (round 244), and a kill lost them from the archive (161 of
+# 4,933, round 245). So the writer takes every record queued when it gets to
+# one: a lone record is a flat file, as before; a backlog is one append to
+# the pack, NS_RECORD_APPEND's single write, so it never grows (round 247).
+_PENDING_RECORDS: list[tuple[Path, str, dict[str, Any]]] = []
+_PENDING_LOCK = threading.Lock()
+
+
+def _write_pending_records() -> None:
+    with _PENDING_LOCK:
+        pending = _PENDING_RECORDS[:]
+        _PENDING_RECORDS.clear()
+    if len(pending) == 1:
+        eval_dir, text, _ = pending[0]
+        _write_record(flat_record_path(eval_dir), text)
+    elif pending:
+        _append_record(pending[0][0].parent, b"".join(
+            f"{eval_dir.name}\t{json.dumps(record)}\n".encode() for eval_dir, _, record in pending))
+        _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(pending)
+
+
+# The appending writer fell behind the same way under a loaded Lustre: a
+# 2-node search ended with 11,085 of its 23,279 records still queued, 1,078
+# on one node (round 296). NS_RECORD_BATCH=1 has a record job append every
+# line queued when it runs, in one write - up to the first whose detail is
+# still to publish, which its own job, queued behind that publish, appends.
+# It costs no steady evals/s on 2 nodes (102.3 vs 102.0, ~7 min ABBA arms)
+# and leaves 8-15x fewer records queued at the finish (round 297), and a
+# kill -9 loses no more than the old writer (round 298), so it is the
+# default; NS_RECORD_BATCH=0 queues one job per record.
+_PENDING_LINES: list[tuple[Path, bytes, Any]] = []
+
+
+def _append_pending_lines() -> None:
+    with _PENDING_LOCK:
+        ready = 0
+        for _, _, publish in _PENDING_LINES:
+            if publish is not None and not publish.done():
+                break
+            ready += 1
+        batch = _PENDING_LINES[:ready]
+        del _PENDING_LINES[:ready]
+    if batch:
+        _append_record(batch[0][0], b"".join(line for _, line, _ in batch))
+        if len(batch) > 1:
+            _WRITER_SECONDS["coalesced"] = _WRITER_SECONDS.get("coalesced", 0) + len(batch)
+
+
+def _submit_record_job(job: Any, kind: str = "record") -> Any:
+    for done in [future for future in _RECORD_WRITES if future.done()]:
+        _RECORD_WRITES.remove(done)
+        done.result()  # a failed write raises here, on the rank's own thread
+    future = _RECORD_WRITER.submit(_timed_record_job, job, kind)
+    future.kind = kind
+    _RECORD_WRITES.append(future)
+    return future
+
+
+def _timed_record_job(job: Any, kind: str) -> None:
+    started = time.monotonic()
+    try:
+        job()
+    finally:
+        _WRITER_SECONDS[kind] = _WRITER_SECONDS.get(kind, 0.0) + time.monotonic() - started
+
+
+def _write_record(path: Path, text: str) -> None:
+    _write_text_atomic(path, text)
+
+
+# A run's writer appends each record to the pack instead of creating a flat
+# file - one write on a descriptor held open, against a create and a rename in
+# the evaluations dir (on RDS, 38 processes: 0.15-0.24 against 1.9-2.1 ms,
+# worst 0.01 against 1.2 s). A kill loses none (rounds 245, 261), and at 113
+# ranks on whole sapphire flat creates convoyed in the MDS (~40x the
+# writer-seconds, load ~200) for +1.9% evals/s, so it is the default (round
+# 264; NS_RECORD_APPEND=0 for the coalescing flat writer). O_APPEND keeps
+# concurrent lines whole; the shared lock keeps them out of a pack writer's
+# truncate of a torn last line, which takes it exclusively.
+_PACK_FDS: dict[str, int] = {}
+
+
+def _append_record(evaluations_dir: Path, line: bytes) -> None:
+    import fcntl
+
+    path = evaluations_dir / os.environ.get("NS_RECORD_PACK", RECORD_PACK)
+    fd = _PACK_FDS.get(str(path))
+    if fd is None:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        _PACK_FDS[str(path)] = fd
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        written = os.write(fd, line)
+        if written != len(line):
+            raise OSError(f"short append to {path}: {written} of {len(line)} bytes")
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+# A record write (create, write, rename) costs ~50ms on CSD3's Lustre, a fifth
+# of a WSClean evaluation, and the rank sat idle through it. A run hands it to
+# one thread per rank instead; whatever reads the records back drains it first.
+_RECORD_WRITER: Any = None
+_RECORD_WRITES: list[Any] = []
+# Every record this process wrote, by eval dir, for finished_run_records().
+_WRITTEN_RECORDS: dict[str, str] = {}
+# Seconds this rank's writer spent on each kind of job, for post_run_line(),
+# and as cancelled_held a count: the held publishes it was spared (round 235).
+_WRITER_SECONDS: dict[str, float] = {}
+
+
+# The writer must not share the rank's pinned CPU. Every mkdir in evaluations/
+# holds the directory's lock across its Lustre round trip, so a writer that then
+# waits behind its rank's busy worker for the core stalls all 36 ranks' writers:
+# ~570ms a mkdir there while scoring, against 0.13ms in a subdirectory
+# (docs/csd3-speed.md, round 54).
+def _unpin_thread() -> None:
+    if _UNPINNED_CPUS:
+        os.sched_setaffinity(0, _UNPINNED_CPUS)  # this thread only, on Linux
+
+
+def write_records_in_background() -> None:
+    global _RECORD_WRITER
+    from concurrent.futures import ThreadPoolExecutor
+
+    if _RECORD_WRITER is None:
+        _RECORD_WRITER = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="record-writer", initializer=_unpin_thread)
+        atexit.register(drain_record_writes)
+
+
+def drain_record_writes(timeout: float | None = None, flush_held: bool = True) -> None:
+    """Wait for queued record writes; back to writing inline. Raises the first
+    failed write, unless `timeout` is set (abort paths, which must not hang).
+    `flush_held=False` leaves the held extremes to finished_run_records()."""
+    global _RECORD_WRITER
+    import concurrent.futures
+
+    if timeout is None and flush_held:
+        flush_held_evaluations(force=True)
+    writer, _RECORD_WRITER = _RECORD_WRITER, None
+    if writer is None:
+        return
+    pending = list(_RECORD_WRITES)
+    _RECORD_WRITES.clear()
+    concurrent.futures.wait(pending, timeout=timeout)
+    writer.shutdown(wait=timeout is None)
+    if timeout is None:
+        for future in pending:
+            future.result()
+
+
+# Keeping every evaluation's logs and images until a run ends costs 10-15 files
+# an evaluation, and CSD3's hpc-work allows a million: a 112-rank run reaches it
+# within hours (docs/csd3-experiments.md). So as it goes, each rank strips a
+# successful evaluation to its metrics.json unless it is one of that rank's
+# IMAGE_KEEP_ENDS lowest or highest objectives so far - the run's own are always
+# among those, so prune_run_artefacts() still finds them - or one of the 1 in
+# NS_KEEP_DETAIL_EVERY kept whole, which `./ri profile` reads its logs from.
+_LOWEST: list[tuple[float, str]] = []
+_HIGHEST: list[tuple[float, str]] = []
+
+
+def _keeps_detail(key: str) -> bool:
+    import hashlib
+
+    every = int(os.environ.get("NS_KEEP_DETAIL_EVERY", "100"))
+    return every <= 1 or int(hashlib.sha256(key.encode()).hexdigest(), 16) % every == 0
+
+
+def _strip_to_record(eval_dir: Path) -> None:
+    import shutil
+
+    try:
+        entries = list(eval_dir.iterdir())
+    except FileNotFoundError:
+        return  # stripped already, or never published
+    for entry in entries:
+        # A pre-round-92 record, or its .partial while a writer is on it.
+        if entry.name.startswith("metrics.json"):
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    try:
+        eval_dir.rmdir()  # its record is beside it, not in it
+    except OSError:
+        pass
+
+
+def _always_retained(eval_dir: Path, record: dict[str, Any]) -> bool:
+    return (os.environ.get("NS_KEEP_ALL_IMAGES", "0") != "0"
+            or os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") != "0"
+            or "error" in record or record.get("objective") is None
+            or _keeps_detail(eval_dir.name))
+
+
+def retain_evaluation_detail(eval_dir: Path, record: dict[str, Any]) -> bool:
+    """False if this evaluation is stripped to its record."""
+    import heapq
+    import shutil
+
+    if _always_retained(eval_dir, record):
+        return True
+    key, objective = eval_dir.name, float(record["objective"])
+    evicted = set()
+    heapq.heappush(_LOWEST, (-objective, key))
+    heapq.heappush(_HIGHEST, (objective, key))
+    if len(_LOWEST) > IMAGE_KEEP_ENDS:
+        evicted.add(heapq.heappop(_LOWEST)[1])
+    if len(_HIGHEST) > IMAGE_KEEP_ENDS:
+        evicted.add(heapq.heappop(_HIGHEST)[1])
+    evicted -= {k for _, k in _LOWEST} | {k for _, k in _HIGHEST}
+    for name in evicted:
+        if name in _HELD:
+            shutil.rmtree(_HELD.pop(name)[0], ignore_errors=True)
+        elif (cancelled := _cancel_held_publish(name)) is not None:
+            # Its copy to Lustre had not started, so nothing of it is there:
+            # dropped in tmpfs, with no publish or strip for the writer.
+            shutil.rmtree(cancelled[0], ignore_errors=True)
+        # This evaluation's own dir is empty, or not made yet, while its
+        # output is still in scratch: no Lustre walk for it (round 14).
+        elif name != key or evaluation_scratch_dir(eval_dir) is None:
+            # One already on Lustre: its walk, unlinks and rmdir go to the
+            # record writer, after its own move there. On the rank's thread a
+            # Lustre metadata stall froze every rank at once for 15-48s,
+            # ~19% of a 1,500-dead search (docs/csd3-speed.md, round 232).
+            _defer_lustre(lambda path=eval_dir.parent / name: _strip_to_record(path), "strip")
+    if key in evicted:
+        for image_key in RETAINED_IMAGE_KEYS:
+            (record.get("paths") or {}).pop(image_key, None)
+    return key not in evicted
+
+
+
+# A rank's extremes so far are mostly evicted again: replaying the 71k-evaluation
+# R2D2 run's objectives, 9-13% of all evaluations at 24-36 ranks enter one, and
+# publishing each to Lustre and stripping it later cost ~0.3s of the rank's
+# main thread (docs/csd3-speed.md, round 47). So with scratch they wait in
+# tmpfs under .held/, an eviction there is free, and the survivors go to Lustre
+# every NS_RETAIN_FLUSH_SECONDS and, at the end, only those the run keeps
+# (finished_run_records()). A job that dies loses at most that much of its
+# extremes' images; the records survive and prune_run_artefacts() drops the
+# paths that no longer exist.
+_HELD: dict[str, tuple[Path, Path]] = {}
+_HELD_SINCE: float | None = None
+# Held extremes the periodic flush queued on the writer, by name. Most are
+# evicted again, and on a loaded Lustre the writer runs minutes behind, so the
+# eviction usually comes first: cancelling the publish then saves its copies
+# and the strip that would undo them, ~27% of the writer's time (round 235).
+_PUBLISHING: dict[str, tuple[Any, Path, Path]] = {}
+
+
+def _cancel_held_publish(name: str) -> tuple[Path, Path] | None:
+    """(held, eval_dir) if `name`'s queued publish was cancelled, else None."""
+    entry = _PUBLISHING.pop(name, None)
+    if entry is None or not entry[0].cancel():
+        return None
+    _RECORD_WRITES.remove(entry[0])  # a cancelled future's result() raises
+    _WRITER_SECONDS["cancelled_held"] = _WRITER_SECONDS.get("cancelled_held", 0) + 1
+    return entry[1:]
+
+
+def hold_evaluation_scratch(eval_dir: Path, record: dict[str, Any]) -> None:
+    global _HELD_SINCE
+    scratch = evaluation_scratch_dir(eval_dir)
+    if scratch is None or not scratch.is_dir():
+        return
+    held = scratch.parent / ".held" / scratch.name
+    held.parent.mkdir(exist_ok=True)
+    scratch.rename(held)
+    _HELD[eval_dir.name] = (held, eval_dir)
+    if _HELD_SINCE is None:
+        _HELD_SINCE = time.monotonic()
+    paths = record.get("paths") or {}
+    for key, value in paths.items():
+        if isinstance(value, str) and Path(value).is_relative_to(scratch):
+            paths[key] = str(eval_dir / Path(value).relative_to(scratch))
+
+
+def flush_held_evaluations(force: bool = False, keep: set[str] | None = None) -> None:
+    """Move held extremes to Lustre; with `keep`, only those the run keeps."""
+    import shutil
+
+    global _HELD_SINCE
+    if not _HELD or not force and (
+            time.monotonic() - (_HELD_SINCE or 0.0)
+            < float(os.environ.get("NS_RETAIN_FLUSH_SECONDS", "600"))):
+        return
+    for name, (held, eval_dir) in _HELD.items():
+        if not held.is_dir():
+            continue  # a self-check's scratch, already gone
+        if keep is not None and name not in keep:
+            shutil.rmtree(held, ignore_errors=True)
+            continue
+        # The periodic flush is the record writer's (round 232); a forced
+        # one is the end of a run, whose readers need the files there.
+        publish = lambda held=held, eval_dir=eval_dir: _publish_held(held, eval_dir)  # noqa: E731
+        if force or _RECORD_WRITER is None:
+            publish()
+        else:
+            _PUBLISHING[name] = (_submit_record_job(publish, "held"), held, eval_dir)
+    for name in [name for name, entry in _PUBLISHING.items() if entry[0].done()]:
+        del _PUBLISHING[name]
+    _HELD.clear()
+    _HELD_SINCE = None
+
+
+def strip_unkept_evaluations(evaluations_dir: Path, named: list[str], keep: set[str]) -> int:
+    """Strip what this rank put on Lustre and the run does not keep, so rank 0
+    finds almost nothing to prune: one 32-thread pool unlinked 64k files of 9.2k
+    dirs in 21s at 430k evaluations, ~6x the 128k figure (csd3-speed.md, round 345).
+
+    `named` is this rank's records still naming an image. Most are extremes it
+    evicted long ago, whose dirs are gone; only a current extreme or one of the
+    1 in NS_KEEP_DETAIL_EVERY can still have one, so only those cost a listing.
+    """
+    extremes = {key for _, key in _LOWEST} | {key for _, key in _HIGHEST}
+    unkept = [name for name in named if name not in keep and (name in extremes or _keeps_detail(name))]
+    for name in unkept:
+        _strip_to_record(evaluations_dir / name)
+    return len(unkept)
+
+
+def _publish_held(held: Path, eval_dir: Path) -> None:
+    import shutil
+
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    for produced in held.iterdir():
+        shutil.move(str(produced), eval_dir / produced.name, copy_function=shutil.copyfile)
+    held.rmdir()
+
+
+def _defer_lustre(job: Any, kind: str) -> None:
+    """Run a Lustre job on the record writer if there is one, else now."""
+    if _RECORD_WRITER is None:
+        job()
+    else:
+        _submit_record_job(job, kind)
+
+
+def self_check_streaming_retention() -> None:
+    import tempfile
+
+    global IMAGE_KEEP_ENDS
+    class Comm:  # rank by rank, in rank order, as comm.gather()
+        def __init__(self, rank: int) -> None:
+            self.rank, self.sent = rank, []
+
+        def Get_rank(self) -> int:
+            return self.rank
+
+        def Get_size(self) -> int:
+            return 3
+
+        def send(self, value: Any, dest: int, tag: int) -> None:
+            self.sent.append((value, dest, tag))
+
+        def recv(self, source: int, tag: int) -> str:
+            return f"from {source}"
+
+    assert gather_large(Comm(0), "mine") == ["mine", "from 1", "from 2"]
+    sender = Comm(2)
+    assert gather_large(sender, "mine") is None and sender.sent == [("mine", 0, GATHER_LARGE_TAG)]
+
+    saved = IMAGE_KEEP_ENDS, os.environ.get("NS_KEEP_DETAIL_EVERY")
+    IMAGE_KEEP_ENDS = 3
+    os.environ["NS_KEEP_DETAIL_EVERY"] = "10"
+    try:
+        # Same outcome whether an evaluation writes beside its record or in
+        # scratch that is published only if it is kept, and whether records
+        # are written inline or by the run's background writer.
+        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+        for scratch_root, background in ((None, False), ("scratch", False), ("scratch", True)):
+            _LOWEST.clear()
+            _HIGHEST.clear()
+            _HELD.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                evaluations = Path(tmp) / "evaluations"
+                if scratch_root:
+                    os.environ["NS_SCRATCH_DIR"] = str(Path(tmp) / scratch_root)
+                if background:
+                    write_records_in_background()
+                evaluations.mkdir()
+                objectives = {}
+                for index in range(300):
+                    eval_dir = evaluations / f"eval-{index:04d}"
+                    # As simulate_measurement_set(): with scratch, nothing
+                    # makes the eval dir before its record or publish does.
+                    if not scratch_root:
+                        eval_dir.mkdir()
+                    work = evaluation_scratch_dir(eval_dir) or eval_dir
+                    (work / "wsclean").mkdir(parents=True)
+                    (work / "wsclean" / "recon-image.fits").write_text("x")
+                    (work / "wsclean.stdout.log").write_text("x")
+                    objective = ((index * 7919) % 300) / 10
+                    objectives[eval_dir.name] = objective
+                    record = {"objective": objective,
+                              "paths": {"eval_dir": str(eval_dir),
+                                        "image": str(work / "wsclean" / "recon-image.fits")}}
+                    write_evaluation_record(eval_dir, record)
+                    # A kept evaluation's move to Lustre is the writer's job.
+                    for future in list(_RECORD_WRITES):
+                        future.result()
+                    assert not (Path(tmp) / "scratch" / eval_dir.name).exists(), "scratch outlived scoring"
+                    if eval_dir.name in _HELD:
+                        # Held in tmpfs: nothing of it on Lustre but its record.
+                        assert not (eval_dir / "wsclean").exists(), "a held evaluation was published"
+                        assert (Path(tmp) / "scratch" / ".held" / eval_dir.name / "wsclean").is_dir()
+                    if not (eval_dir / "wsclean").exists() and eval_dir.name not in _HELD:
+                        assert "image" not in record["paths"], "a stripped record still names its image"
+                    else:
+                        assert record["paths"]["image"] == str(eval_dir / "wsclean" / "recon-image.fits")
+                if scratch_root:
+                    assert _HELD, "no extreme was held in scratch"
+                    assert len(_HELD) <= 6, sorted(_HELD)
+                held_root = Path(tmp) / "scratch" / ".held"
+                if background:
+                    # Another rank's extreme so far that the run does not keep:
+                    # dropped in tmpfs, never published. Its record is read
+                    # from disk, as an earlier segment's would be.
+                    other = evaluations / "eval-other"
+                    (held_root / other.name / "wsclean").mkdir(parents=True)
+                    _HELD[other.name] = (held_root / other.name, other)
+                    _write_record(flat_record_path(other), _json_text(
+                        {"objective": 15.05, "paths": {"eval_dir": str(other)}}))
+                    # Its periodic publish still queued behind a stuck writer
+                    # when the run ends: cancelled, and dropped with the rest.
+                    import threading
+
+                    gate = threading.Event()
+                    _submit_record_job(gate.wait)
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                    flush_held_evaluations()
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                    assert other.name in _PUBLISHING and not _HELD
+                    threading.Timer(0.5, gate.set).start()
+                    records = finished_run_records(evaluations)
+                    assert records is not None and len(records) == len(objectives) + 1
+                    assert not other.exists()
+                    flat_record_path(other).unlink()
+                else:
+                    drain_record_writes()
+                assert not _HELD and not (held_root.exists() and any(held_root.iterdir()))
+                ordered = sorted(objectives, key=objectives.get)
+                must = set(ordered[:3]) | set(ordered[-3:]) | {k for k in objectives if _keeps_detail(k)}
+                if background:  # finished_run_records() strips what the run does not keep
+                    must &= evaluations_keeping_images(records)
+                for key in objectives:
+                    if key in must:
+                        kept = sorted(p.name for p in (evaluations / key).iterdir())
+                        assert kept == ["wsclean", "wsclean.stdout.log"], (key, kept)
+                    else:
+                        # Stripped to its record, which is beside the dir: no dir.
+                        assert not (evaluations / key).exists(), key
+                    written = _record_reader(evaluations)[1](key)  # flat or appended
+                    assert written["objective"] == objectives[key], (key, written)
+
+                # What the run does not keep goes with the rank that wrote it;
+                # a name that is neither an extreme nor kept whole costs no listing.
+                bystander = evaluations / "eval-bystander"
+                bystander.mkdir()
+                assert not _keeps_detail(bystander.name)
+                assert strip_unkept_evaluations(evaluations, [*must, bystander.name], set(ordered[:3])) == len(must - set(ordered[:3]))
+                assert bystander.is_dir()
+                bystander.rmdir()
+                assert all((evaluations / key).is_dir() == (key in ordered[:3]) for key in must), must
+
+                if scratch_root:
+                    # Once NS_RETAIN_FLUSH_SECONDS have passed, the next record publishes.
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                    eval_dir = evaluations / "eval-best"
+                    (evaluation_scratch_dir(eval_dir) / "wsclean").mkdir(parents=True)
+                    write_evaluation_record(eval_dir, {"objective": 1e3, "paths": {}})
+                    os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                    assert not _HELD and (eval_dir / "wsclean").is_dir()
+
+                if background:
+                    # The periodic flush, and stripping an extreme it published,
+                    # are the writer's: with it stuck (a Lustre stall), the
+                    # rank's thread touches neither (round 232).
+                    import threading
+
+                    names = [n for n in (f"eval-hi-{i}" for i in range(40)) if not _keeps_detail(n)]
+                    published = evaluations / names[0]  # an extreme so far, on Lustre
+                    (published / "wsclean").mkdir(parents=True)
+                    retain_evaluation_detail(published, {"objective": 1.5e3})
+                    write_records_in_background()
+                    gate = threading.Event()
+                    _submit_record_job(gate.wait)
+                    held = evaluations / "eval-held"
+                    (evaluation_scratch_dir(held) / "wsclean").mkdir(parents=True)
+                    hold_evaluation_scratch(held, {"paths": {}})
+                    try:
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                        flush_held_evaluations()
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                        for rank, name in enumerate(names[1:IMAGE_KEEP_ENDS + 1]):
+                            retain_evaluation_detail(evaluations / name, {"objective": 2e3 + rank})
+                        assert not _HELD and not (held / "wsclean").exists(), "the rank's thread published"
+                        assert (published / "wsclean").is_dir(), "the rank's thread stripped"
+                    finally:
+                        gate.set()
+                    drain_record_writes(flush_held=False)
+                    assert (held / "wsclean").is_dir() and not published.exists()
+
+                    # An extreme the periodic flush queued but the writer has
+                    # not reached, evicted again: never copied to Lustre and
+                    # never stripped, just dropped in tmpfs (round 235).
+                    _LOWEST.clear()
+                    _HIGHEST.clear()
+                    write_records_in_background()
+                    gate = threading.Event()
+                    _submit_record_job(gate.wait)
+                    try:
+                        evicted = evaluations / names[IMAGE_KEEP_ENDS + 1]
+                        (evaluation_scratch_dir(evicted) / "wsclean").mkdir(parents=True)
+                        retain_evaluation_detail(evicted, {"objective": 50.0})
+                        hold_evaluation_scratch(evicted, {"paths": {}})
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "0"
+                        flush_held_evaluations()
+                        os.environ["NS_RETAIN_FLUSH_SECONDS"] = "1e9"
+                        assert evicted.name in _PUBLISHING
+                        others = names[IMAGE_KEEP_ENDS + 2:3 * IMAGE_KEEP_ENDS + 2]
+                        for rank, name in enumerate(others):
+                            objective = 100.0 + rank if rank < IMAGE_KEEP_ENDS else rank
+                            retain_evaluation_detail(evaluations / name, {"objective": objective})
+                        assert evicted.name not in _PUBLISHING, "the evicted extreme's publish stayed queued"
+                        assert not (held_root / evicted.name).exists(), "the evicted extreme outlived tmpfs"
+                        assert "held" not in [f.kind for f in _RECORD_WRITES if not f.done()]
+                    finally:
+                        gate.set()
+                    drain_record_writes(flush_held=False)
+                    assert not evicted.exists(), "a cancelled publish reached Lustre"
+
+                if background:
+                    # A write that fails in the background still fails the run.
+                    write_records_in_background()
+                    blocked = evaluations / "blocked" / "eval-blocked"
+                    flat_record_path(blocked).with_name(blocked.name + ".json.partial").mkdir(parents=True)
+                    (blocked.parent / RECORD_PACK).mkdir()  # and the append's
+                    write_evaluation_record(blocked, {"objective": 1.0})
+                    try:
+                        drain_record_writes()
+                    except IsADirectoryError:
+                        pass
+                    else:
+                        raise AssertionError("a failed background record write was lost")
+
+                # A dead worker's logs outlive its scratch; its MS does not.
+                eval_dir = evaluations / "eval-9999-died"
+                if not scratch_root:
+                    eval_dir.mkdir()
+                work = evaluation_scratch_dir(eval_dir) or eval_dir
+                (work / "sim.ms").mkdir(parents=True)
+                (work / "simulate.stderr.log").write_text("Traceback")
+                salvage_evaluation_logs(eval_dir)
+                assert (eval_dir / "simulate.stderr.log").read_text() == "Traceback"
+                if scratch_root:
+                    assert not (eval_dir / "sim.ms").exists() and not work.exists()
+            os.environ.pop("NS_SCRATCH_DIR", None)
+    finally:
+        drain_record_writes(timeout=0)
+        os.environ.pop("NS_SCRATCH_DIR", None)
+        os.environ.pop("NS_RETAIN_FLUSH_SECONDS", None)
+        _HELD.clear()
+        _PUBLISHING.clear()
+        IMAGE_KEEP_ENDS = saved[0]
+        if saved[1] is None:
+            os.environ.pop("NS_KEEP_DETAIL_EVERY", None)
+        else:
+            os.environ["NS_KEEP_DETAIL_EVERY"] = saved[1]
+        _LOWEST.clear()
+        _HIGHEST.clear()
+    print("streaming retention self-check passed")
 
 
 _SIMULATE_WORKERS: dict[str, "FifoWorker"] = {}
@@ -1853,6 +3784,7 @@ class FifoWorker:
         # same order serve() uses - request pipe first, reply pipe second.
         self.stdout = reply_path.open("r")
         self.base = base
+        self.fresh = True
 
     def terminate(self) -> None:
         """Let go of both ends.
@@ -1889,8 +3821,33 @@ def _forget(workers: dict[str, "FifoWorker"], key: str) -> None:
 
 # The pools come up alongside the ranks: a SIF to start, torch or Timba to
 # import, and on a cluster node every rank's worker doing it off the same
-# filesystem at once. A missing pool is only ever paid for in full.
-POOL_CONNECT_SECONDS = 60.0
+# filesystem at once. A missing pool is only ever paid for in full. A worker
+# opens its FIFO only after its warm-up, and on a 112-rank CSD3 node all of them
+# warm up at once, after every restart too: 60s was not enough (E5, E8 in
+# docs/csd3-experiments.md), and a rank that gives up aborts the whole run.
+POOL_CONNECT_SECONDS = float(os.environ.get("NS_POOL_CONNECT_SECONDS", "300"))
+# Added to a newly connected worker's first reply bound, for the same reason:
+# the bounds below are sized for a warm worker on a quiet node.
+WORKER_FIRST_REPLY_SLACK = float(os.environ.get("NS_WORKER_FIRST_REPLY_SLACK", "120"))
+# A reconnect - this rank has had a worker on these FIFOs - gives up this soon
+# once the pid file names a dead worker nothing has replaced. A live pool's
+# loop rewrites it the moment it spawns one, so only a pool that is gone (its
+# process group killed) leaves it dead. Without this a dead pool cost each
+# rank the whole POOL_CONNECT_SECONDS before the retry that restores it.
+POOL_GONE_SECONDS = float(os.environ.get("NS_POOL_GONE_SECONDS", "30"))
+_CONNECTED_BASES: set[str] = set()
+
+
+def _pid_file_dead(base: Path) -> str | None:
+    """The pid file's contents if they name a process that is gone, else None."""
+    try:
+        text = Path(f"{base}.pid").read_text()
+        os.kill(int(text), 0)
+    except ProcessLookupError:
+        return text
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
@@ -1899,18 +3856,123 @@ def _connect_shell_started_worker(fifo_dir_var: str) -> FifoWorker | None:
     if not fifo_dir:
         return None
     base = Path(fifo_dir) / str(mpi_rank())
+    reconnect = str(base) in _CONNECTED_BASES
     # Nonblocking open returns ENXIO until the worker opens its end.
     deadline = time.monotonic() + POOL_CONNECT_SECONDS
+    # The pid file is on Lustre, so it is read once a second, not per poll.
+    next_pid_check, dead_pid, dead_since = 0.0, None, 0.0
     while True:
         try:
             write_fd = os.open(f"{base}.in", os.O_WRONLY | os.O_NONBLOCK)
         except OSError:
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 return None
+            if reconnect and now >= next_pid_check:
+                next_pid_check = now + 1.0
+                dead = _pid_file_dead(base)
+                if dead is None or dead != dead_pid:
+                    dead_pid, dead_since = dead, now
+                elif now - dead_since > POOL_GONE_SECONDS:
+                    return None
             time.sleep(0.002)
             continue
+        _CONNECTED_BASES.add(str(base))
         os.set_blocking(write_fd, True)
+        if _PINNED_CPU is not None:
+            # The pool loop writes the pid at spawn, before the worker's warm-up
+            # opens the FIFO, so it is this worker's. Forks inherit it.
+            try:
+                os.sched_setaffinity(int(Path(f"{base}.pid").read_text()), {_PINNED_CPU})
+            except (OSError, ValueError):
+                pass
         return FifoWorker(write_fd, Path(f"{base}.out"), base)
+
+
+# A rank and its workers take turns - it waits while they run - so sharing one
+# CPU costs nothing, and keeps the MS the simulator just wrote in that core's
+# cache for WSClean. Left to the scheduler on a 36-rank CSD3 node they wander:
+# steady evals/s 99.7-117.0 unpinned against 121.5-131.8 pinned (round 16 of
+# docs/csd3-speed.md). The CPU is claimed with a lock held for the rank's
+# life, so two searches sharing one allocation never pin onto the same one.
+_PINNED_CPU: int | None = None
+_UNPINNED_CPUS: list[int] = []
+
+
+def pin_rank_cpu() -> int | None:
+    """Claim a CPU for this rank and its workers, or None if there are too few."""
+    global _PINNED_CPU, _UNPINNED_CPUS
+    import fcntl
+
+    if not hasattr(os, "sched_setaffinity"):  # macOS
+        return None
+    cpus = sorted(os.sched_getaffinity(0))
+    ranks = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "0"))
+    if os.environ.get("NS_PIN_CPUS", "1") == "0" or not 0 < ranks <= len(cpus):
+        return None
+    start = mpi_rank() % len(cpus)
+    for cpu in cpus[start:] + cpus[:start]:
+        try:
+            fd = os.open(f"/dev/shm/ri-cpu-{cpu}.lock", os.O_RDWR | os.O_CREAT, 0o666)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        # fd stays open: the lock is released when this rank exits.
+        os.sched_setaffinity(0, {cpu})
+        _PINNED_CPU, _UNPINNED_CPUS = cpu, cpus
+        return cpu
+    return None
+
+
+def _process_tree_tids(pid: int | str) -> list[int]:
+    """Every thread of `pid` and of its descendants."""
+    tids, pending = [], [str(pid)]
+    while pending:
+        for task in Path(f"/proc/{pending.pop()}/task").glob("*"):
+            tids.append(int(task.name))
+            try:
+                pending.extend((task / "children").read_text().split())
+            except OSError:
+                pass
+    return tids
+
+
+def _set_tree_affinity(pid: int | str, cpus: set[int]) -> None:
+    for tid in _process_tree_tids(pid):
+        try:
+            os.sched_setaffinity(tid, cpus)
+        except OSError:
+            pass
+
+
+# On a whole node each R2D2 worker sits on one socket (r2d2_serve.enter_node),
+# but mpirun binds its rank to a socket by its own rule, the far one for about
+# half of them, and the simulate worker floats across both: each read what the
+# other wrote from the far socket's memory. Two socket-bound searches ran +9%
+# over one whole-node search (round 176).
+def follow_r2d2_worker_node(r2d2_image: str, meqtrees_image: str) -> set[int] | None:
+    """Move this rank and its simulate worker onto its R2D2 worker's CPUs."""
+    r2d2, simulate = _R2D2_WORKERS.get(r2d2_image), _SIMULATE_WORKERS.get(meqtrees_image)
+    if r2d2 is None or not hasattr(os, "sched_setaffinity") or os.environ.get("NS_PIN_CPUS", "1") == "0":
+        return None
+    try:
+        cpus = os.sched_getaffinity(int(Path(f"{r2d2.base}.pid").read_text()))
+    except (OSError, ValueError):
+        return None
+    # Already there, or a worker free to run wherever this rank may: stay put.
+    if cpus >= os.sched_getaffinity(0):
+        return None
+    _set_tree_affinity(os.getpid(), cpus)
+    if simulate is not None:
+        try:
+            _set_tree_affinity(Path(f"{simulate.base}.pid").read_text().strip(), cpus)
+        except OSError:
+            pass
+    return cpus
 
 
 def simulate_worker(meqtrees_image: str, platform: str) -> FifoWorker:
@@ -2004,8 +4066,9 @@ def simulate_worker_request(
         if not worker_send(worker.stdin, json.dumps(request) + "\n"):
             _forget(_SIMULATE_WORKERS, meqtrees_image)
             continue
-        reply = worker_reply(worker.stdout, reply_timeout)
+        reply = worker_reply(worker.stdout, reply_timeout + (WORKER_FIRST_REPLY_SLACK if getattr(worker, "fresh", False) else 0))
         if reply:
+            worker.fresh = False
             return int(json.loads(reply)["returncode"])
         if reply is None:
             worker.kill()
@@ -2023,10 +4086,15 @@ def simulate_measurement_set(
     eval_dir: Path,
     meqtrees_image: str,
     platform: str,
+    r2d2_mat: bool = False,
 ) -> tuple[Path, list[str], subprocess.CalledProcessError | None]:
-    eval_dir.mkdir(parents=True, exist_ok=False)
     scratch = evaluation_scratch_dir(eval_dir)
-    if scratch is not None:
+    if scratch is None:
+        eval_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        # The eval dir on Lustre is left to whatever first writes into it
+        # (the record writer, or publishing a kept evaluation): one slow
+        # metadata call there used to stall every rank (csd3-speed.md, round 14).
         # A restart that re-runs an evaluation whose scratch survived would hit
         # require_clean_output() in the simulator; the run owns this directory,
         # so clearing it is safe and normally costs an ENOENT.
@@ -2034,15 +4102,16 @@ def simulate_measurement_set(
 
         shutil.rmtree(scratch, ignore_errors=True)
         scratch.mkdir(parents=True)
-    ms_path = (scratch or eval_dir) / "sim.ms"
+    work = scratch or eval_dir
+    ms_path = work / "sim.ms"
     n_times = evaluation_time_samples(params)
-    sim_stdout = eval_dir / "simulate.stdout.log"
-    sim_stderr = eval_dir / "simulate.stderr.log"
+    sim_stdout = work / "simulate.stdout.log"
+    sim_stderr = work / "simulate.stderr.log"
     sim_cmd = [
         "--output-ms",
         str(ms_path),
         "--metadata-json",
-        str(eval_dir / "simulation.json"),
+        str(work / "simulation.json"),
         "--vla-config",
         params["vla_config"],
         "--observation-minutes",
@@ -2055,17 +4124,17 @@ def simulate_measurement_set(
         str(params["channel_width_hz"]),
         "--source-flux-jy",
         str(params["source_flux_jy"]),
-        "--source-l-arcsec",
-        str(params["source_l_arcsec"]),
-        "--source-m-arcsec",
-        str(params["source_m_arcsec"]),
+        # `=` because argparse reads a separate "-7.4e-06" as an option, not a value.
+        f"--source-l-arcsec={params['source_l_arcsec']}",
+        f"--source-m-arcsec={params['source_m_arcsec']}",
+        # Positional, not repr: nargs=2 takes no `=`, and argparse reads only
+        # exponent-free negatives as values.
         *(
             arg
             for l_arcsec, m_arcsec in extra_source_offsets_arcsec(params)
-            for arg in ("--extra-source-arcsec", str(l_arcsec), str(m_arcsec))
+            for arg in ("--extra-source-arcsec", *(np.format_float_positional(v, trim="-") for v in (l_arcsec, m_arcsec)))
         ),
-        "--declination-deg",
-        str(params["declination_deg"]),
+        f"--declination-deg={params['declination_deg']}",
         "--integration-seconds",
         str(params["integration_seconds"]),
         "--dynamic-range",
@@ -2078,36 +4147,29 @@ def simulate_measurement_set(
         # rather than by two constants in two images agreeing.
         "--predict-wait-seconds",
         str(predict_wait_seconds(n_times)),
+        "--observation-horizon-minutes",
+        str(observation_horizon_minutes()),
     ]
+    if r2d2_mat:
+        # Written by the simulate request itself, beside the MS: a separate
+        # convert request re-read the MS for 25ms typical, 170ms heavy (round 13).
+        sim_cmd += ["--mat-path", str(work / "r2d2_data.mat")]
+        # R2D2 reads only the .mat, so no MS is built unless one is being kept
+        # (round 21: -25ms of a 75ms stage at 36 ranks, the .mat byte-identical).
+        if os.environ.get("NS_KEEP_MEASUREMENT_SETS", "0") == "0":
+            sim_cmd.append("--mat-only")
     returncode = simulate_worker_request(
         meqtrees_image,
         platform,
         {"argv": sim_cmd, "stdout": str(sim_stdout), "stderr": str(sim_stderr)},
         sim_stderr,
-        reply_timeout=simulate_reply_timeout(n_times),
+        # A miss builds the observation at the horizon, so that is the length to wait on.
+        reply_timeout=simulate_reply_timeout(
+            max(n_times, evaluation_time_samples({**params, "observation_minutes": observation_horizon_minutes()}))),
     )
     if returncode != 0:
         return ms_path, sim_cmd, subprocess.CalledProcessError(returncode, sim_cmd)
     return ms_path, sim_cmd, None
-
-
-def convert_ms_to_mat(
-    argv: list[str],
-    eval_dir: Path,
-    meqtrees_image: str,
-    platform: str,
-) -> int:
-    return simulate_worker_request(
-        meqtrees_image,
-        platform,
-        {
-            "action": "convert",
-            "argv": argv,
-            "stdout": str(eval_dir / "convert.stdout.log"),
-            "stderr": str(eval_dir / "convert.stderr.log"),
-        },
-        eval_dir / "convert.stderr.log",
-    )
 
 
 def cube_like_from_theta(theta: np.ndarray) -> np.ndarray:
@@ -2130,6 +4192,42 @@ def prior_vector(cube: np.ndarray, params: dict[str, Any]) -> np.ndarray:
         [params[spec["name"]] if spec["name"] in params else math.log10(params["dynamic_range"]) for spec in load_parameter_space()],
         dtype=np.float64,
     )
+
+
+def self_check_abort_on_exception() -> None:
+    """A rank that raises aborts the job; a clean exit does not (round 348)."""
+    global abort_run
+    real, aborts = abort_run, []
+    abort_run = aborts.append
+    try:
+        abort_on_exception(lambda: None)
+        assert aborts == []
+
+        def exits(code: Any) -> None:
+            raise SystemExit(code)
+
+        for code in (None, 0):
+            try:
+                abort_on_exception(lambda: exits(code))
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("a clean SystemExit was swallowed")
+        assert aborts == []
+
+        def fails() -> None:
+            raise RuntimeError("the gather failed")
+
+        abort_on_exception(fails)
+        assert len(aborts) == 1 and "the gather failed" in aborts[0], aborts
+        try:
+            abort_on_exception(lambda: exits("FATAL: bad"))
+        except SystemExit:
+            pass  # abort_run does not return; this fake one does
+        assert aborts[1:] == ["FATAL: bad"], aborts
+    finally:
+        abort_run = real
+    print("abort on exception self-check passed")
 
 
 def self_check_worker_timeout() -> None:
@@ -2231,6 +4329,7 @@ def self_check_worker_timeout() -> None:
 
 
 def self_check_worker_pool_connect() -> None:
+    global POOL_GONE_SECONDS
     import subprocess
     import tempfile
 
@@ -2281,6 +4380,20 @@ def self_check_worker_pool_connect() -> None:
                         pass
                     assert time.monotonic() < deadline, "the worker's child survived kill()"
                     time.sleep(0.02)
+            # The pool gone with it: a reconnect gives up once the dead pid has
+            # gone unreplaced for POOL_GONE_SECONDS, not POOL_CONNECT_SECONDS.
+            for worker in workers:
+                worker.terminate()
+            for fd in ends:
+                os.close(fd)
+            ends = []
+            saved_gone, POOL_GONE_SECONDS = POOL_GONE_SECONDS, 0.5
+            try:
+                started = time.monotonic()
+                assert _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR") is None
+                assert time.monotonic() - started < 10, time.monotonic() - started
+            finally:
+                POOL_GONE_SECONDS = saved_gone
             # No pool at all is a WorkerDied, not a rank-started fallback.
             _SIMULATE_WORKERS.pop("meqtrees-self-check", None)
             del os.environ["NS_SIMULATE_FIFO_DIR"]
@@ -2304,11 +4417,113 @@ def self_check_worker_pool_connect() -> None:
     print("worker pool connect self-check passed")
 
 
+def self_check_cpu_pinning() -> None:
+    global _PINNED_CPU
+    import subprocess
+    import tempfile
+
+    if not hasattr(os, "sched_setaffinity"):
+        print("cpu pinning self-check skipped (no sched_setaffinity)")
+        return
+    allowed = os.sched_getaffinity(0)
+    if len(allowed) < 2:
+        print("cpu pinning self-check skipped (one CPU)")
+        return
+    original = dict(os.environ)
+    stand_in = subprocess.Popen(["sleep", "30"])
+    claims = []
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "0"
+            os.mkfifo(f"{base}.in")
+            os.mkfifo(f"{base}.out")
+            ends = [os.open(f"{base}.in", os.O_RDWR), os.open(f"{base}.out", os.O_RDWR)]
+            Path(f"{base}.pid").write_text(f"{stand_in.pid}\n")
+            os.environ.update(OMPI_COMM_WORLD_RANK="0", OMPI_COMM_WORLD_SIZE="2", NS_SIMULATE_FIFO_DIR=tmp)
+            # Two claims from one process are two lock holders, as two ranks
+            # are: the second must not take the first one's CPU.
+            for _ in range(2):
+                _PINNED_CPU = None
+                os.sched_setaffinity(0, allowed)
+                claims.append(pin_rank_cpu())
+            assert None not in claims and claims[0] != claims[1], claims
+            assert os.sched_getaffinity(0) == {claims[1]}
+            write_records_in_background()
+            assert _RECORD_WRITER.submit(os.sched_getaffinity, 0).result() == allowed
+            drain_record_writes(flush_held=False)
+            worker = _connect_shell_started_worker("NS_SIMULATE_FIFO_DIR")
+            assert worker is not None
+            assert os.sched_getaffinity(stand_in.pid) == {claims[1]}, os.sched_getaffinity(stand_in.pid)
+            worker.stdin.close()
+            worker.stdout.close()
+            for fd in ends:
+                os.close(fd)
+            # More ranks than CPUs: no pinning at all, rather than two on one.
+            _PINNED_CPU = None
+            os.sched_setaffinity(0, allowed)
+            os.environ["OMPI_COMM_WORLD_SIZE"] = str(len(allowed) + 1)
+            assert pin_rank_cpu() is None and _PINNED_CPU is None
+    finally:
+        _PINNED_CPU = None
+        os.sched_setaffinity(0, allowed)
+        os.environ.clear()
+        os.environ.update(original)
+        stand_in.kill()
+        stand_in.wait()
+    print("cpu pinning self-check passed")
+
+
+def self_check_follow_worker_node() -> None:
+    import signal
+    import subprocess
+    import tempfile
+    from types import SimpleNamespace
+
+    allowed = os.sched_getaffinity(0) if hasattr(os, "sched_setaffinity") else set()
+    if len(allowed) < 2:
+        print("worker node following self-check skipped")
+        return
+    node = set(sorted(allowed)[: len(allowed) // 2])
+    r2d2 = subprocess.Popen(["sleep", "30"])
+    # A shell with a child: the simulate worker's whole tree must move.
+    simulate = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], start_new_session=True)
+    side = threading.Thread(target=time.sleep, args=(1,))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "r.pid").write_text(f"{r2d2.pid}\n")
+            Path(tmp, "s.pid").write_text(f"{simulate.pid}\n")
+            _R2D2_WORKERS["r"], _SIMULATE_WORKERS["m"] = SimpleNamespace(base=Path(tmp, "r")), SimpleNamespace(base=Path(tmp, "s"))
+            # A worker that may run anywhere this rank may: nothing moves.
+            assert follow_r2d2_worker_node("r", "m") is None and os.sched_getaffinity(0) == allowed
+            os.sched_setaffinity(r2d2.pid, node)
+            deadline = time.monotonic() + 5
+            while not Path(f"/proc/{simulate.pid}/task/{simulate.pid}/children").read_text().split():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            side.start()
+            # mpirun bound this rank to the other socket: it moves anyway.
+            _set_tree_affinity(os.getpid(), allowed - node)
+            os.sched_setaffinity(r2d2.pid, node)  # a child here, so it moved too
+            assert follow_r2d2_worker_node("r", "m") == node
+            assert os.sched_getaffinity(0) == node and os.sched_getaffinity(side.native_id) == node
+            assert all(os.sched_getaffinity(tid) == node for tid in _process_tree_tids(simulate.pid))
+            assert len(_process_tree_tids(simulate.pid)) >= 2
+    finally:
+        _R2D2_WORKERS.pop("r", None)
+        _SIMULATE_WORKERS.pop("m", None)
+        _set_tree_affinity(os.getpid(), allowed)
+        os.killpg(simulate.pid, signal.SIGKILL)
+        for process in (r2d2, simulate):
+            process.kill()
+            process.wait()
+    print("worker node following self-check passed")
+
+
 def self_check_parameter_space() -> None:
     for spec in load_all_parameter_specs():
         assert "default" in spec, spec
     specs = load_parameter_space()
-    assert len(specs) == 6, specs
+    assert len(specs) == sum(spec.get("enabled", True) for spec in load_all_parameter_specs()), specs
     for spec in specs:
         assert spec["name"] in PARAMETER_TEX_LABELS, spec
         assert float(spec["min"]) < float(spec["max"]), spec
@@ -2505,10 +4720,13 @@ def self_check_source_offset() -> None:
     # only the sign and non-zero-ness of the offset are pinned here. Forced on
     # rather than read from defaults.toml: this dimension is toggled off and on
     # between runs, and the arithmetic above it still has to be right on the
-    # runs that enable it.
+    # runs that enable it. The other representation is forced off each time,
+    # since the two must not be enabled together.
     saved_on = os.environ.get("NS_ENABLE_PARAMS")
+    saved_off = os.environ.get("NS_DISABLE_PARAMS")
     try:
         os.environ["NS_ENABLE_PARAMS"] = "source_offset_fraction"
+        os.environ["NS_DISABLE_PARAMS"] = "source_l_pixels,source_m_pixels"
         load_parameter_space.cache_clear()
         n = len(load_parameter_space())
         params = cube_to_params(np.full(n, 0.5))
@@ -2517,6 +4735,7 @@ def self_check_source_offset() -> None:
         # The cartesian axes land the source on the pixel they name: the box
         # is symmetric about 0, so cube 0.5 is the centre and 1.0 the maximum.
         os.environ["NS_ENABLE_PARAMS"] = "source_l_pixels,source_m_pixels"
+        os.environ["NS_DISABLE_PARAMS"] = "source_offset_fraction"
         load_parameter_space.cache_clear()
         specs = load_parameter_space()
         n = len(specs)
@@ -2573,10 +4792,11 @@ def self_check_source_offset() -> None:
             for clear in (image_dim, load_all_parameter_specs, load_parameter_space):
                 clear.cache_clear()
     finally:
-        if saved_on is None:
-            os.environ.pop("NS_ENABLE_PARAMS", None)
-        else:
-            os.environ["NS_ENABLE_PARAMS"] = saved_on
+        for var, saved in (("NS_ENABLE_PARAMS", saved_on), ("NS_DISABLE_PARAMS", saved_off)):
+            if saved is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = saved
         load_parameter_space.cache_clear()
     print("source offset self-check passed")
 
@@ -2696,6 +4916,75 @@ def self_check_fits_reader() -> None:
     assert header["CRPIX1"] == 4.0 and header["CRPIX2"] == 5.0
     assert header["SIMPLE"] is True
     assert int(header["NAXIS"]) == int(expected_header["NAXIS"])
+
+
+def self_check_evidence_record() -> None:
+    """The summary's evidence block reads PolyChordOutput's fields, and an
+    output without them (an older pypolychord returned None) records None."""
+    from types import SimpleNamespace
+
+    output = SimpleNamespace(logZ=-12.5, logZerr=0.25, ndead=300, nlike=4567)
+    assert evidence_record(output) == {"log_z": -12.5, "log_z_err": 0.25, "ndead": 300, "nlike": 4567}
+    assert evidence_record(None) is None
+    print("evidence record reads log(Z) from PolyChordOutput")
+
+
+def polychord_nfail(nlive: int, ranks: int | None = None) -> int:
+    """PolyChord's consecutive-failed-replacement limit, raised by the workers.
+
+    Its default is nlive, and every async chain still running when the
+    contour passes its seed comes back unplaceable, so with more workers than
+    nlive the first wave alone tripped it: PolyChord stopped after the prior
+    with exit 0 and a meaningless log(Z) (round 337: 4 nodes, 155 workers,
+    nlive 150; round 339: WSClean, nlive 8 on 30 ranks). Below that the guard never fires, so results are unchanged.
+    """
+    if ranks is None:
+        from mpi4py import MPI
+
+        ranks = MPI.COMM_WORLD.Get_size()
+    return nlive + max(ranks - 1, 0)
+
+
+def self_check_polychord_nfail() -> None:
+    assert polychord_nfail(150, 156) == 305
+    assert polychord_nfail(150, 1) == 150
+    print("OK: PolyChord's nfail covers every async worker")
+
+
+def self_check_polychord_finish() -> None:
+    """PolyChordFinish's answers end a slice_sample (chordal_sampling.f90,
+    PolyChordLite 370f6af) within three calls, wherever in it they start and
+    however many of its points fall outside the cube, so a worker never
+    reaches the 101-step shrink limit and its 'Non deterministic' warning."""
+    import random
+
+    logzero, contour = -1e30, -1.0
+    rng = random.Random(81)
+    for stop_at in range(1, 40):
+        for outside in (0.0, 0.3, 0.7):
+            finish, calls = PolyChordFinish.__new__(PolyChordFinish), [0]
+            finish.skipped = 0
+
+            def point() -> float:
+                if rng.random() < outside:
+                    return logzero  # calculate_point: outside the cube, no likelihood call
+                calls[0] += 1
+                return finish.discarded() if calls[0] >= stop_at else 0.0  # a real point inside the contour
+
+            for _ in range(15):
+                right, left = point(), point()
+                while right >= contour and right > logzero:
+                    right = point()
+                while left >= contour and left > logzero:
+                    left = point()
+                for _ in range(101):
+                    baby = point()
+                    if baby >= contour and baby > logzero:
+                        break
+                else:
+                    raise AssertionError(f"shrink hit its limit (stop at call {stop_at}, outside {outside})")
+            assert finish.skipped <= 3 * 15, finish.skipped
+    print("polychord finish answers end each slice_sample within three calls")
 
 
 def self_check_lazy_numpy() -> None:
@@ -2917,12 +5206,12 @@ def self_check_profiling() -> None:
     assert mpi["worker_seconds_budget"] == 30.0  # not 40.0: rank 0 is not a worker
     assert abs(mpi["subtotal_share"] - 0.65) < 1e-9
     assert abs(mpi["remainder_rows"][0]["seconds"] - 10.5) < 1e-9
-    assert mpi["rows"][0]["label"] == "simulate (MeqTrees)"
+    assert mpi["rows"][0]["label"] == "simulate (visibilities + noise)"
 
     oversubscribed = profiling_breakdown(summarize_profiling(evaluations, total_wall_seconds=1.0, mpi_procs=2))
     assert oversubscribed["worker_seconds_budget"] == 19.5
     assert oversubscribed["remainder_rows"][0]["seconds"] == 0.0
-    assert oversubscribed["rows"][0]["label"] == "simulate (MeqTrees)"
+    assert oversubscribed["rows"][0]["label"] == "simulate (visibilities + noise)"
 
     for unsplit in (serial, mpi):
         assert [row["label"] for row in unsplit["remainder_rows"]] == [UNACCOUNTED_LABEL]

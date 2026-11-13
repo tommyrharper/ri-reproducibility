@@ -45,12 +45,15 @@ def slurm_job_names() -> set[str]:
 
 
 def read_run_env(run_dir: Path) -> dict[str, str]:
-    try:
-        text = (run_dir / "run.env").read_text()
-    except OSError:
-        return {}
-    return {name.strip(): raw.strip().strip("'").replace("'\\''", "'")
-            for name, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line)}
+    """run.env, or before the job has written it, the settings it was submitted with."""
+    for name in ("run.env", SUBMITTED_SETTINGS):
+        try:
+            text = (run_dir / name).read_text()
+        except OSError:
+            continue
+        return {key.strip().removeprefix("export ").strip(): raw.strip().strip("'").replace("'\\''", "'")
+                for key, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line)}
+    return {}
 
 
 def read_parameter_space(run_dir: Path) -> list[dict[str, object]]:
@@ -125,21 +128,72 @@ def default_parameter_space() -> list[dict[str, object]]:
         return []
 
 
+def summary_evaluation_count(run_dir: Path) -> int | None:
+    """The run's own count, out of summary.json's head, or None if absent.
+
+    A converged run holds one directory per evaluation - 71k of them after six
+    hours - and stat-ing them all took `./ri runs` past ten minutes on Lustre.
+    Summaries written before this field fall back to the scan below."""
+    try:
+        with open(run_dir / "summary.json", encoding="utf-8", errors="replace") as f:
+            head = f.read(SUMMARY_HEAD)
+    except OSError:
+        return None
+    if (bulk := head.find('"evaluations"')) > 0:
+        head = head[:bulk]
+    match = re.search(r'"evaluation_count"\s*:\s*(\d+)', head)
+    return int(match.group(1)) if match else None
+
+
+def logged_evaluation_count(run_dir: Path) -> int | None:
+    """Scored evaluations from the run's own log, or None if it has none yet.
+
+    One line per scored evaluation, so one sequential read against a stat per
+    evaluation directory: 214s of stats over 13k evaluations on Lustre, where
+    the log is milliseconds. Matched the directory scan exactly on the 13k and
+    71k runs it was measured against."""
+    try:
+        with open(run_dir / "run.log", "rb") as log:
+            return sum(1 for line in log if b'"eval_id"' in line)
+    except OSError:
+        return None
+
+
 def count_evaluations(run_dir: Path) -> int:
     """How many evaluations this run has actually scored.
 
     os.scandir rather than Path.glob: this is the busiest loop in a listing -
     one stat per evaluation directory, thousands of them on a long run - and
     glob spends as much again building a Path for every entry it walks."""
+    counted = summary_evaluation_count(run_dir)
+    if counted is None:
+        counted = logged_evaluation_count(run_dir)
+    if counted is not None:
+        return counted
     try:
+        # Records are eval-*.json (round 92) or, before, eval-*/metrics.json;
+        # a kept evaluation's dir sits beside its record, so count names.
         with os.scandir(run_dir / "evaluations") as entries:
-            return sum(1 for e in entries if e.name.startswith("eval-")
-                       and os.path.exists(os.path.join(e.path, "metrics.json")))
+            names = {e.name.removesuffix(".json") for e in entries if e.name.startswith("eval-")
+                     and (e.name.endswith(".json")
+                          or os.path.exists(os.path.join(e.path, "metrics.json")))}
     except OSError:  # no evaluations directory yet
         return 0
+    # And those a resume packed into records.jsonl (round 93), a name a line,
+    # or a multi-node run appended to its records.<host>.jsonl (round 290).
+    for path in [*(run_dir / "evaluations").glob("records.*.jsonl"), run_dir / "evaluations" / "records.jsonl"]:
+        try:
+            with open(path, "rb") as pack:
+                names.update(line.partition(b"\t")[0].decode(errors="replace")
+                             for line in pack if line.endswith(b"\n"))
+        except OSError:
+            pass
+    return len(names)
 
 
-RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
+# Written by slurm.sh at submission, before the job starts: a queued run has only this.
+SUBMITTED_SETTINGS = ".job-settings.env"
+RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains", SUBMITTED_SETTINGS)
 
 
 def summary_is_complete(run_dir: Path) -> bool:
@@ -216,10 +270,13 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     evaluations = count_evaluations(run_dir)
     complete = summary_is_complete(run_dir)
     resumable = any((run_dir / "chains").glob("*.resume"))
+    submitted_only = not any((run_dir / a).exists() for a in RUN_ARTIFACTS if a != SUBMITTED_SETTINGS)
     if complete:
         status = "complete"
     elif str(run_dir.resolve()) in running:
-        status = "running"
+        status = "queued" if submitted_only else "running"
+    elif submitted_only:
+        status = "not started"
     else:
         status = "resumable" if resumable else "incomplete"
     started = started_at(run_dir)
@@ -259,9 +316,11 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = find_runs()
     live = [r for r in runs if r["status"] == "running"]
-    unfinished = [r for r in runs if r["status"] not in ("complete", "running")]
+    queued = [r for r in runs if r["status"] == "queued"]
+    never = [r for r in runs if r["status"] == "not started"]
+    unfinished = [r for r in runs if r["status"] in ("resumable", "incomplete")]
     if args.incomplete:
-        runs = unfinished
+        runs = unfinished + never
 
     if args.json:
         print(json.dumps(runs, indent=2))
@@ -287,6 +346,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{len(live)} run{'' if len(live) == 1 else 's'} still going. Check on it with:")
         for run in live:
             print(f"  ./ri health {run['name']}")
+    if queued:
+        print(f"\n{len(queued)} run{'' if len(queued) == 1 else 's'} waiting for Slurm to start "
+              f"{'it' if len(queued) == 1 else 'them'}; `./ri health` works once it starts.")
+    if never:
+        print(f"\n{len(never)} run{'' if len(never) == 1 else 's'} submitted but never started "
+              "(no job in the queue). Submit again with ./ri search, or delete:")
+        for run in never:
+            print(f"  rm -r {run['path']}")
     if unfinished:
         count = len(unfinished)
         print(f"\n{count} run{'' if count == 1 else 's'} stopped before finishing.")
@@ -329,6 +396,12 @@ def self_check() -> None:
             score(stopped / "evaluations" / "eval-0001-b")
             score(stopped / "evaluations" / "eval-0002-c")
             (stopped / "evaluations" / "eval-0003-d").mkdir()
+            # A round-92 record, with the dir of what it keeps beside it: one.
+            (stopped / "evaluations" / "eval-0004-e.json").write_text("{}")
+            (stopped / "evaluations" / "eval-0004-e").mkdir()
+            # Packed (round 93): one also a file, one only packed, one torn.
+            (stopped / "evaluations" / "records.jsonl").write_text(
+                'eval-0004-e\t{}\neval-0005-f\t{}\neval-0006-g\t{"ev')
             (stopped / "chains").mkdir()
             (stopped / "chains" / "wsclean_vlaa.resume").write_text("")
             (stopped / "run.env").write_text(
@@ -341,7 +414,7 @@ def self_check() -> None:
             runs = {r["name"]: r for r in find_runs(running=set())}
             assert runs[done.name]["status"] == "complete", runs[done.name]
             assert runs[stopped.name]["status"] == "resumable", runs[stopped.name]
-            assert runs[stopped.name]["evaluations"] == 2, runs[stopped.name]
+            assert runs[stopped.name]["evaluations"] == 4, runs[stopped.name]
             assert runs[stopped.name]["algorithm"] == "wsclean"
             assert runs[stopped.name]["settings"]["NS_METRIC"] == "total_rms_jy - snr"
             assert runs[stopped.name]["settings"]["NS_MPI_PROCS"] == "7"
@@ -349,6 +422,23 @@ def self_check() -> None:
                 {"name": "channel_count", "min": 1, "max": 8, "kind": "integer"}]
             # A recorded box is never relabelled as borrowed.
             assert runs[stopped.name]["parameter_space_from_defaults"] is False
+
+            # Submitted but not started: slurm.sh's settings file is all there is.
+            pending = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260104T000000Z"
+            pending.mkdir()
+            (pending / SUBMITTED_SETTINGS).write_text(
+                "export NS_METRIC=total_rms_jy\nexport NS_NLIVE=500\nexport R2D2_DEVICE=cpu\n")
+            queued = {r["name"]: r for r in find_runs(running={str(pending.resolve())})}[pending.name]
+            assert queued["status"] == "queued", queued
+            assert queued["algorithm"] == "r2d2", queued
+            assert queued["settings"]["NS_NLIVE"] == "500", queued["settings"]
+            gone = {r["name"]: r for r in find_runs(running=set())}[pending.name]
+            assert gone["status"] == "not started", gone
+            # Once the job writes run.env it is running, then the usual states.
+            (pending / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_NLIVE=500\n")
+            started = {r["name"]: r for r in find_runs(running={str(pending.resolve())})}[pending.name]
+            assert started["status"] == "running", started
+            shutil.rmtree(pending)
 
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
             bare.mkdir()

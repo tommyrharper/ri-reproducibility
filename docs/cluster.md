@@ -47,12 +47,33 @@ unpacks into `images/.tmp` and caches under `images/.cache`, both beside the
 output, so the login node's `/tmp` and the 50GB home quota are not part of
 the story. An archive newer than its SIF is rebuilt; anything else is skipped.
 
+A SIF carries only the WSClean patches that existed when its Docker image was
+built. To bring `images/wsclean.sif` up to this tree's
+`docker/wsclean/patches/` without a Docker host, run
+`./ri images patch-wsclean` inside a compute-node job (~2 minutes with 30
+cores). It compiles WSClean in an `apptainer --fakeroot` sandbox against the
+SIF's own casacore, layers the result over the SIF, and keeps the old one as
+`wsclean.sif.orig`. The derived SIF keeps the old `ri.build-inputs` label and
+adds `ri.wsclean-patches` (a hash of the patches), and its image id in
+`run.env` and `benchmarks.jsonl` is the old one plus `+p` and the first 12
+characters of that hash, so bench never pools the two. When `wsclean.sif` matches neither label to this tree, a WSClean search warns on
+the login node, and its job builds the same layer once into
+`$RI_WORK_DIR/.cache/ri/wsclean-<base id>-p<patches hash>.sif` (~2 minutes
+with the job's CPUs), uses it, and every later run reuses it; the shared SIF
+is not touched, a failed build falls back to it, and `NS_PATCH_WSCLEAN=0`
+skips the step (round 94: +50% evals/s, chains byte-identical). On today's code the
+upgrade from the shipped 0001-0006 SIF to 0001-0016 is worth +42% evals/s in a
+17-rank search (binary 193 -> 126 ms, chains byte-identical). See
+[csd3-speed](csd3-speed.md), rounds 43, 70 and 71.
+
 ## Where things live on CSD3
 
 | what | where | why |
 | --- | --- | --- |
 | this checkout, `images/`, `results/` | `/rds/user/<crsid>/hpc-work/ri-reproducibility` | Lustre, 1TB, shared by every node; home is 50GB NFS, and CSD3 asks that jobs do no I/O there - a run writes `results/`, its FIFOs and `benchmarks.jsonl` under the checkout, so a checkout in `~` is the wrong place |
 | in-flight Measurement Sets (`NS_SCRATCH_DIR`) | `/dev/shm` on the node | same as on main; nodes have 256GB+ |
+| makems observations kept across runs (`NS_OBSERVATION_CACHE_DIR`) | `hpc-work/.cache/ri/ms-observations/<meqtrees image id>` | up to 183MB per image; saves ~0.33s/eval ([csd3-speed.md](csd3-speed.md), round 6) |
+| a host-built `fastnoise.so` for a `meqtrees.sif` without one (`NS_FASTNOISE_DIR`) | `hpc-work/.cache/ri/fastnoise/<hash of source + gcc>` | ~20ms/eval of simulate ([csd3-speed.md](csd3-speed.md), round 42); like the row above, under `RI_WORK_DIR` (else the checkout's parent) even with `NS_JOB_ENV=0` |
 | a job's `uv`, uv's Pythons (which `.venv` points into), `XDG_CACHE_HOME`, `HOME` | `hpc-work/.local/bin`, `hpc-work/.local/share/uv/python`, `hpc-work/.cache`, `hpc-work/.ri-job/home` | a job runs nothing from `/home` (below) |
 | worker FIFOs | inside the run directory, as on main | one node per run, so a FIFO on Lustre is local to its readers |
 
@@ -132,9 +153,11 @@ bash scripts/lib/job-env.sh --check                       # the job's environmen
 would hand it, and says `nothing resolves into /home or a Nix store` or what
 does. `bash scripts/lib/job-env.sh --self-check` tests the check itself.
 
-Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive
---mem 0`) and the run script sizes the ranks from the allocation; with it the
-job asks for that many cores and the matching memory. `--partition` defaults
+Sizing: without `--mpi-procs` the job takes a whole node (`--exclusive`;
+CSD3 refuses `--mem 0`) and the run script sizes the ranks from the allocation; with it the
+job asks for that many cores and the matching memory. A CPU R2D2 job then
+runs one rank more than its cores, for PolyChord's root, which never
+evaluates (round 253; `NS_R2D2_ROOT_RANK_EXTRA=0` runs exactly `--mpi-procs`). `--partition` defaults
 to `icelake` and `--time` to `12:00:00`, the SL3 cap, which every service
 level accepts; SL1/SL2 accounts can pass `--time 36:00:00`, their own cap,
 and a limit above your level is refused by sbatch. Both, and anything
@@ -142,6 +165,44 @@ else sbatch accepts, can also be set through sbatch's own `SBATCH_*` variables
 (`SBATCH_QOS`, `SBATCH_RESERVATION`, ...). `NS_SBATCH=0` forces a run in
 place. A failed submission (a bad account, say) removes the claimed directory
 again.
+
+`./ri search r2d2 --nodes N` (CPU only, `NS_NODES`) spreads one search over N
+whole nodes (`--nodes N --exclusive`), each with `--mpi-procs` ranks of its own
+(sized per node as above). The launcher's node starts the others' pools with
+an `srun` step that runs the same script as `NS_NODE_ROLE=pools`, and the ranks
+are a second `srun --mpi=pmix` step rather than the image's `mpirun`, which
+cannot reach another node. A FIFO on Lustre is a pipe on each node by itself,
+so each host's ranks and pools meet in `.r2d2-workers/<host>/` and
+`.simulate-workers/<host>/`; pool logs are in `.node-<host>/`. Only rank 0's node
+holds the chains tmpfs and its Lustre mirror. Before a retry each other node
+resets its own workers when the launcher drops a `.node-<host>/reset` file, and
+`run.env` keeps `NS_NODES`, so `./ri resume` comes back on as many nodes. Two
+icelake half-nodes ran a converged search in half the wall time of one, at 94%
+of the single-node rate per node (docs/csd3-speed.md, rounds 287-288). PolyChord
+looks for its `.resume` on every rank, so a resumed attempt copies it into each
+other node's chains tmpfs first (round 289: without that, every multi-node
+retry and resume deadlocked). Each node appends its records to its own
+`evaluations/records.<host>.jsonl`, which the finish or a resume folds into
+`records.jsonl`. Each append writes every queued line at once
+(`NS_RECORD_BATCH=1`), so a kill -9 on 2 nodes at 3,000 scored evaluations lost
+no record, and a same-job `./ri resume` clears the killed attempt's `/dev/shm`
+scratch on every node first (rounds 297-298). More nodes buy evaluations/s (4 nodes:
+3.57x one), but an async PolyChord search converges on about as many
+evaluations as one with ~0.4 x workers more live points, whatever `--nlive`
+is (rounds 293 and 307). Time to converge therefore goes as
+`nlive/workers + 0.4`, and extra nodes stop paying once workers pass a few
+times nlive: at nlive 150, 2, 4 and 8 nodes of 39 ranks converge ~1.85x,
+~3.2x and ~4.9x faster than one, and at nlive 300 ~1.9x, ~3.5x and ~6x
+(before the ~5-10% per-node rate loss). Measured on 4 nodes at nlive 150
+(rounds 337-338, three seeds), stock converged 2.72x faster than one node,
+and on 8 nodes (round 339, two seeds) 4.37x; searches with more workers than nlive need
+round 337's `nfail` fix, as before it PolyChord stopped them after the prior
+with exit 0. A larger `--nlive` does not remove the
+extra evaluations: it adds more than it saves, so raise it for precision,
+never for speed. The launcher warns when the extra share passes ~10%.
+Keep one rank per CPU on every node until the job's total ranks pass ~1.25 x
+nlive (8 nodes at nlive 150): below that, fewer ranks per node lose more
+U-Net throughput than they save in evaluations (rounds 334-335).
 
 `--qos intr` (`SBATCH_QOS`) is CSD3's interactive quality of service: the job
 skips the queue but is capped at one hour, so without `--time` the limit
@@ -173,7 +234,7 @@ the containers replaced by processes:
   that dies, or exits because its rank's end of the FIFO closed, is started
   again by the shell loop around it; the R2D2 pool forks a replacement from
   its warm parent (`serve_pool`). The rank reconnects to the same FIFOs
-  (`_connect_shell_started_worker` in `common.py`, sixty seconds' grace). A
+  (`_connect_shell_started_worker` in `common.py`, `NS_POOL_CONNECT_SECONDS`' grace, 300s; 30s once the pool itself is gone). A
   rank kills a wedged worker itself: every worker writes `<rank>.pid` beside
   its FIFOs, Apptainer shares the host's pid namespace, and
   `FifoWorker.kill()` walks `/proc` for its children, since `polychord.sif`
@@ -195,8 +256,8 @@ the containers replaced by processes:
   and carried over again.
 - **Memory sets the rank count**, as on `main`; `rank-budget.sh` reads the
   job's limit inside one (`SLURM_MEM_PER_NODE`, or `SLURM_MEM_PER_CPU` times
-  the cores, which is how a partition default is spelled; `--mem 0` means the
-  node, so `MemAvailable`) and `MemAvailable` outside one. A pool a
+  the cores, which is how a partition default and a whole-node `--exclusive` job are
+  spelled) and `MemAvailable` outside one. A pool a
   SIGKILLed run left behind is reaped by the next run's budget (the pool's
   shell names its FIFO directory, whose run has no ranks and whose launcher
   pid in `.launcher.pid` is gone).
@@ -207,7 +268,7 @@ the containers replaced by processes:
   test.
 - `run.env` and the manifests record each image as the `ri.build-inputs`
   label the Docker build stamped it with (`ns_image_id`), which the SIF
-  keeps.
+  keeps, plus a `+p<patches hash>` suffix on a `patch-wsclean-sif.sh` build.
 
 ### Being a good citizen on CSD3
 
@@ -233,6 +294,39 @@ two minutes. What here would otherwise break that:
 hand-written batch script still see it. GNU `nproc` honours it, so the run scripts count
 CPUs with it unset (`env -u OMP_NUM_THREADS nproc`); a bare `nproc` there reads
 1 on a 76-core node, which sized a whole-node job to a single rank.
+
+### What a long run needs here
+
+`hpc-work` allows a million files, and an evaluation used to keep 10-15 until
+the run ended, so a run at CSD3 rates reached the quota within hours and every
+rank then died on `mkdir`. Four bounds keep a long run inside it, all in
+`defaults.toml` (`docs/csd3-experiments.md` has the measurements):
+
+- `NS_KEEP_DETAIL_EVERY` (100): a successful evaluation is stripped to its
+  record as the run goes, unless it is among its rank's 20 lowest or
+  highest objectives - which is what the end-of-run image policy needs - or one
+  of the 1 in 100 kept whole, which `./ri profile` reads.
+- `NS_KEEP_FAILED_ARTEFACTS` (20): failures per run that keep their Measurement
+  Set and images; the rest keep logs and metrics.
+- `NS_MS_SKELETON_CACHE_MAX` (512): MS skeletons cached in `/dev/shm`. A
+  parameter space that varies `integration_seconds` or `declination_deg` makes
+  nearly every evaluation a new shape, and the cache had no bound.
+- `NS_MEQSERVER_RECYCLE` (20): predicts before a simulate worker replaces its
+  meqserver, which holds every MS it has written open and so pins it in tmpfs.
+
+Those bounds still leave ~1.1 files per evaluation (its `eval-*.json` record;
+a dir only for what it keeps), ~510 per unit of nlive for a converged
+15-repeat run, so an nlive of ~2000 cannot finish even in an empty quota. A
+search warns at the start when its estimate passes what its project has left
+(`ns_warn_file_quota`, `docs/csd3-speed.md` rounds 91-92). That is the live
+segment only: a resume packs the records before it into
+`evaluations/records.jsonl` and a finished run packs them all, and
+`scripts/prune-run-artefacts.py results/nested-sampling/*/` packs runs that
+finished before round 93.
+
+A failure storm is worse here than slow: `FAILURE_OBJECTIVE` is the likelihood
+PolyChord maximises, so thousands of infrastructure failures took over the live
+points and the run "converged" on them.
 
 ### Reading a run from the login node
 
@@ -265,7 +359,32 @@ three image tensors on the GPU and hands the result back as the CPU tensor the
 rest of upstream expects. TF32 is off, so the GPU does the CPU's float32
 arithmetic. The pool still forks its workers from one warm parent: the parent
 never touches CUDA, and each worker makes its own context on its first request
-(a context made before a fork is unusable in the child).
+(a context made before a fork is unusable in the child). The run starts a
+CUDA MPS daemon on the host first (`sidecar_cuda_mps_flags` in
+`start-sidecars.sh`; no root needed, pipe directory in the run's scratch) so
+those contexts share the card instead of time-slicing it: 16 ranks on an A100
+went from ~16 to ~41 evals/s. `NS_CUDA_MPS=0` turns it off
+(`docs/csd3-speed.md`, rounds 117 and 119). A worker waits for the card on a
+blocking CUDA event, not by spinning in the copy back, so its CPU goes to the
+other ranks while it waits (+6%; `R2D2_CUDA_BLOCKING_SYNC=0` spins, round 123).
+That freed CPU is why the default is 19 ranks a card, the most its memory
+holds (`NS_R2D2_CUDA_MAX_RANKS`; 43.9 against 41.1 evals/s at 16, round 124).
+`R2D2_RUNTIME=trt` runs the U-Net as TensorRT fp32 engines instead: requests
+are 45% faster, but only 12 ranks fit, so a search gains ~4% (plans are built
+on first use and cached, ~5 minutes; round 171). Since round 215 the GPU
+default is TensorRT with `R2D2_TRT_SHARED=1`: one forward server holds the 25
+engines for every worker, the workers stay on the CPU and no MPS daemon is
+started, so the 19 ranks fit again. It converged the 22 Sep search in 785 s
+against 1,165 s for eager torch (90.8 against 64.2 evals/s, log(Z) 0.06 sigma
+apart). Since round 328 that server gathers up to 8 workers' forwards of one
+net into one launch on 4 lanes (`R2D2_TRT_BATCH=8 R2D2_TRT_LANES=4`), and
+because its batches keep the card fed past the ~19 single-image lanes that
+saturate it, the rank cap is the CPUs plus PolyChord's root: 33 x 1 on a
+32-CPU A100 job. The production search converged 8% sooner than at 19 x 2
+unbatched, in all five pairs, log(Z) 0.007 sigma apart (rounds 319 and 326).
+`R2D2_TRT_BATCH=1` brings back 19 x 2 single forwards, `R2D2_RUNTIME=torch`
+eager torch with MPS, and `R2D2_TRT_SHARED=0` per-worker engines. A run from
+before round 328 resumes unbatched.
 
 Measured on `gpu-q-23`, one search each, same seed (`--nlive 16 --max-ndead
 48`), CPU and GPU on the same 32-core allocation:
@@ -283,6 +402,9 @@ Dockerfile builds, whose other packages resolved afresh. Its objective agreed
 with the CPU run to the same 4.9e-6 over 34 shared evaluations. The 1.8 -> 3.1
 gap between the two GPU images is one run each on a shared node and is not
 explained; roughly 2-3x the CPU rate is what these support.
+Those CPU rates predate csd3-speed.md rounds 6-10. Re-measured after them
+(round 11), one A100 does 12.5-13.2 evals/s against 15.4-16.8 for 24 icelake
+cores, so production should stay on CPUs.
 
 Over the 30 evaluations the CPU and GPU runs shared exact parameters for, the
 objective (`total_rms_jy`) agreed to 4.9e-6 relative and every metric to
@@ -307,12 +429,35 @@ export` carries it when it exists (~4GB) and `./ri images import` makes
 - One node per job. `icelake` is 76 cores x 3370MiB (256GB), `icelake-himem`
   6760MiB per core (512GB); `sapphire` 112 cores x 4580MiB (512GB). A
   `--mem` above the cores' share is granted by allocating (and charging)
-  more cores. R2D2 needs
-  ~3.4GB per rank, so `--mem` sets the rank count, not `-c`.
+  more cores. For WSClean, half a sapphire node does ~41% more evals/s
+  than half an icelake node but ~5% fewer per core (`docs/csd3-speed.md`,
+  round 84), so pick by deadline or by charge. For R2D2, sapphire wins on
+  both: half a node does ~1.8x the evals/s of half an icelake node and ~20%
+  more per core (round 103), so `--partition sapphire` is the better R2D2 run
+  unless sapphire is charged >20% more per core. R2D2 needs ~4.2GB once plus
+  ~0.4GB per rank (the workers share the checkpoints after the fork;
+  `docs/csd3-speed.md`, round 18), so on CPU nodes the cores set the rank count.
 - `nproc` inside the job reports the allocated cores, so `HOST_CPUS` in the
-  run scripts needs no change. `NS_R2D2_MAX_RANKS` (8, from the 20-core
-  host) caps an R2D2 job well below a 76-core node; the first whole-node R2D2
-  run is where to re-measure it (`docs/nested-sampling-throughput.md`).
+  run scripts needs no change. `NS_R2D2_MAX_RANKS` (112) caps an R2D2 job
+  at a whole sapphire node's cores: one rank per CPU beat 56 x 2 by ~20% on
+  whole icelake and sapphire nodes (`docs/csd3-speed.md`, round 105).
+  A CPU run then takes one rank more than its cores, because PolyChord's
+  root rank never evaluates (+3.7% on half an icelake node, round 186).
+  On such a node the R2D2 pool loads one checkpoint copy per socket and
+  pins each worker to its socket (+19% on a whole sapphire node, round 106; +21% on a whole icelake
+  node, round 107), and builds the ONNX Runtime sessions once per socket the
+  same way (+36% on a whole icelake node, round 149; +40% and 117 evals/s on a
+  whole sapphire node, round 150);
+  `R2D2_WEIGHTS_PER_NODE=0` keeps one shared copy. A sized (`--mpi-procs`)
+  R2D2 job can land on one socket, which turns this off; on one sapphire
+  node, 56 CPUs split 28/28 ran 75 evals/s against 54 on one socket (+37%,
+  round 111; +26% on icelake, round 250), so a sized CPU R2D2 search
+  (`--mpi-procs` >= 4) submits with `NS_SLURM_SOCKETS=2` by default: the job
+  asks for `--ntasks 2 --ntasks-per-socket 1 --cpus-per-task N/2` and twice
+  the shared memory (`sbatch --test-only` gives it the same start estimate as
+  one socket, round 250; `NS_SLURM_SOCKETS=1` keeps one). It is for R2D2 only: 56-rank
+  WSClean ran the same either way (round 114), so a WSClean job need not wait
+  for it.
 - Load `rhel8/slurm` and nothing else: Apptainer, Slurm and the SIFs are the
   whole toolchain, and a job purges the rest (above). `uv` is still needed for
   the host-side scripts (`./ri profile`, `./ri merge`, the defaults loader,

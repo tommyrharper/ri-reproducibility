@@ -157,8 +157,11 @@ PolyChord container. `NS_MPI_PROCS` sets the rank count (default
 evaluations for debugging.
 
 The target builds any missing WSClean, MeqTrees, and PolyChord images first.
-Each likelihood evaluation runs one MeqTrees simulate and one WSClean imaging
-step in this rank's already-running sidecar containers.
+Each likelihood evaluation runs one simulate and one WSClean imaging step in
+this rank's already-running sidecar containers. The simulate runs in the
+MeqTrees container but computes the point source analytically; the MeqTrees
+predict itself runs only in self-checks, as the reference the analytic one is
+checked against.
 
 ### R2D2
 
@@ -169,7 +172,7 @@ step in this rank's already-running sidecar containers.
 Output: `results/nested-sampling/r2d2-vlaa-<UTC timestamp>/`.
 
 The target builds R2D2, MeqTrees, and PolyChord images first. Each likelihood
-evaluation runs one MeqTrees simulate, one MeqTrees-hosted MS-to-`.mat`
+evaluation runs one simulate (analytic, as above), one MeqTrees-hosted MS-to-`.mat`
 conversion and one R2D2 imaging job, each a request to a long-lived process
 inside one of the run's two sidecar containers.
 
@@ -191,14 +194,17 @@ process that imports torch once, forks a worker per pair, and opens every pair
 before it starts importing so the ranks do not wait for it (see "R2D2 imaging runs in a long-lived
 worker", "The workers are started by the container, not by the ranks" and "The
 ranks attach to the pool before the warm-up" in
-[nested-sampling-profiling.md](nested-sampling-profiling.md)). That process also
-patches R2D2's `MeasOp.get_op_norm` to solve the operator norm with Lanczos
-rather than upstream's power iteration - the same quantity, ~3.5x fewer NUFFT
-pairs and ~3e-6 relative accuracy instead of ~1e-4, and no longer a different
-answer on every run (see "The operator norm is solved with Lanczos" there) - and
+[nested-sampling-profiling.md](nested-sampling-profiling.md)). The run's
+`r2d2_config.yaml` sets `target_dynamic_range`, which R2D2 only reads against a
+ground truth, so `imager.py` never solves for the operator norm
+([csd3-speed.md](csd3-speed.md), round 4). That process builds the U-Net once
+per worker rather than once per request, and
 it gives each measurement operator one FINUFFT plan per transform type instead
 of the one-plan-per-transform `pytorch_finufft` builds, worth ~30% of a warm
-imaging request (see "Each measurement operator keeps its FINUFFT plans"). Its
+imaging request (see "Each measurement operator keeps its FINUFFT plans"). Each
+iteration's residual then skips the NUFFTs altogether: `A^H A` is applied as an
+FFT convolution with a kernel one NUFFT builds per request
+([csd3-speed.md](csd3-speed.md), round 10). Its
 warm-up runs `imager.py`'s own import block - the file under a run name that is
 not `__main__` - plus the NUFFT backend `create_meas_op` imports lazily, and
 makes `utils` resolve its submodules on demand so the imaging path never pays
@@ -215,7 +221,10 @@ instead of all of them. Set `R2D2_OMP_THREADS` explicitly to override this
 per-rank default. The same count is written into every per-evaluation
 `r2d2_config.yaml` as `ncpus`, because those env vars alone do not reach
 torch - see "R2D2 sizes its own torch thread pool" in
-[nested-sampling-profiling.md](nested-sampling-profiling.md).
+[nested-sampling-profiling.md](nested-sampling-profiling.md). In async runs
+that count is a floor: each evaluation gets `R2D2_MAX_THREADS` (default: host
+CPUs, at most 16) over the evaluations in flight, so a run's last chains use the cores
+the finished ranks left idle ([csd3-speed.md](csd3-speed.md), round 9).
 
 ### Environment overrides
 
@@ -264,9 +273,11 @@ host with `NS_NLIVE` held at 12 and only the rank count varied:
 That is 3.4GB per R2D2 rank, linear, against ~0.2GB per WSClean rank. Two
 consequences:
 
-- **`NS_NLIVE` is free.** It sets search quality, not memory. `--nlive 40
+- **`NS_NLIVE` costs no memory.** It sets search quality. `--nlive 40
   --mpi-procs 12` evaluates 40 live points 12 at a time and costs 12 ranks of
-  memory. Raise `--nlive` for a better search without paying for it in RAM.
+  memory. It is not free in time: a converged search needs evaluations in
+  proportion to `nlive + 0.41 x workers`, so raise it for precision, never for
+  speed (docs/csd3-speed.md, rounds 307-308).
 - **`--mpi-procs` is what has to fit.** On a 62GB host R2D2 tops out around 16
   ranks; the CPU would allow 20.
 
@@ -580,11 +591,15 @@ each evaluation was 1.5x cheaper. The R2D2 arms happened to stay level (44, 43,
 
 R2D2-RI reads visibilities from a MATLAB `.mat` file via `load_data_to_tensor()`
 in the upstream `src/utils.py`. The nested-sampling simulator produces a CASA
-Measurement Set (`sim.ms`) that WSClean consumes directly. The R2D2 run adds
-`scripts/lib/nested_sampling/ms_to_r2d2_mat.py`, which the rank's simulate
-worker runs in-process inside the MeqTrees sidecar (python3-casacore plus
-scipy), and which writes the minimal field set R2D2 loads without flag
-metadata:
+Measurement Set (`sim.ms`) that WSClean consumes directly. For the R2D2 run
+the simulate request also writes `r2d2_data.mat` (`--mat-path`) from the arrays
+it just put in the MS, through `write_r2d2_mat()` in
+`scripts/lib/nested_sampling/ms_to_r2d2_mat.py`; that script still converts any
+MS standalone. Since nothing in an R2D2 run reads the MS, the request also
+passes `--mat-only` (unless `NS_KEEP_MEASUREMENT_SETS=1`): once the
+observation is cached it writes the same `.mat`, byte for byte, without
+building an MS at all ([csd3-speed.md](csd3-speed.md), round 21). Either way
+the file holds the minimal field set R2D2 loads, without flag metadata:
 
 | Field | Meaning |
 |---|---|
@@ -592,7 +607,7 @@ metadata:
 | `y` | Complex visibilities for correlation index 0 (parallel-hand Stokes I) |
 | `nW` | `sqrt(WEIGHT)` from the MS, divided by `--noise-sigma-jy` |
 
-The simulator leaves `WEIGHT` at makems' 1.0 rather than writing `1/sigma^2` into every row - it is one number for the whole MS, and writing it was a third of the simulate stage. `polychord_r2d2.py` passes the sigma from the evaluation's `simulation.json` (`noise.complex_sigma_jy`) as `--noise-sigma-jy`, so `nW` comes out exactly where the column used to put it. The default of 1.0 takes `WEIGHT` at face value, which is what a Measurement Set carrying real weights wants.
+The simulator leaves `WEIGHT` at makems' 1.0 rather than writing `1/sigma^2` into every row - it is one number for the whole MS, and writing it was a third of the simulate stage. The simulator applies its own sigma (recorded as `noise.complex_sigma_jy` in `simulation.json`; the standalone script takes it as `--noise-sigma-jy`), so `nW` comes out exactly where the column used to put it. The default of 1.0 takes `WEIGHT` at face value, which is what a Measurement Set carrying real weights wants.
 
 Imaging weights are generated inside R2D2 when `data_weighting: True` in the
 per-evaluation YAML config. The converter does not replicate the bundled

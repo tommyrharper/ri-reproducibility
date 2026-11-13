@@ -46,11 +46,42 @@ write_run_config() {
         printf 'WSCLEAN_TARGET_CPU=%q\n' "${WSCLEAN_TARGET_CPU}"
       fi
     fi
+    # Without it `./ri resume` brought a GPU run back on the CPU.
+    if [ "${algorithm}" = r2d2 ]; then
+      printf 'R2D2_DEVICE=%q\n' "${R2D2_DEVICE:-cpu}"
+      printf 'R2D2_RUNTIME=%q\n' "${R2D2_RUNTIME:-torch}"
+      # A multi-node search (round 287) resumes on as many nodes.
+      if [ "${NS_NODES:-1}" -gt 1 ]; then
+        printf 'NS_NODES=%q\n' "${NS_NODES}"
+      fi
+      if [ -n "${R2D2_TRT_SHARED:-}" ]; then
+        printf 'R2D2_TRT_SHARED=%q\n' "${R2D2_TRT_SHARED}"
+      fi
+      # Opt-in batching (round 224); a resume keeps its plans and server.
+      if [ -n "${R2D2_TRT_BATCH:-}" ]; then
+        printf 'R2D2_TRT_BATCH=%q\n' "${R2D2_TRT_BATCH}"
+      fi
+      if [ -n "${R2D2_TRT_LANES:-}" ]; then
+        printf 'R2D2_TRT_LANES=%q\n' "${R2D2_TRT_LANES}"
+      fi
+    fi
     if [ -n "${R2D2_OMP_THREADS:-}" ]; then
       printf 'R2D2_OMP_THREADS=%q\n' "${R2D2_OMP_THREADS}"
     fi
     if [ -n "${R2D2_INTEROP_THREADS:-}" ]; then
       printf 'R2D2_INTEROP_THREADS=%q\n' "${R2D2_INTEROP_THREADS}"
+    fi
+    if [ -n "${R2D2_MAX_THREADS:-}" ]; then
+      printf 'R2D2_MAX_THREADS=%q\n' "${R2D2_MAX_THREADS}"
+    fi
+    if [ -n "${R2D2_INTERLEAVE_WEIGHTS:-}" ]; then
+      printf 'R2D2_INTERLEAVE_WEIGHTS=%q\n' "${R2D2_INTERLEAVE_WEIGHTS}"
+    fi
+    if [ -n "${R2D2_WEIGHTS_PER_NODE:-}" ]; then
+      printf 'R2D2_WEIGHTS_PER_NODE=%q\n' "${R2D2_WEIGHTS_PER_NODE}"
+    fi
+    if [ -n "${R2D2_CUDA_BLOCKING_SYNC:-}" ]; then
+      printf 'R2D2_CUDA_BLOCKING_SYNC=%q\n' "${R2D2_CUDA_BLOCKING_SYNC}"
     fi
   } >"${output_dir}/run.env"
 }
@@ -159,14 +190,41 @@ ns_refuse_unmounted_run() {
   exit 1
 }
 
+# Stripped as it goes, an evaluation leaves ~1.1 files (its eval-*.json
+# record, and a dir for the few it keeps: 8,562 files for 7,821 evaluations,
+# docs/csd3-speed.md round 92; ~2.1 before), and a converged run makes ~9 x
+# nlive dead points at ~3.4 x num_repeats evaluations each (round 91). So ~4
+# files per repeat per dead point; a run sized past the free file quota dies on EDQUOT
+# part way through. Warns, never refuses: the estimate is rough, and only
+# Lustre's project quota (CSD3's hpc-work) is read.
+#   ns_warn_file_quota <run dir> <nlive> <num repeats> <max ndead>
+ns_warn_file_quota() {
+  local project ndead need free
+  command -v "${LFS:-lfs}" >/dev/null 2>&1 || return 0
+  # `|| true`: off Lustre (a /dev/shm tree) lfs fails, and under the run
+  # scripts' `set -e -o pipefail` that failure ended the search (round 149).
+  project="$("${LFS:-lfs}" project -d "$1" 2>/dev/null | awk '{ print $1 }' || true)"
+  [ "${project:-0}" -gt 0 ] 2>/dev/null || return 0
+  ndead="$4"
+  [ "${ndead}" -gt 0 ] 2>/dev/null || ndead=$((9 * $2))
+  need=$((4 * $3 * ndead))
+  # Header, then: filesystem kbytes quota limit grace files quota limit grace.
+  free="$("${LFS:-lfs}" quota -p "${project}" "$1" 2>/dev/null \
+    | awk 'NR > 2 && $8 + 0 > 0 { print $8 - $6; exit }' || true)"
+  [ -n "${free}" ] && [ "${need}" -gt "${free}" ] || return 0
+  echo "WARNING: this run may make ~${need} files (nlive $2, num_repeats $3), and" \
+    "its project quota has ${free} left: a full quota kills it with EDQUOT. Delete" \
+    "finished runs' evaluations/ or lower --nlive (docs/cluster.md)." >&2
+}
+
 # `bash scripts/lib/run-config.sh --self-check` - that what is written can be
 # sourced back to the same values, including a metric that needs quoting.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
   _dir="$(mktemp -d)"
   NS_NLIVE=8 NS_NUM_REPEATS=2 NS_MAX_NDEAD=12 NS_SEED=41 NS_RETRIES=2 \
-    NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 R2D2_INTEROP_THREADS=1 \
-    NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 NS_IMAGE_DIM=96 \
+    NS_METRIC='total_rms_jy - 0.5 * snr' NS_MPI_PROCS=7 R2D2_OMP_THREADS=2 R2D2_INTEROP_THREADS=1 R2D2_MAX_THREADS=16 \
+    NS_STALL_TIMEOUT=3600 NS_SYNCHRONOUS=1 NS_KEEP_MEASUREMENT_SETS=1 NS_IMAGE_DIM=96 NS_NODES=2 \
     write_run_config "${_dir}" r2d2
   (
     set -a
@@ -179,6 +237,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     [ "${NS_METRIC}" = 'total_rms_jy - 0.5 * snr' ]
     [ "${R2D2_OMP_THREADS}" = 2 ]
     [ "${R2D2_INTEROP_THREADS}" = 1 ]
+    [ "${R2D2_MAX_THREADS}" = 16 ]
+    [ "${NS_NODES}" = 2 ]
     [ "${NS_STALL_TIMEOUT}" = 3600 ]
     [ "${NS_SYNCHRONOUS}" = 1 ]
     [ "${NS_KEEP_MEASUREMENT_SETS}" = 1 ]
@@ -192,6 +252,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     NS_STALL_TIMEOUT=0 NS_SYNCHRONOUS=0 NS_KEEP_MEASUREMENT_SETS=0 \
     NS_WSCLEAN_MGAIN=0.9 NS_WSCLEAN_NITER=250 NS_IMAGE_DIM=64 \
     write_run_config "${_dir}" wsclean
+  grep -q NS_NODES "${_dir}/run.env" && {
+    echo "FAIL: a single-node run.env names NS_NODES"; exit 1
+  }
   grep -qx 'NS_IMAGE_DIM=64' "${_dir}/run.env" || {
     echo "FAIL: NS_IMAGE_DIM not recorded in run.env"; exit 1
   }
@@ -314,6 +377,30 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   touch "${_dir}/elsewhere/R2D2_A1/R2D2_UNet_N1.ckpt"
   ( ns_refuse_missing_checkpoints "${_dir}/elsewhere" R2D2_A1 ) ||
     { echo "FAIL: CHECKPOINTS_DIR must be what decides where to look"; exit 1; }
+
+  # The file-quota warning, against a stand-in lfs with FREE files left on
+  # project 110845 (FREE empty: no project, as off Lustre).
+  # shellcheck disable=SC2016  # expanded by the stand-in, not here
+  printf '%s\n' '#!/bin/sh' \
+    'case "$1" in project) [ -n "${FREE}" ] && echo "110845 P $3" || echo "0 - $3" ;;' \
+    'quota) echo "Disk quotas for prj 110845 (pid 110845):"' \
+    '  echo "Filesystem kbytes quota limit grace files quota limit grace"' \
+    '  echo ". 1 2 3 - $((1048576 - FREE)) 1048576 1048576 -" ;; esac' >"${_dir}/lfs"
+  chmod +x "${_dir}/lfs"
+  quota_warns() { LFS="${_dir}/lfs" FREE="$1" ns_warn_file_quota "${_dir}" "$2" 15 "$3" 2>&1 | grep -c EDQUOT; }
+  # nlive 150 converged: 4 x 15 x 1350 = 81,000 files.
+  [ "$(quota_warns 650000 150 -1)" = 0 ] || { echo "FAIL: 650k free must fit nlive 150"; exit 1; }
+  [ "$(quota_warns 60000 150 -1)" = 1 ] || { echo "FAIL: 60k free must warn for nlive 150"; exit 1; }
+  [ "$(quota_warns 60000 150 900)" = 0 ] || { echo "FAIL: max-ndead must bound the estimate"; exit 1; }
+  [ "$(quota_warns '' 5000 -1)" = 0 ] || { echo "FAIL: no project quota must stay quiet"; exit 1; }
+  [ "$(LFS="${_dir}/missing" ns_warn_file_quota "${_dir}" 5000 15 -1 2>&1 | grep -c EDQUOT)" = 0 ] \
+    || { echo "FAIL: no lfs must stay quiet"; exit 1; }
+  # Not inside `||` or `[ ]`, which would suspend `set -e`: lfs failing (off
+  # Lustre) must not end the caller.
+  printf '#!/bin/sh\nexit 25\n' >"${_dir}/lfs-fails"
+  chmod +x "${_dir}/lfs-fails"
+  _reached="$(set -e -o pipefail; LFS="${_dir}/lfs-fails" ns_warn_file_quota "${_dir}" 150 15 -1; echo reached)"
+  [ "${_reached}" = reached ] || { echo "FAIL: lfs failing off Lustre must not end the run"; exit 1; }
 
   rm -rf "${_dir}"
   echo "run-config self-check passed"

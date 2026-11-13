@@ -21,11 +21,16 @@ ns_should_submit() {
   [ -z "${SLURM_JOB_ID:-}" ] && [ "${NS_SBATCH:-1}" = 1 ] && command -v sbatch >/dev/null 2>&1
 }
 
-# ns_submit_run <run dir> <MB per rank> <command...>
+# ns_submit_run <run dir> <memory> <command...>, memory as rank-budget.sh spells it
 #
 # One node, one task (mpirun forks the ranks), named after the run so squeue
 # and ns_run_is_live can find it, stdout beside the run's own logs. With an
 # explicit NS_MPI_PROCS the job is sized to it; otherwise it takes the node.
+# A sized job may land on one socket; NS_SLURM_SOCKETS=2 spreads its cores
+# over two (one task per socket, mpirun ignores the tasks) and counts the
+# shared memory once per socket, for the R2D2 pool's per-socket checkpoint
+# copies: 56 R2D2 CPUs split 28/28 ran +37% over one socket (round 111), so
+# run-nested-sampling-r2d2.sh defaults to it for sized CPU jobs (round 250).
 # NS_SLURM_GPUS=N (R2D2_DEVICE=cuda sets 1) asks for N GPUs on the ampere
 # partition instead, with the 32 cores per GPU CSD3 allows there: a GPU job is
 # charged in GPU hours, so the cores and their 8000MB each cost nothing extra.
@@ -36,7 +41,7 @@ ns_should_submit() {
 # a directory of its own. sbatch still reads SBATCH_* from this shell. Paths
 # are physical: the job's REPO_ROOT is, and the settings' directories are.
 ns_submit_run() {
-  local run_dir="$1" mb_per_rank="$2" cmd size repo="${REPO_ROOT}" settings phys
+  local run_dir="$1" memory="$2" shared=0 sockets="${NS_SLURM_SOCKETS:-1}" cmd size repo="${REPO_ROOT}" settings phys
   shift 2
   # A -CPU project has no GPU hours, and sbatch's own refusal does not say so.
   if [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
@@ -53,14 +58,25 @@ ns_submit_run() {
   . "$(dirname "${BASH_SOURCE[0]}")/job-env.sh"
   ns_write_job_settings "${settings}" || return
   printf -v cmd '%q ' /bin/bash "${repo}/scripts/lib/job-env.sh" "${settings}" "$@"
-  if [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
-    size=(--gres "gpu:${NS_SLURM_GPUS}" --cpus-per-task "$((32 * NS_SLURM_GPUS))")
+  if [ "${NS_NODES:-1}" -gt 1 ]; then
+    # A multi-node search takes whole nodes; its ranks are per node.
+    size=(--ntasks-per-node 1 --exclusive)
+  elif [ "${NS_SLURM_GPUS:-0}" -gt 0 ]; then
+    size=(--ntasks 1 --gres "gpu:${NS_SLURM_GPUS}" --cpus-per-task "$((32 * NS_SLURM_GPUS))")
     export SBATCH_PARTITION="${SBATCH_PARTITION:-ampere}"
   elif [ -n "${NS_MPI_PROCS:-}" ]; then
-    size=(--cpus-per-task "${NS_MPI_PROCS}"
-          --mem "$((NS_MPI_PROCS * mb_per_rank + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
+    case "${memory}" in *+*) shared="${memory%%+*}" memory="${memory#*+}" ;; esac
+    if [ "${sockets}" -gt 1 ]; then
+      size=(--ntasks "${sockets}" --ntasks-per-socket 1
+            --cpus-per-task "$(((NS_MPI_PROCS + sockets - 1) / sockets))")
+    else
+      size=(--ntasks 1 --cpus-per-task "${NS_MPI_PROCS}")
+    fi
+    size+=(--mem "$((sockets * shared + NS_MPI_PROCS * memory + ${NS_RANK_BUDGET_HEADROOM_MB:-4096}))")
   else
-    size=(--exclusive --mem 0)
+    # Not --mem 0: CSD3's sbatch refuses it. --exclusive already brings every
+    # core's default memory, i.e. the node.
+    size=(--ntasks 1 --exclusive)
   fi
   export SBATCH_PARTITION="${SBATCH_PARTITION:-icelake}"
   # CSD3's `intr` QoS starts at once but caps a job at one hour, and sbatch
@@ -77,7 +93,7 @@ ns_submit_run() {
     --job-name "${run_dir##*/}" \
     --chdir "${repo}" \
     --output "${run_dir}/slurm-%j.out" \
-    --nodes 1 --ntasks 1 "${size[@]}" \
+    --nodes "${NS_NODES:-1}" "${size[@]}" \
     --wrap "exec ${cmd}" || return
   # The readers' shared squeue cache (scripts/slurm_queue.py) predates this job;
   # dropped so `./ri runs` lists it as queued straight away.
@@ -106,12 +122,39 @@ ns_enter_job_env() {
   exec /bin/bash "${repo}/scripts/lib/job-env.sh" "${run_dir}/.job-settings.env" "$@"
 }
 
+# ns_expand_hostlist <list> [<count>]: one host per line from a Slurm hostlist
+# such as SLURM_JOB_NODELIST (cpu-q-[83-84,90],gpu-q-1), keeping zero padding -
+# without `scontrol show hostnames`, which this repo does not call from a job.
+# <count> stops after that many: `| head -n` SIGPIPEd it under pipefail, so
+# --nodes 2 in a 4-node allocation died at once with 141 (round 292).
+ns_expand_hostlist() {
+  local item prefix body range lo hi n left="${2:--1}"
+  # Commas inside brackets become ';' so the top-level ones split items.
+  for item in $(printf '%s\n' "$1" | sed -E ':a;s/(\[[^],]*),/\1;/;ta' | tr ',' ' '); do
+    case "${item}" in
+      *\[*\]) ;;
+      *) [ "${left}" -eq 0 ] && return; left=$((left - 1)); printf '%s\n' "${item}"; continue ;;
+    esac
+    prefix="${item%%\[*}" body="${item#*\[}"
+    body="${body%\]}"
+    for range in ${body//;/ }; do
+      lo="${range%-*}" hi="${range#*-}"
+      for ((n = 10#${lo}; n <= 10#${hi}; n++)); do
+        [ "${left}" -eq 0 ] && return; left=$((left - 1))
+        printf '%s%0*d\n' "${prefix}" "${#lo}" "${n}"
+      done
+    done
+  done
+}
+
 # `bash scripts/lib/slurm.sh --self-check`: when a run submits, and what it
 # submits, against a fake sbatch that records its arguments and environment.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   set -euo pipefail
-  # Physical: ns_submit_run resolves symlinks, and macOS TMPDIR is one (/var -> /private/var).
-  _dir="$(cd "$(mktemp -d)" && pwd -P)"
+  _dir="$(mktemp -d)"
+  # Physical: ns_submit_run resolves the paths it passes, and macOS hands out
+  # temporary directories under /var, a symlink to /private/var.
+  _dir="$(cd "${_dir}" && pwd -P)"
   trap 'rm -rf "${_dir}"' EXIT
   mkdir -p "${_dir}/bin"
   # shellcheck disable=SC2016  # the $vars are for the fake sbatch's own sh
@@ -120,7 +163,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   chmod +x "${_dir}/bin/sbatch"
   REPO_ROOT="${_dir}/repo"
   mkdir -p "${REPO_ROOT}"
-  unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS SBATCH_PARTITION SBATCH_TIMELIMIT SBATCH_QOS
+  unset SLURM_JOB_ID NS_SBATCH NS_MPI_PROCS NS_SLURM_SOCKETS SBATCH_PARTITION SBATCH_TIMELIMIT SBATCH_QOS
 
   # A PATH of only the fake: the real cluster has sbatch on its own PATH.
   PATH="${_dir}/none" ns_should_submit && { echo "FAIL: no sbatch on PATH, so the run must stay in place"; exit 1; }
@@ -141,7 +184,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
     || { echo "FAIL: the job must inherit the run directory and the sbatch defaults, got: $(cat "${_dir}/env")"; exit 1; }
   _args="$(tr '\n' ' ' <"${_dir}/args")"
   for _want in "--export=NIL" "--job-name wsclean-vlaa-20260101T000000Z" "--chdir ${REPO_ROOT}" \
-               "--output ${_run}/slurm-%j.out" "--nodes 1 --ntasks 1 --exclusive --mem 0" \
+               "--output ${_run}/slurm-%j.out" "--nodes 1 --ntasks 1 --exclusive --wrap" \
                "--wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling.sh"; do
     case "${_args}" in
       *"${_want}"*) ;;
@@ -157,14 +200,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   grep -q UNRELATED "${_run}/.job-settings.env" \
     && { echo "FAIL: only run settings may reach the job: $(cat "${_run}/.job-settings.env")"; exit 1; }
   unset UNRELATED
-
-  # An explicit rank count sizes the job instead of taking the node, and the
-  # caller's partition and time are left alone.
+  # An explicit rank count sizes the job (shared memory once, plus per rank)
+  # instead of taking the node, and the caller's partition and time are left alone.
   SBATCH_PARTITION=sapphire SBATCH_TIMELIMIT=01:00:00 NS_MPI_PROCS=4 \
-    ns_submit_run "${_run}" 3500 scripts/run-nested-sampling-r2d2.sh >/dev/null
+    ns_submit_run "${_run}" 8000+600 scripts/run-nested-sampling-r2d2.sh >/dev/null
   _args="$(tr '\n' ' ' <"${_dir}/args")"
   case "${_args}" in
-    *"--nodes 1 --ntasks 1 --cpus-per-task 4 --mem 18096 --wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling-r2d2.sh"*) ;;
+    *"--nodes 1 --ntasks 1 --cpus-per-task 4 --mem 14496 --wrap exec /bin/bash ${REPO_ROOT}/scripts/lib/job-env.sh ${_run}/.job-settings.env scripts/run-nested-sampling-r2d2.sh"*) ;;
     *) echo "FAIL: NS_MPI_PROCS must size the job, got: ${_args}"; exit 1 ;;
   esac
   case "${_args}" in
@@ -172,6 +214,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   esac
   [ "$(cat "${_dir}/env")" = "${_run} sapphire 01:00:00" ] \
     || { echo "FAIL: the caller's partition and time must win, got: $(cat "${_dir}/env")"; exit 1; }
+  # Two sockets: one task on each, the cores split between them (rounded
+  # up) and the shared memory counted per socket.
+  NS_SLURM_SOCKETS=2 NS_MPI_PROCS=5 ns_submit_run "${_run}" 8000+600 x >/dev/null
+  _args="$(tr '\n' ' ' <"${_dir}/args")"
+  case "${_args}" in
+    *"--nodes 1 --ntasks 2 --ntasks-per-socket 1 --cpus-per-task 3 --mem 23096 --wrap"*) ;;
+    *) echo "FAIL: NS_SLURM_SOCKETS=2 must split the job over two sockets, got: ${_args}"; exit 1 ;;
+  esac
 
   # The intr QoS caps a job at an hour, so without a time that is the default;
   # a submission also drops the squeue cache so the job is seen at once.
@@ -217,6 +267,25 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
   SBATCH_ACCOUNT=PROJ-CPU NS_SLURM_GPUS=1 ns_submit_run "${_run}" 3500 x >/dev/null 2>&1 \
     && { echo "FAIL: a GPU run on a -CPU project must be refused"; exit 1; }
   [ -e "${_dir}/args" ] && { echo "FAIL: a refused GPU run must not reach sbatch"; exit 1; }
+
+  # A multi-node search takes whole nodes, one task each.
+  NS_NODES=2 NS_MPI_PROCS=39 ns_submit_run "${_run}" 3500 x >/dev/null
+  _args="$(tr '\n' ' ' <"${_dir}/args")"
+  case "${_args}" in
+    *"--nodes 2 --ntasks-per-node 1 --exclusive --wrap"*) ;;
+    *) echo "FAIL: NS_NODES=2 must ask for two whole nodes, got: ${_args}"; exit 1 ;;
+  esac
+  _hosts="$(ns_expand_hostlist 'cpu-q-[83-84,090],cpu-p-7,gpu-q-[1,3-4]' | paste -sd' ')"
+  [ "${_hosts}" = "cpu-q-83 cpu-q-84 cpu-q-090 cpu-p-7 gpu-q-1 gpu-q-3 gpu-q-4" ] \
+    || { echo "FAIL: ns_expand_hostlist, got: ${_hosts}"; exit 1; }
+  [ "$(ns_expand_hostlist 'n[008-010]' | paste -sd' ')" = "n008 n009 n010" ] \
+    || { echo "FAIL: ns_expand_hostlist must keep zero padding"; exit 1; }
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    _hosts="$(ns_expand_hostlist 'cpu-q-[1-4000],cpu-p-7' 2 | paste -sd' ')"
+  done
+  [ "${_hosts}" = "cpu-q-1 cpu-q-2" ] || { echo "FAIL: ns_expand_hostlist <list> 2, got: ${_hosts}"; exit 1; }
+  [ "$(ns_expand_hostlist 'cpu-p-7,cpu-q-[1-4]' 3 | paste -sd' ')" = "cpu-p-7 cpu-q-1 cpu-q-2" ] \
+    || { echo "FAIL: ns_expand_hostlist must count single hosts"; exit 1; }
 
   echo "slurm self-check passed"
 fi

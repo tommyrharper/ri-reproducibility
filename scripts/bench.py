@@ -10,6 +10,7 @@ dominate a group's result. See docs/nested-sampling-benchmarks.md.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -28,7 +29,15 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib" / "nested_sampling"))
 
-from common import backfill_busy_seconds, profiling_breakdown  # noqa: E402
+from common import (  # noqa: E402
+    backfill_busy_seconds,
+    first_request,
+    mean_r2d2_iterations,
+    profiling_breakdown,
+    read_summary_skeleton,
+    record_digest,
+    start_gaps,
+)
 
 LEDGER = REPO_ROOT / "benchmarks.jsonl"
 NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
@@ -40,12 +49,17 @@ NESTED_SAMPLING_DIR = REPO_ROOT / "results" / "nested-sampling"
 # NS_STALL_TIMEOUT are absent because they cost nothing until something breaks.
 # The three image ids are here because the images bake the code: two rows at
 # one commit measured different binaries if a rebuild landed between them.
+# NS_MPI_PROCS is per node, so NS_NODES (in run.env only when above 1) keeps a
+# 2-node search out of its 1-node cell (docs/csd3-speed.md, round 306).
 WORKLOAD_KEYS = (
     "NS_NLIVE", "NS_NUM_REPEATS", "NS_MAX_NDEAD", "NS_METRIC", "NS_MPI_PROCS",
-    "NS_IMAGE_DIM",
-    "NS_SYNCHRONOUS", "NS_WSCLEAN_MGAIN", "NS_WSCLEAN_NITER", "NS_WSCLEAN_LOG_TIME",
+    "NS_NODES", "NS_IMAGE_DIM",
+    # NS_ADOPT_CONTOUR and NS_EARLY_STOP no longer exist; kept so old rows that set them stay apart.
+    "NS_SYNCHRONOUS", "NS_ADOPT_CONTOUR", "NS_EARLY_STOP", "NS_WSCLEAN_MGAIN", "NS_WSCLEAN_NITER", "NS_WSCLEAN_LOG_TIME",
     "NS_KEEP_MEASUREMENT_SETS", "WSCLEAN_TARGET_CPU",
-    "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS",
+    "R2D2_OMP_THREADS", "R2D2_INTEROP_THREADS", "R2D2_MAX_THREADS", "R2D2_INTERLEAVE_WEIGHTS",
+    "R2D2_WEIGHTS_PER_NODE", "R2D2_CUDA_BLOCKING_SYNC", "R2D2_RUNTIME", "R2D2_DEVICE",
+    "R2D2_TRT_SHARED", "R2D2_TRT_BATCH", "R2D2_TRT_LANES",
     "NS_IMAGER_IMAGE_ID", "NS_MEQTREES_IMAGE_ID", "NS_POLYCHORD_IMAGE_ID",
 )
 
@@ -88,7 +102,20 @@ def machine_id() -> str:
             if "IOPlatformUUID" in line and '"' in line:
                 raw = line.rsplit('"', 2)[-2]
                 break
+    # Cluster nodes boot one image and share its machine-id, so there the
+    # machine is the node class: CSD3's icelake and ampere rows must not pool.
+    if raw and os.environ.get("SLURM_JOB_ID"):
+        raw += "|" + cpu_model()
     return hashlib.sha256((raw or platform.node()).encode()).hexdigest()[:8]
+
+
+def cpu_model() -> str:
+    try:
+        text = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return platform.processor()
+    return next((line.split(":", 1)[1].strip() for line in text.splitlines()
+                 if line.startswith("model name")), "")
 
 
 def available_cpu_count() -> int:
@@ -154,6 +181,62 @@ def resolve_run(raw: str) -> Path:
     return target.resolve()
 
 
+def pre_run_phases(run_dir: Path, digest: dict[str, Any]) -> dict[str, float] | None:
+    """Seconds each phase took, from the launcher's start in the job to the
+    first evaluation, out of the pre-run.tsv the R2D2 launcher and its ranks
+    write; a rank phase ends at its slowest rank (round 341). `searched` is
+    the last evaluation's end to the search's exit: rank 0's post-run."""
+    try:
+        rows = [line.split("\t") for line in (run_dir / "pre-run.tsv").read_text().splitlines()]
+    except OSError:
+        return None
+    marks = []
+    for row in rows:
+        if len(row) == 3:
+            try:
+                marks = [] if row[1] == "job" else marks
+                marks.append((row[1], float(row[0])))
+            except ValueError:
+                continue
+    first_started, last_ended = digest.get("first_started_epoch"), digest.get("last_ended_epoch")
+    if not marks or marks[0][0] != "job" or first_started is None:
+        return None
+    searched = dict(marks).get("searched")
+    # After the search: its own record is written between these two.
+    marks = [mark for mark in marks if mark[0] not in ("searched", "recorded", "finished")]
+    marks.append(("first_eval", first_started))
+    phases = {name: round(at - before, 2) for (_, before), (name, at) in zip(marks, marks[1:])}
+    phases["total"] = round(marks[-1][1] - marks[0][1], 2)
+    if searched is not None:
+        phases["searched"] = round(searched - last_ended, 2)
+    return phases
+
+
+def pool_warm_phases(run_dir: Path) -> dict[str, float] | None:
+    """Slowest pool's seconds per warm-up phase, from the line each node's pool
+    prints to workers-r2d2.log: what a cold first request is made of (round 368)."""
+    slowest: dict[str, float] = {}
+    try:
+        lines = (run_dir / "workers-r2d2.log").read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("r2d2 pool warm-up seconds: "):
+            for phase in line.split(": ", 1)[1].split(", "):
+                name, _, seconds = phase.partition(" ")
+                slowest[name] = max(slowest.get(name, 0.0), float(seconds))
+    return slowest or None
+
+
+def trt_mean_batch(run_dir: Path) -> float | None:
+    """The gathering TensorRT server's mean batch, from the r2d2-trt-batches.txt it keeps (round 330)."""
+    try:
+        words = (run_dir / "r2d2-trt-batches.txt").read_text().split()
+        return float(words[words.index("mean") + 1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def row_for(run_dir: Path) -> dict[str, Any] | None:
     """One ledger row for a finished run, or None with a reason on stderr.
 
@@ -173,7 +256,8 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         # covers all of them, so the throughput it implies is fiction.
         return skip("it restarted or was resumed")
     try:
-        summary = json.loads((run_dir / "summary.json").read_text())
+        summary = (read_summary_skeleton(run_dir / "summary.json")
+                   or json.loads((run_dir / "summary.json").read_text()))
     except (OSError, ValueError):
         return skip("no whole summary.json - it did not finish")
 
@@ -188,14 +272,15 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
     run_env = read_run_env(run_dir)
     settings = {key: value for key, value in run_env.items() if key in WORKLOAD_KEYS}
     per_eval = breakdown["subtotal_per_eval_seconds"]
-    peak_memory = max(
-        (float((record.get("metrics") or {}).get("peak_memory_bytes", 0.0))
-         or float(record.get("peak_memory_bytes", 0.0))
-         for record in summary.get("evaluations", [])
-         if (record.get("metrics") or {}).get("peak_memory_bytes")
-         or record.get("peak_memory_bytes")),
-        default=0.0,
-    )
+    digest = ((summary.get("profiling") or {}).get("record_digest")
+              or record_digest(summary.get("evaluations", [])))
+    peak_memory = digest["peak_memory_bytes"]
+    startup, stall, span = (digest[key] for key in ("startup_s", "stall_s", "span_s"))
+    steady = span and span - startup - stall
+    first, iterations = digest["first_request_s"], digest["r2d2_iterations"]
+    batch = trt_mean_batch(run_dir)
+    pre_run = pre_run_phases(run_dir, digest)
+    pool_warm = pool_warm_phases(run_dir)
     return {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "--short=7", "HEAD") or "unknown",
@@ -215,7 +300,15 @@ def row_for(run_dir: Path) -> dict[str, Any] | None:
         "idle_fraction": round(max(0.0, 1.0 - busy_wall / wall), 4)
         if busy_wall else None,
         "ms_per_eval": round(per_eval * 1000.0, 4) if per_eval else None,
+        "startup_s": round(startup, 1) if span else None,
+        "stall_s": round(stall, 1) if span else None,
+        "first_request_s": round(first, 2) if first is not None else None,
+        "steady_evals_per_s": round(evals / steady, 4) if steady and steady > 0 else None,
         "peak_memory_mb": round(peak_memory / (1024.0 ** 2), 1) if peak_memory else None,
+        "r2d2_iterations": round(iterations, 3) if iterations else None,
+        **({"trt_mean_batch": batch} if batch else {}),
+        **({"pre_run_s": pre_run} if pre_run else {}),
+        **({"pool_warm_s": pool_warm} if pool_warm else {}),
         "stages_ms": {row["key"]: round(row["per_eval_seconds"] * 1000.0, 4)
                       for row in breakdown["rows"] if row["per_eval_seconds"]},
         "settings": settings,
@@ -226,6 +319,7 @@ def do_record(args: argparse.Namespace) -> int:
     if os.environ.get("NS_BENCH_RECORD") == "0":
         print("benchmark: warm-up run, not recorded", file=sys.stderr)
         return 0
+    gc.disable()  # parsing summary.json, all of which stays live (round 342)
     row = row_for(resolve_run(args.run))
     if row is None:
         return 0
@@ -323,7 +417,7 @@ def submit(args: argparse.Namespace) -> int:
     if args.mpi_procs is not None:
         env["NS_MPI_PROCS"] = str(args.mpi_procs)
     script = (". scripts/lib/defaults.sh; . scripts/lib/rank-budget.sh; . scripts/lib/slurm.sh; "
-              'mb="${NS_WSCLEAN_MB_PER_RANK}"; [ "$1" = r2d2 ] && mb="${NS_R2D2_MB_PER_RANK}"; '
+              'mb="${NS_WSCLEAN_MB_PER_RANK}"; [ "$1" = r2d2 ] && mb="${NS_R2D2_MB}"; '
               'ns_submit_run "$2" "${mb}" "${@:3}"')
     returncode = subprocess.run(
         ["bash", "-c", script, "bench", args.imager, str(job_dir),
@@ -352,7 +446,11 @@ def load_rows() -> list[dict[str, Any]]:
                 # A row half written by a killed run costs that row, not the file.
                 print(f"benchmark: skipping unreadable line in {LEDGER.name}",
                       file=sys.stderr)
-    return rows
+    # Hand-logged stage timings ("kind": "stage", rounds 201-203) are not runs,
+    # and since round 245 some carry an "imager" too; some are marked
+    # "preset": "stage" instead and carry no machine (round 341).
+    return [row for row in rows if "imager" in row and "machine" in row
+            and row.get("kind") != "stage" and row.get("preset") != "stage"]
 
 
 def commit_order() -> dict[str, int]:
@@ -427,6 +525,35 @@ def series(rows: list[dict[str, Any]], path: tuple[str, ...]) -> list[float]:
     return values
 
 
+# A converged async search needs ~0.41 x workers live points' worth of extra
+# evaluations whatever nlive is (docs/csd3-speed.md, round 307), so raw evals/s
+# flatters more ranks. Scaled by nlive/(nlive + 0.41 x workers) it is the rate
+# a converged search makes progress at, and that compares across rank counts
+# and nodes. Workers leave out PolyChord's root; synchronous runs get no line.
+ASYNC_OVERHEAD_PER_WORKER = 0.41
+
+
+def useful_evals_per_s(row: dict[str, Any]) -> float | None:
+    settings = row.get("settings") or {}
+    rate = row.get("steady_evals_per_s") or row.get("evals_per_s")
+    try:
+        nlive = int(settings["NS_NLIVE"])
+        workers = int(settings["NS_MPI_PROCS"]) * int(settings.get("NS_NODES", "1")) - 1
+    except (KeyError, ValueError):
+        return None
+    if settings.get("NS_SYNCHRONOUS", "0") != "0" or not rate or nlive <= 0 or workers < 1:
+        return None
+    return round(rate * nlive / (nlive + ASYNC_OVERHEAD_PER_WORKER * workers), 4)
+
+
+def ms_per_r2d2_iteration(row: dict[str, Any]) -> float | None:
+    """The imager's cost per solver iteration: ms/eval moves with where a run
+    lands, because R2D2 stops early except near the peak (round 351)."""
+    imager_ms = row.get("stages_ms", {}).get("image_container")
+    iterations = row.get("r2d2_iterations")
+    return round(imager_ms / iterations, 2) if imager_ms and iterations else None
+
+
 def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
                 columns: int, order: dict[str, int]) -> None:
     imager, preset, machine, settings_json = key
@@ -470,10 +597,23 @@ def print_group(key: tuple[str, str, str, str], rows: list[dict[str, Any]],
     line("Δ evals/s", [delta(series(by_commit[new], ("evals_per_s",)),
                             series(by_commit[old], ("evals_per_s",)))
                        for new, old in zip(labels, labels[1:])])
+    row_for_path("steady evals/s", ("steady_evals_per_s",))
+    useful = [cell([v for v in map(useful_evals_per_s, by_commit[c]) if v is not None])
+              for c in labels]
+    if any(useful):
+        line("converging evals/s", useful)
+    row_for_path("stall s", ("stall_s",))
+    row_for_path("first request s", ("first_request_s",))
     row_for_path("ms/eval", ("ms_per_eval",))
     row_for_path("busy wall s", ("busy_wall_s",))
     row_for_path("idle fraction", ("idle_fraction",))
     row_for_path("peak memory MB", ("peak_memory_mb",))
+    row_for_path("R2D2 iterations", ("r2d2_iterations",))
+    per_iteration = [cell([v for v in map(ms_per_r2d2_iteration, by_commit[c]) if v is not None])
+                     for c in labels]
+    if any(per_iteration):
+        line("ms/R2D2 iteration", per_iteration)
+    row_for_path("TensorRT mean batch", ("trt_mean_batch",))
     stages: list[str] = []
     for row in rows:
         stages += [key for key in row.get("stages_ms", {}) if key not in stages]
@@ -509,10 +649,21 @@ def do_table(_args: argparse.Namespace | None = None) -> int:
 
 
 def self_check() -> None:
+    import tempfile
+
     global LEDGER
 
     assert machine_id() == machine_id(), "machine id must be stable"
     assert len(machine_id()) == 8, machine_id()
+    saved = os.environ.pop("SLURM_JOB_ID", None)
+    try:
+        outside = machine_id()
+        os.environ["SLURM_JOB_ID"] = "1"
+        assert machine_id() != outside or not cpu_model(), "a Slurm node's id must carry its CPU model"
+    finally:
+        os.environ.pop("SLURM_JOB_ID", None)
+        if saved is not None:
+            os.environ["SLURM_JOB_ID"] = saved
 
     median, error = stat([10.0, 12.0])
     assert median == 11.0 and abs(error - 0.657) < 1e-3, (median, error)
@@ -538,6 +689,16 @@ def self_check() -> None:
 
     assert series([{"stages_ms": {"simulate": 3.0}}], ("stages_ms", "simulate")) == [3.0]
     assert series([{"stages_ms": {}}], ("stages_ms", "simulate")) == []
+    assert mean_r2d2_iterations([{"timing": {"r2d2_iterations": 25}}, {"timing": {"r2d2_iterations": 9}},
+                                 {"timing": {}}, {"objective": 0.0}]) == 17.0
+    assert mean_r2d2_iterations([]) is None
+    assert ms_per_r2d2_iteration({"stages_ms": {"image_container": 760.0}, "r2d2_iterations": 19.0}) == 40.0
+    assert ms_per_r2d2_iteration({"stages_ms": {"image_container": 760.0}}) is None
+    assert ms_per_r2d2_iteration({"r2d2_iterations": 19.0}) is None
+    with tempfile.TemporaryDirectory() as tmp:
+        assert trt_mean_batch(Path(tmp)) is None
+        (Path(tmp) / "r2d2-trt-batches.txt").write_text("launches 3 forwards 6 mean 2.000 sizes 1:2 4:1\n")
+        assert trt_mean_batch(Path(tmp)) == 2.0
     assert series([{"ms_per_eval": None}], ("ms_per_eval",)) == []
 
     defined = presets()
@@ -560,6 +721,21 @@ def self_check() -> None:
     assert preset_for({**preset_settings("default", "wsclean"),
                        "NS_MPI_PROCS": "3"}, "wsclean") == "default"
     assert preset_for({}, "wsclean") == "custom"
+    # Two nodes at the same per-node NS_MPI_PROCS is twice the work rate.
+    one, two = ({key: value for key, value in env.items() if key in WORKLOAD_KEYS}
+                for env in ({"NS_MPI_PROCS": "39"}, {"NS_MPI_PROCS": "39", "NS_NODES": "2"}))
+    assert group_key({"imager": "r2d2", "preset": "custom", "machine": "m", "settings": one}) \
+        != group_key({"imager": "r2d2", "preset": "custom", "machine": "m", "settings": two})
+
+    # Round 288: 2 x 39 ranks at nlive 300, 99.1 evals/s, is 77 workers.
+    two_nodes = {"steady_evals_per_s": 99.1, "settings": {
+        "NS_NLIVE": "300", "NS_MPI_PROCS": "39", "NS_NODES": "2", "NS_SYNCHRONOUS": "0"}}
+    assert useful_evals_per_s(two_nodes) == round(99.1 * 300 / (300 + 0.41 * 77), 4)
+    one_node = {"evals_per_s": 50.0, "settings": {"NS_NLIVE": "300", "NS_MPI_PROCS": "39"}}
+    assert useful_evals_per_s(one_node) == round(50.0 * 300 / (300 + 0.41 * 38), 4)
+    assert useful_evals_per_s({**one_node, "settings": {**one_node["settings"],
+                                                        "NS_SYNCHRONOUS": "1"}}) is None
+    assert useful_evals_per_s({"evals_per_s": 1.0, "settings": {}}) is None
 
     timeout = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
                                start_new_session=True)
@@ -589,6 +765,20 @@ def self_check() -> None:
             accepted = False
         assert accepted is expected, probe
 
+    # Start-up and a mid-run stall are cut; ordinary spacing is not.
+    timed = [{"timing": {"started_epoch": t, "ended_epoch": t + 0.3}}
+             for t in [0.0, 0.0] + [30.0 + 0.1 * n for n in range(100)] + [50.0 + 0.1 * n for n in range(100)]]
+    startup, stall, span = start_gaps(timed)
+    assert (startup, round(stall, 1), round(span, 1)) == (30.0, 10.1, 60.2), (startup, stall, span)
+    assert start_gaps([{"timing": {"started_epoch": 0.0, "ended_epoch": 1.0}},
+                       {"timing": {"started_epoch": 0.5, "ended_epoch": 1.5}}]) == (0.0, 0.0, 1.5)
+    assert start_gaps([{"timing": {}}]) is None
+    # All ranks' cold first requests together: no gap, but the first wave is slow.
+    wave = [{"timing": {"started_epoch": 0.1 * n, "ended_epoch": 6.0 + 0.1 * n}} for n in range(5)]
+    wave += [{"timing": {"started_epoch": 6.0 + 0.1 * n, "ended_epoch": 6.7 + 0.1 * n}} for n in range(20)]
+    assert start_gaps(wave)[0] == 0.0 and first_request(wave) == 6.0, first_request(wave)
+    assert first_request([{"timing": {}}]) is None
+
     import tempfile
 
     with tempfile.TemporaryDirectory() as raw:
@@ -596,6 +786,20 @@ def self_check() -> None:
         env_dir.mkdir()
         (env_dir / "run.env").write_text("NS_METRIC=total_rms_jy\\ -\\ 0.5\\ *\\ snr\n")
         assert read_run_env(env_dir)["NS_METRIC"] == "total_rms_jy - 0.5 * snr"
+
+        # The last launch's marks only (a resume appends), torn lines skipped.
+        (env_dir / "pre-run.tsv").write_text(
+            "1.0\tjob\t1.0\n5.0\tlaunch\t5.0\n100.0\tjob\t100.0\n101.5\tsized\t101.5\n"
+            "103.0\tlaunch\t103.0\n109.0\twarm\t106.0\n130.0\tsearched\t130.0\n133.0\tfinished\t133.0\n10")
+        assert pre_run_phases(env_dir, record_digest([
+                {"timing": {"started_epoch": 110.0, "ended_epoch": 125.0}}, {"timing": {}}])) == {
+            "sized": 1.5, "launch": 1.5, "warm": 6.0, "first_eval": 1.0, "total": 10.0, "searched": 5.0}
+        assert pre_run_phases(env_dir, record_digest([])) is None
+        assert pre_run_phases(Path(raw), record_digest([{"timing": {"started_epoch": 1.0}}])) is None
+        assert pool_warm_phases(Path(raw)) is None
+        (Path(raw) / "workers-r2d2.log").write_text(
+            "noise\nr2d2 pool warm-up seconds: imager 3.2, networks 2.4\nr2d2 pool warm-up seconds: imager 30.5, networks 1.0\n")
+        assert pool_warm_phases(Path(raw)) == {"imager": 30.5, "networks": 2.4}
 
         run = Path(raw) / "wsclean-vlaa-20260101T000000Z"
         run.mkdir()
@@ -611,7 +815,9 @@ def self_check() -> None:
                 "peak_memory_mb": 256.0,
                 "stages_ms": {"simulate": 40.0}, "settings": {"NS_NLIVE": "8"},
                 "busy_wall_s": 0.9, "idle_fraction": 0.1,
-            }) + "\nnot json\n")
+            }) + "\nnot json\n" + json.dumps({"kind": "stage", "stage": "s"}) + "\n"
+                + json.dumps({"kind": "stage", "imager": "r2d2", "run": "s"}) + "\n"
+                + json.dumps({"preset": "stage", "imager": "r2d2", "run": "s"}) + "\n")
             rows = load_rows()
             assert len(rows) == 1, rows
             do_table()
