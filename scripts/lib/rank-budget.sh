@@ -419,17 +419,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--self-check" ]; then
 
   # The kill takes the run's ranks and spares its srun, which has to live to
   # end the step on the other nodes.
-  ln -s "$(command -v sleep)" "${_orphan_dir}/bin/srun"
+  # Not sleep: uutils' multi-call sleep refuses to run as `srun`.
+  ln -s "$(command -v bash)" "${_orphan_dir}/bin/srun"
   bash -c 'exec -a "polychord_r2d2.py --output-dir $1" sleep 60' sh "${_orphan_run}" &
   _rank_pid=$!
-  bash -c 'exec -a "srun -n 2 polychord_r2d2.py --output-dir $1" "$2" 60' sh "${_orphan_run}" "${_orphan_dir}/bin/srun" &
+  bash -c 'exec -a "srun -n 2 polychord_r2d2.py --output-dir $1" "$2" -c "exec 2>/dev/null; sleep 60; :"' sh "${_orphan_run}" "${_orphan_dir}/bin/srun" &
   _srun_pid=$!
   sleep 0.5
   ns_kill_run_ranks "${_orphan_run}"
   wait "${_rank_pid}" 2>/dev/null || true
   kill -0 "${_rank_pid}" 2>/dev/null && { echo "FAIL: ns_kill_run_ranks left a rank"; kill "${_rank_pid}" "${_srun_pid}"; exit 1; }
   kill -0 "${_srun_pid}" 2>/dev/null || { echo "FAIL: ns_kill_run_ranks killed srun"; exit 1; }
-  kill "${_srun_pid}"; wait "${_srun_pid}" 2>/dev/null || true
+  pkill -P "${_srun_pid}"; wait "${_srun_pid}" 2>/dev/null || true
   rm -rf "${_orphan_dir}"
 
   # Shared memory is paid once: 40960 - 4096 headroom - 8000 shared = 28864,

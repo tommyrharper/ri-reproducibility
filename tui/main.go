@@ -269,8 +269,8 @@ func (m model) visible() []Run {
 	}
 	var live []Run
 	for _, run := range runs {
-		// Keep our not-yet-visible `starting` runs in the running-only table.
-		if run.Status == "running" || run.Status == "starting" {
+		// Keep our not-yet-visible `starting` runs, and queued ones, in the running-only table.
+		if run.Status == "running" || run.Status == "starting" || run.Status == "queued" {
 			live = append(live, run)
 		}
 	}
@@ -466,9 +466,9 @@ func (m model) updateRuns(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !ok {
 			return m, nil
 		}
-		// Starting runs have only logs; bind log pane before showRun builds model.
+		// Starting and queued runs have no health yet; bind log pane before showRun builds model.
 		openOn := paneHealth
-		if run.Status == "starting" {
+		if run.Status == "starting" || run.Status == "queued" {
 			openOn = paneLog
 		}
 		cmd := m.showRun(run, openOn)

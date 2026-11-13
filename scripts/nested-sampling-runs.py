@@ -45,12 +45,15 @@ def slurm_job_names() -> set[str]:
 
 
 def read_run_env(run_dir: Path) -> dict[str, str]:
-    try:
-        text = (run_dir / "run.env").read_text()
-    except OSError:
-        return {}
-    return {name.strip(): raw.strip().strip("'").replace("'\\''", "'")
-            for name, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line)}
+    """run.env, or before the job has written it, the settings it was submitted with."""
+    for name in ("run.env", SUBMITTED_SETTINGS):
+        try:
+            text = (run_dir / name).read_text()
+        except OSError:
+            continue
+        return {key.strip().removeprefix("export ").strip(): raw.strip().strip("'").replace("'\\''", "'")
+                for key, raw in (line.split("=", 1) for line in text.splitlines() if "=" in line)}
+    return {}
 
 
 def read_parameter_space(run_dir: Path) -> list[dict[str, object]]:
@@ -188,7 +191,9 @@ def count_evaluations(run_dir: Path) -> int:
     return len(names)
 
 
-RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains")
+# Written by slurm.sh at submission, before the job starts: a queued run has only this.
+SUBMITTED_SETTINGS = ".job-settings.env"
+RUN_ARTIFACTS = ("run.env", "run.log", "summary.json", "evaluations", "chains", SUBMITTED_SETTINGS)
 
 
 def summary_is_complete(run_dir: Path) -> bool:
@@ -265,10 +270,13 @@ def describe(run_dir: Path, running: set[str]) -> dict[str, object]:
     evaluations = count_evaluations(run_dir)
     complete = summary_is_complete(run_dir)
     resumable = any((run_dir / "chains").glob("*.resume"))
+    submitted_only = not any((run_dir / a).exists() for a in RUN_ARTIFACTS if a != SUBMITTED_SETTINGS)
     if complete:
         status = "complete"
     elif str(run_dir.resolve()) in running:
-        status = "running"
+        status = "queued" if submitted_only else "running"
+    elif submitted_only:
+        status = "not started"
     else:
         status = "resumable" if resumable else "incomplete"
     started = started_at(run_dir)
@@ -308,9 +316,11 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = find_runs()
     live = [r for r in runs if r["status"] == "running"]
-    unfinished = [r for r in runs if r["status"] not in ("complete", "running")]
+    queued = [r for r in runs if r["status"] == "queued"]
+    never = [r for r in runs if r["status"] == "not started"]
+    unfinished = [r for r in runs if r["status"] in ("resumable", "incomplete")]
     if args.incomplete:
-        runs = unfinished
+        runs = unfinished + never
 
     if args.json:
         print(json.dumps(runs, indent=2))
@@ -336,6 +346,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{len(live)} run{'' if len(live) == 1 else 's'} still going. Check on it with:")
         for run in live:
             print(f"  ./ri health {run['name']}")
+    if queued:
+        print(f"\n{len(queued)} run{'' if len(queued) == 1 else 's'} waiting for Slurm to start "
+              f"{'it' if len(queued) == 1 else 'them'}; `./ri health` works once it starts.")
+    if never:
+        print(f"\n{len(never)} run{'' if len(never) == 1 else 's'} submitted but never started "
+              "(no job in the queue). Submit again with ./ri search, or delete:")
+        for run in never:
+            print(f"  rm -r {run['path']}")
     if unfinished:
         count = len(unfinished)
         print(f"\n{count} run{'' if count == 1 else 's'} stopped before finishing.")
@@ -404,6 +422,23 @@ def self_check() -> None:
                 {"name": "channel_count", "min": 1, "max": 8, "kind": "integer"}]
             # A recorded box is never relabelled as borrowed.
             assert runs[stopped.name]["parameter_space_from_defaults"] is False
+
+            # Submitted but not started: slurm.sh's settings file is all there is.
+            pending = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260104T000000Z"
+            pending.mkdir()
+            (pending / SUBMITTED_SETTINGS).write_text(
+                "export NS_METRIC=total_rms_jy\nexport NS_NLIVE=500\nexport R2D2_DEVICE=cpu\n")
+            queued = {r["name"]: r for r in find_runs(running={str(pending.resolve())})}[pending.name]
+            assert queued["status"] == "queued", queued
+            assert queued["algorithm"] == "r2d2", queued
+            assert queued["settings"]["NS_NLIVE"] == "500", queued["settings"]
+            gone = {r["name"]: r for r in find_runs(running=set())}[pending.name]
+            assert gone["status"] == "not started", gone
+            # Once the job writes run.env it is running, then the usual states.
+            (pending / "run.env").write_text("NS_ALGORITHM=r2d2\nNS_NLIVE=500\n")
+            started = {r["name"]: r for r in find_runs(running={str(pending.resolve())})}[pending.name]
+            assert started["status"] == "running", started
+            shutil.rmtree(pending)
 
             bare = NESTED_SAMPLING_DIR / "r2d2-vlaa-20260103T000000Z"
             bare.mkdir()
