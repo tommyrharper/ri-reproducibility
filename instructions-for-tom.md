@@ -156,13 +156,13 @@ srun -A WBARKER-SL3-CPU -p icelake --qos=intr -c 4 -t 00:30:00 ./ri report --run
 
 Then to merge the results:
  ```bash
- srun -A WBARKER-SL3-CPU -p icelake --qos=intr -c 4 -t 00:30:00 bash -c './ri plot likelihood --last && ./ri report'
- ./ri report
+srun -A WBARKER-SL3-CPU -p icelake --qos=intr -c 4 -t 00:30:00 bash -c './ri plot likelihood --last && ./ri report'
+./ri report
  ```
 
  Then to serve them:
  ```
- ./ri serve
+./ri serve
  ```
  Now run the `ssh -NC -L 8000:127.0.0.1:8000 th773@128.232.224.16` style command returned, and open `http://localhost:8000/`.
 
