@@ -10,8 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  # Linting reads the source and does not care what it is running on, so it
-  # stays on one runner rather than doubling with the matrix below.
   lint:
     name: Lint and syntax
     runs-on: ubuntu-latest
