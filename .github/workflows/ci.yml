@@ -103,6 +103,9 @@ jobs:
       - name: Check the wsclean phase profiler
         run: uv run --no-project python3 scripts/profile-nested-sampling-run.py --self-check
 
+      - name: Check chains export and pull
+        run: uv run --no-project python3 scripts/chains.py --self-check
+
       - name: Check the benchmark ledger
         run: uv run --no-project python3 scripts/bench.py --self-check
 
