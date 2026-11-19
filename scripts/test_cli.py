@@ -464,6 +464,18 @@ check(
 )
 
 check(
+    "chains export passes the runs through",
+    [["uv", "run", "scripts/chains.py", "export", "run-a"]],
+    plan("chains", "export", "run-a")[1],
+)
+
+check(
+    "chains pull fetches from where export said",
+    [["uv", "run", "scripts/chains.py", "pull", "me@host:/x.tar.gz"]],
+    plan("chains", "pull", "me@host:/x.tar.gz")[1],
+)
+
+check(
     "plot gui --live asks for the run in progress",
     [["uv", "run", "scripts/anesthetic-gui.py", "--live"]],
     plan("plot", "gui", "--live")[1],

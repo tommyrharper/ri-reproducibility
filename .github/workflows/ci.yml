@@ -99,6 +99,9 @@ jobs:
       - name: Check the shared squeue cache
         run: uv run --no-project python3 scripts/slurm_queue.py --self-check
 
+      - name: Check chains export and pull
+        run: uv run --no-project python3 scripts/chains.py --self-check
+
       - name: Check the benchmark ledger
         run: uv run --no-project python3 scripts/bench.py --self-check
 

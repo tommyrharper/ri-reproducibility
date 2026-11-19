@@ -42,6 +42,8 @@ the complete interface.
 ```bash
 ./ri plot gui                     # interactive corner plots of the newest run
 ./ri plot gui results/nested-sampling/<run>
+./ri chains export                # on the cluster: pack every run's chains, print the pull command
+./ri chains pull HOST:PATH        # on your machine: fetch them into results/chains/
 ./ri plot fits                    # render FITS images to PNG in results/
 ./ri plot likelihood              # R2D2 vs WSClean failure-score figures
 ./ri plot likelihood --last       # ...for the last two directly comparable runs

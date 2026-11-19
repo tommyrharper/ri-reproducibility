@@ -282,6 +282,14 @@ def do_merge(args):
     return {}, [uv("scripts/merge-nested-sampling-runs.py", *args.runs, *out)]
 
 
+def do_chains_export(args):
+    return {}, [uv("scripts/chains.py", "export", *args.runs)]
+
+
+def do_chains_pull(args):
+    return {}, [uv("scripts/chains.py", "pull", args.source)]
+
+
 def do_plot_fits(args):
     return {}, [["scripts/plot-fits.sh", *args.files]]
 
@@ -806,6 +814,26 @@ def build_parser():
     merge.add_argument("runs", nargs="*", metavar="RUN", help="run directories to merge")
     merge.add_argument("--out", metavar="DIR",
                        help="output directory (only with an explicit run list)")
+
+    chains = add("chains", None, "carry runs' chains to another machine",
+                 description="Export on the host that ran the searches, then pull on "
+                             "the other machine with the command export prints. Only "
+                             "what reading the chains needs travels: chains/ without "
+                             "its .resume checkpoint, run.env and parameter-space.json.")
+    chains_subs = chains.add_subparsers(metavar="<what>", required=True)
+    chains_export = chains_subs.add_parser(
+        "export", parents=[dry_run], help="pack the chains into one archive",
+        description="Write results/chains-export.tar.gz and print the pull command. "
+                    "Set RI_SSH_HOST if this host is reached by another name.")
+    chains_export.add_argument("runs", nargs="*", metavar="RUN",
+                               help="run directories or names (default: every complete run)")
+    chains_export.set_defaults(handler=do_chains_export)
+    chains_pull = chains_subs.add_parser(
+        "pull", parents=[dry_run], help="fetch an export and unpack it",
+        description="scp the archive and unpack it into results/chains/<run>/, "
+                    "for ./ri plot gui. Pulling again overwrites.")
+    chains_pull.add_argument("source", metavar="HOST:PATH", help="what export printed")
+    chains_pull.set_defaults(handler=do_chains_pull)
 
     plot = add("plot", None, "render figures and open the sample viewer")
     plot_subs = plot.add_subparsers(dest="plot_command", metavar="<what>", required=True)
